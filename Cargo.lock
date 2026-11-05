@@ -4255,6 +4255,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "shlex",
+ "stacker",
  "strsim",
  "tar",
  "tempfile",
@@ -5271,8 +5272,6 @@ dependencies = [
 [[package]]
 name = "oxc_parser"
 version = "0.157.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d575332e9df032cc25e781b2aa2d1c10fed2b592f46c8f159e4ae8798f5451b5"
 dependencies = [
  "bitflags 2.13.2",
  "cow-utils",

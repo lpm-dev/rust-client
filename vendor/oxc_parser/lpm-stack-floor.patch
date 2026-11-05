@@ -1,0 +1,129 @@
+--- a/src/cursor.rs
++++ b/src/cursor.rs
+@@ -108,13 +108,37 @@
+         if self.token.escaped() && kind.is_any_keyword() {
+             self.report_escaped_keyword(self.token.span());
+         }
++        self.check_stack_floor();
+         self.prev_token_end = self.token.end();
+         self.token = self.lexer.next_token();
+     }
+ 
++    /// Stop with a fatal error once the stack pointer is below
++    /// `ParseOptions::stack_floor`. The fatal error moves the lexer to the end
++    /// of the source, so every caller unwinds without reading more tokens.
++    #[inline]
++    fn check_stack_floor(&mut self) {
++        let marker = 0u8;
++        if (&raw const marker).addr() < self.options.stack_floor {
++            self.stop_at_stack_floor();
++        }
++    }
++
++    /// A speculative parse that reaches the floor rewinds its fatal error
++    /// away, so the error is set again on every crossing, and
++    /// `stack_exhausted` stays set: the speculation's outcome, and so the
++    /// AST, may differ from what a deeper stack would have produced.
++    #[cold]
++    #[inline(never)]
++    fn stop_at_stack_floor(&mut self) {
++        self.stack_exhausted = true;
++        self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
++    }
++
+     /// Move to the next `JSXChild`
+     /// Checks if the current token is escaped if it is a keyword
+     pub(crate) fn advance_for_jsx_child(&mut self) {
++        self.check_stack_floor();
+         self.prev_token_end = self.token.end();
+         self.token = self.lexer.next_jsx_child();
+     }
+@@ -233,6 +257,7 @@
+ 
+     /// Move to the next token, lexing it as a JSX attribute value.
+     pub(crate) fn advance_for_jsx_attribute_value(&mut self) {
++        self.check_stack_floor();
+         self.prev_token_end = self.token.end();
+         self.token = self.lexer.next_jsx_attribute_value();
+     }
+--- a/src/diagnostics.rs
++++ b/src/diagnostics.rs
+@@ -91,6 +91,11 @@
+         OxcDiagnostic::error("Source length exceeds 4 GiB limit")
+     };
+ 
++    stack_exhausted(span: Span) => {
++        OxcDiagnostic::error("Source nests too deeply to parse on the stack the parser was given")
++            .with_label(span)
++    };
++
+     file_appears_to_be_binary() => {
+         ts_error("1490", "File appears to be binary.")
+     };
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -213,6 +213,11 @@
+ 
+     /// Whether the file is [flow](https://flow.org).
+     pub is_flow_language: bool,
++
++    /// Whether parsing stopped at [`ParseOptions::stack_floor`]: the source
++    /// nests too deeply to parse on the stack the parser was given.
++    /// [`fatal_error`](ParserReturn::fatal_error) is set too.
++    pub stack_exhausted: bool,
+ }
+ 
+ /// Parse options
+@@ -267,6 +272,18 @@
+     ///
+     /// Default: `true`
+     pub enable_ident_hashes: bool,
++
++    /// Lowest address on the parsing thread's stack the parser may use.
++    ///
++    /// The parser recurses once per level of nesting. Before reading each
++    /// token it compares the stack pointer with this address, and below it
++    /// stops with a fatal error and [`ParserReturn::stack_exhausted`] set,
++    /// instead of overflowing the stack. Every level of nesting reads at
++    /// least one token, so the parser never goes deeper than the frames
++    /// between two tokens past this address: leave room for them below it.
++    ///
++    /// Default: `0`, no limit
++    pub stack_floor: usize,
+ }
+ 
+ impl Default for ParseOptions {
+@@ -278,6 +295,7 @@
+             preserve_parens: true,
+             allow_v8_intrinsics: false,
+             enable_ident_hashes: true,
++            stack_floor: 0,
+         }
+     }
+ }
+@@ -670,6 +688,9 @@
+ 
+     /// Precomputed typescript detection
+     is_ts: bool,
++
++    /// Parsing reached [`ParseOptions::stack_floor`].
++    stack_exhausted: bool,
+ }
+ 
+ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
+@@ -702,6 +723,7 @@
+             ast: ParserAstBuilder::new(allocator),
+             module_record_builder: ModuleRecordBuilder::new(allocator, source_type),
+             is_ts: source_type.is_typescript(),
++            stack_exhausted: false,
+         }
+     }
+ 
+@@ -795,6 +817,7 @@
+             tokens,
+             fatal_error: has_fatal_error,
+             is_flow_language,
++            stack_exhausted: self.stack_exhausted,
+         }
+     }
+ 

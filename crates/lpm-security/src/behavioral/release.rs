@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_bundled_dependencies_native_addons_and_the_hidden_files_installs_skip() {
+    fn reads_bundled_dependencies_native_addons_and_hidden_files() {
         let signals = analyze(&[
             ("package.json", br#"{"name":"kit","license":"MIT"}"#),
             (

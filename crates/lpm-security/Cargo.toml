@@ -23,6 +23,7 @@ rayon = { workspace = true }
 regex = "1"
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "hybrid", "unicode"] }
 memchr = "2"
+stacker = "0.1"
 ignore = { workspace = true }
 bytecount = "0.6"
 chrono = { workspace = true }

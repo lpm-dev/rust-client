@@ -235,6 +235,13 @@ pub(super) fn argv_requests_json(args: &[std::ffi::OsString]) -> bool {
 }
 
 pub(super) fn clap_help_hint_from_argv(args: &[std::ffi::OsString]) -> Option<String> {
+    subcommand_from_argv(args)
+        .map(|command| format!("Run `lpm {command} --help` for command usage."))
+}
+
+/// The subcommand an argument list names: its first argument that isn't a
+/// global option or an option's value.
+pub(super) fn subcommand_from_argv(args: &[std::ffi::OsString]) -> Option<&str> {
     let mut skip_next = false;
     for arg in args
         .iter()
@@ -265,12 +272,16 @@ pub(super) fn clap_help_hint_from_argv(args: &[std::ffi::OsString]) -> Option<St
                 continue;
             }
             _ if value.starts_with('-') => continue,
-            command => {
-                return Some(format!("Run `lpm {command} --help` for command usage."));
-            }
+            command => return Some(command),
         }
     }
     None
+}
+
+/// Whether an argument list runs a helper whose only output is JSON, so a
+/// usage error is reported as the JSON usage envelope without `--json`.
+pub(super) fn argv_runs_json_only_helper(args: &[std::ffi::OsString]) -> bool {
+    subcommand_from_argv(args) == Some("internal-package-signals")
 }
 
 /// Whether `cmd` only takes login state or certificate trust away from the
@@ -848,6 +859,28 @@ mod tests {
             .unwrap()
             .command
             .expect("test parse missing subcommand")
+    }
+
+    fn argv(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn the_signals_helper_reports_usage_errors_as_json_wherever_its_name_is() {
+        for args in [
+            &["lpm", "internal-package-signals", "--ecosystem", "go"][..],
+            &["lpm", "--color", "never", "internal-package-signals"],
+            &["lpm", "--verbose", "internal-package-signals", "--bogus"],
+        ] {
+            assert!(argv_runs_json_only_helper(&argv(args)), "{args:?}");
+        }
+        for args in [
+            &["lpm", "run", "internal-package-signals"][..],
+            &["lpm", "--registry", "internal-package-signals", "install"],
+            &["lpm", "audit", "--", "internal-package-signals"],
+        ] {
+            assert!(!argv_runs_json_only_helper(&argv(args)), "{args:?}");
+        }
     }
 
     /// Banner suppression: every `lpm self-update` invocation

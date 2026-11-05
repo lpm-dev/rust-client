@@ -160,6 +160,22 @@ fn reports_input_that_is_not_a_release_tarball_as_a_json_error() {
 }
 
 #[test]
+fn reports_a_usage_error_as_the_json_usage_envelope() {
+    let output = package_signals(&["--ecosystem", "go"], b"");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|parse| panic!("usage error must be JSON ({parse}): {output:?}"));
+    assert_eq!(error["success"], false);
+    assert_eq!(error["error_code"], "usage");
+    assert_eq!(error["value"], "go");
+    assert_eq!(
+        error["valid_values"],
+        serde_json::json!(["js", "swift", "rust", "python"])
+    );
+}
+
+#[test]
 fn stays_out_of_help() {
     let project = TempDir::new().unwrap();
     let lpm_home = TempDir::new().unwrap();

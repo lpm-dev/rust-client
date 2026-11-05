@@ -4,11 +4,13 @@ use miette::Diagnostic as _;
 use crate::install_ui;
 
 use super::args::{Cli, Commands};
-use super::helpers::{args_for_cli_parse, argv_requests_json, clap_help_hint_from_argv};
+use super::helpers::{
+    args_for_cli_parse, argv_requests_json, argv_runs_json_only_helper, clap_help_hint_from_argv,
+};
 
 pub(super) fn parse_cli_or_exit() -> Cli {
     let args = args_for_cli_parse(std::env::args_os());
-    let json_output = argv_requests_json(&args);
+    let json_output = argv_requests_json(&args) || argv_runs_json_only_helper(&args);
     let help_hint = clap_help_hint_from_argv(&args);
     match Cli::try_parse_from(args) {
         Ok(mut cli) => {

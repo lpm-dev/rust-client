@@ -15,7 +15,6 @@
 mod bindings;
 mod evidence;
 pub mod manifest;
-mod nesting;
 pub mod release;
 pub mod roles;
 pub mod secrets;
@@ -489,18 +488,20 @@ pub fn analyze_package_with_timings(
 /// own files.
 #[derive(Clone, Copy, Debug)]
 pub enum PackageDirectory<'a> {
-    /// The package's files as its tarball unpacked them. A `node_modules/`
-    /// among them holds the dependencies the package bundles, which the
-    /// analysis reads as the package's code.
+    /// The package's files as its tarball unpacked them, hidden files
+    /// included. A `node_modules/` among them holds the dependencies the
+    /// package bundles, which the analysis reads as the package's code.
     Published,
     /// A package a project installed. The linker may have nested other
     /// packages in its `node_modules/`, at these package-relative
     /// directories. The analysis leaves them out, so their code counts once,
-    /// as theirs, and reads the rest of `node_modules/` as bundled.
+    /// as theirs, and the package manager's hidden entries directly in a
+    /// `node_modules/`, and reads the rest as bundled.
     Installed(&'a [std::path::PathBuf]),
     /// A local directory a project depends on. Its `node_modules/`
     /// directories hold its own installs, packages in their own right that
-    /// a project doesn't get from it, so the analysis reads none of them.
+    /// a project doesn't get from it, and its hidden files are its tooling
+    /// and caches, so the analysis reads neither.
     LocalSource,
 }
 
@@ -535,18 +536,41 @@ pub fn nested_packages<'a>(
 }
 
 impl PackageDirectory<'_> {
-    /// Whether the analysis walks into the package-relative directory
-    /// `relative`, whose parent it already walks.
-    fn walks_into(self, relative: &Path) -> bool {
-        PackageAnalyzer::should_scan_directory(relative)
-            && match self {
-                Self::Published => true,
-                Self::Installed(nested) => !nested.iter().any(|package| package == relative),
-                Self::LocalSource => {
-                    relative.file_name() != Some(std::ffi::OsStr::new("node_modules"))
-                }
+    /// Whether the analysis reads the package-relative entry `relative`, a
+    /// directory it walks into or a file, whose parent it already walks.
+    ///
+    /// A `.git` directory is never package content: an npm client doesn't
+    /// unpack one. Otherwise a published or installed package's hidden
+    /// files are read, as a registry reads them, except the package
+    /// manager's own entries directly in a `node_modules/` (`.bin`, `.lpm`).
+    /// A local source's hidden files are its tooling and caches (`.next`,
+    /// `.turbo`), not what it publishes.
+    fn reads(self, relative: &Path) -> bool {
+        let Some(name) = relative.file_name() else {
+            return false;
+        };
+        if is_git_dir_component(name) {
+            return false;
+        }
+        let hidden = name.as_encoded_bytes().starts_with(b".");
+        match self {
+            Self::Published => true,
+            Self::Installed(nested) => {
+                !(hidden
+                    && relative.parent().and_then(Path::file_name)
+                        == Some(std::ffi::OsStr::new("node_modules")))
+                    && !nested.iter().any(|package| package == relative)
             }
+            Self::LocalSource => !hidden && name != "node_modules",
+        }
     }
+}
+
+/// Whether a path component is one git reads as `.git`
+/// ([`lpm_common::names::is_git_dir_name`]).
+fn is_git_dir_component(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(lpm_common::names::is_git_dir_name)
 }
 
 /// Analyze a package through an already-open directory capability.
@@ -712,10 +736,10 @@ fn collect_cap_fingerprint_files(
         if metadata.is_symlink() {
             continue;
         }
+        if !contents.reads(&relative) {
+            continue;
+        }
         if metadata.is_dir() {
-            if !contents.walks_into(&relative) {
-                continue;
-            }
             let child = directory.open_dir_nofollow(&name)?;
             collect_cap_fingerprint_files(
                 &child,
@@ -1107,7 +1131,7 @@ fn analyze_source_file(
 ///
 /// The caller is responsible for:
 /// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
-///   exclusion, and directory filtering (hidden directories).
+///   exclusion, and directory filtering (`.git`).
 ///   [`PackageAnalyzer::should_scan`] encodes the current policy.
 /// - routing files over the 4 MiB full-scan limit to
 ///   [`PackageAnalyzer::feed_oversized_source_file`] or another bounded
@@ -1342,11 +1366,11 @@ fn extend_oversized_source_files(
     target.extend(source.into_iter().take(remaining));
 }
 
-/// Collect the source files and native artifacts of a package directory,
-/// bundled dependencies included, as package-relative paths.
+/// Collect the source files and native artifacts of a package directory as
+/// its tarball unpacked them ([`PackageDirectory::Published`]), bundled
+/// dependencies and hidden files included, as package-relative paths.
 ///
-/// Skips symlinks, hidden files and directories, declaration files, and
-/// source maps.
+/// Skips symlinks, `.git`, declaration files, and source maps.
 fn collect_source_files_recursive(
     package_dir: &Path,
     relative_dir: &Path,
@@ -1359,7 +1383,7 @@ fn collect_source_files_recursive(
 
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if name.as_encoded_bytes().starts_with(b".") {
+        if is_git_dir_component(&name) {
             continue;
         }
         let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
@@ -1580,10 +1604,11 @@ impl PackageAnalyzer {
     /// Returns `true` iff:
     /// - Extension is in `SOURCE_EXTENSIONS` (js/mjs/cjs/ts/mts/cts/jsx/tsx)
     /// - Filename is not `.d.ts` / `.d.mts` / `.d.cts` / `.map`
-    /// - No path component starts with `.` (hidden files/dirs)
+    /// - No path component is `.git`
     ///
-    /// A file under `node_modules/` qualifies: in a tarball, it's a
-    /// dependency the package bundles.
+    /// Hidden files qualify, as an npm client unpacks them. A file under
+    /// `node_modules/` qualifies: in a tarball, it's a dependency the
+    /// package bundles.
     ///
     /// The size cap is intentionally NOT checked here: oversized files still
     /// need lightweight metadata via [`PackageAnalyzer::feed_oversized_source_file`].
@@ -1626,18 +1651,9 @@ impl PackageAnalyzer {
     }
 
     fn in_scanned_tree(relative_path: &Path) -> bool {
-        relative_path.components().all(|component| match component {
-            std::path::Component::Normal(name) => !name.as_encoded_bytes().starts_with(b"."),
-            _ => true,
-        })
-    }
-
-    fn should_scan_directory(relative_path: &Path) -> bool {
-        relative_path.components().all(|component| {
-            let std::path::Component::Normal(name) = component else {
-                return false;
-            };
-            !name.as_encoded_bytes().starts_with(b".")
+        !relative_path.components().any(|component| match component {
+            std::path::Component::Normal(name) => is_git_dir_component(name),
+            _ => false,
         })
     }
 
@@ -2453,11 +2469,12 @@ mod tests {
         assert_eq!(analysis.meta.skipped_files, 1);
     }
 
-    /// Analyzes `source` on a thread with the stack a rayon worker has.
-    fn analyze_on_a_worker_stack(source: String) -> FileAnalysisResult {
+    /// Analyzes `source`, named `filename`, on a thread with the stack a
+    /// rayon worker has.
+    fn analyze_on_a_worker_stack(filename: &'static str, source: String) -> FileAnalysisResult {
         std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
-            .spawn(move || analyze_bytes("index.js", source.as_bytes()))
+            .spawn(move || analyze_bytes(filename, source.as_bytes()))
             .unwrap()
             .join()
             .unwrap()
@@ -2465,17 +2482,43 @@ mod tests {
 
     #[test]
     fn source_nested_deeper_than_a_worker_stack_is_parsed_on_a_stack_that_fits() {
-        for source in [
-            format!("x={}eval(y){};", "[".repeat(3_000), "]".repeat(3_000)),
-            format!("x={}eval(y);", "a=>".repeat(2_500)),
-            format!("{}eval(y);", "if(a)x;else ".repeat(3_000)),
-            format!(
-                "{}eval(y){}",
-                "(function(){return ".repeat(1_000),
-                "})()".repeat(1_000)
+        for (filename, source) in [
+            (
+                "index.js",
+                format!("x={}eval(y){};", "[".repeat(3_000), "]".repeat(3_000)),
+            ),
+            ("index.js", format!("x={}eval(y);", "a=>".repeat(2_500))),
+            (
+                "index.js",
+                format!("{}eval(y);", "if(a)x;else ".repeat(3_000)),
+            ),
+            ("index.js", format!("{}eval(y);", "a:".repeat(5_000))),
+            (
+                "index.js",
+                format!(
+                    "{}eval(y){}",
+                    "(function(){return ".repeat(1_000),
+                    "})()".repeat(1_000)
+                ),
+            ),
+            (
+                "index.js",
+                format!(
+                    "x=`{}${{eval(y)}}{}`;",
+                    "${`".repeat(2_000),
+                    "`}".repeat(2_000)
+                ),
+            ),
+            (
+                "index.ts",
+                format!(
+                    "let x: {}X{} = eval(y);",
+                    "A<".repeat(2_000),
+                    ">".repeat(2_000)
+                ),
             ),
         ] {
-            let result = analyze_on_a_worker_stack(source);
+            let result = analyze_on_a_worker_stack(filename, source);
             assert!(result.source.eval);
             assert_eq!(result.unparsed_files, 0);
         }
@@ -2483,12 +2526,32 @@ mod tests {
 
     #[test]
     fn source_nested_too_deeply_to_parse_is_read_without_parsing() {
-        for source in [
-            format!("x={}eval(y){};", "[".repeat(100_000), "]".repeat(100_000)),
-            format!("x={}eval(y);", "!".repeat(1_000_000)),
-            format!("x=a{}+eval(y);", ".b".repeat(1_000_000)),
+        for (filename, source) in [
+            (
+                "index.js",
+                format!("x={}eval(y){};", "[".repeat(100_000), "]".repeat(100_000)),
+            ),
+            ("index.js", format!("x={}eval(y);", "!".repeat(500_000))),
+            ("index.js", format!("x=a{}+eval(y);", ".b".repeat(500_000))),
+            ("index.js", format!("{}eval(y);", "a:".repeat(200_000))),
+            (
+                "index.ts",
+                format!(
+                    "let x: {}X{} = eval(y);",
+                    "A<".repeat(200_000),
+                    ">".repeat(200_000)
+                ),
+            ),
+            (
+                "index.jsx",
+                format!(
+                    "x={}{}; eval(y);",
+                    "<a>".repeat(200_000),
+                    "</a>".repeat(200_000)
+                ),
+            ),
         ] {
-            let result = analyze_on_a_worker_stack(source);
+            let result = analyze_on_a_worker_stack(filename, source);
             assert!(result.source.eval);
             assert_eq!(result.unparsed_files, 1);
         }
@@ -2750,6 +2813,81 @@ mod tests {
             [Path::new("node_modules/deep")]
         );
         assert!(!nested.contains_key(Path::new("/p/node_modules/other")));
+    }
+
+    /// A package whose hidden files hold code it runs, beside a `.git`
+    /// directory and package-manager state.
+    fn package_with_hidden_files() -> tempfile::TempDir {
+        let package = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node .x/run.js"}}"#,
+                ),
+                ("index.js", "module.exports = 1\n"),
+                (
+                    ".x/run.js",
+                    "require('child_process').exec(process.argv[2])\n",
+                ),
+                (".git/hooks/run.js", "eval(process.argv[2])\n"),
+                (
+                    "node_modules/.bin/tool.js",
+                    "fetch('https://tool.example/')\n",
+                ),
+            ],
+        );
+        package
+    }
+
+    #[test]
+    fn published_packages_read_hidden_files_but_never_git() {
+        let package = package_with_hidden_files();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        for analysis in [
+            analyze_package(package.path()),
+            analyze_package_from_open_dir(&directory, PackageDirectory::Published),
+        ] {
+            assert!(analysis.source.child_process);
+            assert!(analysis.source.network);
+            assert!(!analysis.source.eval);
+        }
+        assert!(PackageAnalyzer::should_scan(Path::new(".x/run.js"), 1));
+        assert!(!PackageAnalyzer::should_scan(
+            Path::new(".git/hooks/run.js"),
+            1
+        ));
+    }
+
+    #[test]
+    fn installed_packages_read_hidden_files_but_not_package_manager_state() {
+        let package = package_with_hidden_files();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::Installed(&[]));
+
+        assert!(analysis.source.child_process);
+        assert!(!analysis.source.network);
+        assert!(!analysis.source.eval);
+    }
+
+    #[test]
+    fn a_local_source_leaves_out_its_hidden_files() {
+        let package = package_with_hidden_files();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::LocalSource);
+
+        assert!(!analysis.source.child_process);
+        assert!(!analysis.source.network);
     }
 
     #[test]

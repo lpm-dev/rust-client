@@ -2856,25 +2856,49 @@ async fn audit_counts_a_test_file_a_lifecycle_script_runs_as_package_code() {
     );
 }
 
-/// `--fail-on=behavior` must fire on a HIGH-severity behavioral finding
-/// like eval(). Pins the positive case for the `Behavior` arm of
-/// `FailPolicy` (audit/mod.rs::should_fail).
+/// Whether `--fail-on=behavior` fails an audit of one package of `files`.
+async fn fail_on_behavior_fails(files: &[(&str, &str)]) -> bool {
+    let project = TempProject::empty(r#"{"name":"eval-host","version":"1.0.0"}"#);
+    seed_node_modules_package(&project, "eval-pkg", files);
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    !run_audit_no_osv(&project, &mock, &["--fail-on=behavior"])
+        .status
+        .success()
+}
+
+/// `--fail-on=behavior` fires on a high-severity capability such as
+/// `eval()` in the code a package runs, and on nothing else this package
+/// has: the same package without it passes, and so does `eval()` only a test
+/// file contains.
 #[tokio::test]
 async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
-    let project = TempProject::empty(r#"{"name":"eval-host","version":"1.0.0"}"#);
-    seed_eval_package(&project, "eval-pkg");
-
-    let mock = MockRegistry::start().await;
-    // Audit will query OSV for non-@lpm.dev packages; return empty so
-    // the only failure trigger is the behavioral finding.
-    mock.with_osv_querybatch(vec![vec![]]).await;
-
-    let out = run_audit_no_osv(&project, &mock, &["--fail-on=behavior"]);
     assert!(
-        !out.status.success(),
-        "--fail-on=behavior must fire when eval() is detected; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+        fail_on_behavior_fails(&[(
+            "index.js",
+            "module.exports = function (src) { return eval(src) }\n"
+        )])
+        .await,
+        "--fail-on=behavior must fire when the package runs eval()"
+    );
+    assert!(
+        !fail_on_behavior_fails(&[(
+            "index.js",
+            "module.exports = function (src) { return src }\n"
+        )])
+        .await,
+        "without eval() the package has nothing --fail-on=behavior fails on"
+    );
+    assert!(
+        !fail_on_behavior_fails(&[
+            (
+                "index.js",
+                "module.exports = function (src) { return src }\n"
+            ),
+            ("test/run.test.js", "eval(process.argv[2])\n"),
+        ])
+        .await,
+        "eval() only a test file contains must not fail --fail-on=behavior"
     );
 }
 
