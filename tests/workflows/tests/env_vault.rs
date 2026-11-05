@@ -5593,7 +5593,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("JSON failure must contain exactly one parseable document");
     assert_eq!(json["success"], false);
-    assert_eq!(json["error_code"], "script");
+    assert_eq!(json["error_code"], "env");
     assert!(
         json["error"]
             .as_str()
@@ -6327,7 +6327,7 @@ async fn env_share_force_under_json_emits_error_envelope_on_stdout() {
 
     let json = parse_clean_json_stdout(&output);
     assert_eq!(json["success"], false);
-    assert_eq!(json["error_code"], "script");
+    assert_eq!(json["error_code"], "env");
     let error = json["error"].as_str().expect("error should be a string");
     assert!(error.contains("previously bound to this checkout"));
 }
@@ -8225,10 +8225,10 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
     assert!(!failed_push.status.success(), "denied push must fail");
     let failed_json = parse_clean_json_stdout(&failed_push);
     assert_eq!(failed_json["success"], false);
-    assert_eq!(failed_json["error_code"], "script");
+    assert_eq!(failed_json["error_code"], "env");
     assert_eq!(
         failed_json["error"],
-        "script error: GitHub Actions variable update failed with HTTP 403 Forbidden: workflow denied"
+        "env error: GitHub Actions variable update failed with HTTP 403 Forbidden: workflow denied"
     );
     insta::assert_json_snapshot!("env_github_actions_failed_push_json_envelope", failed_json);
 }
@@ -8673,10 +8673,7 @@ async fn env_platform_json_error_paths_emit_error_envelopes_on_stdout() {
         );
         let json = parse_clean_json_stdout(&output);
         assert_eq!(json["success"], false, "lpm {args:?} envelope: {json}");
-        assert_eq!(
-            json["error_code"], "script",
-            "lpm {args:?} envelope: {json}"
-        );
+        assert_eq!(json["error_code"], "env", "lpm {args:?} envelope: {json}");
         assert!(
             json["error"]
                 .as_str()

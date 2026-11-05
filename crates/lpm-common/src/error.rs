@@ -709,6 +709,12 @@ pub enum LpmError {
         specifier: String,
     },
 
+    /// An `lpm env` command failed. The message says why and, where it
+    /// helps, what to do.
+    #[error("env error: {0}")]
+    #[diagnostic(code(lpm::env))]
+    Env(String),
+
     #[error("environment validation failed:\n{0}")]
     #[diagnostic(
         code(lpm::env_validation),
@@ -955,6 +961,7 @@ impl LpmError {
                 "catalog_entry_invalid_recursive_definition"
             }
             LpmError::EnvValidation(_) => "env_validation",
+            LpmError::Env(_) => "env",
             LpmError::EnvProjectRefused(_) => "env_project_refused",
             LpmError::History { code, .. } => code,
             LpmError::EnvGeneration { .. } => "env_generation",
@@ -1083,6 +1090,17 @@ mod tests {
         let err = LpmError::ExitCode(1);
         let code = err.code().unwrap();
         assert_eq!(code.to_string(), "lpm::exit_code");
+    }
+
+    #[test]
+    fn an_env_error_names_env_and_carries_no_script_guidance() {
+        let error = LpmError::Env("no secrets in source environment \"nope\"".into());
+        assert_eq!(
+            error.to_string(),
+            "env error: no secrets in source environment \"nope\""
+        );
+        assert_eq!(error.code().unwrap().to_string(), "lpm::env");
+        assert!(error.help().is_none());
     }
 
     #[test]
@@ -1248,6 +1266,7 @@ mod tests {
                 code: "history.entry_not_found",
                 message: "x".into(),
             },
+            LpmError::Env("x".into()),
             LpmError::EngineMismatch(Box::new(EngineMismatchErrorContext {
                 engine: "lpm".into(),
                 required: ">=1.0.0".into(),
@@ -1509,6 +1528,7 @@ mod tests {
             LpmError::EnvValidation("x".into()).error_code(),
             "env_validation"
         );
+        assert_eq!(LpmError::Env("x".into()).error_code(), "env");
         assert_eq!(
             LpmError::History {
                 code: "history.entry_not_found",

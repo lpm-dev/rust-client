@@ -11,9 +11,9 @@ pub(super) fn env_set(
         .map(|arg| {
             let pair = arg
                 .split_once('=')
-                .ok_or_else(|| LpmError::Script("expected KEY=VALUE".into()))?;
+                .ok_or_else(|| LpmError::Env("expected KEY=VALUE".into()))?;
             if !lpm_env::is_valid_env_var_name(pair.0) {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "env keys must match [A-Za-z_][A-Za-z0-9_]*".into(),
                 ));
             }
@@ -28,11 +28,11 @@ pub(super) fn env_set(
     match &resolved_env {
         Some(env) => {
             lpm_vault::set_env(project_dir, env, &pairs, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         }
         None => {
             lpm_vault::set(project_dir, &pairs, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         }
     }
 
@@ -109,7 +109,7 @@ pub(super) fn env_get(
         Some(env) => lpm_vault::try_get_env(project_dir, env, key),
         None => lpm_vault::try_get(project_dir, key),
     };
-    let value = value.map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+    let value = value.map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
 
     match value {
         Some(value) => {
@@ -133,7 +133,7 @@ pub(super) fn env_get(
             }
         }
         None => {
-            return Err(LpmError::Script(format!("secret '{key}' not found")));
+            return Err(LpmError::Env(format!("secret '{key}' not found")));
         }
     }
     Ok(())
@@ -164,11 +164,11 @@ pub(super) fn env_delete(
     match &resolved_env {
         Some(env) => {
             lpm_vault::delete_env(project_dir, env, &keys, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         }
         None => {
             lpm_vault::delete(project_dir, &keys, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         }
     }
 
@@ -217,9 +217,9 @@ pub(super) fn env_import(
     );
     let imported = match &resolved_env {
         Some(env) => lpm_vault::import_env_file_to_env(project_dir, env, &path, overwrite, &source)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
         None => lpm_vault::import_env_file(project_dir, &path, overwrite, &source)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
     };
     let count = imported.count;
     let warnings = keep_env_source_ignored(project_dir, &path)?;
@@ -277,7 +277,7 @@ pub(super) fn env_export(
         Some(env) => lpm_vault::export_env_content_from_env(project_dir, env),
         None => lpm_vault::export_env_content(project_dir),
     }
-    .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let (count, warnings) = match content {
         None => (0, Vec::new()),
         Some((content, count)) => {
@@ -324,7 +324,7 @@ pub(super) fn env_export(
 /// in, which can be below the project.
 pub(super) fn invocation_relative(file: &str) -> Result<std::path::PathBuf, LpmError> {
     std::path::absolute(file)
-        .map_err(|error| LpmError::Script(format!("failed to resolve {file}: {error}")))
+        .map_err(|error| LpmError::Env(format!("failed to resolve {file}: {error}")))
 }
 
 /// Keeps an env file the user imported from, which holds secrets, out of
@@ -358,14 +358,14 @@ pub(super) fn resolve_env_from_flag(
     project_dir: &std::path::Path,
 ) -> Result<(Option<String>, Option<lpm_runner::lpm_json::LpmJsonConfig>), LpmError> {
     let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let empty = std::collections::HashMap::new();
     match env_input {
         Some(input) => {
             let env_map = config.as_ref().map_or(&empty, |c| &c.env);
             let environments = config.as_ref().and_then(|c| c.environments.as_ref());
             let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
-                .map_err(|e| LpmError::Script(format!("invalid environment name: {e}")))?;
+                .map_err(|e| LpmError::Env(format!("invalid environment name: {e}")))?;
             Ok((Some(resolved.canonical), config))
         }
         None => Ok((None, config)),
@@ -382,7 +382,7 @@ pub(super) fn vars_list(
         Some(env) => lpm_vault::try_get_all_env(project_dir, env),
         None => lpm_vault::try_get_all(project_dir),
     };
-    let secrets = secrets.map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+    let secrets = secrets.map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let env_label = env_name.unwrap_or("default");
 
     if json_output {

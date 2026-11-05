@@ -32,13 +32,13 @@ pub(super) async fn rotate_personal_key(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned)
-        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+        .ok_or_else(|| LpmError::Env("no vault configured".into()))?;
     let expected_principal_id = manifest
         .vault
         .personal_expected_principal_for_registry(client.base_url())
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
 
     let (pulled, pulled_registry_url) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
@@ -56,8 +56,7 @@ pub(super) async fn rotate_personal_key(
             }
         })
         .await?;
-    let environment_names =
-        validate_rotation_payload(&pulled.raw_json).map_err(LpmError::Script)?;
+    let environment_names = validate_rotation_payload(&pulled.raw_json).map_err(LpmError::Env)?;
     let raw_json = std::sync::Arc::new(pulled.raw_json);
     let pulled_principal_id = pulled.principal_id;
     let current_version = pulled.version;
@@ -113,7 +112,7 @@ pub(super) async fn rotate_personal_key(
 
     let version = result
         .version
-        .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
+        .ok_or_else(|| LpmError::Env("rotation response omitted the new version".into()))?;
     let checkpoint_result = super::sync_payload::persist_personal_sync_version(
         &project_dir,
         &vault_id,
@@ -183,7 +182,7 @@ fn parse_rotate_key_options(args: &[&str]) -> Result<RotateKeyOptions, LpmError>
                 "`lpm env rotate-key --org` requires exactly one organization slug",
             )?;
             if org_slug.is_some() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "`lpm env rotate-key --org` requires exactly one organization slug".into(),
                 ));
             }
@@ -194,7 +193,7 @@ fn parse_rotate_key_options(args: &[&str]) -> Result<RotateKeyOptions, LpmError>
                 "`lpm env rotate-key --org` requires exactly one organization slug",
             )?;
             if org_slug.is_some() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "`lpm env rotate-key --org` requires exactly one organization slug".into(),
                 ));
             }
@@ -203,14 +202,14 @@ fn parse_rotate_key_options(args: &[&str]) -> Result<RotateKeyOptions, LpmError>
             index += 1;
         } else if argument.starts_with("--accept-recipient-keys=") {
         } else {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "unknown rotate-key argument: {argument}"
             )));
         }
         index += 1;
     }
     if recipient_set_acceptance.is_some() && org_slug.is_none() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "`--accept-recipient-keys` is valid only with `lpm env rotate-key --org <slug>`".into(),
         ));
     }
@@ -236,13 +235,13 @@ async fn env_rotate_org_key(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned)
-        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+        .ok_or_else(|| LpmError::Env("no vault configured".into()))?;
     let expected_principal_id = manifest
         .vault
         .org_sync_principal_for_registry(org_slug, client.base_url())
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
 
     let (pulled, pulled_registry_url) = pull_org_with_local_key_first(
         client,
@@ -259,11 +258,11 @@ async fn env_rotate_org_key(
         principal_id: pulled_principal_id,
         ..
     } = pulled;
-    let environment_names = validate_rotation_payload(&raw_json).map_err(LpmError::Script)?;
+    let environment_names = validate_rotation_payload(&raw_json).map_err(LpmError::Env)?;
     let raw_json = std::sync::Arc::new(raw_json);
     let expected_content_key_version =
         pulled_content_key_version.checked_add(1).ok_or_else(|| {
-            LpmError::Script("organization content-key version cannot advance further".into())
+            LpmError::Env("organization content-key version cannot advance further".into())
         })?;
     let project_dir = project_dir.to_path_buf();
 
@@ -324,12 +323,12 @@ async fn env_rotate_org_key(
         .await?;
     let version = result
         .version
-        .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
+        .ok_or_else(|| LpmError::Env("rotation response omitted the new version".into()))?;
     let content_key_version = result.content_key_version.ok_or_else(|| {
-        LpmError::Script("rotation response omitted the new content-key version".into())
+        LpmError::Env("rotation response omitted the new content-key version".into())
     })?;
     if content_key_version != expected_content_key_version {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "rotation response did not advance the organization content-key version".into(),
         ));
     }
@@ -799,7 +798,7 @@ pub(super) async fn sharing_key_and_member_access_for_org_op(
         .await?;
     let state =
         lpm_vault::sync::resolve_public_key_state_from_member_access(&registry_url, &access)
-            .map_err(|error| LpmError::Script(error.to_string()))?;
+            .map_err(|error| LpmError::Env(error.to_string()))?;
 
     match state {
         PublicKeyRegistrationState::Matches(local) => Ok((local.private_key, access)),
@@ -837,7 +836,7 @@ async fn register_missing_sharing_key_for_org(
          to authorize the write."
     ));
     let step_up_scope = lpm_vault::sync::sharing_key_step_up_scope(None, &local.public_key_b64)
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
     let proof = crate::step_up::request_cli_step_up_proof(client, &step_up_scope).await?;
     let (refreshed_access, refreshed_registry_url) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
@@ -859,7 +858,7 @@ async fn register_missing_sharing_key_for_org(
         })
         .await?;
     if refreshed_registry_url != initial_registry_url {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the active registry changed during sharing-key registration; retry the command".into(),
         ));
     }
@@ -868,9 +867,9 @@ async fn register_missing_sharing_key_for_org(
         local.clone(),
         &refreshed_access,
     )
-    .map_err(|error| LpmError::Script(error.to_string()))?;
+    .map_err(|error| LpmError::Env(error.to_string()))?;
     if !matches!(state, PublicKeyRegistrationState::Matches(_)) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "organization member inventory did not confirm the registered sharing key".into(),
         ));
     }
@@ -894,12 +893,12 @@ fn ensure_member_access_matches_identity(
     access: &lpm_vault::sync::OrgMemberKeyAccess,
 ) -> Result<(), LpmError> {
     if access.organization_id != expected_organization_id {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "organization identity changed during sharing-key recovery; retry the command".into(),
         ));
     }
     if access.caller_user_id != expected_caller_user_id {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "authenticated caller identity changed during sharing-key recovery; retry the command"
                 .into(),
         ));
@@ -912,7 +911,7 @@ fn ensure_pulled_organization_identity(
     pulled: &lpm_vault::sync::PulledOrgVault,
 ) -> Result<(), LpmError> {
     if pulled.principal_id != expected_organization_id {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "organization identity changed while retrying the pull; retry the command".into(),
         ));
     }
@@ -920,7 +919,7 @@ fn ensure_pulled_organization_identity(
 }
 
 fn sharing_key_rotation_required_error(op_label: &str) -> LpmError {
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "refusing to {op_label}: this device's sharing key does NOT match the key on \
          the server. Silently overwriting the server-side key would invalidate every \
          org teammate's wrapped access without your knowledge — exactly the attack \
@@ -1001,7 +1000,7 @@ pub(super) async fn pull_org_with_local_key_first(
         })
         .await?;
     if access_registry_url != initial_registry_url {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the active registry changed during sharing-key recovery; retry the command".into(),
         ));
     }
@@ -1012,7 +1011,7 @@ pub(super) async fn pull_org_with_local_key_first(
     )?;
     let state =
         lpm_vault::sync::resolve_public_key_state_from_member_access(&access_registry_url, &access)
-            .map_err(|error| LpmError::Script(error.to_string()))?;
+            .map_err(|error| LpmError::Env(error.to_string()))?;
     match state {
         PublicKeyRegistrationState::NeedsInitialSet(local) => {
             register_missing_sharing_key_for_org(
@@ -1026,7 +1025,7 @@ pub(super) async fn pull_org_with_local_key_first(
             .await?;
         }
         PublicKeyRegistrationState::Matches(_) => {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "your registered sharing key does not have access to this env project yet; ask an organization admin to share it again"
                     .into(),
             ));
@@ -1073,7 +1072,7 @@ pub(super) async fn env_rotate_sharing_key(
     // piped from an unattended runner.
     let yes_skip = args.contains(&"--yes");
     if !std::io::stdin().is_terminal() || yes_skip {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "`lpm env rotate-sharing-key` is an interactive recovery surface and \
              refuses to run without a TTY. Run it manually from your terminal."
                 .into(),
@@ -1089,7 +1088,7 @@ pub(super) async fn env_rotate_sharing_key(
     .await
     .map_err(|error| match error {
         lpm_vault::sync::SharingKeyRotationStartError::Read(error) => error,
-        lpm_vault::sync::SharingKeyRotationStartError::Local(message) => LpmError::Script(message),
+        lpm_vault::sync::SharingKeyRotationStartError::Local(message) => LpmError::Env(message),
     })?;
     let (key_scope, _rotation_lock, server_key) = match start {
         lpm_vault::sync::SharingKeyRotationStart::Resumed => {
@@ -1145,9 +1144,9 @@ pub(super) async fn env_rotate_sharing_key(
     let typed: String =
         cliclack::input("Type ROTATE (uppercase) to confirm. Any other input cancels.")
             .interact()
-            .map_prompt_err(|e| LpmError::Script(format!("confirmation prompt failed: {e}")))?;
+            .map_prompt_err(|e| LpmError::Env(format!("confirmation prompt failed: {e}")))?;
     if typed != "ROTATE" {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "rotation cancelled — no server-side or local state changed.".into(),
         ));
     }
@@ -1156,15 +1155,14 @@ pub(super) async fn env_rotate_sharing_key(
     // or cancelled confirmation discards it; this run holds the rotation
     // lock, so no other run can be relying on it.
     let pending =
-        lpm_vault::sync::create_pending_x25519_keypair(&key_scope).map_err(LpmError::Script)?;
+        lpm_vault::sync::create_pending_x25519_keypair(&key_scope).map_err(LpmError::Env)?;
     let step_up_scope = server_key
         .step_up_scope_to_install(&pending.public_key_b64)
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
     let proof = match crate::step_up::request_cli_step_up_proof(client, &step_up_scope).await {
         Ok(proof) => proof,
         Err(error) => {
-            lpm_vault::sync::discard_pending_x25519_keypair(&key_scope)
-                .map_err(LpmError::Script)?;
+            lpm_vault::sync::discard_pending_x25519_keypair(&key_scope).map_err(LpmError::Env)?;
             return Err(error);
         }
     };
@@ -1202,14 +1200,14 @@ pub(super) async fn env_rotate_sharing_key(
             // became unparsable. Preserve the pending private key so the next
             // invocation can compare its public half with the authoritative
             // server key and either promote it or discard a confirmed orphan.
-            return Err(LpmError::Script(e.to_string()));
+            return Err(LpmError::Env(e.to_string()));
         }
     };
 
     // Promote pending → live. A crash here leaves the pending slot
     // and the server-side new key, which the crash-recovery branch
     // at the top of this function will finish on the next run.
-    lpm_vault::sync::promote_pending_x25519_keypair(&key_scope).map_err(LpmError::Script)?;
+    lpm_vault::sync::promote_pending_x25519_keypair(&key_scope).map_err(LpmError::Env)?;
 
     if json_output {
         println!(

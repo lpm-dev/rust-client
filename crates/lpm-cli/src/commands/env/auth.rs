@@ -13,7 +13,7 @@ async fn resolve_bearer(
 fn login_required(error: LpmError) -> LpmError {
     match error {
         LpmError::AuthRequired | LpmError::SessionExpired => {
-            LpmError::Script("not logged in. Run `lpm login` first".into())
+            LpmError::Env("not logged in. Run `lpm login` first".into())
         }
         other => other,
     }
@@ -31,7 +31,7 @@ pub(super) async fn resolve_session_bearer(client: &RegistryClient) -> Result<St
                 .current_source()?
                 .is_some_and(|source| !source.is_session_backed());
             if has_non_session_source {
-                Err(LpmError::Script(
+                Err(LpmError::Env(
                     "your current credential is not an interactive session.\n  \
                      Run `lpm logout` then `lpm login` to authenticate."
                         .into(),
@@ -48,7 +48,7 @@ fn sync_error(error: lpm_vault::sync::SyncError) -> LpmError {
     if error.is_unauthorized() {
         login_required(LpmError::AuthRequired)
     } else {
-        LpmError::Script(error.to_string())
+        LpmError::Env(error.to_string())
     }
 }
 

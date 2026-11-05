@@ -108,7 +108,7 @@ impl GitHubActionsClient {
             validate_environment(environment)?;
         }
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| LpmError::Script("GitHub token contains invalid characters".into()))?;
+            .map_err(|_| LpmError::Env("GitHub token contains invalid characters".into()))?;
         authorization.set_sensitive(true);
         let http = lpm_http::client_builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -152,7 +152,7 @@ impl GitHubActionsClient {
             .full_name
             .eq_ignore_ascii_case(&client.config.repository)
         {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "GitHub returned repository {} while {} was requested",
                 repository.full_name, client.config.repository
             )));
@@ -191,7 +191,7 @@ impl GitHubActionsClient {
         for key in &diff.added {
             let value = local.readable.get(key).ok_or_else(|| {
                 PlatformApplyError::tracked(
-                    LpmError::Script(format!("missing local value for {key}")),
+                    LpmError::Env(format!("missing local value for {key}")),
                     applied,
                 )
             })?;
@@ -209,7 +209,7 @@ impl GitHubActionsClient {
         for key in &diff.changed {
             let value = local.readable.get(key).ok_or_else(|| {
                 PlatformApplyError::tracked(
-                    LpmError::Script(format!("missing local value for {key}")),
+                    LpmError::Env(format!("missing local value for {key}")),
                     applied,
                 )
             })?;
@@ -271,7 +271,7 @@ impl GitHubActionsClient {
             .map_err(|error| PlatformApplyError::tracked(error, applied))?;
         if !state_matches_local(&observed, local, clean) {
             return Err(PlatformApplyError::tracked(
-                LpmError::Script(
+                LpmError::Env(
                     "GitHub Actions synchronization verification failed; readable variables or secret-name coverage do not match the requested state"
                         .into(),
                 ),
@@ -405,7 +405,7 @@ impl GitHubActionsClient {
         if observed.id.to_string() != self.config.repository_id
             || observed.full_name != self.config.repository
         {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "GitHub repository binding changed: expected {} (ID {}), received {} (ID {}); reconnect before syncing",
                 self.config.repository, self.config.repository_id, observed.full_name, observed.id
             )));
@@ -429,7 +429,7 @@ impl GitHubActionsClient {
                 validate_value_name(&variable.name)?;
                 validate_value_size(&variable.name, &variable.value)?;
                 if result.contains_key(&variable.name) {
-                    return Err(LpmError::Script(format!(
+                    return Err(LpmError::Env(format!(
                         "GitHub returned duplicate Actions variable {}",
                         variable.name
                     )));
@@ -470,7 +470,7 @@ impl GitHubActionsClient {
             for secret in data.secrets {
                 validate_value_name(&secret.name)?;
                 if !result.insert(secret.name.clone()) {
-                    return Err(LpmError::Script(format!(
+                    return Err(LpmError::Env(format!(
                         "GitHub returned duplicate Actions secret {}",
                         secret.name
                     )));
@@ -503,15 +503,15 @@ impl GitHubActionsClient {
             )
             .await?;
         if public_key.key_id.is_empty() {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "GitHub returned an empty Actions public-key ID".into(),
             ));
         }
-        let key_bytes = BASE64.decode(public_key.key.as_bytes()).map_err(|_| {
-            LpmError::Script("GitHub returned an invalid Actions public key".into())
-        })?;
+        let key_bytes = BASE64
+            .decode(public_key.key.as_bytes())
+            .map_err(|_| LpmError::Env("GitHub returned an invalid Actions public key".into()))?;
         let public_key_bytes: [u8; 32] = key_bytes.try_into().map_err(|_| {
-            LpmError::Script("GitHub returned an invalid Actions public-key length".into())
+            LpmError::Env("GitHub returned an invalid Actions public-key length".into())
         })?;
         let mut encrypted = Vec::with_capacity(secret_count);
         for (keys, is_new) in [
@@ -520,7 +520,7 @@ impl GitHubActionsClient {
         ] {
             for key in keys {
                 let value = local.write_only.get(key).ok_or_else(|| {
-                    LpmError::Script(format!("missing local secret value for {key}"))
+                    LpmError::Env(format!("missing local secret value for {key}"))
                 })?;
                 let ciphertext = seal_secret(&public_key_bytes, value.as_bytes())?;
                 encrypted.push((
@@ -622,7 +622,7 @@ impl GitHubActionsClient {
             return Err(github_api_error(operation, status, &body));
         }
         serde_json::from_slice(&body).map_err(|error| {
-            LpmError::Script(format!(
+            LpmError::Env(format!(
                 "invalid GitHub Actions {operation} response: {error}"
             ))
         })
@@ -676,9 +676,8 @@ impl GitHubActionsClient {
     }
 
     fn repository_url(&self) -> Result<String, LpmError> {
-        let (owner, repository) = split_repository(&self.config.repository).ok_or_else(|| {
-            LpmError::Script("stored GitHub repository binding is invalid".into())
-        })?;
+        let (owner, repository) = split_repository(&self.config.repository)
+            .ok_or_else(|| LpmError::Env("stored GitHub repository binding is invalid".into()))?;
         Ok(format!(
             "{}/repos/{}/{}",
             self.api_url,
@@ -739,7 +738,7 @@ pub(super) fn partition_local_values(
     for key in local.keys() {
         let folded = key.to_ascii_uppercase();
         if !folded_names.insert(folded) {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "GitHub Actions value names contain a case-insensitive collision".into(),
             ));
         }
@@ -752,7 +751,7 @@ pub(super) fn partition_local_values(
     for (key, value) in local {
         validate_value_name(key)?;
         if value.len() > GITHUB_VALUE_MAX_BYTES {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "GitHub Actions value {key} exceeds the {GITHUB_VALUE_MAX_BYTES}-byte limit"
             )));
         }
@@ -796,7 +795,7 @@ fn state_matches_local(remote: &PlatformState, local: &LocalPlatformValues, clea
 fn seal_secret(public_key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, LpmError> {
     PublicKey::from(*public_key)
         .seal(&mut crypto_box::aead::OsRng, plaintext)
-        .map_err(|_| LpmError::Script("failed to encrypt GitHub Actions secret".into()))
+        .map_err(|_| LpmError::Env("failed to encrypt GitHub Actions secret".into()))
 }
 
 fn validate_value_name(name: &str) -> Result<(), LpmError> {
@@ -809,7 +808,7 @@ fn validate_value_name(name: &str) -> Result<(), LpmError> {
         character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit()
     });
     if !valid_length || !valid_first || !valid_rest || name.starts_with("GITHUB_") {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "invalid GitHub Actions value name '{name}'; use canonical uppercase letters, digits, and underscores, do not start with a digit, and do not use the GITHUB_ prefix"
         )));
     }
@@ -818,7 +817,7 @@ fn validate_value_name(name: &str) -> Result<(), LpmError> {
 
 fn validate_value_size(name: &str, value: &str) -> Result<(), LpmError> {
     if value.len() > GITHUB_VALUE_MAX_BYTES {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "GitHub Actions value {name} exceeds the {GITHUB_VALUE_MAX_BYTES}-byte limit"
         )));
     }
@@ -830,7 +829,7 @@ fn validate_environment(environment: &str) -> Result<(), LpmError> {
         || environment.chars().count() > GITHUB_ENVIRONMENT_MAX_CHARS
         || environment.chars().any(char::is_control)
     {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "--environment must contain 1 to {GITHUB_ENVIRONMENT_MAX_CHARS} non-control characters"
         )));
     }
@@ -847,7 +846,7 @@ fn validate_page_total(
         return Err(pagination_limit_error(namespace));
     }
     if expected.is_some_and(|expected| expected != total) {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "GitHub Actions {namespace} changed during pagination; retry the operation"
         )));
     }
@@ -855,7 +854,7 @@ fn validate_page_total(
 }
 
 fn pagination_limit_error(namespace: &str) -> LpmError {
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "GitHub Actions returned more than {GITHUB_MAX_PAGES} pages of {namespace}; refusing an unbounded sync"
     ))
 }
@@ -875,7 +874,7 @@ fn github_api_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -
     } else {
         format!(": {}", detail.chars().take(300).collect::<String>())
     };
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "GitHub Actions {operation} failed with HTTP {status}{suffix}"
     ))
 }

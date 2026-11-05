@@ -15,16 +15,14 @@ impl CloudManifestSnapshot {
             Ok(content) => Some(content),
             Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
             Err(error) => {
-                return Err(LpmError::Script(format!(
-                    "failed to read lpm.json: {error}"
-                )));
+                return Err(LpmError::Env(format!("failed to read lpm.json: {error}")));
             }
         };
         let config = content
             .as_deref()
             .map(|content| lpm_runner::lpm_json::parse_lpm_json_in(project_dir, content))
             .transpose()
-            .map_err(LpmError::Script)?;
+            .map_err(LpmError::Env)?;
         let sources = match (&content, &config) {
             (Some(content), Some(config)) => Some(match &config.env_schema_resolution {
                 Some(snapshot) => std::sync::Arc::clone(snapshot),
@@ -34,7 +32,7 @@ impl CloudManifestSnapshot {
                         content.as_bytes(),
                         lpm_env::EnvSchemaDefinition::default(),
                     )
-                    .map_err(|error| LpmError::Script(error.to_string()))?
+                    .map_err(|error| LpmError::Env(error.to_string()))?
                     .snapshot
                 }
             }),
@@ -44,10 +42,10 @@ impl CloudManifestSnapshot {
             project_dir,
             content.as_deref(),
         )
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
         if let Some(sync) = vault.sync_state() {
             serde_json::from_value::<lpm_runner::lpm_json::VaultSyncConfig>(sync.clone()).map_err(
-                |error| LpmError::Script(format!("the env sync state is not valid: {error}")),
+                |error| LpmError::Env(format!("the env sync state is not valid: {error}")),
             )?;
         }
         Ok(Self {
@@ -223,7 +221,7 @@ pub(super) fn build_sync_payload(
         environments: HashMap<String, HashMap<String, String>>,
     }
     serde_json::to_string(&SyncPayload { environments })
-        .map_err(|error| LpmError::Script(format!("failed to serialize: {error}")))
+        .map_err(|error| LpmError::Env(format!("failed to serialize: {error}")))
 }
 
 pub(super) fn parse_remote_pull_payload_for_overwrite(
@@ -263,7 +261,7 @@ pub(super) fn personal_sync_checkpoint_warnings(
 pub(super) fn read_lpm_json_for_push(
     project_dir: &std::path::Path,
 ) -> Result<Option<lpm_runner::lpm_json::LpmJsonConfig>, LpmError> {
-    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)
+    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)
 }
 
 /// Build the `schema` JSON value sent alongside a vault push.
@@ -301,7 +299,7 @@ fn validate_metadata_size(value: &serde_json::Value) -> Result<(), LpmError> {
         }
     }
     serde_json::to_writer(Budget(MAX_METADATA_BYTES), value).map_err(|_| {
-        LpmError::Script(
+        LpmError::Env(
             "env.metadata_too_large: Env metadata exceeds the cloud limit of 256 KiB".into(),
         )
     })
@@ -441,7 +439,7 @@ pub(super) fn persist_personal_sync_version(
         version,
         principal,
     )
-    .map_err(LpmError::Script)
+    .map_err(LpmError::Env)
 }
 
 pub(super) fn persist_org_sync_version(
@@ -463,7 +461,7 @@ pub(super) fn persist_org_sync_version(
         version,
         principal,
     )
-    .map_err(LpmError::Script)
+    .map_err(LpmError::Env)
 }
 
 #[cfg(test)]

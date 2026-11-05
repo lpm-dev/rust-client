@@ -145,7 +145,7 @@ fn confirm(question: &str, yes: bool, json_output: bool) -> Result<Option<bool>,
         .initial_value(false)
         .interact()
         .map(Some)
-        .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))
+        .map_err(|error| LpmError::Env(format!("prompt failed: {error}")))
 }
 
 fn local_time(ms: i64) -> DateTime<Local> {

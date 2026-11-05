@@ -23,7 +23,7 @@ fn parse_pull_target<'a>(args: &'a [&str]) -> Result<PullTarget<'a>, LpmError> {
         .any(|argument| *argument == "--org" || argument.starts_with("--org="));
 
     if oidc_selected && (platform_selected || org_selected) {
-        return Err(LpmError::Script(USAGE.into()));
+        return Err(LpmError::Env(USAGE.into()));
     }
     if platform_selected {
         super::platform::validate_platform_pull_arguments(command_args, USAGE)?;
@@ -43,17 +43,15 @@ fn parse_pull_target<'a>(args: &'a [&str]) -> Result<PullTarget<'a>, LpmError> {
             let slug =
                 super::remote::parse_org_slug_value(command_args.get(index).copied(), USAGE)?;
             if org_slug.replace(slug).is_some() {
-                return Err(LpmError::Script(USAGE.into()));
+                return Err(LpmError::Env(USAGE.into()));
             }
         } else if let Some(slug) = argument.strip_prefix("--org=") {
             let slug = super::remote::parse_org_slug_value(Some(slug), USAGE)?;
             if org_slug.replace(slug).is_some() {
-                return Err(LpmError::Script(USAGE.into()));
+                return Err(LpmError::Env(USAGE.into()));
             }
         } else {
-            return Err(LpmError::Script(format!(
-                "unknown pull argument: {argument}"
-            )));
+            return Err(LpmError::Env(format!("unknown pull argument: {argument}")));
         }
         index += 1;
     }
@@ -84,11 +82,9 @@ pub(super) async fn vars_pull(
     };
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
-    let vault_id = match manifest.vault.vault_id().map_err(LpmError::Script)? {
+    let vault_id = match manifest.vault.vault_id().map_err(LpmError::Env)? {
         Some(vault_id) => vault_id.to_owned(),
-        None => {
-            lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?
-        }
+        None => lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Env)?,
     };
 
     // Org pull: different flow with X25519 decryption
@@ -101,11 +97,11 @@ pub(super) async fn vars_pull(
         }
 
         let baseline_environments = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         let expected_principal_id = manifest
             .vault
             .org_sync_principal_for_registry(org_slug, client.base_url())
-            .map_err(LpmError::Script)?;
+            .map_err(LpmError::Env)?;
 
         let (pulled, registry_url) = super::rotation::pull_org_with_local_key_first(
             client,
@@ -118,7 +114,7 @@ pub(super) async fn vars_pull(
 
         let remote_environments =
             super::sync_payload::parse_remote_pull_payload_for_overwrite(&pulled.raw_json)
-                .map_err(LpmError::Script)?;
+                .map_err(LpmError::Env)?;
         let target = lpm_vault::RemoteSyncTarget::Organization {
             slug: org_slug.to_owned(),
         };
@@ -134,11 +130,11 @@ pub(super) async fn vars_pull(
                 principal_id: &pulled.principal_id,
             },
         )
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
         let committed_environments = match committed {
             lpm_vault::RemoteEnvironmentCommit::Committed(environments) => environments,
             lpm_vault::RemoteEnvironmentCommit::Conflict(_) => {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "local secrets changed while the organization vault was downloading; no remote changes were applied. Review the local values and retry."
                         .into(),
                 ));
@@ -175,7 +171,7 @@ pub(super) async fn vars_pull(
 
     let project_name = manifest.vault.project_name(project_dir);
     let baseline_environments = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
-        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let local_key_count = baseline_environments
         .values()
         .map(|env| env.len())
@@ -189,7 +185,7 @@ pub(super) async fn vars_pull(
         let confirm = cliclack::confirm("Continue?")
             .initial_value(false)
             .interact()
-            .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+            .map_prompt_err(|e| LpmError::Env(format!("prompt failed: {e}")))?;
         if !confirm {
             output::info("cancelled");
             return Ok(());
@@ -202,7 +198,7 @@ pub(super) async fn vars_pull(
     let expected_principal_id = manifest
         .vault
         .personal_expected_principal_for_registry(client.base_url())
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
 
     let (pulled, registry_url) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
@@ -223,7 +219,7 @@ pub(super) async fn vars_pull(
 
     let remote_envs =
         super::sync_payload::parse_remote_pull_payload_for_overwrite(&pulled.raw_json)
-            .map_err(LpmError::Script)?;
+            .map_err(LpmError::Env)?;
     let committed = lpm_vault::commit_remote_environments_for_principal(
         project_dir,
         &vault_id,
@@ -236,11 +232,11 @@ pub(super) async fn vars_pull(
             principal_id: &pulled.principal_id,
         },
     )
-    .map_err(LpmError::Script)?;
+    .map_err(LpmError::Env)?;
     let committed_environments = match committed {
         lpm_vault::RemoteEnvironmentCommit::Committed(environments) => environments,
         lpm_vault::RemoteEnvironmentCommit::Conflict(_) => {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "local secrets changed while the cloud vault was downloading; no remote changes were applied. Review the local values and retry."
                     .into(),
             ));

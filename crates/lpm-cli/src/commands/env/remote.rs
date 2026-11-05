@@ -12,9 +12,9 @@ pub(super) async fn env_log(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned)
-        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+        .ok_or_else(|| LpmError::Env("no vault configured".into()))?;
 
     let result =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
@@ -61,7 +61,7 @@ pub(super) fn parse_org_slug_value<'a>(
 ) -> Result<&'a str, LpmError> {
     value
         .filter(|slug| !slug.trim().is_empty() && !slug.trim_start().starts_with('-'))
-        .ok_or_else(|| LpmError::Script(error_message.into()))
+        .ok_or_else(|| LpmError::Env(error_message.into()))
 }
 
 fn parse_share_org_slug<'a>(args: &'a [&str]) -> Result<&'a str, LpmError> {
@@ -76,25 +76,23 @@ fn parse_share_org_slug<'a>(args: &'a [&str]) -> Result<&'a str, LpmError> {
             index += 1;
             let slug = parse_org_slug_value(args.get(index).copied(), USAGE)?;
             if org_slug.replace(slug).is_some() {
-                return Err(LpmError::Script(USAGE.into()));
+                return Err(LpmError::Env(USAGE.into()));
             }
         } else if let Some(slug) = argument.strip_prefix("--org=") {
             let slug = parse_org_slug_value(Some(slug), USAGE)?;
             if org_slug.replace(slug).is_some() {
-                return Err(LpmError::Script(USAGE.into()));
+                return Err(LpmError::Env(USAGE.into()));
             }
         } else if argument == "--accept-recipient-keys" {
             index += 1;
         } else if argument.starts_with("--accept-recipient-keys=") || argument == "--force" {
         } else {
-            return Err(LpmError::Script(format!(
-                "unknown share argument: {argument}"
-            )));
+            return Err(LpmError::Env(format!("unknown share argument: {argument}")));
         }
         index += 1;
     }
 
-    org_slug.ok_or_else(|| LpmError::Script(USAGE.into()))
+    org_slug.ok_or_else(|| LpmError::Env(USAGE.into()))
 }
 
 pub(super) fn parse_list_remote_org_slug<'a>(
@@ -111,15 +109,15 @@ pub(super) fn parse_list_remote_org_slug<'a>(
             index += 1;
             let slug = parse_org_slug_value(args.get(index).copied(), USAGE)?;
             if org_slug.replace(slug).is_some() {
-                return Err(LpmError::Script(USAGE.into()));
+                return Err(LpmError::Env(USAGE.into()));
             }
         } else if let Some(slug) = argument.strip_prefix("--org=") {
             let slug = parse_org_slug_value(Some(slug), USAGE)?;
             if org_slug.replace(slug).is_some() {
-                return Err(LpmError::Script(USAGE.into()));
+                return Err(LpmError::Env(USAGE.into()));
             }
         } else {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "unknown list-remote argument: {argument}"
             )));
         }
@@ -145,26 +143,26 @@ pub(super) async fn env_share(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned)
-        .ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env set` first".into()))?;
+        .ok_or_else(|| LpmError::Env("no vault configured. Run `lpm env set` first".into()))?;
     let expected_principal_id = manifest
         .vault
         .org_sync_principal_for_registry(org_slug, client.base_url())
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
     if recreate_missing && expected_principal_id.is_none() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "`lpm env share --force` can recreate only an organization env previously bound to this checkout"
                 .into(),
         ));
     }
 
     let all_envs = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
-        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let environment_count = all_envs.len();
     let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
     if all_envs.is_empty() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "no environments configured, nothing to share".into(),
         ));
     }
@@ -176,7 +174,7 @@ pub(super) async fn env_share(
         .as_deref()
         .is_some_and(|expected| expected != member_access.organization_id)
     {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
 			"this env checkout is bound to a different organization; use a separate checkout when switching organizations"
 				.into(),
 		));
@@ -185,7 +183,7 @@ pub(super) async fn env_share(
 
     let schema_snapshot = manifest
         .sources
-        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json".into()))?;
+        .ok_or_else(|| LpmError::Env("env.source_changed at lpm.json".into()))?;
     let vault_manifest = std::sync::Arc::new(manifest.vault);
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
@@ -322,7 +320,7 @@ pub(super) fn parse_recipient_set_acceptance(args: &[&str]) -> Result<Option<Str
         let value = if argument == "--accept-recipient-keys" {
             index += 1;
             Some(args.get(index).copied().ok_or_else(|| {
-                LpmError::Script(
+                LpmError::Env(
                     "`--accept-recipient-keys` requires a 64-character recipient-set digest".into(),
                 )
             })?)
@@ -331,12 +329,12 @@ pub(super) fn parse_recipient_set_acceptance(args: &[&str]) -> Result<Option<Str
         };
         if let Some(value) = value {
             if acceptance.is_some() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "`--accept-recipient-keys` may be specified only once".into(),
                 ));
             }
             if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "`--accept-recipient-keys` requires a 64-character hexadecimal recipient-set digest"
                         .into(),
                 ));
@@ -507,7 +505,7 @@ pub(super) async fn vars_diff(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned);
     let config = manifest.config;
     let empty_env_map = std::collections::HashMap::new();
@@ -520,7 +518,7 @@ pub(super) async fn vars_diff(
         let resolved_b = lpm_env::resolver::resolve(args[1], env_map, environments);
         let local_environments = match vault_id.as_deref() {
             Some(vault_id) => lpm_vault::try_get_all_environments_for_vault_id(vault_id)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
             None => HashMap::new(),
         };
         let (a, b) = take_local_diff_pair(
@@ -539,14 +537,14 @@ pub(super) async fn vars_diff(
         let resolved = lpm_env::resolver::resolve(args[0], env_map, environments);
         let vault_id = vault_id
             .as_deref()
-            .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+            .ok_or_else(|| LpmError::Env("no vault configured".into()))?;
         let local = lpm_vault::try_get_all_env_for_vault_id(vault_id, &resolved.storage_key)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         let canonical = resolved.canonical.clone();
         let expected_principal_id = manifest
             .vault
             .personal_expected_principal_for_registry(client.base_url())
-            .map_err(LpmError::Script)?;
+            .map_err(LpmError::Env)?;
         let (remote, _version) =
             super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
                 let vault_id = vault_id.to_owned();
@@ -575,13 +573,13 @@ pub(super) async fn vars_diff(
         // Default: local default vs cloud
         let vault_id = vault_id
             .as_deref()
-            .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+            .ok_or_else(|| LpmError::Env("no vault configured".into()))?;
         let local = lpm_vault::try_get_all_env_for_vault_id(vault_id, "default")
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         let expected_principal_id = manifest
             .vault
             .personal_expected_principal_for_registry(client.base_url())
-            .map_err(LpmError::Script)?;
+            .map_err(LpmError::Env)?;
         let (remote, _version) =
             super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
                 let vault_id = vault_id.to_owned();

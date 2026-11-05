@@ -110,7 +110,7 @@ fn perform_init_actions(
         snapshot,
         &lpm_vault::history::Source::new(lpm_vault::history::Action::InitFromFiles),
     )
-    .map_err(LpmError::Script)
+    .map_err(LpmError::Env)
     .map(|results| {
         results
             .into_iter()
@@ -145,7 +145,7 @@ pub(super) fn vars_init(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned);
     let config = manifest.config;
 
@@ -161,7 +161,7 @@ pub(super) fn vars_init(
         }
     }
     let snapshot = lpm_vault::capture_environment_initialization_snapshot(vault_id.as_deref())
-        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
 
     // Build the list of environments to process
     let all_envs = lpm_env::resolver::list_all_from_vault_names(
@@ -396,7 +396,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned);
     let sync_summary = manifest.vault.sync_summary();
     let config = manifest.config;
@@ -409,7 +409,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     // includes the personal overrides.
     let (vault_envs, overrides_by_env) = match vault_id.as_deref() {
         Some(vault_id) => lpm_vault::try_get_all_run_environments_for_vault_id(vault_id)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
         None => (HashMap::new(), HashMap::new()),
     };
     let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
@@ -655,7 +655,7 @@ pub(super) fn vars_copy(
     overwrite: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
     let empty = HashMap::new();
     let env_map = config.as_ref().map_or(&empty, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
@@ -663,10 +663,10 @@ pub(super) fn vars_copy(
     // Resolve both env names (src = read path, dst = write path)
     let resolved_src = lpm_env::resolver::resolve(src, env_map, environments);
     let resolved_dst = lpm_env::resolver::resolve_checked(dst, env_map, environments)
-        .map_err(|e| LpmError::Script(format!("invalid target environment: {e}")))?;
+        .map_err(|e| LpmError::Env(format!("invalid target environment: {e}")))?;
 
     if resolved_src.canonical == resolved_dst.canonical {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "source and target environments are the same".into(),
         ));
     }
@@ -678,9 +678,9 @@ pub(super) fn vars_copy(
         overwrite,
         &lpm_vault::history::Source::new(lpm_vault::history::Action::CopyEnvironment),
     )
-    .map_err(LpmError::Script)?;
+    .map_err(LpmError::Env)?;
     let Some(copy) = copy else {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "no secrets in source environment \"{}\"",
             resolved_src.canonical
         )));

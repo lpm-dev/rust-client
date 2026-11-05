@@ -204,6 +204,35 @@ fn env_assignment_errors_do_not_print_secret_values() {
 }
 
 #[test]
+fn env_failures_are_reported_as_env_errors_without_a_script_hint() {
+    let project = TempProject::empty(r#"{"name":"env-error-kind"}"#);
+    for args in [
+        &["env", "set", "bad key=1"][..],
+        &["env", "copy", "missing", "staging"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("Env error"), "{args:?}: {text}");
+        assert!(!text.contains("Script error"), "{args:?}: {text}");
+        assert!(!text.contains("package.json scripts"), "{args:?}: {text}");
+
+        let output = lpm(&project).args(args).arg("--json").output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let value = parse_json_stdout(&output, &args.join(" "));
+        assert_eq!(value["error_code"], "env", "{args:?}: {value}");
+        assert!(
+            value["error"].as_str().unwrap().starts_with("env error: "),
+            "{args:?}: {value}"
+        );
+    }
+}
+
+#[test]
 fn env_set_rejects_partial_assignments_before_writing_the_vault() {
     let project = TempProject::empty(r#"{"name":"env-assignment-validation"}"#);
     let output = lpm(&project)

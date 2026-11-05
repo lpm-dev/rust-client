@@ -88,7 +88,7 @@ pub(super) struct RailwayClient {
 impl RailwayClient {
     pub(super) fn new(token: String, config: RailwayConnectionConfig) -> Result<Self, LpmError> {
         let mut token = HeaderValue::from_str(&token)
-            .map_err(|_| LpmError::Script("Railway token contains invalid characters".into()))?;
+            .map_err(|_| LpmError::Env("Railway token contains invalid characters".into()))?;
         token.set_sensitive(true);
         let http = lpm_http::client_builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -183,7 +183,7 @@ impl RailwayClient {
         input.insert(
             "variables".into(),
             serde_json::to_value(&local_values).map_err(|error| {
-                LpmError::Script(format!("failed to serialize Railway values: {error}"))
+                LpmError::Env(format!("failed to serialize Railway values: {error}"))
             })?,
         );
         input.insert("replace".into(), serde_json::Value::Bool(clean));
@@ -195,7 +195,7 @@ impl RailwayClient {
             )
             .await?;
         if !data.variable_collection_upsert {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "Railway bulk upsert returned an unsuccessful result".into(),
             ));
         }
@@ -206,7 +206,7 @@ impl RailwayClient {
             .map(|(key, variable)| (key, variable.value))
             .collect::<HashMap<_, _>>();
         if observed_values != desired {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "Railway synchronization verification failed; the authoritative values do not match the requested state"
                     .into(),
             ));
@@ -263,11 +263,10 @@ impl RailwayClient {
                 "Bearer {}",
                 self.token
                     .to_str()
-                    .map_err(|_| LpmError::Script("Railway token is not valid text".into()))?
+                    .map_err(|_| LpmError::Env("Railway token is not valid text".into()))?
             );
-            let mut bearer = HeaderValue::from_str(&bearer).map_err(|_| {
-                LpmError::Script("Railway token contains invalid characters".into())
-            })?;
+            let mut bearer = HeaderValue::from_str(&bearer)
+                .map_err(|_| LpmError::Env("Railway token contains invalid characters".into()))?;
             bearer.set_sensitive(true);
             request.header(AUTHORIZATION, bearer)
         };
@@ -282,7 +281,7 @@ impl RailwayClient {
             return Err(railway_http_error(operation, status, &body));
         }
         let response: GraphqlResponse<T> = serde_json::from_slice(&body)
-            .map_err(|error| LpmError::Script(format!("invalid Railway response: {error}")))?;
+            .map_err(|error| LpmError::Env(format!("invalid Railway response: {error}")))?;
         if !response.errors.is_empty() {
             let detail = response
                 .errors
@@ -290,13 +289,13 @@ impl RailwayClient {
                 .map(|error| error.message.as_str())
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "Railway {operation} failed: {}",
                 detail.chars().take(500).collect::<String>()
             )));
         }
         response.data.ok_or_else(|| {
-            LpmError::Script(format!("Railway {operation} response did not include data"))
+            LpmError::Env(format!("Railway {operation} response did not include data"))
         })
     }
 }
@@ -316,29 +315,29 @@ pub(super) fn railway_api_url() -> Result<String, LpmError> {
     }
     let candidate = candidate.to_string_lossy();
     let parsed = reqwest::Url::parse(&candidate)
-        .map_err(|error| LpmError::Script(format!("invalid acceptance Railway URL: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid acceptance Railway URL: {error}")))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Railway URL must not contain credentials".into(),
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Railway URL must not contain a query or fragment".into(),
         ));
     }
     if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Railway URL must use a loopback host".into(),
         ));
     }
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Railway URL must use HTTP or HTTPS".into(),
         ));
     }
     if parsed.path() != "/graphql/v2" {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Railway URL must end with /graphql/v2".into(),
         ));
     }
@@ -353,7 +352,7 @@ fn railway_http_error(operation: &str, status: reqwest::StatusCode, body: &[u8])
     } else {
         format!(": {}", detail.chars().take(300).collect::<String>())
     };
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "Railway {operation} failed with HTTP {status}{suffix}"
     ))
 }
@@ -646,7 +645,7 @@ mod tests {
         ]);
         let mut client = RailwayClient::new("railway-token".into(), config(false)).expect("client");
         client.source_check = Some(std::sync::Arc::new(|| {
-            Err(LpmError::Script("env.source_changed".into()))
+            Err(LpmError::Env("env.source_changed".into()))
         }));
         let client = super::super::PlatformClient::Railway(client);
         let error = client
@@ -705,7 +704,7 @@ mod tests {
             if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 Ok(())
             } else {
-                Err(LpmError::Script("env.source_changed".into()))
+                Err(LpmError::Env("env.source_changed".into()))
             }
         }));
         let result = client

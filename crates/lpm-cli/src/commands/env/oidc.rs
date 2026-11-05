@@ -65,20 +65,20 @@ fn resolve_oidc_policy_id(explicit: Option<&str>) -> Result<String, LpmError> {
         match std::env::var(OIDC_POLICY_ID_ENV) {
             Ok(value) => value,
             Err(std::env::VarError::NotPresent) => {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "OIDC policy selection is required. Set {OIDC_POLICY_ID_ENV} to the policy ID \
                      returned by `lpm env oidc allow`, or pass --policy-id=<uuid>."
                 )));
             }
             Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "{OIDC_POLICY_ID_ENV} must contain a UTF-8 server-issued UUID."
                 )));
             }
         }
     };
     normalize_oidc_policy_id(&value).ok_or_else(|| {
-        LpmError::Script(format!(
+        LpmError::Env(format!(
             "OIDC policy ID must be a server-issued UUID. Check {OIDC_POLICY_ID_ENV}, \
              --policy-id, or run `lpm env oidc list`."
         ))
@@ -90,7 +90,7 @@ fn policy_id_from_response(result: &serde_json::Value) -> Result<String, LpmErro
         .as_str()
         .and_then(normalize_oidc_policy_id)
         .ok_or_else(|| {
-            LpmError::Script(
+            LpmError::Env(
                 "the server did not return a valid OIDC policy ID. The policy may have been \
                  created, but CI cannot select it safely. Run `lpm env oidc list` to recover \
                  the policy ID before enabling CI pulls."
@@ -107,7 +107,7 @@ pub(super) async fn vars_oidc(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if args.is_empty() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "usage: lpm env oidc allow --allow-server-decryption --provider=github --repo=<owner/repo> \
              --workflow=.github/workflows/<file>.yml --branch=<branch> --env=<env> \
              [--events=push,workflow_dispatch] [--allow-forks]"
@@ -127,7 +127,7 @@ pub(super) async fn vars_oidc(
         "allow" => vars_oidc_allow(client, &args[1..], project_dir, json_output).await,
         "list" => vars_oidc_list(client, &args[1..], project_dir, json_output).await,
         "disable" => organization::disable(client, &args[1..], project_dir, json_output).await,
-        unknown => Err(LpmError::Script(format!(
+        unknown => Err(LpmError::Env(format!(
             "unknown oidc action: '{unknown}'. Available: allow, list, disable"
         ))),
     }
@@ -179,7 +179,7 @@ pub(super) async fn vars_oidc_allow(
         if let Some(v) = arg.strip_prefix("--org=") {
             organization::validate_selector(v)?;
             if org.replace(v).is_some() {
-                return Err(LpmError::Script("supply --org only once".into()));
+                return Err(LpmError::Env("supply --org only once".into()));
             }
         } else if *arg == "--allow-server-decryption" {
             allow_server_decryption = true;
@@ -203,18 +203,18 @@ pub(super) async fn vars_oidc_allow(
         } else if *arg == "--allow-forks" {
             allow_forks = true;
         } else {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "unknown OIDC policy argument: {arg}"
             )));
         }
     }
 
     if !allow_server_decryption {
-        return Err(LpmError::Script("CI access requires --allow-server-decryption. This shares a key for the current project with the server so authorized CI jobs can read its environments.".into()));
+        return Err(LpmError::Env("CI access requires --allow-server-decryption. This shares a key for the current project with the server so authorized CI jobs can read its environments.".into()));
     }
 
     if envs.is_empty() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "missing --env flag; name at least one environment this policy may access".into(),
         ));
     }
@@ -222,12 +222,12 @@ pub(super) async fn vars_oidc_allow(
     let (subject, identity_label, repository_id) = match provider {
         "github" => {
             if project_id.is_some() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "--project-id applies only to GitLab OIDC policies".into(),
                 ));
             }
             let repo = repo.ok_or_else(|| {
-                LpmError::Script(
+                LpmError::Env(
                     "missing --repo flag. Usage: lpm env oidc allow --allow-server-decryption --provider=github \
                      --repo=owner/repo --workflow=.github/workflows/deploy.yml \
                      --branch=main --env=production"
@@ -236,7 +236,7 @@ pub(super) async fn vars_oidc_allow(
             })?;
             validate_repository(repo, "--repo")?;
             if workflows.is_empty() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "missing --workflow flag. GitHub policies require \
                      --workflow=.github/workflows/<file>.yml"
                         .into(),
@@ -247,7 +247,7 @@ pub(super) async fn vars_oidc_allow(
                     && !workflow[".github/workflows/".len()..].contains('/')
                     && (workflow.ends_with(".yml") || workflow.ends_with(".yaml"));
                 if !valid {
-                    return Err(LpmError::Script(format!(
+                    return Err(LpmError::Env(format!(
                         "workflow path '{workflow}' must be of the form \
                          `.github/workflows/<file>.yml`"
                     )));
@@ -270,14 +270,14 @@ pub(super) async fn vars_oidc_allow(
                 || events_supplied
                 || allow_forks
             {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "GitLab OIDC policies do not accept GitHub-only --repo, --repository-id, \
                      --workflow, --events, or --allow-forks flags"
                         .into(),
                 ));
             }
             let project_id = project_id.ok_or_else(|| {
-                LpmError::Script(
+                LpmError::Env(
                     "missing --project-id flag. GitLab policies require the numeric project ID"
                         .into(),
                 )
@@ -286,7 +286,7 @@ pub(super) async fn vars_oidc_allow(
                 || project_id.is_empty()
                 || !project_id.bytes().all(|byte| byte.is_ascii_digit())
             {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "--project-id must be a positive numeric GitLab project ID".into(),
                 ));
             }
@@ -297,14 +297,14 @@ pub(super) async fn vars_oidc_allow(
             )
         }
         unknown => {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "unsupported OIDC provider '{unknown}'; available providers: github, gitlab"
             )));
         }
     };
 
     if !envs.is_empty() {
-        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
         let empty = std::collections::HashMap::new();
         let env_map = config.as_ref().map_or(&empty, |c| &c.env);
         let environments = config.as_ref().and_then(|c| c.environments.as_ref());
@@ -339,16 +339,16 @@ pub(super) async fn vars_oidc_allow(
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
     let expected_principal_id = if let Some(org) = org {
         manifest.vault.org_sync_principal_for_registry(org, registry_client.base_url())
-            .map_err(LpmError::Script)?.ok_or_else(|| LpmError::Script("this checkout has no authenticated organization binding; share or pull the env project before configuring OIDC".into()))?
+            .map_err(LpmError::Env)?.ok_or_else(|| LpmError::Env("this checkout has no authenticated organization binding; share or pull the env project before configuring OIDC".into()))?
     } else {
         manifest.vault.personal_expected_principal_for_registry(registry_client.base_url())
-            .map_err(LpmError::Script)?.ok_or_else(|| LpmError::Script("this checkout has no authenticated personal binding; push or pull the env project before configuring OIDC".into()))?
+            .map_err(LpmError::Env)?.ok_or_else(|| LpmError::Env("this checkout has no authenticated personal binding; push or pull the env project before configuring OIDC".into()))?
     };
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
-        .ok_or_else(|| LpmError::Script("no env project configured".into()))?
+        .map_err(LpmError::Env)?
+        .ok_or_else(|| LpmError::Env("no env project configured".into()))?
         .to_owned();
     let mut policy_body = serde_json::json!({
         "vaultId": vault_id,
@@ -379,7 +379,7 @@ pub(super) async fn vars_oidc_allow(
                         &registry_url,
                         policy_body["expectedPrincipalId"].as_str(),
                     )
-                    .map_err(LpmError::Script)?;
+                    .map_err(LpmError::Env)?;
                 }
                 if org.is_some() {
                     create_oidc_policy(&registry_url, &auth_token, &policy_body).await
@@ -394,7 +394,7 @@ pub(super) async fn vars_oidc_allow(
                         &registry_url,
                         Some(principal),
                     )
-                    .map_err(LpmError::Script)?;
+                    .map_err(LpmError::Env)?;
                     let mut policy = policy_body.clone();
                     if let Some(fields) = policy.as_object_mut() {
                         fields.remove("expectedPrincipalId");
@@ -411,7 +411,7 @@ pub(super) async fn vars_oidc_allow(
                         if error.is_unauthorized() {
                             LpmError::AuthRequired
                         } else {
-                            LpmError::Script(error.to_string())
+                            LpmError::Env(error.to_string())
                         }
                     })
                 }
@@ -516,7 +516,7 @@ async fn resolve_github_repository_identity(
         } else {
             "For a private repository, set GITHUB_TOKEN or GH_TOKEN, or pass --repository-id=<numeric-id>."
         };
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "GitHub repository ID lookup for {repository} failed with HTTP {status}. {remediation}"
         )));
     }
@@ -527,7 +527,7 @@ async fn resolve_github_repository_identity(
     validate_repository_id(&repository_id)?;
     validate_repository(&response_identity.full_name, "GitHub repository name")?;
     if !response_identity.full_name.eq_ignore_ascii_case(repository) {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "GitHub returned repository {} while {repository} was requested",
             response_identity.full_name
         )));
@@ -548,7 +548,7 @@ fn github_api_token() -> Option<String> {
 }
 
 fn oidc_escrow_setup_error(step: &str, error: &str) -> LpmError {
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "OIDC policy may already have been created, but CI pulls are not ready because escrow \
          setup failed while {step}: {error}. Fix the escrow problem, then rerun the same \
          `lpm env oidc allow` command; rerunning safely updates the existing policy."
@@ -565,7 +565,7 @@ async fn parse_authenticated_oidc_response(
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(LpmError::AuthRequired);
         }
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             body["error"].as_str().unwrap_or("failed").to_string(),
         ));
     }
@@ -634,7 +634,7 @@ pub(super) async fn vars_oidc_list(
 ) -> Result<(), LpmError> {
     let org = organization::selector(args)?;
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
-        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+        .ok_or_else(|| LpmError::Env("no vault configured".into()))?;
     let result =
         super::auth::execute_lpm_with_bearer(registry_client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
@@ -643,7 +643,7 @@ pub(super) async fn vars_oidc_list(
         .await?;
     let policies = result["policies"]
         .as_array()
-        .ok_or_else(|| LpmError::Script("invalid OIDC policy list response".into()))?;
+        .ok_or_else(|| LpmError::Env("invalid OIDC policy list response".into()))?;
     let policy_ids = policies
         .iter()
         .map(policy_id_from_response_for_list)
@@ -735,7 +735,7 @@ fn policy_id_from_response_for_list(policy: &serde_json::Value) -> Result<String
         .as_str()
         .and_then(normalize_oidc_policy_id)
         .ok_or_else(|| {
-            LpmError::Script(
+            LpmError::Env(
                 "the server returned an OIDC policy without a valid policy ID; rerun the command after the Registry is updated"
                     .into(),
             )
@@ -770,14 +770,12 @@ pub(super) async fn vars_oidc_pull(
             output_file = Some(v);
         } else if let Some(v) = arg.strip_prefix("--policy-id=") {
             if explicit_policy_id.replace(v).is_some() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "--policy-id may be supplied only once".into(),
                 ));
             }
         } else {
-            return Err(LpmError::Script(format!(
-                "unknown OIDC pull argument: {arg}"
-            )));
+            return Err(LpmError::Env(format!("unknown OIDC pull argument: {arg}")));
         }
     }
     let policy_id = resolve_oidc_policy_id(explicit_policy_id)?;
@@ -813,7 +811,7 @@ pub(super) async fn vars_oidc_pull(
         let error = body["error"].as_str().unwrap_or("OIDC exchange failed");
         let hint = body["hint"].as_str().unwrap_or("");
         let code = body["code"].as_str().unwrap_or("");
-        return Err(LpmError::Script(build_oidc_pull_error_message(
+        return Err(LpmError::Env(build_oidc_pull_error_message(
             error, hint, code,
         )));
     }
@@ -823,19 +821,19 @@ pub(super) async fn vars_oidc_pull(
 
     let lpm_token = exchange_result["token"]
         .as_str()
-        .ok_or_else(|| LpmError::Script("missing token in OIDC response".into()))?;
+        .ok_or_else(|| LpmError::Env("missing token in OIDC response".into()))?;
 
     // Pull via CI escrow — server decrypts and returns plaintext secrets
     let (vars, env_name) = lpm_vault::sync::ci_pull(&registry_url, lpm_token, &vault_id, env_mode)
         .await
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
 
     if let Some(file) = output_file {
         let content = format_oidc_dotenv(&vars, &env_name);
         let mut keys: Vec<&String> = vars.keys().collect();
         keys.sort();
         let destination = std::path::absolute(file)
-            .map_err(|e| LpmError::Script(format!("failed to resolve {file}: {e}")))?;
+            .map_err(|e| LpmError::Env(format!("failed to resolve {file}: {e}")))?;
         let write = lpm_common::project_secret::write_secret_file(
             project_dir,
             &destination,
@@ -904,7 +902,7 @@ fn resolve_oidc_pull_vault_id(project_dir: &std::path::Path) -> Result<String, L
         let vault_id = value.trim();
         if !vault_id.is_empty() {
             if !lpm_vault::vault_id::is_safe_vault_id(vault_id) {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "LPM_VAULT_ID is unsafe; use a vault ID without path separators, control \
                      characters, or path-traversal components."
                         .into(),
@@ -915,7 +913,7 @@ fn resolve_oidc_pull_vault_id(project_dir: &std::path::Path) -> Result<String, L
     }
 
     lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
-        LpmError::Script(
+        LpmError::Env(
             "no vault configured. Set a non-empty LPM_VAULT_ID or add `vault` to lpm.json".into(),
         )
     })
@@ -930,7 +928,7 @@ fn resolve_oidc_pull_vault_id(project_dir: &std::path::Path) -> Result<String, L
 async fn get_ci_oidc_token() -> Result<String, LpmError> {
     crate::oidc::resolve_registry_exchange_jwt()
         .await
-        .map_err(|e| LpmError::Script(format!("{e}")))
+        .map_err(|e| LpmError::Env(format!("{e}")))
 }
 
 /// Map a server-side error response from `POST /api/vault/oidc` to a

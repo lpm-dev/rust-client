@@ -36,7 +36,7 @@ pub(super) async fn read_capped_platform_body_with_budget(
     let declared_length = declared.and_then(|length| usize::try_from(length).ok());
     if declared_length.is_some_and(|declared| declared > budget.remaining) {
         let declared = declared.unwrap_or(u64::MAX);
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "platform response too large: declared length {declared} exceeds the remaining {}-byte pagination budget",
             budget.remaining,
         )));
@@ -45,9 +45,9 @@ pub(super) async fn read_capped_platform_body_with_budget(
     let mut buf: Vec<u8> = Vec::with_capacity(initial_capacity);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| LpmError::Script(format!("response read error: {e}")))?;
+        let chunk = chunk.map_err(|e| LpmError::Env(format!("response read error: {e}")))?;
         if buf.len().saturating_add(chunk.len()) > budget.remaining {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "platform response too large: streamed body exceeded the remaining {}-byte pagination budget",
                 budget.remaining,
             )));
@@ -68,7 +68,7 @@ pub(super) async fn parse_capped_platform_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, LpmError> {
     let buf = read_capped_platform_body(response).await?;
-    serde_json::from_slice(&buf).map_err(|e| LpmError::Script(format!("parse error: {e}")))
+    serde_json::from_slice(&buf).map_err(|e| LpmError::Env(format!("parse error: {e}")))
 }
 
 /// Parse a capped platform response as JSON, falling back to a stub

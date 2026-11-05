@@ -85,17 +85,17 @@ impl PlatformEnvelopeContext {
         expected_principal_id: Option<&str>,
     ) -> Result<(), LpmError> {
         if self.request_nonce != expected_nonce {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform response does not match the request nonce".into(),
             ));
         }
         if self.vault_id != expected_vault_id {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform response is bound to a different vault".into(),
             ));
         }
         if self.platform.as_deref() != expected_platform {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform response is bound to a different platform selector".into(),
             ));
         }
@@ -104,7 +104,7 @@ impl PlatformEnvelopeContext {
             || self.principal_id.chars().any(char::is_control)
             || expected_principal_id.is_some_and(|expected| expected != self.principal_id)
         {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform response is bound to a different principal".into(),
             ));
         }
@@ -112,7 +112,7 @@ impl PlatformEnvelopeContext {
             PlatformRequestScope::Personal
                 if self.scope != "personal" || self.organization_slug.is_some() =>
             {
-                Err(LpmError::Script(
+                Err(LpmError::Env(
                     "platform response has a mismatched personal scope".into(),
                 ))
             }
@@ -120,7 +120,7 @@ impl PlatformEnvelopeContext {
                 if self.scope != "organization"
                     || self.organization_slug.as_deref() != Some(slug) =>
             {
-                Err(LpmError::Script(
+                Err(LpmError::Env(
                     "platform response has a mismatched organization scope".into(),
                 ))
             }
@@ -142,7 +142,7 @@ struct PlatformConnectResponse {
 impl PlatformConnectResponse {
     fn validate(&self) -> Result<(), LpmError> {
         if !matches!(self.status.as_str(), "created" | "updated") {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform connect response has an unexpected status".into(),
             ));
         }
@@ -150,7 +150,7 @@ impl PlatformConnectResponse {
             || self.connection_id.len() > 128
             || self.connection_id.chars().any(char::is_control)
         {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform connect response omitted a valid connection ID".into(),
             ));
         }
@@ -169,7 +169,7 @@ struct PlatformCredentialsResponse {
 impl PlatformCredentialsResponse {
     fn validate_connections(&self, expected_platform: Option<&str>) -> Result<(), LpmError> {
         if expected_platform.is_some() && self.connections.len() != 1 {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform response did not contain exactly one requested connection".into(),
             ));
         }
@@ -181,7 +181,7 @@ impl PlatformCredentialsResponse {
                 || connection.id.chars().any(char::is_control)
                 || !ids.insert(connection.id.as_str())
             {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "platform response contained an invalid connection ID".into(),
                 ));
             }
@@ -189,7 +189,7 @@ impl PlatformCredentialsResponse {
                 || !platforms.insert(connection.platform.as_str())
                 || expected_platform.is_some_and(|expected| expected != connection.platform)
             {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "platform response contained a mismatched connection".into(),
                 ));
             }
@@ -226,7 +226,7 @@ impl PlatformAuditResponse {
             || self.status != "recorded"
             || self.connection_id != expected_connection_id
         {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform audit response does not match the recorded operation".into(),
             ));
         }
@@ -615,10 +615,10 @@ impl VercelClient {
                 return Err(vercel_api_error("list", status, &body));
             }
             let data: VercelListResponse = serde_json::from_slice(&body)
-                .map_err(|error| LpmError::Script(format!("invalid Vercel response: {error}")))?;
+                .map_err(|error| LpmError::Env(format!("invalid Vercel response: {error}")))?;
             received_items = received_items.saturating_add(data.envs.len());
             if received_items > 10_000 {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "Vercel returned more than 10000 env values; refusing an unbounded sync".into(),
                 ));
             }
@@ -628,7 +628,7 @@ impl VercelClient {
                     continue;
                 }
                 if variable.target.is_empty() {
-                    return Err(LpmError::Script(format!(
+                    return Err(LpmError::Env(format!(
                         "Vercel value {} has no deployment target; refusing an ambiguous sync",
                         variable.key
                     )));
@@ -645,14 +645,14 @@ impl VercelClient {
                     .iter()
                     .all(|target| selected_targets.contains(target))
                 {
-                    return Err(LpmError::Script(format!(
+                    return Err(LpmError::Env(format!(
                         "Vercel value {} also applies outside the configured targets; split the variable by target before syncing",
                         variable.key
                     )));
                 }
                 let key = variable.key;
                 if variables.contains_key(&key) {
-                    return Err(LpmError::Script(format!(
+                    return Err(LpmError::Env(format!(
                         "Vercel returned multiple values named {key} for the configured targets; consolidate them before syncing"
                     )));
                 }
@@ -676,13 +676,13 @@ impl VercelClient {
                 return Ok(variables);
             };
             if !seen_cursors.insert(next_cursor.clone()) {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "Vercel repeated an env pagination cursor; refusing a pagination cycle".into(),
                 ));
             }
             cursor = Some(next_cursor);
             if page == 19 {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "Vercel returned more than 20 pages of env values; refusing an unbounded sync"
                         .into(),
                 ));
@@ -703,7 +703,7 @@ impl VercelClient {
         for key in &diff.added {
             let value = local
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing local value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             mutations.push(VercelMutation::Add {
                 key: key.clone(),
@@ -714,16 +714,16 @@ impl VercelClient {
         for key in &diff.changed {
             let value = local
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing local value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             let variable = remote
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing Vercel value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing Vercel value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             self.assert_mutation_targets(key, variable)
                 .map_err(PlatformApplyError::untracked)?;
             let VariableScope::Vercel { targets } = &variable.scope else {
-                return Err(PlatformApplyError::untracked(LpmError::Script(format!(
+                return Err(PlatformApplyError::untracked(LpmError::Env(format!(
                     "Vercel value {key} does not match the configured deployment targets"
                 ))));
             };
@@ -737,7 +737,7 @@ impl VercelClient {
         for key in &diff.removed {
             let variable = remote
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing Vercel value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing Vercel value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             self.assert_mutation_targets(key, variable)
                 .map_err(PlatformApplyError::untracked)?;
@@ -763,7 +763,7 @@ impl VercelClient {
     ) -> Result<(), LpmError> {
         let selected_targets = self.selected_targets().into_iter().collect::<HashSet<_>>();
         let VariableScope::Vercel { targets } = &variable.scope else {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "Vercel value {key} does not match the configured deployment targets"
             )));
         };
@@ -772,7 +772,7 @@ impl VercelClient {
                 .iter()
                 .all(|target| selected_targets.contains(target))
         {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "Vercel value {key} does not match the configured deployment targets"
             )));
         }
@@ -902,7 +902,9 @@ fn variable_has_targets(variable: &PlatformVariable, expected: &[String]) -> boo
 fn append_platform_error_context(error: LpmError, context: String) -> LpmError {
     match error {
         LpmError::Network(message) => LpmError::Network(format!("{message}; {context}")),
-        LpmError::Script(message) => LpmError::Script(format!("{message}; {context}")),
+        LpmError::Env(message) | LpmError::Script(message) => {
+            LpmError::Env(format!("{message}; {context}"))
+        }
         other => other,
     }
 }
@@ -922,7 +924,7 @@ impl PlatformClient {
                 let config = serde_json::from_value::<VercelConnectionConfig>(
                     connection.connection_config.clone(),
                 )
-                .map_err(|error| LpmError::Script(format!("invalid Vercel connection: {error}")))?;
+                .map_err(|error| LpmError::Env(format!("invalid Vercel connection: {error}")))?;
                 Ok(Self::Vercel(VercelClient::new(
                     connection.token.clone(),
                     config,
@@ -932,9 +934,7 @@ impl PlatformClient {
                 let config = serde_json::from_value::<coolify::CoolifyConnectionConfig>(
                     connection.connection_config.clone(),
                 )
-                .map_err(|error| {
-                    LpmError::Script(format!("invalid Coolify connection: {error}"))
-                })?;
+                .map_err(|error| LpmError::Env(format!("invalid Coolify connection: {error}")))?;
                 Ok(Self::Coolify(coolify::CoolifyClient::new(
                     connection.token.clone(),
                     config,
@@ -944,7 +944,7 @@ impl PlatformClient {
                 let config = serde_json::from_value::<fly::FlyConnectionConfig>(
                     connection.connection_config.clone(),
                 )
-                .map_err(|error| LpmError::Script(format!("invalid Fly.io connection: {error}")))?;
+                .map_err(|error| LpmError::Env(format!("invalid Fly.io connection: {error}")))?;
                 Ok(Self::Fly(fly::FlyClient::new(
                     connection.token.clone(),
                     config,
@@ -956,7 +956,7 @@ impl PlatformClient {
                         connection.connection_config.clone(),
                     )
                     .map_err(|error| {
-                        LpmError::Script(format!("invalid GitHub Actions connection: {error}"))
+                        LpmError::Env(format!("invalid GitHub Actions connection: {error}"))
                     })?;
                 Ok(Self::GitHubActions(
                     github_actions::GitHubActionsClient::new(connection.token.clone(), config)?,
@@ -966,15 +966,13 @@ impl PlatformClient {
                 let config = serde_json::from_value::<railway::RailwayConnectionConfig>(
                     connection.connection_config.clone(),
                 )
-                .map_err(|error| {
-                    LpmError::Script(format!("invalid Railway connection: {error}"))
-                })?;
+                .map_err(|error| LpmError::Env(format!("invalid Railway connection: {error}")))?;
                 Ok(Self::Railway(railway::RailwayClient::new(
                     connection.token.clone(),
                     config,
                 )?))
             }
-            platform => Err(LpmError::Script(format!(
+            platform => Err(LpmError::Env(format!(
                 "unsupported env platform '{platform}'; use vercel, coolify, fly, railway, or github-actions"
             ))),
         }
@@ -1052,7 +1050,7 @@ impl PlatformClient {
                     .apply(diff, local.readable(), &remote.readable, clean)
                     .await
             }
-            _ => Err(PlatformApplyError::untracked(LpmError::Script(
+            _ => Err(PlatformApplyError::untracked(LpmError::Env(
                 "platform local-value classification is inconsistent".into(),
             ))),
         }
@@ -1109,10 +1107,10 @@ fn vercel_api_url() -> Result<String, LpmError> {
     }
     let candidate = candidate.to_string_lossy();
     let parsed = reqwest::Url::parse(&candidate)
-        .map_err(|error| LpmError::Script(format!("invalid acceptance Vercel URL: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid acceptance Vercel URL: {error}")))?;
     let host = parsed.host_str().unwrap_or_default();
     if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Vercel URL must use a loopback host".into(),
         ));
     }
@@ -1272,7 +1270,7 @@ async fn read_signed_lpm_response(
             key_id.as_deref(),
             signature.as_deref(),
         );
-        verification.map_err(|error| LpmError::Script(error.to_string()))?;
+        verification.map_err(|error| LpmError::Env(error.to_string()))?;
     }
     Ok((status, body))
 }
@@ -1280,7 +1278,7 @@ async fn read_signed_lpm_response(
 fn generate_platform_request_nonce() -> Result<String, LpmError> {
     let mut nonce = [0u8; PLATFORM_REQUEST_NONCE_BYTES];
     rand::rng().try_fill_bytes(&mut nonce).map_err(|error| {
-        LpmError::Script(format!(
+        LpmError::Env(format!(
             "failed to generate platform request nonce: {error}"
         ))
     })?;
@@ -1295,7 +1293,7 @@ fn response_error(status: reqwest::StatusCode, body: &[u8], fallback: &str) -> L
         .ok()
         .and_then(|value| value["error"].as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{fallback} (HTTP {status})"));
-    LpmError::Script(message)
+    LpmError::Env(message)
 }
 
 async fn fetch_connections_with_recovery(
@@ -1392,7 +1390,7 @@ async fn save_platform_connection(
         return Err(response_error(status, &body, "connection failed"));
     }
     let response: PlatformConnectResponse = serde_json::from_slice(&body)
-        .map_err(|error| LpmError::Script(format!("invalid LPM response: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid LPM response: {error}")))?;
     response.context.validate(
         &request_nonce,
         vault_id,
@@ -1413,17 +1411,17 @@ async fn record_platform_audit_with_recovery(
     let vault_id = body
         .get("vaultId")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LpmError::Script("platform audit omitted the vault ID".into()))?
+        .ok_or_else(|| LpmError::Env("platform audit omitted the vault ID".into()))?
         .to_owned();
     let platform = body
         .get("platform")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LpmError::Script("platform audit omitted the platform".into()))?
+        .ok_or_else(|| LpmError::Env("platform audit omitted the platform".into()))?
         .to_owned();
     let operation = body
         .get("operation")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LpmError::Script("platform audit omitted the operation".into()))?
+        .ok_or_else(|| LpmError::Env("platform audit omitted the operation".into()))?
         .to_owned();
     if let Some(org_slug) = org_slug {
         body["org"] = org_slug.into();
@@ -1464,7 +1462,7 @@ fn vercel_api_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -
     } else {
         format!(": {}", detail.chars().take(300).collect::<String>())
     };
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "Vercel {operation} failed with HTTP {status}{suffix}"
     ))
 }
@@ -1511,7 +1509,7 @@ async fn fetch_connections(
         ));
     }
     let data: PlatformCredentialsResponse = serde_json::from_slice(&body)
-        .map_err(|error| LpmError::Script(format!("invalid LPM response: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid LPM response: {error}")))?;
     data.context.validate(
         &request_nonce,
         vault_id,
@@ -1566,7 +1564,7 @@ async fn fetch_platform_context(
         ));
     }
     let response: PlatformCredentialsResponse = serde_json::from_slice(&body)
-        .map_err(|error| LpmError::Script(format!("invalid LPM response: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid LPM response: {error}")))?;
     response.context.validate(
         &request_nonce,
         vault_id,
@@ -1575,7 +1573,7 @@ async fn fetch_platform_context(
         expected_principal_id,
     )?;
     if !response.connections.is_empty() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "platform identity response unexpectedly included credentials".into(),
         ));
     }
@@ -1592,11 +1590,11 @@ async fn record_platform_audit(
         .get("connectionId")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 128)
-        .ok_or_else(|| LpmError::Script("platform audit omitted the connection ID".into()))?
+        .ok_or_else(|| LpmError::Env("platform audit omitted the connection ID".into()))?
         .to_owned();
     let expected_principal_id = expected
         .principal_id
-        .ok_or_else(|| LpmError::Script("platform audit omitted the captured principal".into()))?;
+        .ok_or_else(|| LpmError::Env("platform audit omitted the captured principal".into()))?;
     body["expectedPrincipalId"] = expected_principal_id.into();
     let request_nonce = generate_platform_request_nonce()?;
     let client = lpm_http::client_builder()
@@ -1621,7 +1619,7 @@ async fn record_platform_audit(
         return Err(response_error(status, &body, "failed to record env audit"));
     }
     let response: PlatformAuditResponse = serde_json::from_slice(&body)
-        .map_err(|error| LpmError::Script(format!("invalid LPM response: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid LPM response: {error}")))?;
     response.context.validate(
         &request_nonce,
         expected.vault_id,
@@ -1645,32 +1643,32 @@ fn validate_platform_arguments(
         let argument = args[index];
         if boolean_flags.contains(&argument) {
             if !seen.insert(argument) {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             }
             index += 1;
             continue;
         }
         if let Some((flag, value)) = argument.split_once('=') {
             if !value_flags.contains(&flag) || value.is_empty() || !seen.insert(flag) {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             }
             index += 1;
             continue;
         }
         if value_flags.contains(&argument) {
             if !seen.insert(argument) {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             }
             let Some(value) = args.get(index + 1) else {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             };
             if value.starts_with('-') {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             }
             index += 2;
             continue;
         }
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "unknown platform argument: {argument}. {usage}"
         )));
     }
@@ -1679,7 +1677,7 @@ fn validate_platform_arguments(
 
 fn reject_duplicate_confirmation_aliases(args: &[&str], usage: &str) -> Result<(), LpmError> {
     if args.contains(&"--yes") && args.contains(&"-y") {
-        return Err(LpmError::Script(usage.into()));
+        return Err(LpmError::Env(usage.into()));
     }
     Ok(())
 }
@@ -1718,7 +1716,7 @@ fn validate_platform_connect_arguments(
             &["--project", "--environment", "--service"],
             &["--project-token"],
         ),
-        _ => return Err(LpmError::Script(usage.into())),
+        _ => return Err(LpmError::Env(usage.into())),
     };
     let mut values = Vec::with_capacity(common.len() + platform_values.len());
     values.extend_from_slice(&common);
@@ -1750,12 +1748,12 @@ fn parse_platform_org<'a>(args: &'a [&str], usage: &str) -> Result<Option<&'a st
             index += 1;
             let slug = super::remote::parse_org_slug_value(args.get(index).copied(), usage)?;
             if organization.replace(slug).is_some() {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             }
         } else if let Some(slug) = argument.strip_prefix("--org=") {
             let slug = super::remote::parse_org_slug_value(Some(slug), usage)?;
             if organization.replace(slug).is_some() {
-                return Err(LpmError::Script(usage.into()));
+                return Err(LpmError::Env(usage.into()));
             }
         }
         index += 1;
@@ -1788,15 +1786,15 @@ fn expected_platform_principal_from_manifest(
         manifest
             .vault
             .org_sync_principal_for_registry(slug, registry_url)
-            .map_err(LpmError::Script)?
+            .map_err(LpmError::Env)?
     } else {
         manifest
             .vault
             .personal_expected_principal_for_registry(registry_url)
-            .map_err(LpmError::Script)?
+            .map_err(LpmError::Env)?
     };
     if org_slug.is_some() && principal.is_none() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "this checkout has no authenticated binding for that organization; pull or share the organization env project first"
                 .into(),
         ));
@@ -1810,7 +1808,7 @@ fn required_platform_principal(
     org_slug: Option<&str>,
 ) -> Result<String, LpmError> {
     expected_platform_principal(project_dir, registry_url, org_slug)?.ok_or_else(|| {
-        LpmError::Script(
+        LpmError::Env(
             "this checkout has no authenticated personal platform binding; reconnect the platform before using stored credentials"
                 .into(),
         )
@@ -1824,10 +1822,10 @@ fn validate_connect_field(
     required: bool,
 ) -> Result<(), LpmError> {
     if required && value.is_empty() {
-        return Err(LpmError::Script(format!("{flag} cannot be empty")));
+        return Err(LpmError::Env(format!("{flag} cannot be empty")));
     }
     if value.chars().count() > max_chars {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "{flag} must be at most {max_chars} characters"
         )));
     }
@@ -1838,7 +1836,7 @@ fn resolve_env_name(
     project_dir: &std::path::Path,
     input: Option<&str>,
 ) -> Result<Option<String>, LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
     resolve_env_name_with_config(input, config.as_ref())
 }
 
@@ -1853,7 +1851,7 @@ fn resolve_env_name_with_config(
     let env_map = config.map_or(&empty, |value| &value.env);
     let environments = config.and_then(|value| value.environments.as_ref());
     let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
-        .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid environment name: {error}")))?;
     Ok(Some(resolved.canonical))
 }
 
@@ -1878,7 +1876,7 @@ fn parse_targets(value: Option<&str>) -> Result<Option<Vec<String>>, LpmError> {
     let mut targets = Vec::new();
     for target in value.split(',').filter(|target| !target.is_empty()) {
         if !matches!(target, "production" | "preview" | "development") {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "unsupported Vercel target '{target}'; use production, preview, or development"
             )));
         }
@@ -1887,7 +1885,7 @@ fn parse_targets(value: Option<&str>) -> Result<Option<Vec<String>>, LpmError> {
         }
     }
     if targets.is_empty() {
-        return Err(LpmError::Script("--target cannot be empty".into()));
+        return Err(LpmError::Env("--target cannot be empty".into()));
     }
     Ok(Some(targets))
 }
@@ -1901,7 +1899,7 @@ pub(super) async fn vars_connect(
     const USAGE: &str =
         "usage: lpm env connect <platform> [platform options] [--org <org-slug>] [--token=<token>]";
     let platform = args.first().copied().ok_or_else(|| {
-        LpmError::Script(
+        LpmError::Env(
             "usage: lpm env connect <vercel|coolify|fly|railway|github-actions> [platform options] [--token=<token>]"
                 .into(),
         )
@@ -1916,7 +1914,7 @@ pub(super) async fn vars_connect(
         "github-actions" => "GitHub Actions",
         "railway" => "Railway",
         _ => {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "unsupported env platform '{platform}'; use vercel, coolify, fly, railway, or github-actions"
             )));
         }
@@ -1927,10 +1925,10 @@ pub(super) async fn vars_connect(
     } else {
         cliclack::password(format!("Paste {display_name} API token"))
             .interact()
-            .map_prompt_err(|error| LpmError::Script(format!("prompt failed: {error}")))?
+            .map_prompt_err(|error| LpmError::Env(format!("prompt failed: {error}")))?
     };
     if platform_token.is_empty() {
-        return Err(LpmError::Script("--token cannot be empty".into()));
+        return Err(LpmError::Env("--token cannot be empty".into()));
     }
     validate_connect_field("--token", &platform_token, PLATFORM_TOKEN_MAX_CHARS, true)?;
     if let Some(label) = label {
@@ -1941,7 +1939,7 @@ pub(super) async fn vars_connect(
     }
 
     let vault_id =
-        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
+        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Env)?;
     let expected_principal_id =
         expected_platform_principal(project_dir, registry_client.base_url(), org_slug)?;
     let platform_context = fetch_platform_context_with_recovery(
@@ -1958,7 +1956,7 @@ pub(super) async fn vars_connect(
         "vercel" => {
             let project_id = parse_flag(args, "--project")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --project flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --project flag".into()))?;
             validate_connect_field("--project", project_id, VERCEL_ID_MAX_CHARS, true)?;
             let team_id = parse_flag(args, "--team")
                 .map(|value| {
@@ -1977,7 +1975,7 @@ pub(super) async fn vars_connect(
             (
                 client,
                 serde_json::to_value(config).map_err(|error| {
-                    LpmError::Script(format!("failed to serialize Vercel connection: {error}"))
+                    LpmError::Env(format!("failed to serialize Vercel connection: {error}"))
                 })?,
                 format!("project: {project_id}"),
             )
@@ -1985,11 +1983,11 @@ pub(super) async fn vars_connect(
         "coolify" => {
             let url = parse_flag(args, "--url")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --url flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --url flag".into()))?;
             validate_connect_field("--url", url, COOLIFY_URL_MAX_CHARS, true)?;
             let application_id = parse_flag(args, "--application")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --application flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --application flag".into()))?;
             validate_connect_field(
                 "--application",
                 application_id,
@@ -2004,7 +2002,7 @@ pub(super) async fn vars_connect(
             };
             let coolify_client = coolify::CoolifyClient::new(platform_token.clone(), config)?;
             let config = serde_json::to_value(coolify_client.config()).map_err(|error| {
-                LpmError::Script(format!("failed to serialize Coolify connection: {error}"))
+                LpmError::Env(format!("failed to serialize Coolify connection: {error}"))
             })?;
             let client = PlatformClient::Coolify(coolify_client);
             (client, config, format!("application: {application_id}"))
@@ -2012,12 +2010,12 @@ pub(super) async fn vars_connect(
         "fly" => {
             let app = parse_flag(args, "--app")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --app flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --app flag".into()))?;
             fly::validate_app_name(app)?;
             let fly_client =
                 fly::FlyClient::discover_config(platform_token.clone(), app, linked_env).await?;
             let config = serde_json::to_value(fly_client.config()).map_err(|error| {
-                LpmError::Script(format!("failed to serialize Fly.io connection: {error}"))
+                LpmError::Env(format!("failed to serialize Fly.io connection: {error}"))
             })?;
             let target = format!(
                 "app: {}, organization: {}",
@@ -2029,7 +2027,7 @@ pub(super) async fn vars_connect(
         "github-actions" => {
             let repository = parse_flag(args, "--repository")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --repository flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --repository flag".into()))?;
             let environment = parse_flag(args, "--environment").map(str::to_owned);
             let github_client = github_actions::GitHubActionsClient::discover_config(
                 platform_token.clone(),
@@ -2039,7 +2037,7 @@ pub(super) async fn vars_connect(
             )
             .await?;
             let config = serde_json::to_value(github_client.config()).map_err(|error| {
-                LpmError::Script(format!(
+                LpmError::Env(format!(
                     "failed to serialize GitHub Actions connection: {error}"
                 ))
             })?;
@@ -2059,11 +2057,11 @@ pub(super) async fn vars_connect(
         "railway" => {
             let project_id = parse_flag(args, "--project")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --project flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --project flag".into()))?;
             validate_connect_field("--project", project_id, RAILWAY_ID_MAX_CHARS, true)?;
             let environment_id = parse_flag(args, "--environment")
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| LpmError::Script("missing --environment flag".into()))?;
+                .ok_or_else(|| LpmError::Env("missing --environment flag".into()))?;
             validate_connect_field("--environment", environment_id, RAILWAY_ID_MAX_CHARS, true)?;
             let service_id = parse_flag(args, "--service")
                 .map(|value| {
@@ -2083,7 +2081,7 @@ pub(super) async fn vars_connect(
                 config.clone(),
             )?);
             let config = serde_json::to_value(config).map_err(|error| {
-                LpmError::Script(format!("failed to serialize Railway connection: {error}"))
+                LpmError::Env(format!("failed to serialize Railway connection: {error}"))
             })?;
             let target = if let Some(service_id) = parse_flag(args, "--service") {
                 format!(
@@ -2146,7 +2144,7 @@ pub(super) async fn vars_connect(
                 principal_id: &result.context.principal_id,
             },
         )
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
     }
     if json_output {
         super::response::print_json_value(&super::response::success_envelope(serde_json::json!({
@@ -2174,11 +2172,11 @@ pub(super) async fn vars_platform_push(
     const USAGE: &str = "usage: lpm env push --to <platform> [--org <org-slug>] [--env <environment>] [--clean] [--yes]";
     validate_platform_push_arguments(args, USAGE)?;
     let platform = parse_flag(args, "--to").ok_or_else(|| {
-        LpmError::Script("missing --to flag. Usage: lpm env push --to <platform>".into())
+        LpmError::Env("missing --to flag. Usage: lpm env push --to <platform>".into())
     })?;
     let org_slug = parse_platform_org(args, USAGE)?;
     if !is_supported_platform(platform) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "unsupported env platform; use vercel, coolify, fly, railway, or github-actions".into(),
         ));
     }
@@ -2188,16 +2186,16 @@ pub(super) async fn vars_platform_push(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned)
         .ok_or_else(|| {
-            LpmError::Script("no env project configured. Run `lpm env set` first".into())
+            LpmError::Env("no env project configured. Run `lpm env set` first".into())
         })?;
     let expected_principal_id = Some(expected_platform_principal_from_manifest(
         &manifest,
         registry_client.base_url(),
         org_slug,
-    )?.ok_or_else(|| LpmError::Script("this checkout has no authenticated personal platform binding; reconnect the platform before using stored credentials".into()))?);
+    )?.ok_or_else(|| LpmError::Env("this checkout has no authenticated personal platform binding; reconnect the platform before using stored credentials".into()))?);
     let mut credentials = fetch_connections_with_recovery(
         registry_client,
         &vault_id,
@@ -2209,14 +2207,14 @@ pub(super) async fn vars_platform_push(
     let connection = credentials
         .connections
         .pop()
-        .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
+        .ok_or_else(|| LpmError::Env(format!("No {platform} connection found")))?;
     let connection_id = connection.id.clone();
     let mut client = PlatformClient::from_connection(&connection)?;
     let display_name = client.display_name();
     let snapshot = manifest.sources;
     let config = manifest.config;
     super::sync_payload::verify_schema_snapshot(project_dir, snapshot.as_deref())
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
     let resolved_env = resolve_platform_environment(
         config.as_ref(),
         parse_flag(args, "--env"),
@@ -2239,7 +2237,7 @@ pub(super) async fn vars_platform_push(
     let source_dir = project_dir.to_path_buf();
     client.set_source_check(std::sync::Arc::new(move || {
         super::sync_payload::verify_schema_snapshot(&source_dir, snapshot.as_deref())
-            .map_err(LpmError::Script)
+            .map_err(LpmError::Env)
     }));
 
     if !json_output {
@@ -2367,7 +2365,7 @@ pub(super) async fn vars_platform_push(
         ))
         .initial_value(false)
         .interact()
-        .map_prompt_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
+        .map_prompt_err(|error| LpmError::Env(format!("prompt failed: {error}")))?;
         if !confirmed {
             output::info("cancelled");
             return Ok(());
@@ -2478,7 +2476,7 @@ pub(super) async fn vars_platform_status(
     validate_platform_status_arguments(args, USAGE)?;
     let org_slug = parse_platform_org(args, USAGE)?;
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
-        LpmError::Script("no env project configured. Run `lpm env set` first".into())
+        LpmError::Env("no env project configured. Run `lpm env set` first".into())
     })?;
     let expected_principal_id = Some(required_platform_principal(
         project_dir,
@@ -2740,17 +2738,17 @@ pub(super) async fn vars_platform_pull(
         "usage: lpm env pull --from <platform> [--org <org-slug>] [--env <environment>] [--yes]";
     validate_platform_pull_arguments(args, USAGE)?;
     let platform = parse_flag(args, "--from").ok_or_else(|| {
-        LpmError::Script("missing --from flag. Usage: lpm env pull --from <platform>".into())
+        LpmError::Env("missing --from flag. Usage: lpm env pull --from <platform>".into())
     })?;
     let org_slug = parse_platform_org(args, USAGE)?;
     if !is_supported_platform(platform) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "unsupported env platform; use vercel, coolify, fly, railway, or github-actions".into(),
         ));
     }
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
     let vault_id =
-        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
+        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Env)?;
     let expected_principal_id = Some(required_platform_principal(
         project_dir,
         registry_client.base_url(),
@@ -2767,11 +2765,11 @@ pub(super) async fn vars_platform_pull(
     let connection = credentials
         .connections
         .pop()
-        .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
+        .ok_or_else(|| LpmError::Env(format!("No {platform} connection found")))?;
     let connection_id = connection.id.clone();
     let client = PlatformClient::from_connection(&connection)?;
     let display_name = client.display_name();
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
     let resolved_env = resolve_platform_environment(
         config.as_ref(),
         parse_flag(args, "--env"),
@@ -2836,7 +2834,7 @@ pub(super) async fn vars_platform_pull(
         )))
         .initial_value(true)
         .interact()
-        .map_prompt_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
+        .map_prompt_err(|error| LpmError::Env(format!("prompt failed: {error}")))?;
         if !confirmed {
             output::info("cancelled");
             return Ok(());
@@ -2855,10 +2853,10 @@ pub(super) async fn vars_platform_pull(
     );
     if env_name == "default" {
         lpm_vault::set(project_dir, &pairs, &source)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     } else {
         lpm_vault::set_env(project_dir, env_name, &pairs, &source)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     }
     let audit = record_platform_audit_with_recovery(
         registry_client,
@@ -3601,7 +3599,7 @@ mod tests {
             .mount(&server).await;
         let mut client = vercel_client_at(server.uri());
         client.source_check = Some(std::sync::Arc::new(|| {
-            Err(LpmError::Script("env.source_changed".into()))
+            Err(LpmError::Env("env.source_changed".into()))
         }));
         let outcome = client
             .apply_one(VercelMutation::Add {
