@@ -21,6 +21,12 @@ fn project_with_team_value(scripts: &str) -> (TempProject, String) {
         .args(["env", "set", "API_URL=team"])
         .assert()
         .success();
+    // These tests plant the feature marker they need, so the project keeps no
+    // local history whose records the planted marker wouldn't list.
+    lpm(&project)
+        .args(["env", "history", "off", "--yes"])
+        .assert()
+        .success();
     let vault_id =
         lpm_vault::vault_id::read_vault_id(project.path()).expect("env set creates a vault ID");
     (project, vault_id)
