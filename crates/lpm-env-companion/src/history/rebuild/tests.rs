@@ -607,6 +607,7 @@ fn an_unreadable_part_makes_the_keys_that_changed_across_it_unknown() {
         &mut source(&store),
         &current,
         &Filter::default(),
+        false,
     )
     .expect("timeline");
     assert_eq!(timeline.unreadable_parts, 1);
@@ -812,6 +813,7 @@ fn the_timeline_lists_newest_first_with_partitioned_counts_and_filters() {
         &mut source(&store),
         &live_values,
         &Filter::default(),
+        false,
     )
     .expect("timeline");
     let ids: Vec<EntryId> = timeline
@@ -844,6 +846,7 @@ fn the_timeline_lists_newest_first_with_partitioned_counts_and_filters() {
             environment: Some("staging"),
             ..Filter::default()
         },
+        false,
     )
     .expect("timeline");
     assert_eq!(staging.readable, 1);
@@ -859,6 +862,7 @@ fn the_timeline_lists_newest_first_with_partitioned_counts_and_filters() {
             limit: Some(5),
             ..Filter::default()
         },
+        false,
     )
     .expect("timeline");
     assert_eq!(by_key.rows.len(), 1);
@@ -909,6 +913,7 @@ fn the_timeline_names_deleted_environments_with_when_they_went() {
         &mut source(&store),
         &current,
         &Filter::default(),
+        false,
     )
     .expect("timeline");
     let local = timeline
@@ -930,7 +935,11 @@ fn damaged_history_records_are_found_beyond_the_listing() {
     let store = history(&steps);
     let head = store.get(&head_account(VAULT)).expect("head").to_vec();
     let key = store.get(&key_account(VAULT)).expect("key").to_vec();
-    let tail = |part: u16| store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec);
+    let tail = |part: u16| {
+        store
+            .get(&part_account(VAULT, part))
+            .map(std::borrow::Cow::Borrowed)
+    };
     assert!(check_records(VAULT, Some(&head), Some(&key), tail).is_empty());
 
     let damage = check_records(VAULT, Some(b"{}"), Some(&key), tail);
@@ -942,7 +951,7 @@ fn damaged_history_records_are_found_beyond_the_listing() {
         matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "key")
     );
     let damage = check_records(VAULT, Some(&head), Some(&key), |_| {
-        Some(b"garbage".to_vec())
+        Some(std::borrow::Cow::Borrowed(&b"garbage"[..]))
     });
     assert!(
         matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "history")
@@ -969,7 +978,11 @@ fn damaged_history_records_are_found_beyond_the_listing() {
     let tail = rolled.head().tail();
     let without_tail = |part: u16| {
         (part != tail)
-            .then(|| rolled.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+            .then(|| {
+                rolled
+                    .get(&part_account(VAULT, part))
+                    .map(std::borrow::Cow::Borrowed)
+            })
             .flatten()
     };
     assert!(
@@ -1436,7 +1449,14 @@ fn the_timeline_follows_a_key_and_an_environment_back_through_renames() {
         .expect("changed again");
     let current = after_rename.values();
     let timeline = |filter: Filter<'_>| {
-        read_timeline(&opened(&store), &mut source(&store), &current, &filter).expect("timeline")
+        read_timeline(
+            &opened(&store),
+            &mut source(&store),
+            &current,
+            &filter,
+            false,
+        )
+        .expect("timeline")
     };
     let by_key = timeline(Filter {
         key: Some(KeyMatch::Exact("NEW")),
@@ -1627,4 +1647,429 @@ fn an_id_prefix_matches_by_hex_digit_and_a_whole_id_stops_at_its_entry() {
 
 fn id_of(n: u8) -> EntryId {
     id(n)
+}
+
+fn record_all(steps: &[(Action, Project, Vec<Rename<'static>>)]) -> Store {
+    let mut store = Store::new();
+    for pair in steps.windows(2) {
+        let (_, before, _) = &pair[0];
+        let (action, after, renames) = &pair[1];
+        store
+            .record(*action, before, after, renames)
+            .expect("recorded");
+    }
+    store
+}
+
+#[test]
+fn an_environment_created_after_a_rename_away_rolls_back_to_before_it_existed() {
+    let x1 = Project::with(&[("X", &[("A", "1")])]);
+    let y1 = Project::with(&[("Y", &[("A", "1")])]);
+    let new_x = Project::with(&[("X", &[("B", "2")]), ("Y", &[("A", "1")])]);
+    let store = record_all(&[
+        (Action::Set, Project::with(&[("X", &[])]), vec![]),
+        (Action::Set, x1, vec![]),
+        (
+            Action::RenameEnvironment,
+            y1,
+            vec![Rename::Environment { from: "X", to: "Y" }],
+        ),
+        (Action::Set, new_x.clone(), vec![]),
+    ]);
+    let current = new_x.values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::Now("X"),
+        before(2),
+    )
+    .expect("the new X didn't exist then");
+    assert!(plan.environments[0].offers_deletion(), "{plan:?}");
+
+    let c = Project::with(&[("C", &[("B", "2")]), ("Y", &[("A", "1")])]);
+    let mut renaming = record_all(&[
+        (Action::Set, Project::with(&[("X", &[])]), vec![]),
+        (Action::Set, Project::with(&[("X", &[("A", "1")])]), vec![]),
+        (
+            Action::RenameEnvironment,
+            Project::with(&[("Y", &[("A", "1")])]),
+            vec![Rename::Environment { from: "X", to: "Y" }],
+        ),
+        (Action::Set, new_x.clone(), vec![]),
+    ]);
+    renaming
+        .record(
+            Action::RenameEnvironment,
+            &new_x,
+            &c,
+            &[Rename::Environment { from: "X", to: "C" }],
+        )
+        .expect("renamed");
+    let current = c.values();
+    let plan = plan_environment_rollback(
+        &opened(&renaming),
+        &mut source(&renaming),
+        &current,
+        EnvironmentRef::Now("C"),
+        before(2),
+    )
+    .expect("C exists now and didn't then");
+    assert!(plan.environments[0].offers_deletion(), "{plan:?}");
+}
+
+#[test]
+fn a_key_rollback_in_an_environment_renamed_away_and_deleted_refuses_a_taken_name() {
+    let store = record_all(&[
+        (Action::Set, Project::with(&[("P", &[])]), vec![]),
+        (
+            Action::Set,
+            Project::with(&[("P", &[("K", "old1")])]),
+            vec![],
+        ),
+        (
+            Action::Set,
+            Project::with(&[("P", &[("K", "old2")])]),
+            vec![],
+        ),
+        (
+            Action::RenameEnvironment,
+            Project::with(&[("Q", &[("K", "old2")])]),
+            vec![Rename::Environment { from: "P", to: "Q" }],
+        ),
+        (Action::DeleteEnvironment, Project::with(&[]), vec![]),
+        (
+            Action::Set,
+            Project::with(&[("P", &[("K", "new")])]),
+            vec![],
+        ),
+    ]);
+    let current = Project::with(&[("P", &[("K", "new")])]);
+    let current = current.values();
+    let plan = plan_key_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("P"),
+        "K",
+        id(2),
+    );
+    assert_eq!(plan, Err(PlanError::NameTaken("P".to_owned())));
+}
+
+#[test]
+fn undoing_a_change_keeps_the_environment_s_name_now() {
+    let store = record_all(&[
+        (Action::Set, Project::with(&[("E", &[])]), vec![]),
+        (Action::Set, Project::with(&[("E", &[("A", "1")])]), vec![]),
+        (Action::Set, Project::with(&[("E", &[("A", "2")])]), vec![]),
+        (
+            Action::RenameEnvironment,
+            Project::with(&[("F", &[("A", "2")])]),
+            vec![Rename::Environment { from: "E", to: "F" }],
+        ),
+    ]);
+    let current = Project::with(&[("F", &[("A", "2")])]);
+    let current = current.values();
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, id(2)).expect("plan");
+    let environment = &undo.environments[0];
+    assert_eq!(
+        (
+            environment.current.as_deref(),
+            environment.target.as_deref()
+        ),
+        (Some("F"), Some("F")),
+        "an undo restores values, not the name"
+    );
+    assert_eq!(rows(&undo), vec![row("A", "= 1")]);
+}
+
+#[test]
+fn a_key_rolled_back_by_its_earlier_name_rolls_back_the_key_it_became() {
+    let store = record_all(&[
+        (Action::Set, Project::with(&[("e", &[])]), vec![]),
+        (Action::Set, Project::with(&[("e", &[("A", "1")])]), vec![]),
+        (Action::Set, Project::with(&[("e", &[("A", "2")])]), vec![]),
+        (
+            Action::RenameKey,
+            Project::with(&[("e", &[("B", "2")])]),
+            vec![Rename::Key {
+                environment: "e",
+                from: "A",
+                to: "B",
+            }],
+        ),
+    ]);
+    let current = Project::with(&[("e", &[("B", "2")])]);
+    let current = current.values();
+    let plan = plan_key_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::Now("e"),
+        "A",
+        id(2),
+    )
+    .expect("plan");
+    assert_eq!(
+        rows(&plan),
+        vec![row("B", "= 1")],
+        "no copy under the old name"
+    );
+}
+
+#[test]
+fn a_rollback_to_after_an_outside_change_reads_only_the_parts_it_needs() {
+    let keys = 50;
+    let (store, current_project) = spread_history(keys);
+    let current = current_project.values();
+    let opened = opened(&store);
+    let mut reads = 0;
+    let mut counted = |part: u16| {
+        reads += 1;
+        Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+    };
+    // The newest entry is the change; the one before it, in the same part,
+    // is the outside entry.
+    let timeline = read_timeline(
+        &opened,
+        &mut source(&store),
+        &current,
+        &Filter::default(),
+        false,
+    )
+    .expect("timeline");
+    let TimelineRow::Entry(gap) = &timeline.rows[1] else {
+        panic!("an entry");
+    };
+    assert_eq!(gap.action, Action::Outside);
+    plan_environment_rollback(
+        &opened,
+        &mut counted,
+        &current,
+        EnvironmentRef::AtPoint("e"),
+        Point {
+            entry: gap.id,
+            side: RelatedSide::After,
+        },
+    )
+    .expect("plan");
+    assert_eq!(reads, 1, "the state after the outside entry is fully known");
+}
+
+#[test]
+fn a_timeline_filter_stops_where_its_name_was_renamed_away() {
+    let store = record_all(&[
+        (Action::Set, Project::with(&[("e", &[])]), vec![]),
+        (Action::Set, Project::with(&[("e", &[("K", "1")])]), vec![]),
+        (Action::Set, Project::with(&[("e", &[("K", "2")])]), vec![]),
+        (
+            Action::RenameKey,
+            Project::with(&[("e", &[("J", "2")])]),
+            vec![Rename::Key {
+                environment: "e",
+                from: "K",
+                to: "J",
+            }],
+        ),
+        (
+            Action::Set,
+            Project::with(&[("e", &[("J", "2"), ("K", "n")])]),
+            vec![],
+        ),
+    ]);
+    let current = Project::with(&[("e", &[("J", "2"), ("K", "n")])]);
+    let current = current.values();
+    let count = |key: &'static str| {
+        read_timeline(
+            &opened(&store),
+            &mut source(&store),
+            &current,
+            &Filter {
+                key: Some(KeyMatch::Exact(key)),
+                ..Filter::default()
+            },
+            false,
+        )
+        .expect("timeline")
+        .readable
+    };
+    assert_eq!(count("K"), 1, "only the new K's own entry");
+    assert_eq!(count("J"), 3, "J's rename and the changes it made as K");
+
+    let x = record_all(&[
+        (Action::Set, Project::with(&[("X", &[])]), vec![]),
+        (Action::Set, Project::with(&[("X", &[("A", "1")])]), vec![]),
+        (
+            Action::RenameEnvironment,
+            Project::with(&[("Y", &[("A", "1")])]),
+            vec![Rename::Environment { from: "X", to: "Y" }],
+        ),
+        (
+            Action::Set,
+            Project::with(&[("X", &[("B", "2")]), ("Y", &[("A", "1")])]),
+            vec![],
+        ),
+    ]);
+    let current = Project::with(&[("X", &[("B", "2")]), ("Y", &[("A", "1")])]);
+    let current = current.values();
+    let count = |environment: &'static str| {
+        read_timeline(
+            &opened(&x),
+            &mut source(&x),
+            &current,
+            &Filter {
+                environment: Some(environment),
+                ..Filter::default()
+            },
+            false,
+        )
+        .expect("timeline")
+        .readable
+    };
+    assert_eq!(count("X"), 1, "only the new X's own entry");
+    assert_eq!(count("Y"), 2);
+}
+
+#[test]
+fn a_missing_newest_part_with_nothing_before_it_reads_as_a_damaged_tail() {
+    let steps = steps();
+    let mut store = history(&steps[..2]);
+    store.delete(&part_account(VAULT, 0));
+    let current = steps[1].values();
+    let retained = crate::history::read::read_retained(&opened(&store), &mut source(&store))
+        .expect("retained");
+    assert!(retained.damaged_tail);
+    let timeline = read_timeline(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        &Filter::default(),
+        false,
+    )
+    .expect("timeline");
+    assert!(timeline.damaged_tail);
+}
+
+#[test]
+fn a_timeline_builds_only_the_rows_it_shows_and_reveals_them_in_the_same_walk() {
+    let (store, current_project) = spread_history(50);
+    let current = current_project.values();
+    let parts = store.head().parts.len();
+    let mut reads = 0;
+    let mut counted = |part: u16| {
+        reads += 1;
+        Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+    };
+    crate::work::reset();
+    let timeline = read_timeline(
+        &opened(&store),
+        &mut counted,
+        &current,
+        &Filter {
+            limit: Some(2),
+            ..Filter::default()
+        },
+        true,
+    )
+    .expect("timeline");
+    assert_eq!(timeline.rows.len(), 2);
+    assert_eq!(
+        crate::work::count(crate::work::Work::Listed),
+        2,
+        "two rows built"
+    );
+    assert_eq!(timeline.values.len(), 2, "both shown rows revealed");
+    assert_eq!(reads, parts, "one walk");
+    assert!(timeline.readable > 2, "counts still cover every entry");
+}
+
+#[test]
+fn undoing_one_step_of_a_key_swap_shows_the_value_it_replaces() {
+    let store = record_all(&[
+        (Action::Set, Project::with(&[("e", &[])]), vec![]),
+        (
+            Action::Set,
+            Project::with(&[("e", &[("A", "a"), ("B", "b")])]),
+            vec![],
+        ),
+        (
+            Action::RenameKey,
+            Project::with(&[("e", &[("B", "b"), ("T", "a")])]),
+            vec![Rename::Key {
+                environment: "e",
+                from: "A",
+                to: "T",
+            }],
+        ),
+        (
+            Action::RenameKey,
+            Project::with(&[("e", &[("A", "b"), ("T", "a")])]),
+            vec![Rename::Key {
+                environment: "e",
+                from: "B",
+                to: "A",
+            }],
+        ),
+        (
+            Action::RenameKey,
+            Project::with(&[("e", &[("A", "b"), ("B", "a")])]),
+            vec![Rename::Key {
+                environment: "e",
+                from: "T",
+                to: "B",
+            }],
+        ),
+    ]);
+    let current = Project::with(&[("e", &[("A", "b"), ("B", "a")])]);
+    let current = current.values();
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, id(2)).expect("plan");
+    let a = undo.environments[0]
+        .rows
+        .iter()
+        .find(|row| row.key == "A")
+        .expect("A");
+    assert_eq!(
+        a.current.as_deref().map(String::as_str),
+        Some("b"),
+        "the review shows A's value now"
+    );
+    assert!(
+        a.changed_again.is_some(),
+        "and says it changed after the undone step"
+    );
+    assert_eq!(
+        a.linked,
+        vec!["B".to_owned()],
+        "the rename's two rows go together"
+    );
+}
+
+#[test]
+fn a_key_removed_outside_history_carries_the_gap_into_its_rollback() {
+    let mut store = Store::new();
+    let empty = Project::with(&[("e", &[])]);
+    let first = Project::with(&[("e", &[("A", "1"), ("B", "1")])]);
+    store
+        .record(Action::Set, &empty, &first, &[])
+        .expect("created");
+    let current = Project::with(&[("e", &[("B", "1")])]);
+    let values = current.values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &values,
+        EnvironmentRef::AtPoint("e"),
+        after(1),
+    )
+    .expect("plan");
+    let a = plan.environments[0]
+        .rows
+        .iter()
+        .find(|row| row.key == "A")
+        .expect("A comes back");
+    assert!(
+        a.gaps.iter().any(|gap| gap.until.is_none()),
+        "putting A back replaces its removal outside history"
+    );
 }

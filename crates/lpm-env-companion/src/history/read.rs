@@ -25,11 +25,11 @@ use crate::keyring::{self, Digest, DigestKeys, KeyRecord};
 /// it's damage only when that part is missing or won't read too. Repairing
 /// any of these removes history; it stays on and restarts at the next
 /// change. `part` reads one part's sealed bytes.
-pub fn check_records(
+pub fn check_records<'p>(
     vault_id: &str,
     head: Option<&[u8]>,
     key: Option<&[u8]>,
-    mut part: impl FnMut(u16) -> Option<Vec<u8>>,
+    mut part: impl FnMut(u16) -> Option<Cow<'p, [u8]>>,
 ) -> Vec<crate::gate::Damage> {
     use crate::gate::Damage;
     let mut damage = Vec::new();
@@ -211,14 +211,28 @@ impl Opened {
         mut visit: impl FnMut(PartRead<'_>) -> bool,
     ) -> Result<(), ReadError> {
         let tail = self.head.tail();
+        // After a skipped tail, the part before it is what the next append
+        // recovers from, so it won't reading damages history as the tail
+        // would; with no part before it, the skipped tail is damage itself.
+        let mut recovering = false;
         for part in self.head.parts.iter().rev().copied() {
             let is_tail = part == tail;
             let unreadable = PartRead::Unreadable {
                 part,
-                tail: is_tail,
+                tail: is_tail || recovering,
+            };
+            if !is_tail {
+                recovering = false;
+            }
+            let skip_tail = |recovering: &mut bool| {
+                *recovering = true;
+                self.head.parts.len() == 1
             };
             let Some(sealed) = source.part(part).map_err(ReadError::Storage)? else {
                 if is_tail {
+                    if skip_tail(&mut recovering) && !visit(unreadable) {
+                        break;
+                    }
                     continue;
                 }
                 if !visit(unreadable) {
@@ -242,6 +256,9 @@ impl Opened {
                 continue;
             };
             if is_tail && decoded.epoch != self.head.tail_epoch {
+                if skip_tail(&mut recovering) && !visit(PartRead::Unreadable { part, tail: true }) {
+                    break;
+                }
                 continue;
             }
             if !visit(PartRead::Readable {
@@ -511,6 +528,7 @@ fn detail_info(detail: &Detail<'_>) -> DetailInfo {
 }
 
 pub fn entry_info(entry: &Entry<'_>) -> EntryInfo {
+    crate::work::note(crate::work::Work::Listed);
     EntryInfo {
         seq: entry.seq,
         id: entry.id,
@@ -617,111 +635,150 @@ impl Filter<'_> {
 }
 
 /// A filter's environment and exact key, followed back through renames as
-/// a listing goes from the newest entry to the oldest.
+/// a listing goes from the newest entry to the oldest. Where an entry
+/// renames the name being followed away to another name, the entries before
+/// it under that name are the other name's, so the match stops there.
 struct Matcher<'f> {
     filter: &'f Filter<'f>,
-    /// The filtered environment's name before the entries matched so far.
-    environment: Option<String>,
+    /// The filtered environment's name before the entries matched so far;
+    /// `None` once its history ended.
+    environment: Option<Option<String>>,
     /// An exact key's name before the entries matched so far, by the name
     /// its environment had then, where it differs from the filter's.
     renamed_keys: HashMap<String, String>,
+    /// Environments, by their name then, where the exact key's history
+    /// ended.
+    ended_keys: HashSet<String>,
 }
 
 impl<'f> Matcher<'f> {
     fn new(filter: &'f Filter<'f>) -> Self {
         Self {
             filter,
-            environment: filter.environment.map(str::to_owned),
+            environment: filter.environment.map(|name| Some(name.to_owned())),
             renamed_keys: HashMap::new(),
+            ended_keys: HashSet::new(),
         }
     }
 
-    /// Whether `environments`, one entry's changes, touch what the filter
-    /// follows; then step back across the renames they record.
-    fn matches(&mut self, environments: &[EnvironmentInfo]) -> bool {
-        let mut matched = false;
-        let mut environment_rename: Option<String> = None;
-        let mut key_moves: Vec<(String, String, Option<String>)> = Vec::new();
-        for environment in environments {
-            if self
-                .environment
-                .as_deref()
-                .is_some_and(|wanted| environment.name != wanted)
-            {
-                continue;
-            }
-            let earlier_name = match &environment.kind {
-                EnvironmentKindInfo::RenamedFrom(from) => Some(from.clone()),
-                _ => None,
-            };
-            let key_matches = match self.filter.key {
-                None => true,
-                Some(KeyMatch::Contains(text)) => match &environment.keys {
-                    KeysInfo::Count(_) => false,
-                    KeysInfo::Changes(changes) => changes.iter().any(|change| {
-                        contains_ignoring_ascii_case(&change.key, text)
-                            || matches!(&change.kind, KeyKindInfo::RenamedFrom(from)
-                                if contains_ignoring_ascii_case(from, text))
-                    }),
-                },
-                Some(KeyMatch::Exact(wanted)) => {
-                    let name = self
-                        .renamed_keys
-                        .get(&environment.name)
-                        .map_or(wanted, String::as_str);
-                    let change = match &environment.keys {
-                        KeysInfo::Count(_) => None,
-                        KeysInfo::Changes(changes) => {
-                            changes.iter().find(|change| change.key == name)
-                        }
-                    };
-                    let earlier_key = match change.map(|change| &change.kind) {
-                        Some(KeyKindInfo::RenamedFrom(from)) => Some(from.clone()),
-                        _ => None,
-                    };
-                    if earlier_name.is_some() || earlier_key.is_some() {
-                        key_moves.push((
-                            environment.name.clone(),
-                            earlier_name
-                                .clone()
-                                .unwrap_or_else(|| environment.name.clone()),
-                            earlier_key
-                                .or_else(|| self.renamed_keys.get(&environment.name).cloned()),
-                        ));
-                    }
-                    change.is_some()
-                }
-            };
-            matched |= key_matches;
-            if self.environment.is_some()
-                && let Some(from) = earlier_name
-            {
-                environment_rename = Some(from);
-            }
-        }
-        if let Some(from) = environment_rename {
-            self.environment = Some(from);
-        }
-        for (name, earlier_name, key) in key_moves {
-            self.renamed_keys.remove(&name);
-            match key {
-                Some(key) if Some(key.as_str()) != self.exact_key() => {
-                    self.renamed_keys.insert(earlier_name, key);
-                }
-                _ => {
-                    self.renamed_keys.remove(&earlier_name);
-                }
-            }
-        }
-        matched
-    }
-
-    fn exact_key(&self) -> Option<&str> {
+    fn exact_key(&self) -> Option<&'f str> {
         match self.filter.key {
             Some(KeyMatch::Exact(key)) => Some(key),
             _ => None,
         }
     }
+
+    /// Whether `environments`, one entry's changes, touch what the filter
+    /// follows; then step back across the renames they record.
+    fn matches(&mut self, environments: &[EnvironmentChange<'_>]) -> bool {
+        let wanted = match &self.environment {
+            Some(None) => return false,
+            Some(Some(name)) => Some(name.clone()),
+            None => None,
+        };
+        let mut matched = false;
+        let mut environment_step: Option<Option<String>> = None;
+        let mut key_steps: Vec<(String, String, KeyStep)> = Vec::new();
+        for environment in environments {
+            let earlier_name = match environment.kind {
+                EnvironmentKind::RenamedFrom(from) => Some(from),
+                _ => None,
+            };
+            if let Some(wanted) = &wanted {
+                if environment.name != wanted {
+                    if earlier_name == Some(wanted.as_str()) {
+                        // The followed name became this environment's here.
+                        environment_step = Some(None);
+                    }
+                    continue;
+                }
+                if let Some(from) = earlier_name {
+                    environment_step = Some(Some(from.to_owned()));
+                }
+            }
+            let earlier = earlier_name.unwrap_or(environment.name);
+            let key_matches = match self.filter.key {
+                None => true,
+                Some(KeyMatch::Contains(text)) => match &environment.keys {
+                    Keys::Count(_) => false,
+                    Keys::Changes(changes) => changes.iter().any(|change| {
+                        contains_ignoring_ascii_case(change.key, text)
+                            || matches!(change.kind, KeyKind::RenamedFrom(from)
+                                if contains_ignoring_ascii_case(from, text))
+                    }),
+                },
+                Some(KeyMatch::Exact(wanted_key)) => {
+                    if self.ended_keys.contains(environment.name) {
+                        if earlier_name.is_some() {
+                            key_steps.push((
+                                environment.name.to_owned(),
+                                earlier.to_owned(),
+                                KeyStep::Ended,
+                            ));
+                        }
+                        false
+                    } else {
+                        let name = self
+                            .renamed_keys
+                            .get(environment.name)
+                            .map_or(wanted_key, String::as_str);
+                        let changes = match &environment.keys {
+                            Keys::Count(_) => &[][..],
+                            Keys::Changes(changes) => changes.as_slice(),
+                        };
+                        let change = changes.iter().find(|change| change.key == name);
+                        let step = match change.map(|change| change.kind) {
+                            Some(KeyKind::RenamedFrom(from)) => KeyStep::Named(from.to_owned()),
+                            Some(_) => KeyStep::Named(name.to_owned()),
+                            None if changes.iter().any(|change| {
+                                matches!(change.kind, KeyKind::RenamedFrom(from) if from == name)
+                            }) =>
+                            {
+                                KeyStep::Ended
+                            }
+                            None => KeyStep::Named(name.to_owned()),
+                        };
+                        let moved = earlier_name.is_some()
+                            || !matches!(&step, KeyStep::Named(next) if next == name);
+                        if moved {
+                            key_steps.push((environment.name.to_owned(), earlier.to_owned(), step));
+                        }
+                        change.is_some()
+                    }
+                }
+            };
+            matched |= key_matches;
+        }
+        if let Some(step) = environment_step {
+            self.environment = Some(step);
+        }
+        for (name, earlier, step) in key_steps {
+            self.renamed_keys.remove(&name);
+            self.ended_keys.remove(&name);
+            match step {
+                KeyStep::Ended => {
+                    self.renamed_keys.remove(&earlier);
+                    self.ended_keys.insert(earlier);
+                }
+                KeyStep::Named(key) if Some(key.as_str()) != self.exact_key() => {
+                    self.ended_keys.remove(&earlier);
+                    self.renamed_keys.insert(earlier, key);
+                }
+                KeyStep::Named(_) => {
+                    self.ended_keys.remove(&earlier);
+                    self.renamed_keys.remove(&earlier);
+                }
+            }
+        }
+        matched
+    }
+}
+
+/// What an exact key's name is before one entry, in one environment.
+enum KeyStep {
+    Named(String),
+    /// The name was renamed away to another key here.
+    Ended,
 }
 
 /// One timeline row, newest first.
@@ -755,9 +812,12 @@ pub struct EnvironmentName {
     pub deleted_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Timeline {
     pub rows: Vec<TimelineRow>,
+    /// The shown entries' kept values, by entry ID, each environment's key
+    /// changes in the order their entry lists them; empty unless revealed.
+    pub values: HashMap<EntryId, Vec<Vec<RevealedValues>>>,
     pub live_gap: Option<LiveGap>,
     /// Readable entries matching the filter's environment and key, before
     /// its source and limit.
@@ -808,22 +868,61 @@ impl Names {
     }
 }
 
+impl fmt::Debug for Timeline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Timeline")
+            .field("rows", &self.rows)
+            .field("values", &self.values.len())
+            .field("live_gap", &self.live_gap)
+            .field("readable", &self.readable)
+            .field("counts", &self.counts)
+            .field("oldest", &self.oldest)
+            .field("damaged_tail", &self.damaged_tail)
+            .field("unreadable_parts", &self.unreadable_parts)
+            .field("environments", &self.environments)
+            .finish()
+    }
+}
+
+/// A timeline row as the walk builds it. A repeated entry's row moves to
+/// its oldest copy's place and leaves a gap behind.
+enum Building {
+    Row(TimelineRow),
+    Moved,
+}
+
 /// Read the timeline: entries newest first, each repeated entry ID once
 /// (the oldest copy, as a retry after someone else's rollover stores it
 /// twice), unreadable parts at their place, and the live gap against
-/// `current`.
+/// `current`. Only the rows shown are built, with their values when
+/// `reveal` is set, in the same walk.
 pub fn read_timeline(
     opened: &Opened,
     source: &mut impl PartSource,
     current: &Values<'_>,
     filter: &Filter<'_>,
+    reveal: bool,
 ) -> Result<Timeline, ReadError> {
-    let mut rows: Vec<TimelineRow> = Vec::new();
+    let mut rows: Vec<Building> = Vec::new();
+    let mut values: HashMap<EntryId, Vec<Vec<RevealedValues>>> = HashMap::new();
+    // Each entry ID seen, with its row's place when it's shown.
+    let mut seen: HashMap<EntryId, Option<usize>> = HashMap::new();
     let mut live_gap = None;
     let mut newest_summary_seen = false;
     let mut damaged_tail = false;
     let mut unreadable_parts = 0;
     let mut names = Names::new(current);
+    let mut matcher = Matcher::new(filter);
+    let mut counts: BTreeMap<SourceGroup, usize> = SourceGroup::ALL
+        .into_iter()
+        .map(|group| (group, 0))
+        .collect();
+    let mut readable = 0;
+    let mut oldest = None;
+    let mut shown = 0;
+    let mut newer_time = None;
+    let mut open_unreadable: Vec<usize> = Vec::new();
     let gap_shown = filter
         .source
         .is_none_or(|group| group == SourceGroup::Outside);
@@ -832,11 +931,14 @@ pub fn read_timeline(
             PartRead::Unreadable { part, tail } => {
                 damaged_tail |= tail;
                 unreadable_parts += 1;
-                rows.push(TimelineRow::Unreadable {
-                    part,
-                    after: None,
-                    before: None,
-                });
+                if filter.limit.is_none_or(|limit| shown < limit) {
+                    open_unreadable.push(rows.len());
+                    rows.push(Building::Row(TimelineRow::Unreadable {
+                        part,
+                        after: None,
+                        before: newer_time,
+                    }));
+                }
             }
             PartRead::Readable { decoded, .. } => {
                 if !newest_summary_seen {
@@ -845,7 +947,9 @@ pub fn read_timeline(
                         let summary = opened.scrubbed_summary(&decoded.summary);
                         let current_summary = current.summary(&opened.keys);
                         let gaps = gap_changes(&summary, current, &current_summary);
-                        if !gaps.is_empty() {
+                        if !gaps.is_empty()
+                            && (!filter.narrows() || Matcher::new(filter).matches(&gaps))
+                        {
                             live_gap = Some(LiveGap {
                                 since: decoded.last_header().map(|header| header.time),
                                 environments: environments_info(&gaps),
@@ -854,80 +958,59 @@ pub fn read_timeline(
                     }
                 }
                 for entry in decoded.decoded_entries().rev() {
+                    let time = entry.time;
+                    for index in open_unreadable.drain(..) {
+                        if let Building::Row(TimelineRow::Unreadable { after, .. }) =
+                            &mut rows[index]
+                        {
+                            *after = Some(time);
+                        }
+                    }
+                    newer_time = Some(time);
                     let entry = opened.scrubbed(entry);
                     names.note(&entry);
-                    rows.push(TimelineRow::Entry(entry_info(&entry)));
+                    if let Some(place) = seen.get(&entry.id) {
+                        if let Some(place) = *place {
+                            let row = std::mem::replace(&mut rows[place], Building::Moved);
+                            seen.insert(entry.id, Some(rows.len()));
+                            rows.push(row);
+                        }
+                        continue;
+                    }
+                    if filter.narrows() && !matcher.matches(&entry.environments) {
+                        seen.insert(entry.id, None);
+                        continue;
+                    }
+                    readable += 1;
+                    let group = SourceGroup::of(entry.actor, entry.action);
+                    *counts.entry(group).or_default() += 1;
+                    oldest = Some(time);
+                    if filter.source.is_some_and(|wanted| wanted != group)
+                        || filter.limit.is_some_and(|limit| shown >= limit)
+                    {
+                        seen.insert(entry.id, None);
+                        continue;
+                    }
+                    shown += 1;
+                    if reveal {
+                        values.insert(entry.id, revealed_values(&entry));
+                    }
+                    seen.insert(entry.id, Some(rows.len()));
+                    rows.push(Building::Row(TimelineRow::Entry(entry_info(&entry))));
                 }
             }
         }
         true
     })?;
-    // A retry after someone else's rollover can store an entry twice; the
-    // oldest copy stays, in its place.
-    let mut kept_ids: HashSet<EntryId> = HashSet::with_capacity(rows.len());
-    let mut deduplicated: Vec<TimelineRow> = Vec::with_capacity(rows.len());
-    for row in rows.into_iter().rev() {
-        if let TimelineRow::Entry(info) = &row
-            && !kept_ids.insert(info.id)
-        {
-            continue;
-        }
-        deduplicated.push(row);
-    }
-    deduplicated.reverse();
-
-    let mut counts: BTreeMap<SourceGroup, usize> = SourceGroup::ALL
-        .into_iter()
-        .map(|group| (group, 0))
-        .collect();
-    let mut readable = 0;
-    let mut oldest = None;
-    let mut matcher = Matcher::new(filter);
-    let mut shown = 0;
-    let mut newer_time = None;
-    let mut matched: Vec<TimelineRow> = Vec::with_capacity(deduplicated.len());
-    let mut open_unreadable: Vec<usize> = Vec::new();
-    for row in deduplicated {
-        match row {
-            TimelineRow::Entry(info) => {
-                let time = info.time;
-                for index in open_unreadable.drain(..) {
-                    if let TimelineRow::Unreadable { after, .. } = &mut matched[index] {
-                        *after = Some(time);
-                    }
-                }
-                newer_time = Some(time);
-                if filter.narrows() && !matcher.matches(&info.environments) {
-                    continue;
-                }
-                readable += 1;
-                *counts.entry(info.source()).or_default() += 1;
-                oldest = Some(time);
-                if filter.source.is_some_and(|group| group != info.source())
-                    || filter.limit.is_some_and(|limit| shown >= limit)
-                {
-                    continue;
-                }
-                shown += 1;
-                matched.push(TimelineRow::Entry(info));
-            }
-            TimelineRow::Unreadable { part, .. } => {
-                if filter.limit.is_none_or(|limit| shown < limit) {
-                    open_unreadable.push(matched.len());
-                    matched.push(TimelineRow::Unreadable {
-                        part,
-                        after: None,
-                        before: newer_time,
-                    });
-                }
-            }
-        }
-    }
-    let live_gap = live_gap.filter(|gap: &LiveGap| {
-        !filter.narrows() || Matcher::new(filter).matches(&gap.environments)
-    });
     Ok(Timeline {
-        rows: matched,
+        rows: rows
+            .into_iter()
+            .filter_map(|row| match row {
+                Building::Row(row) => Some(row),
+                Building::Moved => None,
+            })
+            .collect(),
+        values,
         live_gap,
         readable,
         counts,
@@ -1144,21 +1227,26 @@ pub fn reveal_entries(
 fn revealed(entry: &Entry<'_>) -> RevealedEntry {
     RevealedEntry {
         info: entry_info(entry),
-        values: entry
-            .environments
-            .iter()
-            .map(|environment| match &environment.keys {
-                Keys::Count(_) => Vec::new(),
-                Keys::Changes(changes) => changes
-                    .iter()
-                    .map(|change| RevealedValues {
-                        before: kept(&change.before),
-                        after: kept(&change.after),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        values: revealed_values(entry),
     }
+}
+
+/// An entry's kept values, each environment's key changes in order.
+fn revealed_values(entry: &Entry<'_>) -> Vec<Vec<RevealedValues>> {
+    entry
+        .environments
+        .iter()
+        .map(|environment| match &environment.keys {
+            Keys::Count(_) => Vec::new(),
+            Keys::Changes(changes) => changes
+                .iter()
+                .map(|change| RevealedValues {
+                    before: kept(&change.before),
+                    after: kept(&change.after),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn kept(side: &Side<'_>) -> Option<Zeroizing<String>> {

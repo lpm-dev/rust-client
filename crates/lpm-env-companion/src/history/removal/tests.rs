@@ -762,3 +762,96 @@ fn removal_refuses_a_value_current_under_an_earlier_name_of_its_place() {
         started.map(|writes| writes.len())
     );
 }
+
+#[test]
+fn a_review_by_a_short_id_reads_each_part_once() {
+    let (store, project) = shared_value();
+    let current = project.values();
+    let mut reads = 0;
+    let mut counted = |part: u16| {
+        reads += 1;
+        Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+    };
+    let prefix = IdPrefix::parse(
+        &id(2)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .expect("an ID");
+    let (info, review) =
+        review_removal_for(&opened(&store), &mut counted, &current, &prefix, |info| {
+            Ok::<_, RemovalError>(ChosenSide {
+                environment: info.environments[0].name.clone(),
+                key: "API_KEY".to_owned(),
+                side: RelatedSide::Before,
+            })
+        })
+        .expect("review");
+    assert_eq!(info.id, id(2));
+    assert!(!review.places.is_empty());
+    assert_eq!(reads, store.head().parts.len(), "one walk");
+}
+
+#[test]
+fn a_review_of_an_old_entry_holds_a_bounded_number_of_sides_and_finds_every_place() {
+    let mut store = Store::new();
+    let empty = Project::with(&[("e", &[])]);
+    let mut project = empty.clone();
+    for index in 0..400 {
+        project.set("e", &format!("K{index:03}"), "shared");
+    }
+    store
+        .record(Action::Set, &empty, &project, &[])
+        .expect("created");
+    // Every later change moves every key away from "shared" and back, so
+    // far more sides than the review holds come after the chosen entry.
+    for round in 0..12 {
+        let mut next = project.clone();
+        let value = if round % 2 == 0 { "other" } else { "shared" };
+        for index in 0..400 {
+            next.set("e", &format!("K{index:03}"), value);
+        }
+        store
+            .record(Action::Set, &project, &next, &[])
+            .expect("recorded");
+        project = next;
+    }
+    let mut last = project.clone();
+    for index in 0..400 {
+        last.set("e", &format!("K{index:03}"), "final");
+    }
+    store
+        .record(Action::Set, &project, &last, &[])
+        .expect("recorded");
+    let current = last.values();
+    let review = review_removal(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        Chosen {
+            entry: id(1),
+            environment: "e",
+            key: "K000",
+            side: RelatedSide::After,
+        },
+    )
+    .expect("review");
+    assert_eq!(
+        store.head().parts.len(),
+        14,
+        "every entry is still in the ring"
+    );
+    assert_eq!(review.places.len(), 400);
+    let k000 = review
+        .places
+        .iter()
+        .find(|place| place.key == "K000")
+        .expect("K000");
+    assert_eq!(
+        k000.occurrences.len(),
+        7,
+        "set at creation and at every second round: {:?}",
+        k000.occurrences
+    );
+}

@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
 use zeroize::Zeroizing;
 
@@ -17,7 +18,9 @@ use crate::history::codec::{
     Action, Entry, EntryId, EnvironmentKind, KeyKind, Keys, RelatedSide, Remote, Side, Slot,
     Summary, Unkept,
 };
-use crate::history::read::{Opened, PartRead, PartSource, ReadError};
+use crate::history::read::{
+    EntryInfo, IdPrefix, Opened, PartRead, PartSource, ReadError, entry_info,
+};
 use crate::history::values::Values;
 use crate::keyring::{Digest, DigestKeys};
 
@@ -155,13 +158,17 @@ impl KeyState {
     }
 }
 
+/// A name the walk shares between the maps that hold it, so a key's name
+/// is stored once.
+type Name = Rc<str>;
+
 /// A key as the walk tracks it, one per identity: its name now, if it
 /// exists now, and its state at the point the walk reached. A key keeps its
 /// identity while it's absent, so a key removed and added back, or an
 /// environment deleted and recreated, is still the key named now.
 #[derive(Clone)]
 struct TrackedKey {
-    current: Option<String>,
+    current: Option<Name>,
     state: KeyState,
 }
 
@@ -169,13 +176,13 @@ type KeyId = usize;
 
 #[derive(Clone, Default)]
 struct TrackedEnvironment {
-    current: Option<String>,
+    current: Option<Name>,
     exists: bool,
     /// Set when an oversized entry hides which keys the environment had at
     /// this point: some may be missing from `keys`.
     unnamed: Option<UnknownReason>,
     /// Keys by their names at this point.
-    keys: BTreeMap<String, KeyId>,
+    keys: BTreeMap<Name, KeyId>,
 }
 
 /// What the walk learns about a key from the entries newer than the point.
@@ -223,15 +230,22 @@ struct Notes {
 #[derive(Default)]
 struct State {
     keys: Vec<TrackedKey>,
-    environments: BTreeMap<String, TrackedEnvironment>,
+    environments: BTreeMap<Name, TrackedEnvironment>,
+    /// Environments another one displaced at a name because it existed
+    /// there at this point, kept so the name they have now still finds
+    /// them.
+    detached: Vec<TrackedEnvironment>,
     /// Every key that exists now, by its environment's and its own name now.
-    now: BTreeMap<String, BTreeMap<String, KeyId>>,
+    now: BTreeMap<Name, BTreeMap<Name, KeyId>>,
     /// Keys whose state a kept value with this digest can resolve. An ID
     /// stays listed after its state changes, so each use checks it.
     wanted: HashMap<Digest, Vec<KeyId>>,
-    /// How many keys a kept value can still resolve.
+    /// How many keys the plan reads that a kept value can still resolve.
     unresolved: usize,
-    /// Notes per key that exists now.
+    /// The keys the plan reads, once the point is reached; every key
+    /// before.
+    focus: Option<HashSet<KeyId>>,
+    /// Notes per key identity.
     notes: HashMap<KeyId, Notes>,
 }
 
@@ -239,34 +253,36 @@ impl State {
     fn from_values(values: &Values<'_>, digest_keys: &DigestKeys) -> Self {
         let mut state = Self::default();
         for (name, values) in values.environments() {
+            let environment_name: Name = Rc::from(*name);
             let mut keys = BTreeMap::new();
             let mut now = BTreeMap::new();
             for (key, value) in values {
+                let key_name: Name = Rc::from(*key);
                 let id = state.add_key(
-                    Some((*key).to_owned()),
+                    Some(key_name.clone()),
                     KeyState::Known {
                         value: Zeroizing::new((*value).to_owned()),
                         digest: digest_keys.value(value.as_bytes()),
                     },
                 );
-                keys.insert((*key).to_owned(), id);
-                now.insert((*key).to_owned(), id);
+                keys.insert(key_name.clone(), id);
+                now.insert(key_name, id);
             }
             state.environments.insert(
-                (*name).to_owned(),
+                environment_name.clone(),
                 TrackedEnvironment {
-                    current: Some((*name).to_owned()),
+                    current: Some(environment_name.clone()),
                     exists: true,
                     unnamed: None,
                     keys,
                 },
             );
-            state.now.insert((*name).to_owned(), now);
+            state.now.insert(environment_name, now);
         }
         state
     }
 
-    fn add_key(&mut self, current: Option<String>, state: KeyState) -> KeyId {
+    fn add_key(&mut self, current: Option<Name>, state: KeyState) -> KeyId {
         let id = self.keys.len();
         self.keys.push(TrackedKey {
             current,
@@ -276,17 +292,33 @@ impl State {
         id
     }
 
+    fn counts(&self, id: KeyId) -> bool {
+        self.focus.as_ref().is_none_or(|focus| focus.contains(&id))
+    }
+
     /// Every state change goes through here, which keeps `wanted` and
     /// `unresolved` true.
     fn set_state(&mut self, id: KeyId, state: KeyState) {
-        if self.keys[id].state.wanted().is_some() {
+        let counts = self.counts(id);
+        if counts && self.keys[id].state.wanted().is_some() {
             self.unresolved -= 1;
         }
         if let Some(digest) = state.wanted() {
-            self.unresolved += 1;
+            if counts {
+                self.unresolved += 1;
+            }
             self.wanted.entry(digest).or_default().push(id);
         }
         self.keys[id].state = state;
+    }
+
+    /// From now on, wait only for the keys in `focus` to resolve.
+    fn set_focus(&mut self, focus: HashSet<KeyId>) {
+        self.unresolved = focus
+            .iter()
+            .filter(|id| self.state(**id).wanted().is_some())
+            .count();
+        self.focus = Some(focus);
     }
 
     fn state(&self, id: KeyId) -> &KeyState {
@@ -302,24 +334,71 @@ impl State {
         {
             return;
         }
-        environment.keys.insert(name.to_owned(), id);
+        environment.keys.insert(Rc::from(name), id);
     }
 
     /// Put `environment` at `name`. One that didn't exist at this point
-    /// never displaces one that did.
+    /// never displaces one that did; the one left out is kept apart.
     fn place_environment(&mut self, name: &str, environment: TrackedEnvironment) {
         if let Some(existing) = self.environments.get(name)
             && !environment.exists
             && existing.exists
         {
+            self.detached.push(environment);
             return;
         }
-        self.environments.insert(name.to_owned(), environment);
+        if let Some(displaced) = self.environments.insert(Rc::from(name), environment) {
+            self.detached.push(displaced);
+        }
     }
 
     /// The key that exists now as `key` in `environment`.
     fn now(&self, environment: &str, key: &str) -> Option<KeyId> {
         self.now.get(environment)?.get(key).copied()
+    }
+
+    /// The environment `reference` names, with its name at the point.
+    fn environment(&self, reference: EnvironmentRef<'_>) -> Option<(&str, &TrackedEnvironment)> {
+        let at_point = |name: &str| {
+            self.environments
+                .get_key_value(name)
+                .map(|(name, tracked)| (&**name, tracked))
+        };
+        match reference {
+            EnvironmentRef::Now(name) => self
+                .environments
+                .iter()
+                .find(|(_, tracked)| tracked.current.as_deref() == Some(name))
+                .map(|(name, tracked)| (&**name, tracked))
+                .or_else(|| {
+                    self.detached.iter().find_map(|tracked| {
+                        tracked
+                            .current
+                            .as_deref()
+                            .filter(|current| *current == name)
+                            .map(|current| (current, tracked))
+                    })
+                })
+                .or_else(|| at_point(name)),
+            EnvironmentRef::AtPoint(name) => at_point(name),
+        }
+    }
+
+    /// The key a key rollback reads: the key named `key` now in the
+    /// environment, or the key its name had at the point.
+    fn key(
+        &self,
+        environment: EnvironmentRef<'_>,
+        key: &str,
+        current: &Values<'_>,
+    ) -> Option<KeyId> {
+        let (_, tracked) = self.environment(environment)?;
+        tracked
+            .current
+            .as_deref()
+            .filter(|name| current.environment(name).is_some())
+            .and_then(|name| self.now(name, key))
+            .or_else(|| tracked.keys.get(key).copied())
     }
 
     /// Make the derived state agree with `summary`, the state at this point
@@ -328,18 +407,18 @@ impl State {
     /// list is absent, and a key only the summary lists is unknown. The key
     /// set is complete again afterwards.
     fn reconcile(&mut self, summary: &Summary<'_>, reason: UnknownReason) {
-        let names: Vec<String> = self.environments.keys().cloned().collect();
+        let names: Vec<Name> = self.environments.keys().cloned().collect();
         for name in names {
             let mut environment = self
                 .environments
                 .remove(&name)
                 .expect("the name came from the map");
             environment.unnamed = None;
-            let recorded = summary.environments.get(name.as_str());
+            let recorded = summary.environments.get(&*name);
             environment.exists = recorded.is_some();
             for (key, id) in &environment.keys {
                 crate::work::note(crate::work::Work::KeyVisit);
-                match recorded.and_then(|recorded| recorded.get(key.as_str())) {
+                match recorded.and_then(|recorded| recorded.get(&**key)) {
                     None => {
                         if !self.state(*id).is_absent() {
                             self.set_state(*id, KeyState::Absent);
@@ -356,7 +435,7 @@ impl State {
                 for (key, slot) in recorded {
                     if !environment.keys.contains_key(*key) {
                         let id = self.add_key(None, KeyState::unknown(*slot, reason));
-                        environment.keys.insert((*key).to_owned(), id);
+                        environment.keys.insert(Rc::from(*key), id);
                     }
                 }
             }
@@ -372,15 +451,15 @@ impl State {
             };
             for (key, slot) in recorded {
                 let id = self.add_key(None, KeyState::unknown(*slot, reason));
-                environment.keys.insert((*key).to_owned(), id);
+                environment.keys.insert(Rc::from(*key), id);
             }
-            self.environments.insert((*name).to_owned(), environment);
+            self.environments.insert(Rc::from(*name), environment);
         }
     }
 
-    /// Note what `entry` tells about the keys it changed that exist now: a
-    /// gap it records, whether the key's current value came from a pull,
-    /// and with `changed_again`, that the key changed after the point.
+    /// Note what `entry` tells about the keys it changed: a gap it records,
+    /// whether the key's value after it came from a pull, and with
+    /// `changed_again`, that the key changed after the point.
     fn note(&mut self, entry: &Entry<'_>, changed_again: bool) {
         let outside = entry.action == Action::Outside;
         let pulled = (entry.action == Action::Pull).then(|| Pulled {
@@ -399,12 +478,7 @@ impl State {
                 continue;
             };
             for key_change in key_changes {
-                let Some(id) = environment
-                    .keys
-                    .get(key_change.key)
-                    .copied()
-                    .filter(|id| self.keys[*id].current.is_some())
-                else {
+                let Some(id) = environment.keys.get(key_change.key).copied() else {
                     continue;
                 };
                 let notes = self.notes.entry(id).or_default();
@@ -540,34 +614,67 @@ impl State {
         self.unresolved > 0
     }
 
-    /// Note a live gap on every key now whose value differs from the newest
-    /// summary.
-    fn note_live_gap(&mut self, summary: &Summary<'_>, since: Option<i64>) {
-        let mut gaps = Vec::new();
+    /// The live gap against the newest summary: the keys now whose value
+    /// differs from it, and the names of keys it lists that are gone now,
+    /// which the summary's reconcile gives an identity.
+    fn live_gap(&self, summary: &Summary<'_>) -> (Vec<KeyId>, Vec<(Name, Name)>) {
+        let mut changed = Vec::new();
         for (name, keys) in &self.now {
-            let recorded = summary.environments.get(name.as_str());
+            let recorded = summary.environments.get(&**name);
             for (key, id) in keys {
                 let same = recorded
-                    .and_then(|recorded| recorded.get(key.as_str()))
+                    .and_then(|recorded| recorded.get(&**key))
                     .is_some_and(|slot| self.state(*id).agrees_with(*slot));
                 if !same {
-                    gaps.push(*id);
+                    changed.push(*id);
                 }
             }
         }
-        for id in gaps {
-            self.notes
-                .entry(id)
-                .or_default()
-                .gaps
-                .push(Gap { since, until: None });
+        let mut gone = Vec::new();
+        for (name, recorded) in &summary.environments {
+            let now = self.now.get(*name);
+            for key in recorded.keys() {
+                if now.is_none_or(|now| !now.contains_key(*key)) {
+                    gone.push((Rc::from(*name), Rc::from(*key)));
+                }
+            }
         }
+        (changed, gone)
     }
 
-    fn notes(&self, id: Option<KeyId>) -> Notes {
-        id.and_then(|id| self.notes.get(&id))
-            .cloned()
-            .unwrap_or_default()
+    fn note_gap(&mut self, id: KeyId, since: Option<i64>) {
+        self.notes
+            .entry(id)
+            .or_default()
+            .gaps
+            .push(Gap { since, until: None });
+    }
+
+    fn take_notes(&mut self, id: Option<KeyId>) -> Notes {
+        id.and_then(|id| self.notes.remove(&id)).unwrap_or_default()
+    }
+
+    /// Wait only for what `target` reads: the environment's keys at the
+    /// point, the key, or the undone entry's "before" sides.
+    fn focus_on(&mut self, target: &Target, undone: Option<&OwnedEntry>, current: &Values<'_>) {
+        let focus: HashSet<KeyId> = match target {
+            Target::Environment { environment, .. } => self
+                .environment(environment.reference())
+                .filter(|(_, tracked)| tracked.exists)
+                .map(|(_, tracked)| tracked.keys.values().copied().collect())
+                .unwrap_or_default(),
+            Target::Key { environment, key } => self
+                .key(environment.reference(), key, current)
+                .into_iter()
+                .collect(),
+            Target::Undo { .. } => undone
+                .iter()
+                .flat_map(|undone| &undone.environments)
+                .flat_map(|change| change.keys.iter().flatten())
+                .map(|key_change| key_change.before)
+                .collect(),
+        };
+        self.set_focus(focus);
     }
 }
 
@@ -577,6 +684,8 @@ pub enum PlanError {
     Read(ReadError),
     /// No readable entry has that ID.
     EntryNotFound,
+    /// More than one entry starts with that ID.
+    AmbiguousEntry,
     /// The environment didn't exist at the point and doesn't now.
     UnknownEnvironment,
     /// The rollback would give an environment back a name another
@@ -589,6 +698,9 @@ impl fmt::Display for PlanError {
         match self {
             Self::Read(error) => write!(formatter, "{error}"),
             Self::EntryNotFound => formatter.write_str("no entry in local history has that ID"),
+            Self::AmbiguousEntry => {
+                formatter.write_str("more than one entry in local history starts with that ID")
+            }
             Self::UnknownEnvironment => {
                 formatter.write_str("that environment isn't in local history at that point")
             }
@@ -606,11 +718,77 @@ impl From<ReadError> for PlanError {
     }
 }
 
+/// How a rollback names its environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentRef<'a> {
+    /// As it's named now, as a person types it. A name no environment has
+    /// now is taken as the name at the point, which names a deleted one.
+    Now(&'a str),
+    /// As it was named at the point, as the entry there names it.
+    AtPoint(&'a str),
+}
+
+/// An owned [`EnvironmentRef`], for a choice made once the entry is found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentName {
+    Now(String),
+    AtPoint(String),
+}
+
+impl EnvironmentName {
+    pub fn reference(&self) -> EnvironmentRef<'_> {
+        match self {
+            Self::Now(name) => EnvironmentRef::Now(name),
+            Self::AtPoint(name) => EnvironmentRef::AtPoint(name),
+        }
+    }
+}
+
+impl From<EnvironmentRef<'_>> for EnvironmentName {
+    fn from(reference: EnvironmentRef<'_>) -> Self {
+        match reference {
+            EnvironmentRef::Now(name) => Self::Now(name.to_owned()),
+            EnvironmentRef::AtPoint(name) => Self::AtPoint(name.to_owned()),
+        }
+    }
+}
+
+/// What a rollback goes back to, chosen once its entry is found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// An environment's whole state after or before the entry.
+    Environment {
+        environment: EnvironmentName,
+        side: RelatedSide,
+    },
+    /// One key, named as it is now, back to its value before the entry.
+    Key {
+        environment: EnvironmentName,
+        key: String,
+    },
+    /// The keys the entry changed back to their values before it, in every
+    /// environment it touched, or in `only`.
+    Undo { only: Option<EnvironmentName> },
+}
+
+impl Target {
+    fn side(&self) -> RelatedSide {
+        match self {
+            Self::Environment { side, .. } => *side,
+            Self::Key { .. } => RelatedSide::Before,
+            Self::Undo { .. } => RelatedSide::After,
+        }
+    }
+}
+
 struct Walked {
     state: State,
-    /// The entry the walk stopped at, kept for undo plans.
-    entry: Option<OwnedEntry>,
-    target_time: i64,
+    info: EntryInfo,
+    target: Target,
+    point: Point,
+    point_time: i64,
+    /// The entry an undo reverts.
+    undone: Option<OwnedEntry>,
 }
 
 /// The parts of an entry an undo needs once its part's plaintext is gone.
@@ -677,85 +855,154 @@ fn owned(entry: &Entry<'_>, state: &mut State) -> OwnedEntry {
     }
 }
 
-/// Walk from `current` back to `point`, then on while unknown digests may
-/// still resolve.
-fn walk(
+/// Walk from `current` back to the entry `entry` names, let `choose` say
+/// what to roll back, then go on only while a key the plan reads may still
+/// resolve. A prefix shorter than a whole ID makes the walk read every part,
+/// so another entry starting the same way is found.
+fn walk<E: From<PlanError>>(
     opened: &Opened,
     source: &mut impl PartSource,
     current: &Values<'_>,
-    point: Point,
-) -> Result<Walked, PlanError> {
+    entry_id: &IdPrefix,
+    choose: impl FnOnce(&EntryInfo) -> Result<Target, E>,
+) -> Result<Walked, E> {
     let mut state = State::from_values(current, &opened.keys);
+    let mut choose = Some(choose);
+    let mut failure: Option<E> = None;
     let mut first_part = true;
     let mut skipped_unreadable = false;
-    let mut reached = false;
+    let mut found: Option<(EntryInfo, Target, Point, i64)> = None;
+    let mut undone: Option<OwnedEntry> = None;
+    // Set once the plan needs nothing more; the walk then only looks for
+    // another entry the prefix matches.
+    let mut done = false;
+    let mut ambiguous = false;
     // Set when the point is just before a part's oldest entry, so the next
     // part's summary is the state at the point itself.
     let mut point_at_boundary = false;
-    let mut walked_entry = None;
-    let mut target_time = 0;
-    opened.walk(source, |read| {
-        let decoded = match read {
-            PartRead::Unreadable { .. } => {
-                skipped_unreadable = true;
-                point_at_boundary = false;
-                return true;
-            }
-            PartRead::Readable { decoded, .. } => decoded,
-        };
-        let summary = opened.scrubbed_summary(&decoded.summary);
-        let reason = if skipped_unreadable {
-            UnknownReason::Unreadable
-        } else {
-            UnknownReason::NotRecorded
-        };
-        if first_part {
-            first_part = false;
-            state.note_live_gap(&summary, decoded.last_header().map(|header| header.time));
-        }
-        if !reached || point_at_boundary {
-            state.reconcile(&summary, reason);
-            point_at_boundary = false;
-        }
-        skipped_unreadable = false;
-        let oldest = decoded.decoded_entries().next().map(|entry| entry.id);
-        for entry in decoded.decoded_entries().rev() {
-            let entry = opened.scrubbed(entry);
-            if reached {
-                state.resolve(&entry);
-                if !state.has_unresolved() {
-                    return false;
+    opened
+        .walk(source, |read| {
+            let decoded = match read {
+                PartRead::Unreadable { .. } => {
+                    skipped_unreadable = true;
+                    point_at_boundary = false;
+                    return true;
                 }
-                continue;
+                PartRead::Readable { decoded, .. } => decoded,
+            };
+            if !done {
+                let summary = opened.scrubbed_summary(&decoded.summary);
+                let reason = if skipped_unreadable {
+                    UnknownReason::Unreadable
+                } else {
+                    UnknownReason::NotRecorded
+                };
+                if first_part {
+                    first_part = false;
+                    let since = decoded.last_header().map(|header| header.time);
+                    let (changed, gone) = state.live_gap(&summary);
+                    state.reconcile(&summary, reason);
+                    for id in changed {
+                        state.note_gap(id, since);
+                    }
+                    for (environment, key) in gone {
+                        if let Some(id) = state
+                            .environments
+                            .get(&environment)
+                            .and_then(|tracked| tracked.keys.get(&key))
+                            .copied()
+                        {
+                            state.note_gap(id, since);
+                        }
+                    }
+                } else if found.is_none() || point_at_boundary {
+                    state.reconcile(&summary, reason);
+                    if point_at_boundary {
+                        point_at_boundary = false;
+                        if let Some((_, target, ..)) = &found {
+                            state.focus_on(target, undone.as_ref(), current);
+                        }
+                        done = !state.has_unresolved();
+                    }
+                }
             }
-            if entry.id == point.entry {
-                target_time = entry.time;
-                walked_entry = Some(owned(&entry, &mut state));
+            skipped_unreadable = false;
+            let oldest = decoded.decoded_entries().next().map(|entry| entry.id);
+            for entry in decoded.decoded_entries().rev() {
+                if let Some((_, _, point, _)) = &found {
+                    if entry.id != point.entry && entry_id.matches(&entry.id) {
+                        ambiguous = true;
+                        return false;
+                    }
+                    if done {
+                        continue;
+                    }
+                    state.resolve(&opened.scrubbed(entry));
+                    if !state.has_unresolved() {
+                        done = true;
+                        if entry_id.is_whole() {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+                let entry = opened.scrubbed(entry);
+                if !entry_id.matches(&entry.id) {
+                    state.note(&entry, true);
+                    state.undo(&entry);
+                    state.resolve(&entry);
+                    continue;
+                }
+                let info = entry_info(&entry);
+                let chooser = choose.take().expect("one entry is chosen");
+                let target = match chooser(&info) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                };
+                let side = target.side();
+                if matches!(target, Target::Undo { .. }) {
+                    undone = Some(owned(&entry, &mut state));
+                }
                 state.note(&entry, false);
-                if point.side == RelatedSide::Before {
+                if side == RelatedSide::Before {
                     state.undo(&entry);
                     point_at_boundary = oldest == Some(entry.id);
                 }
-                reached = true;
+                state.focus_on(&target, undone.as_ref(), current);
                 state.resolve(&entry);
+                let point = Point {
+                    entry: entry.id,
+                    side,
+                };
+                found = Some((info, target, point, entry.time));
                 if !state.has_unresolved() && !point_at_boundary {
-                    return false;
+                    done = true;
+                    if entry_id.is_whole() {
+                        return false;
+                    }
                 }
-                continue;
             }
-            state.note(&entry, true);
-            state.undo(&entry);
-            state.resolve(&entry);
-        }
-        true
-    })?;
-    if !reached {
-        return Err(PlanError::EntryNotFound);
+            true
+        })
+        .map_err(|error| E::from(PlanError::from(error)))?;
+    if let Some(failure) = failure {
+        return Err(failure);
     }
+    if ambiguous {
+        return Err(E::from(PlanError::AmbiguousEntry));
+    }
+    let (info, target, point, point_time) =
+        found.ok_or_else(|| E::from(PlanError::EntryNotFound))?;
     Ok(Walked {
         state,
-        entry: walked_entry,
-        target_time,
+        info,
+        target,
+        point,
+        point_time,
+        undone,
     })
 }
 
@@ -820,6 +1067,28 @@ impl Row {
     fn shown(&self) -> bool {
         self.changes() || matches!(self.target, TargetValue::Unknown(_))
     }
+
+    fn new(key: &str, current: Option<&str>, target: TargetValue, notes: Notes) -> Self {
+        Self {
+            key: key.to_owned(),
+            current: current.map(|value| Zeroizing::new(value.to_owned())),
+            target,
+            gaps: notes.gaps,
+            pulled: notes.pulled,
+            changed_again: notes.changed_again,
+            linked: Vec::new(),
+        }
+    }
+}
+
+/// Whether a row from `target` to `current` would be shown, decided before
+/// anything is copied.
+fn shown(target: Option<&KeyState>, current: Option<&str>) -> bool {
+    match target {
+        Some(KeyState::Known { value, .. }) => current != Some(value.as_str()),
+        Some(KeyState::Unknown { .. }) => true,
+        Some(KeyState::Absent) | None => current.is_some(),
+    }
 }
 
 /// One environment of a rollback.
@@ -827,8 +1096,8 @@ impl Row {
 pub struct EnvironmentPlan {
     /// Its name now, or `None` when the rollback recreates it.
     pub current: Option<String>,
-    /// Its name at the point, or `None` when it didn't exist then, so the
-    /// rollback can delete it.
+    /// Its name after the rollback, or `None` when it didn't exist at the
+    /// point, so the rollback can delete it.
     pub target: Option<String>,
     pub rows: Vec<Row>,
     pub binding: Binding,
@@ -909,26 +1178,28 @@ fn key_binding(keys: &DigestKeys, value: Option<&str>) -> Option<Digest> {
 /// of a group whose earlier value is unknown unknown too: half a rename
 /// would lose the value or keep a copy.
 fn link_rows(rows: &mut [Row], links: &[(String, String)]) {
+    if links.is_empty() {
+        return;
+    }
     let index: HashMap<&str, usize> = rows
         .iter()
         .enumerate()
         .map(|(position, row)| (row.key.as_str(), position))
         .collect();
-    let mut groups = Groups::new(rows.len());
+    let mut groups = Groups::default();
     for (left, right) in links {
         if let (Some(left), Some(right)) = (index.get(left.as_str()), index.get(right.as_str())) {
             groups.join(*left, *right);
         }
     }
-    let members = groups.members();
-    for group in members.values().filter(|group| group.len() > 1) {
+    for group in groups.members() {
         let unknown = group
             .iter()
             .find_map(|position| match rows[*position].target {
                 TargetValue::Unknown(reason) => Some(reason),
                 _ => None,
             });
-        for position in group {
+        for position in &group {
             rows[*position].linked = group
                 .iter()
                 .filter(|other| *other != position)
@@ -941,40 +1212,46 @@ fn link_rows(rows: &mut [Row], links: &[(String, String)]) {
     }
 }
 
-/// Disjoint sets over row positions.
+/// Disjoint sets over the row positions that links name.
+#[derive(Default)]
 struct Groups {
-    parent: Vec<usize>,
+    parent: HashMap<usize, usize>,
 }
 
 impl Groups {
-    fn new(size: usize) -> Self {
-        Self {
-            parent: (0..size).collect(),
+    fn find(&mut self, position: usize) -> usize {
+        let parent = *self.parent.entry(position).or_insert(position);
+        if parent == position {
+            return position;
         }
-    }
-
-    fn find(&mut self, mut position: usize) -> usize {
-        while self.parent[position] != position {
-            self.parent[position] = self.parent[self.parent[position]];
-            position = self.parent[position];
-        }
-        position
+        let root = self.find(parent);
+        self.parent.insert(position, root);
+        root
     }
 
     fn join(&mut self, left: usize, right: usize) {
         let (left, right) = (self.find(left), self.find(right));
         if left != right {
-            self.parent[left.max(right)] = left.min(right);
+            self.parent.insert(left.max(right), left.min(right));
         }
     }
 
-    fn members(&mut self) -> BTreeMap<usize, Vec<usize>> {
+    /// Every group of two or more positions.
+    fn members(&mut self) -> Vec<Vec<usize>> {
+        let positions: Vec<usize> = self.parent.keys().copied().collect();
         let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for position in 0..self.parent.len() {
+        for position in positions {
             let root = self.find(position);
             members.entry(root).or_default().push(position);
         }
         members
+            .into_values()
+            .filter(|group| group.len() > 1)
+            .map(|mut group| {
+                group.sort_unstable();
+                group
+            })
+            .collect()
     }
 }
 
@@ -999,34 +1276,40 @@ fn check_target_name(
     }
 }
 
-/// How a rollback names its environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvironmentRef<'a> {
-    /// As it's named now, as a person types it. A name no environment has
-    /// now is taken as the name at the point, which names a deleted one.
-    Now(&'a str),
-    /// As it was named at the point, as the entry there names it.
-    AtPoint(&'a str),
-}
-
-impl State {
-    /// The environment `reference` names, with its name at the point.
-    fn environment(&self, reference: EnvironmentRef<'_>) -> Option<(&str, &TrackedEnvironment)> {
-        let at_point = |name: &str| {
-            self.environments
-                .get_key_value(name)
-                .map(|(name, tracked)| (name.as_str(), tracked))
-        };
-        match reference {
-            EnvironmentRef::Now(name) => self
-                .environments
-                .iter()
-                .find(|(_, tracked)| tracked.current.as_deref() == Some(name))
-                .map(|(name, tracked)| (name.as_str(), tracked))
-                .or_else(|| at_point(name)),
-            EnvironmentRef::AtPoint(name) => at_point(name),
+/// Find the entry `entry` names, let `choose` say what to roll back given
+/// that entry, and plan it, in one walk.
+pub fn plan_rollback<E: From<PlanError>>(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    current: &Values<'_>,
+    entry: &IdPrefix,
+    choose: impl FnOnce(&EntryInfo) -> Result<Target, E>,
+) -> Result<(EntryInfo, RollbackPlan), E> {
+    let mut walked = walk(opened, source, current, entry, choose)?;
+    let generation = opened.record.current().generation();
+    let target = walked.target.clone();
+    let plan = match &target {
+        Target::Environment { environment, .. } => {
+            plan_environment(&mut walked, current, &opened.keys, generation, environment)
         }
+        Target::Key { environment, key } => plan_key(
+            &mut walked,
+            current,
+            &opened.keys,
+            generation,
+            environment,
+            key,
+        ),
+        Target::Undo { only } => plan_undo_walked(
+            &mut walked,
+            current,
+            &opened.keys,
+            generation,
+            only.as_ref(),
+        ),
     }
+    .map_err(E::from)?;
+    Ok((walked.info, plan))
 }
 
 /// Plan rolling an environment back to its whole state at `point`.
@@ -1037,19 +1320,76 @@ pub fn plan_environment_rollback(
     environment: EnvironmentRef<'_>,
     point: Point,
 ) -> Result<RollbackPlan, PlanError> {
-    let walked = walk(opened, source, current, point)?;
+    plan_rollback(
+        opened,
+        source,
+        current,
+        &IdPrefix::whole(point.entry),
+        |_| {
+            Ok::<_, PlanError>(Target::Environment {
+                environment: environment.into(),
+                side: point.side,
+            })
+        },
+    )
+    .map(|(_, plan)| plan)
+}
+
+/// Plan rolling one key back to its value before `entry`, as the key
+/// inspector's Roll Back… does, so it never does nothing even on the newest
+/// change. `key` names it now; a key that doesn't exist now is the one its
+/// name had at the point.
+pub fn plan_key_rollback(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    current: &Values<'_>,
+    environment: EnvironmentRef<'_>,
+    key: &str,
+    entry: EntryId,
+) -> Result<RollbackPlan, PlanError> {
+    plan_rollback(opened, source, current, &IdPrefix::whole(entry), |_| {
+        Ok::<_, PlanError>(Target::Key {
+            environment: environment.into(),
+            key: key.to_owned(),
+        })
+    })
+    .map(|(_, plan)| plan)
+}
+
+/// Plan undoing `entry`: every key it changed goes back to its value before
+/// it, in every environment it touched.
+pub fn plan_undo(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    current: &Values<'_>,
+    entry: EntryId,
+) -> Result<RollbackPlan, PlanError> {
+    plan_rollback(opened, source, current, &IdPrefix::whole(entry), |_| {
+        Ok::<_, PlanError>(Target::Undo { only: None })
+    })
+    .map(|(_, plan)| plan)
+}
+
+fn plan_environment(
+    walked: &mut Walked,
+    current: &Values<'_>,
+    keys: &DigestKeys,
+    generation: u32,
+    environment: &EnvironmentName,
+) -> Result<RollbackPlan, PlanError> {
     let state = &walked.state;
-    let (environment, tracked) = state
-        .environment(environment)
+    let (point_name, tracked) = state
+        .environment(environment.reference())
         .ok_or(PlanError::UnknownEnvironment)?;
     let current_name = tracked
         .current
-        .clone()
-        .filter(|name| current.environment(name).is_some());
+        .as_deref()
+        .filter(|name| current.environment(name).is_some())
+        .map(str::to_owned);
     let current_values = current_name
         .as_deref()
         .and_then(|name| current.environment(name));
-    let target_name = tracked.exists.then(|| environment.to_owned());
+    let target_name = tracked.exists.then(|| point_name.to_owned());
     if current_name.is_none() && target_name.is_none() {
         return Err(PlanError::UnknownEnvironment);
     }
@@ -1066,162 +1406,167 @@ pub fn plan_environment_rollback(
             if state.state(*id).is_absent() {
                 continue;
             }
-            names.insert(name.as_str());
+            names.insert(name);
             if let Some(now) = state.keys[*id]
                 .current
                 .as_deref()
-                .filter(|now| *now != name && current_name.is_some())
+                .filter(|now| *now != &**name && current_name.is_some())
             {
-                links.push((name.clone(), now.to_owned()));
+                links.push((name.to_string(), now.to_owned()));
             }
         }
     }
     if let Some(values) = current_values {
         names.extend(values.keys().copied());
     }
-    let mut rows = Vec::with_capacity(names.len());
+    let mut chosen: Vec<(&str, Option<&str>, TargetValue, Option<KeyId>)> = Vec::new();
     for name in names {
-        let target = if tracked.exists {
-            tracked
-                .keys
-                .get(name)
-                .map_or(TargetValue::Absent, |id| state.state(*id).target())
-        } else {
-            TargetValue::Absent
-        };
+        let target_id = tracked.keys.get(name).copied().filter(|_| tracked.exists);
+        let target_state = target_id.map(|id| state.state(id));
         let current_value = current_values.and_then(|values| values.get(name)).copied();
-        let notes = state.notes(
-            current_name
-                .as_deref()
-                .and_then(|environment| state.now(environment, name)),
-        );
-        let row = Row {
-            key: name.to_owned(),
-            current: current_value.map(|value| Zeroizing::new(value.to_owned())),
-            target,
-            gaps: notes.gaps,
-            pulled: notes.pulled,
-            changed_again: None,
-            linked: Vec::new(),
-        };
-        if row.shown() {
-            rows.push(row);
+        if !shown(target_state, current_value) {
+            continue;
         }
+        let notes_id = current_name
+            .as_deref()
+            .and_then(|environment| state.now(environment, name))
+            .or(target_id);
+        chosen.push((
+            name,
+            current_value,
+            target_state.map_or(TargetValue::Absent, KeyState::target),
+            notes_id,
+        ));
+    }
+    let chosen: Vec<(String, Option<&str>, TargetValue, Option<KeyId>)> = chosen
+        .into_iter()
+        .map(|(name, current_value, target, id)| (name.to_owned(), current_value, target, id))
+        .collect();
+    let unnamed_keys = tracked.unnamed.filter(|_| tracked.exists);
+    let mut rows: Vec<Row> = Vec::with_capacity(chosen.len());
+    for (name, current_value, target, id) in chosen {
+        let notes = walked.state.take_notes(id);
+        let mut row = Row::new(&name, current_value, target, notes);
+        row.changed_again = None;
+        rows.push(row);
     }
     link_rows(&mut rows, &links);
     Ok(RollbackPlan {
         kind: RollbackKind::Environment,
-        point,
-        point_time: walked.target_time,
-        generation: opened.record.current().generation(),
+        point: walked.point,
+        point_time: walked.point_time,
+        generation,
         environments: vec![EnvironmentPlan {
-            binding: Binding::Environment(environment_binding(&opened.keys, current_values)),
+            binding: Binding::Environment(environment_binding(keys, current_values)),
             current: current_name,
             target: target_name,
             rows,
-            unnamed_keys: tracked.unnamed.filter(|_| tracked.exists),
+            unnamed_keys,
         }],
     })
 }
 
-/// Plan rolling one key back to its value before `entry`, as the key
-/// inspector's Roll Back… does, so it never does nothing even on the newest
-/// change. `key` names it now; a key that doesn't exist now is the one its
-/// name had at the point.
-pub fn plan_key_rollback(
-    opened: &Opened,
-    source: &mut impl PartSource,
+fn plan_key(
+    walked: &mut Walked,
     current: &Values<'_>,
-    environment: EnvironmentRef<'_>,
+    keys: &DigestKeys,
+    generation: u32,
+    environment: &EnvironmentName,
     key: &str,
-    entry: EntryId,
 ) -> Result<RollbackPlan, PlanError> {
-    let point = Point {
-        entry,
-        side: RelatedSide::Before,
-    };
-    let walked = walk(opened, source, current, point)?;
     let state = &walked.state;
     let (point_name, tracked) = state
-        .environment(environment)
+        .environment(environment.reference())
         .ok_or(PlanError::UnknownEnvironment)?;
-    let environment = tracked
+    let environment_now = tracked
         .current
         .as_deref()
-        .filter(|name| current.environment(name).is_some())
-        .unwrap_or(point_name);
-    let now = state.now(environment, key);
-    let id = now.or_else(|| tracked.keys.get(key).copied());
+        .filter(|name| current.environment(name).is_some());
+    if environment_now.is_none() {
+        check_target_name(current, None, Some(point_name), &BTreeSet::new())?;
+    }
+    let environment_name = environment_now.unwrap_or(point_name).to_owned();
+    let id = state.key(environment.reference(), key, current);
+    let key_now = id
+        .and_then(|id| state.keys[id].current.as_deref())
+        .filter(|name| current.get(&environment_name, name).is_some())
+        .unwrap_or(key)
+        .to_owned();
     let target = id.map_or(TargetValue::Absent, |id| state.state(id).target());
-    let notes = state.notes(now);
-    let current_value = current.get(environment, key);
-    let row = Row {
-        key: key.to_owned(),
-        current: current_value.map(|value| Zeroizing::new(value.to_owned())),
-        target,
-        gaps: notes.gaps,
-        pulled: notes.pulled,
-        changed_again: None,
-        linked: Vec::new(),
-    };
+    let current_value = current.get(&environment_name, &key_now);
+    let binding = Binding::Key(key_binding(keys, current_value));
+    let environment_exists = current.environment(&environment_name).is_some();
+    let notes = walked.state.take_notes(id);
+    let mut row = Row::new(&key_now, current_value, target, notes);
+    row.changed_again = None;
     Ok(RollbackPlan {
         kind: RollbackKind::Key,
-        point,
-        point_time: walked.target_time,
-        generation: opened.record.current().generation(),
+        point: walked.point,
+        point_time: walked.point_time,
+        generation,
         environments: vec![EnvironmentPlan {
-            current: current
-                .environment(environment)
-                .map(|_| environment.to_owned()),
-            target: Some(environment.to_owned()),
+            current: environment_exists.then(|| environment_name.clone()),
+            target: Some(environment_name),
             rows: vec![row],
-            binding: Binding::Key(key_binding(&opened.keys, current_value)),
+            binding,
             unnamed_keys: None,
         }],
     })
 }
 
-/// Plan undoing `entry`: every key it changed goes back to its value before
-/// it, in every environment it touched.
-pub fn plan_undo(
-    opened: &Opened,
-    source: &mut impl PartSource,
+fn plan_undo_walked(
+    walked: &mut Walked,
     current: &Values<'_>,
-    entry: EntryId,
+    keys: &DigestKeys,
+    generation: u32,
+    only: Option<&EnvironmentName>,
 ) -> Result<RollbackPlan, PlanError> {
-    let point = Point {
-        entry,
-        side: RelatedSide::After,
-    };
-    let walked = walk(opened, source, current, point)?;
+    let undone = walked
+        .undone
+        .take()
+        .expect("an undo walk keeps the entry it reverts");
     let state = &walked.state;
-    let undone = walked.entry.as_ref().expect("the walk reached the entry");
-    let mut names = Vec::with_capacity(undone.environments.len());
+    let mut chosen: Vec<(&OwnedEnvironmentChange, Option<String>, Option<String>)> =
+        Vec::with_capacity(undone.environments.len());
     for change in &undone.environments {
         let current_name = state
             .environments
-            .get(&change.name)
-            .and_then(|tracked| tracked.current.clone())
-            .filter(|name| current.environment(name).is_some());
+            .get(change.name.as_str())
+            .and_then(|tracked| tracked.current.as_deref())
+            .filter(|name| current.environment(name).is_some())
+            .map(str::to_owned);
         let target_name = match &change.kind {
             OwnedEnvironmentKind::Created => None,
             OwnedEnvironmentKind::RenamedFrom(from) => Some(from.clone()),
             OwnedEnvironmentKind::Unchanged | OwnedEnvironmentKind::Removed => {
-                Some(change.name.clone())
+                Some(current_name.clone().unwrap_or_else(|| change.name.clone()))
             }
         };
-        names.push((current_name, target_name));
-    }
-    let freed: BTreeSet<&str> = names
-        .iter()
-        .filter_map(|(current_name, target_name)| match current_name {
-            Some(current_name) if target_name.as_ref() != Some(current_name) => {
-                Some(current_name.as_str())
+        let wanted = only.is_none_or(|only| match only {
+            EnvironmentName::Now(name) => current_name.as_deref() == Some(name.as_str()),
+            EnvironmentName::AtPoint(name) => {
+                change.name == *name || target_name.as_deref() == Some(name.as_str())
             }
-            _ => None,
-        })
+        });
+        if wanted {
+            chosen.push((change, current_name, target_name));
+        }
+    }
+    if chosen.is_empty() {
+        return Err(PlanError::UnknownEnvironment);
+    }
+    let freed: BTreeSet<&str> = chosen
+        .iter()
+        .filter_map(
+            |(_, current_name, target_name)| match (current_name, target_name) {
+                (Some(current_name), Some(target_name)) if target_name != current_name => {
+                    Some(current_name.as_str())
+                }
+                _ => None,
+            },
+        )
         .collect();
-    for (current_name, target_name) in &names {
+    for (_, current_name, target_name) in &chosen {
         check_target_name(
             current,
             current_name.as_deref(),
@@ -1229,25 +1574,31 @@ pub fn plan_undo(
             &freed,
         )?;
     }
-    let mut environments = Vec::with_capacity(undone.environments.len());
-    for (change, (current_name, target_name)) in undone.environments.iter().zip(names) {
-        let tracked = state.environments.get(&change.name);
+    /// One row before its notes: key, current value, target, the key whose
+    /// notes it shows, and whether it's a renamed key's name leaving.
+    type PlannedRow = (String, Option<String>, TargetValue, Option<KeyId>, bool);
+    struct Planned {
+        rows: Vec<PlannedRow>,
+        links: Vec<(String, String)>,
+    }
+    let mut planned: Vec<Planned> = Vec::with_capacity(chosen.len());
+    for (change, current_name, _) in &chosen {
+        let tracked = state.environments.get(change.name.as_str());
         let current_values = current_name
             .as_deref()
             .and_then(|name| current.environment(name));
-        let mut rows: BTreeMap<String, Row> = BTreeMap::new();
+        let mut rows: BTreeMap<String, (Option<String>, TargetValue, Option<KeyId>, bool)> =
+            BTreeMap::new();
         let mut links = Vec::new();
         for key_change in change.keys.iter().flatten() {
             let id_now = tracked
-                .and_then(|tracked| tracked.keys.get(&key_change.key))
+                .and_then(|tracked| tracked.keys.get(key_change.key.as_str()))
                 .copied()
                 .filter(|id| state.keys[*id].current.is_some());
             let current_key = id_now
-                .and_then(|id| state.keys[id].current.clone())
-                .filter(|name| {
-                    current_values.is_some_and(|values| values.contains_key(name.as_str()))
-                });
-            let notes = state.notes(id_now.filter(|_| current_key.is_some()));
+                .and_then(|id| state.keys[id].current.as_deref())
+                .filter(|name| current_values.is_some_and(|values| values.contains_key(name)))
+                .map(str::to_owned);
             let target = state.state(key_change.before).target();
             let target_key = key_change
                 .renamed_from
@@ -1258,40 +1609,75 @@ pub fn plan_undo(
             } else {
                 current_key.clone().unwrap_or_else(|| target_key.clone())
             };
+            let notes_id = id_now.filter(|_| current_key.is_some());
             if let Some(leaving) = current_key
                 .as_ref()
                 .filter(|leaving| key_change.renamed_from.is_some() && **leaving != row_key)
             {
                 links.push((leaving.clone(), row_key.clone()));
-                rows.entry(leaving.clone()).or_insert_with(|| Row {
-                    key: leaving.clone(),
-                    current: current_values
-                        .and_then(|values| values.get(leaving.as_str()))
-                        .map(|value| Zeroizing::new((*value).to_owned())),
-                    target: TargetValue::Absent,
-                    gaps: notes.gaps.clone(),
-                    pulled: notes.pulled.clone(),
-                    changed_again: notes.changed_again.clone(),
-                    linked: Vec::new(),
+                rows.entry(leaving.clone()).or_insert_with(|| {
+                    (
+                        current_values
+                            .and_then(|values| values.get(leaving.as_str()))
+                            .map(|value| (*value).to_owned()),
+                        TargetValue::Absent,
+                        notes_id,
+                        true,
+                    )
                 });
             }
-            let row = Row {
-                current: current_values
-                    .and_then(|values| values.get(row_key.as_str()))
-                    .map(|value| Zeroizing::new((*value).to_owned())),
-                key: row_key.clone(),
-                target,
-                gaps: notes.gaps,
-                pulled: notes.pulled,
-                changed_again: notes.changed_again,
-                linked: Vec::new(),
-            };
-            rows.insert(row_key, row);
+            let current_value = current_values
+                .and_then(|values| values.get(row_key.as_str()))
+                .map(|value| (*value).to_owned());
+            rows.insert(row_key, (current_value, target, notes_id, false));
         }
-        let mut rows: Vec<Row> = rows.into_values().filter(Row::shown).collect();
-        link_rows(&mut rows, &links);
+        planned.push(Planned {
+            rows: rows
+                .into_iter()
+                .map(|(key, (current_value, target, id, leaving))| {
+                    (key, current_value, target, id, leaving)
+                })
+                .collect(),
+            links,
+        });
+    }
+    let mut environments = Vec::with_capacity(chosen.len());
+    let bindings: Vec<Option<Digest>> = chosen
+        .iter()
+        .map(|(_, current_name, _)| {
+            environment_binding(
+                keys,
+                current_name
+                    .as_deref()
+                    .and_then(|name| current.environment(name)),
+            )
+        })
+        .collect();
+    let mut shared: HashMap<KeyId, Notes> = HashMap::new();
+    for (((change, current_name, target_name), planned), binding) in
+        chosen.into_iter().zip(planned).zip(bindings)
+    {
+        let mut rows: Vec<Row> = Vec::with_capacity(planned.rows.len());
+        for (key, current_value, target, id, leaving) in planned.rows {
+            // A rename's two rows share its key's notes.
+            let notes = match id {
+                Some(id) if leaving => shared
+                    .entry(id)
+                    .or_insert_with(|| walked.state.take_notes(Some(id)))
+                    .clone(),
+                Some(id) => shared
+                    .remove(&id)
+                    .unwrap_or_else(|| walked.state.take_notes(Some(id))),
+                None => Notes::default(),
+            };
+            let row = Row::new(&key, current_value.as_deref(), target, notes);
+            if row.shown() {
+                rows.push(row);
+            }
+        }
+        link_rows(&mut rows, &planned.links);
         environments.push(EnvironmentPlan {
-            binding: Binding::Environment(environment_binding(&opened.keys, current_values)),
+            binding: Binding::Environment(binding),
             current: current_name,
             target: target_name,
             rows,
@@ -1300,9 +1686,9 @@ pub fn plan_undo(
     }
     Ok(RollbackPlan {
         kind: RollbackKind::Undo,
-        point,
-        point_time: walked.target_time,
-        generation: opened.record.current().generation(),
+        point: walked.point,
+        point_time: walked.point_time,
+        generation,
         environments,
     })
 }

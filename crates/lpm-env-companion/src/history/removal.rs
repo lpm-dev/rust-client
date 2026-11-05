@@ -23,7 +23,9 @@ use crate::append_log::{HISTORY, Head, MAX_REMOVAL_PLACES, Removing};
 use crate::history::codec::{
     Entry, EntryId, EnvironmentKind, KeyKind, Keys, Part, RelatedSide, Side, encode_part,
 };
-use crate::history::read::{Opened, PartRead, PartSource, ReadError, Scrub};
+use crate::history::read::{
+    EntryInfo, IdPrefix, Opened, PartRead, PartSource, ReadError, Scrub, entry_info,
+};
 use crate::history::values::Values;
 use crate::history::{RecordWrite, head_account, key_account, part_account, part_identity};
 use crate::keyring::{self, Approval, Digest, DigestKeys, KeyRecord, Random, RotationError};
@@ -110,6 +112,8 @@ pub enum RemovalError {
     Limit,
     /// The values or the key changed since the review.
     ChangedSinceReview,
+    /// More than one entry starts with that ID.
+    AmbiguousEntry,
     /// The key can't rotate again.
     GenerationExhausted,
     /// A rotation or removal is already running.
@@ -135,6 +139,9 @@ impl fmt::Display for RemovalError {
             ),
             Self::ChangedSinceReview => {
                 formatter.write_str("the values changed since the removal was reviewed")
+            }
+            Self::AmbiguousEntry => {
+                formatter.write_str("more than one entry in local history starts with that ID")
             }
             Self::GenerationExhausted => formatter.write_str(
                 "local history's key can't rotate any more. Turn history off and on to start a new history",
@@ -197,7 +204,8 @@ impl Aliases {
 /// review is for.
 struct Sighting {
     digest: Digest,
-    place: (String, String),
+    environment: String,
+    key: String,
     time: i64,
     set: bool,
     seq: u64,
@@ -225,55 +233,163 @@ impl Found {
     }
 }
 
+/// The side a removal starts from, chosen once its entry is found: a key's
+/// value before or after the entry, named as the entry names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenSide {
+    pub environment: String,
+    pub key: String,
+    pub side: RelatedSide,
+}
+
+/// The most sides a review holds, names and digests only, before it knows
+/// which value it's for. Past it, it drops them and reads the parts newer
+/// than the chosen entry again, so its memory stays bounded.
+pub const MAX_SIGHTINGS: usize = 8 * 1024;
+
 /// Review removing the value `chosen` names: every place it appears, in
-/// every readable part, grouped and with its occurrences. One walk: sides
-/// read before the chosen entry are held, names and digests only, until
-/// its value is known.
+/// every readable part, grouped and with its occurrences.
 pub fn review_removal(
     opened: &Opened,
     source: &mut impl PartSource,
     current: &Values<'_>,
     chosen: Chosen<'_>,
 ) -> Result<RemovalReview, RemovalError> {
+    review_removal_for(
+        opened,
+        source,
+        current,
+        &IdPrefix::whole(chosen.entry),
+        |_| {
+            Ok::<_, RemovalError>(ChosenSide {
+                environment: chosen.environment.to_owned(),
+                key: chosen.key.to_owned(),
+                side: chosen.side,
+            })
+        },
+    )
+    .map(|(_, review)| review)
+}
+
+/// Find the entry `entry` names, let `choose` say which of its values to
+/// remove, and review it, in one walk: sides read before the entry is
+/// found are held, names and digests only, until its value is known.
+pub fn review_removal_for<E: From<RemovalError>>(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    current: &Values<'_>,
+    entry: &IdPrefix,
+    choose: impl FnOnce(&EntryInfo) -> Result<ChosenSide, E>,
+) -> Result<(EntryInfo, RemovalReview), E> {
     if opened.record.is_rotating() || opened.head.removing.is_some() {
-        return Err(RemovalError::Running);
+        return Err(E::from(RemovalError::Running));
     }
+    let mut choose = Some(choose);
+    let mut failure: Option<E> = None;
+    let mut chosen: Option<(EntryInfo, ChosenSide, EntryId)> = None;
     let mut value: Option<Option<Digest>> = None;
+    let mut ambiguous = false;
     let mut found = Found::default();
     let mut sightings: Vec<Sighting> = Vec::new();
+    let mut overflowed = false;
+    // Entries read before the chosen one, which a second walk reads again
+    // when the sightings overflowed.
+    let mut before_chosen: HashSet<EntryId> = HashSet::new();
     let mut entries: HashSet<EntryId> = HashSet::new();
-    opened.walk(source, |read| {
-        let PartRead::Readable { decoded, .. } = read else {
-            return true;
-        };
-        for entry in decoded.decoded_entries() {
-            if !entries.insert(entry.id) {
-                continue;
-            }
-            if value.is_none() && entry.id == chosen.entry {
-                let Some(side) = side_of(entry, chosen) else {
-                    return false;
-                };
-                let digest = side.digest();
-                value = Some(digest);
-                let Some(digest) = digest else {
-                    return false;
-                };
-                for sighting in sightings.drain(..) {
-                    if sighting.digest == digest {
-                        found.add(sighting.place, sighting.time, sighting.set, sighting.seq);
+    opened
+        .walk(source, |read| {
+            let PartRead::Readable { decoded, .. } = read else {
+                return true;
+            };
+            for candidate in decoded.decoded_entries() {
+                if !entries.insert(candidate.id) {
+                    continue;
+                }
+                if entry.matches(&candidate.id) {
+                    if chosen.is_some() {
+                        ambiguous = true;
+                        return false;
                     }
+                    let info = entry_info(&opened.scrubbed(candidate));
+                    let side = match choose.take().expect("one entry is chosen")(&info) {
+                        Ok(side) => side,
+                        Err(error) => {
+                            failure = Some(error);
+                            return false;
+                        }
+                    };
+                    let digest = side_of(candidate, &side).map(|side| side.digest());
+                    let Some(digest) = digest else {
+                        failure = Some(E::from(RemovalError::NotFound));
+                        return false;
+                    };
+                    value = Some(digest);
+                    let Some(digest) = digest else {
+                        failure = Some(E::from(RemovalError::NothingToRemove));
+                        return false;
+                    };
+                    chosen = Some((info, side, candidate.id));
+                    for sighting in sightings.drain(..) {
+                        if sighting.digest == digest {
+                            found.add(
+                                (sighting.environment, sighting.key),
+                                sighting.time,
+                                sighting.set,
+                                sighting.seq,
+                            );
+                        }
+                    }
+                } else if chosen.is_none() {
+                    before_chosen.insert(candidate.id);
+                }
+                let held = (!overflowed && chosen.is_none()).then_some(&mut sightings);
+                collect(candidate, value.flatten(), &mut found, held);
+                if sightings.len() > MAX_SIGHTINGS {
+                    sightings = Vec::new();
+                    overflowed = true;
                 }
             }
-            collect(entry, value.flatten(), &mut found, &mut sightings);
-        }
-        true
-    })?;
+            true
+        })
+        .map_err(|error| E::from(RemovalError::from(error)))?;
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    if ambiguous {
+        return Err(E::from(RemovalError::AmbiguousEntry));
+    }
+    let (info, side, _) = chosen.ok_or_else(|| E::from(RemovalError::NotFound))?;
     let value = value
-        .ok_or(RemovalError::NotFound)?
-        .ok_or(RemovalError::NothingToRemove)?;
+        .flatten()
+        .ok_or_else(|| E::from(RemovalError::NothingToRemove))?;
     drop(sightings);
+    if overflowed {
+        let mut again: HashSet<EntryId> = HashSet::new();
+        opened
+            .walk(source, |read| {
+                let PartRead::Readable { decoded, .. } = read else {
+                    return true;
+                };
+                for candidate in decoded.decoded_entries() {
+                    if before_chosen.contains(&candidate.id) && again.insert(candidate.id) {
+                        collect_sides(candidate, value, &mut found);
+                    }
+                }
+                again.len() < before_chosen.len()
+            })
+            .map_err(|error| E::from(RemovalError::from(error)))?;
+    }
+    let review = places_of(opened, current, value, found, &side);
+    Ok((info, review))
+}
 
+fn places_of(
+    opened: &Opened,
+    current: &Values<'_>,
+    value: Digest,
+    found: Found,
+    chosen: &ChosenSide,
+) -> RemovalReview {
     let mut environments = Aliases::default();
     for (from, to) in &found.environment_renames {
         environments.link(from, to);
@@ -286,8 +402,8 @@ pub fn review_removal(
     let mut places: BTreeMap<(String, String), Place> = BTreeMap::new();
     let mut newest: BTreeMap<(String, String), u64> = BTreeMap::new();
     let chosen_identity = {
-        let environment = environments.root(chosen.environment);
-        keys.root(&key_identity(&environment, chosen.key))
+        let environment = environments.root(&chosen.environment);
+        keys.root(&key_identity(&environment, &chosen.key))
     };
     for ((environment, key), events) in &found.events {
         let environment_root = environments.root(environment);
@@ -366,11 +482,11 @@ pub fn review_removal(
             &right.environment,
         ))
     });
-    Ok(RemovalReview {
+    RemovalReview {
         value,
         generation: opened.record.current().generation(),
         places: out,
-    })
+    }
 }
 
 /// The place digest of every key that holds `value` now. A place is
@@ -399,7 +515,7 @@ fn key_identity(environment_root: &str, key: &str) -> String {
     identity
 }
 
-fn side_of<'a>(entry: &Entry<'a>, chosen: Chosen<'_>) -> Option<Side<'a>> {
+fn side_of<'a>(entry: &Entry<'a>, chosen: &ChosenSide) -> Option<Side<'a>> {
     entry.environments.iter().find_map(|environment| {
         if environment.name != chosen.environment {
             return None;
@@ -418,21 +534,70 @@ fn side_of<'a>(entry: &Entry<'a>, chosen: Chosen<'_>) -> Option<Side<'a>> {
 }
 
 /// Collect `entry`'s renames and its sides that hold `value`, or, before
-/// the value is known, every side that holds some value.
+/// the value is known, every side that holds some value into `sightings`
+/// while they're held.
 fn collect(
     entry: &Entry<'_>,
     value: Option<Digest>,
     found: &mut Found,
-    sightings: &mut Vec<Sighting>,
+    sightings: Option<&mut Vec<Sighting>>,
 ) {
     for environment in &entry.environments {
-        let before_environment = match environment.kind {
-            EnvironmentKind::RenamedFrom(from) => {
-                found
-                    .environment_renames
-                    .push((from.to_owned(), environment.name.to_owned()));
-                from
+        if let EnvironmentKind::RenamedFrom(from) = environment.kind {
+            found
+                .environment_renames
+                .push((from.to_owned(), environment.name.to_owned()));
+        }
+        let Keys::Changes(changes) = &environment.keys else {
+            continue;
+        };
+        for change in changes {
+            if let KeyKind::RenamedFrom(from) = change.kind {
+                found.key_renames.push((
+                    environment.name.to_owned(),
+                    from.to_owned(),
+                    change.key.to_owned(),
+                ));
             }
+        }
+    }
+    match (value, sightings) {
+        (Some(value), _) => collect_sides(entry, value, found),
+        (None, Some(sightings)) => each_side(entry, |digest, environment, key, set| {
+            sightings.push(Sighting {
+                digest,
+                environment: environment.to_owned(),
+                key: key.to_owned(),
+                time: entry.time,
+                set,
+                seq: entry.seq,
+            });
+        }),
+        (None, None) => {}
+    }
+}
+
+/// Collect `entry`'s sides that hold `value`.
+fn collect_sides(entry: &Entry<'_>, value: Digest, found: &mut Found) {
+    each_side(entry, |digest, environment, key, set| {
+        if digest == value {
+            found.add(
+                (environment.to_owned(), key.to_owned()),
+                entry.time,
+                set,
+                entry.seq,
+            );
+        }
+    });
+}
+
+/// Every side of `entry` with a digest, under the names it had: a "before"
+/// side under the names before the entry, an "after" side under the names
+/// after it.
+fn each_side(entry: &Entry<'_>, mut visit: impl FnMut(Digest, &str, &str, bool)) {
+    for environment in &entry.environments {
+        let before_environment = match environment.kind {
+            EnvironmentKind::RenamedFrom(from) => from,
             _ => environment.name,
         };
         let Keys::Changes(changes) = &environment.keys else {
@@ -440,35 +605,14 @@ fn collect(
         };
         for change in changes {
             let before_key = match change.kind {
-                KeyKind::RenamedFrom(from) => {
-                    found.key_renames.push((
-                        environment.name.to_owned(),
-                        from.to_owned(),
-                        change.key.to_owned(),
-                    ));
-                    from
-                }
+                KeyKind::RenamedFrom(from) => from,
                 _ => change.key,
             };
-            for (side, environment_name, key, set) in [
-                (&change.before, before_environment, before_key, false),
-                (&change.after, environment.name, change.key, true),
-            ] {
-                let Some(digest) = side.digest() else {
-                    continue;
-                };
-                let place = (environment_name.to_owned(), key.to_owned());
-                match value {
-                    Some(value) if digest == value => found.add(place, entry.time, set, entry.seq),
-                    Some(_) => {}
-                    None => sightings.push(Sighting {
-                        digest,
-                        place,
-                        time: entry.time,
-                        set,
-                        seq: entry.seq,
-                    }),
-                }
+            if let Some(digest) = change.before.digest() {
+                visit(digest, before_environment, before_key, false);
+            }
+            if let Some(digest) = change.after.digest() {
+                visit(digest, environment.name, change.key, true);
             }
         }
     }

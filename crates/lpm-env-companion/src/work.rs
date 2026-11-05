@@ -12,6 +12,8 @@ pub(crate) enum Work {
     KeyVisit,
     /// One step through a removal review's rename groups.
     AliasStep,
+    /// One entry built into a listing.
+    Listed,
 }
 
 #[cfg(test)]
@@ -27,6 +29,7 @@ fn name(work: Work) -> &'static str {
         Work::PartDecode => "part decode",
         Work::KeyVisit => "key visit",
         Work::AliasStep => "alias step",
+        Work::Listed => "listed",
     }
 }
 

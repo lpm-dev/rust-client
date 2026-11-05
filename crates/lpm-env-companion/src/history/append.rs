@@ -470,10 +470,20 @@ fn finish<'v>(
     random: &mut impl Random,
 ) -> Result<AppendPlan, NotRecorded> {
     let keys = record.digest_keys(vault_id);
-    let before_summary = cache
-        .before_summary
-        .get_or_insert_with(|| change.before.summary(&keys))
-        .clone();
+    // Only a plan that may still ask admission is planned again.
+    let may_ask = matches!(
+        shape,
+        Shape::SteadyOrSlide(Growth::Unasked) | Shape::SteadyOrRollover(Growth::Unasked)
+    );
+    let before_summary = match cache.before_summary.take() {
+        Some(summary) if may_ask => cache.before_summary.insert(summary).clone(),
+        Some(summary) => summary,
+        None if may_ask => cache
+            .before_summary
+            .insert(change.before.summary(&keys))
+            .clone(),
+        None => change.before.summary(&keys),
+    };
     let gaps = gap_changes(baseline, change.before, &before_summary);
     let changes = net_change(
         change.before,
