@@ -794,6 +794,14 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
         project.home().join(".lpm/security-policy.toml").as_os_str(),
     );
 
+    // A test that needs OSV mounts the mock's endpoint and sets LPM_OSV_URL to
+    // it. Every other command gets an address nothing can listen on, so no test
+    // depends on api.osv.dev being up; osv_live removes this on purpose.
+    cmd.set_env(
+        "LPM_OSV_URL",
+        OsStr::new("http://127.0.0.1:0/v1/querybatch"),
+    );
+
     // Clear auth tokens to prevent accidental network calls with real creds
     cmd.remove_env("LPM_TOKEN");
     cmd.remove_env("LPM_REMOTE_CACHE");
