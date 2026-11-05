@@ -806,9 +806,10 @@ fn wrap_keys_for_members<'recipient>(
     }
 
     if wrapped_keys.is_empty() {
-        return Err(
-            "no org members have valid public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".into(),
-        );
+        return Err(format!(
+            "no org members have valid public keys. {}",
+            super::recipient_set::REGISTER_MEMBER_KEY_HINT
+        ));
     }
 
     Ok(wrapped_keys)

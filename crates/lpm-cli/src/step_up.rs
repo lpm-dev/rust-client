@@ -106,11 +106,15 @@ pub async fn request_cli_step_up_proof(
                  (Settings → Security) and retry."
             )))
         }
-        other => Err(LpmError::Script(format!(
-            "server returned unknown step-up method `{other}` — your CLI may be too old; \
-             try upgrading with `lpm upgrade`"
-        ))),
+        other => Err(unknown_step_up_method(other)),
     }
+}
+
+fn unknown_step_up_method(method: &str) -> LpmError {
+    LpmError::Script(format!(
+        "server returned unknown step-up method `{method}`. This LPM CLI may be too old: \
+         update it with `lpm self-update`"
+    ))
 }
 
 /// Whether to approve in the browser rather than type the password and an
@@ -209,4 +213,18 @@ async fn totp_step_up(
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unknown_step_up_method;
+
+    #[test]
+    fn an_unknown_method_points_to_self_update() {
+        let message = unknown_step_up_method("webauthn").to_string();
+
+        assert!(message.contains("`webauthn`"), "{message}");
+        assert!(message.contains("lpm self-update"), "{message}");
+        assert!(!message.contains("lpm upgrade"), "{message}");
+    }
 }
