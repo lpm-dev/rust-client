@@ -39,9 +39,11 @@ def package(name, version='1.0.0', source=REGISTRY, license='MIT', directory=Non
     }
 
 
-def metadata(packages, edges):
-    """`cargo metadata` output for packages, with edges from a package's id to (dependency id, kind)."""
-    return {'packages': packages, 'resolve': {'nodes': [
+def metadata(packages, edges, workspace=None):
+    """`cargo metadata` output for packages, with edges from a package's id to (dependency id, kind). The
+    workspace members are the given ids, or else every package without a source."""
+    members = workspace if workspace is not None else [entry['id'] for entry in packages if entry['source'] is None]
+    return {'packages': packages, 'workspace_members': members, 'resolve': {'nodes': [
         {'id': entry['id'], 'deps': [{'pkg': dependency, 'dep_kinds': [{'kind': kind, 'target': None}]} for dependency, kind in edges.get(entry['id'], [])]}
         for entry in packages]}}
 
@@ -121,6 +123,43 @@ class EngineExportTests(unittest.TestCase):
 
             (root / 'crates/lpm-build-helper/Cargo.toml').write_text('[dependencies]\noutside = { path = "../../../elsewhere" }\n')
             with self.assertRaisesRegex(RuntimeError, 'outside the repository: outside'):
+                exporter.engine_crates(root)
+
+    def test_provenance_covers_each_patched_directory_the_engine_reaches_and_no_other(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_sources(root)
+            manifests = {
+                'Cargo.toml': MANIFESTS['Cargo.toml'] + '\n[patch.crates-io]\nzxcvbn = { path = "vendor/zxcvbn" }\nring = { path = "vendor/ring" }\noxc_parser = { path = "vendor/oxc_parser" }\n',
+                'crates/lpm-env-ffi/Cargo.toml': '[dependencies]\nlpm-env-source.workspace = true\nstrength = { version = "3", package = "zxcvbn" }\naes = "1"\n[dev-dependencies]\noxc_parser = "0.157"\n',
+                'vendor/zxcvbn/Cargo.toml': '[dependencies.fancy-regex]\nversion = "0.11"\n',
+                'vendor/ring/Cargo.toml': '[dependencies]\n',
+                'vendor/oxc_parser/Cargo.toml': '[dependencies]\n',
+                'Cargo.lock': (
+                    'version = 4\n'
+                    '[[package]]\nname = "lpm-env-ffi"\nversion = "0.1.0"\ndependencies = ["aes", "lpm-env-source", "oxc_parser", "zxcvbn"]\n'
+                    '[[package]]\nname = "aes"\nversion = "1.0.0"\nsource = "' + REGISTRY + '"\ndependencies = ["cipher 1.0.0"]\n'
+                    '[[package]]\nname = "cipher"\nversion = "1.0.0"\nsource = "' + REGISTRY + '"\ndependencies = ["ring"]\n'
+                    '[[package]]\nname = "ring"\nversion = "0.17.0"\n'
+                    '[[package]]\nname = "zxcvbn"\nversion = "3.1.1"\ndependencies = ["fancy-regex"]\n'
+                    '[[package]]\nname = "fancy-regex"\nversion = "0.11.0"\nsource = "' + REGISTRY + '"\n'
+                    '[[package]]\nname = "oxc_parser"\nversion = "0.157.0"\n'
+                ),
+            }
+            for name, text in manifests.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            for name in ['vendor/zxcvbn/src/scoring.rs', 'vendor/oxc_parser/src/lib.rs']:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text('source')
+
+            self.assertEqual(exporter.engine_crates(root), [Path('crates') / name for name in ['lpm-env', 'lpm-env-ffi', 'lpm-env-source']] + [Path('vendor/ring'), Path('vendor/zxcvbn')])
+            self.assertIn('vendor/zxcvbn/src/scoring.rs', exporter.source_hashes(root))
+            self.assertNotIn('vendor/oxc_parser/src/lib.rs', exporter.source_hashes(root), 'a dev-dependency is not linked')
+
+            (root / 'Cargo.toml').write_text(manifests['Cargo.toml'].replace('vendor/ring', '../ring'))
+            with self.assertRaisesRegex(RuntimeError, 'outside the repository: ring'):
                 exporter.engine_crates(root)
 
     def test_archive_hashing_streams_without_reading_the_complete_file(self):
@@ -406,6 +445,13 @@ class ThirdPartyNoticeTests(unittest.TestCase):
         intel = metadata([ffi, env, serde, derive, syn, cc, tempfile_crate, foundation], dict(edges, **{ffi['id']: edges[ffi['id']] + [(foundation['id'], None)]}))
         self.assertEqual([entry['name'] for entry in exporter.linked_packages([arm, intel])], ['core-foundation', 'serde'])
 
+    def test_linked_packages_include_a_crate_patched_from_a_directory_outside_the_workspace(self):
+        ffi, backup = package('lpm-env-ffi', source=None), package('lpm-env-backup', source=None)
+        vendored = package('zxcvbn', version='3.1.1', source=None)
+        edges = {ffi['id']: [(backup['id'], None)], backup['id']: [(vendored['id'], None)]}
+        graph = metadata([ffi, backup, vendored], edges, workspace=[ffi['id'], backup['id']])
+        self.assertEqual([entry['name'] for entry in exporter.linked_packages([graph])], ['zxcvbn'])
+
     def test_license_texts_are_every_notice_file_without_apache_when_mit_alone_applies(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -447,6 +493,8 @@ class ThirdPartyNoticeTests(unittest.TestCase):
             self.assertIn('<b>alpha</b> 1.0.0, MIT, source https://crates.io/crates/alpha/1.0.0, texts <a href="#text-1">1</a>', notices)
             self.assertIn('<b>beta</b> 1.0.0, MIT, source https://crates.io/crates/beta/1.0.0, texts <a href="#text-1">1</a>', notices)
             self.assertIn('<b>gamma</b> 1.0.0, Unicode-3.0, source https://crates.io/crates/gamma/1.0.0, texts <a href="#text-2">2</a>', notices)
+            patched = exporter.third_party_notices([package('zxcvbn', version='3.1.1', source=None, directory=shared)], MIT_TEXT, [], STD_NOTICE)
+            self.assertIn('<b>zxcvbn</b> 3.1.1, MIT, source https://crates.io/crates/zxcvbn/3.1.1 with changes by LPM, texts <a href="#text-1">1</a>', patched)
             self.assertIn('<h2>Data</h2>\n<pre># EFF wordlist\nCC BY 3.0 US</pre>', notices)
             self.assertIn('<h1>Copyright notices for The Rust Standard Library</h1>', notices)
             self.assertNotIn('<title>std</title>', notices)
@@ -471,7 +519,7 @@ usage = collections.namedtuple('usage', 'total used free')
 module.shutil.disk_usage = lambda path: usage(1 << 40, 0, 1 << 40)
 marker = (root / 'crates/lpm-env/src/lib.rs').read_text()
 paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
-engine_metadata = '{"packages": [{"id": "ffi", "name": "lpm-env-ffi", "version": "1.0.0", "source": null, "targets": []}], "resolve": {"nodes": [{"id": "ffi", "deps": []}]}}'
+engine_metadata = '{"packages": [{"id": "ffi", "name": "lpm-env-ffi", "version": "1.0.0", "source": null, "targets": []}], "workspace_members": ["ffi"], "resolve": {"nodes": [{"id": "ffi", "deps": []}]}}'
 module.subprocess.check_output = lambda args, **kwargs: (str(sysroot) + '\n' if '--print' in args else 'host: aarch64-apple-darwin\n') if args[0] == 'rustc' else engine_metadata if args[0] == 'cargo' else (root / args[2].split(':', 1)[1]).read_bytes() if args[1] == 'show' else paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 def command(args, **kwargs):
     if args[0] == 'cargo':
