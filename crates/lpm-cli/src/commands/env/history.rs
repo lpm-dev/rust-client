@@ -1205,22 +1205,23 @@ pub(super) struct RollbackArgs<'a> {
     pub yes: bool,
 }
 
-fn row_change(row: &Row) -> (&'static str, Option<&'static str>) {
+fn row_change(row: &Row) -> (&'static str, Option<UnknownReason>) {
     match (&row.target, &row.current) {
-        (TargetValue::Unknown(reason), _) => (
-            "unknown",
-            Some(match reason {
-                UnknownReason::NotRecorded => {
-                    "Its earlier value wasn't recorded: it changed outside local history."
-                }
-                UnknownReason::TooLarge => "Too large to keep.",
-                UnknownReason::Removed => "Removed from history.",
-                UnknownReason::Unreadable => "Part of history couldn't be read.",
-            }),
-        ),
+        (TargetValue::Unknown(reason), _) => ("unknown", Some(*reason)),
         (TargetValue::Known(_), Some(_)) => ("changed", None),
         (TargetValue::Known(_), None) => ("added", None),
         (TargetValue::Absent, _) => ("removed", None),
+    }
+}
+
+fn unknown_reason_text(reason: UnknownReason) -> &'static str {
+    match reason {
+        UnknownReason::NotRecorded => {
+            "Its earlier value wasn't recorded: it changed outside local history."
+        }
+        UnknownReason::TooLarge => "Too large to keep.",
+        UnknownReason::Removed => "Removed from history.",
+        UnknownReason::Unreadable => "Part of history couldn't be read.",
     }
 }
 
@@ -1363,7 +1364,7 @@ fn rollback_json<'a>(plan: &'a RollbackPlan, choices: &Choices) -> RollbackJson<
                         RollbackRowJson {
                             key: &row.key,
                             change,
-                            reason,
+                            reason: reason.map(unknown_reason),
                             applied: applies(row, &skipped),
                             gaps: row
                                 .gaps
@@ -1466,7 +1467,7 @@ fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
                 });
             }
             if let Some(reason) = reason {
-                line.push_str(&format!("  ({reason})"));
+                line.push_str(&format!("  ({})", unknown_reason_text(reason)));
             }
             println!("{line}");
             for gap in &row.gaps {
@@ -1879,6 +1880,40 @@ mod tests {
             2,
             "the rename applies whole"
         );
+    }
+
+    #[test]
+    fn a_rollback_review_gives_the_reason_a_key_stays_as_a_code() {
+        let reasons = [
+            (UnknownReason::NotRecorded, "not_recorded"),
+            (UnknownReason::TooLarge, "too_large"),
+            (UnknownReason::Removed, "removed"),
+            (UnknownReason::Unreadable, "unreadable"),
+        ];
+        let plan = plan(vec![environment(
+            "default",
+            "default",
+            reasons
+                .iter()
+                .enumerate()
+                .map(|(index, (reason, _))| {
+                    row(
+                        &format!("KEY_{index}"),
+                        Some("1"),
+                        TargetValue::Unknown(*reason),
+                        &[],
+                    )
+                })
+                .collect(),
+        )]);
+        let review = serde_json::to_value(rollback_json(&plan, &Choices::default())).unwrap();
+        let rows = review["environments"][0]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), reasons.len());
+        for (row, (_, code)) in rows.iter().zip(reasons) {
+            assert_eq!(row["change"], "unknown", "{row}");
+            assert_eq!(row["reason"], code, "{row}");
+            assert_eq!(row["applied"], false, "{row}");
+        }
     }
 
     #[test]
