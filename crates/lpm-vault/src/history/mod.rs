@@ -6,7 +6,7 @@
 //! operation read and wrote, and runs the engine's plans against the
 //! Keychain or the file store.
 
-mod record;
+pub(crate) mod record;
 pub(crate) mod scope;
 pub(crate) mod store;
 

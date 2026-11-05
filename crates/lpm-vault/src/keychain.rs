@@ -677,37 +677,49 @@ fn verified_values_access(
     vault_id: &str,
     written_in_transaction: bool,
 ) -> Result<CliAccess, String> {
+    probe_values_access(storage, vault_id, written_in_transaction)?.ok_or_else(|| {
+        "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
+            .to_owned()
+    })
+}
+
+/// [`verified_values_access`], with `None` when the Keychain is unavailable,
+/// so nothing about the values item's access can be concluded.
+fn probe_values_access(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    written_in_transaction: bool,
+) -> Result<Option<CliAccess>, String> {
     let marker = crate::companion::account::marker_account(vault_id);
     let open = [PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()];
-    match storage.probe(vault_id, &open) {
+    Ok(Some(match storage.probe(vault_id, &open) {
         // A weak item that claims approval gets the approval it claims, and
         // passes approval on, never its weakness.
         ProbeOutcome::Automatic => match storage.claimed_access(vault_id)? {
-            Some(ClaimedAccess::Automatic) | None => Ok(CliAccess::Automatic),
+            Some(ClaimedAccess::Automatic) | None => CliAccess::Automatic,
             Some(ClaimedAccess::RequireApproval) => {
                 storage.require_approval(vault_id, &open)?;
                 tracing::warn!(
                     "this env project's values claimed CLI approval that the macOS Keychain wasn't enforcing; LPM now requires it, as they claimed"
                 );
-                Ok(CliAccess::RequireApproval)
+                CliAccess::RequireApproval
             }
             Some(ClaimedAccess::Contradictory) => {
                 tracing::warn!(
                     "this env project's values have approval attributes that contradict each other, so its newer data is stored with approval; switch the project's CLI approval in LPM Vault to set it again"
                 );
-                Ok(CliAccess::RequireApproval)
+                CliAccess::RequireApproval
             }
         },
-        ProbeOutcome::Protected => Ok(CliAccess::RequireApproval),
-        ProbeOutcome::Absent if written_in_transaction => Ok(CliAccess::Automatic),
-        ProbeOutcome::Absent => Err(format!(
-            "env project {vault_id} has no values, so its newer data can't be written"
-        )),
-        ProbeOutcome::Inconclusive => Err(
-            "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
-                .to_owned(),
-        ),
-    }
+        ProbeOutcome::Protected => CliAccess::RequireApproval,
+        ProbeOutcome::Absent if written_in_transaction => CliAccess::Automatic,
+        ProbeOutcome::Absent => {
+            return Err(format!(
+                "env project {vault_id} has no values, so its newer data can't be written"
+            ));
+        }
+        ProbeOutcome::Inconclusive => return Ok(None),
+    }))
 }
 
 /// Check a transaction's companion changes as both its commit and its
@@ -2502,6 +2514,7 @@ mod tests {
     use super::*;
 
     mod companion;
+    mod history;
 
     #[test]
     fn large_env_data_is_warned_of_in_binary_units() {

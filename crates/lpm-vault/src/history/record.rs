@@ -121,8 +121,7 @@ fn append(
     change: &Change<'_, '_>,
     random: &mut impl Random,
 ) -> Result<Outcome, NotRecorded> {
-    maintain_key(store, vault_id, random)?;
-    let (head, key) = read_head_and_key(store, vault_id)?;
+    let (head, key) = open_maintained(store, vault_id, random)?;
     let mut growth = Growth::Unasked;
     let mut previous: Option<Vec<u8>> = None;
     let mut crowded = None;
@@ -196,6 +195,28 @@ pub(super) fn read_head_and_key(
         .map_err(NotRecorded::Failed)?
         .ok_or(NotRecorded::Damaged)?;
     Ok((head, key))
+}
+
+/// The head and key, read once, after any key upkeep they need: an append
+/// or a read reads them again only when a rotation ran or an approval
+/// change was recorded.
+pub(super) fn open_maintained(
+    store: &mut impl HistoryStore,
+    vault_id: &str,
+    random: &mut impl Random,
+) -> Result<(Secret, Secret), NotRecorded> {
+    let (head, key) = read_head_and_key(store, vault_id)?;
+    let opened = Opened::open(vault_id, &head, &key).map_err(|_| NotRecorded::Damaged)?;
+    let claimed = store
+        .claimed_approval(vault_id)
+        .map_err(NotRecorded::Failed)?;
+    if !needs_finishing(&opened)
+        && matches!(key_maintenance(&opened, claimed), KeyMaintenance::Nothing)
+    {
+        return Ok((head, key));
+    }
+    maintain_key(store, vault_id, random)?;
+    read_head_and_key(store, vault_id)
 }
 
 fn opened(store: &mut impl HistoryStore, vault_id: &str) -> Result<Opened, NotRecorded> {

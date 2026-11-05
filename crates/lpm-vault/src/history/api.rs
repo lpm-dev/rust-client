@@ -23,7 +23,7 @@ use lpm_env_companion::history::removal::{
 use lpm_env_companion::history::switch::{MarkerHistory, plan_off, plan_on};
 use lpm_env_companion::keyring::SystemRandom;
 
-use super::record::{commit, finish_running, maintain_key, read_head_and_key};
+use super::record::{commit, finish_running, open_maintained, read_head_and_key};
 use super::store::HistoryStore;
 use super::{Action, NotRecorded, RelatedSide, Source, SourceDetail, values_of};
 use crate::EnvironmentMap;
@@ -219,8 +219,7 @@ fn open_and_run<T>(
         MarkerHistory::Both => return Err(HistoryError::Damaged),
         MarkerHistory::On => {}
     }
-    maintain_key(store, vault_id, &mut SystemRandom)?;
-    let (head, key) = read_head_and_key(store, vault_id)?;
+    let (head, key) = open_maintained(store, vault_id, &mut SystemRandom)?;
     let opened = Opened::open(vault_id, &head, &key)?;
     let mut read = |part: u16| store.read(&part_account(vault_id, part));
     run(&mut Parts { read: &mut read }, &opened, values).map(Some)
@@ -527,8 +526,7 @@ pub fn forget(
                     return Err(HistoryError::Unsupported);
                 }
             }
-            maintain_key(store, &vault_id, &mut random)?;
-            let (head, key) = read_head_and_key(store, &vault_id)?;
+            let (head, key) = open_maintained(store, &vault_id, &mut random)?;
             let opened = Opened::open(&vault_id, &head, &key)?;
             let approval = store
                 .claimed_approval(&vault_id)

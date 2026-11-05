@@ -5,16 +5,12 @@
 use zeroize::Zeroizing;
 
 use super::companion_gate::{KeychainCompanion, match_values_approval};
-use super::{
-    ClaimedAccess, KeychainProjectStorage, ListedStorage, PROJECT_INDEX_MARKER_ACCOUNT,
-    ProjectStorage,
-};
+use super::{ClaimedAccess, CliAccess, KeychainProjectStorage, ListedStorage, ProjectStorage};
 use crate::companion::CompanionBackend;
-use crate::companion::account::{CompanionAccount, marker_account};
+use crate::companion::account::CompanionAccount;
 use crate::companion::graph::{AccessClass, record_access_class};
 use crate::companion::lifecycle::{LifecycleStore, Mutation};
 use crate::history::store::{AdmissionInventory, HistoryStore};
-use crate::macos_keychain::ProbeOutcome;
 use lpm_env_companion::history::admission;
 use lpm_env_companion::keyring::Approval;
 
@@ -163,15 +159,17 @@ pub(super) fn claimed_approval(
     }
 }
 
+/// The values item's verified access, as the journal verifies it before
+/// staging records that follow values, a weak item that claims approval
+/// strengthened first, so the key records the access its records get.
 pub(super) fn verified_approval(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
 ) -> Result<Option<Approval>, String> {
-    let marker = marker_account(vault_id);
-    match storage.probe(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()]) {
-        ProbeOutcome::Automatic => Ok(Some(Approval::Automatic)),
-        ProbeOutcome::Protected => Ok(Some(Approval::Protected)),
-        ProbeOutcome::Absent => Err(format!("env project {vault_id} has no values item")),
-        ProbeOutcome::Inconclusive => Ok(None),
-    }
+    Ok(
+        super::probe_values_access(storage, vault_id, false)?.map(|access| match access {
+            CliAccess::Automatic => Approval::Automatic,
+            CliAccess::RequireApproval => Approval::Protected,
+        }),
+    )
 }
