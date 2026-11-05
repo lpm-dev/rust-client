@@ -101,6 +101,34 @@ fn env_history_show_finds_an_entry_by_its_short_id_and_reports_unknown_ones() {
 }
 
 #[test]
+fn env_rollback_to_values_the_environment_already_has_changes_nothing() {
+    let project = project();
+    set(&project, "DB_URL=postgres://one");
+    set(&project, "DB_URL=postgres://two");
+    let newest = entry_ids(&project).first().unwrap().clone();
+
+    let (success, response) = json(&project, &["env", "rollback", "--to", &newest, "--json"]);
+    assert!(success, "{response}");
+    assert_eq!(response["rolled_back"], serde_json::json!([]));
+    assert_eq!(entry_ids(&project).len(), 2, "nothing was recorded");
+
+    let output = lpm(&project)
+        .args(["env", "rollback", "--to", &newest])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("nothing to roll back: default already has the values it had at"),
+        "{text}"
+    );
+}
+
+#[test]
 fn env_rollback_reviews_first_and_needs_yes_without_a_terminal() {
     let project = project();
     set(&project, "DB_URL=postgres://one");

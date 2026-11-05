@@ -1498,7 +1498,53 @@ fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
             }
         }
     }
-    println!("{changing} of {total} keys change. {ROLLBACK_FOOTER}");
+    println!("{} {ROLLBACK_FOOTER}", changing_summary(changing, total));
+}
+
+/// How many of the review's keys change, in words that agree with the
+/// counts.
+fn changing_summary(changing: usize, total: usize) -> String {
+    format!(
+        "{changing} of {total} {} {}.",
+        if total == 1 { "key" } else { "keys" },
+        if changing == 1 { "changes" } else { "change" }
+    )
+}
+
+/// What applying a reviewed rollback with the chosen rows does.
+#[derive(Debug, PartialEq, Eq)]
+enum Effect {
+    /// It changes values or an environment.
+    Changes,
+    /// Every value it covers already has its target, and no environment
+    /// changes.
+    AlreadyMatches,
+    /// History doesn't know the values it would change.
+    Unknown,
+}
+
+fn effect(plan: &RollbackPlan, choices: &Choices) -> Effect {
+    if changing_rows(plan, choices) > 0 || changes_an_environment(plan, choices) {
+        return Effect::Changes;
+    }
+    // A plan lists only rows that change a value or whose target is
+    // unknown, so a chosen row that changes nothing is an unknown one.
+    let chosen = plan
+        .environments
+        .iter()
+        .enumerate()
+        .any(|(environment_index, environment)| {
+            let skipped = skipped_keys(environment, environment_index, choices);
+            environment
+                .rows
+                .iter()
+                .any(|row| !skipped.contains(row.key.as_str()))
+        });
+    if chosen {
+        Effect::Unknown
+    } else {
+        Effect::AlreadyMatches
+    }
 }
 
 /// The rows a rollback leaves out when the person names keys: all but
@@ -1608,14 +1654,55 @@ pub(super) fn env_rollback(
             moment(info.time)
         ),
     };
+    #[derive(Serialize)]
+    struct RolledBack<'a> {
+        success: bool,
+        rolled_back: &'a [String],
+        rollback: RollbackJson<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history: Option<serde_json::Value>,
+    }
     let choices = choices_for_keys(&plan, args.keys);
-    let changing = changing_rows(&plan, &choices);
+    let effect = effect(&plan, &choices);
+    if effect == Effect::AlreadyMatches {
+        if json_output {
+            print_json(&RolledBack {
+                success: true,
+                rolled_back: &[],
+                rollback: rollback_json(&plan, &choices),
+                history: None,
+            });
+        } else {
+            output::info(&match plan.kind {
+                RollbackKind::Undo => format!(
+                    "nothing to undo: the keys \"{}\" changed already have the values they had before it",
+                    describe(&info)
+                ),
+                RollbackKind::Key => format!(
+                    "nothing to roll back: {} in {target_name} already has the value it had before {}",
+                    args.keys.first().map(String::as_str).unwrap_or_default(),
+                    moment(info.time)
+                ),
+                RollbackKind::Environment => format!(
+                    "nothing to roll back: {target_name} already has the values it had {} {}",
+                    if side == RelatedSide::Before {
+                        "before"
+                    } else {
+                        "at"
+                    },
+                    moment(info.time)
+                ),
+            });
+        }
+        return Ok(());
+    }
     if !json_output {
         print_rollback(&plan, &choices, &title);
     }
-    if changing == 0 && !changes_an_environment(&plan, &choices) {
+    if effect == Effect::Unknown {
         return Err(fail(&HistoryError::TargetUnknown, json_output));
     }
+    let changing = changing_rows(&plan, &choices);
     match confirm("Roll back these values?", args.yes, json_output)? {
         None => {
             return Err(confirmation_required(
@@ -1639,14 +1726,6 @@ pub(super) fn env_rollback(
     let written = lpm_vault::history::commit_rollback(project_dir, &plan, &choices)
         .map_err(|error| fail(&error, json_output))?;
     if json_output {
-        #[derive(Serialize)]
-        struct RolledBack<'a> {
-            success: bool,
-            rolled_back: &'a [String],
-            rollback: RollbackJson<'a>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            history: Option<serde_json::Value>,
-        }
         print_json(&RolledBack {
             success: true,
             rolled_back: &written,
@@ -1794,6 +1873,48 @@ mod tests {
             2,
             "the rename applies whole"
         );
+    }
+
+    #[test]
+    fn a_rollback_to_values_an_environment_already_has_is_not_unknown() {
+        let matching = plan(vec![environment("default", "default", Vec::new())]);
+        assert_eq!(
+            effect(&matching, &Choices::default()),
+            Effect::AlreadyMatches
+        );
+        let unknown = plan(vec![environment(
+            "default",
+            "default",
+            vec![row(
+                "A",
+                Some("1"),
+                TargetValue::Unknown(UnknownReason::NotRecorded),
+                &[],
+            )],
+        )]);
+        assert_eq!(effect(&unknown, &Choices::default()), Effect::Unknown);
+        let changing = plan(vec![environment(
+            "default",
+            "default",
+            vec![
+                row("A", Some("2"), known("1"), &[]),
+                row("B", None, known("b"), &[]),
+            ],
+        )]);
+        assert_eq!(effect(&changing, &Choices::default()), Effect::Changes);
+        assert_eq!(
+            effect(&changing, &choices_for_keys(&changing, &["C".to_owned()])),
+            Effect::AlreadyMatches,
+            "a key the plan doesn't list already has its value"
+        );
+    }
+
+    #[test]
+    fn the_review_counts_keys_in_words_that_agree() {
+        assert_eq!(changing_summary(1, 1), "1 of 1 key changes.");
+        assert_eq!(changing_summary(1, 3), "1 of 3 keys changes.");
+        assert_eq!(changing_summary(2, 3), "2 of 3 keys change.");
+        assert_eq!(changing_summary(0, 2), "0 of 2 keys change.");
     }
 
     #[test]
