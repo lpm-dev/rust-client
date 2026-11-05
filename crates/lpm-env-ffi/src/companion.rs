@@ -414,6 +414,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                         .map(|read| read.bytes.as_ref().map(|bytes| bytes.0.as_slice())),
                     access: request.access_damage.as_deref(),
                     unfinished: request.unfinished.as_deref(),
+                    history: &[],
                 },
             );
             let marker = assessment.gate.marker();

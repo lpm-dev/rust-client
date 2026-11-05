@@ -31,6 +31,9 @@ pub struct Observed<'a> {
     /// Why the project's interrupted step can never be finished, when the
     /// client's resume found it can't.
     pub unfinished: Option<&'a str>,
+    /// Damage the client found reading local history's records, from
+    /// [`crate::history::read::check_records`].
+    pub history: &'a [Damage],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +141,9 @@ pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
         {
             found(damaged);
         }
+    }
+    for damage in observed.history {
+        found(damage.clone());
     }
     if let Some(reason) = observed.access {
         found(Damage::Access(reason.to_owned()));
@@ -282,6 +288,7 @@ mod tests {
                     overrides: Some(overrides),
                     access: None,
                     unfinished: None,
+                    history: &[],
                 },
             );
             assert!(assessment.damage.is_empty(), "{:?}", assessment.damage);
@@ -304,6 +311,7 @@ mod tests {
                 overrides: Some(Some(RECORD)),
                 access: None,
                 unfinished: None,
+                history: &[],
             },
         );
         assert!(assessment.damage.is_empty());

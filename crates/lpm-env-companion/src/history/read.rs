@@ -17,6 +17,53 @@ use crate::history::part_identity;
 use crate::history::values::{Values, gap_changes};
 use crate::keyring::{self, Digest, DigestKeys, KeyRecord};
 
+/// Damage in history's records that a names-only listing can't see: a head
+/// or key that won't parse, or a tail that won't open. A tail that's absent
+/// or from another epoch is a rollover a crash interrupted, which the next
+/// append finishes, so it isn't damage. Repairing any of these removes
+/// history; it stays on and restarts at the next change.
+pub fn check_records(
+    vault_id: &str,
+    head: Option<&[u8]>,
+    key: Option<&[u8]>,
+    tail: impl FnOnce(u16) -> Option<Vec<u8>>,
+) -> Vec<crate::gate::Damage> {
+    use crate::gate::Damage;
+    let mut damage = Vec::new();
+    let head = head.map(|bytes| Head::parse(HISTORY, vault_id, bytes));
+    if let Some(Err(error)) = &head {
+        damage.push(Damage::InvalidRecord {
+            kind: HISTORY.head_kind.to_owned(),
+            reason: error.to_string(),
+        });
+    }
+    let record = key.map(KeyRecord::decode);
+    if let Some(Err(error)) = &record {
+        damage.push(Damage::InvalidRecord {
+            kind: crate::graph::SHARED_KEY_KIND.to_owned(),
+            reason: error.to_string(),
+        });
+    }
+    if let (Some(Ok(head)), Some(Ok(record))) = (head, record)
+        && let Some(sealed) = tail(head.tail())
+    {
+        let opened = keyring::open(&record, &part_identity(vault_id, head.tail()), &sealed)
+            .map_err(|error| error.to_string())
+            .and_then(|plaintext| {
+                Part::decode(&plaintext)
+                    .map(|part| part.epoch)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(reason) = opened {
+            damage.push(Damage::InvalidRecord {
+                kind: HISTORY.kind.to_owned(),
+                reason: format!("the newest part won't read: {reason}"),
+            });
+        }
+    }
+    damage
+}
+
 /// Where a reader gets parts from: the store, read one at a time inside the
 /// client's lock, or the array the app passed.
 pub trait PartSource {

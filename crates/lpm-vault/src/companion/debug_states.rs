@@ -465,6 +465,7 @@ mod tests {
                     .any(|(_, claim)| *claim == PlantedClaim::UnknownPolicy)
                     .then_some("contradicts"),
                 unfinished: None,
+                history: &[],
             },
         )
     }

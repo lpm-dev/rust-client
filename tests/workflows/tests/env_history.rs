@@ -241,3 +241,33 @@ fn a_values_write_that_history_cant_record_still_succeeds_and_says_why() {
     );
     assert_eq!(stored(&project, "A"), "2");
 }
+
+#[test]
+fn env_repair_removes_damaged_history_which_restarts_at_the_next_change() {
+    let project = project();
+    set(&project, "A=1");
+    let vaults = project.home().join(".lpm").join("vaults");
+    let companion = std::fs::read_dir(&vaults)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".companion"))
+        .expect("the project's companion folder")
+        .path();
+    std::fs::write(companion.join("record.history-head"), b"damaged").unwrap();
+
+    let (success, review) = json(&project, &["env", "repair", "--json"]);
+    assert!(!success, "the review alone fails: {review}");
+    assert_eq!(
+        review["problems"][0]["repair"]["feature"], "history",
+        "{review}"
+    );
+    let (success, repaired) = json(&project, &["env", "repair", "--yes", "--json"]);
+    assert!(success, "{repaired}");
+    let (_, status) = json(&project, &["env", "history", "status", "--json"]);
+    assert_eq!(
+        (status["state"].as_str(), status["retained"].as_u64()),
+        (Some("on"), Some(0))
+    );
+    set(&project, "A=2");
+    assert_eq!(entry_ids(&project).len(), 1);
+}

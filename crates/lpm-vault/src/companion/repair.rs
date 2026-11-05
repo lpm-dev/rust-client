@@ -113,6 +113,10 @@ pub(crate) fn review(
             part: None,
         })?),
     };
+    let history = match (unfinished, marker.as_deref()) {
+        (None, Some(bytes)) => history_damage(backend, vault_id, bytes),
+        _ => Vec::new(),
+    };
     let assessment = assess(
         vault_id,
         Observed {
@@ -121,6 +125,7 @@ pub(crate) fn review(
             overrides: overrides.as_ref().map(Option::as_deref),
             access,
             unfinished,
+            history: &history,
         },
     );
     Ok(CompanionReview {
@@ -137,6 +142,53 @@ pub(crate) fn review(
             .map(CompanionRepair::from)
             .collect(),
     })
+}
+
+/// What's wrong with local history's records beyond what the listing shows,
+/// while the marker has history v1 on.
+fn history_damage(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+    marker: &[u8],
+) -> Vec<super::gate::Damage> {
+    use lpm_env_companion::history::switch::MarkerHistory;
+    let Ok(marker) = Marker::parse(vault_id, marker) else {
+        return Vec::new();
+    };
+    if MarkerHistory::of(Some(&marker)) != MarkerHistory::On {
+        return Vec::new();
+    }
+    // On the file store a corrupt entry fails to open as a read error, so a
+    // history record that won't read is damage like one that won't parse.
+    let unreadable = |kind: &str, error: String| super::gate::Damage::InvalidRecord {
+        kind: kind.to_owned(),
+        reason: format!("it can't be read: {error}"),
+    };
+    let head = match backend.read(&lpm_env_companion::history::head_account(vault_id)) {
+        Ok(head) => head,
+        Err(error) => return vec![unreadable("history-head", error)],
+    };
+    let key = match backend.read(&lpm_env_companion::history::key_account(vault_id)) {
+        Ok(key) => zeroize::Zeroizing::new(key),
+        Err(error) => return vec![unreadable("key", error)],
+    };
+    let mut tail_error = None;
+    let mut damage = lpm_env_companion::history::read::check_records(
+        vault_id,
+        head.as_deref(),
+        key.as_deref(),
+        |part| match backend.read(&lpm_env_companion::history::part_account(vault_id, part)) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                tail_error = Some(error);
+                None
+            }
+        },
+    );
+    if let Some(error) = tail_error {
+        damage.push(unreadable("history", error));
+    }
+    damage
 }
 
 /// Run every repair `reviewed` lists, after checking `vault_id` still shows

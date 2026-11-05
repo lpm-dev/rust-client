@@ -911,3 +911,33 @@ fn the_timeline_names_deleted_environments_with_when_they_went() {
         .iter()
         .any(|environment| environment.name == "production" && environment.deleted_at.is_none()));
 }
+
+#[test]
+fn damaged_history_records_are_found_beyond_the_listing() {
+    use crate::history::read::check_records;
+    let steps = steps();
+    let store = history(&steps);
+    let head = store.get(&head_account(VAULT)).expect("head").to_vec();
+    let key = store.get(&key_account(VAULT)).expect("key").to_vec();
+    let tail = |part: u16| store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec);
+    assert!(check_records(VAULT, Some(&head), Some(&key), tail).is_empty());
+
+    let damage = check_records(VAULT, Some(b"{}"), Some(&key), tail);
+    assert!(
+        matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "history-head")
+    );
+    let damage = check_records(VAULT, Some(&head), Some(b"LPMK"), tail);
+    assert!(
+        matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "key")
+    );
+    let damage = check_records(VAULT, Some(&head), Some(&key), |_| {
+        Some(b"garbage".to_vec())
+    });
+    assert!(
+        matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "history")
+    );
+    assert!(
+        check_records(VAULT, Some(&head), Some(&key), |_| None).is_empty(),
+        "an absent tail is an interrupted rollover, not damage"
+    );
+}
