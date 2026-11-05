@@ -934,8 +934,9 @@ impl Summary<'_> {
 
 /// A decoded part, borrowing from the plaintext. Each entry is decoded
 /// once, when the part is checked, and kept with its encoded bytes, which
-/// an append copies into the next part unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// an append copies into the next part unchanged. Its `Debug` shows counts
+/// only: entries hold values.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Part<'a> {
     pub epoch: u64,
     pub summary: Summary<'a>,
@@ -952,6 +953,17 @@ pub fn part_len(summary_len: usize, entry_lens: impl IntoIterator<Item = usize>)
             .into_iter()
             .map(|length| 4 + length)
             .sum::<usize>()
+}
+
+impl fmt::Debug for Part<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Part")
+            .field("epoch", &self.epoch)
+            .field("environments", &self.summary.environments.len())
+            .field("entries", &self.entries.len())
+            .finish()
+    }
 }
 
 impl<'a> Part<'a> {
@@ -1538,5 +1550,38 @@ pub(crate) mod tests {
         let debug = format!("{entry:?}");
         assert!(!debug.contains("postgres://"), "{debug}");
         assert!(!debug.contains("\"old\""), "{debug}");
+    }
+
+    #[test]
+    fn a_part_s_debug_shows_no_entry_bytes() {
+        let entry = Entry {
+            seq: 1,
+            id: [7; 16],
+            time: 0,
+            actor: Actor::Cli,
+            action: Action::Set,
+            flags: Flags::default(),
+            since: None,
+            detail: Detail::default(),
+            environments: vec![EnvironmentChange {
+                name: "e",
+                kind: EnvironmentKind::Unchanged,
+                keys: Keys::Changes(vec![KeyChange {
+                    key: "K",
+                    kind: KeyKind::Added,
+                    before: Side::Absent,
+                    after: Side::Value {
+                        value: "plaintext-sentinel",
+                        digest: [1; 16],
+                    },
+                }]),
+            }],
+        };
+        let bytes = encode_part(1, &Summary::default(), &[], &[entry]).expect("part");
+        let part = Part::decode(&bytes).expect("decodes");
+        let shown = format!("{part:?}");
+        assert!(!shown.contains("plaintext"), "{shown}");
+        let sentinel: Vec<String> = b"plaintext-sentinel".iter().map(u8::to_string).collect();
+        assert!(!shown.contains(&sentinel[..4].join(", ")), "{shown}");
     }
 }

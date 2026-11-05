@@ -139,9 +139,18 @@ pub fn too_many_values(values: &Values<'_>) -> bool {
 /// What the plans of one append share while the client answers their
 /// requests for another read or for admission, so a plan made again
 /// doesn't digest every value again. One cache serves one append.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AppendCache<'v> {
     before_summary: Option<Summary<'v>>,
+}
+
+impl fmt::Debug for AppendCache<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppendCache")
+            .field("digested", &self.before_summary.is_some())
+            .finish()
+    }
 }
 
 /// Why a change wasn't recorded, which the values write it follows never
@@ -274,8 +283,9 @@ pub fn plan_creation(
     }))
 }
 
-/// What a client read for an append, inside its lock.
-#[derive(Debug, Clone, Copy, Default)]
+/// What a client read for an append, inside its lock. Its `Debug` shows
+/// lengths only: the key record holds keys.
+#[derive(Clone, Copy, Default)]
 pub struct Stored<'a> {
     pub head: &'a [u8],
     pub key: &'a [u8],
@@ -283,6 +293,18 @@ pub struct Stored<'a> {
     pub tail: Option<&'a [u8]>,
     /// The part before the tail, once the plan asked for it.
     pub previous: Option<&'a [u8]>,
+}
+
+impl fmt::Debug for Stored<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Stored")
+            .field("head", &self.head.len())
+            .field("key", &self.key.len())
+            .field("tail", &self.tail.map(<[u8]>::len))
+            .field("previous", &self.previous.map(<[u8]>::len))
+            .finish()
+    }
 }
 
 /// Whether a rollover may add a part, which only admission decides: a

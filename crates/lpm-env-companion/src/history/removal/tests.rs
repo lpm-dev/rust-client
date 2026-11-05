@@ -687,3 +687,78 @@ fn a_review_reads_each_part_once_and_groups_places_in_linear_steps() {
     let steps = crate::work::count(crate::work::Work::AliasStep);
     assert!(steps <= 300 * 6, "{steps} alias steps for 300 places");
 }
+
+#[test]
+fn removal_refuses_a_value_current_under_an_earlier_name_of_its_place() {
+    let mut store = Store::new();
+    let empty = Project::with(&[("stage", &[])]);
+    let first = Project::with(&[("stage", &[("STRIPE_KEY", "sk_live")])]);
+    store
+        .record(Action::Set, &empty, &first, &[])
+        .expect("created");
+    let renamed = Project::with(&[("staging", &[("STRIPE_SECRET_KEY", "sk_live")])]);
+    store
+        .record(
+            Action::RenameKey,
+            &first,
+            &renamed,
+            &[
+                Rename::Environment {
+                    from: "stage",
+                    to: "staging",
+                },
+                Rename::Key {
+                    environment: "staging",
+                    from: "STRIPE_KEY",
+                    to: "STRIPE_SECRET_KEY",
+                },
+            ],
+        )
+        .expect("renamed");
+    let rotated = Project::with(&[("staging", &[("STRIPE_SECRET_KEY", "sk_new")])]);
+    store
+        .record(Action::Set, &renamed, &rotated, &[])
+        .expect("rotated");
+    // An older client put the secret back under the place's earlier names.
+    let restored = Project::with(&[
+        ("stage", &[("STRIPE_KEY", "sk_live")]),
+        ("staging", &[("STRIPE_SECRET_KEY", "sk_new")]),
+    ]);
+    let current = restored.values();
+    let review = review_removal(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        Chosen {
+            entry: id(3),
+            environment: "staging",
+            key: "STRIPE_SECRET_KEY",
+            side: RelatedSide::Before,
+        },
+    )
+    .expect("review");
+    let place = review
+        .places
+        .iter()
+        .position(|place| place.key == "STRIPE_SECRET_KEY")
+        .expect("the place");
+    assert!(
+        review.places[place].current,
+        "its earlier names hold the value now"
+    );
+    let mut forged = review;
+    forged.places[place].current = false;
+    let started = start_removal(
+        &opened(&store),
+        &forged,
+        &BTreeSet::from([place]),
+        &current,
+        Approval::Automatic,
+        &mut CountingRandom(5),
+    );
+    assert!(
+        matches!(started, Err(RemovalError::ChangedSinceReview)),
+        "start checks every name the place had: {:?}",
+        started.map(|writes| writes.len())
+    );
+}

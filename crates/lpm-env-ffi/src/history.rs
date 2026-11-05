@@ -1568,6 +1568,62 @@ struct StartRequest {
     review: ReviewRequest,
     selection: Vec<usize>,
     approval: String,
+    /// The review's fingerprint, which binds a start to the review shown.
+    fingerprint: String,
+}
+
+/// What a removal review showed, keyed with the history's digest key, so a
+/// start can tell the review it was given is the one the engine returned:
+/// the value, the generation, and every place's names, group, current flag
+/// and digests.
+fn review_fingerprint(opened: &Opened, review: &RemovalReview) -> String {
+    let text = |encoded: &mut Vec<u8>, text: &str| {
+        encoded.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(text.as_bytes());
+    };
+    let length = 16
+        + 4
+        + review
+            .places
+            .iter()
+            .map(|place| {
+                8 + place.environment.len()
+                    + place.key.len()
+                    + place
+                        .renamed_from
+                        .iter()
+                        .chain(&place.renamed_environments)
+                        .map(|name| 4 + name.len())
+                        .sum::<usize>()
+                    + 8
+                    + 2
+                    + 4
+                    + 16 * place.digests.len()
+            })
+            .sum::<usize>();
+    let mut encoded = Vec::with_capacity(length);
+    encoded.extend_from_slice(&review.value);
+    encoded.extend_from_slice(&review.generation.to_be_bytes());
+    for place in &review.places {
+        text(&mut encoded, &place.environment);
+        text(&mut encoded, &place.key);
+        for names in [&place.renamed_from, &place.renamed_environments] {
+            encoded.extend_from_slice(&(names.len() as u32).to_be_bytes());
+            for name in names {
+                text(&mut encoded, name);
+            }
+        }
+        encoded.push(match place.group {
+            PlaceGroup::ThisKey => 1,
+            PlaceGroup::OtherKey => 2,
+        });
+        encoded.push(u8::from(place.current));
+        encoded.extend_from_slice(&(place.digests.len() as u32).to_be_bytes());
+        for digest in &place.digests {
+            encoded.extend_from_slice(digest);
+        }
+    }
+    digest_text(&opened.keys.value(&encoded))
 }
 
 fn removal_refusal(error: RemovalError) -> LPMEnvResult {
@@ -1611,10 +1667,12 @@ struct ReviewOut<'a> {
     generation: u32,
     places: Vec<PlaceOut<'a>>,
     default_selection: BTreeSet<usize>,
+    fingerprint: String,
 }
 
-fn review_out(review: &RemovalReview) -> ReviewOut<'_> {
+fn review_out<'a>(opened: &Opened, review: &'a RemovalReview) -> ReviewOut<'a> {
     ReviewOut {
+        fingerprint: review_fingerprint(opened, review),
         value: digest_text(&review.value),
         generation: review.generation,
         places: review
@@ -1718,7 +1776,7 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                                     review: ReviewOut<'a>,
                                 }
                                 Output::default().finish(&Reviewed {
-                                    review: review_out(&review),
+                                    review: review_out(&opening.opened, &review),
                                 })
                             }
                             Err(error) => removal_refusal(error),
@@ -1730,6 +1788,9 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                         else {
                             return failure(2, "history.invalid_input");
                         };
+                        if review_fingerprint(&opening.opened, &review) != start.fingerprint {
+                            return refused("history.changed_since_review", None);
+                        }
                         let selection: BTreeSet<usize> = start.selection.iter().copied().collect();
                         match start_removal(
                             &opening.opened,

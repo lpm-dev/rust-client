@@ -733,3 +733,17 @@ fn too_many_values_agrees_with_the_summary_check() {
         );
     }
 }
+
+#[test]
+fn stored_records_debug_shows_no_key_or_part_bytes() {
+    let key = [0x5a_u8; 91];
+    let stored = Stored {
+        head: b"{}",
+        key: &key,
+        tail: Some(b"sealed-sentinel"),
+        previous: None,
+    };
+    let shown = format!("{stored:?}");
+    assert!(!shown.contains("90, 90, 90"), "{shown}");
+    assert!(!shown.contains("115, 101, 97"), "{shown}");
+}

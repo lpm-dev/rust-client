@@ -170,12 +170,14 @@ impl Assessment {
     }
 
     /// Whether `damage` touches local history only: its head, parts, or
-    /// "off" setting, or the shared key while history alone lists it.
+    /// "off" setting, or the shared key while history alone lists it. An
+    /// unlisted record is project damage, except a `history-off` record,
+    /// which is never listed: a record no feature owns is never scoped
+    /// away by its kind alone.
     pub fn is_history_damage(&self, damage: &Damage) -> bool {
         let kind = match damage {
-            Damage::MissingRecord { kind }
-            | Damage::InvalidRecord { kind, .. }
-            | Damage::UnlistedRecord { kind } => kind.as_str(),
+            Damage::UnlistedRecord { kind } => return kind == HISTORY_OFF.name,
+            Damage::MissingRecord { kind } | Damage::InvalidRecord { kind, .. } => kind.as_str(),
             Damage::InvalidMarker(_) | Damage::Access(_) | Damage::Unfinished(_) => return false,
         };
         if kind == SHARED_KEY_KIND {
@@ -706,5 +708,39 @@ mod tests {
             .is_err(),
             "no transaction may write one"
         );
+    }
+
+    #[test]
+    fn an_unlisted_history_record_without_history_is_project_damage() {
+        let overrides_only = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"ignore","kinds":["overrides"],"state":"active"}}}"#;
+        for marker in [None, Some(&overrides_only[..])] {
+            for stray in [record("history", Some(0)), record("history-head", None)] {
+                let mut inventory = vec![stray];
+                if marker.is_some() {
+                    inventory.push(record("overrides", None));
+                }
+                let assessment = assess(
+                    "proj",
+                    Observed {
+                        marker,
+                        inventory: Some(&inventory),
+                        overrides: marker.map(|_| Some(RECORD)),
+                        ..Observed::default()
+                    },
+                );
+                assert!(
+                    matches!(assessment.damage[..], [Damage::UnlistedRecord { .. }]),
+                    "{:?}",
+                    assessment.damage
+                );
+                assert!(assessment.history_damage().is_none());
+                for operation in [Operation::ReadExcludingOverrides, Operation::Write] {
+                    assert!(
+                        assessment.authorize(operation).is_err(),
+                        "{marker:?} {inventory:?} {operation:?}"
+                    );
+                }
+            }
+        }
     }
 }

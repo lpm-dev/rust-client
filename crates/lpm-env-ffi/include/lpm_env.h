@@ -355,10 +355,11 @@ LPMEnvResult lpm_env_history_reveal(const uint8_t *input, size_t input_length);
 LPMEnvResult lpm_env_history_rollback(const uint8_t *input, size_t input_length);
 /* Review removing one value, then start it. Input: reading fields with values,
  * and chosen: {entry, environment, key, side}, or start: {review (as returned),
- * selection: [place index], approval}. Review output {review: {value,
+ * selection: [place index], approval, fingerprint (the review's)}; a review
+ * that isn't the one returned refuses with history.changed_since_review. Review output {review: {value,
  * generation, places: [{environment, key, renamedFrom, group: "thisKey" |
  * "otherKey", current, occurrences, digests, renamedEnvironments}],
- * defaultSelection}}. A place is current, and can't be checked, when any name
+ * defaultSelection, fingerprint}}. A place is current, and can't be checked, when any name
  * it had holds the value now. Start output
  * {journal: true, writes}; then finish with lpm_env_history_maintenance. */
 LPMEnvResult lpm_env_history_removal(const uint8_t *input, size_t input_length);

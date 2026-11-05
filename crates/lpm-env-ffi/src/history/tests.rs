@@ -280,7 +280,12 @@ fn the_app_records_reads_reveals_rolls_back_and_removes_through_the_binary_inter
     let selection = review["review"]["defaultSelection"].clone();
     let (request, blobs) = store.reading(
         &two,
-        json!({ "start": { "review": review["review"], "selection": selection, "approval": "automatic" } }),
+        json!({ "start": {
+            "review": review["review"],
+            "selection": selection,
+            "approval": "automatic",
+            "fingerprint": review["review"]["fingerprint"],
+        } }),
     );
     let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
     let (status, started, started_blobs) = call(lpm_env_history_removal, &request, &blob_refs);
@@ -524,4 +529,72 @@ fn a_rollback_onto_a_name_another_environment_holds_is_refused() {
         (5, Some("history.name_taken")),
         "{refusal}"
     );
+}
+
+#[test]
+fn a_removal_starts_only_from_the_review_it_was_shown() {
+    let mut store = Store::default();
+    let empty = payload_bytes(&[("e", &[])]);
+    let one = payload_bytes(&[("e", &[("A", "true"), ("B", "true")])]);
+    record(&mut store, 1, &empty, &one);
+    let two = payload_bytes(&[("e", &[("A", "false"), ("B", "true")])]);
+    record(&mut store, 2, &one, &two);
+    let chosen =
+        json!({ "entry": hex::encode([2; 16]), "environment": "e", "key": "A", "side": "before" });
+    let (request, blobs) = store.reading(&two, json!({ "chosen": chosen }));
+    let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+    let (status, review, _) = call(lpm_env_history_removal, &request, &blob_refs);
+    assert_eq!(status, 0, "{review}");
+    let review = review["review"].clone();
+    let this_key = review["places"]
+        .as_array()
+        .expect("places")
+        .iter()
+        .position(|place| place["key"] == "A")
+        .expect("A");
+    let other_key = review["places"]
+        .as_array()
+        .expect("places")
+        .iter()
+        .position(|place| place["key"] == "B")
+        .expect("B");
+    let start = |review: &Value| {
+        let (request, blobs) = store.reading(
+            &two,
+            json!({ "start": {
+                "review": review,
+                "selection": [this_key],
+                "approval": "automatic",
+                "fingerprint": review["fingerprint"],
+            } }),
+        );
+        let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        let (status, response, _) = call(lpm_env_history_removal, &request, &blob_refs);
+        (status, response["code"].as_str().map(str::to_owned))
+    };
+    let mut forgeries = Vec::new();
+    let mut other_digests = review.clone();
+    other_digests["places"][this_key]["digests"] = review["places"][other_key]["digests"].clone();
+    forgeries.push(("another place's digests", other_digests));
+    let mut renamed = review.clone();
+    renamed["places"][this_key]["key"] = json!("NOT_A_KEY");
+    forgeries.push(("another name", renamed));
+    let mut current = review.clone();
+    assert_eq!(
+        review["places"][other_key]["current"], true,
+        "B holds it now"
+    );
+    current["places"][other_key]["current"] = json!(false);
+    forgeries.push(("another current flag", current));
+    let mut value = review.clone();
+    value["value"] = review["places"][this_key]["digests"][0].clone();
+    forgeries.push(("another value", value));
+    for (what, forged) in &forgeries {
+        assert_eq!(
+            start(forged),
+            (5, Some("history.changed_since_review".to_owned())),
+            "{what}"
+        );
+    }
+    assert_eq!(start(&review).0, 0, "the review as shown starts");
 }
