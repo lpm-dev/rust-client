@@ -105,28 +105,36 @@ fn fail(error: &HistoryError, json_output: bool) -> LpmError {
 }
 
 /// A review was printed, but there's no terminal to confirm it on and no
-/// `--yes`.
-fn confirmation_required(json_output: bool, review: &impl Serialize, rerun: &str) -> LpmError {
-    if json_output {
-        #[derive(Serialize)]
-        struct Required<'a, R> {
-            success: bool,
-            error: String,
-            error_code: &'static str,
-            review: &'a R,
-        }
-        print_json(&Required {
-            success: false,
-            error: format!("confirm by running it again with --yes: {rerun}"),
-            error_code: "confirmation_required",
-            review,
-        });
-        LpmError::ExitCode(1)
-    } else {
-        LpmError::Script(format!(
-            "nothing was changed; confirm by running it again with --yes: {rerun}"
-        ))
+/// `--yes`, so `command` didn't `change` anything. JSON output carries the
+/// review.
+fn confirmation_required(
+    json_output: bool,
+    review: &impl Serialize,
+    command: &'static str,
+    change: String,
+) -> LpmError {
+    let error = LpmError::ConfirmationRequired {
+        command,
+        change,
+        help: "Read the review, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+    };
+    if !json_output {
+        return error;
     }
+    #[derive(Serialize)]
+    struct Required<'a, R> {
+        success: bool,
+        error: String,
+        error_code: &'static str,
+        review: &'a R,
+    }
+    print_json(&Required {
+        success: false,
+        error: error.to_string(),
+        error_code: error.error_code(),
+        review,
+    });
+    LpmError::ExitCode(1)
 }
 
 /// Ask a yes-or-no question that defaults to No, or skip it with `yes`.
@@ -731,16 +739,32 @@ fn print_timeline(timeline: &Timeline, project_dir: &std::path::Path, reveal: bo
         }
     }
     println!();
-    let mut summary = format!("{} changes", timeline.readable);
-    summary.push_str(if timeline.unreadable_parts > 0 {
-        " readable"
-    } else {
-        " kept"
-    });
-    if let Some(oldest) = timeline.oldest {
+    println!(
+        "{}.",
+        kept_summary(
+            timeline.readable,
+            timeline.unreadable_parts,
+            timeline.oldest
+        )
+    );
+}
+
+/// How many changes history keeps, or can read when part of it won't, and
+/// since when.
+fn kept_summary(count: usize, unreadable_parts: usize, oldest: Option<i64>) -> String {
+    let mut summary = format!(
+        "{count} {} {}",
+        if count == 1 { "change" } else { "changes" },
+        if unreadable_parts > 0 {
+            "readable"
+        } else {
+            "kept"
+        }
+    );
+    if let Some(oldest) = oldest {
         summary.push_str(&format!(" since {}", day(oldest)));
     }
-    println!("{summary}.");
+    summary
 }
 
 fn print_values(info: &EntryInfo, revealed: &[Vec<RevealedValues>]) {
@@ -890,19 +914,10 @@ fn history_status(project_dir: &std::path::Path, json_output: bool) -> Result<()
             Device::CURRENT.this()
         )),
         HistoryState::On => {
-            let mut line = format!(
-                "local history is on for {name}: {} changes {}",
-                status.retained,
-                if status.unreadable_parts > 0 {
-                    "readable"
-                } else {
-                    "kept"
-                }
-            );
-            if let Some(oldest) = status.oldest {
-                line.push_str(&format!(" since {}", day(oldest)));
-            }
-            output::success(&line);
+            output::success(&format!(
+                "local history is on for {name}: {}",
+                kept_summary(status.retained, status.unreadable_parts, status.oldest)
+            ));
             if status.unreadable_parts > 0 {
                 output::warn("part of this project's history couldn't be read");
             }
@@ -926,7 +941,8 @@ fn history_off(
             return Err(confirmation_required(
                 json_output,
                 &serde_json::json!({ "action": "off", "message": off_warning(Device::CURRENT) }),
-                "lpm env history off --yes",
+                "lpm env history off",
+                format!("delete the local history of {name}"),
             ));
         }
         Some(false) => {
@@ -1147,7 +1163,8 @@ fn history_forget(
             return Err(confirmation_required(
                 json_output,
                 &places_json(Some("forget"), None),
-                "lpm env history forget ENTRY KEY --yes",
+                "lpm env history forget",
+                format!("remove the value of {} from local history", args.key),
             ));
         }
         Some(false) => {
@@ -1604,7 +1621,13 @@ pub(super) fn env_rollback(
             return Err(confirmation_required(
                 json_output,
                 &rollback_json(&plan, &choices),
-                "lpm env rollback ... --yes",
+                "lpm env rollback",
+                match plan.kind {
+                    RollbackKind::Undo => format!("undo \"{}\"", describe(&info)),
+                    RollbackKind::Key | RollbackKind::Environment => {
+                        format!("roll back {target_name}")
+                    }
+                },
             ));
         }
         Some(false) => {
@@ -1671,6 +1694,37 @@ mod tests {
         assert!(removal_warning(Device::Mac).contains("Time Machine, APFS snapshots"));
         assert!(off_warning(Device::Mac).contains("LPM Vault and the LPM CLI"));
         assert!(pulled_notice(Device::Mac, "API_KEY", &pulled).contains("your other Macs"));
+    }
+
+    #[test]
+    fn a_review_with_no_terminal_and_no_yes_asks_for_yes_as_other_commands_do() {
+        let error = confirmation_required(
+            false,
+            &(),
+            "lpm env rollback",
+            "roll back default".to_owned(),
+        );
+        assert!(
+            matches!(
+                error,
+                LpmError::ConfirmationRequired {
+                    command: "lpm env rollback",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "`lpm env rollback` needs `--yes` to roll back default without asking"
+        );
+    }
+
+    #[test]
+    fn one_kept_change_is_counted_as_one_change() {
+        assert_eq!(kept_summary(1, 0, None), "1 change kept");
+        assert_eq!(kept_summary(2, 0, None), "2 changes kept");
+        assert_eq!(kept_summary(3, 1, None), "3 changes readable");
     }
 
     #[test]
