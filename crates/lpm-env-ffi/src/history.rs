@@ -23,19 +23,21 @@ use lpm_env_companion::budgets::admission_count;
 use lpm_env_companion::history::RecordWrite;
 use lpm_env_companion::history::admission::{self, CreationAdmission};
 use lpm_env_companion::history::append::{
-    AppendPlan, AppendShape, Change, CreationPlan, Growth, NotRecorded, Stored, plan_append,
-    plan_creation,
+    AppendCache, AppendPlan, AppendShape, Change, CreationPlan, Growth, NotRecorded, Stored,
+    plan_append, plan_creation,
 };
 use lpm_env_companion::history::codec::{
     Action, Actor, Detail, EntryId, Platform, Related, RelatedSide, Remote,
 };
 use lpm_env_companion::history::read::{
-    EntryInfo, EnvironmentKindInfo, Filter, KeyKindInfo, KeyMatch, KeysInfo, Opened, ReadError,
-    RemoteInfo, SideInfo, SourceGroup, TimelineRow, check_records, read_timeline, reveal_entries,
+    EntryInfo, EnvironmentInfo, EnvironmentKindInfo, Filter, KeyKindInfo, KeyMatch, KeysInfo,
+    Opened, PartSource, ReadError, RemoteInfo, RevealedValues, SideInfo, SourceGroup, Timeline,
+    TimelineRow, check_records, read_timeline, reveal_entries,
 };
 use lpm_env_companion::history::rebuild::{
-    Binding, Choices, PlanError, Point, Refusal, RollbackKind, RollbackPlan, TargetValue,
-    UnknownReason, apply_rollback, plan_environment_rollback, plan_key_rollback, plan_undo,
+    Binding, Choices, EnvironmentRef, PlanError, Point, Refusal, RollbackKind, RollbackPlan,
+    TargetValue, UnknownReason, apply_rollback, plan_environment_rollback, plan_key_rollback,
+    plan_undo,
 };
 use lpm_env_companion::history::removal::{
     Chosen, KeyMaintenance, Occurrence, Place, PlaceGroup, RemovalError, RemovalReview,
@@ -46,7 +48,8 @@ use lpm_env_companion::history::switch::MarkerHistory;
 use lpm_env_companion::history::values::{Rename, Values};
 use lpm_env_companion::keyring::{Approval, Digest, SystemRandom};
 use lpm_env_companion::marker::Marker;
-use serde::Deserialize;
+use serde::ser::SerializeMap as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -121,11 +124,21 @@ impl Output {
         self.blob(std::mem::take(&mut *value).into_bytes())
     }
 
-    fn finish(self, mut response: Value) -> LPMEnvResult {
-        if let Value::Object(object) = &mut response {
-            object.insert("abiVersion".to_owned(), json!(ABI_VERSION));
+    /// The output frame: `response` with the ABI version, serialized once,
+    /// then every blob, in a buffer sized exactly.
+    fn finish(self, response: &impl Serialize) -> LPMEnvResult {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Framed<'r, R> {
+            #[serde(flatten)]
+            response: &'r R,
+            abi_version: u32,
         }
-        let request = serde_json::to_vec(&response).unwrap_or_default();
+        let request = serde_json::to_vec(&Framed {
+            response,
+            abi_version: ABI_VERSION,
+        })
+        .unwrap_or_default();
         let total = 4
             + 1
             + 4
@@ -488,7 +501,7 @@ pub unsafe extern "C" fn lpm_env_history_record(input: *const u8, length: usize)
                         }
                         Err(reason) => not_recorded(&reason),
                     };
-                    output.finish(response)
+                    output.finish(&response)
                 }
                 (None, Some(append)) => {
                     let (Some(head), Some(key)) =
@@ -508,47 +521,52 @@ pub unsafe extern "C" fn lpm_env_history_record(input: *const u8, length: usize)
                         tail: append.tail.and_then(|index| blob(blobs, index)),
                         previous: append.previous.and_then(|index| blob(blobs, index)),
                     };
-                    let response =
-                        match plan_append(vault_id, &stored, &change, growth, &mut random) {
-                            Ok(AppendPlan::Unchanged) => json!({ "result": "unchanged" }),
-                            Ok(AppendPlan::AlreadyRecorded) => {
-                                json!({ "result": "alreadyRecorded" })
+                    let mut cache = AppendCache::default();
+                    let response = match plan_append(
+                        vault_id,
+                        &stored,
+                        &change,
+                        growth,
+                        &mut cache,
+                        &mut random,
+                    ) {
+                        Ok(AppendPlan::Unchanged) => json!({ "result": "unchanged" }),
+                        Ok(AppendPlan::AlreadyRecorded) => {
+                            json!({ "result": "alreadyRecorded" })
+                        }
+                        Ok(AppendPlan::NeedsPrevious { part }) => {
+                            json!({ "result": "needsPrevious", "part": part })
+                        }
+                        Ok(AppendPlan::NeedsGrowthAdmission) => {
+                            json!({ "result": "needsGrowthAdmission" })
+                        }
+                        Ok(AppendPlan::Write(write)) => {
+                            let (shape, dropped, grew) = match write.shape {
+                                AppendShape::Steady => ("steady", None, None),
+                                AppendShape::Slid { dropped } => ("slid", Some(dropped), None),
+                                AppendShape::Rollover { grew } => ("rollover", None, Some(grew)),
+                                AppendShape::Recovered => ("recovered", None, None),
+                            };
+                            let mut writes = Vec::with_capacity(2);
+                            if let Some(head) = write.head {
+                                writes.push(output.write(head));
                             }
-                            Ok(AppendPlan::NeedsPrevious { part }) => {
-                                json!({ "result": "needsPrevious", "part": part })
-                            }
-                            Ok(AppendPlan::NeedsGrowthAdmission) => {
-                                json!({ "result": "needsGrowthAdmission" })
-                            }
-                            Ok(AppendPlan::Write(write)) => {
-                                let (shape, dropped, grew) = match write.shape {
-                                    AppendShape::Steady => ("steady", None, None),
-                                    AppendShape::Slid { dropped } => ("slid", Some(dropped), None),
-                                    AppendShape::Rollover { grew } => {
-                                        ("rollover", None, Some(grew))
-                                    }
-                                    AppendShape::Recovered => ("recovered", None, None),
-                                };
-                                let mut writes = Vec::with_capacity(2);
-                                if let Some(head) = write.head {
-                                    writes.push(output.write(head));
-                                }
-                                writes.push(output.write(write.part));
-                                json!({
-                                    "result": "write",
-                                    "journal": false,
-                                    "writes": writes,
-                                    "entry": hex::encode(write.entry),
-                                    "gap": write.gap,
-                                    "valuesKept": write.values_kept,
-                                    "shape": shape,
-                                    "dropped": dropped,
-                                    "grew": grew,
-                                })
-                            }
-                            Err(reason) => not_recorded(&reason),
-                        };
-                    output.finish(response)
+                            writes.push(output.write(write.part));
+                            json!({
+                                "result": "write",
+                                "journal": false,
+                                "writes": writes,
+                                "entry": hex::encode(write.entry),
+                                "gap": write.gap,
+                                "valuesKept": write.values_kept,
+                                "shape": shape,
+                                "dropped": dropped,
+                                "grew": grew,
+                            })
+                        }
+                        Err(reason) => not_recorded(&reason),
+                    };
+                    output.finish(&response)
                 }
                 _ => failure(2, "history.invalid_input"),
             }
@@ -619,9 +637,21 @@ fn open<'a, T>(
     })
 }
 
-impl Opening<'_> {
-    fn source(&self) -> impl FnMut(u16) -> Result<Option<Vec<u8>>, String> + '_ {
-        |part| Ok(self.parts.get(&part).map(|bytes| bytes.to_vec()))
+/// The parts the app passed, lent to a reader without copying.
+struct LentParts<'a, 'b>(&'b HashMap<u16, &'a [u8]>);
+
+impl PartSource for LentParts<'_, '_> {
+    fn part(&mut self, part: u16) -> Result<Option<std::borrow::Cow<'_, [u8]>>, String> {
+        Ok(self
+            .0
+            .get(&part)
+            .map(|bytes| std::borrow::Cow::Borrowed(*bytes)))
+    }
+}
+
+impl<'a> Opening<'a> {
+    fn source(&self) -> LentParts<'a, '_> {
+        LentParts(&self.parts)
     }
 
     fn values(&self) -> Values<'_> {
@@ -646,81 +676,272 @@ fn side_info(side: SideInfo) -> &'static str {
     }
 }
 
-fn entry_json(info: &EntryInfo) -> Value {
-    let environments: Vec<Value> = info
-        .environments
+fn actor_name(actor: Actor) -> &'static str {
+    match actor {
+        Actor::App => "app",
+        Actor::Cli => "cli",
+        Actor::Outside => "outside",
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyOut<'a> {
+    key: &'a str,
+    change: &'static str,
+    before: &'static str,
+    after: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed_from: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentOut<'a> {
+    name: &'a str,
+    change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed_from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keys: Option<Vec<KeyOut<'a>>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RemoteOut<'a> {
+    Personal(&'static str),
+    Org { org: &'a str },
+}
+
+#[derive(Serialize)]
+struct RelatedOut {
+    id: String,
+    side: &'static str,
+    time: i64,
+}
+
+/// A kept value's blobs, before and after.
+#[derive(Serialize)]
+struct ValuesOut {
+    before: Option<usize>,
+    after: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EntryOut<'a> {
+    id: String,
+    seq: u64,
+    time: i64,
+    actor: &'static str,
+    action: &'static str,
+    source: &'static str,
+    since: Option<i64>,
+    values_kept: bool,
+    oversized: bool,
+    file_name: Option<&'a str>,
+    pasted: bool,
+    remote: Option<RemoteOut<'a>>,
+    remote_version: Option<u64>,
+    platform: Option<&'static str>,
+    related: Option<RelatedOut>,
+    environments: Vec<EnvironmentOut<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    values: Option<Vec<Vec<ValuesOut>>>,
+}
+
+fn environments_out(environments: &[EnvironmentInfo]) -> Vec<EnvironmentOut<'_>> {
+    environments
         .iter()
         .map(|environment| {
-            let mut object = json!({
-                "name": environment.name,
-                "change": match &environment.kind {
-                    EnvironmentKindInfo::Unchanged => "unchanged",
-                    EnvironmentKindInfo::Created => "created",
-                    EnvironmentKindInfo::Removed => "removed",
-                    EnvironmentKindInfo::RenamedFrom(_) => "renamed",
-                },
-            });
-            if let EnvironmentKindInfo::RenamedFrom(from) = &environment.kind {
-                object["renamedFrom"] = json!(from);
-            }
-            match &environment.keys {
-                KeysInfo::Count(count) => object["keyCount"] = json!(count),
-                KeysInfo::Changes(changes) => {
-                    object["keys"] = changes
-                        .iter()
-                        .map(|change| {
-                            let mut key = json!({
-                                "key": change.key,
-                                "change": match &change.kind {
+            let (key_count, keys) = match &environment.keys {
+                KeysInfo::Count(count) => (Some(*count), None),
+                KeysInfo::Changes(changes) => (
+                    None,
+                    Some(
+                        changes
+                            .iter()
+                            .map(|change| KeyOut {
+                                key: &change.key,
+                                change: match &change.kind {
                                     KeyKindInfo::Added => "added",
                                     KeyKindInfo::Changed => "changed",
                                     KeyKindInfo::Removed => "removed",
                                     KeyKindInfo::RenamedFrom(_) => "renamed",
                                 },
-                                "before": side_info(change.before),
-                                "after": side_info(change.after),
-                            });
-                            if let KeyKindInfo::RenamedFrom(from) = &change.kind {
-                                key["renamedFrom"] = json!(from);
-                            }
-                            key
-                        })
-                        .collect();
-                }
+                                before: side_info(change.before),
+                                after: side_info(change.after),
+                                renamed_from: match &change.kind {
+                                    KeyKindInfo::RenamedFrom(from) => Some(from),
+                                    _ => None,
+                                },
+                            })
+                            .collect(),
+                    ),
+                ),
+            };
+            EnvironmentOut {
+                name: &environment.name,
+                change: match &environment.kind {
+                    EnvironmentKindInfo::Unchanged => "unchanged",
+                    EnvironmentKindInfo::Created => "created",
+                    EnvironmentKindInfo::Removed => "removed",
+                    EnvironmentKindInfo::RenamedFrom(_) => "renamed",
+                },
+                renamed_from: match &environment.kind {
+                    EnvironmentKindInfo::RenamedFrom(from) => Some(from),
+                    _ => None,
+                },
+                key_count,
+                keys,
             }
-            object
         })
-        .collect();
+        .collect()
+}
+
+fn entry_out(info: &EntryInfo) -> EntryOut<'_> {
     let detail = &info.detail;
-    json!({
-        "id": hex::encode(info.id),
-        "seq": info.seq,
-        "time": info.time,
-        "actor": match info.actor {
-            Actor::App => "app",
-            Actor::Cli => "cli",
-            Actor::Outside => "outside",
-        },
-        "action": info.action.name(),
-        "source": info.source().name(),
-        "since": info.since,
-        "valuesKept": !info.flags.values_not_kept,
-        "oversized": info.flags.oversized,
-        "fileName": detail.file_name,
-        "pasted": detail.pasted,
-        "remote": detail.remote.as_ref().map(|remote| match remote {
-            RemoteInfo::Personal => json!("personal"),
-            RemoteInfo::Org(slug) => json!({ "org": slug }),
+    EntryOut {
+        id: hex::encode(info.id),
+        seq: info.seq,
+        time: info.time,
+        actor: actor_name(info.actor),
+        action: info.action.name(),
+        source: info.source().name(),
+        since: info.since,
+        values_kept: !info.flags.values_not_kept,
+        oversized: info.flags.oversized,
+        file_name: detail.file_name.as_deref(),
+        pasted: detail.pasted,
+        remote: detail.remote.as_ref().map(|remote| match remote {
+            RemoteInfo::Personal => RemoteOut::Personal("personal"),
+            RemoteInfo::Org(slug) => RemoteOut::Org { org: slug },
         }),
-        "remoteVersion": detail.remote_version,
-        "platform": detail.platform.map(Platform::name),
-        "related": detail.related.map(|related| json!({
-            "id": hex::encode(related.id),
-            "side": side_name(related.side),
-            "time": related.time,
-        })),
-        "environments": environments,
-    })
+        remote_version: detail.remote_version,
+        platform: detail.platform.map(Platform::name),
+        related: detail.related.map(|related| RelatedOut {
+            id: hex::encode(related.id),
+            side: side_name(related.side),
+            time: related.time,
+        }),
+        environments: environments_out(&info.environments),
+        values: None,
+    }
+}
+
+/// The source counts as a map, in the groups' order.
+struct CountsOut<'a>(&'a BTreeMap<SourceGroup, usize>);
+
+impl Serialize for CountsOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (group, count) in self.0 {
+            map.serialize_entry(group.name(), count)?;
+        }
+        map.end()
+    }
+}
+
+// Unreadable rows are rare, and boxing every entry would cost an allocation
+// per row of every timeline.
+#[allow(clippy::large_enum_variant)]
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RowOut<'a> {
+    Entry(EntryOut<'a>),
+    Unreadable {
+        unreadable: bool,
+        part: u16,
+        after: Option<i64>,
+        before: Option<i64>,
+    },
+}
+
+#[derive(Serialize)]
+struct LiveGapEnvironmentOut<'a> {
+    name: &'a str,
+    keys: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct LiveGapOut<'a> {
+    since: Option<i64>,
+    environments: Vec<LiveGapEnvironmentOut<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentNameOut<'a> {
+    name: &'a str,
+    deleted_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineOut<'a> {
+    rows: Vec<RowOut<'a>>,
+    live_gap: Option<LiveGapOut<'a>>,
+    readable: usize,
+    counts: CountsOut<'a>,
+    oldest: Option<i64>,
+    damaged_tail: bool,
+    unreadable_parts: usize,
+    environments: Vec<EnvironmentNameOut<'a>>,
+    key_generation: u32,
+}
+
+fn timeline_out(timeline: &Timeline, key_generation: u32) -> TimelineOut<'_> {
+    TimelineOut {
+        rows: timeline
+            .rows
+            .iter()
+            .map(|row| match row {
+                TimelineRow::Entry(info) => RowOut::Entry(entry_out(info)),
+                TimelineRow::Unreadable {
+                    part,
+                    after,
+                    before,
+                } => RowOut::Unreadable {
+                    unreadable: true,
+                    part: *part,
+                    after: *after,
+                    before: *before,
+                },
+            })
+            .collect(),
+        live_gap: timeline.live_gap.as_ref().map(|gap| LiveGapOut {
+            since: gap.since,
+            environments: gap
+                .environments
+                .iter()
+                .map(|environment| LiveGapEnvironmentOut {
+                    name: &environment.name,
+                    keys: match &environment.keys {
+                        KeysInfo::Changes(changes) => {
+                            changes.iter().map(|change| change.key.as_str()).collect()
+                        }
+                        KeysInfo::Count(_) => Vec::new(),
+                    },
+                })
+                .collect(),
+        }),
+        readable: timeline.readable,
+        counts: CountsOut(&timeline.counts),
+        oldest: timeline.oldest,
+        damaged_tail: timeline.damaged_tail,
+        unreadable_parts: timeline.unreadable_parts,
+        environments: timeline
+            .environments
+            .iter()
+            .map(|environment| EnvironmentNameOut {
+                name: &environment.name,
+                deleted_at: environment.deleted_at,
+            })
+            .collect(),
+        key_generation,
+    }
 }
 
 #[derive(Deserialize)]
@@ -787,51 +1008,10 @@ pub unsafe extern "C" fn lpm_env_history_timeline(input: *const u8, length: usiz
                         Ok(timeline) => timeline,
                         Err(error) => return read_refusal(error),
                     };
-                let rows: Vec<Value> = timeline
-                    .rows
-                    .iter()
-                    .map(|row| match row {
-                        TimelineRow::Entry(info) => entry_json(info),
-                        TimelineRow::Unreadable {
-                            part,
-                            after,
-                            before,
-                        } => json!({
-                            "unreadable": true,
-                            "part": part,
-                            "after": after,
-                            "before": before,
-                        }),
-                    })
-                    .collect();
-                let counts: serde_json::Map<String, Value> = timeline
-                    .counts
-                    .iter()
-                    .map(|(group, count)| (group.name().to_owned(), json!(count)))
-                    .collect();
-                Output::default().finish(json!({
-                "rows": rows,
-                "liveGap": timeline.live_gap.map(|gap| json!({
-                    "since": gap.since,
-                    "environments": gap.environments.iter().map(|environment| json!({
-                        "name": environment.name,
-                        "keys": match &environment.keys {
-                            KeysInfo::Changes(changes) => changes.iter().map(|change| change.key.clone()).collect::<Vec<_>>(),
-                            KeysInfo::Count(_) => Vec::new(),
-                        },
-                    })).collect::<Vec<_>>(),
-                })),
-                "readable": timeline.readable,
-                "counts": counts,
-                "oldest": timeline.oldest,
-                "damagedTail": timeline.damaged_tail,
-                "unreadableParts": timeline.unreadable_parts,
-                "environments": timeline.environments.iter().map(|environment| json!({
-                    "name": environment.name,
-                    "deletedAt": environment.deleted_at,
-                })).collect::<Vec<_>>(),
-                "keyGeneration": opening.opened.record.current().generation(),
-            }))
+                Output::default().finish(&timeline_out(
+                    &timeline,
+                    opening.opened.record.current().generation(),
+                ))
             },
         )
     }
@@ -873,29 +1053,39 @@ pub unsafe extern "C" fn lpm_env_history_reveal(input: *const u8, length: usize)
                     Err(error) => return read_refusal(error),
                 };
                 let mut output = Output::default();
-                let entries: Vec<Value> = revealed
-                    .into_iter()
-                    .map(|entry| {
-                        let mut object = entry_json(&entry.info);
-                        object["values"] = entry
+                let mut infos = Vec::with_capacity(revealed.len());
+                let mut blobs: Vec<Vec<Vec<ValuesOut>>> = Vec::with_capacity(revealed.len());
+                for entry in revealed {
+                    blobs.push(
+                        entry
                             .values
                             .into_iter()
                             .map(|environment| {
                                 environment
-                                .into_iter()
-                                .map(|values| {
-                                    json!({
-                                        "before": values.before.map(|value| output.secret(value)),
-                                        "after": values.after.map(|value| output.secret(value)),
+                                    .into_iter()
+                                    .map(|RevealedValues { before, after }| ValuesOut {
+                                        before: before.map(|value| output.secret(value)),
+                                        after: after.map(|value| output.secret(value)),
                                     })
-                                })
-                                .collect::<Vec<_>>()
+                                    .collect()
                             })
-                            .collect();
-                        object
+                            .collect(),
+                    );
+                    infos.push(entry.info);
+                }
+                let entries: Vec<EntryOut<'_>> = infos
+                    .iter()
+                    .zip(blobs)
+                    .map(|(info, values)| EntryOut {
+                        values: Some(values),
+                        ..entry_out(info)
                     })
                     .collect();
-                output.finish(json!({ "entries": entries }))
+                #[derive(Serialize)]
+                struct Revealed<'a> {
+                    entries: Vec<EntryOut<'a>>,
+                }
+                output.finish(&Revealed { entries })
             },
         )
     }
@@ -908,10 +1098,28 @@ struct RollbackRequestJson {
     entry: String,
     #[serde(default)]
     environment: Option<String>,
+    /// How `environment` is named: `"now"`, or `"atPoint"`, as the entry
+    /// there names it. An environment rollback defaults to `"atPoint"`, a
+    /// key rollback to `"now"`.
+    #[serde(default)]
+    environment_named: Option<String>,
     #[serde(default)]
     key: Option<String>,
     #[serde(default)]
     side: Option<String>,
+}
+
+fn environment_ref<'a>(
+    name: &'a str,
+    named: Option<&str>,
+    default: fn(&'a str) -> EnvironmentRef<'a>,
+) -> Option<EnvironmentRef<'a>> {
+    match named {
+        None => Some(default(name)),
+        Some("now") => Some(EnvironmentRef::Now(name)),
+        Some("atPoint") => Some(EnvironmentRef::AtPoint(name)),
+        Some(_) => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -941,7 +1149,13 @@ fn plan_rollback(
     let planned = match request.kind.as_str() {
         "environment" => {
             let (Some(environment), Some(side)) = (
-                request.environment.as_deref(),
+                request.environment.as_deref().and_then(|name| {
+                    environment_ref(
+                        name,
+                        request.environment_named.as_deref(),
+                        EnvironmentRef::AtPoint,
+                    )
+                }),
                 request.side.as_deref().and_then(side),
             ) else {
                 return Err(failure(2, "history.invalid_input"));
@@ -955,9 +1169,16 @@ fn plan_rollback(
             )
         }
         "key" => {
-            let (Some(environment), Some(key)) =
-                (request.environment.as_deref(), request.key.as_deref())
-            else {
+            let (Some(environment), Some(key)) = (
+                request.environment.as_deref().and_then(|name| {
+                    environment_ref(
+                        name,
+                        request.environment_named.as_deref(),
+                        EnvironmentRef::Now,
+                    )
+                }),
+                request.key.as_deref(),
+            ) else {
                 return Err(failure(2, "history.invalid_input"));
             };
             plan_key_rollback(
@@ -976,13 +1197,38 @@ fn plan_rollback(
         PlanError::Read(error) => read_refusal(error),
         PlanError::EntryNotFound => refused("history.entry_not_found", None),
         PlanError::UnknownEnvironment => refused("history.unknown_environment", None),
+        PlanError::NameTaken(name) => refused(
+            "history.name_taken",
+            Some(PlanError::NameTaken(name).to_string()),
+        ),
     })
 }
 
 /// What a review saw, so an apply can tell whether a fresh plan matches it:
 /// every row's key, its target's kind and digest, and each binding.
 fn fingerprint(opened: &Opened, plan: &RollbackPlan) -> String {
-    let mut encoded = Zeroizing::new(Vec::new());
+    let length = 4 + plan
+        .environments
+        .iter()
+        .map(|environment| {
+            2 + 8
+                + environment.current.as_ref().map_or(0, String::len)
+                + environment.target.as_ref().map_or(0, String::len)
+                + 16
+                + 1
+                + environment
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        4 + row.key.len()
+                            + 17
+                            + row.linked.iter().map(|key| 4 + key.len()).sum::<usize>()
+                            + 4
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    let mut encoded = Zeroizing::new(Vec::with_capacity(length));
     encoded.extend_from_slice(&plan.generation.to_be_bytes());
     for environment in &plan.environments {
         for name in [&environment.current, &environment.target] {
@@ -999,6 +1245,7 @@ fn fingerprint(opened: &Opened, plan: &RollbackPlan) -> String {
             Binding::Environment(digest) | Binding::Key(digest) => digest,
         };
         encoded.extend_from_slice(&binding.unwrap_or([0; 16]));
+        encoded.push(u8::from(environment.unnamed_keys.is_some()));
         for row in &environment.rows {
             encoded.extend_from_slice(&(row.key.len() as u32).to_be_bytes());
             encoded.extend_from_slice(row.key.as_bytes());
@@ -1009,6 +1256,11 @@ fn fingerprint(opened: &Opened, plan: &RollbackPlan) -> String {
                 }
                 TargetValue::Absent => encoded.push(2),
                 TargetValue::Unknown(_) => encoded.push(3),
+            }
+            encoded.extend_from_slice(&(row.linked.len() as u32).to_be_bytes());
+            for key in &row.linked {
+                encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                encoded.extend_from_slice(key.as_bytes());
             }
         }
     }
@@ -1024,82 +1276,156 @@ fn unknown_reason(reason: UnknownReason) -> &'static str {
     }
 }
 
-fn plan_json(opened: &Opened, plan: RollbackPlan, output: &mut Output) -> Value {
+#[derive(Serialize)]
+struct GapOut {
+    since: Option<i64>,
+    until: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct PulledOut {
+    remote: Value,
+    version: Option<u64>,
+    time: i64,
+}
+
+#[derive(Serialize)]
+struct ChangedAgainOut {
+    time: i64,
+    actor: &'static str,
+    action: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanRowOut {
+    key: String,
+    change: &'static str,
+    changes: bool,
+    reason: Option<&'static str>,
+    current: Option<usize>,
+    target: Option<usize>,
+    gaps: Vec<GapOut>,
+    pulled: Option<PulledOut>,
+    changed_again: Option<ChangedAgainOut>,
+    linked: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanEnvironmentOut {
+    current: Option<String>,
+    target: Option<String>,
+    recreates: bool,
+    offers_deletion: bool,
+    renames: bool,
+    unnamed_keys: Option<&'static str>,
+    rows: Vec<PlanRowOut>,
+}
+
+#[derive(Serialize)]
+struct PointOut {
+    entry: String,
+    side: &'static str,
+    time: i64,
+}
+
+#[derive(Serialize)]
+struct PlanOut {
+    kind: &'static str,
+    point: PointOut,
+    generation: u32,
+    fingerprint: String,
+    environments: Vec<PlanEnvironmentOut>,
+}
+
+fn plan_out(opened: &Opened, plan: RollbackPlan, output: &mut Output) -> PlanOut {
     let fingerprint = fingerprint(opened, &plan);
-    let environments: Vec<Value> = plan
+    let environments = plan
         .environments
         .into_iter()
         .map(|environment| {
             let recreates = environment.recreates();
             let offers_deletion = environment.offers_deletion();
-            let rows: Vec<Value> = environment
+            let renames = environment.renames();
+            let rows = environment
                 .rows
                 .into_iter()
                 .map(|row| {
                     let changes = row.changes();
                     let (change, reason) = match (&row.target, &row.current) {
-                        (TargetValue::Unknown(reason), _) => ("unknown", Some(unknown_reason(*reason))),
+                        (TargetValue::Unknown(reason), _) => {
+                            ("unknown", Some(unknown_reason(*reason)))
+                        }
                         (TargetValue::Known(_), Some(_)) => ("changed", None),
                         (TargetValue::Known(_), None) => ("added", None),
                         (TargetValue::Absent, _) => ("removed", None),
                     };
-                    let current = row.current.map(|value| output.secret(value));
-                    let target = match row.target {
-                        TargetValue::Known(value) => Some(output.secret(value)),
-                        TargetValue::Absent | TargetValue::Unknown(_) => None,
-                    };
-                    json!({
-                        "key": row.key,
-                        "change": change,
-                        "changes": changes,
-                        "reason": reason,
-                        "current": current,
-                        "target": target,
-                        "gaps": row.gaps.iter().map(|gap| json!({ "since": gap.since, "until": gap.until })).collect::<Vec<_>>(),
-                        "pulled": row.pulled.map(|pulled| json!({
-                            "remote": match pulled.remote {
-                                Some(lpm_env_companion::history::rebuild::RemoteName::Org(slug)) => json!({ "org": slug }),
+                    PlanRowOut {
+                        key: row.key,
+                        change,
+                        changes,
+                        reason,
+                        current: row.current.map(|value| output.secret(value)),
+                        target: match row.target {
+                            TargetValue::Known(value) => Some(output.secret(value)),
+                            TargetValue::Absent | TargetValue::Unknown(_) => None,
+                        },
+                        gaps: row
+                            .gaps
+                            .iter()
+                            .map(|gap| GapOut {
+                                since: gap.since,
+                                until: gap.until,
+                            })
+                            .collect(),
+                        pulled: row.pulled.map(|pulled| PulledOut {
+                            remote: match pulled.remote {
+                                Some(lpm_env_companion::history::rebuild::RemoteName::Org(
+                                    slug,
+                                )) => {
+                                    json!({ "org": slug })
+                                }
                                 _ => json!("personal"),
                             },
-                            "version": pulled.version,
-                            "time": pulled.time,
-                        })),
-                        "changedAgain": row.changed_again.map(|changed| json!({
-                            "time": changed.time,
-                            "actor": match changed.actor {
-                                Actor::App => "app",
-                                Actor::Cli => "cli",
-                                Actor::Outside => "outside",
-                            },
-                            "action": changed.action.name(),
-                        })),
-                    })
+                            version: pulled.version,
+                            time: pulled.time,
+                        }),
+                        changed_again: row.changed_again.map(|changed| ChangedAgainOut {
+                            time: changed.time,
+                            actor: actor_name(changed.actor),
+                            action: changed.action.name(),
+                        }),
+                        linked: row.linked,
+                    }
                 })
                 .collect();
-            json!({
-                "current": environment.current,
-                "target": environment.target,
-                "recreates": recreates,
-                "offersDeletion": offers_deletion,
-                "rows": rows,
-            })
+            PlanEnvironmentOut {
+                current: environment.current,
+                target: environment.target,
+                recreates,
+                offers_deletion,
+                renames,
+                unnamed_keys: environment.unnamed_keys.map(unknown_reason),
+                rows,
+            }
         })
         .collect();
-    json!({
-        "kind": match plan.kind {
+    PlanOut {
+        kind: match plan.kind {
             RollbackKind::Environment => "environment",
             RollbackKind::Key => "key",
             RollbackKind::Undo => "undo",
         },
-        "point": {
-            "entry": hex::encode(plan.point.entry),
-            "side": side_name(plan.point.side),
-            "time": plan.point_time,
+        point: PointOut {
+            entry: hex::encode(plan.point.entry),
+            side: side_name(plan.point.side),
+            time: plan.point_time,
         },
-        "generation": plan.generation,
-        "fingerprint": fingerprint,
-        "environments": environments,
-    })
+        generation: plan.generation,
+        fingerprint,
+        environments,
+    }
 }
 
 /// Plan a rollback for review, or, with `apply`, plan it again and return
@@ -1128,8 +1454,12 @@ pub unsafe extern "C" fn lpm_env_history_rollback(input: *const u8, length: usiz
                 };
                 let mut output = Output::default();
                 let Some(apply) = request.rest.apply else {
-                    let plan = plan_json(&opening.opened, plan, &mut output);
-                    return output.finish(json!({ "plan": plan }));
+                    #[derive(Serialize)]
+                    struct Planned {
+                        plan: PlanOut,
+                    }
+                    let plan = plan_out(&opening.opened, plan, &mut output);
+                    return output.finish(&Planned { plan });
                 };
                 if fingerprint(&opening.opened, &plan) != apply.fingerprint {
                     return refused("history.changed_since_review", None);
@@ -1152,24 +1482,39 @@ pub unsafe extern "C" fn lpm_env_history_rollback(input: *const u8, length: usiz
                     }
                     Err(Refusal::NothingToApply) => return refused("history.target_unknown", None),
                 };
-                let writes: Vec<Value> = writes
+                #[derive(Serialize)]
+                struct ValueOut {
+                    key: String,
+                    value: usize,
+                }
+                #[derive(Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct WriteOut {
+                    name: String,
+                    renamed_from: Option<String>,
+                    values: Option<Vec<ValueOut>>,
+                }
+                #[derive(Serialize)]
+                struct Writes {
+                    writes: Vec<WriteOut>,
+                }
+                let writes = writes
                     .into_iter()
-                    .map(|write| {
-                        let values = write.values.map(|values| {
-                            let object: BTreeMap<&str, &str> = values
-                                .iter()
-                                .map(|(key, value)| (key.as_str(), value.as_str()))
-                                .collect();
-                            output.blob(serde_json::to_vec(&object).unwrap_or_default())
-                        });
-                        json!({
-                            "name": write.name,
-                            "renamedFrom": write.renamed_from,
-                            "values": values,
-                        })
+                    .map(|write| WriteOut {
+                        name: write.name,
+                        renamed_from: write.renamed_from,
+                        values: write.values.map(|values| {
+                            values
+                                .into_iter()
+                                .map(|(key, value)| ValueOut {
+                                    key,
+                                    value: output.secret(value),
+                                })
+                                .collect()
+                        }),
                     })
                     .collect();
-                output.finish(json!({ "writes": writes }))
+                output.finish(&Writes { writes })
             },
         )
     }
@@ -1193,6 +1538,8 @@ struct PlaceRequest {
     key: String,
     #[serde(default)]
     renamed_from: Vec<String>,
+    #[serde(default)]
+    renamed_environments: Vec<String>,
     group: String,
     current: bool,
     digests: Vec<String>,
@@ -1238,27 +1585,64 @@ fn removal_refusal(error: RemovalError) -> LPMEnvResult {
     refused(code, Some(error.to_string()))
 }
 
-fn review_json(review: &RemovalReview) -> Value {
-    json!({
-        "value": digest_text(&review.value),
-        "generation": review.generation,
-        "places": review.places.iter().map(|place| json!({
-            "environment": place.environment,
-            "key": place.key,
-            "renamedFrom": place.renamed_from,
-            "group": match place.group {
-                PlaceGroup::ThisKey => "thisKey",
-                PlaceGroup::OtherKey => "otherKey",
-            },
-            "current": place.current,
-            "occurrences": place.occurrences.iter().map(|occurrence| json!({
-                "set": occurrence.set,
-                "replaced": occurrence.replaced,
-            })).collect::<Vec<_>>(),
-            "digests": place.digests.iter().map(digest_text).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "defaultSelection": review.default_selection(),
-    })
+#[derive(Serialize)]
+struct OccurrenceOut {
+    set: Option<i64>,
+    replaced: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaceOut<'a> {
+    environment: &'a str,
+    key: &'a str,
+    renamed_from: &'a [String],
+    renamed_environments: &'a [String],
+    group: &'static str,
+    current: bool,
+    occurrences: Vec<OccurrenceOut>,
+    digests: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewOut<'a> {
+    value: String,
+    generation: u32,
+    places: Vec<PlaceOut<'a>>,
+    default_selection: BTreeSet<usize>,
+}
+
+fn review_out(review: &RemovalReview) -> ReviewOut<'_> {
+    ReviewOut {
+        value: digest_text(&review.value),
+        generation: review.generation,
+        places: review
+            .places
+            .iter()
+            .map(|place| PlaceOut {
+                environment: &place.environment,
+                key: &place.key,
+                renamed_from: &place.renamed_from,
+                renamed_environments: &place.renamed_environments,
+                group: match place.group {
+                    PlaceGroup::ThisKey => "thisKey",
+                    PlaceGroup::OtherKey => "otherKey",
+                },
+                current: place.current,
+                occurrences: place
+                    .occurrences
+                    .iter()
+                    .map(|occurrence| OccurrenceOut {
+                        set: occurrence.set,
+                        replaced: occurrence.replaced,
+                    })
+                    .collect(),
+                digests: place.digests.iter().map(digest_text).collect(),
+            })
+            .collect(),
+        default_selection: review.default_selection(),
+    }
 }
 
 fn review_from(request: &ReviewRequest) -> Option<RemovalReview> {
@@ -1273,6 +1657,7 @@ fn review_from(request: &ReviewRequest) -> Option<RemovalReview> {
                     environment: place.environment.clone(),
                     key: place.key.clone(),
                     renamed_from: place.renamed_from.clone(),
+                    renamed_environments: place.renamed_environments.clone(),
                     group: match place.group.as_str() {
                         "thisKey" => PlaceGroup::ThisKey,
                         "otherKey" => PlaceGroup::OtherKey,
@@ -1328,7 +1713,13 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                             },
                         ) {
                             Ok(review) => {
-                                Output::default().finish(json!({ "review": review_json(&review) }))
+                                #[derive(Serialize)]
+                                struct Reviewed<'a> {
+                                    review: ReviewOut<'a>,
+                                }
+                                Output::default().finish(&Reviewed {
+                                    review: review_out(&review),
+                                })
                             }
                             Err(error) => removal_refusal(error),
                         }
@@ -1354,7 +1745,7 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                                     .into_iter()
                                     .map(|write| output.write(write))
                                     .collect();
-                                output.finish(json!({ "journal": true, "writes": writes }))
+                                output.finish(&json!({ "journal": true, "writes": writes }))
                             }
                             Err(error) => removal_refusal(error),
                         }
@@ -1451,7 +1842,7 @@ pub unsafe extern "C" fn lpm_env_history_maintenance(
                     },
                     _ => return failure(2, "history.invalid_input"),
                 };
-                output.finish(response)
+                output.finish(&response)
             },
         )
     }
@@ -1500,32 +1891,79 @@ pub unsafe extern "C" fn lpm_env_history_check(input: *const u8, length: usize) 
                 MarkerHistory::Off => ("off", None),
                 MarkerHistory::Both => ("both", None),
             };
-            let parts: HashMap<u16, &[u8]> = request
-                .parts
-                .iter()
-                .filter_map(|part| Some((part.part, blob(blobs, part.blob?)?)))
-                .collect();
-            let damage = if state == MarkerHistory::On {
-                check_records(
-                    vault_id,
-                    request.head.and_then(|index| blob(blobs, index)),
-                    request.key.and_then(|index| blob(blobs, index)),
-                    |part| parts.get(&part).map(|bytes| bytes.to_vec()),
-                )
-            } else {
-                Vec::new()
-            };
-            let tail = request
+            let head = request
                 .head
                 .and_then(|index| blob(blobs, index))
-                .and_then(|bytes| Head::parse(HISTORY, vault_id, bytes).ok())
-                .map(|head| head.tail());
-            Output::default().finish(json!({
-                "history": name,
-                "version": version,
-                "tailPart": tail,
-                "damage": damage.iter().map(|damage| json!({ "description": damage.to_string() })).collect::<Vec<_>>(),
-            }))
+                .and_then(|bytes| Head::parse(HISTORY, vault_id, bytes).ok());
+            let needed: Vec<u16> = head
+                .iter()
+                .flat_map(|head| std::iter::once(head.tail()).chain(head.before_tail()))
+                .collect();
+            let listed: HashMap<u16, Option<&[u8]>> = request
+                .parts
+                .iter()
+                .map(|part| (part.part, part.blob.and_then(|index| blob(blobs, index))))
+                .collect();
+            #[derive(Serialize)]
+            struct DamageOut {
+                kind: String,
+                reason: String,
+                description: String,
+            }
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Checked {
+                history: &'static str,
+                version: Option<u16>,
+                tail_part: Option<u16>,
+                /// The parts the check needs before it can say: the tail and
+                /// the part before it, each listed with its blob, or without
+                /// one when its account is absent.
+                needs_parts: Option<Vec<u16>>,
+                damage: Option<Vec<DamageOut>>,
+            }
+            let missing =
+                state == MarkerHistory::On && needed.iter().any(|part| !listed.contains_key(part));
+            let damage = if missing {
+                None
+            } else if state == MarkerHistory::On {
+                Some(
+                    check_records(
+                        vault_id,
+                        request.head.and_then(|index| blob(blobs, index)),
+                        request.key.and_then(|index| blob(blobs, index)),
+                        |part| listed.get(&part).copied().flatten().map(<[u8]>::to_vec),
+                    )
+                    .into_iter()
+                    .map(|damage| {
+                        let description = damage.to_string();
+                        match damage {
+                            lpm_env_companion::gate::Damage::InvalidRecord { kind, reason } => {
+                                DamageOut {
+                                    kind,
+                                    reason,
+                                    description,
+                                }
+                            }
+                            _ => DamageOut {
+                                kind: String::new(),
+                                reason: description.clone(),
+                                description,
+                            },
+                        }
+                    })
+                    .collect(),
+                )
+            } else {
+                Some(Vec::new())
+            };
+            Output::default().finish(&Checked {
+                history: name,
+                version,
+                tail_part: head.as_ref().map(Head::tail),
+                needs_parts: missing.then_some(needed),
+                damage,
+            })
         })
     }
 }
@@ -1539,6 +1977,12 @@ struct AdmissionRequest {
     trimmable: Option<Vec<String>>,
     #[serde(default)]
     max_trims: Option<usize>,
+    /// For growth: the growing ring's vault ID and head blob, which say
+    /// whether it grows below its limit or grows back after shrinking.
+    #[serde(default)]
+    vault_id: Option<String>,
+    #[serde(default)]
+    head: Option<usize>,
 }
 
 /// Admission and trims, from a names-only listing of the service: no
@@ -1553,7 +1997,17 @@ pub unsafe extern "C" fn lpm_env_history_admission(
 ) -> LPMEnvResult {
     // SAFETY: Forwarded from this function's contract.
     unsafe {
-        respond(input, length, |request: AdmissionRequest, _| {
+        respond(input, length, |request: AdmissionRequest, blobs| {
+            let growing = match (&request.vault_id, request.head) {
+                (Some(vault_id), Some(index)) => match blob(blobs, index)
+                    .and_then(|bytes| Head::parse(HISTORY, vault_id, bytes).ok())
+                {
+                    Some(head) => Some(head),
+                    None => return failure(2, "history.invalid_input"),
+                },
+                (None, None) => None,
+                _ => return failure(2, "history.invalid_input"),
+            };
             let existing = admission_count(request.names.iter().map(String::as_str));
             let accounts: Vec<_> = request
                 .names
@@ -1588,13 +2042,16 @@ pub unsafe extern "C" fn lpm_env_history_admission(
                 CreationAdmission::Reduced => "reduced",
                 CreationAdmission::Refused => "refused",
             };
-            Output::default().finish(json!({
+            Output::default().finish(&json!({
                 "existing": existing,
                 "trims": trims.iter().map(|(vault_id, count)| json!({ "vaultId": vault_id, "count": count })).collect::<Vec<_>>(),
                 "afterTrims": after_trims,
                 "creation": creation,
                 "ringLimit": admission::admit_creation(after_trims).ring_limit(),
-                "growth": admission::admit_growth(after_trims),
+                "growth": growing.as_ref().map_or_else(
+                    || admission::admit_growth(after_trims),
+                    |head| admission::admit_growth_of(head, after_trims),
+                ),
                 "regrow": after_trims < admission::REGROW_BELOW,
             }))
         })
@@ -1661,7 +2118,7 @@ pub unsafe extern "C" fn lpm_env_history_ring(input: *const u8, length: usize) -
                 }
                 _ => return failure(2, "history.invalid_input"),
             };
-            output.finish(response)
+            output.finish(&response)
         })
     }
 }

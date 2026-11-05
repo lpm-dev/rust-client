@@ -304,11 +304,21 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         access_damage: Option<String>,
         #[serde(default)]
         unfinished: Option<String>,
+        /// The damage `lpm_env_history_check` found in history's records,
+        /// passed on unchanged.
+        #[serde(default)]
+        history_damage: Vec<HistoryDamage>,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Read {
         bytes: Option<Bytes>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HistoryDamage {
+        kind: String,
+        reason: String,
     }
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -403,6 +413,14 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                 .inventory
                 .as_deref()
                 .map(|names| project_inventory(&request.vault_id, names));
+            let history: Vec<Damage> = request
+                .history_damage
+                .iter()
+                .map(|damage| Damage::InvalidRecord {
+                    kind: damage.kind.clone(),
+                    reason: damage.reason.clone(),
+                })
+                .collect();
             let assessment = assess(
                 &request.vault_id,
                 Observed {
@@ -414,7 +432,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                         .map(|read| read.bytes.as_ref().map(|bytes| bytes.0.as_slice())),
                     access: request.access_damage.as_deref(),
                     unfinished: request.unfinished.as_deref(),
-                    history: &[],
+                    history: &history,
                 },
             );
             let marker = assessment.gate.marker();
