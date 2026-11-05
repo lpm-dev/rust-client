@@ -727,6 +727,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -982,6 +983,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -994,6 +996,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305 0.9.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1783,6 +1786,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -3783,9 +3787,15 @@ name = "lpm-env-companion"
 version = "0.84.0"
 dependencies = [
  "base64 0.23.1",
+ "chacha20poly1305",
+ "getrandom 0.4.3",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
  "lpm-common",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "zeroize",
 ]
 
 [[package]]

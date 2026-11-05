@@ -9,11 +9,14 @@
 //! each client runs it against its own.
 
 pub mod account;
+pub mod append_log;
 pub mod assessment;
 pub mod budgets;
 pub mod gate;
 pub mod graph;
+pub mod history;
 pub mod invariants;
+pub mod keyring;
 pub mod lifecycle;
 pub mod marker;
 pub mod overrides;
