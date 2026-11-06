@@ -409,6 +409,193 @@ fn the_app_records_reads_reveals_rolls_back_and_removes_through_the_binary_inter
     );
 }
 
+/// Record a change that may grow the ring, letting it grow when admission
+/// is asked.
+fn record_growing(store: &mut Store, id: u8, before: &[u8], after: &[u8]) {
+    let mut owned: Vec<Vec<u8>> = vec![before.to_vec(), after.to_vec()];
+    for account in [
+        lpm_env_companion::history::head_account(VAULT),
+        lpm_env_companion::history::key_account(VAULT),
+        lpm_env_companion::history::part_account(VAULT, store.head().tail()),
+        lpm_env_companion::account::CompanionAccount::Marker {
+            vault_id: VAULT.to_owned(),
+        },
+    ] {
+        owned.push(store.get(&account).expect("record").to_vec());
+    }
+    let blobs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    for growth in ["unasked", "allowed"] {
+        let request = json!({
+            "vaultId": VAULT,
+            "change": change(id, "set"),
+            "before": 1,
+            "after": 2,
+            "append": { "head": 3, "key": 4, "tail": 5, "marker": 6, "growth": growth },
+        });
+        let (status, response, out) = call(lpm_env_history_record, &request, &blobs);
+        assert_eq!(status, 0, "{response}");
+        if response["result"] == "needsGrowthAdmission" {
+            continue;
+        }
+        assert_eq!(response["result"], "write", "{response}");
+        store.apply(&response, &out);
+        return;
+    }
+    panic!("the change wasn't recorded");
+}
+
+/// A ring of several parts, each holding a few changes to a large value,
+/// and the payload its last change left.
+fn several_parts(store: &mut Store) -> Vec<u8> {
+    let value = |index: u8| format!("{index}").repeat(6_000);
+    let empty = payload_bytes(&[("production", &[])]);
+    let first = value(1);
+    let mut current = payload_bytes(&[("production", &[("BIG", first.as_str())])]);
+    record(store, 1, &empty, &current);
+    for id in 2..=12 {
+        let next_value = value(id);
+        let next = payload_bytes(&[("production", &[("BIG", next_value.as_str())])]);
+        record_growing(store, id, &current, &next);
+        current = next;
+    }
+    assert!(store.head().parts.len() >= 4, "{:?}", store.head().parts);
+    current
+}
+
+/// A call's status, response and blobs.
+type Answer = (u32, Value, Vec<Vec<u8>>);
+
+/// Call a reading function with `partial`, giving it only the parts it asks
+/// for, one answer at a time; returns its answer and the parts it read.
+fn call_partially(
+    function: unsafe extern "C" fn(*const u8, usize) -> LPMEnvResult,
+    store: &Store,
+    values: &[u8],
+    rest: Value,
+) -> (Answer, Vec<u16>) {
+    let mut read: Vec<u16> = Vec::new();
+    loop {
+        let mut blobs = vec![
+            store
+                .get(&lpm_env_companion::history::head_account(VAULT))
+                .expect("head")
+                .to_vec(),
+            store
+                .get(&lpm_env_companion::history::key_account(VAULT))
+                .expect("key")
+                .to_vec(),
+            values.to_vec(),
+        ];
+        let parts: Vec<Value> = read
+            .iter()
+            .map(
+                |part| match store.get(&lpm_env_companion::history::part_account(VAULT, *part)) {
+                    Some(bytes) => {
+                        blobs.push(bytes.to_vec());
+                        json!({ "part": part, "blob": blobs.len() })
+                    }
+                    None => json!({ "part": part }),
+                },
+            )
+            .collect();
+        let mut request = rest.clone();
+        let object = request.as_object_mut().expect("object");
+        object.insert("vaultId".to_owned(), json!(VAULT));
+        object.insert("head".to_owned(), json!(1));
+        object.insert("key".to_owned(), json!(2));
+        object.insert("values".to_owned(), json!(3));
+        object.insert("parts".to_owned(), json!(parts));
+        object.insert("partial".to_owned(), json!(true));
+        let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        let answer = call(function, &request, &blob_refs);
+        match answer.1["needsParts"].as_array() {
+            Some(needed) if answer.0 == 0 => {
+                let needed: Vec<u16> = needed
+                    .iter()
+                    .map(|part| part.as_u64().expect("part") as u16)
+                    .collect();
+                assert!(
+                    !needed.is_empty() && needed.iter().all(|part| !read.contains(part)),
+                    "{needed:?} after {read:?}"
+                );
+                read.extend(needed);
+            }
+            _ => return (answer, read),
+        }
+    }
+}
+
+#[test]
+fn a_partial_read_asks_only_for_the_parts_its_walk_reaches_and_answers_as_a_whole_read_does() {
+    let mut store = Store::default();
+    let current = several_parts(&mut store);
+    let head = store.head();
+    let newest = hex::encode([12; 16]);
+
+    let (request, blobs) = store.reading(&current, json!({ "ids": [newest] }));
+    let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+    let whole = call(lpm_env_history_reveal, &request, &blob_refs);
+    let (partial, read) = call_partially(
+        lpm_env_history_reveal,
+        &store,
+        &current,
+        json!({ "ids": [newest] }),
+    );
+    assert_eq!(partial.0, 0, "{}", partial.1);
+    assert_eq!(read, vec![head.tail()], "the newest change is in the tail");
+    assert_eq!((partial.1, partial.2), (whole.1, whole.2));
+
+    let undo = json!({ "rollback": { "kind": "undo", "entry": newest } });
+    let (request, blobs) = store.reading(&current, undo.clone());
+    let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+    let whole = call(lpm_env_history_rollback, &request, &blob_refs);
+    let (partial, read) = call_partially(lpm_env_history_rollback, &store, &current, undo);
+    assert_eq!(partial.0, 0, "{}", partial.1);
+    assert!(
+        read.len() < head.parts.len(),
+        "read {read:?} of {:?}",
+        head.parts
+    );
+    assert_eq!(
+        partial.1["plan"]["fingerprint"],
+        whole.1["plan"]["fingerprint"]
+    );
+
+    let oldest = hex::encode([1; 16]);
+    let (request, blobs) = store.reading(&current, json!({ "ids": [oldest] }));
+    let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+    let whole = call(lpm_env_history_reveal, &request, &blob_refs);
+    let (partial, read) = call_partially(
+        lpm_env_history_reveal,
+        &store,
+        &current,
+        json!({ "ids": [oldest] }),
+    );
+    assert_eq!(partial.0, 0, "{}", partial.1);
+    let mut newest_first = head.parts;
+    newest_first.reverse();
+    assert_eq!(
+        read, newest_first,
+        "the oldest change needs every part, newest first"
+    );
+    assert_eq!((partial.1, partial.2), (whole.1, whole.2));
+}
+
+#[test]
+fn a_whole_read_still_takes_an_omitted_blob_as_an_absent_part() {
+    let mut store = Store::default();
+    let current = several_parts(&mut store);
+    let (mut request, blobs) = store.reading(&current, json!({}));
+    let parts = request["parts"].as_array_mut().expect("parts");
+    let oldest = parts.first_mut().expect("a part");
+    oldest.as_object_mut().expect("object").remove("blob");
+    let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+    let (status, timeline, _) = call(lpm_env_history_timeline, &request, &blob_refs);
+    assert_eq!(status, 0, "{timeline}");
+    assert!(timeline.get("needsParts").is_none());
+    assert_eq!(timeline["unreadableParts"], 1);
+}
+
 #[test]
 fn check_reports_history_state_and_damage_beyond_the_listing() {
     let mut store = Store::default();

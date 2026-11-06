@@ -13,6 +13,7 @@
 //! payloads, revealed values, records to write. Values and key records never
 //! appear in JSON, and every output buffer is wiped when it's released.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -616,7 +617,9 @@ struct PartBlob {
 }
 
 /// What every reading function takes: the head, the key and the parts the
-/// head lists, each with its blob, or none when its account is absent.
+/// head lists, each with its blob, or none when its account is absent. With
+/// `partial`, `parts` holds only the parts read so far, and a part the walk
+/// reaches that isn't among them is asked for instead.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HistoryRequest<T> {
@@ -627,6 +630,8 @@ struct HistoryRequest<T> {
     values: Option<usize>,
     #[serde(default)]
     parts: Vec<PartBlob>,
+    #[serde(default)]
+    partial: bool,
     #[serde(flatten)]
     rest: T,
 }
@@ -635,6 +640,10 @@ struct Opening<'a> {
     opened: Opened,
     parts: HashMap<u16, &'a [u8]>,
     values: Option<Payload>,
+    /// With a partial read, the parts the request listed, read or absent.
+    listed: Option<HashSet<u16>>,
+    /// The part a partial read's walk reached without having it.
+    needed: Cell<Option<u16>>,
 }
 
 fn open<'a, T>(
@@ -647,6 +656,9 @@ fn open<'a, T>(
     let opened = Opened::open(&request.vault_id, head, key)
         .map_err(|error| refused("history.damaged", Some(error.to_string())))?;
     let mut parts = HashMap::with_capacity(request.parts.len());
+    let listed = request
+        .partial
+        .then(|| request.parts.iter().map(|part| part.part).collect());
     for part in &request.parts {
         if let Some(index) = part.blob {
             let Some(bytes) = blob(blobs, index) else {
@@ -667,24 +679,49 @@ fn open<'a, T>(
         opened,
         parts,
         values,
+        listed,
+        needed: Cell::new(None),
     })
 }
 
-/// The parts the app passed, lent to a reader without copying.
-struct LentParts<'a, 'b>(&'b HashMap<u16, &'a [u8]>);
+/// The parts the app passed, lent to a reader without copying. In a partial
+/// read, reaching a part the app didn't list stops the walk, noting the part.
+struct LentParts<'a, 'b> {
+    parts: &'b HashMap<u16, &'a [u8]>,
+    listed: Option<&'b HashSet<u16>>,
+    needed: &'b Cell<Option<u16>>,
+}
 
 impl PartSource for LentParts<'_, '_> {
     fn part(&mut self, part: u16) -> Result<Option<std::borrow::Cow<'_, [u8]>>, String> {
-        Ok(self
-            .0
-            .get(&part)
-            .map(|bytes| std::borrow::Cow::Borrowed(*bytes)))
+        if let Some(bytes) = self.parts.get(&part) {
+            return Ok(Some(std::borrow::Cow::Borrowed(*bytes)));
+        }
+        match self.listed {
+            Some(listed) if !listed.contains(&part) => {
+                self.needed.set(Some(part));
+                Err(format!("history part {part} hasn't been read yet"))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
 impl<'a> Opening<'a> {
     fn source(&self) -> LentParts<'a, '_> {
-        LentParts(&self.parts)
+        LentParts {
+            parts: &self.parts,
+            listed: self.listed.as_ref(),
+            needed: &self.needed,
+        }
+    }
+
+    /// The answer that asks for the part a partial read's walk stopped at,
+    /// when it stopped for one.
+    fn asked(&self) -> Option<LPMEnvResult> {
+        self.needed
+            .get()
+            .map(|part| Output::default().finish(&json!({ "needsParts": [part] })))
     }
 
     fn values(&self) -> Values<'_> {
@@ -1044,7 +1081,7 @@ pub unsafe extern "C" fn lpm_env_history_timeline(input: *const u8, length: usiz
                     false,
                 ) {
                     Ok(timeline) => timeline,
-                    Err(error) => return read_refusal(error),
+                    Err(error) => return opening.asked().unwrap_or_else(|| read_refusal(error)),
                 };
                 Output::default().finish(&timeline_out(
                     &timeline,
@@ -1088,7 +1125,7 @@ pub unsafe extern "C" fn lpm_env_history_reveal(input: *const u8, length: usize)
                 };
                 let revealed = match reveal_entries(&opening.opened, &mut opening.source(), &ids) {
                     Ok(revealed) => revealed,
-                    Err(error) => return read_refusal(error),
+                    Err(error) => return opening.asked().unwrap_or_else(|| read_refusal(error)),
                 };
                 let mut output = Output::default();
                 let mut infos = Vec::with_capacity(revealed.len());
@@ -1252,6 +1289,9 @@ fn plan_rollback(
         _ => return Err(failure(2, "history.invalid_input")),
     };
     planned.map_err(|error| match error {
+        PlanError::Read(_) if opening.needed.get().is_some() => {
+            opening.asked().expect("a part was asked for")
+        }
         PlanError::Read(error) => read_refusal(error),
         PlanError::EntryNotFound => refused("history.entry_not_found", None),
         PlanError::AmbiguousEntry => refused("history.ambiguous_entry", None),
@@ -1846,7 +1886,7 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                                     review: review_out(&opening.opened, &review),
                                 })
                             }
-                            Err(error) => removal_refusal(error),
+                            Err(error) => opening.asked().unwrap_or_else(|| removal_refusal(error)),
                         }
                     }
                     (None, Some(start)) => {

@@ -302,6 +302,10 @@ LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t in
  *
  * Most functions read history: {vaultId, head, key, values?, parts: [{part,
  * blob?}]}, every part the head lists, blob omitted when its account is absent.
+ * With partial: true, parts lists only the parts read so far, newest first as
+ * they were asked for, and a part the call reaches that parts doesn't list
+ * answers {needsParts: [part]} instead: read it, add it, and call again. A
+ * reveal or rollback near the newest change then reads only the parts it needs.
  *
  * Plan recording a change. Input {vaultId, change: {id (32 hex), time (ms),
  * action, detail?: {fileName?, pasted?, remote?: "personal" | {org},
