@@ -242,13 +242,11 @@ fn decode_path(bytes: &[u8]) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStringExt;
-        if !bytes.len().is_multiple_of(2) {
+        let (pairs, odd_byte) = bytes.as_chunks::<2>();
+        if !odd_byte.is_empty() {
             return None;
         }
-        let wide: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let wide: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         Some(PathBuf::from(OsString::from_wide(&wide)))
     }
     #[cfg(unix)]
