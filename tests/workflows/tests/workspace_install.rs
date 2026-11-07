@@ -3099,3 +3099,24 @@ async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
     .expect("member two should link contested-dep");
     assert_eq!(two_manifest["version"], "2.0.0");
 }
+
+#[test]
+fn install_with_settings_only_pnpm_workspace_yaml_installs_the_standalone_project() {
+    let project = TempProject::empty(r#"{"name":"app","version":"1.0.0"}"#);
+    project.write_file("pnpm-workspace.yaml", "allowBuilds:\n  esbuild: true\n");
+    let output = lpm(&project)
+        .arg("install")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("run install beside a settings-only pnpm-workspace.yaml");
+
+    assert_install_succeeded(
+        &output,
+        "a pnpm-workspace.yaml without `packages` holds settings, not a workspace",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("--recursive"),
+        "the user never asked for a recursive install"
+    );
+    assert_target_installed(&project, "");
+}

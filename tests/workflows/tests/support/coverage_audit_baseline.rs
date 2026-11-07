@@ -126,6 +126,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "InternalPackageSignals",
     "InternalSecurityPolicy",
     "InternalTsTransform",
+    "InternalNestedPm",
     "InternalVerifyRelease",
     "InternalUpdateCheck",
     "Completions",

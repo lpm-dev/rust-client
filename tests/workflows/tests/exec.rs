@@ -2811,3 +2811,63 @@ fn typescript_alias_targets_ignore_multiple_wildcards() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn exec_tool_installs_run_through_lpm_and_other_package_manager_commands_run_unchanged() {
+    let project = TempProject::empty(r#"{"name":"exec-pm-test","version":"1.0.0"}"#);
+    project.write_file("sub/package.json", r#"{"name":"sub","version":"1.0.0"}"#);
+    project.write_file(
+        "npm-owned/package.json",
+        r#"{"name":"npm-owned","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "npm-owned/package-lock.json",
+        r#"{"name":"npm-owned","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"npm-owned","version":"1.0.0"}}}"#,
+    );
+    write_fake_local_bin(
+        &project,
+        "setup-sub",
+        "#!/bin/sh\nset -e\necho \"agent=$npm_config_user_agent\"\n(cd sub && npm install)\n(cd npm-owned && npm install --offline --no-audit --no-fund)\nnpm --version >/dev/null\n",
+        "",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "setup-sub"])
+        .output()
+        .expect("failed to run project-local binary via lpm exec");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.path().join("sub/lpm.lock").is_file());
+    assert!(!project.path().join("sub/package-lock.json").exists());
+    assert!(
+        !project.path().join("npm-owned/lpm.lock").exists(),
+        "a project npm owns keeps npm's lockfile only"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("agent=lpm/"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("setup-sub ran 3 package-manager commands"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "npm install --offline --no-audit --no-fund  →  ran npm directly because the project uses package-lock.json; its dependency scripts followed npm's rules, not LPM's  (in npm-owned)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("npm install  →  handled by lpm install  (in sub)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("npm --version  →  ran npm directly  (in .)"),
+        "{stderr}"
+    );
+}

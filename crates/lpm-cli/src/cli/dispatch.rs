@@ -219,6 +219,21 @@ async fn async_main(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if let Commands::InternalNestedPm(args) = &command {
+        let code = match commands::run::nested_pm::run_shim(&args.manager, args.args.clone()) {
+            Ok(()) => 0,
+            Err(lpm_common::LpmError::ExitCode(code)) => code,
+            Err(error) => {
+                eprintln!(
+                    "lpm: {}",
+                    lpm_common::sanitize_terminal_multiline(&error.to_string())
+                );
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     if let Commands::InternalTsTransform(args) = &command {
         let result = if args.persistent {
             lpm_runner::ts_transform::run_persistent_stdio()
@@ -993,6 +1008,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 .workspaces
                 .is_some()
                     || install_state::has_pnpm_workspace_yaml(&cwd);
+                // pnpm accepts a `pnpm-workspace.yaml` that only holds
+                // settings (`allowBuilds`, catalogs, overrides); without
+                // `packages` it declares no workspace. Discovery errors
+                // still take the recursive path, which reports them.
+                let workspace_root_default = workspace_root_default
+                    && !matches!(lpm_workspace::discover_workspace(&cwd), Ok(None));
                 let recursive_install = recursive || (workspace_root_default && !no_recursive);
 
                 if catalog.is_some() {
@@ -3259,6 +3280,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             std::process::exit(0);
         }
         Commands::InternalTsTransform(_)
+        | Commands::InternalNestedPm(_)
         | Commands::InternalVerifyRelease(_)
         | Commands::InternalPackageSignals(_) => {
             unreachable!("handled before async command dispatch")

@@ -1580,7 +1580,7 @@ pub fn run_local_bin(
     no_env_check: bool,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    let mut command = build_local_bin_command(
+    let command = build_local_bin_command(
         project_dir,
         command_name,
         extra_args,
@@ -1588,6 +1588,12 @@ pub fn run_local_bin(
         no_env_check,
         bin_hint,
     )?;
+    run_built_local_bin_command(command)
+}
+
+/// Run a command from [`build_local_bin_command`], forwarding signals and
+/// the child's exit code.
+pub fn run_built_local_bin_command(mut command: Command) -> Result<(), LpmError> {
     let signals = crate::execution::ExecutionSignals::new()?;
     let status = signals.run(&mut command)?;
 

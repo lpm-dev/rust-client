@@ -607,6 +607,11 @@ pub(crate) enum Commands {
     #[command(name = "internal-ts-transform", hide = true)]
     InternalTsTransform(build::InternalTsTransformArgs),
 
+    /// Hidden target of the package-manager shims `lpm dlx` and
+    /// `lpm exec` put on a tool's PATH.
+    #[command(name = "internal-nested-pm", hide = true)]
+    InternalNestedPm(build::InternalNestedPmArgs),
+
     /// Hidden registry helper: the code signals of a published release,
     /// from its gzipped tarball on stdin, as JSON.
     #[command(name = "internal-package-signals", hide = true)]

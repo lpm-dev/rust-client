@@ -622,6 +622,15 @@ pub(crate) struct InternalVerifyReleaseArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct InternalNestedPmArgs {
+    /// Package manager command the shim stands in for.
+    pub(crate) manager: String,
+    /// Arguments the tool passed, after `--`.
+    #[arg(last = true)]
+    pub(crate) args: Vec<std::ffi::OsString>,
+}
+
+#[derive(Args)]
 pub(crate) struct InternalTsTransformArgs {
     #[arg(long, hide = true)]
     pub(crate) persistent: bool,

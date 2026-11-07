@@ -2,6 +2,7 @@ mod cache;
 mod dlx;
 mod dlx_policy;
 mod format;
+pub(crate) mod nested_pm;
 mod parallel;
 mod runtime;
 mod sequential;
@@ -328,7 +329,7 @@ pub async fn run_external_shortcut(
         install_ui::yellow(command_name)
     ));
     let start = std::time::Instant::now();
-    lpm_runner::script::run_local_bin(
+    nested_pm::run_local_tool(
         project_dir,
         command_name,
         extra_args,

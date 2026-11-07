@@ -453,14 +453,17 @@ async fn dlx_under_store_lock(
                 let executed = lpm_common::with_shared_lock_async(lock_path.clone(), async {
                     if let Some(policy) = &caller_policy { policy.recheck(client, &caller_root)?; }
                     let Some(identity) = cached_dlx_identity(&install, &target, receipt, prepared_generation.as_deref()) else { return Ok(false) };
-                    let command = lpm_runner::dlx::build_dlx_command(project_dir, install.root(), &target.install_spec, options.extra_args)?;
+                    let mut command = lpm_runner::dlx::build_dlx_command(project_dir, install.root(), &target.install_spec, options.extra_args)?;
                     check_dlx_execution_engines(&command, project_dir, &caller_root, install.root(), options.reserve_stdout)?;
                     if prepared_generation.is_none() {
                         install_ui::phase_line(crate::install_ui::terminal_line!("Reusing dlx cache entry ({})", install_ui::status_ok("fresh")));
                     }
                     print_dlx_identity(&identity);
                     install_ui::warn_untrusted(&format!("running `{package_spec}` inherits cwd privileges; credential env vars are stripped"));
-                    lpm_runner::dlx::exec_built_dlx_command(command, &target.install_spec)?;
+                    let tool = super::nested_pm::ToolRun::attach(&mut command);
+                    let result = lpm_runner::dlx::exec_built_dlx_command(command, &target.install_spec);
+                    tool.report(package_spec, project_dir);
+                    result?;
                     Ok(true)
                 }).await?;
                 if executed { return Ok(()); }
