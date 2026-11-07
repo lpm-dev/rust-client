@@ -658,7 +658,7 @@ pub fn is_ca_installed(ca_cert_path: &Path) -> Result<bool, LpmError> {
 
     #[cfg(target_os = "macos")]
     {
-        is_ca_installed_macos(&expected_hex)
+        Ok(is_ca_installed_macos(&expected_hex)? && is_ca_trusted_macos(ca_cert_path)?)
     }
 
     #[cfg(target_os = "linux")]
@@ -688,7 +688,8 @@ pub(crate) fn is_ca_installed_bytes(
         return is_ca_installed_test(&expected_hex, &trust_store_path);
     }
     #[cfg(target_os = "macos")]
-    return is_ca_installed_macos(&expected_hex);
+    return Ok(is_ca_installed_macos(&expected_hex)?
+        && with_verified_certificate_file(cert_pem, _display_path, is_ca_trusted_macos)?);
     #[cfg(target_os = "linux")]
     return is_ca_installed_linux_bytes(cert_pem);
     #[cfg(target_os = "windows")]
@@ -849,6 +850,20 @@ fn is_ca_installed_macos(expected_fingerprint_hex: &str) -> Result<bool, LpmErro
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(parse_macos_sha256_lines(&stdout)
         .any(|fp| fp.eq_ignore_ascii_case(expected_fingerprint_hex)))
+}
+
+/// Whether macOS trusts the CA, not just holds it: a cancelled authorization
+/// prompt during `add-trusted-cert`, a double-clicked import, or "Never
+/// Trust" all leave the certificate in the keychain without trust settings,
+/// and browsers then reject its leaves.
+#[cfg(target_os = "macos")]
+fn is_ca_trusted_macos(ca_cert_path: &Path) -> Result<bool, LpmError> {
+    let output = Command::new(SECURITY_EXECUTABLE)
+        .args(["verify-cert", "-L", "-l", "-c"])
+        .arg(ca_cert_path)
+        .output()
+        .map_err(|e| LpmError::Cert(format!("failed to run `security verify-cert`: {e}")))?;
+    Ok(output.status.success())
 }
 
 #[cfg(target_os = "macos")]
@@ -1701,5 +1716,37 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_trust_tests {
+    use super::*;
+
+    #[test]
+    fn a_ca_macos_holds_without_trust_settings_reads_as_untrusted() {
+        let (cert_pem, _key_pem) = crate::ca::generate_ca().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        std::fs::write(&path, cert_pem).unwrap();
+
+        assert!(!is_ca_trusted_macos(&path).unwrap());
+    }
+
+    #[test]
+    fn a_root_macos_trusts_reads_as_trusted() {
+        let output = Command::new(SECURITY_EXECUTABLE)
+            .args(["find-certificate", "-c", "ISRG Root X1", "-p"])
+            .arg("/System/Library/Keychains/SystemRootCertificates.keychain")
+            .output()
+            .unwrap();
+        if !output.status.success() || output.stdout.is_empty() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.pem");
+        std::fs::write(&path, output.stdout).unwrap();
+
+        assert!(is_ca_trusted_macos(&path).unwrap());
     }
 }

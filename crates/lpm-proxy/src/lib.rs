@@ -106,8 +106,10 @@ pub(crate) use protocol::{
 pub(crate) use state_file::write_state_file;
 #[cfg(all(test, unix))]
 pub(crate) use tls::cert_covers_hostname;
+#[cfg(test)]
+pub(crate) use tls::refresh_tls_cert_store;
 pub(crate) use tls::{
-    TlsCertificateStore, prepare_tls_certificates_if_enabled, refresh_tls_cert_store,
+    TlsCertificateStore, certificate_map_for_routes, prepare_tls_certificates_if_enabled,
     start_tls_proxy,
 };
 #[cfg(unix)]

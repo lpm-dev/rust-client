@@ -808,6 +808,40 @@ fn tls_cert_store_loads_project_leaf_for_registered_host() {
 
 #[test]
 #[cfg(all(unix, debug_assertions))]
+fn another_project_registers_routes_while_a_served_project_s_cert_files_are_gone() {
+    let (_home, _guard) = setup_cert_home();
+    let served = tempfile::tempdir().unwrap();
+    let joining = tempfile::tempdir().unwrap();
+    prepare_project_cert(served.path(), &["app.localhost"]);
+    prepare_project_cert(joining.path(), &["shop.localhost"]);
+    let route = |host: &str, project: &std::path::Path, lease: u64| RouteStatus {
+        host: host.to_string(),
+        upstream_port: 3000,
+        project_dir: project.to_path_buf(),
+        service: None,
+        lease_id: RouteLeaseId(lease),
+        owner_pid: 123,
+    };
+    let store = TlsCertificateStore::default();
+    refresh_tls_cert_store(&store, &[route("app.localhost", served.path(), 1)]).unwrap();
+    let served_key = store.get("app.localhost").unwrap();
+    std::fs::remove_dir_all(served.path().join(".lpm").join("certs")).unwrap();
+
+    let keys = certificate_map_for_routes(
+        &store.snapshot().unwrap(),
+        &[
+            route("app.localhost", served.path(), 1),
+            route("shop.localhost", joining.path(), 2),
+        ],
+    )
+    .unwrap();
+
+    assert!(Arc::ptr_eq(&keys["app.localhost"], &served_key));
+    assert!(keys.contains_key("shop.localhost"));
+}
+
+#[test]
+#[cfg(all(unix, debug_assertions))]
 fn failed_tls_cert_store_refresh_retains_the_previous_complete_store() {
     let (_home, _guard) = setup_cert_home();
     let project = tempfile::tempdir().unwrap();
@@ -2919,4 +2953,25 @@ async fn wait_for_control_pipe_server(pipe_name: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("control server did not become ready");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_daemon_start_waits_for_no_one_and_leaves_another_starter_s_socket_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("proxy.sock");
+    std::fs::write(&socket, "").unwrap();
+    let _other_starter = lpm_common::try_acquire_exclusive_lock(socket.with_extension("lock"))
+        .unwrap()
+        .unwrap();
+
+    let error = serve_control_at_path(&socket, &dir.path().join("proxy.json"))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("already owns"), "{error}");
+    assert!(
+        socket.exists(),
+        "the starter removed a socket it didn't own"
+    );
 }

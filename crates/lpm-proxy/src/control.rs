@@ -80,6 +80,17 @@ pub async fn serve_control_at_path_with_options(
     if let Some(parent) = socket_path.parent() {
         ensure_lpm_root(parent)?;
     }
+    // Held for the daemon's life. Two starters racing after a crash would
+    // otherwise both find the old socket dead, and the second would delete
+    // the socket the first just bound, leaving a daemon nothing can reach.
+    let _daemon_lock = lpm_common::try_acquire_exclusive_lock(socket_path.with_extension("lock"))
+        .map_err(|error| ProxyError::Ipc(format!("lock the proxy daemon: {error}")))?
+        .ok_or_else(|| {
+            ProxyError::Ipc(format!(
+                "local proxy daemon already owns {}",
+                socket_path.display()
+            ))
+        })?;
     if socket_path.exists() {
         match send_request_to_path(socket_path, ProxyRequest::Status).await {
             Ok(_) => {
@@ -315,9 +326,23 @@ async fn serve_unix_listener(
                 });
             }
             _ = prune_interval.tick() => {
+                // Under the write lock, so a route commit in progress can't
+                // publish a registry that still holds the pruned leases.
+                let _write_guard = state_write_lock.lock().await;
                 let removed = registry.lock().await.prune_dead_leases();
-                if removed > 0 {
-                    write_current_state(&registry, &state_write_lock, state_path, socket_path.display().to_string(), listener_addrs.clone(), tls_cert_store.as_ref()).await?;
+                // A failed refresh keeps the daemon serving the routes it
+                // has; stopping it would drop every project's routes.
+                if removed > 0
+                    && let Err(error) = write_current_state_locked(
+                        &registry,
+                        state_path,
+                        &socket_path.display().to_string(),
+                        &listener_addrs,
+                        tls_cert_store.as_ref(),
+                    )
+                    .await
+                {
+                    eprintln!("lpm proxy: could not publish routes after pruning dead leases: {error}");
                 }
             }
             _ = stop_rx.recv() => break,
@@ -864,48 +889,73 @@ async fn commit_connection_backed_routes(
     routes: Vec<Route>,
 ) -> Result<(), ProxyError> {
     let _write_guard = context.state_write_lock.lock().await;
-    let mut registry = context.registry.lock().await;
-    registry.prune_dead_leases();
-    let previous_routes = registry.routes_for_lease(lease_id);
+    let (previous, mut candidate) = {
+        let mut registry = context.registry.lock().await;
+        registry.prune_dead_leases();
+        (registry.clone(), registry.clone())
+    };
+    if routes.is_empty() {
+        candidate.restore_routes_for_lease(lease_id, routes)?;
+    } else {
+        candidate.replace_routes(lease_id, routes)?;
+    }
+    publish_registry(context, previous, candidate).await
+}
+
+async fn commit_connection_backed_release(
+    context: &ControlStreamContext,
+    lease_id: RouteLeaseId,
+) -> Result<usize, ProxyError> {
+    let _write_guard = context.state_write_lock.lock().await;
+    let (previous, mut candidate) = {
+        let registry = context.registry.lock().await;
+        (registry.clone(), registry.clone())
+    };
+    let removed = candidate.release(lease_id);
+    publish_registry(context, previous, candidate).await?;
+    Ok(removed)
+}
+
+/// Publishes `candidate` in place of `previous`: its certificates, then its
+/// routes, then the state file, restoring `previous` if the state file can't
+/// be written. The caller holds the state write lock. Certificates load and
+/// the state file is written without the route registry locked, so requests
+/// keep routing while either waits on the disk or on another process's
+/// certificate lock.
+async fn publish_registry(
+    context: &ControlStreamContext,
+    previous: RouteRegistry,
+    candidate: RouteRegistry,
+) -> Result<(), ProxyError> {
+    let published_routes = candidate.statuses();
     let previous_certificates = context
         .tls_cert_store
         .as_ref()
         .map(TlsCertificateStore::snapshot)
         .transpose()?;
-    if routes.is_empty() {
-        registry.restore_routes_for_lease(lease_id, routes)?;
-    } else {
-        registry.replace_routes(lease_id, routes)?;
+    if let (Some(cert_store), Some(current_keys)) = (
+        context.tls_cert_store.as_ref(),
+        previous_certificates.clone(),
+    ) {
+        cert_store.replace(certificates_for(current_keys, published_routes.clone()).await?)?;
     }
-    let published_routes = registry.statuses();
-    if let Some(cert_store) = context.tls_cert_store.as_ref()
-        && let Err(refresh_error) = refresh_tls_cert_store(cert_store, &published_routes)
-    {
-        if let Err(restore_error) = registry.restore_routes_for_lease(lease_id, previous_routes) {
-            return Err(ProxyError::Tls(format!(
-                "{refresh_error}; restoring the previous routes also failed: {restore_error}"
-            )));
-        }
-        return Err(refresh_error);
-    }
-    let write_result = write_state_file(
-        &context.state_path,
-        &ProxyDaemonState {
-            pid: std::process::id(),
-            endpoint: Some(context.endpoint.clone()),
-            http_addr: context.listener_addrs.http_addr.clone(),
-            http_redirect_addr: context.listener_addrs.http_redirect_addr.clone(),
-            tls_addr: context.listener_addrs.tls_addr.clone(),
-            public_tls_addr: context.listener_addrs.public_tls_addr.clone(),
-            routes: published_routes,
-        },
-    );
+    *context.registry.lock().await = candidate;
+
+    let state = ProxyDaemonState {
+        pid: std::process::id(),
+        endpoint: Some(context.endpoint.clone()),
+        http_addr: context.listener_addrs.http_addr.clone(),
+        http_redirect_addr: context.listener_addrs.http_redirect_addr.clone(),
+        tls_addr: context.listener_addrs.tls_addr.clone(),
+        public_tls_addr: context.listener_addrs.public_tls_addr.clone(),
+        routes: published_routes,
+    };
+    let state_path = context.state_path.clone();
+    let write_result = tokio::task::spawn_blocking(move || write_state_file(&state_path, &state))
+        .await
+        .map_err(|error| ProxyError::StateWrite(format!("state write task failed: {error}")))?;
     if let Err(write_error) = write_result {
-        if let Err(restore_error) = registry.restore_routes_for_lease(lease_id, previous_routes) {
-            return Err(ProxyError::StateWrite(format!(
-                "{write_error}; restoring the previous in-memory routes also failed: {restore_error}"
-            )));
-        }
+        *context.registry.lock().await = previous;
         if let (Some(cert_store), Some(previous_certificates)) =
             (context.tls_cert_store.as_ref(), previous_certificates)
             && let Err(restore_error) = cert_store.replace(previous_certificates)
@@ -919,67 +969,25 @@ async fn commit_connection_backed_routes(
     Ok(())
 }
 
-async fn commit_connection_backed_release(
-    context: &ControlStreamContext,
-    lease_id: RouteLeaseId,
-) -> Result<usize, ProxyError> {
-    let _write_guard = context.state_write_lock.lock().await;
-    let mut registry = context.registry.lock().await;
-    let previous_registry = registry.clone();
-    let previous_certificates = context
-        .tls_cert_store
-        .as_ref()
-        .map(TlsCertificateStore::snapshot)
-        .transpose()?;
-    let removed = registry.release(lease_id);
-    let published_routes = registry.statuses();
-    if let Some(cert_store) = context.tls_cert_store.as_ref()
-        && let Err(refresh_error) = refresh_tls_cert_store(cert_store, &published_routes)
-    {
-        *registry = previous_registry;
-        return Err(refresh_error);
-    }
-    let write_result = write_state_file(
-        &context.state_path,
-        &ProxyDaemonState {
-            pid: std::process::id(),
-            endpoint: Some(context.endpoint.clone()),
-            http_addr: context.listener_addrs.http_addr.clone(),
-            http_redirect_addr: context.listener_addrs.http_redirect_addr.clone(),
-            tls_addr: context.listener_addrs.tls_addr.clone(),
-            public_tls_addr: context.listener_addrs.public_tls_addr.clone(),
-            routes: published_routes,
-        },
-    );
-    if let Err(write_error) = write_result {
-        *registry = previous_registry;
-        if let (Some(cert_store), Some(previous_certificates)) =
-            (context.tls_cert_store.as_ref(), previous_certificates)
-            && let Err(restore_error) = cert_store.replace(previous_certificates)
-        {
-            return Err(ProxyError::StateWrite(format!(
-                "{write_error}; restoring the previous TLS certificate store also failed: {restore_error}"
-            )));
-        }
-        return Err(write_error);
-    }
-    Ok(removed)
+/// Certificates for `routes`, loaded on the blocking pool: a project that
+/// gained a host may wait on its certificate files or another process's
+/// certificate lock.
+async fn certificates_for(
+    current_keys: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    routes: Vec<RouteStatus>,
+) -> Result<HashMap<String, Arc<rustls::sign::CertifiedKey>>, ProxyError> {
+    tokio::task::spawn_blocking(move || certificate_map_for_routes(&current_keys, &routes))
+        .await
+        .map_err(|error| ProxyError::Tls(format!("certificate refresh task failed: {error}")))?
 }
 
 pub(crate) async fn release_connection_backed_lease(
     context: &ControlStreamContext,
     lease_id: RouteLeaseId,
 ) -> Result<(), ProxyError> {
-    context.registry.lock().await.release(lease_id);
-    write_current_state(
-        &context.registry,
-        &context.state_write_lock,
-        &context.state_path,
-        context.endpoint.clone(),
-        context.listener_addrs.clone(),
-        context.tls_cert_store.as_ref(),
-    )
-    .await
+    commit_connection_backed_release(context, lease_id)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn write_current_state(
@@ -1025,20 +1033,21 @@ async fn write_current_state_locked(
 ) -> Result<(), ProxyError> {
     let routes = registry.lock().await.statuses();
     if let Some(cert_store) = tls_cert_store {
-        refresh_tls_cert_store(cert_store, &routes)?;
+        cert_store.replace(certificates_for(cert_store.snapshot()?, routes.clone()).await?)?;
     }
-    write_state_file(
-        state_path,
-        &ProxyDaemonState {
-            pid: std::process::id(),
-            endpoint: Some(endpoint.to_string()),
-            http_addr: listener_addrs.http_addr.clone(),
-            http_redirect_addr: listener_addrs.http_redirect_addr.clone(),
-            tls_addr: listener_addrs.tls_addr.clone(),
-            public_tls_addr: listener_addrs.public_tls_addr.clone(),
-            routes,
-        },
-    )
+    let state = ProxyDaemonState {
+        pid: std::process::id(),
+        endpoint: Some(endpoint.to_string()),
+        http_addr: listener_addrs.http_addr.clone(),
+        http_redirect_addr: listener_addrs.http_redirect_addr.clone(),
+        tls_addr: listener_addrs.tls_addr.clone(),
+        public_tls_addr: listener_addrs.public_tls_addr.clone(),
+        routes,
+    };
+    let state_path = state_path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_state_file(&state_path, &state))
+        .await
+        .map_err(|error| ProxyError::StateWrite(format!("state write task failed: {error}")))?
 }
 
 pub(crate) async fn handle_request(
@@ -1479,12 +1488,20 @@ mod connection_cleanup_tests {
         commit_connection_backed_routes(
             &context,
             lease_id,
-            vec![Route {
-                host: "app.localhost".to_string(),
-                upstream_port: 4000,
-                project_dir: project,
-                service: Some("web".to_string()),
-            }],
+            vec![
+                Route {
+                    host: "app.localhost".to_string(),
+                    upstream_port: 4000,
+                    project_dir: project.clone(),
+                    service: Some("web".to_string()),
+                },
+                Route {
+                    host: "api.localhost".to_string(),
+                    upstream_port: 4001,
+                    project_dir: project,
+                    service: Some("api".to_string()),
+                },
+            ],
         )
         .await
         .unwrap_err();
@@ -1493,5 +1510,6 @@ mod connection_cleanup_tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].upstream_port, 3000);
         assert!(tls_cert_store.get("app.localhost").is_some());
+        assert!(tls_cert_store.get("api.localhost").is_none());
     }
 }
