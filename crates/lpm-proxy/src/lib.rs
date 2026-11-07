@@ -82,14 +82,14 @@ pub use types::{
     RegisteredRoute, Route, RouteLeaseId, RouteStatus,
 };
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) use client::{LeaseConnection, register_lease_to_path};
 #[cfg(test)]
 pub(crate) use http::find_header_end;
 pub(crate) use http::{format_loopback_bind_error, proxy_http_request_inner, start_http_redirect};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use platform::parse_linux_status_effective_uid;
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) use platform::{current_effective_uid, unix_control_peer_uid, validate_unix_peer_uid};
 pub(crate) use platform::{ensure_lpm_root, process_is_running};
 #[cfg(unix)]
@@ -97,16 +97,16 @@ pub(crate) use platform::{
     process_owner_uid, read_forwarder_daemon_state, validate_forwarder_daemon_state,
     validate_unix_control_peer,
 };
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) use protocol::read_proxy_request;
 pub(crate) use protocol::{
     read_proxy_request_after_activity, read_proxy_request_with_timeout, send_request_on_stream,
     send_request_on_stream_ref, write_response,
 };
 pub(crate) use state_file::write_state_file;
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) use tls::cert_covers_hostname;
-#[cfg(test)]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) use tls::refresh_tls_cert_store;
 pub(crate) use tls::{
     TlsCertificateStore, certificate_map_for_routes, prepare_tls_certificates_if_enabled,

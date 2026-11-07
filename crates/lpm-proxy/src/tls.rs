@@ -293,7 +293,7 @@ async fn serve_tls_http_connection(
 
 /// Loads every route's certificate from disk, as a daemon with no current
 /// keys would.
-#[cfg(test)]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) fn refresh_tls_cert_store(
     cert_store: &TlsCertificateStore,
     routes: &[RouteStatus],
@@ -536,7 +536,7 @@ fn parse_certified_key_bytes(
     Ok(certified_key)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) fn cert_covers_hostname(cert_path: &Path, host: &str) -> Result<bool, ProxyError> {
     let cert_pem =
         lpm_common::read_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
