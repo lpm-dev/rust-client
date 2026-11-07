@@ -21,6 +21,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ use crate::install_ui;
 pub(crate) const SHIMS_ENV: &str = "LPM_NESTED_PM_SHIMS";
 /// File the shims append one [`LogEntry`] line to per command.
 pub(crate) const LOG_ENV: &str = "LPM_NESTED_PM_LOG";
+/// When the tool started, in nanoseconds since the Unix epoch.
+const STARTED_ENV: &str = "LPM_NESTED_PM_STARTED";
 const USER_AGENT_ENV: &str = "npm_config_user_agent";
 
 const MANAGERS: &[&str] = &[
@@ -116,10 +119,14 @@ impl NestedPmSession {
                 "could not add package-manager shims to PATH: {error}"
             ))
         })?;
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
         command
             .env("PATH", path)
             .env(SHIMS_ENV, &self.shim_dir)
-            .env(LOG_ENV, self.log.path());
+            .env(LOG_ENV, self.log.path())
+            .env(STARTED_ENV, started.to_string());
         Ok(())
     }
 
@@ -163,7 +170,67 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
             lpm_common::AtomicWriteOptions::default().unix_mode(0o755),
         )?;
     }
+    #[cfg(windows)]
+    for manager in managers {
+        ensure_launcher(lpm, &dir.join(format!("{manager}.exe")))?;
+    }
     Ok(dir)
+}
+
+/// On Windows, a process started without a shell (Node's `spawn('bun')`)
+/// finds only `.com` and `.exe` files, so a `.cmd` shim alone would be
+/// skipped for a real `bun.exe` later on PATH. Each shim therefore also
+/// gets an `.exe` that is the LPM binary itself, hard-linked when the
+/// volume allows and copied otherwise; [`launcher_manager`] recognizes
+/// it at startup.
+#[cfg(windows)]
+fn ensure_launcher(lpm: &Path, target: &Path) -> Result<(), LpmError> {
+    if target.is_file() {
+        return Ok(());
+    }
+    let staged = target.with_extension(format!("exe.{}", std::process::id()));
+    if std::fs::hard_link(lpm, &staged).is_err() {
+        std::fs::copy(lpm, &staged)?;
+    }
+    match std::fs::rename(&staged, target) {
+        Ok(()) => Ok(()),
+        Err(_) if target.is_file() => {
+            let _ = std::fs::remove_file(&staged);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            Err(error.into())
+        }
+    }
+}
+
+/// The package manager a shim launcher stands in for, when the running
+/// binary is one of the `.exe` launchers in the session's shim directory.
+#[cfg(any(windows, test))]
+pub(crate) fn launcher_manager(exe: &Path, shim_dir: Option<&OsStr>) -> Option<&'static str> {
+    let shim_dir = Path::new(shim_dir?);
+    if !same_dir(exe.parent()?, shim_dir) {
+        return None;
+    }
+    let stem = exe.file_stem()?.to_str()?.to_ascii_lowercase();
+    MANAGERS.iter().copied().find(|manager| *manager == stem)
+}
+
+/// Run a shimmed command and exit with its status.
+pub(crate) fn exit_with_shim(manager: &str, args: Vec<OsString>) -> ! {
+    let code = match run_shim(manager, args) {
+        Ok(()) => 0,
+        Err(LpmError::ExitCode(code)) => code,
+        Err(error) => {
+            eprintln!(
+                "lpm: {}",
+                lpm_common::sanitize_terminal_multiline(&error.to_string())
+            );
+            1
+        }
+    };
+    std::process::exit(code);
 }
 
 fn shim_file_name(manager: &str) -> String {
@@ -261,9 +328,9 @@ pub(crate) fn translate(
 ) -> Plan {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match manager {
-        "npx" => runner(&args, Runner::LocalFirst, cwd, local_bin),
-        "bunx" => runner(&args, Runner::LocalFirst, cwd, local_bin),
-        "pnpx" => runner(&args, Runner::Download, cwd, local_bin),
+        "npx" => runner(&args, Runner::LocalFirst, cwd, None, local_bin),
+        "bunx" => runner(&args, Runner::LocalFirst, cwd, None, local_bin),
+        "pnpx" => runner(&args, Runner::Download, cwd, None, local_bin),
         "npm" | "pnpm" | "yarn" | "yarnpkg" | "bun" => {
             manager_command(manager, &args, cwd, local_bin).unwrap_or(Plan::Real)
         }
@@ -300,11 +367,13 @@ const VALUE_FLAGS: &[&str] = &[
     "--cwd",
     "--loglevel",
     "--reporter",
+    "--registry",
 ];
 
 /// Effect of one install flag on the translated `lpm install`.
 enum InstallFlag {
     Dir,
+    Registry,
     Lpm(&'static str),
     Ignore,
     /// Changes what is installed or where, beyond what `lpm install`
@@ -316,30 +385,44 @@ fn install_flag(manager: &str, flag: &str) -> InstallFlag {
     let (name, value) = flag
         .split_once('=')
         .map_or((flag, None), |(n, v)| (n, Some(v)));
+    // `--frozen-lockfile=false` turns a boolean flag off rather than on.
+    let off = matches!(value, Some("false" | "0"));
+    let on_or_ignore = |lpm: &'static str| {
+        if off {
+            InstallFlag::Ignore
+        } else {
+            InstallFlag::Lpm(lpm)
+        }
+    };
     match (manager, name) {
         ("npm", "--prefix" | "-C") | ("pnpm", "-C" | "--dir") | ("yarn" | "bun", "--cwd") => {
             InstallFlag::Dir
         }
+        (_, "--registry") => InstallFlag::Registry,
         (_, "--save-dev")
         | ("npm" | "pnpm" | "yarn" | "bun", "-D")
         | ("yarn" | "bun", "--dev")
-        | ("bun", "-d" | "--development") => InstallFlag::Lpm("-D"),
-        ("npm", "--production" | "--prod") | ("npm", "--omit")
-            if value == Some("dev") || name != "--omit" =>
-        {
-            InstallFlag::Lpm("--prod")
-        }
-        ("pnpm", "-P" | "--prod" | "--production")
+        | ("bun", "-d" | "--development") => on_or_ignore("-D"),
+        ("npm", "--omit") if value == Some("dev") => InstallFlag::Lpm("--prod"),
+        ("npm", "--production" | "--prod")
+        | ("pnpm", "-P" | "--prod" | "--production")
         | ("yarn", "--production" | "--prod")
-        | ("bun", "-p" | "--production") => InstallFlag::Lpm("--prod"),
+        | ("bun", "-p" | "--production") => on_or_ignore("--prod"),
         ("pnpm" | "yarn" | "bun", "--frozen-lockfile") | ("yarn", "--immutable") => {
-            InstallFlag::Lpm("--frozen-lockfile")
+            InstallFlag::Lpm(if off {
+                "--no-frozen-lockfile"
+            } else {
+                "--frozen-lockfile"
+            })
         }
-        (_, "--offline") => InstallFlag::Lpm("--offline"),
-        (_, "--ignore-scripts") if value.is_none_or(|v| v == "true") => {
-            InstallFlag::Lpm("--policy=deny")
-        }
-        (_, "--strict-peer-dependencies") => InstallFlag::Lpm("--strict-peer-dependencies"),
+        ("pnpm", "--no-frozen-lockfile") => InstallFlag::Lpm("--no-frozen-lockfile"),
+        (_, "--offline") => on_or_ignore("--offline"),
+        (_, "--ignore-scripts") => on_or_ignore("--policy=deny"),
+        (_, "--strict-peer-dependencies") => InstallFlag::Lpm(if off {
+            "--no-strict-peer-dependencies"
+        } else {
+            "--strict-peer-dependencies"
+        }),
         (
             _,
             "--no-audit"
@@ -368,12 +451,18 @@ fn install_flag(manager: &str, flag: &str) -> InstallFlag {
             | "--legacy-peer-deps"
             | "--no-package-lock"
             | "--prefer-frozen-lockfile"
-            | "--yes"
-            | "--no-optional-yes",
+            | "--yes",
         ) => InstallFlag::Ignore,
         ("npm", "-P") => InstallFlag::Ignore,
         _ => InstallFlag::Unsupported,
     }
+}
+
+/// `--version` / `--help` answer and exit instead of running the
+/// command's default action (a bare `yarn` installs).
+fn has_query_flag(args: &[&str]) -> bool {
+    args.iter()
+        .any(|arg| matches!(*arg, "--version" | "-v" | "-V" | "--help" | "-h"))
 }
 
 /// `None` when the command is not one this module translates, or uses a
@@ -394,23 +483,49 @@ fn manager_command(
     let is_install = match (manager, subcommand) {
         ("npm", Some(sub)) => NPM_INSTALL.contains(&sub),
         ("pnpm", Some("install" | "i" | "add")) => true,
-        ("yarn", None | Some("install" | "add")) => true,
+        ("yarn", None) => !has_query_flag(args),
+        ("yarn", Some("install" | "add")) => true,
         ("bun", Some("install" | "i" | "add" | "a")) => true,
         _ => false,
     };
     let is_clean_install =
         manager == "npm" && subcommand.is_some_and(|sub| NPM_CLEAN_INSTALL.contains(&sub));
-    let rest = subcommand_index.map_or(args, |index| &args[index + 1..]);
     if is_install || is_clean_install {
         return install(manager, args, subcommand_index, is_clean_install, cwd);
     }
-    match (manager, subcommand) {
-        ("npm", Some("exec" | "x")) | ("bun", Some("x")) => {
-            Some(runner(rest, Runner::LocalFirst, cwd, local_bin))
+    let kind = match (manager, subcommand) {
+        ("npm", Some("exec" | "x")) | ("bun", Some("x")) => Runner::LocalFirst,
+        ("pnpm" | "yarn", Some("dlx")) => Runner::Download,
+        _ => return None,
+    };
+    let index = subcommand_index?;
+    let dir = runner_dir(manager, &args[..index], cwd)?;
+    Some(runner(&args[index + 1..], kind, cwd, dir, local_bin))
+}
+
+/// The directory a manager option before the subcommand moves a runner to
+/// (`Some(None)` when none does). `None` when an option changes runner
+/// behavior in a way `lpm exec` / `lpm dlx` cannot reproduce.
+fn runner_dir(manager: &str, options: &[&str], cwd: &Path) -> Option<Option<PathBuf>> {
+    let mut dir = None;
+    let mut index = 0;
+    while index < options.len() {
+        let option = options[index];
+        index += 1;
+        let value = if VALUE_FLAGS.contains(&option) {
+            let value = *options.get(index)?;
+            index += 1;
+            Some(value)
+        } else {
+            option.split_once('=').map(|(_, value)| value)
+        };
+        match install_flag(manager, option) {
+            InstallFlag::Dir => dir = Some(cwd.join(value?)),
+            InstallFlag::Ignore => {}
+            _ => return None,
         }
-        ("pnpm" | "yarn", Some("dlx")) => Some(runner(rest, Runner::Download, cwd, local_bin)),
-        _ => None,
     }
+    Some(dir)
 }
 
 fn install(
@@ -423,6 +538,7 @@ fn install(
     let mut lpm_flags: BTreeSet<&str> = BTreeSet::new();
     let mut packages = Vec::new();
     let mut dir = None;
+    let mut registry = None;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index];
@@ -446,6 +562,7 @@ fn install(
         };
         match install_flag(manager, arg) {
             InstallFlag::Dir => dir = Some(cwd.join(value?)),
+            InstallFlag::Registry => registry = Some(value?),
             InstallFlag::Lpm(flag) => {
                 lpm_flags.insert(flag);
             }
@@ -459,7 +576,16 @@ fn install(
             return None;
         }
         lpm_args.push("ci".to_string());
-        lpm_flags.retain(|flag| matches!(*flag, "--prod" | "--offline"));
+        lpm_flags.retain(|flag| {
+            matches!(
+                *flag,
+                "--prod"
+                    | "--offline"
+                    | "--policy=deny"
+                    | "--strict-peer-dependencies"
+                    | "--no-strict-peer-dependencies"
+            )
+        });
     } else {
         lpm_args.push("install".to_string());
         if packages.is_empty() {
@@ -469,6 +595,9 @@ fn install(
         }
     }
     lpm_args.extend(lpm_flags.iter().map(|flag| (*flag).to_string()));
+    if let Some(registry) = registry {
+        lpm_args.push(format!("--registry={registry}"));
+    }
     lpm_args.extend(packages);
     Some(Plan::Lpm {
         args: lpm_args,
@@ -499,6 +628,7 @@ fn runner(
     args: &[&str],
     kind: Runner,
     cwd: &Path,
+    dir: Option<PathBuf>,
     local_bin: &dyn Fn(&Path, &str) -> bool,
 ) -> Plan {
     let mut index = 0;
@@ -522,25 +652,21 @@ fn runner(
         return Plan::Real;
     };
     let rest = rest.iter().map(|arg| (*arg).to_string());
-    if kind == Runner::LocalFirst && !command.contains('@') && local_bin(cwd, command) {
-        return Plan::Lpm {
-            args: std::iter::once("exec".to_string())
-                .chain(std::iter::once((*command).to_string()))
-                .chain(rest)
-                .collect(),
-            dir: None,
-        };
+    let lookup_dir = dir.clone().unwrap_or_else(|| cwd.to_path_buf());
+    let run = |subcommand: &str| Plan::Lpm {
+        args: [subcommand.to_string(), (*command).to_string()]
+            .into_iter()
+            .chain(rest.clone())
+            .collect(),
+        dir: dir.clone(),
+    };
+    if kind == Runner::LocalFirst && !command.contains('@') && local_bin(&lookup_dir, command) {
+        return run("exec");
     }
     if local_only {
         return Plan::Real;
     }
-    Plan::Lpm {
-        args: std::iter::once("dlx".to_string())
-            .chain(std::iter::once((*command).to_string()))
-            .chain(rest)
-            .collect(),
-        dir: None,
-    }
+    run("dlx")
 }
 
 /// Lockfiles that mark which package manager owns a project.
@@ -554,11 +680,11 @@ const LOCKFILES: &[(&str, bool)] = &[
     ("bun.lockb", false),
 ];
 
-/// The lockfile of the nearest directory at or above `dir` that has one,
-/// when no `lpm.lock` sits beside it. Such a project belongs to another
-/// package manager, so its installs stay with that manager; a project with
-/// `lpm.lock`, or with no lockfile yet, is LPM's to install.
-fn foreign_lockfile(dir: &Path) -> Option<&'static str> {
+/// The nearest directory at or above `dir` with a lockfile, and that
+/// lockfile, when no `lpm.lock` sits beside it. Such a project belongs to
+/// another package manager, so its installs stay with that manager; a
+/// project with `lpm.lock`, or with no lockfile yet, is LPM's to install.
+fn foreign_lockfile(dir: &Path) -> Option<(&Path, &'static str)> {
     for ancestor in dir.ancestors() {
         let mut foreign = None;
         for (file, is_lpm) in LOCKFILES {
@@ -569,26 +695,62 @@ fn foreign_lockfile(dir: &Path) -> Option<&'static str> {
                 foreign.get_or_insert(*file);
             }
         }
-        if foreign.is_some() {
-            return foreign;
+        if let Some(file) = foreign {
+            return Some((ancestor, file));
         }
     }
     None
 }
 
-/// `plan` with installs into a project another package manager owns
-/// turned back into the real command, and why.
-fn respect_project_owner(plan: Plan, cwd: &Path) -> (Plan, Option<String>) {
+/// Whether `path` was created, or replaced, at or after `start`. A
+/// scaffold template that copies or extracts its own lockfile does not
+/// make the generated project another package manager's: the change time
+/// moves even when the modification time is preserved.
+fn changed_since(path: &Path, start: SystemTime) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        u64::try_from(metadata.ctime()).ok().and_then(|seconds| {
+            let nanos = u32::try_from(metadata.ctime_nsec()).unwrap_or(0);
+            UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
+        })
+    };
+    #[cfg(not(unix))]
+    let changed = metadata.created().ok();
+    changed.is_some_and(|changed| changed >= start)
+}
+
+/// `plan` with installs into a project another package manager owned
+/// before the tool started turned back into the real command, and why.
+/// Once a command in this run has left a project to its owner, later
+/// ones do too, even after that manager rewrote its lockfile.
+fn respect_project_owner(
+    plan: Plan,
+    cwd: &Path,
+    started: Option<SystemTime>,
+    earlier: &[LogEntry],
+) -> (Plan, Option<String>) {
     let Plan::Lpm { args, dir } = &plan else {
         return (plan, None);
     };
     if !matches!(args.first().map(String::as_str), Some("install" | "ci")) {
         return (plan, None);
     }
-    match foreign_lockfile(dir.as_deref().unwrap_or(cwd)) {
-        Some(lockfile) => (Plan::Real, Some(format!("the project uses {lockfile}"))),
-        None => (plan, None),
+    let Some((project, lockfile)) = foreign_lockfile(dir.as_deref().unwrap_or(cwd)) else {
+        return (plan, None);
+    };
+    let owned_earlier = earlier
+        .iter()
+        .any(|entry| entry.reason.is_some() && entry.dir.starts_with(project));
+    let created_by_tool =
+        started.is_some_and(|started| changed_since(&project.join(lockfile), started));
+    if created_by_tool && !owned_earlier {
+        return (plan, None);
     }
+    (Plan::Real, Some(format!("the project uses {lockfile}")))
 }
 
 /// One shimmed command, as the shim recorded it before running it.
@@ -639,10 +801,16 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
         }),
         None => Plan::Real,
     };
-    let (plan, reason) = respect_project_owner(plan, &cwd);
-    if let Some(log) = std::env::var_os(LOG_ENV) {
+    let log = std::env::var_os(LOG_ENV).map(PathBuf::from);
+    let earlier = log.as_deref().map(read_log).unwrap_or_default();
+    let started = std::env::var(STARTED_ENV)
+        .ok()
+        .and_then(|nanos| nanos.parse::<u64>().ok())
+        .map(|nanos| UNIX_EPOCH + Duration::from_nanos(nanos));
+    let (plan, reason) = respect_project_owner(plan, &cwd, started, &earlier);
+    if let Some(log) = log {
         append_log(
-            Path::new(&log),
+            &log,
             &LogEntry {
                 manager: manager.to_string(),
                 args: args
@@ -667,6 +835,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
                 .env("PATH", path_without(&path, shim_dir.as_deref())?)
                 .env_remove(SHIMS_ENV)
                 .env_remove(LOG_ENV)
+                .env_remove(STARTED_ENV)
                 .env_remove(USER_AGENT_ENV);
             command
         }
@@ -813,7 +982,7 @@ fn is_install_command(manager: &str, args: &[String]) -> bool {
     match (manager, subcommand) {
         ("npm", Some(sub)) => NPM_INSTALL.contains(&sub) || NPM_CLEAN_INSTALL.contains(&sub),
         ("pnpm", Some(sub)) => matches!(sub, "install" | "i" | "add"),
-        ("yarn" | "yarnpkg", None) => true,
+        ("yarn" | "yarnpkg", None) => !has_query_flag(&args),
         ("yarn" | "yarnpkg", Some(sub)) => matches!(sub, "install" | "add"),
         ("bun", Some(sub)) => matches!(sub, "install" | "i" | "add" | "a"),
         _ => false,
@@ -1064,7 +1233,7 @@ mod tests {
     fn installs_lpm_cannot_express_run_the_real_package_manager() {
         for (manager, args) in [
             ("npm", "install -g create-thing"),
-            ("npm", "install --registry https://example.invalid"),
+            ("npm", "install --workspace docs"),
             ("npm", "ci some-package"),
             ("pnpm", "add -g thing"),
             ("pnpm", "install --filter docs"),
@@ -1280,12 +1449,16 @@ mod tests {
         );
 
         std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
-        assert_eq!(foreign_lockfile(&app), Some("pnpm-lock.yaml"));
-        let (plan, reason) = respect_project_owner(lpm("install"), &app);
+        assert_eq!(
+            foreign_lockfile(&app),
+            Some((root.path(), "pnpm-lock.yaml"))
+        );
+        let started = SystemTime::now() + Duration::from_secs(60);
+        let (plan, reason) = respect_project_owner(lpm("install"), &app, Some(started), &[]);
         assert_eq!(plan, Plan::Real);
         assert_eq!(reason.as_deref(), Some("the project uses pnpm-lock.yaml"));
         assert_eq!(
-            respect_project_owner(lpm("dlx cowsay"), &app),
+            respect_project_owner(lpm("dlx cowsay"), &app, Some(started), &[]),
             (lpm("dlx cowsay"), None),
             "running a package does not install into the project"
         );
@@ -1302,6 +1475,122 @@ mod tests {
             None,
             "lpm.lock wins beside another lockfile"
         );
+    }
+
+    #[test]
+    fn lockfile_a_tool_wrote_during_the_run_does_not_make_the_project_foreign() {
+        let started = SystemTime::now() - Duration::from_secs(60);
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(
+            respect_project_owner(lpm("install"), project.path(), Some(started), &[]),
+            (lpm("install"), None),
+            "a template's copied lockfile was written after the tool started"
+        );
+
+        let earlier = [LogEntry {
+            manager: "npm".into(),
+            args: vec!["install".into()],
+            dir: project.path().to_path_buf(),
+            ran: "real".into(),
+            reason: Some("the project uses package-lock.json".into()),
+        }];
+        assert_eq!(
+            respect_project_owner(lpm("install"), project.path(), Some(started), &earlier).0,
+            Plan::Real,
+            "once left to its owner in this run, a rewritten lockfile keeps the project there"
+        );
+    }
+
+    #[test]
+    fn yarn_version_and_help_queries_run_the_real_yarn() {
+        for args in ["--version", "-v", "--help"] {
+            assert_eq!(plan("yarn", args), Plan::Real, "yarn {args}");
+        }
+        assert!(!is_install_command("yarn", &["--version".to_string()]));
+    }
+
+    #[test]
+    fn boolean_flags_set_to_false_turn_the_option_off() {
+        assert_eq!(plan("npm", "install --production=false"), lpm("install"));
+        assert_eq!(
+            plan("pnpm", "install --frozen-lockfile=false"),
+            lpm("install --no-frozen-lockfile")
+        );
+        assert_eq!(
+            plan("npm", "install --ignore-scripts=false"),
+            lpm("install")
+        );
+        assert_eq!(
+            plan("npm", "install --save-dev=false vite"),
+            lpm("install vite")
+        );
+        assert_eq!(
+            plan("pnpm", "install --strict-peer-dependencies=false"),
+            lpm("install --no-strict-peer-dependencies")
+        );
+    }
+
+    #[test]
+    fn clean_install_keeps_script_policy_and_peer_flags() {
+        assert_eq!(
+            plan("npm", "ci --ignore-scripts --strict-peer-dependencies"),
+            lpm("ci --policy=deny --strict-peer-dependencies")
+        );
+    }
+
+    #[test]
+    fn registry_flag_carries_over_to_lpm() {
+        assert_eq!(
+            plan("npm", "install --registry https://registry.example/"),
+            lpm("install --registry=https://registry.example/")
+        );
+        assert_eq!(
+            plan("pnpm", "add --registry=https://registry.example/ vite"),
+            lpm("install --registry=https://registry.example/ vite")
+        );
+    }
+
+    #[test]
+    fn runner_directory_options_before_the_subcommand_move_the_lookup() {
+        let args: Vec<String> = shlex::split("--prefix other exec -- tool --flag").unwrap();
+        let plan = translate("npm", &args, Path::new("/work"), &|dir, bin| {
+            dir == Path::new("/work/other") && bin == "tool"
+        });
+        assert_eq!(
+            plan,
+            lpm_in("exec tool --flag", "other"),
+            "the binary installed under --prefix runs, from there"
+        );
+        assert_eq!(
+            plan_with_local("npm", "--foo bar exec tool", &["tool"]),
+            Plan::Real,
+            "an option LPM cannot reproduce runs the real runner"
+        );
+    }
+
+    #[test]
+    fn launcher_is_recognized_only_inside_the_session_shim_directory() {
+        let shims = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let shim_env = Some(shims.path().as_os_str());
+        assert_eq!(
+            launcher_manager(&shims.path().join("bun.exe"), shim_env),
+            Some("bun")
+        );
+        assert_eq!(
+            launcher_manager(&shims.path().join("NPM.EXE"), shim_env),
+            Some("npm")
+        );
+        assert_eq!(
+            launcher_manager(&shims.path().join("lpm.exe"), shim_env),
+            None
+        );
+        assert_eq!(
+            launcher_manager(&elsewhere.path().join("bun.exe"), shim_env),
+            None
+        );
+        assert_eq!(launcher_manager(&shims.path().join("bun.exe"), None), None);
     }
 
     #[test]

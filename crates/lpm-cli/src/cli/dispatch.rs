@@ -32,6 +32,16 @@ use super::helpers::{
 };
 
 pub(crate) fn run() -> Result<()> {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(manager) = commands::run::nested_pm::launcher_manager(
+            &exe,
+            std::env::var_os(commands::run::nested_pm::SHIMS_ENV).as_deref(),
+        )
+    {
+        commands::run::nested_pm::exit_with_shim(manager, std::env::args_os().skip(1).collect());
+    }
+
     // Color policy must initialize BEFORE any styled output, including
     // the `--version` fast path (which prints an `update_check` notice)
     // and the bare-`lpm install` fast lane below (which prints a header
@@ -220,18 +230,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     if let Commands::InternalNestedPm(args) = &command {
-        let code = match commands::run::nested_pm::run_shim(&args.manager, args.args.clone()) {
-            Ok(()) => 0,
-            Err(lpm_common::LpmError::ExitCode(code)) => code,
-            Err(error) => {
-                eprintln!(
-                    "lpm: {}",
-                    lpm_common::sanitize_terminal_multiline(&error.to_string())
-                );
-                1
-            }
-        };
-        std::process::exit(code);
+        commands::run::nested_pm::exit_with_shim(&args.manager, args.args.clone());
     }
 
     if let Commands::InternalTsTransform(args) = &command {
