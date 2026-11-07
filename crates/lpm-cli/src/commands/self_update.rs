@@ -3318,6 +3318,7 @@ fn install_staged_binary(
 
     #[cfg(windows)]
     {
+        remove_binaries_moved_aside_by_earlier_updates(parent, &file_name.to_string_lossy());
         let old_name = format!("{}.old.{}", file_name.to_string_lossy(), std::process::id());
         let old_path = parent.join(&old_name);
         if let Err(e) = std::fs::rename(current_exe, &old_path) {
@@ -3351,6 +3352,33 @@ fn install_staged_binary(
             ))
         })
     }
+}
+
+/// Removes `<binary>.old.<pid>` files that earlier Windows updates moved
+/// aside: a running executable can't be deleted, so each update leaves its
+/// predecessor behind. One that is still running stays locked, and its
+/// removal fails quietly until a later update.
+#[cfg(any(windows, test))]
+fn remove_binaries_moved_aside_by_earlier_updates(directory: &Path, binary_name: &str) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| is_binary_moved_aside(name, binary_name))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_binary_moved_aside(name: &str, binary_name: &str) -> bool {
+    name.strip_prefix(binary_name)
+        .and_then(|rest| rest.strip_prefix(".old."))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[cfg(unix)]
@@ -3525,6 +3553,29 @@ fn humanize_seconds(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_update_removes_the_binaries_earlier_updates_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "lpm.exe",
+            "lpm.exe.old.123",
+            "lpm.exe.old.9",
+            "lpm.exe.old.x",
+            "lpm.exe.previous",
+        ] {
+            std::fs::write(dir.path().join(name), "binary").unwrap();
+        }
+
+        remove_binaries_moved_aside_by_earlier_updates(dir.path(), "lpm.exe");
+
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["lpm.exe", "lpm.exe.old.x", "lpm.exe.previous"]);
+    }
     use crate::release_lookup::{self, UpdateCache};
     use tempfile::tempdir;
 

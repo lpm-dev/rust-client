@@ -117,6 +117,11 @@ pub async fn install_node_with_report(
     release: &NodeRelease,
     platform: &Platform,
 ) -> Result<RuntimeInstallReport, LpmError> {
+    if let Some(reason) = platform.node_unavailable_reason() {
+        return Err(LpmError::Script(format!(
+            "cannot install Node.js: {reason}"
+        )));
+    }
     let version = release.version_bare();
     let target_dir = node::node_version_dir(version)?;
     let executable_relative_path = Path::new(if cfg!(windows) {
