@@ -2812,6 +2812,21 @@ fn typescript_alias_targets_ignore_multiple_wildcards() {
     );
 }
 
+/// PATH with a fake `npm` first, so shims exist and anything they hand to
+/// the real binary is visible without depending on the host's npm.
+#[cfg(unix)]
+fn path_with_fake_npm(project: &TempProject) -> std::ffi::OsString {
+    let bin = project.home().join("fake-npm-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let npm = bin.join("npm");
+    std::fs::write(&npm, "#!/bin/sh\necho \"fake-npm $*\"\n").unwrap();
+    make_executable(&npm);
+    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap()
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tool_installs_run_through_lpm_and_other_package_manager_commands_run_unchanged() {
@@ -2828,12 +2843,14 @@ fn exec_tool_installs_run_through_lpm_and_other_package_manager_commands_run_unc
     write_fake_local_bin(
         &project,
         "setup-sub",
-        "#!/bin/sh\nset -e\necho \"agent=$npm_config_user_agent\"\n(cd sub && npm install)\n(cd npm-owned && npm install --offline --no-audit --no-fund)\nnpm --version >/dev/null\n",
+        "#!/bin/sh\nset -e\necho \"agent=$npm_config_user_agent\"\n(cd sub && npm install)\n(cd npm-owned && npm install --offline --no-audit --no-fund)\nnpm --version\nenv -i PATH=\"$PATH\" npm --version\n",
         "",
     );
 
     let output = lpm(&project)
+        .env("PATH", path_with_fake_npm(&project))
         .args(["exec", "setup-sub"])
+        .timeout(std::time::Duration::from_secs(60))
         .output()
         .expect("failed to run project-local binary via lpm exec");
 
@@ -2853,8 +2870,16 @@ fn exec_tool_installs_run_through_lpm_and_other_package_manager_commands_run_unc
     assert!(stdout.contains("agent=lpm/"), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
+        stdout.matches("fake-npm --version").count() == 2,
+        "both version queries reach the real npm, with or without the session environment: {stdout}"
+    );
+    assert!(
+        stdout.contains("fake-npm install --offline --no-audit --no-fund"),
+        "{stdout}"
+    );
+    assert!(
         stderr.contains("setup-sub ran 3 package-manager commands"),
-        "{stderr}"
+        "the stripped-environment call is not logged: {stderr}"
     );
     assert!(
         stderr.contains(

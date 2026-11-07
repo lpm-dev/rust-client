@@ -34,10 +34,7 @@ use super::helpers::{
 pub(crate) fn run() -> Result<()> {
     #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe()
-        && let Some(manager) = commands::run::nested_pm::launcher_manager(
-            &exe,
-            std::env::var_os(commands::run::nested_pm::SHIMS_ENV).as_deref(),
-        )
+        && let Some(manager) = commands::run::nested_pm::launcher_manager(&exe)
     {
         commands::run::nested_pm::exit_with_shim(manager, std::env::args_os().skip(1).collect());
     }
@@ -996,7 +993,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
 
             if packages.is_empty() {
-                let workspace_root_default = lpm_workspace::read_package_json(
+                let manifest_declares_workspaces = lpm_workspace::read_package_json(
                     &cwd.join("package.json"),
                 )
                 .map_err(|error| {
@@ -1005,15 +1002,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                     ))
                 })?
                 .workspaces
-                .is_some()
-                    || install_state::has_pnpm_workspace_yaml(&cwd);
-                // pnpm accepts a `pnpm-workspace.yaml` that only holds
-                // settings (`allowBuilds`, catalogs, overrides); without
-                // `packages` it declares no workspace. Discovery errors
-                // still take the recursive path, which reports them.
-                let workspace_root_default = workspace_root_default
-                    && !matches!(lpm_workspace::discover_workspace(&cwd), Ok(None));
-                let recursive_install = recursive || (workspace_root_default && !no_recursive);
+                .is_some();
+                let recursive_install = recursive
+                    || (!no_recursive
+                        && (manifest_declares_workspaces
+                            || install_state::pnpm_workspace_declares_packages(&cwd)));
 
                 if catalog.is_some() {
                     return Err(lpm_common::LpmError::Script(
@@ -2278,6 +2271,38 @@ async fn async_main(cli: Cli) -> Result<()> {
                 min_release_age_exclude,
                 args,
             } = args;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let min_release_age_override = match min_release_age.as_deref() {
+                Some(s) => Some(release_age_config::parse_duration(s)?),
+                None => None,
+            };
+            commands::run::dlx(
+                &client,
+                &cwd,
+                &package,
+                commands::run::DlxOptions {
+                    extra_args: &args,
+                    refresh,
+                    allow_new,
+                    strict_integrity: false,
+                    min_release_age_override,
+                    min_release_age_exclude: &min_release_age_exclude,
+                    inherit_caller_context: true,
+                    reserve_stdout: cli.json,
+                },
+            )
+            .await
+        }
+        Commands::Create(args) => {
+            let network_args::CreateArgs {
+                initializer,
+                refresh,
+                allow_new,
+                min_release_age,
+                min_release_age_exclude,
+                args,
+            } = args;
+            let package = commands::run::initializer_package(&initializer)?;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let min_release_age_override = match min_release_age.as_deref() {
                 Some(s) => Some(release_age_config::parse_duration(s)?),

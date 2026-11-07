@@ -406,6 +406,10 @@ pub(crate) enum Commands {
     /// Run a package binary without installing it into the project.
     Dlx(network::DlxArgs),
 
+    /// Run a package initializer, like `npm create`: `lpm create vite`
+    /// runs `create-vite` through `lpm dlx`.
+    Create(network::CreateArgs),
+
     /// Materialize a single workspace member's deploy closure into a
     /// self-contained output directory ready for `COPY --from=pruned` in a
     /// Dockerfile.

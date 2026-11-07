@@ -799,6 +799,7 @@ const LPM_INSTALL_VERBS: &[&str] = &[
     "add",
     "ci",
     "dlx",
+    "create",
     "rebuild",
     "upgrade",
     "update",

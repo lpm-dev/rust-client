@@ -515,6 +515,29 @@ pub fn has_pnpm_workspace_yaml(project_dir: &std::path::Path) -> bool {
     nearest_pnpm_workspace_yaml(project_dir).is_some()
 }
 
+/// Whether the nearest `pnpm-workspace.yaml` declares workspace
+/// `packages`. pnpm also accepts the file holding only settings
+/// (`allowBuilds`, catalogs, overrides), which declares no workspace. A
+/// file that can't be read or parsed counts as declaring packages, so
+/// workspace discovery reports the problem.
+pub fn pnpm_workspace_declares_packages(project_dir: &std::path::Path) -> bool {
+    let Some(path) = nearest_pnpm_workspace_yaml(project_dir) else {
+        return false;
+    };
+    let Ok(content) =
+        lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
+        return true;
+    };
+    match serde_yaml::from_str::<serde_yaml::Value>(lpm_common::strip_utf8_bom_str(&content)) {
+        Ok(serde_yaml::Value::Null) => false,
+        Ok(document) => document
+            .get("packages")
+            .is_some_and(|packages| packages.as_sequence().is_none_or(|list| !list.is_empty())),
+        Err(_) => true,
+    }
+}
+
 fn push_freshness_file(
     path: std::path::PathBuf,
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
@@ -1546,6 +1569,38 @@ pub fn is_workspace_root_content(pkg_content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pnpm_workspace_yaml_declares_a_workspace_only_with_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("apps/web");
+        std::fs::create_dir_all(&member).unwrap();
+        assert!(!pnpm_workspace_declares_packages(root.path()));
+
+        let yaml = root.path().join("pnpm-workspace.yaml");
+        std::fs::write(&yaml, "allowBuilds:\n  esbuild: true\n").unwrap();
+        assert!(
+            !pnpm_workspace_declares_packages(root.path()),
+            "settings only"
+        );
+
+        std::fs::write(
+            &yaml,
+            "packages:\n  - apps/*\nallowBuilds:\n  esbuild: true\n",
+        )
+        .unwrap();
+        assert!(pnpm_workspace_declares_packages(root.path()));
+        assert!(
+            pnpm_workspace_declares_packages(&member),
+            "found from a member"
+        );
+
+        std::fs::write(&yaml, "packages: [unterminated\n").unwrap();
+        assert!(
+            pnpm_workspace_declares_packages(root.path()),
+            "an unreadable file is left to workspace discovery to report"
+        );
+    }
     use std::fs;
     use tempfile::TempDir;
 

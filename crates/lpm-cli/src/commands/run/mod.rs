@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::install_ui;
 
-pub use dlx::{DlxOptions, dlx, managed_dlx};
+pub use dlx::{DlxOptions, dlx, initializer_package, managed_dlx};
 pub(crate) use runtime::validate_runtime_with_cache;
 pub use runtime::{ensure_detected_runtimes, ensure_runtime, prepare_runtime};
 pub use single::{exec, run, run_file, run_file_watch, run_watch};

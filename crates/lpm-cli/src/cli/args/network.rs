@@ -146,6 +146,29 @@ pub(crate) struct RunFileArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct CreateArgs {
+    /// Initializer to run: `vite` runs `create-vite`, `@scope` runs
+    /// `@scope/create`, and `@scope/app` runs `@scope/create-app`. A
+    /// version or tag stays on the package (`vite@6` runs `create-vite@6`).
+    pub(crate) initializer: String,
+    /// Force reinstall (ignore cache).
+    #[arg(long)]
+    pub(crate) refresh: bool,
+    /// Allow recently published packages for this run.
+    #[arg(long)]
+    pub(crate) allow_new: bool,
+    /// Override the minimumReleaseAge cooldown for this run only.
+    #[arg(long, value_name = "DUR")]
+    pub(crate) min_release_age: Option<String>,
+    /// Exempt a package name, exact version, or @scope/* from minimumReleaseAge.
+    #[arg(long, value_name = "SELECTOR")]
+    pub(crate) min_release_age_exclude: Vec<String>,
+    /// Arguments passed to the initializer.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(crate) args: Vec<String>,
+}
+
+#[derive(Args)]
 pub(crate) struct DlxArgs {
     /// Package to run (e.g., cowsay, create-next-app@latest).
     pub(crate) package: String,

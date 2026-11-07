@@ -94,6 +94,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Exec",
     "RunFile",
     "Dlx",
+    "Create",
     "Deploy",
     "ApproveScripts",
     "Patch",

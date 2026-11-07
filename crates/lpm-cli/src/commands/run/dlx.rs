@@ -405,6 +405,51 @@ fn check_dlx_execution_engines(
     Ok(())
 }
 
+/// The package `lpm create <initializer>` runs, following npm's
+/// initializer naming: `foo` → `create-foo`, `@scope` → `@scope/create`,
+/// `@scope/foo` → `@scope/create-foo`, keeping any `@version` suffix.
+pub fn initializer_package(initializer: &str) -> Result<String, LpmError> {
+    let invalid = || {
+        LpmError::Script(format!(
+            "`{}` is not an initializer name; try `lpm create vite`",
+            lpm_common::sanitize_terminal_inline(initializer)
+        ))
+    };
+    if initializer.is_empty() || initializer.starts_with('-') || initializer.contains(['\\', ' ']) {
+        return Err(invalid());
+    }
+    let (scope, rest) = match initializer.strip_prefix('@') {
+        Some(scoped) => {
+            let end = scoped.find(['/', '@']).unwrap_or(scoped.len());
+            (Some(&scoped[..end]), &scoped[end..])
+        }
+        None => (None, initializer),
+    };
+    if scope.is_some_and(str::is_empty) {
+        return Err(invalid());
+    }
+    let (name, version) = match rest.strip_prefix('/') {
+        Some(named) => {
+            let end = named.find('@').unwrap_or(named.len());
+            (Some(&named[..end]), &named[end..])
+        }
+        None if scope.is_some() => (None, rest),
+        None => {
+            let end = rest.find('@').unwrap_or(rest.len());
+            (Some(&rest[..end]), &rest[end..])
+        }
+    };
+    if name.is_some_and(str::is_empty) || (!version.is_empty() && version.len() == 1) {
+        return Err(invalid());
+    }
+    Ok(match (scope, name) {
+        (Some(scope), Some(name)) => format!("@{scope}/create-{name}{version}"),
+        (Some(scope), None) => format!("@{scope}/create{version}"),
+        (None, Some(name)) => format!("create-{name}{version}"),
+        (None, None) => return Err(invalid()),
+    })
+}
+
 pub async fn dlx(
     client: &lpm_registry::RegistryClient,
     project_dir: &Path,
@@ -1041,5 +1086,32 @@ mod managed_runtime_tests {
         assert!(!refresh_can_use_verified_fallback(
             &resolution_fetch_failure("authentication required"),
         ));
+    }
+}
+
+#[cfg(test)]
+mod initializer_tests {
+    use super::initializer_package;
+
+    #[test]
+    fn initializer_names_follow_npm_create_naming() {
+        for (initializer, package) in [
+            ("vite", "create-vite"),
+            ("vite@6", "create-vite@6"),
+            ("vite@latest", "create-vite@latest"),
+            ("@scope", "@scope/create"),
+            ("@scope@2.0.0", "@scope/create@2.0.0"),
+            ("@scope/app", "@scope/create-app"),
+            ("@scope/app@next", "@scope/create-app@next"),
+        ] {
+            assert_eq!(
+                initializer_package(initializer).unwrap(),
+                package,
+                "{initializer}"
+            );
+        }
+        for invalid in ["", "-y", "@", "@/app", "vite@", "a b"] {
+            assert!(initializer_package(invalid).is_err(), "{invalid:?}");
+        }
     }
 }

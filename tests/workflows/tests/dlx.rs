@@ -1432,7 +1432,20 @@ async fn dlx_tool_npm_install_runs_through_lpm_and_reports_the_approvals_it_wrot
         format!("registry={}/\n", mock.url()),
     )
     .unwrap();
+    let fake_npm = project.home().join("fake-npm-bin");
+    std::fs::create_dir_all(&fake_npm).unwrap();
+    std::fs::write(fake_npm.join("npm"), "#!/bin/sh\necho \"fake-npm $*\"\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fake_npm.join("npm"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(fake_npm).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
     let output = lpm_with_registry(&project, &mock.url())
+        .env("PATH", path)
         .args(["dlx", "create-fixture-app@1.0.0", "my-app"])
         .output()
         .unwrap();
@@ -1466,5 +1479,43 @@ async fn dlx_tool_npm_install_runs_through_lpm_and_reports_the_approvals_it_wrot
     assert!(
         stderr.contains("my-app/pnpm-workspace.yaml  allowBuilds: scripted-dep"),
         "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn create_runs_the_initializer_package_with_its_arguments() {
+    let project = TempProject::empty(r#"{"name":"caller","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let initializer = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"create-hello","version":"1.0.0","bin":{"create-hello":"bin/create.js"}}),
+        &[(
+            "bin/create.js",
+            b"#!/usr/bin/env node\nconsole.log('create-hello:' + process.argv.slice(2).join(' '));\n",
+        )],
+    );
+    mock.with_package_published_at(
+        "create-hello",
+        "1.0.0",
+        &initializer,
+        &iso8601_n_secs_ago(72 * 3600),
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "create",
+            "hello@1.0.0",
+            "my-app",
+            "--template",
+            "react",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert_dlx_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("create-hello:my-app --template react -v"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }

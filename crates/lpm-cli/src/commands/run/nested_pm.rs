@@ -29,9 +29,10 @@ use sha2::{Digest, Sha256};
 
 use crate::install_ui;
 
-/// Directory holding this session's shims. Nested LPM commands remove it
-/// from PATH so their own children never reach the shims.
-pub(crate) const SHIMS_ENV: &str = "LPM_NESTED_PM_SHIMS";
+/// File that marks a directory as LPM shims. The real-binary lookup and
+/// nested LPM commands skip every marked PATH directory, which keeps a
+/// shim from finding itself even when a tool strips the environment.
+const SHIM_MARKER: &str = ".lpm-nested-pm-shims";
 /// File the shims append one [`LogEntry`] line to per command.
 pub(crate) const LOG_ENV: &str = "LPM_NESTED_PM_LOG";
 /// When the tool started, in nanoseconds since the Unix epoch.
@@ -89,7 +90,7 @@ impl NestedPmSession {
         let managers: Vec<&str> = MANAGERS
             .iter()
             .copied()
-            .filter(|manager| find_on_path(manager, path, None).is_some())
+            .filter(|manager| find_on_path(manager, path).is_some())
             .collect();
         if managers.is_empty() {
             return Ok(None);
@@ -124,14 +125,13 @@ impl NestedPmSession {
             .map_or(0, |since| since.as_nanos());
         command
             .env("PATH", path)
-            .env(SHIMS_ENV, &self.shim_dir)
             .env(LOG_ENV, self.log.path())
             .env(STARTED_ENV, started.to_string());
         Ok(())
     }
 
     /// Commands the tool's package-manager calls ran, in order.
-    pub(crate) fn entries(&self) -> Vec<LogEntry> {
+    pub(crate) fn entries(&self) -> Log {
         read_log(self.log.path())
     }
 }
@@ -156,6 +156,10 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
         .join("nested-pm")
         .join(key);
     std::fs::create_dir_all(&dir)?;
+    let marker = dir.join(SHIM_MARKER);
+    if !marker.is_file() {
+        lpm_common::write_file_atomic(&marker, b"LPM package-manager shims\n")?;
+    }
     for manager in managers {
         let target = dir.join(shim_file_name(manager));
         let content = shim_script(lpm, manager);
@@ -183,34 +187,49 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
 /// gets an `.exe` that is the LPM binary itself, hard-linked when the
 /// volume allows and copied otherwise; [`launcher_manager`] recognizes
 /// it at startup.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn ensure_launcher(lpm: &Path, target: &Path) -> Result<(), LpmError> {
-    if target.is_file() {
+    if launcher_in_place(target)? {
         return Ok(());
     }
-    let staged = target.with_extension(format!("exe.{}", std::process::id()));
-    if std::fs::hard_link(lpm, &staged).is_err() {
-        std::fs::copy(lpm, &staged)?;
+    match std::fs::hard_link(lpm, target) {
+        Ok(()) => return Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists && launcher_in_place(target)? =>
+        {
+            return Ok(());
+        }
+        Err(_) => {}
     }
-    match std::fs::rename(&staged, target) {
-        Ok(()) => Ok(()),
-        Err(_) if target.is_file() => {
-            let _ = std::fs::remove_file(&staged);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&staged);
-            Err(error.into())
-        }
+    let mut source = std::fs::File::open(lpm)?;
+    lpm_common::write_file_atomic_with(
+        target,
+        lpm_common::AtomicWriteOptions::default(),
+        |file| std::io::copy(&mut source, file).map(drop),
+    )?;
+    Ok(())
+}
+
+/// Whether a launcher file is already at `target`. A directory, symlink
+/// or other entry there is an error rather than something to replace.
+#[cfg(any(windows, test))]
+fn launcher_in_place(target: &Path) -> Result<bool, LpmError> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(LpmError::Script(format!(
+            "{} is in the way of an LPM package-manager launcher",
+            target.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
 /// The package manager a shim launcher stands in for, when the running
 /// binary is one of the `.exe` launchers in the session's shim directory.
 #[cfg(any(windows, test))]
-pub(crate) fn launcher_manager(exe: &Path, shim_dir: Option<&OsStr>) -> Option<&'static str> {
-    let shim_dir = Path::new(shim_dir?);
-    if !same_dir(exe.parent()?, shim_dir) {
+pub(crate) fn launcher_manager(exe: &Path) -> Option<&'static str> {
+    if !is_shim_dir(exe.parent()?) {
         return None;
     }
     let stem = exe.file_stem()?.to_str()?.to_ascii_lowercase();
@@ -241,22 +260,27 @@ fn shim_file_name(manager: &str) -> String {
     }
 }
 
+/// The shim for `manager`. On Windows it hands off to the `.exe`
+/// launcher beside it, which keeps the file ASCII: cmd.exe reads batch
+/// files in the OEM code page, so an LPM path with non-ASCII characters
+/// written into it would break.
 fn shim_script(lpm: &Path, manager: &str) -> Vec<u8> {
-    let lpm = lpm.to_string_lossy();
     if cfg!(windows) {
-        format!(
-            "@echo off\r\n\"{lpm}\" internal-nested-pm {manager} -- %*\r\nexit /b %ERRORLEVEL%\r\n"
-        )
-        .into_bytes()
+        format!("@echo off\r\n\"%~dp0{manager}.exe\" %*\r\nexit /b %ERRORLEVEL%\r\n").into_bytes()
     } else {
+        let lpm = lpm.to_string_lossy();
         let quoted = lpm.replace('\'', r"'\''");
         format!("#!/bin/sh\nexec '{quoted}' internal-nested-pm {manager} -- \"$@\"\n").into_bytes()
     }
 }
 
-/// First executable named `name` on `path`, skipping `skip`. Honors
-/// `PATHEXT` on Windows.
-pub(crate) fn find_on_path(name: &str, path: &OsStr, skip: Option<&Path>) -> Option<PathBuf> {
+fn is_shim_dir(dir: &Path) -> bool {
+    dir.join(SHIM_MARKER).is_file()
+}
+
+/// First executable named `name` on `path` outside any shim directory.
+/// Honors `PATHEXT` on Windows.
+pub(crate) fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     let extensions: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
@@ -268,17 +292,13 @@ pub(crate) fn find_on_path(name: &str, path: &OsStr, skip: Option<&Path>) -> Opt
         vec![String::new()]
     };
     std::env::split_paths(path)
-        .filter(|dir| !dir.as_os_str().is_empty() && skip.is_none_or(|skip| !same_dir(dir, skip)))
+        .filter(|dir| !dir.as_os_str().is_empty() && !is_shim_dir(dir))
         .flat_map(|dir| {
             extensions
                 .iter()
                 .map(move |ext| dir.join(format!("{name}{ext}")))
         })
         .find(|candidate| is_executable(candidate))
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -415,7 +435,11 @@ fn install_flag(manager: &str, flag: &str) -> InstallFlag {
                 "--frozen-lockfile"
             })
         }
-        ("pnpm", "--no-frozen-lockfile") => InstallFlag::Lpm("--no-frozen-lockfile"),
+        (_, "--no-frozen-lockfile") => InstallFlag::Lpm("--no-frozen-lockfile"),
+        (_, "--save-exact" | "--exact") | ("npm" | "pnpm" | "yarn" | "bun", "-E") => {
+            on_or_ignore("--exact")
+        }
+        ("yarn", "--ignore-engines") => on_or_ignore("--no-engine-strict"),
         (_, "--offline") => on_or_ignore("--offline"),
         (_, "--ignore-scripts") => on_or_ignore("--policy=deny"),
         (_, "--strict-peer-dependencies") => InstallFlag::Lpm(if off {
@@ -442,9 +466,7 @@ fn install_flag(manager: &str, flag: &str) -> InstallFlag {
             | "--no-summary"
             | "--color"
             | "--no-color"
-            | "--save-exact"
-            | "--exact"
-            | "-E"
+            | "--force"
             | "--save"
             | "-S"
             | "--save-prod"
@@ -488,10 +510,18 @@ fn manager_command(
         ("bun", Some("install" | "i" | "add" | "a")) => true,
         _ => false,
     };
-    let is_clean_install =
-        manager == "npm" && subcommand.is_some_and(|sub| NPM_CLEAN_INSTALL.contains(&sub));
+    let is_clean_install = match (manager, subcommand) {
+        ("npm", Some(sub)) => NPM_CLEAN_INSTALL.contains(&sub),
+        ("bun", Some("ci")) => true,
+        _ => false,
+    };
     if is_install || is_clean_install {
         return install(manager, args, subcommand_index, is_clean_install, cwd);
+    }
+    if matches!(manager, "npm" | "pnpm" | "yarn")
+        && subcommand.is_some_and(|sub| matches!(sub, "create" | "init" | "innit"))
+    {
+        return initializer(args, subcommand_index?);
     }
     let kind = match (manager, subcommand) {
         ("npm", Some("exec" | "x")) | ("bun", Some("x")) => Runner::LocalFirst,
@@ -501,6 +531,30 @@ fn manager_command(
     let index = subcommand_index?;
     let dir = runner_dir(manager, &args[..index], cwd)?;
     Some(runner(&args[index + 1..], kind, cwd, dir, local_bin))
+}
+
+/// `npm create x …` / `npm init x …` / `pnpm create x …` / `yarn create
+/// x …` run the `create-x` package, as `lpm create x …` does. `npm init`
+/// without an initializer only writes a manifest, and options before the
+/// subcommand are left to the real package manager.
+fn initializer(args: &[&str], subcommand_index: usize) -> Option<Plan> {
+    if subcommand_index != 0 {
+        return None;
+    }
+    let rest = &args[1..];
+    let (spec, forwarded) = match rest {
+        ["--", spec, forwarded @ ..] => (*spec, forwarded),
+        [spec, forwarded @ ..] if !spec.starts_with('-') => (*spec, forwarded),
+        _ => return None,
+    };
+    let forwarded = forwarded.iter().skip_while(|arg| **arg == "--");
+    Some(Plan::Lpm {
+        args: ["create".to_string(), spec.to_string(), "--".to_string()]
+            .into_iter()
+            .chain(forwarded.map(|arg| (*arg).to_string()))
+            .collect(),
+        dir: None,
+    })
 }
 
 /// The directory a manager option before the subcommand moves a runner to
@@ -584,12 +638,14 @@ fn install(
                     | "--policy=deny"
                     | "--strict-peer-dependencies"
                     | "--no-strict-peer-dependencies"
+                    | "--no-engine-strict"
             )
         });
     } else {
         lpm_args.push("install".to_string());
         if packages.is_empty() {
             lpm_flags.remove("-D");
+            lpm_flags.remove("--exact");
         } else {
             lpm_flags.retain(|flag| !matches!(*flag, "--frozen-lockfile" | "--prod" | "--offline"));
         }
@@ -653,11 +709,17 @@ fn runner(
     };
     let rest = rest.iter().map(|arg| (*arg).to_string());
     let lookup_dir = dir.clone().unwrap_or_else(|| cwd.to_path_buf());
+    // `--` keeps the tool's own flags (`-v`, `--json`, `--env`) from being
+    // read as LPM's.
     let run = |subcommand: &str| Plan::Lpm {
-        args: [subcommand.to_string(), (*command).to_string()]
-            .into_iter()
-            .chain(rest.clone())
-            .collect(),
+        args: [
+            subcommand.to_string(),
+            (*command).to_string(),
+            "--".to_string(),
+        ]
+        .into_iter()
+        .chain(rest.clone())
+        .collect(),
         dir: dir.clone(),
     };
     if kind == Runner::LocalFirst && !command.contains('@') && local_bin(&lookup_dir, command) {
@@ -680,26 +742,54 @@ const LOCKFILES: &[(&str, bool)] = &[
     ("bun.lockb", false),
 ];
 
-/// The nearest directory at or above `dir` with a lockfile, and that
-/// lockfile, when no `lpm.lock` sits beside it. Such a project belongs to
-/// another package manager, so its installs stay with that manager; a
-/// project with `lpm.lock`, or with no lockfile yet, is LPM's to install.
+/// Where a project's lockfile lives and which one it is, when it belongs
+/// to another package manager. The project is the nearest directory at or
+/// above `dir` with a `package.json`; a workspace member's lockfile lives
+/// at the workspace root above it. A project with `lpm.lock`, with no
+/// lockfile yet, or with none in its own workspace is LPM's to install; a
+/// stray lockfile further up (`~/package-lock.json`) does not count.
 fn foreign_lockfile(dir: &Path) -> Option<(&Path, &'static str)> {
-    for ancestor in dir.ancestors() {
-        let mut foreign = None;
-        for (file, is_lpm) in LOCKFILES {
-            if ancestor.join(file).is_file() {
-                if *is_lpm {
-                    return None;
-                }
-                foreign.get_or_insert(*file);
+    let project = dir
+        .ancestors()
+        .find(|ancestor| ancestor.join("package.json").is_file())?;
+    if let Some(lockfile) = lockfile_in(project) {
+        return lockfile.map(|file| (project, file));
+    }
+    let root = project
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| is_workspace_root(ancestor))?;
+    lockfile_in(root)?.map(|file| (root, file))
+}
+
+/// `None` when `dir` has no lockfile, `Some(None)` when it has
+/// `lpm.lock`, and `Some(Some(file))` for another manager's lockfile.
+fn lockfile_in(dir: &Path) -> Option<Option<&'static str>> {
+    let mut foreign = None;
+    for (file, is_lpm) in LOCKFILES {
+        if dir.join(file).is_file() {
+            if *is_lpm {
+                return Some(None);
             }
-        }
-        if let Some(file) = foreign {
-            return Some((ancestor, file));
+            foreign.get_or_insert(*file);
         }
     }
-    None
+    foreign.map(Some)
+}
+
+fn is_workspace_root(dir: &Path) -> bool {
+    if dir.join("pnpm-workspace.yaml").is_file() {
+        return true;
+    }
+    lpm_common::read_text_file_capped(
+        &dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()
+    .and_then(|content| {
+        serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content)).ok()
+    })
+    .is_some_and(|manifest| manifest.get("workspaces").is_some())
 }
 
 /// Whether `path` was created, or replaced, at or after `start`. A
@@ -766,14 +856,40 @@ pub(crate) struct LogEntry {
     pub reason: Option<String>,
 }
 
-fn read_log(path: &Path) -> Vec<LogEntry> {
-    let Ok(bytes) = lpm_common::read_file_capped(path, MAX_LOG_BYTES) else {
-        return Vec::new();
+/// Entries read from a command log, and whether it was cut off at
+/// [`MAX_LOG_BYTES`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Log {
+    pub entries: Vec<LogEntry>,
+    pub truncated: bool,
+}
+
+fn read_log(path: &Path) -> Log {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Log::default();
     };
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    let truncated = file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES);
+    let Ok(mut bytes) =
+        lpm_common::read_stream_capped(std::io::Read::take(file, MAX_LOG_BYTES), MAX_LOG_BYTES)
+    else {
+        return Log::default();
+    };
+    if truncated {
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1);
+        bytes.truncate(complete);
+    }
+    Log {
+        entries: String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect(),
+        truncated,
+    }
 }
 
 fn append_log(path: &Path, entry: &LogEntry) {
@@ -788,7 +904,6 @@ fn append_log(path: &Path, entry: &LogEntry) {
 
 /// Entry point of the hidden `internal-nested-pm` command the shims call.
 pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmError> {
-    let shim_dir = std::env::var_os(SHIMS_ENV).map(PathBuf::from);
     let path = std::env::var_os("PATH").unwrap_or_default();
     let cwd = std::env::current_dir()?;
     let text_args: Option<Vec<String>> = args
@@ -801,8 +916,17 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
         }),
         None => Plan::Real,
     };
+    // The directory the command installs into, kept for the report even
+    // when the install is left to the project's own package manager.
+    let target_dir = match &plan {
+        Plan::Lpm { dir: Some(dir), .. } => dir.clone(),
+        _ => cwd.clone(),
+    };
     let log = std::env::var_os(LOG_ENV).map(PathBuf::from);
-    let earlier = log.as_deref().map(read_log).unwrap_or_default();
+    let earlier = log
+        .as_deref()
+        .map(|log| read_log(log).entries)
+        .unwrap_or_default();
     let started = std::env::var(STARTED_ENV)
         .ok()
         .and_then(|nanos| nanos.parse::<u64>().ok())
@@ -817,10 +941,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
                     .iter()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect(),
-                dir: match &plan {
-                    Plan::Lpm { dir: Some(dir), .. } => dir.clone(),
-                    _ => cwd.clone(),
-                },
+                dir: target_dir,
                 ran: plan.summary(),
                 reason,
             },
@@ -832,15 +953,14 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
             command
                 .args(args)
                 .current_dir(dir.unwrap_or(cwd))
-                .env("PATH", path_without(&path, shim_dir.as_deref())?)
-                .env_remove(SHIMS_ENV)
+                .env("PATH", path_without_shims(&path)?)
                 .env_remove(LOG_ENV)
                 .env_remove(STARTED_ENV)
                 .env_remove(USER_AGENT_ENV);
             command
         }
         Plan::Real => {
-            let Some(real) = find_on_path(manager, &path, shim_dir.as_deref()) else {
+            let Some(real) = find_on_path(manager, &path) else {
                 eprintln!("{manager}: command not found");
                 return Err(LpmError::ExitCode(127));
             };
@@ -858,11 +978,8 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
     }
 }
 
-fn path_without(path: &OsStr, skip: Option<&Path>) -> Result<OsString, LpmError> {
-    let Some(skip) = skip else {
-        return Ok(path.to_os_string());
-    };
-    std::env::join_paths(std::env::split_paths(path).filter(|dir| !same_dir(dir, skip)))
+fn path_without_shims(path: &OsStr) -> Result<OsString, LpmError> {
+    std::env::join_paths(std::env::split_paths(path).filter(|dir| !is_shim_dir(dir)))
         .map_err(|error| LpmError::Script(format!("could not rebuild PATH: {error}")))
 }
 
@@ -905,7 +1022,7 @@ impl ToolRun {
         let Some(session) = self.session else {
             return;
         };
-        let entries = session.entries();
+        let Log { entries, truncated } = session.entries();
         if entries.is_empty() {
             return;
         }
@@ -948,6 +1065,9 @@ impl ToolRun {
                 shown(&entry.dir)
             ));
         }
+        if truncated {
+            install_ui::detail("more commands ran than the log holds; the list above is the start");
+        }
         let mut dirs: Vec<&Path> = entries.iter().map(|entry| entry.dir.as_path()).collect();
         dirs.sort();
         dirs.dedup();
@@ -984,7 +1104,7 @@ fn is_install_command(manager: &str, args: &[String]) -> bool {
         ("pnpm", Some(sub)) => matches!(sub, "install" | "i" | "add"),
         ("yarn" | "yarnpkg", None) => !has_query_flag(&args),
         ("yarn" | "yarnpkg", Some(sub)) => matches!(sub, "install" | "add"),
-        ("bun", Some(sub)) => matches!(sub, "install" | "i" | "add" | "a"),
+        ("bun", Some(sub)) => matches!(sub, "install" | "i" | "add" | "a" | "ci"),
         _ => false,
     }
 }
@@ -1213,7 +1333,7 @@ mod tests {
         assert_eq!(plan("bun", "add -d vite"), lpm("install -D vite"));
         assert_eq!(
             plan("npm", "add -E react react-dom"),
-            lpm("install react react-dom")
+            lpm("install --exact react react-dom")
         );
     }
 
@@ -1265,35 +1385,38 @@ mod tests {
     fn local_first_runners_use_installed_binaries_and_download_the_rest() {
         assert_eq!(
             plan_with_local("npx", "tsc --noEmit", &["tsc"]),
-            lpm("exec tsc --noEmit")
+            lpm("exec tsc -- --noEmit")
         );
-        assert_eq!(plan_with_local("bunx", "tsc", &["tsc"]), lpm("exec tsc"));
+        assert_eq!(plan_with_local("bunx", "tsc", &["tsc"]), lpm("exec tsc --"));
         assert_eq!(
             plan_with_local("npm", "exec -- tsc -b", &["tsc"]),
-            lpm("exec tsc -b")
+            lpm("exec tsc -- -b")
         );
         assert_eq!(
             plan("npx", "-y create-vite@latest app"),
-            lpm("dlx create-vite@latest app")
+            lpm("dlx create-vite@latest -- app")
         );
-        assert_eq!(plan("npx", "cowsay hi"), lpm("dlx cowsay hi"));
-        assert_eq!(plan("npm", "x cowsay"), lpm("dlx cowsay"));
-        assert_eq!(plan("bun", "x cowsay"), lpm("dlx cowsay"));
+        assert_eq!(plan("npx", "cowsay hi"), lpm("dlx cowsay -- hi"));
+        assert_eq!(plan("npm", "x cowsay"), lpm("dlx cowsay --"));
+        assert_eq!(plan("bun", "x cowsay"), lpm("dlx cowsay --"));
         assert_eq!(
             plan_with_local("npx", "tsc@5 --version", &["tsc"]),
-            lpm("dlx tsc@5 --version"),
+            lpm("dlx tsc@5 -- --version"),
             "a versioned spec asks for a download"
         );
     }
 
     #[test]
     fn download_runners_always_go_through_lpm_dlx() {
-        assert_eq!(plan_with_local("pnpm", "dlx tsc", &["tsc"]), lpm("dlx tsc"));
+        assert_eq!(
+            plan_with_local("pnpm", "dlx tsc", &["tsc"]),
+            lpm("dlx tsc --")
+        );
         assert_eq!(
             plan("yarn", "dlx create-thing app"),
-            lpm("dlx create-thing app")
+            lpm("dlx create-thing -- app")
         );
-        assert_eq!(plan("pnpx", "create-thing"), lpm("dlx create-thing"));
+        assert_eq!(plan("pnpx", "create-thing"), lpm("dlx create-thing --"));
     }
 
     #[test]
@@ -1332,27 +1455,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn real_binary_lookup_skips_the_shim_directory() {
+    fn real_binary_lookup_skips_every_marked_shim_directory() {
         use std::os::unix::fs::PermissionsExt;
         let shims = tempfile::tempdir().unwrap();
+        let other_session = tempfile::tempdir().unwrap();
         let real = tempfile::tempdir().unwrap();
-        for dir in [shims.path(), real.path()] {
+        for dir in [shims.path(), other_session.path(), real.path()] {
             let file = dir.join("pnpm");
             std::fs::write(&file, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let path = std::env::join_paths([shims.path(), real.path()]).unwrap();
+        for dir in [shims.path(), other_session.path()] {
+            std::fs::write(dir.join(SHIM_MARKER), "").unwrap();
+        }
+        let path = std::env::join_paths([shims.path(), other_session.path(), real.path()]).unwrap();
+        assert_eq!(find_on_path("pnpm", &path), Some(real.path().join("pnpm")));
+        assert_eq!(find_on_path("yarn", &path), None);
         assert_eq!(
-            find_on_path("pnpm", &path, None),
-            Some(shims.path().join("pnpm"))
-        );
-        assert_eq!(
-            find_on_path("pnpm", &path, Some(shims.path())),
-            Some(real.path().join("pnpm"))
-        );
-        assert_eq!(find_on_path("yarn", &path, None), None);
-        assert_eq!(
-            path_without(&path, Some(shims.path())).unwrap(),
+            path_without_shims(&path).unwrap(),
             std::env::join_paths([real.path()]).unwrap()
         );
     }
@@ -1440,6 +1560,7 @@ mod tests {
     #[test]
     fn installs_into_projects_owned_by_another_package_manager_stay_with_it() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}").unwrap();
         let app = root.path().join("apps/web");
         std::fs::create_dir_all(&app).unwrap();
         assert_eq!(
@@ -1458,11 +1579,12 @@ mod tests {
         assert_eq!(plan, Plan::Real);
         assert_eq!(reason.as_deref(), Some("the project uses pnpm-lock.yaml"));
         assert_eq!(
-            respect_project_owner(lpm("dlx cowsay"), &app, Some(started), &[]),
-            (lpm("dlx cowsay"), None),
+            respect_project_owner(lpm("dlx cowsay --"), &app, Some(started), &[]),
+            (lpm("dlx cowsay --"), None),
             "running a package does not install into the project"
         );
 
+        std::fs::write(app.join("package.json"), "{}").unwrap();
         std::fs::write(app.join("lpm.lock"), "").unwrap();
         assert_eq!(
             foreign_lockfile(&app),
@@ -1481,6 +1603,7 @@ mod tests {
     fn lockfile_a_tool_wrote_during_the_run_does_not_make_the_project_foreign() {
         let started = SystemTime::now() - Duration::from_secs(60);
         let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
         std::fs::write(project.path().join("package-lock.json"), "{}").unwrap();
         assert_eq!(
             respect_project_owner(lpm("install"), project.path(), Some(started), &[]),
@@ -1559,7 +1682,7 @@ mod tests {
         });
         assert_eq!(
             plan,
-            lpm_in("exec tool --flag", "other"),
+            lpm_in("exec tool -- --flag", "other"),
             "the binary installed under --prefix runs, from there"
         );
         assert_eq!(
@@ -1570,27 +1693,159 @@ mod tests {
     }
 
     #[test]
-    fn launcher_is_recognized_only_inside_the_session_shim_directory() {
+    fn launcher_is_recognized_only_inside_a_marked_shim_directory() {
         let shims = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        let shim_env = Some(shims.path().as_os_str());
+        std::fs::write(shims.path().join(SHIM_MARKER), "").unwrap();
+        assert_eq!(launcher_manager(&shims.path().join("bun.exe")), Some("bun"));
+        assert_eq!(launcher_manager(&shims.path().join("NPM.EXE")), Some("npm"));
+        assert_eq!(launcher_manager(&shims.path().join("lpm.exe")), None);
+        assert_eq!(launcher_manager(&elsewhere.path().join("bun.exe")), None);
+    }
+
+    #[test]
+    fn launcher_is_the_lpm_binary_and_an_existing_launcher_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm = dir.path().join("lpm.exe");
+        std::fs::write(&lpm, b"lpm binary").unwrap();
+        let launcher = dir.path().join("bun.exe");
+
+        ensure_launcher(&lpm, &launcher).unwrap();
+        assert_eq!(std::fs::read(&launcher).unwrap(), b"lpm binary");
+
+        std::fs::remove_file(&lpm).unwrap();
+        ensure_launcher(&lpm, &launcher).unwrap();
+        assert_eq!(std::fs::read(&launcher).unwrap(), b"lpm binary");
+    }
+
+    #[test]
+    fn launcher_refuses_to_reuse_a_directory_in_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm = dir.path().join("lpm.exe");
+        std::fs::write(&lpm, b"lpm binary").unwrap();
+        let launcher = dir.path().join("bun.exe");
+        std::fs::create_dir(&launcher).unwrap();
+
+        let error = ensure_launcher(&lpm, &launcher).unwrap_err();
+        assert!(error.to_string().contains("in the way"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_does_not_write_through_a_symlink_in_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm = dir.path().join("lpm.exe");
+        std::fs::write(&lpm, b"lpm binary").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let launcher = dir.path().join("bun.exe");
+        std::os::unix::fs::symlink(&victim, &launcher).unwrap();
+
+        assert!(ensure_launcher(&lpm, &launcher).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn initializers_run_through_lpm_create() {
         assert_eq!(
-            launcher_manager(&shims.path().join("bun.exe"), shim_env),
-            Some("bun")
+            plan("npm", "create vite@latest app --template react"),
+            lpm("create vite@latest -- app --template react")
         );
         assert_eq!(
-            launcher_manager(&shims.path().join("NPM.EXE"), shim_env),
-            Some("npm")
+            plan("npm", "create -- vike@latest --vue app"),
+            lpm("create vike@latest -- --vue app")
+        );
+        assert_eq!(plan("npm", "init vite app"), lpm("create vite -- app"));
+        assert_eq!(plan("pnpm", "create astro"), lpm("create astro --"));
+        assert_eq!(
+            plan("yarn", "create next-app app"),
+            lpm("create next-app -- app")
         );
         assert_eq!(
-            launcher_manager(&shims.path().join("lpm.exe"), shim_env),
-            None
+            plan("npm", "init -y"),
+            Plan::Real,
+            "init without an initializer"
         );
         assert_eq!(
-            launcher_manager(&elsewhere.path().join("bun.exe"), shim_env),
-            None
+            plan("bun", "create owner/repo"),
+            Plan::Real,
+            "bun templates differ"
         );
-        assert_eq!(launcher_manager(&shims.path().join("bun.exe"), None), None);
+    }
+
+    #[test]
+    fn exact_save_engine_and_unfrozen_flags_carry_over() {
+        assert_eq!(
+            plan("npm", "install --save-exact react"),
+            lpm("install --exact react")
+        );
+        assert_eq!(plan("pnpm", "add -E react"), lpm("install --exact react"));
+        assert_eq!(plan("npm", "install -E"), lpm("install"), "nothing to save");
+        assert_eq!(
+            plan("yarn", "--ignore-engines"),
+            lpm("install --no-engine-strict")
+        );
+        assert_eq!(
+            plan("yarn", "install --no-frozen-lockfile"),
+            lpm("install --no-frozen-lockfile")
+        );
+        assert_eq!(plan("npm", "install --force"), lpm("install"));
+    }
+
+    #[test]
+    fn bun_clean_install_runs_lpm_ci() {
+        assert_eq!(plan("bun", "ci"), lpm("ci"));
+        assert!(is_install_command("bun", &["ci".to_string()]));
+    }
+
+    #[test]
+    fn lockfile_ownership_stops_at_the_project_and_its_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("package-lock.json"), "{}").unwrap();
+        let app = home.path().join("code/my-app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
+        assert_eq!(
+            foreign_lockfile(&app),
+            None,
+            "a stray lockfile above the project"
+        );
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - apps/*\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
+        let member = repo.path().join("apps/web");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), "{}").unwrap();
+        assert_eq!(
+            foreign_lockfile(&member),
+            Some((repo.path(), "pnpm-lock.yaml")),
+            "a workspace member's lockfile lives at the workspace root"
+        );
+    }
+
+    #[test]
+    fn oversized_log_keeps_the_complete_entries_it_can_read() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let entry = LogEntry {
+            manager: "npm".into(),
+            args: vec!["x".repeat(4096)],
+            dir: PathBuf::from("/work"),
+            ran: "real".into(),
+            reason: None,
+        };
+        let line_len = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
+        let count = MAX_LOG_BYTES / line_len + 2;
+        for _ in 0..count {
+            append_log(log.path(), &entry);
+        }
+        let read = read_log(log.path());
+        assert!(read.truncated);
+        assert_eq!(read.entries.len() as u64, MAX_LOG_BYTES / line_len);
     }
 
     #[test]
@@ -1611,6 +1866,12 @@ mod tests {
             .write_all(b"not json\n")
             .unwrap();
         append_log(log.path(), &entry);
-        assert_eq!(read_log(log.path()), [entry.clone(), entry]);
+        assert_eq!(
+            read_log(log.path()),
+            Log {
+                entries: vec![entry.clone(), entry],
+                truncated: false,
+            }
+        );
     }
 }
