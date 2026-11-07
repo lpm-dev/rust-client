@@ -2052,6 +2052,44 @@ fn run_in_a_member_ignores_a_sibling_member_with_a_broken_manifest() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("hello-from-app"));
 }
 
+#[cfg(unix)]
+#[test]
+fn run_forwards_sigterm_to_the_script_and_exits_143() {
+    let project = TempProject::empty(
+        r#"{"name":"run-sigterm","version":"1.0.0","scripts":{"serve":"node serve.js"}}"#,
+    );
+    project.write_file(
+        "serve.js",
+        r#"const fs = require('fs');
+process.on('SIGTERM', () => { fs.writeFileSync('got-term', 'yes'); process.exit(0); });
+fs.writeFileSync('ready', 'yes');
+setInterval(() => {}, 1000);"#,
+    );
+    let mut child = lpm_spawnable(&project)
+        .args(["run", "serve"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lpm run serve");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !project.file_exists("ready") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(project.file_exists("ready"), "the script never started");
+
+    // SAFETY: the child is unreaped, so its PID is still ours.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let status = child.wait().expect("wait for lpm run");
+
+    assert!(
+        project.file_exists("got-term"),
+        "SIGTERM never reached the script"
+    );
+    assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
 fn counting_build_project(name: &str, outputs: &str, output_file: &str) -> TempProject {
     let project = TempProject::empty(&format!(
         r#"{{"name":"{name}","version":"1.0.0","scripts":{{"build":"node build.js"}}}}"#

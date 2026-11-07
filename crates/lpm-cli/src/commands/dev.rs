@@ -2061,15 +2061,20 @@ pub async fn run(
                         prepared_proxy_plan,
                         || Ok(()),
                     )?;
-                    if let Some(routes) = registered_proxy_routes.as_deref() {
+                    let terminal_free = !lpm_runner::orchestrator::dashboard_owns_terminal();
+                    if terminal_free
+                        && let Some(routes) = registered_proxy_routes.as_deref()
+                    {
                         print_registered_proxy_routes(routes);
                     }
                     if let Some(controller) = tunnel_forwarding_controller.as_ref() {
                         controller.open();
                     }
-                    dev_ui::trusted_detail("Local", &install_ui::url(&local_url));
-                    dev_ui::blank_line();
-                    dev_ui::done_ready("Local server", multi_started.elapsed());
+                    if terminal_free {
+                        dev_ui::trusted_detail("Local", &install_ui::url(&local_url));
+                        dev_ui::blank_line();
+                        dev_ui::done_ready("Local server", multi_started.elapsed());
+                    }
                     if open_browser {
                         let _ = lpm_common::browser::open(local_url);
                     }
@@ -2232,6 +2237,7 @@ pub async fn run(
             let project_dir_owned = project_dir.to_path_buf();
             let orchestrator_config = Arc::clone(config);
             let dashboard_terminal_tx = dashboard_event_tx.clone();
+            let dashboard_terminal = lpm_runner::orchestrator::DashboardTerminalHold::acquire();
             let orch_handle = std::thread::spawn(move || {
                 run_dashboard_orchestrator(dashboard_terminal_tx, || {
                     lpm_runner::orchestrator::run_services_with_config(
@@ -2253,14 +2259,15 @@ pub async fn run(
             let inspector_url_for_dashboard = inspector_handle.as_ref().map(|h| h.url.clone());
 
             let dashboard_result = if let Some(rx) = dashboard_event_rx {
-                lpm_dashboard::run_dashboard(
+                let result = lpm_dashboard::run_dashboard(
                     dashboard_services,
                     rx,
                     Some(dashboard_command_sink),
                     inspector_url_for_dashboard,
                 )
-                .map(|_| ())
-                .map_err(|error| LpmError::Script(error.to_string()))
+                .map(|_| ());
+                drop(dashboard_terminal);
+                result.map_err(|error| LpmError::Script(error.to_string()))
             } else {
                 Ok(())
             };
@@ -2314,7 +2321,6 @@ pub async fn run(
     let dev_command = single_dev_command.ok_or_else(|| {
         LpmError::Script("single-service dev command was not prepared".to_string())
     })?;
-    let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
     let mut script_env = extra_env.clone();
     let explicit_inspector_port = if tunnel && !no_inspect {
         inspect_port
@@ -2340,6 +2346,9 @@ pub async fn run(
             requested_port,
         )?);
     }
+    // Every early return above happens before the hosts file changes, so a
+    // rejected port can't leave the session's entries behind.
+    let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
 
     let endpoint_required = https
         || network

@@ -225,9 +225,13 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
     }
     command.env("PATH", cmd.path);
 
-    crate::env_access::spawn(&mut command)
-        .and_then(|mut child| child.wait())
-        .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))
+    // Forwarding stop signals matters most here: as a container's PID 1, or
+    // under an IDE's stop button, LPM is the only process that receives them.
+    let signals = crate::execution::ExecutionSignals::new()?;
+    let wait = signals.prepare_wait()?;
+    let mut child = crate::env_access::spawn(&mut command)
+        .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
+    wait.wait(&mut child)
 }
 
 pub(crate) fn spawn_shell_cancellable(
@@ -600,6 +604,8 @@ pub fn spawn_shell_tee_with_reserved_stdout(
     }
     command.env("PATH", cmd.path);
 
+    let signals = crate::execution::ExecutionSignals::new()?;
+    let wait = signals.prepare_wait()?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
@@ -629,9 +635,7 @@ pub fn spawn_shell_tee_with_reserved_stdout(
         })
     });
 
-    let status = child
-        .wait()
-        .map_err(|e| LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command)))?;
+    let status = wait.wait(&mut child)?;
 
     let stdout = stdout_handle.join().unwrap_or_else(|_| {
         tracing::warn!("stdout reader thread panicked");
@@ -683,6 +687,8 @@ pub fn spawn_command_capture(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    let signals = crate::execution::ExecutionSignals::new()?;
+    let wait = signals.prepare_wait()?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{display_name}': {e}")))?;
 
@@ -701,9 +707,7 @@ pub fn spawn_command_capture(
         child_stderr.map_or_else(String::new, |stderr| drain_captured_stream(stderr, |_| {}))
     });
 
-    let status = child
-        .wait()
-        .map_err(|e| LpmError::Script(format!("failed to wait for '{display_name}': {e}")))?;
+    let status = wait.wait(&mut child)?;
 
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
@@ -754,6 +758,8 @@ pub fn spawn_shell_prefixed(
     }
     command.env("PATH", cmd.path);
 
+    let signals = crate::execution::ExecutionSignals::new()?;
+    let wait = signals.prepare_wait()?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
@@ -783,9 +789,7 @@ pub fn spawn_shell_prefixed(
         })
     });
 
-    let status = child
-        .wait()
-        .map_err(|e| LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command)))?;
+    let status = wait.wait(&mut child)?;
 
     let stdout = stdout_handle.join().unwrap_or_else(|_| String::new());
     let stderr = stderr_handle.join().unwrap_or_else(|_| String::new());

@@ -628,10 +628,16 @@ pub async fn run_workspace(
                 failed_flag.store(true, Ordering::Relaxed);
             }
         } else {
-            // Multiple packages in this level — run in parallel
-            for chunk in level_targets.chunks(workspace_concurrency) {
+            // Multiple packages in this level run in parallel, at most
+            // `workspace_concurrency` at once. Each member takes a slot as one
+            // frees up, so a slow member never holds idle slots the way a
+            // batch waiting for its slowest member would.
+            let slots = MemberSlots::new(workspace_concurrency);
+            {
                 std::thread::scope(|scope| -> Result<(), LpmError> {
-                    let handles: Vec<_> = chunk
+                    let slots = &slots;
+                    let failed_flag = &failed_flag;
+                    let handles: Vec<_> = level_targets
                     .iter()
                     .map(|&idx| -> Result<_, LpmError> {
                         let member_dir = ws_graph.members[idx].path.clone();
@@ -663,6 +669,10 @@ pub async fn run_workspace(
 
                         let worker_env_access = env_access.clone();
                         Ok((idx, scope.spawn(move || -> Result<_, LpmError> {
+                            let _slot = slots.acquire();
+                            if !continue_on_error && failed_flag.load(Ordering::Relaxed) {
+                                return Ok(None);
+                            }
                             worker_env_access.run(|| {
                             let report = run_workspace_package(
                                 &member_dir,
@@ -689,7 +699,7 @@ pub async fn run_workspace(
                             } else {
                                 None
                             };
-                            Ok((report, identities))
+                            Ok(Some((report, identities)))
                             })
                         })))
                     })
@@ -697,7 +707,8 @@ pub async fn run_workspace(
 
                     for (idx, handle) in handles {
                         match handle.join() {
-                            Ok(Ok((report, identities))) => {
+                            Ok(Ok(None)) => {}
+                            Ok(Ok(Some((report, identities)))) => {
                                 completed_task_identities[idx] = identities;
                                 completed_task_states[idx] = Some(report.task_states());
                                 if report.is_successful() {
@@ -718,10 +729,6 @@ pub async fn run_workspace(
 
                     Ok(())
                 })?;
-
-                if !continue_on_error && failed_flag.load(Ordering::Relaxed) {
-                    break;
-                }
             }
         }
     }
@@ -883,9 +890,85 @@ fn run_workspace_package(
     }
 }
 
+/// Counts the workspace members that may run at once.
+struct MemberSlots {
+    free: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl MemberSlots {
+    fn new(count: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(count.max(1)),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> MemberSlot<'_> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *free == 0 {
+            free = self
+                .freed
+                .wait(free)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *free -= 1;
+        MemberSlot(self)
+    }
+}
+
+struct MemberSlot<'a>(&'a MemberSlots);
+
+impl Drop for MemberSlot<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_slots_keep_running_members_while_a_slow_one_holds_its_slot() {
+        let slots = MemberSlots::new(2);
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let finished = std::sync::Mutex::new(Vec::new());
+        let (slow_started_tx, slow_started_rx) = std::sync::mpsc::channel();
+
+        let member = |name: &'static str, millis: u64| {
+            let _slot = slots.acquire();
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            if name == "slow" {
+                slow_started_tx.send(()).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+            running.fetch_sub(1, Ordering::SeqCst);
+            finished.lock().unwrap().push(name);
+        };
+        let member = &member;
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || member("slow", 400));
+            slow_started_rx.recv().unwrap();
+            for name in ["a", "b", "c"] {
+                scope.spawn(move || member(name, 20));
+            }
+        });
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(finished.lock().unwrap().last(), Some(&"slow"));
+    }
 
     #[test]
     fn workspace_plan_retains_only_direct_upstream_task_references() {

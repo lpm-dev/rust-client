@@ -1045,20 +1045,37 @@ pub(crate) fn descendant_process_snapshot_until(
 /// Forward a stop signal, allow cleanup, then stop captured surviving descendants.
 #[cfg(unix)]
 pub(crate) fn stop_child_process_tree(child: &mut Child, signal: i32) -> std::io::Result<()> {
+    stop_child_process_tree_within(child, signal, CHILD_STOP_GRACE)
+}
+
+#[cfg(unix)]
+/// How long a stopped command has to finish its cleanup before its remaining
+/// processes are killed.
+const CHILD_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(unix)]
+fn stop_child_process_tree_within(
+    child: &mut Child,
+    signal: i32,
+    grace: std::time::Duration,
+) -> std::io::Result<()> {
     let root_pid = child.id();
     let mut snapshot = descendant_process_snapshot(root_pid);
-    // SAFETY: the Child remains unreaped, so its PID cannot be reused here.
-    unsafe {
-        libc::kill(root_pid as i32, signal);
+    // A terminal Ctrl+C reaches the whole foreground process group, the
+    // child included. Sending SIGINT again would read as a second Ctrl+C,
+    // which many tools treat as "quit without cleaning up". A SIGINT sent to
+    // LPM alone, as a process manager sends it, is still forwarded.
+    let terminal_delivered = signal == libc::SIGINT
+        && shares_our_process_group(root_pid)
+        && our_group_is_terminal_foreground();
+    if !terminal_delivered {
+        signal_process_tree(root_pid, &snapshot, signal);
     }
-    for (&pid, identity) in &snapshot.identities {
-        if pid != root_pid
-            && let Some(identity) = identity
-        {
-            let _ = signal_unix_pid_if_process_identity(pid, identity, signal);
-        }
+    if !wait_for_child_exit(child, grace)? && terminal_delivered {
+        // The SIGINT may have been sent to LPM alone; ask once more, politely.
+        signal_process_tree(root_pid, &snapshot, libc::SIGTERM);
+        wait_for_child_exit(child, grace)?;
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
     let remaining = descendant_process_snapshot(root_pid);
     snapshot.identities.extend(remaining.identities);
     snapshot.uncertain_descendants |= remaining.uncertain_descendants;
@@ -1087,6 +1104,54 @@ pub(crate) fn stop_child_process_tree(child: &mut Child, signal: i32) -> std::io
         Err(std::io::Error::other(format!(
             "could not safely stop {failures} descendant process(es) of PID {root_pid}"
         )))
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_tree(root_pid: u32, snapshot: &DescendantProcessSnapshot, signal: i32) {
+    // SAFETY: the Child remains unreaped, so its PID cannot be reused here.
+    unsafe {
+        libc::kill(root_pid as i32, signal);
+    }
+    for (&pid, identity) in &snapshot.identities {
+        if pid != root_pid
+            && let Some(identity) = identity
+        {
+            let _ = signal_unix_pid_if_process_identity(pid, identity, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn our_group_is_terminal_foreground() -> bool {
+    // SAFETY: getpgrp, isatty and tcgetpgrp only read process and terminal state.
+    unsafe {
+        let ours = libc::getpgrp();
+        [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+            .into_iter()
+            .any(|fd| libc::isatty(fd) == 1 && libc::tcgetpgrp(fd) == ours)
+    }
+}
+
+#[cfg(unix)]
+fn shares_our_process_group(pid: u32) -> bool {
+    // SAFETY: getpgid only reads process-table state.
+    let (theirs, ours) = unsafe { (libc::getpgid(pid as i32), libc::getpgid(0)) };
+    theirs != -1 && theirs == ours
+}
+
+#[cfg(unix)]
+/// Waits up to `grace` for the child to exit, returning as soon as it does.
+fn wait_for_child_exit(child: &mut Child, grace: std::time::Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -5772,6 +5837,65 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
         let port = 49152 + (std::process::id() as u16 % 1000);
         // This might be in use, so just verify the function doesn't panic
         let _ = check_port(port);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_command_gets_time_to_finish_its_cleanup() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cleaned = dir.path().join("cleaned");
+        let ready = dir.path().join("ready");
+        let script = format!(
+            "trap 'sleep 1; touch \"{}\"; exit 0' TERM; touch \"{}\"; while :; do sleep 0.05; done",
+            cleaned.display(),
+            ready.display()
+        );
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        stop_child_process_tree_within(
+            &mut child,
+            libc::SIGTERM,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(
+            cleaned.exists(),
+            "the command was killed before its cleanup finished"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_command_that_exits_at_once_is_not_waited_on() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+
+        stop_child_process_tree_within(
+            &mut child,
+            libc::SIGTERM,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
