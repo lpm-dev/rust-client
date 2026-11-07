@@ -1,0 +1,1 @@
+pnpm approve-builds --all

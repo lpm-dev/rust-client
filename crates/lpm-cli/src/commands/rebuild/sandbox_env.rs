@@ -93,6 +93,9 @@ mod tests {
             "DYLD_INSERT_LIBRARIES",
             "GIT_CONFIG_COUNT",
             "TMPDIR",
+            "npm_config_ignore_scripts",
+            "PNPM_CONFIG_IGNORE_SCRIPTS",
+            "YARN_ENABLE_SCRIPTS",
         ] {
             let error =
                 build_env_with_approved_names(&BTreeSet::from([name.to_string()])).unwrap_err();

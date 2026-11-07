@@ -1,0 +1,1 @@
+pnpm add --dangerously-allow-all-builds some-package

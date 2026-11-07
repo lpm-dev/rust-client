@@ -97,6 +97,20 @@ pub(super) fn execute_script(
     }
 }
 
+/// Settings that keep a package manager started by a dependency's
+/// lifecycle script from running the lifecycle scripts of whatever it
+/// installs, so approving one package's script never approves others.
+/// Each also outranks that manager's own approval lists
+/// (`allowScripts`, `allowBuilds`, `dangerously-allow-all-*`).
+///
+/// pnpm 11 reads only its own `pnpm_config_` prefix. bun has no
+/// environment switch; the static gate flags `bun install` instead.
+const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
+    ("npm_config_ignore_scripts", "true"),
+    ("pnpm_config_ignore_scripts", "true"),
+    ("YARN_ENABLE_SCRIPTS", "false"),
+];
+
 pub(super) fn build_lifecycle_environment(
     env: &super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
@@ -111,23 +125,33 @@ pub(super) fn build_lifecycle_environment(
         prefixed.push(&path_value);
         path_value = prefixed;
     }
-    let mut envs: Vec<(OsString, OsString)> = env
-        .iter()
-        .filter(|(k, _)| {
-            !k.eq_ignore_ascii_case("PATH")
-                && !k.eq_ignore_ascii_case("INIT_CWD")
-                && !k.eq_ignore_ascii_case("TMPDIR")
-                && !k.eq_ignore_ascii_case("TMP")
-                && !k.eq_ignore_ascii_case("TEMP")
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut envs: Vec<(OsString, OsString)> =
+        Vec::with_capacity(env.len() + 5 + NESTED_INSTALL_SCRIPT_GUARD.len());
+    envs.extend(
+        env.iter()
+            .filter(|(k, _)| {
+                !k.eq_ignore_ascii_case("PATH")
+                    && !k.eq_ignore_ascii_case("INIT_CWD")
+                    && !k.eq_ignore_ascii_case("TMPDIR")
+                    && !k.eq_ignore_ascii_case("TMP")
+                    && !k.eq_ignore_ascii_case("TEMP")
+                    && !NESTED_INSTALL_SCRIPT_GUARD
+                        .iter()
+                        .any(|(name, _)| k.eq_ignore_ascii_case(name))
+            })
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
     envs.push(("INIT_CWD".into(), project_dir.as_os_str().to_owned()));
     envs.push(("PATH".into(), path_value));
     let tmp = tmpdir.as_os_str();
     envs.push(("TMPDIR".into(), tmp.to_owned()));
     envs.push(("TMP".into(), tmp.to_owned()));
     envs.push(("TEMP".into(), tmp.to_owned()));
+    envs.extend(
+        NESTED_INSTALL_SCRIPT_GUARD
+            .iter()
+            .map(|(name, value)| ((*name).into(), (*value).into())),
+    );
     envs
 }
 

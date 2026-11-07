@@ -1910,6 +1910,71 @@
     "expected": "red"
   },
   {
+    "id": "red-nested-pm-014-deno-allow-scripts",
+    "expected": "red",
+    "notes": "qunitx-cli postinstall: pre-approves playwright-core's lifecycle scripts through Deno"
+  },
+  {
+    "id": "red-nested-pm-015-npm-typo-alias",
+    "expected": "red",
+    "notes": "npm accepts typo aliases for install"
+  },
+  {
+    "id": "red-nested-pm-016-npm-prefix-flag",
+    "expected": "red",
+    "notes": "global flag with a value before the install subcommand"
+  },
+  {
+    "id": "red-nested-pm-017-pnpm-dir-flag",
+    "expected": "red",
+    "notes": "dsh-tui-pi retry shape: pnpm install in another directory"
+  },
+  {
+    "id": "red-nested-pm-018-corepack-yarn",
+    "expected": "red",
+    "notes": "package manager reached through corepack"
+  },
+  {
+    "id": "red-nested-pm-019-cd-bare-yarn",
+    "expected": "red",
+    "notes": "bare yarn runs an install"
+  },
+  {
+    "id": "red-nested-pm-020-pnpm-dlx",
+    "expected": "red",
+    "notes": "always downloads and executes a package"
+  },
+  {
+    "id": "red-nested-pm-021-npx-yes",
+    "expected": "red",
+    "notes": "explicit download request; plain npx <bin> stays amber"
+  },
+  {
+    "id": "red-nested-pm-022-bun-pm-trust",
+    "expected": "red",
+    "notes": "approves every blocked dependency's scripts for bun"
+  },
+  {
+    "id": "red-nested-pm-023-pnpm-approve-builds",
+    "expected": "red",
+    "notes": "approves every blocked dependency's builds for pnpm"
+  },
+  {
+    "id": "red-nested-pm-024-shell-command-string",
+    "expected": "red",
+    "notes": "nested install hidden in a shell command string"
+  },
+  {
+    "id": "red-nested-pm-025-reenable-npm-scripts",
+    "expected": "red",
+    "notes": "turns dependency scripts back on for a nested npm"
+  },
+  {
+    "id": "red-nested-pm-026-dangerously-allow-builds",
+    "expected": "red",
+    "notes": "pnpm flag that runs every dependency build"
+  },
+  {
     "id": "red-pipe-001-curl-sh",
     "expected": "red"
   },
