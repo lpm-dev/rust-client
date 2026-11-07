@@ -110,6 +110,7 @@ struct SinglePackageTaskPlan {
     config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
     package_scripts: Option<HashMap<String, String>>,
     levels: Vec<Vec<String>>,
+    sequential: Vec<String>,
 }
 
 impl SinglePackageTaskPlan {
@@ -174,8 +175,9 @@ fn prepare_single_package_task_plan_with_config(
     // Always build task graph — expand dependsOn for all scripts, even single ones.
     // This is the core contract: `lpm run test` auto-runs `check` if
     // test.dependsOn includes "check".
-    let levels = lpm_runner::task_graph::task_levels(&all_scripts, tasks, scripts)
-        .map_err(LpmError::Script)?;
+    let lpm_runner::task_graph::TaskSchedule { levels, sequential } =
+        lpm_runner::task_graph::task_schedule(&all_scripts, tasks, scripts)
+            .map_err(LpmError::Script)?;
     for name in levels.iter().flatten() {
         if let Some(task) = tasks.get(name)
             && let Some(dependency) = task.depends_on.iter().find(|dep| dep.starts_with('^'))
@@ -190,6 +192,7 @@ fn prepare_single_package_task_plan_with_config(
         config: lpm_config,
         package_scripts: pkg_scripts,
         levels,
+        sequential,
     })
 }
 
@@ -239,9 +242,9 @@ fn execute_single_package_task_plan(
         let execution_levels = if parallel {
             levels
         } else {
-            serial_levels = levels
+            serial_levels = plan
+                .sequential
                 .iter()
-                .flatten()
                 .cloned()
                 .map(|task| vec![task])
                 .collect::<Vec<_>>();
@@ -268,12 +271,11 @@ fn execute_single_package_task_plan(
         )
     } else {
         // Sequential: run tasks in topological order (deps before dependents)
-        let topo_order: Vec<String> = levels.iter().flatten().cloned().collect();
         run_tasks_sequential(
             project_dir,
             workspace_contract.as_ref(),
             &workspace_dependency_identities,
-            &topo_order,
+            &plan.sequential,
             extra_args,
             env_mode,
             continue_on_error,
