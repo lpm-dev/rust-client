@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/approve_scripts_contract/mod.rs
+expression: "row[\"reach\"]"
+---
+{
+  "findings": [
+    {
+      "kind": "starts-package-manager",
+      "manager": "pnpm",
+      "file": "bin/onboard.mjs"
+    },
+    {
+      "kind": "edits-script-approvals",
+      "key": "allowBuilds",
+      "file": "bin/onboard.mjs"
+    }
+  ],
+  "incomplete": false,
+  "requires_individual_review": true
+}

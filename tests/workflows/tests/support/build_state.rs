@@ -79,6 +79,8 @@ struct FixtureBlockedPackage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     static_tier: Option<StaticTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    reach: Option<lpm_security::reach::ScriptReach>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provenance_at_capture: Option<ProvenanceSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_at: Option<String>,
@@ -211,6 +213,7 @@ pub fn seed_blocked_build_state_with_real_hash(
             "phases_present": ["postinstall"],
             "binding_drift": false,
             "static_tier": "green",
+            "reach": {{}},
             "published_at": "2026-04-22T00:00:00Z"
         }}
     ]
@@ -278,7 +281,7 @@ pub fn seed_global_install_blocked_state_with_tier(
     let install_lpm = install_root.join(".lpm");
     std::fs::create_dir_all(&install_lpm).unwrap();
     let tier_line = match tier {
-        Some(t) => format!(",\n            \"static_tier\": \"{t}\""),
+        Some(t) => format!(",\n            \"static_tier\": \"{t}\",\n            \"reach\": {{}}"),
         None => String::new(),
     };
     let body = format!(

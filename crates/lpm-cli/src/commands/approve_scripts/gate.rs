@@ -22,6 +22,8 @@ pub(super) trait TieredRow {
     fn display_id(&self) -> String;
     /// `Some(tier)` when classification ran, `None` for unclassified state.
     fn static_tier(&self) -> Option<lpm_security::triage::StaticTier>;
+    /// `Some` when the reach scan ran, `None` for rows captured before it.
+    fn reach(&self) -> Option<&lpm_security::reach::ScriptReach>;
 }
 
 impl TieredRow for BlockedPackage {
@@ -31,6 +33,9 @@ impl TieredRow for BlockedPackage {
     fn static_tier(&self) -> Option<lpm_security::triage::StaticTier> {
         self.static_tier
     }
+    fn reach(&self) -> Option<&lpm_security::reach::ScriptReach> {
+        self.reach.as_ref()
+    }
 }
 
 impl TieredRow for crate::global_blocked_set::AggregateBlockedRow {
@@ -39,6 +44,9 @@ impl TieredRow for crate::global_blocked_set::AggregateBlockedRow {
     }
     fn static_tier(&self) -> Option<lpm_security::triage::StaticTier> {
         self.static_tier
+    }
+    fn reach(&self) -> Option<&lpm_security::reach::ScriptReach> {
+        self.reach.as_ref()
     }
 }
 
@@ -53,12 +61,31 @@ impl<T: TieredRow + ?Sized> TieredRow for &T {
     fn static_tier(&self) -> Option<lpm_security::triage::StaticTier> {
         (**self).static_tier()
     }
+    fn reach(&self) -> Option<&lpm_security::reach::ScriptReach> {
+        (**self).reach()
+    }
+}
+
+/// Why `--yes` must leave a row for individual review, or `None` when
+/// bulk approval may include it.
+pub(super) fn individual_review_reason<R: TieredRow>(row: &R) -> Option<&'static str> {
+    use lpm_security::triage::StaticTier;
+    match (row.static_tier(), row.reach()) {
+        (None, _) => Some("unclassified"),
+        (Some(StaticTier::Green), None) => Some("green, reach not analyzed"),
+        (Some(StaticTier::Green), Some(reach)) if reach.requires_individual_review() => {
+            Some("green, reaches beyond its own package")
+        }
+        (Some(StaticTier::Green), Some(_)) => None,
+        (Some(tier), _) => Some(tier_label_text(tier)),
+    }
 }
 
 /// — enforce the `--yes` refusal contract.
 ///
 /// Given the **effective** blocked-set that `--yes` would approve,
-/// return `Err` unless every entry carries an explicit green tier.
+/// return `Err` unless every entry carries an explicit green tier and a
+/// reach scan that found nothing requiring individual review.
 ///
 /// Pure so it's unit-testable without an end-to-end `run()`
 /// invocation. The callsite threads the returned `LpmError` up and
@@ -74,11 +101,9 @@ pub(super) fn enforce_tiered_yes_gate<R: TieredRow>(
     blocked: &[R],
     scope: GateScope,
 ) -> Result<(), LpmError> {
-    use lpm_security::triage::StaticTier;
-
-    let refusals: Vec<&R> = blocked
+    let refusals: Vec<(&R, &str)> = blocked
         .iter()
-        .filter(|bp| !matches!(bp.static_tier(), Some(StaticTier::Green)))
+        .filter_map(|bp| individual_review_reason(bp).map(|reason| (bp, reason)))
         .collect();
 
     if refusals.is_empty() {
@@ -91,10 +116,7 @@ pub(super) fn enforce_tiered_yes_gate<R: TieredRow>(
     // the `"--yes refuses"` prefix, which is stable-onward.
     let detail = refusals
         .iter()
-        .map(|bp| {
-            let tier_text = bp.static_tier().map_or("unclassified", tier_label_text);
-            format!("    {}  [{}]", bp.display_id(), tier_text)
-        })
+        .map(|(bp, reason)| format!("    {}  [{}]", bp.display_id(), reason))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -113,7 +135,8 @@ pub(super) fn enforce_tiered_yes_gate<R: TieredRow>(
 
     Err(LpmError::Script(format!(
         "--yes refuses to bulk-approve {} package(s) classified outside the \
-         green tier. Each requires explicit per-package review.\n\n{}\n\n{}",
+         green tier or reaching beyond their own package. Each requires \
+         explicit per-package review.\n\n{}\n\n{}",
         refusals.len(),
         detail,
         redirect,

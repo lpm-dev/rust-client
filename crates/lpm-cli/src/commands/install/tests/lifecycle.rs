@@ -5,6 +5,15 @@ fn populate_v2_scripted_package(
     wrapper_id: &str,
     script_body: &str,
 ) -> String {
+    populate_v2_scripted_package_with_files(store, wrapper_id, script_body, &[])
+}
+
+fn populate_v2_scripted_package_with_files(
+    store: &lpm_store::v2::Store,
+    wrapper_id: &str,
+    script_body: &str,
+    files: &[(&str, &str)],
+) -> String {
     use std::io::Write;
 
     use lpm_store::v2::{GraphKey, GraphKeyInputs, LinkEntryRequest, LinkerModeTag, PlatformTuple};
@@ -18,13 +27,20 @@ fn populate_v2_scripted_package(
             "scripts": {"postinstall": script_body},
         }))
         .unwrap();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(manifest.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "package/package.json", manifest.as_slice())
-            .unwrap();
+        let entries = std::iter::once(("package.json", manifest.as_slice())).chain(
+            files
+                .iter()
+                .map(|(path, content)| (*path, content.as_bytes())),
+        );
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("package/{path}"), content)
+                .unwrap();
+        }
         builder.finish().unwrap();
     }
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -74,6 +90,52 @@ fn amber_advisor_requests_read_scripts_from_default_v2_store() {
     );
 
     assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn amber_advisor_requests_skip_packages_whose_code_edits_script_approvals() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path().join("lpm-home"));
+    let store = lpm_store::PackageStore::from_root(&lpm_root);
+    let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+    let setup = |marker: &str| {
+        format!(
+            "const fs = require('fs');\nfs.writeFileSync(profile, '{marker}:\\n  scripted: true\\n');\n"
+        )
+    };
+    let reaching_setup = setup("allowBuilds");
+    let plain_setup = setup("packages");
+    let reaching = populate_v2_scripted_package_with_files(
+        &v2_store,
+        "tarball-reaching",
+        "node install.js",
+        &[("install.js", reaching_setup.as_str())],
+    );
+    let plain = populate_v2_scripted_package_with_files(
+        &v2_store,
+        "tarball-plain",
+        "node install.js",
+        &[("install.js", plain_setup.as_str())],
+    );
+
+    let baseline_index = lpm_store::V2BaselineIndex::build(&lpm_root).unwrap();
+    let requests = collect_amber_classification_requests(
+        &store,
+        &lpm_root,
+        Some(&baseline_index),
+        &[
+            ("scripted".into(), "1.0.0".into(), Some(reaching)),
+            ("scripted".into(), "1.0.0".into(), Some(plain.clone())),
+        ],
+    );
+
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.integrity.clone())
+            .collect::<Vec<_>>(),
+        [Some(plain)]
+    );
 }
 
 #[test]
@@ -178,6 +240,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                 phases_present: vec!["postinstall".into()],
                 binding_drift: false,
                 static_tier: None,
+                reach: None,
                 provenance_at_capture: None,
                 published_at: Some("2026-04-22T00:00:00Z".into()),
                 behavioral_tags_hash: Some("sha256-tags".into()),
@@ -191,6 +254,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                 phases_present: vec!["postinstall".into()],
                 binding_drift: false,
                 static_tier: None,
+                reach: None,
                 provenance_at_capture: None,
                 published_at: None,
                 behavioral_tags_hash: None,
@@ -425,6 +489,7 @@ fn bc_with_tiers(green: usize, amber: usize, red: usize) -> crate::build_state::
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
         static_tier: Some(tier),
+        reach: None,
         provenance_at_capture: None,
         published_at: None,
         behavioral_tags_hash: None,
@@ -629,6 +694,7 @@ fn bp_for_diff(
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
         static_tier: Some(lpm_security::triage::StaticTier::Green),
+        reach: None,
         provenance_at_capture: None,
         published_at: None,
         behavioral_tags_hash: None,
@@ -807,6 +873,7 @@ fn blocked_metadata_replay_keeps_distinct_artifacts_separate_and_rejects_unsigne
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
             static_tier: None,
+            reach: None,
             published_at: Some(id.into()),
             behavioral_tags_hash: None,
             behavioral_tags: None,
@@ -853,6 +920,7 @@ fn blocked_metadata_replay_omits_artifacts_without_integrity() {
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
         static_tier: None,
+        reach: None,
         published_at: Some("2020-01-01T00:00:00Z".into()),
         behavioral_tags_hash: None,
         behavioral_tags: None,

@@ -76,6 +76,10 @@ pub struct AggregateBlockedRow {
     /// (see [`merge_static_tier`]) — conservative for the gate that
     /// consumes this field.
     pub static_tier: Option<StaticTier>,
+    /// Reach scan carried from [`BlockedPackage::reach`]. Rows from
+    /// several origins keep the union of their findings; one origin
+    /// without a scan makes the row unanalyzed.
+    pub reach: Option<lpm_security::reach::ScriptReach>,
     /// Globally-installed package names (top-level of each install root)
     /// whose transitive tree contains this blocked package. Sorted.
     pub origins: Vec<String>,
@@ -173,6 +177,7 @@ pub fn aggregate_with_manifest_and_trust(
                         phases_present: blocked.phases_present.clone(),
                         binding_drift,
                         static_tier: row_tier,
+                        reach: blocked.reach.clone(),
                         origins: Vec::new(),
                     },
                     Vec::new(),
@@ -192,6 +197,10 @@ pub fn aggregate_with_manifest_and_trust(
             // tier to the strictest — conservative for the gate at
             // approve-scripts --global --yes.
             row.static_tier = merge_static_tier(row.static_tier, row_tier);
+            row.reach = match (row.reach.take(), blocked.reach.as_ref()) {
+                (Some(a), Some(b)) => Some(a.merged(b)),
+                _ => None,
+            };
         }
     }
 
@@ -325,6 +334,7 @@ mod tests {
             // global flow even when the project-scope flow populates
             // them.
             static_tier: None,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -531,6 +541,7 @@ mod tests {
     ) -> BlockedPackage {
         let mut b = blocked(name, version, integ, script);
         b.static_tier = Some(tier);
+        b.reach = Some(lpm_security::reach::ScriptReach::default());
         b
     }
 

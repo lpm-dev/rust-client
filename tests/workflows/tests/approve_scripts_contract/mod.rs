@@ -532,3 +532,96 @@ fn review_diff_finds_a_prior_artifact_in_multiple_virtual_store_contexts() {
     );
     assert!(stdout.contains("+echo current"), "{stdout}");
 }
+
+const ONBOARDING_SETUP: &str = "const { run } = await import('../bin/onboard.mjs');\nrun();\n";
+const ONBOARDING_CORE: &str = "import { spawnSync } from 'node:child_process';\n\
+import { writeFileSync } from 'node:fs';\n\
+export function run() {\n\
+  writeFileSync(process.env.PROFILE, 'allowBuilds:\\n  onboarding-kit: true\\n');\n\
+  spawnSync('pnpm', ['install'], { cwd: process.env.PROFILE });\n\
+}\n";
+
+/// A dependency whose green-looking postinstall imports a module that
+/// writes pnpm `allowBuilds` and reruns `pnpm install`.
+async fn onboarding_project() -> (TempProject, MockRegistry) {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            json!({"name":"onboarding-kit","version":"2.37.0","scripts":{"postinstall":"node scripts/setup.mjs"}}),
+            &[
+                ("scripts/setup.mjs", ONBOARDING_SETUP.as_bytes()),
+                ("bin/onboard.mjs", ONBOARDING_CORE.as_bytes()),
+            ],
+        )
+        .await;
+    let project = TempProject::empty(
+        &json!({"name":"host","version":"1.0.0","dependencies":{"onboarding-kit":"2.37.0"}})
+            .to_string(),
+    );
+    let output = lpm_with_registry(&project, &registry.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--json",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (project, registry)
+}
+
+#[tokio::test]
+async fn approval_listing_reports_imported_code_that_edits_other_packages_script_approvals() {
+    let (project, registry) = onboarding_project().await;
+    let listing = lpm_with_registry(&project, &registry.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["approve-scripts", "--list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let report: Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(report["schema_version"], 4);
+    let row = &report["blocked"][0];
+    assert_eq!(row["name"], "onboarding-kit");
+    assert_eq!(
+        row["static_tier"], "green",
+        "the delegate shape alone looks green"
+    );
+    assert_eq!(row["reach"]["requires_individual_review"], true);
+    insta::assert_json_snapshot!(
+        "approval_listing_reach_for_code_that_edits_script_approvals",
+        row["reach"]
+    );
+}
+
+#[tokio::test]
+async fn bulk_approval_refuses_green_package_whose_code_edits_script_approvals() {
+    let (project, registry) = onboarding_project().await;
+    let manifest_before = project.read_file("package.json");
+    let output = lpm_with_registry(&project, &registry.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["approve-scripts", "--yes", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--yes refuses"), "{stdout}");
+    assert!(
+        stdout.contains("onboarding-kit@2.37.0  [green, reaches beyond its own package]"),
+        "{stdout}"
+    );
+    assert_eq!(project.read_file("package.json"), manifest_before);
+}

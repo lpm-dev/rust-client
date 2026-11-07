@@ -889,6 +889,20 @@ pub fn blocked_to_json_with_artifact_provenance(
     blocked_to_json_with_provenance_status(blocked, trusted, status)
 }
 
+/// `null` for rows captured before the reach scan existed; otherwise the
+/// findings, whether the scan was cut short, and whether the package
+/// must be approved on its own.
+pub(crate) fn reach_to_json(reach: Option<&lpm_security::reach::ScriptReach>) -> serde_json::Value {
+    match reach {
+        None => serde_json::Value::Null,
+        Some(reach) => serde_json::json!({
+            "findings": reach.findings,
+            "incomplete": reach.incomplete,
+            "requires_individual_review": reach.requires_individual_review(),
+        }),
+    }
+}
+
 fn blocked_to_json_with_provenance_status(
     blocked: &crate::build_state::BlockedPackage,
     trusted: &lpm_workspace::TrustedDependencies,
@@ -909,6 +923,7 @@ fn blocked_to_json_with_provenance_status(
         "phases_present": blocked.phases_present,
         "binding_drift": blocked.binding_drift,
         "static_tier": blocked.static_tier,
+        "reach": reach_to_json(blocked.reach.as_ref()),
         "version_diff": version_diff,
     });
     if let Some(status) = provenance_status {
@@ -943,6 +958,7 @@ mod tests {
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
             static_tier: None,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -1919,6 +1935,7 @@ mod tests {
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
             static_tier: Some(lpm_security::triage::StaticTier::Green),
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,

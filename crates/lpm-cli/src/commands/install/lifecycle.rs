@@ -933,6 +933,11 @@ pub(super) fn collect_amber_requests_from_materializations(
         {
             continue;
         }
+        // Code that reaches other packages' script approvals is a human
+        // decision; a model reading untrusted text must not make it.
+        if lpm_security::reach::analyze(pkg_dir, &bodies).requires_individual_review() {
+            continue;
+        }
         let amber_phases: Vec<(String, String)> = bodies
             .into_iter()
             .filter(|(_, body)| {

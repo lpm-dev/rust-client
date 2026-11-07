@@ -265,6 +265,8 @@ pub(super) fn print_global_list(
                     "script_hash": r.script_hash,
                     "phases_present": r.phases_present,
                     "binding_drift": r.binding_drift,
+                    "static_tier": r.static_tier,
+                    "reach": crate::version_diff::reach_to_json(r.reach.as_ref()),
                     "origins": r.origins,
                 })
             })
@@ -329,10 +331,11 @@ pub(super) fn print_global_list(
                 println!(
                     "{}",
                     install_ui::terminal_line!(
-                        "    {} @ {}{}",
+                        "    {} @ {}{}{}",
                         &r.name,
                         install_ui::dim(&r.version),
                         drift,
+                        super::display::reach_marker(r.reach.as_ref()),
                     )
                 );
             }
@@ -348,13 +351,15 @@ pub(super) fn print_global_list(
             println!(
                 "{}",
                 install_ui::terminal_line!(
-                    "  {} @ {} — used by {}{}",
+                    "  {} @ {} — used by {}{}{}",
                     install_ui::bold(&r.name),
                     install_ui::dim(&r.version),
                     r.origins.join(", "),
                     drift,
+                    super::display::reach_marker(r.reach.as_ref()),
                 )
             );
+            super::display::print_reach_lines(r.reach.as_ref());
         }
     }
     if !aggregate.unreadable_origins.is_empty() {

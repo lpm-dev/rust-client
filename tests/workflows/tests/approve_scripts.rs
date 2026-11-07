@@ -772,6 +772,7 @@ fn write_blocked_build_state_with_drift(
                     "phases_present": ["postinstall"],
                     "binding_drift": false,
                     "static_tier": "green",
+                    "reach": {{}},
                     {tags_block}
                     "published_at": "2026-04-22T00:00:00Z"
                 }}
@@ -920,7 +921,7 @@ fn approve_scripts_list_json_emits_structured_version_diff_on_script_hash_drift(
     });
 
     assert_eq!(parsed["success"].as_bool(), Some(true));
-    assert_eq!(parsed["schema_version"].as_u64(), Some(3));
+    assert_eq!(parsed["schema_version"].as_u64(), Some(4));
     let blocked = parsed["blocked"]
         .as_array()
         .expect("blocked must be an array");
@@ -1155,6 +1156,7 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
                 "phases_present": ["postinstall"],
                 "binding_drift": false,
                 "static_tier": "green",
+                "reach": {},
                 "published_at": "2026-04-22T00:00:00Z"
             })
         })
@@ -1375,7 +1377,7 @@ fn approve_scripts_list_json_emits_exactly_one_valid_json_payload_on_stdout() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
         .unwrap_or_else(|e| panic!("stdout must be valid JSON: {e}\nstdout:\n{stdout_clean}"));
     assert_eq!(parsed["success"].as_bool(), Some(true));
-    assert_eq!(parsed["schema_version"].as_u64(), Some(3));
+    assert_eq!(parsed["schema_version"].as_u64(), Some(4));
     assert!(
         !stdout_clean.contains("WARN"),
         "stdout must NOT contain WARN; stdout:\n{stdout_clean}"

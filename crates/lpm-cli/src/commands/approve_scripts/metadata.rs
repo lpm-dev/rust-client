@@ -317,4 +317,9 @@ fn snapshot_status_for_binding(
 ///   drifted" so agents can distinguish that from "no prior to
 ///   compare." Pre-v3 readers ignore the new field; v3+ readers
 ///   branch on `schema_version >= 3` to know when to expect it.
-pub const SCHEMA_VERSION: u32 = 3;
+/// - **v4**: adds `reach` on each blocked entry, project and global:
+///   `null` when the persisted state predates the scan, otherwise
+///   `{findings, incomplete, requires_individual_review}` (see
+///   [`crate::version_diff::reach_to_json`]). Global entries also gain
+///   `static_tier`.
+pub const SCHEMA_VERSION: u32 = 4;

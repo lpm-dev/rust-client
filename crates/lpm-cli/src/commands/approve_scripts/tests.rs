@@ -417,6 +417,7 @@ fn make_blocked(name: &str, version: &str) -> BlockedPackage {
         // fields default to None for these approve-scripts
         // tests; dedicated tier-aware tests land in+.
         static_tier: None,
+        reach: None,
         provenance_at_capture: None,
         published_at: None,
         behavioral_tags_hash: None,
@@ -434,6 +435,7 @@ fn make_blocked_tiered(
 ) -> BlockedPackage {
     let mut b = make_blocked(name, version);
     b.static_tier = Some(tier);
+    b.reach = Some(lpm_security::reach::ScriptReach::default());
     b
 }
 
@@ -443,6 +445,9 @@ fn write_state(project_dir: &Path, blocked: Vec<BlockedPackage>) {
         .map(|mut package| {
             if package.static_tier.is_none() {
                 package.static_tier = Some(lpm_security::triage::StaticTier::Green);
+            }
+            if package.reach.is_none() {
+                package.reach = Some(lpm_security::reach::ScriptReach::default());
             }
             package
         })
@@ -1203,6 +1208,7 @@ fn agg_row_tiered(
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
         static_tier: Some(tier),
+        reach: Some(lpm_security::reach::ScriptReach::default()),
         origins: vec!["origin-pkg".into()],
     }
 }
@@ -1216,6 +1222,7 @@ fn agg_row_no_tier(name: &str, version: &str) -> crate::global_blocked_set::Aggr
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
         static_tier: None,
+        reach: None,
         origins: vec!["origin-pkg".into()],
     }
 }
@@ -1230,6 +1237,82 @@ fn yes_gate_global_allows_all_green_aggregate() {
     assert!(
         enforce_tiered_yes_gate(&rows, GateScope::Global).is_ok(),
         "all-green aggregate must pass the global gate"
+    );
+}
+
+fn reach_with(
+    findings: Vec<lpm_security::reach::ReachFinding>,
+) -> lpm_security::reach::ScriptReach {
+    lpm_security::reach::ScriptReach {
+        findings,
+        incomplete: false,
+    }
+}
+
+#[test]
+fn yes_gate_refuses_green_package_whose_code_edits_script_approvals() {
+    use lpm_security::reach::ReachFinding;
+    use lpm_security::triage::StaticTier;
+    let mut onboarding = make_blocked_tiered("onboarding", "2.37.0", StaticTier::Green);
+    onboarding.reach = Some(reach_with(vec![ReachFinding::EditsScriptApprovals {
+        key: "allowBuilds".into(),
+        file: "bin/onboard-core.mjs".into(),
+    }]));
+    let blocked = vec![
+        make_blocked_tiered("plain", "1.0.0", StaticTier::Green),
+        onboarding,
+    ];
+    let message = enforce_tiered_yes_gate(&blocked, GateScope::Project)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("--yes refuses"), "{message}");
+    assert!(
+        message.contains("onboarding@2.37.0  [green, reaches beyond its own package]"),
+        "{message}"
+    );
+    assert!(!message.contains("plain@1.0.0"), "{message}");
+}
+
+#[test]
+fn yes_gate_refuses_green_package_captured_before_the_reach_scan() {
+    use lpm_security::triage::StaticTier;
+    let mut legacy = make_blocked_tiered("legacy", "1.0.0", StaticTier::Green);
+    legacy.reach = None;
+    let message = enforce_tiered_yes_gate(&[legacy], GateScope::Project)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("legacy@1.0.0  [green, reach not analyzed]"),
+        "{message}"
+    );
+}
+
+#[test]
+fn yes_gate_allows_green_package_that_only_starts_a_package_manager() {
+    use lpm_security::reach::ReachFinding;
+    use lpm_security::triage::StaticTier;
+    let mut fallback = make_blocked_tiered("native", "1.0.0", StaticTier::Green);
+    fallback.reach = Some(reach_with(vec![ReachFinding::StartsPackageManager {
+        manager: "npm".into(),
+        file: "build.js".into(),
+    }]));
+    assert!(enforce_tiered_yes_gate(&[fallback], GateScope::Project).is_ok());
+}
+
+#[test]
+fn yes_gate_global_refuses_green_row_with_incomplete_reach_scan() {
+    use lpm_security::triage::StaticTier;
+    let mut row = agg_row_tiered("bundle", "1.0.0", StaticTier::Green);
+    row.reach = Some(lpm_security::reach::ScriptReach {
+        findings: Vec::new(),
+        incomplete: true,
+    });
+    let message = enforce_tiered_yes_gate(&[row], GateScope::Global)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("bundle@1.0.0  [green, reaches beyond its own package]"),
+        "{message}"
     );
 }
 
@@ -2263,6 +2346,7 @@ fn row(name: &str, version: &str, origins: &[&str]) -> AggregateBlockedRow {
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
         static_tier: Some(lpm_security::triage::StaticTier::Green),
+        reach: Some(lpm_security::reach::ScriptReach::default()),
         origins: origins.iter().map(|s| (*s).to_string()).collect(),
     }
 }
@@ -2294,6 +2378,7 @@ fn seed_global_manifest_with_blocked(
             phases_present: row.phases_present,
             binding_drift: row.binding_drift,
             static_tier: row.static_tier,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -2856,6 +2941,7 @@ fn capability_widening_row_stays_in_effective_blocked_set() {
             phases_present: vec!["postinstall".into()],
             binding_drift: true, // capture wrote this with drift flag
             static_tier: None,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -2913,6 +2999,7 @@ fn baseline_request_drops_strict_matched_row() {
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
             static_tier: None,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
