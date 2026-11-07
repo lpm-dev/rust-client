@@ -100,11 +100,13 @@ pub(super) fn execute_script(
 /// Settings that keep a package manager started by a dependency's
 /// lifecycle script from running the lifecycle scripts of whatever it
 /// installs, so approving one package's script never approves others.
-/// Each also outranks that manager's own approval lists
+/// npm's and pnpm's settings also outrank their approval lists
 /// (`allowScripts`, `allowBuilds`, `dangerously-allow-all-*`).
 ///
-/// pnpm 11 reads only its own `pnpm_config_` prefix. bun has no
-/// environment switch; the static gate flags `bun install` instead.
+/// pnpm 11 reads only its own `pnpm_config_` prefix. Yarn 2+ still
+/// builds a dependency its project marks `dependenciesMeta.<name>.built`,
+/// and bun has no environment switch; the static gate and the reach scan
+/// cover those.
 const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
     ("npm_config_ignore_scripts", "true"),
     ("pnpm_config_ignore_scripts", "true"),

@@ -837,7 +837,7 @@ impl NestedManager {
                         .any(|arg| is_remote_module_specifier(arg))
             }
             Self::Yarn => match positionals.as_slice() {
-                [] => at_command_position,
+                [] => at_command_position && !args.iter().any(|arg| is_query_flag(arg)),
                 ["workspace", _, subcommand, ..] => YARN_INSTALL_VERBS.contains(subcommand),
                 _ => subcommand_in(YARN_INSTALL_VERBS) || runs_initializer,
             },
@@ -864,6 +864,12 @@ fn runner_fetches_explicitly(args: &[&str]) -> bool {
 /// `file:` specs name a download target instead of a local binary.
 fn is_explicit_package_spec(spec: &str) -> bool {
     spec.get(1..).is_some_and(|rest| rest.contains('@')) || spec.contains(':')
+}
+
+/// `--version` / `--help` answer and exit instead of running the
+/// command's default action (a bare `yarn` installs).
+fn is_query_flag(arg: &str) -> bool {
+    matches!(arg, "--version" | "-v" | "-V" | "--help" | "-h")
 }
 
 fn is_remote_module_specifier(arg: &str) -> bool {
@@ -2469,6 +2475,18 @@ mod tests {
             body = format!("sh -c {}", shlex::try_quote(&body).unwrap());
         }
         assert_eq!(tier(&body), StaticTier::Red);
+    }
+
+    #[test]
+    fn amber_yarn_version_and_help_queries() {
+        for body in [
+            "yarn --version",
+            "yarn -v",
+            "yarn --help",
+            "corepack yarn --version",
+        ] {
+            assert_eq!(tier(body), StaticTier::Amber, "{body}");
+        }
     }
 
     #[test]
