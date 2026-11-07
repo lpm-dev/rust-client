@@ -629,17 +629,22 @@ pub async fn run_workspace(
             }
         } else {
             // Multiple packages in this level run in parallel, at most
-            // `workspace_concurrency` at once. Each member takes a slot as one
-            // frees up, so a slow member never holds idle slots the way a
-            // batch waiting for its slowest member would.
+            // `workspace_concurrency` at once. Members take slots in workspace
+            // order as slots free up, so a slow member never holds idle slots
+            // the way a batch waiting for its slowest member would.
             let slots = MemberSlots::new(workspace_concurrency);
+            // An error, such as a denied environment, stops members that
+            // haven't started, even with `--no-bail`.
+            let stopped = AtomicBool::new(false);
             {
                 std::thread::scope(|scope| -> Result<(), LpmError> {
                     let slots = &slots;
                     let failed_flag = &failed_flag;
+                    let stopped = &stopped;
                     let handles: Vec<_> = level_targets
                     .iter()
-                    .map(|&idx| -> Result<_, LpmError> {
+                    .enumerate()
+                    .map(|(turn, &idx)| -> Result<_, LpmError> {
                         let member_dir = ws_graph.members[idx].path.clone();
                         let member_name = ws_graph.members[idx].name.clone();
                         let args_owned: Vec<String> = extra_args.to_vec();
@@ -669,11 +674,13 @@ pub async fn run_workspace(
 
                         let worker_env_access = env_access.clone();
                         Ok((idx, scope.spawn(move || -> Result<_, LpmError> {
-                            let _slot = slots.acquire();
-                            if !continue_on_error && failed_flag.load(Ordering::Relaxed) {
+                            let _slot = slots.acquire(turn);
+                            if stopped.load(Ordering::Acquire)
+                                || (!continue_on_error && failed_flag.load(Ordering::Relaxed))
+                            {
                                 return Ok(None);
                             }
-                            worker_env_access.run(|| {
+                            let outcome = worker_env_access.run(|| {
                             let report = run_workspace_package(
                                 &member_dir,
                                 workspace_contract.as_ref(),
@@ -700,7 +707,11 @@ pub async fn run_workspace(
                                 None
                             };
                             Ok(Some((report, identities)))
-                            })
+                            });
+                            if outcome.is_err() {
+                                stopped.store(true, Ordering::Release);
+                            }
+                            outcome
                         })))
                     })
                     .collect::<Result<_, _>>()?;
@@ -890,32 +901,44 @@ fn run_workspace_package(
     }
 }
 
-/// Counts the workspace members that may run at once.
+/// The slots of workspace members that may run at once, handed out in
+/// workspace order: a member's turn comes only after every earlier member
+/// has started.
 struct MemberSlots {
-    free: std::sync::Mutex<usize>,
-    freed: std::sync::Condvar,
+    state: std::sync::Mutex<SlotState>,
+    changed: std::sync::Condvar,
+}
+
+struct SlotState {
+    free: usize,
+    next_turn: usize,
 }
 
 impl MemberSlots {
     fn new(count: usize) -> Self {
         Self {
-            free: std::sync::Mutex::new(count.max(1)),
-            freed: std::sync::Condvar::new(),
+            state: std::sync::Mutex::new(SlotState {
+                free: count.max(1),
+                next_turn: 0,
+            }),
+            changed: std::sync::Condvar::new(),
         }
     }
 
-    fn acquire(&self) -> MemberSlot<'_> {
-        let mut free = self
-            .free
+    fn acquire(&self, turn: usize) -> MemberSlot<'_> {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *free == 0 {
-            free = self
-                .freed
-                .wait(free)
+        while state.free == 0 || state.next_turn != turn {
+            state = self
+                .changed
+                .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        *free -= 1;
+        state.free -= 1;
+        state.next_turn += 1;
+        self.changed.notify_all();
         MemberSlot(self)
     }
 }
@@ -924,12 +947,12 @@ struct MemberSlot<'a>(&'a MemberSlots);
 
 impl Drop for MemberSlot<'_> {
     fn drop(&mut self) {
-        *self
-            .0
-            .free
+        self.0
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-        self.0.freed.notify_one();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .free += 1;
+        self.0.changed.notify_all();
     }
 }
 
@@ -943,15 +966,10 @@ mod tests {
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let finished = std::sync::Mutex::new(Vec::new());
-        let (slow_started_tx, slow_started_rx) = std::sync::mpsc::channel();
-
-        let member = |name: &'static str, millis: u64| {
-            let _slot = slots.acquire();
+        let member = |name: &'static str, turn: usize, millis: u64| {
+            let _slot = slots.acquire(turn);
             let now = running.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
-            if name == "slow" {
-                slow_started_tx.send(()).unwrap();
-            }
             std::thread::sleep(std::time::Duration::from_millis(millis));
             running.fetch_sub(1, Ordering::SeqCst);
             finished.lock().unwrap().push(name);
@@ -959,15 +977,33 @@ mod tests {
         let member = &member;
 
         std::thread::scope(|scope| {
-            scope.spawn(move || member("slow", 400));
-            slow_started_rx.recv().unwrap();
-            for name in ["a", "b", "c"] {
-                scope.spawn(move || member(name, 20));
+            scope.spawn(move || member("slow", 0, 400));
+            for (turn, name) in ["a", "b", "c"].into_iter().enumerate() {
+                scope.spawn(move || member(name, turn + 1, 20));
             }
         });
 
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         assert_eq!(finished.lock().unwrap().last(), Some(&"slow"));
+    }
+
+    #[test]
+    fn member_slots_start_members_in_workspace_order() {
+        let slots = MemberSlots::new(1);
+        let started = std::sync::Mutex::new(Vec::new());
+        let member = |turn: usize| {
+            let _slot = slots.acquire(turn);
+            started.lock().unwrap().push(turn);
+        };
+        let member = &member;
+
+        std::thread::scope(|scope| {
+            for turn in [3, 1, 2, 0] {
+                scope.spawn(move || member(turn));
+            }
+        });
+
+        assert_eq!(*started.lock().unwrap(), vec![0, 1, 2, 3]);
     }
 
     #[test]
