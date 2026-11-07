@@ -627,8 +627,17 @@ const VALUE_FLAGS: &[&str] = &[
     "--lock",
 ];
 
+/// How [`positional_args`] reads a flag it doesn't know.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnknownFlags {
+    /// As a boolean switch.
+    TakeNoValue,
+    /// As taking the next token as its value (`npm --omit dev install`).
+    TakeAValue,
+}
+
 /// Positional arguments up to `--`, skipping flags and flag values.
-fn positional_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+fn positional_args<'a>(args: &[&'a str], unknown: UnknownFlags) -> Vec<&'a str> {
     let mut positionals = Vec::new();
     let mut skip_value = false;
     for &arg in args {
@@ -639,7 +648,8 @@ fn positional_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
             break;
         }
         if arg.starts_with('-') {
-            skip_value = VALUE_FLAGS.contains(&arg);
+            skip_value = VALUE_FLAGS.contains(&arg)
+                || (unknown == UnknownFlags::TakeAValue && !arg.contains('='));
             continue;
         }
         positionals.push(arg);
@@ -672,7 +682,20 @@ fn is_command_position(tokens: &[String], index: usize) -> bool {
         || is_environment_assignment(previous)
         || matches!(
             command_name(previous).as_str(),
-            "env" | "exec" | "command" | "corepack" | "sudo" | "time" | "nice" | "nohup" | "xargs"
+            "env"
+                | "exec"
+                | "command"
+                | "corepack"
+                | "sudo"
+                | "time"
+                | "nice"
+                | "nohup"
+                | "xargs"
+                | "npx"
+                | "bunx"
+                | "pnpx"
+                | "dlx"
+                | "x"
         )
 }
 
@@ -766,9 +789,9 @@ const YARN_INSTALL_VERBS: &[&str] = &[
     "install", "add", "up", "upgrade", "dlx", "rebuild", "link", "import", "global",
 ];
 
-const BUN_INSTALL_VERBS: &[&str] = &["install", "i", "add", "a", "update", "link"];
+const BUN_INSTALL_VERBS: &[&str] = &["install", "i", "add", "a", "update", "link", "ci"];
 
-const DENO_INSTALL_VERBS: &[&str] = &["install", "i", "add", "cache"];
+const DENO_INSTALL_VERBS: &[&str] = &["install", "i", "add", "cache", "ci", "approve-scripts"];
 
 const LPM_INSTALL_VERBS: &[&str] = &[
     "install",
@@ -803,9 +826,21 @@ impl NestedManager {
     }
 
     /// `args` are every token after the command up to the next compound
-    /// operator.
+    /// operator. A flag LPM doesn't know may or may not take a value, so
+    /// both readings are checked.
     fn reaches_other_packages(&self, args: &[&str], at_command_position: bool) -> bool {
-        let positionals = positional_args(args);
+        self.reaches_with(
+            args,
+            &positional_args(args, UnknownFlags::TakeNoValue),
+            at_command_position,
+        ) || self.reaches_with(
+            args,
+            &positional_args(args, UnknownFlags::TakeAValue),
+            false,
+        )
+    }
+
+    fn reaches_with(&self, args: &[&str], positionals: &[&str], at_command_position: bool) -> bool {
         let subcommand = positionals.first().copied();
         let subcommand_in = |verbs: &[&str]| subcommand.is_some_and(|s| verbs.contains(&s));
         let runs_initializer = subcommand_in(INITIALIZER_VERBS) && positionals.len() > 1;
@@ -827,18 +862,22 @@ impl NestedManager {
             Self::Bun => {
                 subcommand_in(BUN_INSTALL_VERBS)
                     || runs_initializer
-                    || matches!(positionals.as_slice(), ["pm", "trust", ..])
+                    || matches!(positionals, ["pm", "trust", ..])
                     || (subcommand == Some("x") && runner_fetches_explicitly(runner_args()))
             }
             Self::Deno => {
                 subcommand_in(DENO_INSTALL_VERBS)
+                    || (subcommand == Some("x") && runner_fetches_explicitly(runner_args()))
                     || positionals
                         .iter()
                         .any(|arg| is_remote_module_specifier(arg))
             }
-            Self::Yarn => match positionals.as_slice() {
+            Self::Yarn => match positionals {
                 [] => at_command_position && !args.iter().any(|arg| is_query_flag(arg)),
                 ["workspace", _, subcommand, ..] => YARN_INSTALL_VERBS.contains(subcommand),
+                ["workspaces", "foreach", rest @ ..] => {
+                    rest.iter().any(|arg| YARN_INSTALL_VERBS.contains(arg))
+                }
                 _ => subcommand_in(YARN_INSTALL_VERBS) || runs_initializer,
             },
         }
@@ -853,7 +892,7 @@ fn runner_fetches_explicitly(args: &[&str]) -> bool {
     let requests_download = args.iter().take_while(|arg| **arg != "--").any(|arg| {
         matches!(*arg, "-y" | "--yes" | "-p" | "--package") || arg.starts_with("--package=")
     });
-    let spec = positional_args(args)
+    let spec = positional_args(args, UnknownFlags::TakeNoValue)
         .first()
         .copied()
         .or_else(|| args.iter().skip_while(|arg| **arg != "--").nth(1).copied());
@@ -886,7 +925,75 @@ fn is_remote_module_specifier(arg: &str) -> bool {
 fn has_script_policy_override(tokens: &[String]) -> bool {
     tokens.iter().any(|token| {
         let token = token.to_ascii_lowercase();
-        is_script_approval_flag(&token) || is_script_policy_assignment(&token)
+        is_script_approval_flag(&token)
+            || is_script_policy_assignment(&token)
+            || is_powershell_guard_reference(&token)
+    }) || removes_script_guard(tokens)
+}
+
+/// Variables LPM sets to keep nested installs from running scripts.
+const SCRIPT_GUARD_VARIABLES: &[&str] = &[
+    "npm_config_ignore_scripts",
+    "pnpm_config_ignore_scripts",
+    "yarn_enable_scripts",
+    "yarn_ignore_scripts",
+];
+
+fn is_script_guard_variable(name: &str) -> bool {
+    SCRIPT_GUARD_VARIABLES
+        .iter()
+        .any(|guard| name.eq_ignore_ascii_case(guard))
+}
+
+/// `$env:npm_config_ignore_scripts = …` / `Remove-Item Env:…` inside a
+/// PowerShell command string.
+fn is_powershell_guard_reference(token: &str) -> bool {
+    ["$env:", "env:"].iter().any(|prefix| {
+        token.strip_prefix(prefix).is_some_and(|rest| {
+            SCRIPT_GUARD_VARIABLES
+                .iter()
+                .any(|guard| rest.starts_with(guard))
+        })
+    })
+}
+
+/// `unset npm_config_ignore_scripts`, `env -u npm_config_ignore_scripts …`
+/// and `env -i …` drop the guard as surely as setting it to `false`.
+fn removes_script_guard(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        let mut args = tokens[index + 1..]
+            .iter()
+            .map(String::as_str)
+            .take_while(|arg| !is_compound_op(arg));
+        match command_name(token).as_str() {
+            "unset" => args.any(is_script_guard_variable),
+            "env" => {
+                while let Some(arg) = args.next() {
+                    match arg {
+                        "-i" | "--ignore-environment" | "-" => return true,
+                        "-u" | "--unset" => {
+                            if args.next().is_some_and(is_script_guard_variable) {
+                                return true;
+                            }
+                        }
+                        _ if arg.starts_with("--unset=") => {
+                            if is_script_guard_variable(&arg["--unset=".len()..]) {
+                                return true;
+                            }
+                        }
+                        _ if arg.starts_with("-u") => {
+                            if is_script_guard_variable(&arg[2..]) {
+                                return true;
+                            }
+                        }
+                        _ if arg.starts_with('-') || is_environment_assignment(arg) => {}
+                        _ => return false,
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     })
 }
 
@@ -934,42 +1041,141 @@ fn is_truthy(value: &str) -> bool {
 /// Shell nesting beyond this depth is treated as obfuscation.
 const MAX_SHELL_COMMAND_DEPTH: usize = 4;
 
-/// `sh -c '<body>'` / `bash -lc '<body>'` / `cmd /c "<body>"`: the body
-/// is a single token to the outer tokenizer, so a red command inside it
-/// would otherwise read as an opaque argument.
+/// `sh -c '<body>'`, `bash -o pipefail -c '<body>'`, `cmd /c "<body>"`,
+/// `pwsh -Command '<body>'` and `npx -c '<body>'`: the body is a single
+/// token to the outer tokenizer, so a red command inside it would
+/// otherwise read as an opaque argument. An encoded PowerShell command
+/// cannot be read at all and is red on its own.
 fn has_red_shell_command_string(tokens: &[String], depth: usize) -> bool {
-    const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish"];
-    for (index, token) in tokens.iter().enumerate() {
-        let shell = command_name(token);
-        let is_cmd = shell == "cmd";
-        if !is_cmd && !POSIX_SHELLS.contains(&shell.as_str()) {
-            continue;
+    tokens.iter().enumerate().any(|(index, token)| {
+        let args: Vec<&str> = tokens[index + 1..]
+            .iter()
+            .map(String::as_str)
+            .take_while(|arg| !is_compound_op(arg))
+            .collect();
+        match command_string(&command_name(token), &args) {
+            Some(CommandString::Body(body)) => {
+                depth >= MAX_SHELL_COMMAND_DEPTH || script_is_red(body, depth + 1)
+            }
+            Some(CommandString::Encoded) => true,
+            None => false,
         }
-        let mut rest = tokens[index + 1..].iter();
-        let body = loop {
-            let Some(arg) = rest.next() else {
-                break None;
-            };
-            let opens_command = if is_cmd {
-                arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k")
-            } else {
-                arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')
-            };
-            if opens_command {
-                break rest.next();
+    })
+}
+
+enum CommandString<'a> {
+    Body(&'a str),
+    Encoded,
+}
+
+/// The command string `command args…` is told to execute, if any.
+fn command_string<'a>(command: &str, args: &[&'a str]) -> Option<CommandString<'a>> {
+    const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish"];
+    match command {
+        shell if POSIX_SHELLS.contains(&shell) => {
+            posix_command_string(args).map(CommandString::Body)
+        }
+        "cmd" => {
+            let index = args
+                .iter()
+                .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))?;
+            args.get(index + 1).copied().map(CommandString::Body)
+        }
+        "pwsh" | "powershell" => powershell_command_string(args),
+        "npx" | "npx-cli.js" => runner_call_body(args).map(CommandString::Body),
+        "npm" | "npm-cli.js"
+            if matches!(
+                positional_args(args, UnknownFlags::TakeNoValue).first(),
+                Some(&("exec" | "x"))
+            ) =>
+        {
+            runner_call_body(args).map(CommandString::Body)
+        }
+        _ => None,
+    }
+}
+
+/// The `-c` body of a POSIX shell, after any other options (`-e`, `-o
+/// pipefail`, `--login`) and an optional `--` that follows `-c`.
+fn posix_command_string<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => return None,
+            "-o" | "+o" | "-O" | "+O" => {
+                args.next();
             }
-            if !arg.starts_with('-') && !arg.starts_with('/') {
-                break None;
+            _ if arg.starts_with("--") || arg.starts_with('+') => {}
+            _ if arg.starts_with('-') => {
+                if arg.contains('c') {
+                    let body = args.next()?;
+                    return if body == "--" {
+                        args.next()
+                    } else {
+                        Some(body)
+                    };
+                }
             }
-        };
-        let Some(body) = body else {
-            continue;
-        };
-        if depth >= MAX_SHELL_COMMAND_DEPTH || script_is_red(body, depth + 1) {
-            return true;
+            _ => return None,
         }
     }
-    false
+    None
+}
+
+/// The command string of `pwsh` / `powershell`: the value of `-Command`
+/// (or any prefix of it, `-c` included), or the first non-option argument,
+/// which Windows PowerShell runs as a command. `-EncodedCommand` (`-e`,
+/// `-ec`, `-enc`, …) is reported as encoded; `-File` runs a file.
+fn powershell_command_string<'a>(args: &[&'a str]) -> Option<CommandString<'a>> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "executionpolicy",
+        "ep",
+        "ex",
+        "workingdirectory",
+        "wd",
+        "configurationname",
+        "cnf",
+        "inputformat",
+        "if",
+        "outputformat",
+        "of",
+        "settingsfile",
+    ];
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let Some(option) = arg.strip_prefix('-').or_else(|| arg.strip_prefix('/')) else {
+            return Some(CommandString::Body(arg));
+        };
+        let option = option.to_ascii_lowercase();
+        let abbreviates = |full: &str| !option.is_empty() && full.starts_with(option.as_str());
+        if abbreviates("encodedcommand") || option == "ec" {
+            return Some(CommandString::Encoded);
+        }
+        if abbreviates("command") || abbreviates("commandwithargs") || option == "cwa" {
+            return args.next().map(CommandString::Body);
+        }
+        if abbreviates("file") {
+            return None;
+        }
+        if VALUE_OPTIONS.contains(&option.as_str()) {
+            args.next();
+        }
+    }
+    None
+}
+
+/// The `-c` / `--call` body an `npx` / `npm exec` runner executes.
+fn runner_call_body<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut args = args.iter().copied().take_while(|arg| *arg != "--");
+    while let Some(arg) = args.next() {
+        if let Some(body) = arg.strip_prefix("--call=") {
+            return Some(body);
+        }
+        if matches!(arg, "-c" | "--call") {
+            return args.next();
+        }
+    }
+    None
 }
 
 fn script_is_red(script: &str, depth: usize) -> bool {
@@ -2475,6 +2681,86 @@ mod tests {
             body = format!("sh -c {}", shlex::try_quote(&body).unwrap());
         }
         assert_eq!(tier(&body), StaticTier::Red);
+    }
+
+    #[test]
+    fn red_bun_and_deno_installs_runners_and_approvals() {
+        for body in [
+            "bun ci",
+            "deno ci",
+            "deno approve-scripts --all",
+            "deno x npm:create-thing",
+            "deno x --allow-all jsr:@scope/tool",
+        ] {
+            assert_eq!(tier(body), StaticTier::Red, "{body}");
+        }
+        assert_eq!(tier("deno x tool"), StaticTier::Amber);
+    }
+
+    #[test]
+    fn red_install_after_a_global_flag_with_an_unlisted_value() {
+        for body in [
+            "npm --omit dev install thing",
+            "bun --env-file .env install",
+            "pnpm --use-node-version 22 add thing",
+        ] {
+            assert_eq!(tier(body), StaticTier::Red, "{body}");
+        }
+        assert_eq!(tier("npm --verbose run build"), StaticTier::Amber);
+        assert_eq!(tier("yarn --verbose build"), StaticTier::Amber);
+    }
+
+    #[test]
+    fn red_command_strings_after_shell_options_and_in_powershell_and_runners() {
+        for body in [
+            "bash -o pipefail -c 'bun add thing'",
+            "sh -c -- 'npm install thing'",
+            "bash --login -c 'pnpm add thing'",
+            "pwsh -c 'npm install thing'",
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"npm install thing\"",
+            "pwsh -EncodedCommand ZQBjAGgAbwA=",
+            "powershell -enc ZQBjAGgAbwA=",
+            "npx -c 'bun install'",
+            "npx --call='npm install thing'",
+            "npm exec -c 'pnpm add thing'",
+        ] {
+            assert_eq!(tier(body), StaticTier::Red, "{body}");
+        }
+        assert_eq!(tier("pwsh -File ./build.ps1"), StaticTier::Amber);
+        assert_eq!(tier("bash -o pipefail ./build.sh"), StaticTier::Amber);
+    }
+
+    #[test]
+    fn red_bare_yarn_behind_a_runner_and_yarn_workspace_foreach_installs() {
+        assert_eq!(tier("npx yarn"), StaticTier::Red);
+        assert_eq!(
+            tier("yarn workspaces foreach -A add thing"),
+            StaticTier::Red
+        );
+        assert_eq!(
+            tier("yarn workspaces foreach -A run build"),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn red_commands_that_remove_the_nested_install_script_guard() {
+        for body in [
+            "unset npm_config_ignore_scripts && node setup.js",
+            "env -u npm_config_ignore_scripts node setup.js",
+            "env --unset=PNPM_CONFIG_IGNORE_SCRIPTS node setup.js",
+            "env -uYARN_ENABLE_SCRIPTS node setup.js",
+            "env -i PATH=/usr/bin node setup.js",
+            "pwsh -c 'Remove-Item Env:npm_config_ignore_scripts; npm i'",
+            "pwsh -c '$env:npm_config_ignore_scripts = \"false\"'",
+        ] {
+            assert_eq!(tier(body), StaticTier::Red, "{body}");
+        }
+        assert_eq!(
+            tier("env NODE_ENV=production node setup.js"),
+            StaticTier::Amber
+        );
+        assert_eq!(tier("unset DEBUG && node setup.js"), StaticTier::Amber);
     }
 
     #[test]

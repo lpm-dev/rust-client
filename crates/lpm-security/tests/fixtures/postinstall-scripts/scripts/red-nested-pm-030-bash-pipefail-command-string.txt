@@ -1,0 +1,1 @@
+bash -o pipefail -c 'bun add thing'
