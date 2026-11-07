@@ -8,12 +8,13 @@
 //! edits a package manager's script-approval list, and manifests that
 //! approve other packages' scripts.
 //!
-//! Every finding except [`ReachFinding::StartsPackageManager`] makes the
-//! package [require individual review](ScriptReach::requires_individual_review):
-//! no bulk approval, no advisor approval, no green-tier auto-run. A
-//! nested npm, pnpm or Yarn install already runs with dependency
-//! scripts disabled, so starting one is shown but does not gate; bun has
-//! no such setting, so a bun install does.
+//! Findings that could widen what runs make the package [require
+//! individual review](ScriptReach::requires_individual_review): no bulk
+//! approval and no advisor approval. A nested npm or pnpm install already
+//! runs with dependency scripts disabled, so starting one is shown but does
+//! not gate. Yarn 2+ still builds dependencies a project marks
+//! `dependenciesMeta.<name>.built`, bun has no such setting, and corepack
+//! can start either, so starting any of those does gate.
 //!
 //! The scan is textual. It cannot see code assembled at runtime, so an
 //! empty result means "nothing recognizable", not "proven safe".
@@ -55,9 +56,6 @@ pub struct ScriptReach {
 pub enum ReachFinding {
     /// The code can start another package manager.
     StartsPackageManager { manager: String, file: String },
-    /// The code runs `bun install` / `bun add` / `bun pm`, which run the
-    /// lifecycle scripts of packages bun trusts.
-    InstallsWithBun { file: String },
     /// The code mentions a setting that turns dependency lifecycle
     /// scripts on or off for a package manager it starts.
     ChangesScriptPolicy { marker: String, file: String },
@@ -69,11 +67,23 @@ pub enum ReachFinding {
         field: String,
         packages: Vec<String>,
     },
+    /// A lifecycle command runs one of the package's own scripts
+    /// (`npm run <script>`) whose command the static gate marks Red.
+    RunsRedScript { script: String, command: String },
 }
+
+/// Package managers whose nested installs can still run dependency
+/// lifecycle scripts under the guard every dependency script gets.
+const UNGUARDED_MANAGERS: &[&str] = &["yarn", "yarnpkg", "bun", "bunx", "corepack"];
 
 impl ReachFinding {
     pub fn requires_individual_review(&self) -> bool {
-        !matches!(self, Self::StartsPackageManager { .. })
+        match self {
+            Self::StartsPackageManager { manager, .. } => {
+                UNGUARDED_MANAGERS.contains(&manager.as_str())
+            }
+            _ => true,
+        }
     }
 }
 
@@ -117,8 +127,13 @@ const DISPLAYED_PACKAGES: usize = 5;
 impl std::fmt::Display for ReachFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StartsPackageManager { manager, file } => write!(f, "starts {manager} ({file})"),
-            Self::InstallsWithBun { file } => write!(f, "installs packages with bun ({file})"),
+            Self::StartsPackageManager { manager, file } => {
+                write!(f, "starts {manager} ({file})")?;
+                if self.requires_individual_review() {
+                    f.write_str(", which can run dependency scripts LPM cannot switch off")?;
+                }
+                Ok(())
+            }
             Self::ChangesScriptPolicy { marker, file } => {
                 write!(
                     f,
@@ -127,6 +142,12 @@ impl std::fmt::Display for ReachFinding {
             }
             Self::EditsScriptApprovals { key, file } => {
                 write!(f, "edits script approvals: {key} ({file})")
+            }
+            Self::RunsRedScript { script, command } => {
+                write!(
+                    f,
+                    "runs its own \"{script}\" script, which the static gate marks Red: {command}"
+                )
             }
             Self::ApprovesOtherPackages { field, packages } => {
                 write!(f, "approves scripts for other packages in {field}: ")?;
@@ -147,7 +168,7 @@ impl ReachFinding {
     fn subject(&self) -> &str {
         match self {
             Self::StartsPackageManager { manager, .. } => manager,
-            Self::InstallsWithBun { .. } => "bun",
+            Self::RunsRedScript { script, .. } => script,
             Self::ChangesScriptPolicy { marker, .. } => marker,
             Self::EditsScriptApprovals { key, .. } => key,
             Self::ApprovesOtherPackages { field, .. } => field,
@@ -177,13 +198,9 @@ pub fn analyze(package_dir: &Path, phase_bodies: &[(String, String)]) -> ScriptR
     let bins = own_bins(&manifest);
     let mut entries = BTreeSet::new();
     for (_, body) in phase_bodies {
-        collect_entry_points(&root, body, scripts, &bins, 0, &mut entries);
+        collect_entry_points(&root, body, scripts, &bins, 0, &mut entries, &mut reach);
     }
-    let main = manifest
-        .get("main")
-        .and_then(Value::as_str)
-        .and_then(normalize_relative_path);
-    scan_files(&root, main.as_deref(), entries, &mut reach);
+    scan_files(&root, entries, &mut reach);
     reach
 }
 
@@ -210,6 +227,7 @@ fn collect_entry_points(
     bins: &[(String, String)],
     depth: usize,
     entries: &mut BTreeSet<PathBuf>,
+    reach: &mut ScriptReach,
 ) {
     if let Some(path) = extract_delegate_path(body).and_then(normalize_relative_path) {
         insert_if_file(root, entries, path);
@@ -233,12 +251,25 @@ fn collect_entry_points(
         {
             insert_if_file(root, entries, path);
         }
-        if depth < MAX_RUN_SCRIPT_DEPTH
-            && let Some(name) = run_script_target(first, rest)
-            && let Some(nested) = scripts.and_then(|s| s.get(name)).and_then(Value::as_str)
-        {
-            collect_entry_points(root, nested, scripts, bins, depth + 1, entries);
+        let Some(name) = run_script_target(first, rest) else {
+            continue;
+        };
+        let Some(nested) = scripts.and_then(|s| s.get(name)).and_then(Value::as_str) else {
+            continue;
+        };
+        if depth == MAX_RUN_SCRIPT_DEPTH {
+            reach.incomplete = true;
+            continue;
         }
+        // The static gate classifies lifecycle phases themselves; a script
+        // they reach through `npm run` would otherwise go unclassified.
+        if crate::static_gate::classify(nested) == crate::triage::StaticTier::Red {
+            reach.record(ReachFinding::RunsRedScript {
+                script: name.to_string(),
+                command: nested.to_string(),
+            });
+        }
+        collect_entry_points(root, nested, scripts, bins, depth + 1, entries, reach);
     }
 }
 
@@ -313,12 +344,7 @@ fn own_bins(manifest: &Map<String, Value>) -> Vec<(String, String)> {
     }
 }
 
-fn scan_files(
-    root: &Path,
-    main: Option<&Path>,
-    entries: BTreeSet<PathBuf>,
-    reach: &mut ScriptReach,
-) {
+fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) {
     let mut queue: VecDeque<PathBuf> = entries.into_iter().collect();
     let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
     let mut files = 0usize;
@@ -335,7 +361,7 @@ fn scan_files(
         let display = path_to_slash_string(&relative);
         scan_bytes(&bytes, &display, reach);
         let base = relative.parent().unwrap_or(Path::new(""));
-        for candidate in local_imports(root, main, &bytes, base, reach) {
+        for candidate in local_imports(root, &bytes, base, reach) {
             if seen.insert(candidate.clone()) {
                 queue.push_back(candidate);
             }
@@ -374,15 +400,10 @@ fn read_contained(
 
 /// Existing package files that relative `require` / `import` specifiers
 /// in `bytes` resolve to, with Node and TypeScript resolution. A
-/// specifier that climbs above the package root marks the scan
-/// incomplete: that code is outside what was reviewed.
-fn local_imports(
-    root: &Path,
-    main: Option<&Path>,
-    bytes: &[u8],
-    base: &Path,
-    reach: &mut ScriptReach,
-) -> Vec<PathBuf> {
+/// specifier that climbs above the package root, or names a directory
+/// whose entry cannot be resolved, marks the scan incomplete: that code
+/// is outside what was reviewed.
+fn local_imports(root: &Path, bytes: &[u8], base: &Path, reach: &mut ScriptReach) -> Vec<PathBuf> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     for regex in import_regexes() {
@@ -399,11 +420,10 @@ fn local_imports(
                 reach.incomplete = true;
                 continue;
             };
-            if let Some(found) = resolve_candidates(path, main)
-                .into_iter()
-                .find(|candidate| root.join(candidate).is_file())
-            {
-                out.push(found);
+            match resolve_import(root, &path, 0) {
+                Some(found) => out.push(found),
+                None if root.join(&path).is_dir() => reach.incomplete = true,
+                None => {}
             }
         }
     }
@@ -430,46 +450,68 @@ fn resolve_within_package(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-fn resolve_candidates(path: PathBuf, main: Option<&Path>) -> Vec<PathBuf> {
-    if path.as_os_str().is_empty() {
-        let mut candidates: Vec<PathBuf> = main.map(Path::to_path_buf).into_iter().collect();
-        if let Some(main) = main {
-            candidates.extend(resolve_candidates(main.to_path_buf(), None));
-        }
-        candidates
-            .extend(["js", "cjs", "mjs", "ts"].map(|ext| PathBuf::from(format!("index.{ext}"))));
-        return candidates;
+/// Directory `main` fields followed per import (`helper/package.json`
+/// pointing at another directory with its own `main`).
+const MAX_MAIN_HOPS: usize = 4;
+
+/// The package file Node loads for a relative import of `path`: the file
+/// itself, the file with an extension added (or a TypeScript source for
+/// an emitted `.js` name), then for a directory its `package.json`
+/// `main`, then its `index` file.
+fn resolve_import(root: &Path, path: &Path, hops: usize) -> Option<PathBuf> {
+    let is_file = |candidate: &Path| root.join(candidate).is_file();
+    let extension = path.extension().and_then(|e| e.to_str());
+    if let Some(ext) = extension.filter(|ext| SCRIPT_EXTENSIONS.contains(ext)) {
+        let swaps: &[&str] = match ext {
+            "js" => &["ts", "tsx"],
+            "mjs" => &["mts"],
+            "cjs" => &["cts"],
+            "jsx" => &["tsx"],
+            _ => &[],
+        };
+        return std::iter::once(path.to_path_buf())
+            .chain(swaps.iter().map(|swap| path.with_extension(swap)))
+            .find(|candidate| is_file(candidate));
     }
-    let extension = path.extension().and_then(|e| e.to_str()).map(str::to_owned);
-    let mut candidates = Vec::with_capacity(12);
-    match extension.as_deref() {
-        Some(ext) if SCRIPT_EXTENSIONS.contains(&ext) => {
-            candidates.push(path.clone());
-            // TypeScript sources import their emitted names.
-            let swaps: &[&str] = match ext {
-                "js" => &["ts", "tsx"],
-                "mjs" => &["mts"],
-                "cjs" => &["cts"],
-                "jsx" => &["tsx"],
-                _ => &[],
-            };
-            for swap in swaps {
-                candidates.push(path.with_extension(swap));
-            }
-        }
-        _ => {
-            for ext in SCRIPT_EXTENSIONS {
-                let mut file = path.clone().into_os_string();
+    if !path.as_os_str().is_empty()
+        && let Some(found) = SCRIPT_EXTENSIONS
+            .iter()
+            .map(|ext| {
+                let mut file = path.as_os_str().to_os_string();
                 file.push(".");
                 file.push(ext);
-                candidates.push(PathBuf::from(file));
-            }
-            for ext in ["js", "cjs", "mjs", "ts"] {
-                candidates.push(path.join(format!("index.{ext}")));
-            }
-        }
+                PathBuf::from(file)
+            })
+            .find(|candidate| is_file(candidate))
+    {
+        return Some(found);
     }
-    candidates
+    if !root.join(path).is_dir() {
+        return None;
+    }
+    if hops < MAX_MAIN_HOPS
+        && let Some(main) = directory_main(root, path)
+        && let Some(found) = resolve_import(root, &main, hops + 1)
+    {
+        return Some(found);
+    }
+    ["js", "cjs", "mjs", "ts"]
+        .iter()
+        .map(|ext| path.join(format!("index.{ext}")))
+        .find(|candidate| is_file(candidate))
+}
+
+/// `main` of the `package.json` in package directory `dir`, as a path
+/// inside the package.
+fn directory_main(root: &Path, dir: &Path) -> Option<PathBuf> {
+    let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
+        &root.join(dir).join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
+    let manifest: Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
+    let main = manifest.get("main")?.as_str()?;
+    resolve_within_package(&dir.join(main)).filter(|main| !main.as_os_str().is_empty())
 }
 
 static SPAWN_API: LazyLock<Regex> = LazyLock::new(|| {
@@ -484,13 +526,6 @@ static PACKAGE_MANAGER_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid package manager regex")
 });
 
-static BUN_INSTALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"['"`]bun\s+(?:install|i|add|a|update|pm)\b|['"`]bun['"`]\s*,\s*\[\s*['"`](?:install|i|add|a|update|pm)['"`]"#,
-    )
-    .expect("valid bun install regex")
-});
-
 static SCRIPT_POLICY_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)ignore[-_]?scripts|enable[-_]?scripts|--allow-scripts|--allow-build|dangerously[-_]?allow[-_]?all[-_]?(?:builds|scripts)",
@@ -499,17 +534,12 @@ static SCRIPT_POLICY_MARKER: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static SCRIPT_APPROVAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"allowBuilds|onlyBuiltDependencies|trustedDependencies|allowScripts|approve-builds|approve-scripts|\bpm\s+trust\b")
+    Regex::new(r"allowBuilds|onlyBuiltDependencies|trustedDependencies|allowScripts|dependenciesMeta|approve-builds|approve-scripts|\bpm\s+trust\b")
         .expect("valid script approval regex")
 });
 
 fn scan_bytes(bytes: &[u8], file: &str, reach: &mut ScriptReach) {
     if SPAWN_API.is_match(bytes) {
-        if BUN_INSTALL.is_match(bytes) {
-            reach.record(ReachFinding::InstallsWithBun {
-                file: file.to_string(),
-            });
-        }
         for capture in PACKAGE_MANAGER_LITERAL.captures_iter(bytes) {
             let manager = String::from_utf8_lossy(&capture[1]).into_owned();
             reach.record(ReachFinding::StartsPackageManager {
@@ -556,10 +586,52 @@ fn canonical_policy_marker(found: &[u8]) -> &'static str {
     }
 }
 
-/// Approval lists a manifest can carry for npm 12, bun, pnpm, LavaMoat
-/// and LPM. LPM honors none of them from a dependency; they are reported
-/// because a package that tries to approve unrelated packages' scripts
-/// deserves a closer look.
+/// Approval lists a manifest carries, as `(field, granted package names)`
+/// in a fixed field order: npm 12 `allowScripts`, bun
+/// `trustedDependencies`, pnpm `onlyBuiltDependencies` / `allowBuilds`,
+/// Yarn `dependenciesMeta.<name>.built`, LavaMoat `allowScripts` and LPM
+/// `trustedDependencies`. Names are sorted and deduplicated; fields
+/// without grants are left out.
+pub fn declared_script_approvals(
+    manifest: &Map<String, Value>,
+) -> Vec<(&'static str, Vec<String>)> {
+    let nested = |outer: &str, inner: &str| manifest.get(outer).and_then(|v| v.get(inner));
+    let built: BTreeSet<String> = manifest
+        .get("dependenciesMeta")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, meta)| meta.get("built").and_then(Value::as_bool) == Some(true))
+        .map(|(key, _)| package_name(key).to_string())
+        .collect();
+    let list = |field: &'static str, value: Option<&Value>| {
+        let names: BTreeSet<String> = approved_names(value?).map(str::to_string).collect();
+        (!names.is_empty()).then(|| (field, names.into_iter().collect()))
+    };
+    [
+        list("allowScripts", manifest.get("allowScripts")),
+        list("trustedDependencies", manifest.get("trustedDependencies")),
+        list(
+            "pnpm.onlyBuiltDependencies",
+            nested("pnpm", "onlyBuiltDependencies"),
+        ),
+        list("pnpm.allowBuilds", nested("pnpm", "allowBuilds")),
+        (!built.is_empty()).then(|| ("dependenciesMeta.built", built.into_iter().collect())),
+        list("lavamoat.allowScripts", nested("lavamoat", "allowScripts")),
+        list(
+            "lpm.trustedDependencies",
+            nested("lpm", "trustedDependencies"),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// LPM honors no approval list from a dependency; lists naming packages
+/// outside the dependency's own dependencies are reported because a
+/// package that tries to approve unrelated packages' scripts deserves a
+/// closer look.
 fn approvals_for_other_packages(manifest: &Map<String, Value>, reach: &mut ScriptReach) {
     let own: HashSet<&str> = [
         "dependencies",
@@ -579,33 +651,15 @@ fn approvals_for_other_packages(manifest: &Map<String, Value>, reach: &mut Scrip
     )
     .chain(manifest.get("name").and_then(Value::as_str))
     .collect();
-    let nested = |outer: &str, inner: &str| manifest.get(outer).and_then(|v| v.get(inner));
-    let fields: [(&str, Option<&Value>); 6] = [
-        ("allowScripts", manifest.get("allowScripts")),
-        ("trustedDependencies", manifest.get("trustedDependencies")),
-        (
-            "pnpm.onlyBuiltDependencies",
-            nested("pnpm", "onlyBuiltDependencies"),
-        ),
-        ("pnpm.allowBuilds", nested("pnpm", "allowBuilds")),
-        ("lavamoat.allowScripts", nested("lavamoat", "allowScripts")),
-        (
-            "lpm.trustedDependencies",
-            nested("lpm", "trustedDependencies"),
-        ),
-    ];
-    for (field, value) in fields {
-        let Some(value) = value else {
-            continue;
-        };
-        let packages: BTreeSet<String> = approved_names(value)
-            .filter(|name| !own.contains(name))
-            .map(str::to_string)
+    for (field, names) in declared_script_approvals(manifest) {
+        let packages: Vec<String> = names
+            .into_iter()
+            .filter(|name| !own.contains(name.as_str()))
             .collect();
         if !packages.is_empty() {
             reach.record(ReachFinding::ApprovesOtherPackages {
                 field: field.to_string(),
-                packages: packages.into_iter().collect(),
+                packages,
             });
         }
     }
@@ -736,9 +790,154 @@ mod tests {
             )],
         );
         assert!(reach.requires_individual_review());
-        assert!(reach.findings.contains(&ReachFinding::InstallsWithBun {
-            file: "bin/build.js".into()
-        }));
+        assert!(
+            reach
+                .findings
+                .contains(&ReachFinding::StartsPackageManager {
+                    manager: "bun".into(),
+                    file: "bin/build.js".into()
+                })
+        );
+    }
+
+    #[test]
+    fn starting_a_package_manager_without_a_script_guard_requires_review() {
+        for (manager, source) in [
+            (
+                "bun",
+                "require('child_process').execSync('bun --cwd=vendor install');\n",
+            ),
+            (
+                "yarn",
+                "require('child_process').spawnSync('yarn', ['install'], { cwd: vendor });\n",
+            ),
+            (
+                "corepack",
+                "require('child_process').spawnSync('corepack', ['pnpm', 'install']);\n",
+            ),
+        ] {
+            let reach = scan(
+                serde_json::json!({"name":"x","scripts":{"postinstall":"node setup.js"}}),
+                &[("setup.js", source)],
+            );
+            assert!(reach.requires_individual_review(), "{manager}: {reach:?}");
+            assert!(reach.findings.iter().any(|finding| matches!(
+                finding,
+                ReachFinding::StartsPackageManager { manager: found, .. } if found == manager
+            )));
+        }
+        let npm = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"node setup.js"}}),
+            &[(
+                "setup.js",
+                "require('child_process').spawnSync('pnpm', ['install']);\n",
+            )],
+        );
+        assert!(
+            !npm.requires_individual_review(),
+            "pnpm honors the guard: {npm:?}"
+        );
+    }
+
+    #[test]
+    fn yarn_dependencies_meta_build_approvals_are_found_in_code_and_manifests() {
+        let reach = scan(
+            serde_json::json!({
+                "name":"x",
+                "scripts":{"postinstall":"node setup.js"},
+                "dependenciesMeta":{"evil-native@1.0.0":{"built":true},"quiet":{"built":false},"other":{"optional":true}}
+            }),
+            &[(
+                "setup.js",
+                "pkg.dependenciesMeta = { 'evil-native': { built: true } };\n",
+            )],
+        );
+        assert!(reach.requires_individual_review());
+        assert!(
+            reach
+                .findings
+                .contains(&ReachFinding::ApprovesOtherPackages {
+                    field: "dependenciesMeta.built".into(),
+                    packages: vec!["evil-native".into()],
+                })
+        );
+        assert!(
+            reach
+                .findings
+                .contains(&ReachFinding::EditsScriptApprovals {
+                    key: "dependenciesMeta".into(),
+                    file: "setup.js".into(),
+                })
+        );
+    }
+
+    #[test]
+    fn directory_import_follows_the_directory_package_main_before_index() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"node install.js"}}),
+            &[
+                ("install.js", "require('./helper');\n"),
+                ("helper/package.json", r#"{"main":"approve.cjs"}"#),
+                (
+                    "helper/approve.cjs",
+                    "pkg.allowScripts = { other: true };\n",
+                ),
+                ("helper/index.js", "module.exports = {};\n"),
+            ],
+        );
+        assert!(!reach.incomplete);
+        assert_eq!(
+            reach.findings,
+            [ReachFinding::EditsScriptApprovals {
+                key: "allowScripts".into(),
+                file: "helper/approve.cjs".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn directory_import_with_no_resolvable_entry_marks_the_scan_incomplete() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"node install.js"}}),
+            &[
+                ("install.js", "require('./native');\n"),
+                (
+                    "native/package.json",
+                    r#"{"main":"build/Release/addon.node"}"#,
+                ),
+            ],
+        );
+        assert!(reach.incomplete);
+    }
+
+    #[test]
+    fn red_script_reached_through_npm_run_requires_review() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"npm run setup","setup":"bun install"}}),
+            &[],
+        );
+        assert!(reach.requires_individual_review());
+        assert_eq!(
+            reach.findings,
+            [ReachFinding::RunsRedScript {
+                script: "setup".into(),
+                command: "bun install".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn run_script_chain_deeper_than_the_limit_marks_the_scan_incomplete() {
+        let mut scripts = serde_json::Map::new();
+        scripts.insert("postinstall".into(), "npm run s0".into());
+        for index in 0..=MAX_RUN_SCRIPT_DEPTH {
+            scripts.insert(
+                format!("s{index}"),
+                format!("npm run s{}", index + 1).into(),
+            );
+        }
+        let reach = scan(serde_json::json!({"name":"x","scripts":scripts}), &[]);
+        assert!(reach.incomplete);
     }
 
     #[test]
