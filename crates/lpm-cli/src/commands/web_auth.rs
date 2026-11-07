@@ -256,9 +256,20 @@ async fn poll_for_token(
                 if response.status() == reqwest::StatusCode::GONE {
                     return Err(LpmError::Registry(format!("{label} was denied or expired")));
                 }
-                if response.status() == reqwest::StatusCode::ACCEPTED {
+                let status = response.status();
+                if status == reqwest::StatusCode::ACCEPTED
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
                     retry_after_or_default(response.headers(), poll_interval)
-                } else if response.status().is_success() {
+                } else if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                {
+                    // Pending approval answers 202; any other refusal stays a
+                    // refusal, so waiting out the timeout would only hide it.
+                    return Err(LpmError::Registry(format!(
+                        "{label} failed: the registry answered HTTP {}",
+                        status.as_u16()
+                    )));
+                } else if status.is_success() {
                     let remaining = timeout.saturating_sub(started_at.elapsed());
                     let body = tokio::time::timeout(
                         remaining,
@@ -373,13 +384,20 @@ fn registry_endpoint(registry_url: &str, endpoint: &str) -> Result<reqwest::Url,
         .map_err(|e| LpmError::Registry(format!("invalid registry URL {registry_url}: {e}")))
 }
 
+/// The wait a pending poll asks for, kept between one second, so a
+/// `Retry-After: 0` doesn't poll in a tight loop, and a minute.
 fn retry_after_or_default(headers: &HeaderMap, default: Duration) -> Duration {
     headers
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(default, Duration::from_secs)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(default, |seconds| {
+            Duration::from_secs(seconds).clamp(MIN_POLL_WAIT, MAX_POLL_WAIT)
+        })
 }
+
+const MIN_POLL_WAIT: Duration = Duration::from_secs(1);
+const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 
 fn summarize_body(body: &str) -> String {
     let trimmed = body.trim();
@@ -563,6 +581,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "registry error: browser approval was denied or expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_for_token_stops_at_a_refusal_instead_of_waiting_out_the_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let error = poll_for_token(
+            &format!("{}/done", server.uri()),
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+            "browser approval",
+        )
+        .await
+        .expect_err("a refused poll ends the wait");
+
+        assert!(error.to_string().contains("HTTP 403"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_zero_retry_after_still_waits_a_second_between_polls() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "0".parse().unwrap());
+
+        assert_eq!(
+            retry_after_or_default(&headers, Duration::from_millis(5)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            retry_after_or_default(&HeaderMap::new(), Duration::from_millis(5)),
+            Duration::from_millis(5)
         );
     }
 

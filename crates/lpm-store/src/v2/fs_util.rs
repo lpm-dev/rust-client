@@ -16,6 +16,16 @@ pub(crate) fn tmp_sibling(dir: &Path) -> PathBuf {
     dir.with_extension(format!("tmp.{suffix:016x}"))
 }
 
+/// Whether `name` is a staging directory that [`tmp_sibling`] made: an
+/// entry an install is still writing, or one an interrupted install left.
+pub fn is_staging_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.rsplit_once(".tmp."))
+        .is_some_and(|(_, suffix)| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
 /// Pre-create a tmp staging dir at 0o700 on Unix so partial extracts
 /// can't be read by other UIDs on a shared host. The extractor will
 /// `create_dir_all` again on this same path — a no-op once the dir

@@ -86,8 +86,7 @@ pub async fn download_plugin(
 
     tracing::debug!("downloading plugin {}@{} from {}", def.name, version, url);
 
-    let client = lpm_http::client_builder()
-        .timeout(std::time::Duration::from_secs(120))
+    let client = lpm_http::artifact_download_client_builder()
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 

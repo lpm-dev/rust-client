@@ -293,6 +293,7 @@ async fn run_http_listener(
 ) {
     let capacity = Arc::new(tokio::sync::Semaphore::new(HTTP_CONNECTION_LIMIT));
     let mut connections = tokio::task::JoinSet::new();
+    let mut backoff = crate::tcp_forward::AcceptBackoff::new();
 
     loop {
         while connections.try_join_next().is_some() {}
@@ -311,8 +312,19 @@ async fn run_http_listener(
             _ = wait_for_shutdown(&mut shutdown) => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted else {
-            continue;
+        let stream = match accepted {
+            Ok((stream, _)) => {
+                backoff.reset();
+                stream
+            }
+            Err(_) => {
+                drop(permit);
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => break,
+                    () = tokio::time::sleep(backoff.next_delay()) => continue,
+                }
+            }
         };
         let state = state.clone();
         let mut connection_shutdown = shutdown.clone();
@@ -403,7 +415,7 @@ async fn redirect_http_request_inner(
     };
     let location = format!("https://{host}{path}");
     axum::http::Response::builder()
-        .status(StatusCode::MOVED_PERMANENTLY)
+        .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, location)
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
@@ -453,6 +465,7 @@ pub(crate) async fn proxy_http_request_inner(
 
     let (parts, body) = request.into_parts();
     let method = parts.method;
+    let is_head = method == axum::http::Method::HEAD;
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
     let upstream_url = format!(
         "{}://{}{}",
@@ -503,11 +516,19 @@ pub(crate) async fn proxy_http_request_inner(
     };
 
     let (upstream_parts, upstream_body) = upstream.into_parts();
+    // The streamed body sets the length of a response that has one. A HEAD or
+    // 304 response has none, so its declared length is the resource's and
+    // only the upstream header can carry it.
+    let keep_declared_length = is_head || upstream_parts.status == StatusCode::NOT_MODIFIED;
     let mut response_builder = axum::http::Response::builder().status(upstream_parts.status);
     for (name, value) in &upstream_parts.headers {
-        if is_forwardable_http_header(name.as_str())
-            && !connection_header_nominates(&upstream_parts.headers, name)
-        {
+        let forwardable = if name == header::CONTENT_LENGTH {
+            keep_declared_length
+        } else {
+            is_forwardable_http_header(name.as_str())
+                && !connection_header_nominates(&upstream_parts.headers, name)
+        };
+        if forwardable {
             response_builder = response_builder.header(name.clone(), value.clone());
         }
     }

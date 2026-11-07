@@ -266,6 +266,17 @@ async fn run_single_runner(
         RunnerTool::Test => detect_test_runner_from_package(&package),
         RunnerTool::Bench => detect_bench_runner_from_package(&package),
     }?;
+    // A watcher never finishes, and `--json` output only comes once the run
+    // does, so the command would sit silent until interrupted.
+    if json_output && runner_implies_watch(&runner, args) {
+        let label = match tool {
+            RunnerTool::Test => "test",
+            RunnerTool::Bench => "bench",
+        };
+        return Err(LpmError::Script(format!(
+            "--watch cannot be combined with --json for lpm {label}"
+        )));
+    }
 
     if !json_output {
         match tool {

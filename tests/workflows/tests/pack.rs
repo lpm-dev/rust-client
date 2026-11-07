@@ -248,6 +248,52 @@ fn pack_workspace_human_reports_slim_summary() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn pack_filter_ignores_a_dependency_cycle_among_unselected_members() {
+    let project = TempProject::empty(
+        r#"{"name":"pack-cycle-root","private":true,"workspaces":["packages/*"]}"#,
+    );
+    for (name, dependency) in [("cycle-a", "cycle-b"), ("cycle-b", "cycle-a")] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "devDependencies": { dependency: "workspace:*" }
+            })
+            .to_string(),
+        );
+    }
+    project.write_file(
+        "packages/shared/package.json",
+        r#"{"name":"shared","version":"1.0.0"}"#,
+    );
+    project.write_file("packages/shared/src/index.ts", "export default 1\n");
+    let marker_file = project.home().join("pack-cycle.log");
+    seed_fake_tsdown(&project, &marker_file);
+
+    let output = lpm(&project)
+        .args([
+            "pack",
+            "--json",
+            "--filter",
+            "shared",
+            "--entry",
+            "src/index.ts",
+        ])
+        .output()
+        .expect("failed to run lpm pack --filter shared");
+
+    assert!(
+        output.status.success(),
+        "a cycle outside the selection must not stop pack\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(read_marker_lines(&marker_file).len(), 1);
+}
+
 #[test]
 fn pack_filter_typo_without_fail_flag_uses_slim_warning() {
     let project = TempProject::from_fixture("workspace-monorepo");

@@ -546,10 +546,10 @@ pub(crate) fn resolve_root_node_engine_requirement_from_package(
 pub(crate) fn resolve_execution_node_engine_requirements(
     start_dir: &Path,
 ) -> Result<Vec<NodeEngineRequirement>, LpmError> {
-    let workspace = crate::workspace_discovery_cache::discover_workspace(start_dir)
+    let workspace = lpm_workspace::find_workspace_root_package(start_dir)
         .map_err(|error| LpmError::Workspace(format!("could not discover workspace: {error}")))?;
     let (root_dir, root_pkg) = match workspace.as_ref() {
-        Some(workspace) => (workspace.root.as_path(), &workspace.root_package),
+        Some((root, root_package)) => (root.as_path(), root_package),
         None => {
             let package_path = start_dir.join("package.json");
             if !package_path.exists() {
@@ -690,10 +690,10 @@ fn enforce_root_with_policy(
 /// `lpm add`'s plain source copy into a manifest-less directory; the
 /// gate skips silently rather than blocking the flow.
 fn resolve_root_package(start_dir: &Path) -> Result<Option<(PathBuf, PackageJson)>, LpmError> {
-    if let Some(ws) = crate::workspace_discovery_cache::discover_workspace(start_dir)
+    if let Some(root) = lpm_workspace::find_workspace_root_package(start_dir)
         .map_err(|e| LpmError::Workspace(format!("could not discover workspace: {e}")))?
     {
-        return Ok(Some((ws.root.clone(), ws.root_package.clone())));
+        return Ok(Some(root));
     }
     let pkg_json = start_dir.join("package.json");
     if !pkg_json.exists() {

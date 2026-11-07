@@ -6281,3 +6281,37 @@ fn large_file_streaming_preserves_file_cas_ingestion_and_reuse() {
         b"eval('large-file')"
     );
 }
+
+#[test]
+fn verify_enumeration_skips_link_staging_dirs_and_still_reports_broken_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let links_root = store.paths().links_root();
+    std::fs::create_dir_all(links_root.join("pkg@1.0.0+abc.tmp.0123456789abcdef")).unwrap();
+    std::fs::create_dir_all(links_root.join("broken")).unwrap();
+
+    let entries = store.iter_link_entries_for_verify().unwrap();
+
+    let names: Vec<_> = entries
+        .iter()
+        .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["broken".to_string()]);
+    assert!(entries[0].1.is_err());
+}
+
+#[test]
+fn staging_dir_names_are_recognized_only_with_their_random_suffix() {
+    use std::ffi::OsStr;
+
+    assert!(crate::v2::is_staging_dir_name(OsStr::new(
+        "pkg@1.0.tmp.0123456789abcdef"
+    )));
+    assert!(!crate::v2::is_staging_dir_name(OsStr::new(
+        "pkg@1.0.tmp.stale"
+    )));
+    assert!(!crate::v2::is_staging_dir_name(OsStr::new(
+        "tmp.0123456789abcdef"
+    )));
+    assert!(!crate::v2::is_staging_dir_name(OsStr::new("pkg@1.0.0")));
+}

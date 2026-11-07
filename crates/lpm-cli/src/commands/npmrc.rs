@@ -25,6 +25,19 @@ pub(super) struct SetupRegistry {
     auth_scope: String,
 }
 
+/// The service base URL for a `setup --registry` value written as its
+/// `/api/registry` endpoint: stored logins are keyed by the base. `None`
+/// keeps any other value as written, the key a login with that value stored,
+/// and a value `setup` rejects, which it reports itself.
+pub(crate) fn setup_registry_service_base(raw: &str) -> Option<String> {
+    if !raw.trim_end_matches('/').ends_with("/api/registry") {
+        return None;
+    }
+    SetupRegistry::parse(raw)
+        .ok()
+        .map(|registry| registry.service_base)
+}
+
 impl SetupRegistry {
     pub(super) fn parse(raw: &str) -> Result<Self, LpmError> {
         if raw.is_empty() || raw.trim() != raw || raw.chars().any(char::is_control) {

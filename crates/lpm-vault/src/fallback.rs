@@ -867,6 +867,35 @@ pub(crate) fn mutate_vault_file_env<T>(
     })
 }
 
+/// Runs `operation` on an environment that already exists, writing the vault
+/// only when `operation` reports a change. `None` when there is no such
+/// environment, which is left uncreated.
+pub(crate) fn mutate_existing_vault_file_env<T>(
+    vault_id: &str,
+    env: &str,
+    operation: impl FnOnce(&mut SecretMap) -> (T, bool),
+    source: &crate::history::Source,
+) -> Result<Option<T>, String> {
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        let recording = crate::history::scope::begin(vault_id, source);
+        let mut environments =
+            read_all_environments_unlocked(directory, vault_id)?.unwrap_or_default();
+        let Some(secrets) = environments.get_mut(env) else {
+            return Ok(None);
+        };
+        let (result, changed) = operation(secrets);
+        if changed {
+            commit_environments(
+                directory,
+                vault_id,
+                std::borrow::Cow::Owned(environments),
+                &recording,
+            )?;
+        }
+        Ok(Some(result))
+    })
+}
+
 /// Write vault secrets for a specific environment.
 #[cfg(test)]
 pub(crate) fn write_vault_file_env(

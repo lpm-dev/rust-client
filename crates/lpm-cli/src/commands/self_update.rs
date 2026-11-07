@@ -3119,8 +3119,7 @@ fn install_staged_macos_bundle(
 }
 
 fn release_http_client() -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
-        .timeout(std::time::Duration::from_secs(60))
+    lpm_http::artifact_download_client_builder()
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))
 }

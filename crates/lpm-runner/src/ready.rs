@@ -69,10 +69,15 @@ fn wait_for_port_until_deadline_with_connector(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match connect(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-            remaining.min(Duration::from_millis(200)),
-        ) {
+        let attempt = remaining.min(Duration::from_millis(200));
+        // `listen(port, "localhost")` binds only `::1` where `localhost`
+        // resolves to IPv6 first, as on macOS.
+        match connect(SocketAddr::from(([127, 0, 0, 1], port)), attempt).or_else(|_| {
+            connect(
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+                attempt,
+            )
+        }) {
             Ok(_) => return Ok(start.elapsed()),
             Err(_) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -422,6 +427,20 @@ mod tests {
 
         let duration = wait_for_port(port, 5).unwrap();
         assert!(duration.as_millis() < 500, "should be fast: {duration:?}");
+    }
+
+    #[test]
+    fn wait_for_port_succeeds_when_only_ipv6_loopback_is_listening() {
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        if TcpListener::bind(("127.0.0.1", port)).is_err() {
+            return;
+        }
+
+        let duration = wait_for_port(port, 5).unwrap();
+        assert!(duration.as_millis() < 1000, "should be fast: {duration:?}");
     }
 
     #[test]

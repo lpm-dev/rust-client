@@ -402,6 +402,37 @@ fn setup_ci_command_registry_override_uses_its_stored_session() {
     assert!(npmrc.contains(registry_url));
 }
 
+#[test]
+fn setup_ci_finds_the_stored_session_when_the_registry_is_written_as_its_endpoint() {
+    for written in [
+        "https://setup-endpoint.example.test/api/registry",
+        "https://setup-endpoint.example.test/api/registry/",
+    ] {
+        let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: "https://setup-endpoint.example.test",
+                access_token: Some("endpoint-form-token"),
+                refresh_token: None,
+                session_access_expires_at: None,
+            }],
+        );
+
+        let output = lpm(&project)
+            .args(["setup", "ci", "npmrc", "--registry", written])
+            .output()
+            .expect("run setup ci with an endpoint-form registry");
+
+        assert!(
+            output.status.success(),
+            "setup ci --registry {written} did not find the stored login:\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(project.read_file(".npmrc").contains("endpoint-form-token"));
+    }
+}
+
 #[tokio::test]
 async fn setup_ci_propagates_a_stored_session_refresh_failure() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);

@@ -2794,6 +2794,30 @@ async fn env_pull_oidc_whitespace_vault_id_falls_back_to_local_vault() {
 }
 
 #[test]
+fn env_pull_without_a_vault_fails_and_leaves_lpm_json_untouched() {
+    let project = TempProject::empty(r#"{"name":"vault-pull-no-vault","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "env", "pull"])
+        .output()
+        .expect("failed to run lpm env pull without a vault");
+
+    assert!(!output.status.success(), "pull without a vault must fail");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure must emit one JSON document");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("no vault configured")),
+        "{json}"
+    );
+    assert!(
+        !project.file_exists("lpm.json"),
+        "a failed pull must not write a vault ID into lpm.json"
+    );
+}
+
+#[test]
 fn env_pull_oidc_without_vault_source_emits_clear_json_error() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-no-vault-test","version":"1.0.0"}"#);
 

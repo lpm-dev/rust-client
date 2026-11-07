@@ -68,7 +68,27 @@ pub(super) fn env_repair(
             ));
         }
     }
+    if !repair_succeeded(&review.problems, &repaired) {
+        if json_output {
+            return Err(LpmError::ExitCode(1));
+        }
+        return Err(LpmError::Env(
+            "only LPM Vault can set this env project's CLI approval right; switch it there"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+/// Whether the project is undamaged after `repaired`. Damage only LPM Vault
+/// can repair, such as a project's CLI approval, keeps the command failing
+/// after it repairs the rest.
+fn repair_succeeded(
+    problems: &[lpm_vault::CompanionProblem],
+    repaired: &[CompanionRepair],
+) -> bool {
+    problems.is_empty()
+        || (!repaired.is_empty() && problems.iter().all(|problem| problem.repair.is_some()))
 }
 
 fn is_interactive() -> bool {
@@ -116,9 +136,46 @@ fn print_json(review: &CompanionReview, repaired: &[CompanionRepair]) {
     println!(
         "{}",
         serde_json::json!({
-            "success": review.problems.is_empty() || !repaired.is_empty(),
+            "success": repair_succeeded(&review.problems, repaired),
             "problems": problems,
             "repaired": repaired.iter().map(repair_json).collect::<Vec<_>>(),
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lpm_vault::CompanionProblem;
+
+    fn problem(repair: Option<CompanionRepair>) -> CompanionProblem {
+        CompanionProblem {
+            description: "damaged".into(),
+            repair,
+        }
+    }
+
+    #[test]
+    fn repair_fails_while_damage_only_lpm_vault_can_repair_remains() {
+        let problems = [
+            problem(Some(CompanionRepair::RemoveUnlisted)),
+            problem(None),
+        ];
+
+        assert!(!repair_succeeded(
+            &problems,
+            &[CompanionRepair::RemoveUnlisted]
+        ));
+    }
+
+    #[test]
+    fn repair_succeeds_once_every_problem_is_repaired() {
+        let problems = [problem(Some(CompanionRepair::RemoveUnlisted))];
+
+        assert!(repair_succeeded(
+            &problems,
+            &[CompanionRepair::RemoveUnlisted]
+        ));
+        assert!(repair_succeeded(&[], &[]));
+    }
 }

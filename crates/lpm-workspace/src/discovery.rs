@@ -552,6 +552,17 @@ fn workspace_metadata_generation(
 
 /// Find the applicable workspace root without reading or retaining member manifests.
 pub fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+    Ok(find_workspace_root_package(start_dir)?.map(|(root, _)| root))
+}
+
+/// [`find_workspace_root`] together with the root's `package.json`, read once.
+///
+/// Unlike [`discover_workspace`], this reads no member manifests, so a caller
+/// that needs only the root's own fields neither pays for a scan of every
+/// member nor fails on a sibling member's broken manifest.
+pub fn find_workspace_root_package(
+    start_dir: &Path,
+) -> Result<Option<(PathBuf, PackageJson)>, WorkspaceError> {
     let mut current = start_dir.to_path_buf();
 
     loop {
@@ -559,7 +570,7 @@ pub fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, Workspac
             Ok((root_package, pnpm_workspace)) => {
                 let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
                 if !globs.is_empty() && start_belongs_to_workspace(start_dir, &current, &globs)? {
-                    return Ok(Some(current));
+                    return Ok(Some((current, root_package)));
                 }
             }
             Err(WorkspaceError::NotFound(_)) => {}

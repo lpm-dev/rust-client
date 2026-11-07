@@ -1539,7 +1539,6 @@ pub fn run_services_with_config(
                         name,
                         color,
                         service_index,
-                        shutdown_state: &shutdown_state,
                         event_tx: &options.event_tx,
                         endpoint_candidates: Some(endpoint_candidates),
                     },
@@ -1810,7 +1809,6 @@ struct OutputReaderOptions<'a> {
     name: &'a str,
     color: &'a str,
     service_index: usize,
-    shutdown_state: &'a Arc<AtomicU8>,
     event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     endpoint_candidates: Option<EndpointCandidateSink>,
 }
@@ -1854,7 +1852,6 @@ fn spawn_output_readers(
         name,
         color,
         service_index,
-        shutdown_state,
         event_tx,
         endpoint_candidates,
     } = options;
@@ -1863,12 +1860,11 @@ fn spawn_output_readers(
     {
         let name = name.to_string();
         let color = color.to_string();
-        let shutdown_ref = shutdown_state.clone();
         let event_tx = event_tx.clone();
 
         std::thread::spawn(move || {
             if let Some(stdout) = stdout {
-                drain_service_output(stdout, &shutdown_ref, |line| {
+                drain_service_output(stdout, |line| {
                     if let Some(ref candidates) = endpoint_candidates {
                         candidates.send_line_candidates(line);
                     }
@@ -1891,12 +1887,11 @@ fn spawn_output_readers(
     {
         let name = name.to_string();
         let color = color.to_string();
-        let shutdown_ref = shutdown_state.clone();
         let event_tx = event_tx.clone();
 
         std::thread::spawn(move || {
             if let Some(stderr) = stderr {
-                drain_service_output(stderr, &shutdown_ref, |line| {
+                drain_service_output(stderr, |line| {
                     if let Some(ref candidates) = stderr_endpoint_candidates {
                         candidates.send_line_candidates(line);
                     }
@@ -1916,11 +1911,10 @@ fn spawn_output_readers(
     }
 }
 
-fn drain_service_output<R: std::io::Read>(
-    mut stream: R,
-    shutdown_state: &AtomicU8,
-    mut on_line: impl FnMut(&str),
-) {
+/// Reads a service's output to its end. Reading continues through shutdown:
+/// a service that writes while it stops would otherwise fail with a broken
+/// pipe, and some, such as Go programs, exit on that before they clean up.
+fn drain_service_output<R: std::io::Read>(mut stream: R, mut on_line: impl FnMut(&str)) {
     let mut line = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
     let mut truncated = false;
@@ -1947,9 +1941,6 @@ fn drain_service_output<R: std::io::Read>(
                 .min(MAX_SERVICE_LOG_LINE_BYTES.saturating_sub(line.len()));
             line.extend_from_slice(&remaining[..keep]);
             truncated = keep < remaining.len() || line.len() == MAX_SERVICE_LOG_LINE_BYTES;
-        }
-        if shutdown_state.load(Ordering::Relaxed) > 0 {
-            break;
         }
     }
     if !line.is_empty() {
@@ -2010,12 +2001,15 @@ fn ctrlc_handler(
     shutdown_state: Arc<AtomicU8>,
     children: Arc<Mutex<Vec<(String, Child)>>>,
 ) -> Option<SignalHandler> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
     use signal_hook::iterator::Signals;
 
     let state = shutdown_state;
     let kids = children;
-    let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) else {
+    // Services run in their own process groups, so a closed terminal's
+    // SIGHUP reaches only LPM CLI: without a handler it would exit and leave
+    // every service running.
+    let Ok(mut signals) = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]) else {
         return None;
     };
     let handle = signals.handle();
@@ -2026,11 +2020,14 @@ fn ctrlc_handler(
     let thread = std::thread::spawn(move || {
         #[cfg(test)]
         thread_running.store(true, Ordering::Release);
-        for _ in signals.forever() {
+        for signal in signals.forever() {
             let prev = state.fetch_add(1, Ordering::Relaxed);
             if prev == 0 {
-                eprintln!();
-                ui_warn("Stopping services...");
+                // After SIGHUP the terminal is gone, and writing to it fails.
+                if signal != SIGHUP {
+                    eprintln!();
+                    ui_warn("Stopping services...");
+                }
             } else {
                 eprintln!();
                 ui_warn("Force-killing services...");
@@ -2209,14 +2206,17 @@ fn shutdown_children_ordered(
     }
 }
 
+/// Starts a service in its own process group, so shutdown reaches its whole
+/// tree. Outside the terminal's foreground group, a service that switched the
+/// terminal to raw mode for key shortcuts would be stopped by `SIGTTOU`, so
+/// services get no terminal input.
 fn isolate_service_process_tree(command: &mut Command) {
+    command.stdin(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    #[cfg(not(unix))]
-    let _ = command;
 }
 
 #[cfg(unix)]
@@ -3222,7 +3222,6 @@ mod tests {
         let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
         children.lock().push((name.clone(), child));
 
-        let shutdown = Arc::new(AtomicU8::new(0));
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
 
         spawn_output_readers(
@@ -3232,7 +3231,6 @@ mod tests {
                 name: &name,
                 color: "\x1b[36m",
                 service_index: 0,
-                shutdown_state: &shutdown,
                 event_tx: &Some(tx),
                 endpoint_candidates: None,
             },
@@ -3277,11 +3275,10 @@ mod tests {
 
     #[test]
     fn service_output_reader_bounds_a_newline_free_line() {
-        let shutdown = AtomicU8::new(0);
         let input = vec![b'x'; MAX_SERVICE_LOG_LINE_BYTES * 4];
         let mut observed_len = None;
 
-        drain_service_output(input.as_slice(), &shutdown, |line| {
+        drain_service_output(input.as_slice(), |line| {
             observed_len = Some(line.len());
         });
 

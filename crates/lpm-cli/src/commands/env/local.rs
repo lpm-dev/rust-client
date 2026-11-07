@@ -161,29 +161,41 @@ pub(super) fn env_delete(
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
     let source = lpm_vault::history::Source::new(lpm_vault::history::Action::Delete);
-    match &resolved_env {
-        Some(env) => {
-            lpm_vault::delete_env(project_dir, env, &keys, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
-        }
-        None => {
-            lpm_vault::delete(project_dir, &keys, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
-        }
+    let deleted = match &resolved_env {
+        Some(env) => lpm_vault::delete_env(project_dir, env, &keys, &source),
+        None => lpm_vault::delete(project_dir, &keys, &source),
     }
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+    let not_found: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|key| !deleted.iter().any(|deleted| deleted == key))
+        .collect();
 
     if json_output {
         println!(
             "{}",
-            super::history::with_history_field(
-                serde_json::json!({"success": true, "deleted": keys, "env": env_label})
-            )
+            super::history::with_history_field(serde_json::json!({
+                "success": true,
+                "deleted": deleted,
+                "notFound": not_found,
+                "env": env_label,
+            }))
         );
     } else {
-        super::history::report_write();
-        for key in &keys {
+        if !deleted.is_empty() {
+            super::history::report_write();
+        }
+        for key in &deleted {
             output::success_line(install_ui::terminal_line!(
                 "deleted {} ({})",
+                install_ui::bold(key),
+                env_label,
+            ));
+        }
+        for key in &not_found {
+            install_ui::warn_line(install_ui::terminal_line!(
+                "{} was not set ({}); nothing to delete",
                 install_ui::bold(key),
                 env_label,
             ));

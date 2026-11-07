@@ -113,7 +113,8 @@ impl VaultManifestSnapshot {
         let package_path = project_dir.join("package.json");
         if let Ok(content) =
             lpm_common::read_text_file_capped(&package_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            && let Ok(package) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Ok(package) =
+                serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
             && let Some(name) = package.get("name").and_then(serde_json::Value::as_str)
         {
             return name.to_owned();
@@ -461,7 +462,8 @@ pub fn read_vault_id(project_dir: &Path) -> Option<String> {
     let content =
         lpm_common::read_text_file_capped(&lpm_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .ok()?;
-    let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let config: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
     let raw = config.get("vault").and_then(|v| v.as_str())?;
     if !is_safe_vault_id(raw) {
         tracing::warn!(
@@ -1377,7 +1379,8 @@ pub fn read_project_name(project_dir: &Path) -> String {
     let pkg_path = project_dir.join("package.json");
     if let Ok(content) =
         lpm_common::read_text_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Ok(pkg) =
+            serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
         && let Some(name) = pkg.get("name").and_then(|v| v.as_str())
     {
         return name.to_string();
@@ -1387,7 +1390,8 @@ pub fn read_project_name(project_dir: &Path) -> String {
     let lpm_path = project_dir.join("lpm.json");
     if let Ok(content) =
         lpm_common::read_text_file_capped(&lpm_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        && let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Ok(cfg) =
+            serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
         && let Some(name) = cfg.get("name").and_then(|v| v.as_str())
     {
         return name.to_string();
@@ -1555,6 +1559,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(read_project_name(dir.path()), "my-api-server");
+    }
+
+    #[test]
+    fn read_vault_id_reads_lpm_json_that_starts_with_a_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            "\u{feff}{\"vault\": \"abc123\"}",
+        )
+        .unwrap();
+
+        assert_eq!(read_vault_id(dir.path()).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn read_project_name_reads_package_json_that_starts_with_a_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\"name\": \"bom-app\"}",
+        )
+        .unwrap();
+
+        assert_eq!(read_project_name(dir.path()), "bom-app");
     }
 
     #[test]

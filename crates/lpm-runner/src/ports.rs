@@ -277,14 +277,31 @@ pub fn check_port(port: u16) -> PortStatus {
 }
 
 pub(crate) fn loopback_port_available(port: u16) -> bool {
-    loopback_addr_available("127.0.0.1", port) && loopback_addr_available("::1", port)
+    bind_probe_available("127.0.0.1", port)
+        && bind_probe_available("::1", port)
+        && no_wildcard_listener(port)
 }
 
-fn loopback_addr_available(host: &str, port: u16) -> bool {
+/// BSD-derived stacks, macOS among them, let a socket with `SO_REUSEADDR`,
+/// which std sets, bind a loopback address while another socket listens on
+/// the wildcard address of that port, so the loopback probes miss the common
+/// `listen(port)` server. Linux refuses that bind, so its loopback probes
+/// already see wildcard listeners.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn no_wildcard_listener(port: u16) -> bool {
+    bind_probe_available("0.0.0.0", port) && bind_probe_available("::", port)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn no_wildcard_listener(_port: u16) -> bool {
+    true
+}
+
+fn bind_probe_available(host: &str, port: u16) -> bool {
     match TcpListener::bind((host, port)) {
         Ok(_) => true,
         Err(err)
-            if host == "::1"
+            if host.contains(':')
                 && matches!(
                     err.kind(),
                     std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
@@ -298,12 +315,7 @@ fn loopback_addr_available(host: &str, port: u16) -> bool {
 
 /// Find the next available port starting from `start`.
 pub fn find_available_port(start: u16) -> Option<u16> {
-    for port in start..=65535 {
-        if let PortStatus::Free = check_port(port) {
-            return Some(port);
-        }
-    }
-    None
+    (start..=65535).find(|port| loopback_port_available(*port))
 }
 
 /// Kill the process using a specific port.
@@ -4244,6 +4256,26 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "background descendant retained the process-probe worker for {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn check_port_reports_a_wildcard_listener_as_in_use() {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(!loopback_port_available(port));
+        assert!(matches!(check_port(port), PortStatus::InUse { .. }));
+        assert_ne!(find_available_port(port), Some(port));
+    }
+
+    #[test]
+    fn check_port_reports_a_dual_stack_wildcard_listener_as_in_use() {
+        let Ok(listener) = TcpListener::bind("[::]:0") else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(!loopback_port_available(port));
     }
 
     #[test]

@@ -1187,6 +1187,51 @@ fn acquire_shared_with_hint(
     acquire_shared_from_source(&AmbientLockFileSource { data_path }, on_first_wait)
 }
 
+tokio::task_local! {
+    /// Shared locks that enclosing [`with_shared_lock_async`] sections of the
+    /// current task hold.
+    static TASK_SHARED_LOCKS: Vec<PathBuf>;
+}
+
+thread_local! {
+    /// Shared locks that enclosing [`with_shared_lock`] sections of the
+    /// current thread hold.
+    static THREAD_SHARED_LOCKS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether an enclosing section of the caller already holds `lock_path`
+/// shared. A nested section joins that hold instead of queueing again: a
+/// writer that queued in between waits for the outer hold, and a new reader
+/// waits for the writer, so the nested acquire would never finish. `lpm dlx`
+/// holds the store lock around an install that takes it too.
+///
+/// Independent readers, other tasks and threads, still queue behind a waiting
+/// writer.
+fn shared_lock_held_by_caller(lock_path: &Path) -> bool {
+    TASK_SHARED_LOCKS
+        .try_with(|held| held.iter().any(|path| path == lock_path))
+        .unwrap_or(false)
+        || THREAD_SHARED_LOCKS.with(|held| held.borrow().iter().any(|path| path == lock_path))
+}
+
+struct ThreadSharedLockScope;
+
+impl ThreadSharedLockScope {
+    fn enter(lock_path: &Path) -> Self {
+        THREAD_SHARED_LOCKS.with(|held| held.borrow_mut().push(lock_path.to_path_buf()));
+        Self
+    }
+}
+
+impl Drop for ThreadSharedLockScope {
+    fn drop(&mut self) {
+        THREAD_SHARED_LOCKS.with(|held| {
+            held.borrow_mut().pop();
+        });
+    }
+}
+
 fn acquire_exclusive_with_hint(
     data_path: &Path,
     on_first_wait: impl FnOnce() + Send + 'static,
@@ -1215,7 +1260,12 @@ where
     P: AsRef<Path>,
     F: FnOnce() -> Result<R, LpmError>,
 {
-    let _h = acquire_shared_with_hint(lock_path.as_ref(), default_wait_hint)?;
+    let lock_path = lock_path.as_ref();
+    if shared_lock_held_by_caller(lock_path) {
+        return body();
+    }
+    let _h = acquire_shared_with_hint(lock_path, default_wait_hint)?;
+    let _scope = ThreadSharedLockScope::enter(lock_path);
     body()
 }
 
@@ -1259,12 +1309,18 @@ pub async fn with_shared_lock_async<R>(
     lock_path: PathBuf,
     body: impl std::future::Future<Output = Result<R, LpmError>>,
 ) -> Result<R, LpmError> {
+    if shared_lock_held_by_caller(&lock_path) {
+        return body.await;
+    }
+    let acquire_path = lock_path.clone();
     let _h = tokio::task::spawn_blocking(move || -> Result<SharedLockHandle, LpmError> {
-        acquire_shared_with_hint(&lock_path, default_wait_hint)
+        acquire_shared_with_hint(&acquire_path, default_wait_hint)
     })
     .await
     .map_err(|e| LpmError::Io(std::io::Error::other(format!("lock task join: {e}"))))??;
-    body.await
+    let mut held = TASK_SHARED_LOCKS.try_with(Clone::clone).unwrap_or_default();
+    held.push(lock_path);
+    TASK_SHARED_LOCKS.scope(held, body).await
 }
 
 /// Run an async body under a shared project lock opened through a retained
@@ -2950,6 +3006,63 @@ mod tests {
             1,
             "late reader must complete after writer releases",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_async_shared_section_joins_its_callers_hold_while_a_writer_waits() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("store.lock");
+        let writer_path = lock_path.clone();
+
+        let (nested, writer) = with_shared_lock_async(lock_path.clone(), async {
+            let writer = std::thread::spawn(move || {
+                with_exclusive_lock(&writer_path, || Ok::<_, LpmError>(()))
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let nested = tokio::time::timeout(
+                Duration::from_secs(5),
+                with_shared_lock_async(lock_path.clone(), async { Ok::<_, LpmError>(7) }),
+            )
+            .await;
+            Ok::<_, LpmError>((nested, writer))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            nested
+                .expect("a nested section queued behind the writer its caller blocks")
+                .unwrap(),
+            7
+        );
+        writer.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn nested_sync_shared_section_joins_its_callers_hold_while_a_writer_waits() {
+        let tmp = TempDir::new().unwrap();
+        let scenario_path = tmp.path().join("store.lock");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let writer_path = scenario_path.clone();
+            let result = with_shared_lock(&scenario_path, || {
+                let writer = std::thread::spawn(move || {
+                    with_exclusive_lock(&writer_path, || Ok::<_, LpmError>(()))
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                let nested = with_shared_lock(&scenario_path, || Ok::<_, LpmError>(7))?;
+                Ok::<_, LpmError>((nested, writer))
+            });
+            let _ = done_tx.send(result);
+        });
+
+        let (nested, writer) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a nested section queued behind the writer its caller blocks")
+            .unwrap();
+
+        assert_eq!(nested, 7);
+        writer.join().unwrap().unwrap();
     }
 
     /// The intent-gate file is created automatically alongside the

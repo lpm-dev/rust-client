@@ -38,7 +38,13 @@ const PONG_TIMEOUT_SECS: u64 = 90;
 /// Maximum time to wait for in-flight tasks during graceful shutdown.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
-const MAX_CONCURRENT_HTTP_FORWARDS: usize = 4;
+/// Longest wait for the relay connection and its hello.
+const RELAY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A page load fires dozens of module requests at once, and each open event
+/// stream holds a slot for its life. Memory stays bounded by the request and
+/// response memory budgets, not by this count.
+const MAX_CONCURRENT_HTTP_FORWARDS: usize = 64;
 const HTTP_RESPONSE_MEMORY_PERMITS: usize = 64;
 const HTTP_RESPONSE_MEMORY_UNIT_BYTES: usize = 1024 * 1024;
 const HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
@@ -1934,23 +1940,37 @@ async fn try_connect_with_token(
 
     let connector =
         relay_tls_connector(options, approved_pins).map_err(TunnelConnectError::permanent)?;
-    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        Some(relay_websocket_config()),
-        false,
-        Some(connector),
-    )
-    .await
-    .map_err(classify_websocket_connect_error)?;
-
-    let (mut write, mut read) = ws_stream.split();
-
-    // Wait for ServerHello (Worker sends it after validating token)
-    let server_hello = read
-        .next()
+    // Until the hello arrives no ping runs, so a connection that stalls after
+    // the upgrade would otherwise hang the session and its shutdown.
+    let handshake = async {
+        let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            Some(relay_websocket_config()),
+            false,
+            Some(connector),
+        )
         .await
-        .ok_or_else(|| LpmError::Tunnel("relay closed connection before hello".into()))?
-        .map_err(|e| LpmError::Tunnel(format!("failed to read server hello: {e}")))?;
+        .map_err(classify_websocket_connect_error)?;
+        let (write, mut read) = ws_stream.split();
+        let server_hello = read
+            .next()
+            .await
+            .ok_or_else(|| LpmError::Tunnel("relay closed connection before hello".into()))?
+            .map_err(|e| LpmError::Tunnel(format!("failed to read server hello: {e}")))?;
+        Ok::<_, TunnelConnectError>((write, read, server_hello))
+    };
+    let (mut write, mut read, server_hello) = tokio::select! {
+        biased;
+        _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+        handshake = tokio::time::timeout(RELAY_HANDSHAKE_TIMEOUT, handshake) => {
+            handshake.map_err(|_| {
+                TunnelConnectError::transient(format!(
+                    "the relay did not finish the connection within {} seconds",
+                    RELAY_HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })??
+        }
+    };
 
     let (session, initial_usage, relay_protocol) = match server_hello {
         Message::Text(text) => {
@@ -3946,6 +3966,42 @@ mod tests {
                 "stale-access-token",
                 "fresh-access-token"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_relay_that_upgrades_but_never_says_hello() {
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let _websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut options = TunnelOptions::new("access-token".to_string(), 5173);
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.shutdown = Some(shutdown.clone());
+        let cancel = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                shutdown.cancel();
+            })
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_with_usage(&options, |_| {}, |_| {}, |_, _| {}),
+        )
+        .await;
+
+        relay.abort();
+        cancel.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "shutdown must not wait for a relay hello that never comes"
         );
     }
 

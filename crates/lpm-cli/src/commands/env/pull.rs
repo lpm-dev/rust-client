@@ -82,10 +82,19 @@ pub(super) async fn vars_pull(
     };
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
-    let vault_id = match manifest.vault.vault_id().map_err(LpmError::Env)? {
-        Some(vault_id) => vault_id.to_owned(),
-        None => lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Env)?,
-    };
+    // A pull reads the cloud copy of the vault `lpm.json` names. Without one
+    // there is nothing to read, and a new random ID written here would be
+    // left in `lpm.json` by a pull that fails.
+    let vault_id = manifest
+        .vault
+        .vault_id()
+        .map_err(LpmError::Env)?
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            LpmError::Env(
+                "no vault configured. Commit `lpm.json` with its `vault` field from the project that pushed, or run `lpm env set` first".into(),
+            )
+        })?;
 
     // Org pull: different flow with X25519 decryption
     if let Some(org_slug) = org_flag {

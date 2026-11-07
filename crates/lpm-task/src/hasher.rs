@@ -48,6 +48,35 @@ impl FilesystemValidation {
                 == self.fingerprint,
         )
     }
+
+    /// The first file, in path order, that both these validation globs and
+    /// `output_globs` match: a task that writes it changes its own inputs.
+    pub fn first_file_also_matched_by_outputs(
+        &self,
+        output_globs: &[String],
+    ) -> Result<Option<PathBuf>, LpmError> {
+        let outputs: std::collections::HashSet<PathBuf> =
+            crate::cache::collect_output_files(&self.root, output_globs)?
+                .into_iter()
+                .collect();
+        if outputs.is_empty() {
+            return Ok(None);
+        }
+        let mut first: Option<PathBuf> = None;
+        for pattern in &self.globs {
+            for expanded in expand_glob(pattern) {
+                for_each_cache_glob_match(&self.root, &expanded, |relative| {
+                    if outputs.contains(&relative)
+                        && first.as_ref().is_none_or(|current| relative < *current)
+                    {
+                        first = Some(relative);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(first)
+    }
 }
 
 pub struct WorkspaceContractSnapshot {
@@ -1711,6 +1740,42 @@ mod tests {
         let files = collect_input_files(project.path(), &["src/**".into()]);
 
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn validation_reports_the_first_input_that_is_also_a_declared_output() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src/gen")).unwrap();
+        fs::write(project.path().join("src/index.ts"), "source").unwrap();
+        fs::write(project.path().join("src/gen/b.js"), "generated").unwrap();
+        fs::write(project.path().join("src/gen/a.js"), "generated").unwrap();
+        let validation =
+            capture_filesystem_validation(project.path(), Vec::new(), vec!["src/**".into()])
+                .unwrap();
+
+        let overlap = validation
+            .first_file_also_matched_by_outputs(&["src/gen/**".into()])
+            .unwrap();
+
+        assert_eq!(overlap, Some(PathBuf::from("src/gen/a.js")));
+    }
+
+    #[test]
+    fn validation_reports_no_overlap_when_outputs_sit_outside_inputs() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src")).unwrap();
+        fs::create_dir_all(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("src/index.ts"), "source").unwrap();
+        fs::write(project.path().join("dist/index.js"), "generated").unwrap();
+        let validation =
+            capture_filesystem_validation(project.path(), Vec::new(), vec!["src/**".into()])
+                .unwrap();
+
+        let overlap = validation
+            .first_file_also_matched_by_outputs(&["dist/**".into()])
+            .unwrap();
+
+        assert_eq!(overlap, None);
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

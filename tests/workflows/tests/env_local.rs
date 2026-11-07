@@ -696,6 +696,57 @@ fn env_delete_removes_key() {
 }
 
 #[test]
+fn env_delete_of_a_missing_key_or_environment_changes_nothing() {
+    let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["env", "set", "KEEP=value", "GONE=value"])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["--json", "env", "delete", "GONE", "NEVER_SET"])
+        .output()
+        .expect("failed to run lpm env delete");
+    let typo = lpm(&project)
+        .args(["--json", "env", "delete", "--env=stagign", "KEEP"])
+        .output()
+        .expect("failed to run lpm env delete --env");
+    let list = lpm(&project)
+        .args(["--json", "env", "ls"])
+        .output()
+        .expect("failed to run lpm env ls");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["deleted"],
+        serde_json::json!(["GONE"]),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["notFound"],
+        serde_json::json!(["NEVER_SET"]),
+        "{envelope}"
+    );
+    assert!(
+        typo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&typo.stderr)
+    );
+    let typo: serde_json::Value = serde_json::from_slice(&typo.stdout).unwrap();
+    assert_eq!(typo["deleted"], serde_json::json!([]), "{typo}");
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("stagign"),
+        "deleting from a misspelled environment created it: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}
+
+#[test]
 fn env_list_json_envelope_carries_keys() {
     let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
 

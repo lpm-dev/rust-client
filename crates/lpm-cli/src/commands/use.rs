@@ -348,8 +348,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
         });
     }
 
-    let http_client = lpm_http::client_builder()
-        .timeout(std::time::Duration::from_secs(60))
+    let http_client = lpm_http::artifact_download_client_builder()
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 
@@ -737,7 +736,7 @@ fn read_pinned_runtime_version(
         Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let config: serde_json::Value = serde_json::from_str(&content)
+    let config: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
         .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?;
 
     Ok(config["runtime"][runtime.as_str()]
@@ -826,6 +825,21 @@ mod tests {
         let installed = vec!["22.12.0".to_string()];
 
         assert_eq!(select_pinned_node_version("lts", &installed), "lts");
+    }
+
+    #[test]
+    fn pinned_runtime_reads_lpm_json_that_starts_with_a_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            "\u{feff}{\"runtime\": {\"node\": \"22.12.0\"}}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_pinned_runtime_version(dir.path(), RuntimeKind::Node).unwrap(),
+            Some("22.12.0".to_string())
+        );
     }
 
     #[test]

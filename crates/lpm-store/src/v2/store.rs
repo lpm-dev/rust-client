@@ -2426,6 +2426,9 @@ impl Store {
         let mut out = Vec::new();
         for entry in read_dir {
             let Ok(entry) = entry else { continue };
+            if super::fs_util::is_staging_dir_name(&entry.file_name()) {
+                continue;
+            }
             let link_dir = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;

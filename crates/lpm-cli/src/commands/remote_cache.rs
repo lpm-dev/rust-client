@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, LOCATION};
 use reqwest::{Body, Client};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
@@ -33,6 +33,10 @@ const MAX_LIMIT_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
 /// more; a longer one is a spent limit.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A cache server that a firewall silently drops reaches this long before
+/// the request timeout, so an unreachable cache costs a run seconds, not a
+/// timeout per task.
+const REMOTE_CACHE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Each upload read moves to the blocking pool, so the stream's 4 KiB default
 /// made a 64 MiB upload about ten times slower than 64 KiB reads.
 const UPLOAD_READ_BYTES: usize = 64 * 1024;
@@ -46,7 +50,7 @@ const ARTIFACT_CLIENT_INTERACTIVE_HEADER: &str = "x-artifact-client-interactive"
 /// than streaming it. Other cache servers ignore it.
 const DOWNLOAD_REDIRECT_HEADER: &str = "x-lpm-download-redirect";
 
-static REMOTE_CACHE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
+static REMOTE_CACHE_WARNINGS_SHOWN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// A cache server's base URL and the team its requests name.
 type CacheTeam = (String, Option<String>);
 /// Each cache server and team's request limits, shared by every task's client
@@ -172,6 +176,14 @@ impl RequestLimits {
         self.lookups_refused.load(Ordering::Relaxed)
     }
 
+    /// Stops lookups alone for the rest of the run, as when the cache's
+    /// download host can't be reached: every hit would fail to download,
+    /// while uploads go to the cache server itself. True when this call
+    /// stopped them.
+    fn stop_lookups(&self) -> bool {
+        !self.lookups_refused.swap(true, Ordering::Relaxed)
+    }
+
     /// True the first time the run reaches this kind of limit.
     fn first_warning(&self, request: LimitedRequest) -> bool {
         let warned = match request {
@@ -221,7 +233,21 @@ enum RemoteCacheAuth {
 
 enum RemoteCacheRequestError {
     Unauthorized,
+    /// The request never reached the cache server: the connection failed or
+    /// timed out.
+    Unreachable(String),
     Message(String),
+}
+
+impl RemoteCacheRequestError {
+    fn from_send(context: &str, error: &reqwest::Error) -> Self {
+        let message = format!("{context}: {}", lpm_http::display_error(error));
+        if error.is_connect() || error.is_timeout() {
+            Self::Unreachable(message)
+        } else {
+            Self::Message(message)
+        }
+    }
 }
 
 pub struct CacheStatus {
@@ -534,29 +560,68 @@ impl RemoteCacheRequestError {
     fn into_message(self, unauthorized_message: &str) -> String {
         match self {
             Self::Unauthorized => unauthorized_message.to_string(),
-            Self::Message(message) => message,
+            Self::Unreachable(message) | Self::Message(message) => message,
         }
     }
 }
 
 impl RemoteCacheClient {
+    /// Sends a request with the current bearer, once more with a refreshed
+    /// one if the server rejects it. `request` names the run-time request
+    /// kind whose failures stop the remote cache; a status check names none.
     async fn send_authenticated<T>(
         &self,
+        request: Option<LimitedRequest>,
         unauthorized_message: &str,
         send: impl AsyncFn(String) -> Result<T, RemoteCacheRequestError>,
     ) -> Result<T, String> {
         let bearer = self.auth.bearer().await?;
-        match send(bearer).await {
-            Ok(value) => Ok(value),
+        let result = match send(bearer).await {
             Err(RemoteCacheRequestError::Unauthorized) => {
-                let Some(rotated) = self.auth.refresh_after_rejection().await? else {
-                    return Err(unauthorized_message.to_string());
-                };
-                send(rotated)
-                    .await
-                    .map_err(|error| error.into_message(unauthorized_message))
+                match self.auth.refresh_after_rejection().await? {
+                    Some(rotated) => send(rotated).await,
+                    None => Err(RemoteCacheRequestError::Unauthorized),
+                }
             }
-            Err(error) => Err(error.into_message(unauthorized_message)),
+            result => result,
+        };
+        result.map_err(|error| match request {
+            Some(request) => self.stop_after_failure(request, error, unauthorized_message),
+            None => error.into_message(unauthorized_message),
+        })
+    }
+
+    /// The warning for a failed request. A token the server still rejects
+    /// after a refresh, or a server the request can't reach, fails every
+    /// later request the same way, so those stop the remote cache for the
+    /// rest of the run instead of costing each task a refresh or a timeout.
+    fn stop_after_failure(
+        &self,
+        request: LimitedRequest,
+        error: RemoteCacheRequestError,
+        unauthorized_message: &str,
+    ) -> String {
+        match error {
+            RemoteCacheRequestError::Unauthorized => {
+                self.limits.refuse_lookups();
+                format!(
+                    "{unauthorized_message}; skipping the remote cache for the rest of this run"
+                )
+            }
+            RemoteCacheRequestError::Unreachable(message) => {
+                let skipped = match request {
+                    LimitedRequest::Lookup => {
+                        self.limits.refuse_lookups();
+                        "the remote cache"
+                    }
+                    LimitedRequest::Upload => {
+                        self.limits.refuse_uploads();
+                        "remote cache uploads"
+                    }
+                };
+                format!("{message}; skipping {skipped} for the rest of this run")
+            }
+            RemoteCacheRequestError::Message(message) => message,
         }
     }
 
@@ -583,7 +648,8 @@ impl RemoteCacheClient {
         let response = loop {
             let response = self
                 .send_authenticated(
-                    "remote cache authorization failed; continuing without it",
+                    Some(LimitedRequest::Lookup),
+                    "remote cache authorization failed",
                     async |bearer: String| {
                         let response = client
                             .get(url.clone())
@@ -592,10 +658,10 @@ impl RemoteCacheClient {
                             .send()
                             .await
                             .map_err(|error| {
-                                RemoteCacheRequestError::Message(format!(
-                                    "remote cache lookup failed: {}",
-                                    lpm_http::display_error(&error)
-                                ))
+                                RemoteCacheRequestError::from_send(
+                                    "remote cache lookup failed",
+                                    &error,
+                                )
                             })?;
                         if response.status() == StatusCode::UNAUTHORIZED {
                             Err(RemoteCacheRequestError::Unauthorized)
@@ -641,9 +707,16 @@ impl RemoteCacheClient {
                 if self.signature_key.is_some() && tag.is_none() {
                     return Err(MISSING_SIGNATURE_TAG.into());
                 }
-                match fetch_redirected_artifact(&url, &response).await? {
-                    Some(artifact) => artifact,
-                    None => return Ok(None),
+                match fetch_redirected_artifact(&url, &response).await {
+                    Ok(Some(artifact)) => artifact,
+                    Ok(None) => return Ok(None),
+                    Err(RemoteCacheRequestError::Unreachable(message)) => {
+                        self.limits.stop_lookups();
+                        return Err(format!(
+                            "{message}; skipping remote cache lookups for the rest of this run"
+                        ));
+                    }
+                    Err(error) => return Err(error.into_message("")),
                 }
             }
             StatusCode::NOT_FOUND => return Ok(None),
@@ -794,7 +867,8 @@ impl RemoteCacheClient {
         loop {
             let response = self
                 .send_authenticated(
-                    "remote cache upload was not authorized; continuing without it",
+                    Some(LimitedRequest::Upload),
+                    "remote cache upload was not authorized",
                     async |bearer: String| {
                         let mut body_file = artifact.try_clone().map_err(|error| {
                             RemoteCacheRequestError::Message(format!(
@@ -836,10 +910,7 @@ impl RemoteCacheClient {
                         }
 
                         let response = request.send().await.map_err(|error| {
-                            RemoteCacheRequestError::Message(format!(
-                                "remote cache upload failed: {}",
-                                lpm_http::display_error(&error)
-                            ))
+                            RemoteCacheRequestError::from_send("remote cache upload failed", &error)
                         })?;
                         if response.status() == StatusCode::UNAUTHORIZED {
                             Err(RemoteCacheRequestError::Unauthorized)
@@ -1130,7 +1201,7 @@ impl RemoteCacheClient {
             }
         };
         let response = self
-            .send_authenticated(rejected, async |bearer: String| {
+            .send_authenticated(None, rejected, async |bearer: String| {
                 let response = client
                     .get(url.clone())
                     .bearer_auth(bearer)
@@ -1346,29 +1417,32 @@ const MISSING_SIGNATURE_TAG: &str =
 async fn fetch_redirected_artifact(
     lookup_url: &reqwest::Url,
     redirect: &reqwest::Response,
-) -> Result<Option<reqwest::Response>, String> {
+) -> Result<Option<reqwest::Response>, RemoteCacheRequestError> {
     let target = redirect_target(
         lookup_url,
         redirect
             .headers()
             .get(LOCATION)
             .and_then(|value| value.to_str().ok()),
-    )?;
-    let response = http_client()?.get(target).send().await.map_err(|error| {
-        format!(
-            "remote cache download failed: {}",
-            lpm_http::display_error(&error.without_url())
-        )
-    })?;
+    )
+    .map_err(RemoteCacheRequestError::Message)?;
+    let response = http_client()
+        .map_err(RemoteCacheRequestError::Message)?
+        .get(target)
+        .send()
+        .await
+        .map_err(|error| {
+            RemoteCacheRequestError::from_send("remote cache download failed", &error.without_url())
+        })?;
     // The download host's refusals aren't the cache server's: a 403 there
     // is the URL's, which may have expired, not the token's.
     match response.status() {
         StatusCode::OK => Ok(Some(response)),
         StatusCode::NOT_FOUND => Ok(None),
-        status => Err(format!(
+        status => Err(RemoteCacheRequestError::Message(format!(
             "remote cache download returned HTTP {}; continuing without it",
             status.as_u16()
-        )),
+        ))),
     }
 }
 
@@ -1394,6 +1468,7 @@ fn redirect_target(
 fn lookup_client() -> Result<Client, String> {
     lpm_http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
         .timeout(REMOTE_CACHE_TIMEOUT)
         .build()
         .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))
@@ -1401,6 +1476,7 @@ fn lookup_client() -> Result<Client, String> {
 
 fn http_client() -> Result<Client, String> {
     lpm_http::client_builder()
+        .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
         .timeout(REMOTE_CACHE_TIMEOUT)
         .build()
         .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))
@@ -1778,8 +1854,14 @@ pub fn warn_task_without_cache_env(task: &str) {
     }
 }
 
+/// Shows each distinct remote cache warning once a run, so a timeout early
+/// in the run doesn't hide a later signature or size problem.
 fn warn_once(message: &str) {
-    if !REMOTE_CACHE_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
+    let first = REMOTE_CACHE_WARNINGS_SHOWN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(message.to_owned());
+    if first {
         install_ui::warn_untrusted(message);
     }
 }
@@ -2341,6 +2423,106 @@ mod tests {
             .await
             .unwrap();
         server.verify().await;
+    }
+
+    fn closed_local_port() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}/v8")
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_cache_server_stops_the_cache_for_the_run() {
+        let client = test_client(&closed_local_port(), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        let restored = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+
+        let Err(message) = restored else {
+            panic!("an unreachable lookup is reported");
+        };
+        assert!(
+            message.starts_with("remote cache lookup failed"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("skipping the remote cache for the rest of this run"),
+            "{message}"
+        );
+        assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_upload_stops_uploads_but_leaves_lookups_on() {
+        let client = test_client(&closed_local_port(), MIB);
+        let mut artifact = tempfile::tempfile().unwrap();
+        artifact.write_all(b"artifact").unwrap();
+
+        let uploaded = client
+            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .await;
+
+        let message = uploaded.expect_err("an unreachable upload is reported");
+        assert!(
+            message.ends_with("skipping remote cache uploads for the rest of this run"),
+            "{message}"
+        );
+        assert!(client.limits.uploads_refused());
+        assert!(!client.limits.lookups_refused());
+    }
+
+    #[tokio::test]
+    async fn a_token_the_cache_server_rejects_stops_the_cache_for_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        let restored = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+
+        let Err(message) = restored else {
+            panic!("a rejected token is reported");
+        };
+        assert!(
+            message.starts_with("remote cache authorization failed"),
+            "{message}"
+        );
+        assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
+        let client = client.clone();
+        tokio::task::spawn_blocking(move || {
+            let project = tempfile::tempdir().unwrap();
+            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true));
+            assert!(restored.is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn each_distinct_remote_cache_warning_is_shown_once() {
+        let first = format!("remote cache test warning {}", std::process::id());
+        let second = format!("{first} (another)");
+        let shown = |message: &str| {
+            REMOTE_CACHE_WARNINGS_SHOWN
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(message)
+        };
+
+        warn_once(&first);
+        warn_once(&first);
+        warn_once(&second);
+
+        assert!(shown(&first) && shown(&second));
     }
 
     #[tokio::test]

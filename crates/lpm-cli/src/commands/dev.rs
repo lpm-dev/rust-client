@@ -2341,6 +2341,13 @@ pub async fn run(
         )?);
     }
 
+    let endpoint_required = https
+        || network
+        || tunnel
+        || lpm_config
+            .as_ref()
+            .and_then(|config| config.proxy.as_ref())
+            .is_some_and(|proxy| proxy.host.is_some());
     let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
     let script_project_dir = project_dir.to_path_buf();
     let script_env_mode = env_mode.map(str::to_string);
@@ -2360,6 +2367,7 @@ pub async fn run(
             script_config.as_deref(),
             lpm_runner::script::DevScriptEndpointOptions {
                 requested_port: child_requested_port,
+                discovery: lpm_runner::shell::EndpointDiscovery::required(endpoint_required),
                 stop_requested: script_stop_for_runner,
                 on_endpoint: Box::new(move |result| {
                     let _ = endpoint_tx.send(result);

@@ -33,8 +33,9 @@ pub use discovery::{
     discover_release_workspace_from_open_root, discover_workspace,
     discover_workspace_from_open_root, find_package_root, find_project_config_root,
     find_project_root, find_workspace_root, find_workspace_root_from_open_project,
-    is_same_directory, read_publish_projection_from_open_root, read_workspace_root_package,
-    workspace_declares_member, workspace_manifest_paths_from_open_root,
+    find_workspace_root_package, is_same_directory, read_publish_projection_from_open_root,
+    read_workspace_root_package, workspace_declares_member,
+    workspace_manifest_paths_from_open_root,
 };
 pub use error::WorkspaceError;
 pub use package_json::{

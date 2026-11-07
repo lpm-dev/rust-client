@@ -539,6 +539,59 @@ fn store_verify_fix_refreshes_security_cache_without_requiring_deep_flag() {
     assert_eq!(envelope["securityReanalyzed"], serde_json::json!(1));
 }
 
+#[test]
+fn store_verify_deep_reads_virtual_store_security_caches_from_the_shared_object() {
+    let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
+    seed_v2_entry(&project, "lodash", "4.17.21");
+    let link_package =
+        store_root(&project).join("v2/links/lodash@4.17.21+0123456789abcdef/node_modules/lodash");
+
+    let output = lpm(&project)
+        .args(["--json", "store", "verify", "--deep", "--fix"])
+        .output()
+        .expect("failed to run lpm store verify --deep --fix --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "store verify --deep --fix should pass on a freshly extracted object\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("store verify --json must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(
+        envelope["securityMismatches"],
+        serde_json::json!(0),
+        "{envelope}"
+    );
+    assert!(
+        !link_package.join(".lpm-security.json").exists(),
+        "--fix must not write security caches into link directories that installs never read"
+    );
+}
+
+#[test]
+fn store_verify_ignores_a_link_that_an_install_is_still_staging() {
+    let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
+    seed_v2_entry(&project, "lodash", "4.17.21");
+    std::fs::create_dir_all(
+        store_root(&project).join("v2/links/lodash@4.17.21+0123456789abcdef.tmp.0123456789abcdef"),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "store", "verify"])
+        .output()
+        .expect("failed to run lpm store verify --json");
+
+    assert!(
+        output.status.success(),
+        "a staging directory is not a corrupt link\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 // ─── clean subcommand ─────────────────────────────────────────────────
 
 #[test]
