@@ -26,7 +26,7 @@ use super::root_fs::{
 use lpm_common::LpmError;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Where the privileged forwarder's executable is copied from and to.
