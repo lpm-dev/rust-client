@@ -1381,6 +1381,7 @@ async fn dlx_engine_checks_distinguish_installed_and_skipped_optional_dependenci
 
 /// A scaffolder that writes a project, approves its dependency's build
 /// for pnpm, and installs it with npm, like `create-protoyard`.
+#[cfg(unix)]
 const SCAFFOLDER: &[u8] = br#"#!/usr/bin/env node
 const { spawnSync } = require('child_process');
 const fs = require('fs');

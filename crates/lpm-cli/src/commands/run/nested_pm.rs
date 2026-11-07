@@ -33,6 +33,10 @@ use crate::install_ui;
 /// nested LPM commands skip every marked PATH directory, which keeps a
 /// shim from finding itself even when a tool strips the environment.
 const SHIM_MARKER: &str = ".lpm-nested-pm-shims";
+/// File in the shim directory that names the LPM binary the shims belong
+/// to. A Windows launcher is that binary under a package manager's name,
+/// so the launcher's own path would start the launcher again.
+const LPM_BINARY_RECORD: &str = ".lpm-binary";
 /// File the shims append one [`LogEntry`] line to per command.
 pub(crate) const LOG_ENV: &str = "LPM_NESTED_PM_LOG";
 /// When the tool started, in nanoseconds since the Unix epoch.
@@ -175,10 +179,87 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
         )?;
     }
     #[cfg(windows)]
-    for manager in managers {
-        ensure_launcher(lpm, &dir.join(format!("{manager}.exe")))?;
+    {
+        record_lpm_binary(&dir, lpm)?;
+        for manager in managers {
+            ensure_launcher(lpm, &dir.join(format!("{manager}.exe")))?;
+        }
     }
     Ok(dir)
+}
+
+#[cfg(any(windows, test))]
+fn record_lpm_binary(shim_dir: &Path, lpm: &Path) -> Result<(), LpmError> {
+    let record = shim_dir.join(LPM_BINARY_RECORD);
+    let content = encode_path(lpm);
+    if lpm_common::read_file_capped(&record, MAX_SHIM_BYTES)
+        .is_ok_and(|existing| existing == content)
+    {
+        return Ok(());
+    }
+    lpm_common::write_file_atomic(&record, content)?;
+    Ok(())
+}
+
+/// The LPM binary to start for a translated command. Inside a Windows
+/// launcher that is the binary its shim directory records.
+fn lpm_binary_for(exe: PathBuf) -> Result<PathBuf, LpmError> {
+    let Some(shim_dir) = exe.parent().filter(|dir| is_shim_dir(dir)) else {
+        return Ok(exe);
+    };
+    lpm_common::read_file_capped(&shim_dir.join(LPM_BINARY_RECORD), MAX_SHIM_BYTES)
+        .ok()
+        .and_then(|bytes| decode_path(&bytes))
+        .filter(|lpm| lpm.is_absolute())
+        .ok_or_else(|| {
+            LpmError::Script(format!(
+                "{} does not name the LPM binary its launchers belong to; run the tool through lpm again",
+                shim_dir.display()
+            ))
+        })
+}
+
+#[cfg(any(windows, test))]
+fn encode_path(path: &Path) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        path.as_os_str().as_encoded_bytes().to_vec()
+    }
+}
+
+fn decode_path(bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        if !bytes.len().is_multiple_of(2) {
+            return None;
+        }
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Some(PathBuf::from(OsString::from_wide(&wide)))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
+    }
 }
 
 /// On Windows, a process started without a shell (Node's `spawn('bun')`)
@@ -949,7 +1030,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
     }
     let mut command = match plan {
         Plan::Lpm { args, dir } => {
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = Command::new(lpm_binary_for(std::env::current_exe()?)?);
             command
                 .args(args)
                 .current_dir(dir.unwrap_or(cwd))
@@ -1701,6 +1782,32 @@ mod tests {
         assert_eq!(launcher_manager(&shims.path().join("NPM.EXE")), Some("npm"));
         assert_eq!(launcher_manager(&shims.path().join("lpm.exe")), None);
         assert_eq!(launcher_manager(&elsewhere.path().join("bun.exe")), None);
+    }
+
+    #[test]
+    fn nested_lpm_from_a_launcher_starts_the_recorded_lpm_binary_not_the_launcher() {
+        let shims = tempfile::tempdir().unwrap();
+        let lpm = shims.path().parent().unwrap().join("bin/lpm.exe");
+        record_lpm_binary(shims.path(), &lpm).unwrap();
+        std::fs::write(shims.path().join(SHIM_MARKER), "").unwrap();
+
+        assert_eq!(lpm_binary_for(shims.path().join("npm.exe")).unwrap(), lpm);
+        let elsewhere = Path::new("/opt/lpm/lpm-rs").to_path_buf();
+        assert_eq!(lpm_binary_for(elsewhere.clone()).unwrap(), elsewhere);
+    }
+
+    #[test]
+    fn a_launcher_without_a_usable_lpm_binary_record_is_an_error() {
+        let shims = tempfile::tempdir().unwrap();
+        std::fs::write(shims.path().join(SHIM_MARKER), "").unwrap();
+        let launcher = shims.path().join("npm.exe");
+        assert!(lpm_binary_for(launcher.clone()).is_err(), "missing");
+
+        std::fs::write(shims.path().join(LPM_BINARY_RECORD), "").unwrap();
+        assert!(lpm_binary_for(launcher.clone()).is_err(), "empty");
+
+        record_lpm_binary(shims.path(), Path::new("relative/lpm")).unwrap();
+        assert!(lpm_binary_for(launcher).is_err(), "relative");
     }
 
     #[test]

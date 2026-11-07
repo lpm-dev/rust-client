@@ -2814,17 +2814,75 @@ fn typescript_alias_targets_ignore_multiple_wildcards() {
 
 /// PATH with a fake `npm` first, so shims exist and anything they hand to
 /// the real binary is visible without depending on the host's npm.
-#[cfg(unix)]
 fn path_with_fake_npm(project: &TempProject) -> std::ffi::OsString {
     let bin = project.home().join("fake-npm-bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let npm = bin.join("npm");
-    std::fs::write(&npm, "#!/bin/sh\necho \"fake-npm $*\"\n").unwrap();
-    make_executable(&npm);
+    if cfg!(windows) {
+        std::fs::write(bin.join("npm.cmd"), "@echo fake-npm %*\r\n").unwrap();
+    } else {
+        let npm = bin.join("npm");
+        std::fs::write(&npm, "#!/bin/sh\necho \"fake-npm $*\"\n").unwrap();
+        make_executable(&npm);
+    }
     std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .unwrap()
+}
+
+/// A process started without a shell, like Node's `spawnSync("npm")`,
+/// finds only `.com` and `.exe` files on Windows, so it reaches the shim
+/// directory's `.exe` launcher rather than its `.cmd` shim. Both the fake
+/// npm here and a real npm install are `npm.cmd`, so without the launcher
+/// the spawn fails.
+#[cfg(windows)]
+#[test]
+fn exec_tool_spawning_npm_without_a_shell_on_windows_is_routed_through_lpm() {
+    let project = TempProject::empty(r#"{"name":"exec-pm-windows","version":"1.0.0"}"#);
+    project.write_file("sub/package.json", r#"{"name":"sub","version":"1.0.0"}"#);
+    project.write_file(
+        "spawn-npm.js",
+        r#"const { spawnSync } = require("node:child_process");
+for (const [cwd, args] of [["sub", ["install"]], [".", ["--version"]]]) {
+  const result = spawnSync("npm", args, { cwd, stdio: "inherit" });
+  if (result.error) {
+    console.error(`spawn failed: ${result.error.message}`);
+    process.exit(1);
+  }
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+"#,
+    );
+    write_fake_local_bin(
+        &project,
+        "spawn-npm",
+        "",
+        "@echo off\r\nnode \"%~dp0..\\..\\spawn-npm.js\"\r\n",
+    );
+
+    let output = lpm(&project)
+        .env("PATH", path_with_fake_npm(&project))
+        .args(["exec", "spawn-npm"])
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("failed to run project-local binary via lpm exec");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(project.path().join("sub/lpm.lock").is_file(), "{stderr}");
+    assert!(stdout.contains("fake-npm --version"), "{stdout}");
+    assert!(
+        stderr.contains("npm install  →  handled by lpm install  (in sub)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("npm --version  →  ran npm directly  (in .)"),
+        "{stderr}"
+    );
 }
 
 #[cfg(unix)]
