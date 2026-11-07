@@ -1,0 +1,23 @@
+---
+source: tests/workflows/tests/approve_scripts.rs
+expression: entry
+---
+{
+  "name": "some-blocked-pkg",
+  "version": "2.0.0",
+  "integrity": "sha512-fixture-skip-verify",
+  "script_hash": "sha256-[script-hash]",
+  "phases_present": [
+    "postinstall"
+  ],
+  "binding_drift": false,
+  "static_tier": "green",
+  "reach": {
+    "findings": [],
+    "incomplete": false,
+    "requires_individual_review": false
+  },
+  "origins": [
+    "some-top-level"
+  ]
+}

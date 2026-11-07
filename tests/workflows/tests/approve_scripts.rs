@@ -534,6 +534,37 @@ fn approve_scripts_global_named_dry_run_preserves_pre_seeded_trust_file_byte_equ
 /// (false plain, true under --dry-run) so agents read the flag
 /// without branching on which subcommand produced the output.
 #[test]
+fn approve_scripts_global_list_json_entry_carries_static_tier_and_reach() {
+    let project = TempProject::empty("");
+    write_global_manifest(&project, "some-top-level", "1.0.0");
+    seed_global_install_blocked_state_with_real_hash(
+        &project,
+        "some-top-level",
+        "1.0.0",
+        "some-blocked-pkg",
+        "2.0.0",
+    );
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--list"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --list");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(parsed["schema_version"], 4);
+    let entry = &parsed["blocked"][0];
+    assert_eq!(entry["static_tier"], "green");
+    assert_eq!(entry["reach"]["requires_individual_review"], false);
+    insta::with_settings!({ filters => vec![(r"sha256-[0-9a-f]{64}", "sha256-[script-hash]")] }, {
+        insta::assert_json_snapshot!("approve_scripts_global_list_entry", entry);
+    });
+}
+
+#[test]
 fn approve_scripts_global_list_json_carries_dry_run_flag_on_both_axes() {
     let project = TempProject::empty("");
     write_global_manifest(&project, "some-top-level", "1.0.0");

@@ -373,6 +373,7 @@ pub fn all_scripted_packages_trusted_in_context(
         has_any_unbuilt = true;
 
         let reason = evaluate_trust_with_hash(
+            &pkg_dir,
             script_hash.as_deref(),
             name,
             version,

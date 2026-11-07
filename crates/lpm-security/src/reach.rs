@@ -10,7 +10,7 @@
 //!
 //! Findings that could widen what runs make the package [require
 //! individual review](ScriptReach::requires_individual_review): no bulk
-//! approval and no advisor approval. A nested npm or pnpm install already
+//! approval, no advisor approval and no green-tier auto-run. A nested npm or pnpm install already
 //! runs with dependency scripts disabled, so starting one is shown but does
 //! not gate. Yarn 2+ still builds dependencies a project marks
 //! `dependenciesMeta.<name>.built`, bun has no such setting, and corepack
@@ -40,6 +40,9 @@ pub const MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUN_SCRIPT_DEPTH: usize = 4;
 
 const SCRIPT_EXTENSIONS: &[&str] = &["js", "cjs", "mjs", "ts", "mts", "cts", "jsx", "tsx"];
+/// Shell scripts a lifecycle command can run; each line is classified
+/// with the static gate instead of following imports.
+const SHELL_EXTENSIONS: &[&str] = &["sh", "bash", "zsh", "ps1", "cmd", "bat"];
 
 /// Result of scanning one package. `Default` is "scanned, nothing found".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,9 +70,11 @@ pub enum ReachFinding {
         field: String,
         packages: Vec<String>,
     },
-    /// A lifecycle command runs one of the package's own scripts
-    /// (`npm run <script>`) whose command the static gate marks Red.
-    RunsRedScript { script: String, command: String },
+    /// A command the lifecycle reaches, but the static gate never saw as a
+    /// lifecycle phase, is one it marks Red: a package script run through
+    /// `npm run`, a line of a shell script, or a `binding.gyp` command
+    /// expansion. `source` names where the command came from.
+    RunsRedCommand { source: String, command: String },
 }
 
 /// Package managers whose nested installs can still run dependency
@@ -143,10 +148,10 @@ impl std::fmt::Display for ReachFinding {
             Self::EditsScriptApprovals { key, file } => {
                 write!(f, "edits script approvals: {key} ({file})")
             }
-            Self::RunsRedScript { script, command } => {
+            Self::RunsRedCommand { source, command } => {
                 write!(
                     f,
-                    "runs its own \"{script}\" script, which the static gate marks Red: {command}"
+                    "runs a command the static gate marks Red ({source}): {command}"
                 )
             }
             Self::ApprovesOtherPackages { field, packages } => {
@@ -168,7 +173,7 @@ impl ReachFinding {
     fn subject(&self) -> &str {
         match self {
             Self::StartsPackageManager { manager, .. } => manager,
-            Self::RunsRedScript { script, .. } => script,
+            Self::RunsRedCommand { command, .. } => command,
             Self::ChangesScriptPolicy { marker, .. } => marker,
             Self::EditsScriptApprovals { key, .. } => key,
             Self::ApprovesOtherPackages { field, .. } => field,
@@ -235,21 +240,41 @@ fn collect_entry_points(
     let Some(tokens) = shlex::split(&normalize_operators(body)) else {
         return;
     };
-    for token in &tokens {
-        if let Some(path) = script_file_token(token) {
-            insert_if_file(root, entries, path);
-        }
-    }
+    // `cd scripts && node install.js` runs `scripts/install.js`.
+    let mut dir = PathBuf::new();
     for command in commands(&tokens) {
         let Some((first, rest)) = command.split_first() else {
             continue;
         };
+        if matches!(first.as_str(), "cd" | "pushd") {
+            match rest.first().map(String::as_str) {
+                Some(target) if !target.starts_with(['/', '~', '$', '-']) => {
+                    match resolve_within_package(&dir.join(target)) {
+                        Some(next) => dir = next,
+                        None => reach.incomplete = true,
+                    }
+                }
+                Some(_) => reach.incomplete = true,
+                None => dir = PathBuf::new(),
+            }
+            continue;
+        }
+        for token in command {
+            if let Some(path) =
+                script_file_token(token).and_then(|path| resolve_within_package(&dir.join(path)))
+            {
+                insert_if_file(root, entries, path);
+            }
+        }
         if let Some(path) = bins
             .iter()
             .find(|(name, _)| name == first)
             .and_then(|(_, target)| normalize_relative_path(target))
         {
             insert_if_file(root, entries, path);
+        }
+        if NODE_GYP_COMMANDS.contains(&first.as_str()) {
+            scan_binding_gyp(root, &dir, entries, reach);
         }
         let Some(name) = run_script_target(first, rest) else {
             continue;
@@ -263,13 +288,61 @@ fn collect_entry_points(
         }
         // The static gate classifies lifecycle phases themselves; a script
         // they reach through `npm run` would otherwise go unclassified.
-        if crate::static_gate::classify(nested) == crate::triage::StaticTier::Red {
-            reach.record(ReachFinding::RunsRedScript {
-                script: name.to_string(),
-                command: nested.to_string(),
-            });
-        }
+        record_if_red(reach, &format!("script \"{name}\""), nested);
         collect_entry_points(root, nested, scripts, bins, depth + 1, entries, reach);
+    }
+}
+
+fn record_if_red(reach: &mut ScriptReach, source: &str, command: &str) {
+    if crate::static_gate::classify(command) == crate::triage::StaticTier::Red {
+        reach.record(ReachFinding::RunsRedCommand {
+            source: source.to_string(),
+            command: command.to_string(),
+        });
+    }
+}
+
+/// Commands that configure `binding.gyp`, which can run commands through
+/// `<!(…)` / `<!@(…)` expansions and name package scripts in its actions.
+const NODE_GYP_COMMANDS: &[&str] = &[
+    "node-gyp",
+    "node-gyp-build",
+    "node-gyp-build-optional-packages",
+    "prebuild-install",
+    "node-pre-gyp",
+];
+
+static GYP_COMMAND_EXPANSION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<!@?\(([^)]*)\)").expect("valid gyp command expansion regex"));
+
+static GYP_SCRIPT_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"['"]([^'"\s]+\.(?:js|cjs|mjs|ts|sh))['"]"#).expect("valid gyp script path regex")
+});
+
+fn scan_binding_gyp(
+    root: &Path,
+    dir: &Path,
+    entries: &mut BTreeSet<PathBuf>,
+    reach: &mut ScriptReach,
+) {
+    let gyp = dir.join("binding.gyp");
+    let Ok((content, _)) = lpm_common::read_text_regular_file_capped_with_metadata(
+        &root.join(&gyp),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) else {
+        return;
+    };
+    let source = path_to_slash_string(&gyp);
+    scan_bytes(content.as_bytes(), &source, reach);
+    for capture in GYP_COMMAND_EXPANSION.captures_iter(content.as_bytes()) {
+        let command = String::from_utf8_lossy(&capture[1]);
+        record_if_red(reach, &source, &command);
+    }
+    for capture in GYP_SCRIPT_PATH.captures_iter(content.as_bytes()) {
+        let path = String::from_utf8_lossy(&capture[1]);
+        if let Some(path) = resolve_within_package(&dir.join(path.as_ref())) {
+            insert_if_file(root, entries, path);
+        }
     }
 }
 
@@ -317,7 +390,7 @@ fn run_script_target<'a>(command: &str, rest: &'a [String]) -> Option<&'a str> {
 fn script_file_token(token: &str) -> Option<PathBuf> {
     let token = token.split_once('=').map_or(token, |(_, value)| value);
     let extension = Path::new(token).extension()?.to_str()?;
-    if !SCRIPT_EXTENSIONS.contains(&extension)
+    if !(SCRIPT_EXTENSIONS.contains(&extension) || SHELL_EXTENSIONS.contains(&extension))
         || token.starts_with('/')
         || token.starts_with('~')
         || token.starts_with('$')
@@ -349,10 +422,14 @@ fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) 
     let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
     let mut files = 0usize;
     let mut total_bytes = 0u64;
+    // A helper module can hold the `spawnSync` while another file names
+    // the package manager, so process APIs count across the package.
+    let mut spawns = false;
+    let mut managers: Vec<(String, String)> = Vec::new();
     while let Some(relative) = queue.pop_front() {
         if files == MAX_FILES {
             reach.incomplete = true;
-            return;
+            break;
         }
         files += 1;
         let Some(bytes) = read_contained(root, &relative, &mut total_bytes, reach) else {
@@ -360,11 +437,47 @@ fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) 
         };
         let display = path_to_slash_string(&relative);
         scan_bytes(&bytes, &display, reach);
+        let is_shell = relative
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| SHELL_EXTENSIONS.contains(&ext));
+        if is_shell {
+            scan_shell_lines(&bytes, &display, reach);
+            continue;
+        }
+        spawns |= SPAWN_API.is_match(&bytes);
+        for capture in PACKAGE_MANAGER_LITERAL.captures_iter(&bytes) {
+            managers.push((
+                String::from_utf8_lossy(&capture[1]).into_owned(),
+                display.clone(),
+            ));
+        }
         let base = relative.parent().unwrap_or(Path::new(""));
         for candidate in local_imports(root, &bytes, base, reach) {
             if seen.insert(candidate.clone()) {
                 queue.push_back(candidate);
             }
+        }
+    }
+    if spawns {
+        for (manager, file) in managers {
+            reach.record(ReachFinding::StartsPackageManager { manager, file });
+        }
+    }
+}
+
+/// Each command line of a shell script, classified like a lifecycle
+/// phase.
+fn scan_shell_lines(bytes: &[u8], file: &str, reach: &mut ScriptReach) {
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let line = line.trim();
+        let comment = line.starts_with('#')
+            || line.starts_with("::")
+            || line
+                .get(..4)
+                .is_some_and(|rem| rem.eq_ignore_ascii_case("rem "));
+        if !line.is_empty() && !comment {
+            record_if_red(reach, file, line);
         }
     }
 }
@@ -406,7 +519,7 @@ fn read_contained(
 fn local_imports(root: &Path, bytes: &[u8], base: &Path, reach: &mut ScriptReach) -> Vec<PathBuf> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
-    for regex in import_regexes() {
+    for regex in import_regexes().iter().chain(TEMPLATE_IMPORTS.iter()) {
         for capture in regex.captures_iter(&text) {
             let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
@@ -429,6 +542,16 @@ fn local_imports(root: &Path, bytes: &[u8], base: &Path, reach: &mut ScriptReach
     }
     out
 }
+
+/// ``require(`./x`)`` / ``import(`./x`)`` with a template literal that has
+/// no substitutions name a file as surely as a quoted string.
+static TEMPLATE_IMPORTS: LazyLock<[regex::Regex; 2]> = LazyLock::new(|| {
+    [
+        r"require\s*\(\s*`([^`$]+)`\s*\)",
+        r"import\s*\(\s*`([^`$]+)`\s*\)",
+    ]
+    .map(|pattern| regex::Regex::new(pattern).expect("valid template import regex"))
+});
 
 /// Lexically resolve `path` inside the package. `Some("")` is the
 /// package root itself (`require('../')` from a subdirectory); `None`
@@ -472,6 +595,12 @@ fn resolve_import(root: &Path, path: &Path, hops: usize) -> Option<PathBuf> {
         return std::iter::once(path.to_path_buf())
             .chain(swaps.iter().map(|swap| path.with_extension(swap)))
             .find(|candidate| is_file(candidate));
+    }
+    // Node loads `.json` as data and `.node` as a native addon; any
+    // other existing file, extensionless included, as JavaScript.
+    let data_or_native = matches!(extension, Some("json" | "node"));
+    if !path.as_os_str().is_empty() && !data_or_native && is_file(path) {
+        return Some(path.to_path_buf());
     }
     if !path.as_os_str().is_empty()
         && let Some(found) = SCRIPT_EXTENSIONS
@@ -538,16 +667,8 @@ static SCRIPT_APPROVAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid script approval regex")
 });
 
+/// Script-policy markers and approval keys in any scanned file.
 fn scan_bytes(bytes: &[u8], file: &str, reach: &mut ScriptReach) {
-    if SPAWN_API.is_match(bytes) {
-        for capture in PACKAGE_MANAGER_LITERAL.captures_iter(bytes) {
-            let manager = String::from_utf8_lossy(&capture[1]).into_owned();
-            reach.record(ReachFinding::StartsPackageManager {
-                manager,
-                file: file.to_string(),
-            });
-        }
-    }
     for found in SCRIPT_POLICY_MARKER.find_iter(bytes) {
         reach.record(ReachFinding::ChangesScriptPolicy {
             marker: canonical_policy_marker(found.as_bytes()).to_string(),
@@ -744,12 +865,12 @@ mod tests {
         assert_eq!(
             reach.findings,
             [
-                ReachFinding::StartsPackageManager {
-                    manager: "pnpm".into(),
-                    file: "bin/onboard-core.mjs".into(),
-                },
                 ReachFinding::EditsScriptApprovals {
                     key: "allowBuilds".into(),
+                    file: "bin/onboard-core.mjs".into(),
+                },
+                ReachFinding::StartsPackageManager {
+                    manager: "pnpm".into(),
                     file: "bin/onboard-core.mjs".into(),
                 },
             ]
@@ -919,10 +1040,157 @@ mod tests {
         assert!(reach.requires_individual_review());
         assert_eq!(
             reach.findings,
-            [ReachFinding::RunsRedScript {
-                script: "setup".into(),
+            [ReachFinding::RunsRedCommand {
+                source: "script \"setup\"".into(),
                 command: "bun install".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn extensionless_file_import_is_scanned() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"node setup.js"}}),
+            &[
+                ("setup.js", "require('./helper');\n"),
+                ("helper", "pkg.trustedDependencies = ['other'];\n"),
+            ],
+        );
+        assert_eq!(
+            reach.findings,
+            [ReachFinding::EditsScriptApprovals {
+                key: "trustedDependencies".into(),
+                file: "helper".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn imported_json_data_is_not_scanned_as_code() {
+        let reach = scan(
+            serde_json::json!({
+                "name":"x",
+                "scripts":{"postinstall":"node setup.js"},
+                "devDependencies":{"esbuild":"^0.28.0"},
+                "allowScripts":{"esbuild@0.28.2":true}
+            }),
+            &[("setup.js", "const pkg = require('./package.json');\n")],
+        );
+        assert_eq!(reach, ScriptReach::default());
+    }
+
+    #[test]
+    fn template_literal_import_is_followed() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"node scripts/setup.mjs"}}),
+            &[
+                (
+                    "scripts/setup.mjs",
+                    "const m = await import(`../bin/onboard.mjs`);\n",
+                ),
+                (
+                    "bin/onboard.mjs",
+                    "write(profile, 'allowBuilds:\\n  x: true');\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            reach.findings,
+            [ReachFinding::EditsScriptApprovals {
+                key: "allowBuilds".into(),
+                file: "bin/onboard.mjs".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn package_manager_named_beside_a_spawn_helper_in_another_file_is_found() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"node install.js"}}),
+            &[
+                ("install.js", "require('./run.js')('bun', ['install']);\n"),
+                (
+                    "run.js",
+                    "const { spawnSync } = require('child_process');\nmodule.exports = (cmd, args) => spawnSync(cmd, args);\n",
+                ),
+            ],
+        );
+        assert!(reach.requires_individual_review(), "{reach:?}");
+        assert!(
+            reach
+                .findings
+                .contains(&ReachFinding::StartsPackageManager {
+                    manager: "bun".into(),
+                    file: "install.js".into(),
+                })
+        );
+    }
+
+    #[test]
+    fn working_directory_change_in_the_lifecycle_command_is_followed() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"cd scripts && node install.js"}}),
+            &[(
+                "scripts/install.js",
+                "pkg.allowScripts = { other: true };\n",
+            )],
+        );
+        assert_eq!(
+            reach.findings,
+            [ReachFinding::EditsScriptApprovals {
+                key: "allowScripts".into(),
+                file: "scripts/install.js".into(),
+            }]
+        );
+        let escaping = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"cd .. && node install.js"}}),
+            &[],
+        );
+        assert!(escaping.incomplete);
+    }
+
+    #[test]
+    fn shell_script_entry_is_classified_line_by_line() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"postinstall":"sh ./install.sh"}}),
+            &[(
+                "install.sh",
+                "#!/bin/sh\n# bun install is mentioned in a comment\nset -e\nbun install\n",
+            )],
+        );
+        assert!(reach.requires_individual_review());
+        assert_eq!(
+            reach.findings,
+            [ReachFinding::RunsRedCommand {
+                source: "install.sh".into(),
+                command: "bun install".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn binding_gyp_command_expansions_and_scripts_are_scanned_for_node_gyp() {
+        let reach = scan(
+            serde_json::json!({"name":"x","scripts":{"install":"node-gyp rebuild"}}),
+            &[
+                (
+                    "binding.gyp",
+                    "{'targets':[{'target_name':'x','variables':{'v':'<!(bun install)'},'actions':[{'action':['node','scripts/gen.js']}]}]}\n",
+                ),
+                ("scripts/gen.js", "pkg.allowBuilds = {};\n"),
+            ],
+        );
+        assert!(reach.findings.contains(&ReachFinding::RunsRedCommand {
+            source: "binding.gyp".into(),
+            command: "bun install".into(),
+        }));
+        assert!(
+            reach
+                .findings
+                .contains(&ReachFinding::EditsScriptApprovals {
+                    key: "allowBuilds".into(),
+                    file: "scripts/gen.js".into(),
+                })
         );
     }
 

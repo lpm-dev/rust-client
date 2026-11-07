@@ -983,15 +983,29 @@ pub(super) fn print_origin_group_card(
         println!(
             "{}",
             install_ui::terminal_line!(
-                "    {} @ {}{}",
+                "    {} @ {}{}{}",
                 &row.name,
                 install_ui::dim(&row.version),
                 drift,
+                super::display::reach_marker(row.reach.as_ref()),
             )
         );
     }
     if rows.len() > 8 {
-        println!("    {}", format!("+{} more", rows.len() - 8).dimmed());
+        let hidden_review = rows[8..]
+            .iter()
+            .filter(|row| {
+                row.reach
+                    .as_ref()
+                    .is_none_or(lpm_security::reach::ScriptReach::requires_individual_review)
+            })
+            .count();
+        let note = if hidden_review == 0 {
+            String::new()
+        } else {
+            format!(", {hidden_review} needing individual review")
+        };
+        println!("    {}", format!("+{} more{note}", rows.len() - 8).dimmed());
     }
     println!();
 }
@@ -1364,5 +1378,6 @@ pub(super) fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlo
             install_ui::terminal_line!("    script_hash: {}", install_ui::dim(sh))
         );
     }
+    super::display::print_reach_lines(row.reach.as_ref());
     println!();
 }

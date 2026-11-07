@@ -933,21 +933,22 @@ pub(super) fn collect_amber_requests_from_materializations(
         {
             continue;
         }
-        // Code that reaches other packages' script approvals is a human
-        // decision; a model reading untrusted text must not make it.
-        if lpm_security::reach::analyze(pkg_dir, &bodies).requires_individual_review() {
-            continue;
-        }
         let amber_phases: Vec<(String, String)> = bodies
-            .into_iter()
+            .iter()
             .filter(|(_, body)| {
                 matches!(
                     classify_for_execution(body),
                     StaticTier::Amber | StaticTier::AmberLlm
                 )
             })
+            .cloned()
             .collect();
         if amber_phases.is_empty() {
+            continue;
+        }
+        // Code that reaches other packages' script approvals is a human
+        // decision; a model reading untrusted text must not make it.
+        if lpm_security::reach::analyze(pkg_dir, &bodies).requires_individual_review() {
             continue;
         }
         // The integrity slot carries source identity. Workspace /

@@ -5,13 +5,13 @@ expression: "row[\"reach\"]"
 {
   "findings": [
     {
-      "kind": "starts-package-manager",
-      "manager": "pnpm",
+      "kind": "edits-script-approvals",
+      "key": "allowBuilds",
       "file": "bin/onboard.mjs"
     },
     {
-      "kind": "edits-script-approvals",
-      "key": "allowBuilds",
+      "kind": "starts-package-manager",
+      "manager": "pnpm",
       "file": "bin/onboard.mjs"
     }
   ],
