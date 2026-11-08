@@ -204,6 +204,47 @@ fn unix_forwarder_guard_resolves_each_listener_the_live_user_daemon_advertises()
 
 #[cfg(unix)]
 #[test]
+fn unix_forwarder_guard_parses_the_daemon_state_again_only_after_it_changes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("proxy.json");
+    let write = |addr: &str| {
+        write_state_file(
+            &state_path,
+            &forwarder_state(std::process::id(), Some(addr), None),
+        )
+        .unwrap();
+    };
+    write("https://127.0.0.1:52443");
+    let guard =
+        UnixForwarderGuard::new(&state_path, current_effective_uid(), ForwarderTarget::Https);
+
+    for _ in 0..3 {
+        let connection = guard.clone();
+        assert_eq!(
+            connection.resolve().unwrap(),
+            "127.0.0.1:52443".parse().unwrap()
+        );
+    }
+    assert_eq!(guard.state_parses(), 1);
+
+    write("https://127.0.0.1:53443");
+    assert_eq!(guard.resolve().unwrap(), "127.0.0.1:53443".parse().unwrap());
+    assert_eq!(guard.state_parses(), 2);
+
+    // The ownership and mode checks still run for every connection.
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let error = guard.resolve().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must not be group/world accessible")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn unix_forwarder_guard_rejects_world_accessible_state_file() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2522,6 +2563,87 @@ async fn tls_frontend_times_out_an_idle_http_header_after_handshake() {
             ) => {}
         other => panic!("unexpected TLS header-timeout read result: {other:?}"),
     }
+    frontend.shutdown();
+}
+
+async fn tls_frontend_to(upstream_port: u16) -> (tempfile::TempDir, HttpProxyHandle) {
+    let project = tempfile::tempdir().unwrap();
+    write_project_cert(project.path(), &["localhost"]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cert_dir = project.path().join(".lpm").join("certs");
+    let frontend = start_tls_frontend_on_listener(
+        listener,
+        &cert_dir.join("cert.pem"),
+        &cert_dir.join("key.pem"),
+        lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port),
+    )
+    .await
+    .unwrap();
+    (project, frontend)
+}
+
+fn https_client(http1_only: bool) -> reqwest::Client {
+    let builder = reqwest::Client::builder()
+        .tls_danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5));
+    let builder = if http1_only {
+        builder.http1_only()
+    } else {
+        builder
+    };
+    builder.build().unwrap()
+}
+
+#[tokio::test]
+async fn tls_frontend_serves_http2_to_a_browser_that_offers_it() {
+    let (_project, frontend) = tls_frontend_to(spawn_echo_upstream().await).await;
+    let url = format!("https://localhost:{}/module.js?v=1", frontend.port());
+
+    let response = https_client(false).get(&url).send().await.unwrap();
+
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(
+        response.text().await.unwrap(),
+        format!(
+            "GET /module.js?v=1  host=localhost:{} proto=https",
+            frontend.port()
+        )
+    );
+    let http1 = https_client(true).get(&url).send().await.unwrap();
+    assert_eq!(http1.version(), reqwest::Version::HTTP_11);
+    frontend.shutdown();
+}
+
+#[tokio::test]
+async fn an_http2_request_reaches_the_dev_server_with_its_cookies_in_one_header() {
+    use axum::Router;
+    use axum::routing::any;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(any(|request: axum::extract::Request| async move {
+        let cookies: Vec<_> = request
+            .headers()
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect();
+        cookies.join(" | ")
+    }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (_project, frontend) = tls_frontend_to(upstream_port).await;
+
+    // HTTP/2 lets a client send each cookie as its own header field.
+    let response = https_client(false)
+        .get(format!("https://localhost:{}/", frontend.port()))
+        .header("cookie", "session=abc")
+        .header("cookie", "theme=dark")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.text().await.unwrap(), "session=abc; theme=dark");
     frontend.shutdown();
 }
 

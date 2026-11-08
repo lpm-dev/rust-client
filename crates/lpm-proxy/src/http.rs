@@ -433,12 +433,7 @@ pub(crate) async fn proxy_http_request_inner(
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
-    let Some(host_header) = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-    else {
+    let Some(host_header) = request_host(&request) else {
         return Err((StatusCode::MISDIRECTED_REQUEST, "missing Host header").into_response());
     };
     let upstream = state
@@ -478,11 +473,15 @@ pub(crate) async fn proxy_http_request_inner(
         .uri(upstream_url);
 
     for (name, value) in &parts.headers {
-        if is_forwardable_http_header(name.as_str())
+        if name != header::COOKIE
+            && is_forwardable_http_header(name.as_str())
             && !connection_header_nominates(&parts.headers, name)
         {
             builder = builder.header(name.clone(), value.clone());
         }
+    }
+    if let Some(cookie) = joined_cookie_header(&parts.headers) {
+        builder = builder.header(header::COOKIE, cookie);
     }
     builder = builder
         .header(header::HOST, upstream.authority())
@@ -706,6 +705,40 @@ fn bad_gateway_response(message: &'static str) -> axum::response::Response {
 #[cfg(test)]
 pub(crate) fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// The host a request names: its `Host` header, or, over HTTP/2, which
+/// carries it as `:authority`, the URI's authority.
+fn request_host(request: &axum::extract::Request) -> Option<String> {
+    request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+        .map(str::to_string)
+}
+
+/// One `Cookie` header for the dev server. HTTP/2 lets a client send each
+/// cookie as its own field, which HTTP/1.1 servers may not combine
+/// (RFC 9113 section 8.2.3).
+fn joined_cookie_header(headers: &axum::http::HeaderMap) -> Option<axum::http::HeaderValue> {
+    let mut cookies = headers.get_all(axum::http::header::COOKIE).iter();
+    let first = cookies.next()?;
+    let Some(second) = cookies.next() else {
+        return Some(first.clone());
+    };
+    let mut joined = Vec::with_capacity(first.len() + second.len() + 2);
+    joined.extend_from_slice(first.as_bytes());
+    for value in std::iter::once(second).chain(cookies) {
+        joined.extend_from_slice(b"; ");
+        joined.extend_from_slice(value.as_bytes());
+    }
+    axum::http::HeaderValue::from_bytes(&joined).ok()
 }
 
 fn is_forwardable_http_header(name: &str) -> bool {

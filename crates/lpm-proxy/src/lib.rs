@@ -94,8 +94,7 @@ pub(crate) use platform::{current_effective_uid, unix_control_peer_uid, validate
 pub(crate) use platform::{ensure_lpm_root, process_is_running};
 #[cfg(unix)]
 pub(crate) use platform::{
-    process_owner_uid, read_forwarder_daemon_state, validate_forwarder_daemon_state,
-    validate_unix_control_peer,
+    process_owner_uid, validate_forwarder_daemon_state, validate_unix_control_peer,
 };
 #[cfg(all(test, unix, debug_assertions))]
 pub(crate) use protocol::read_proxy_request;

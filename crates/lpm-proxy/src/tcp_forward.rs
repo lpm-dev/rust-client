@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use std::sync::{Mutex, PoisonError};
 
 /// Loopback TCP relay rule from one listener to one fixed backend.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -100,11 +102,50 @@ impl fmt::Display for ForwarderTarget {
 /// the user daemon's state file, so the daemon may bind any free loopback port
 /// and the forwarder follows it across restarts.
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct UnixForwarderGuard {
     state_path: PathBuf,
     expected_uid: u32,
     target: ForwarderTarget,
+    /// The state the daemon last wrote, by the identity of the file that held
+    /// it, shared by the guard's clones. A connection reads and parses the
+    /// file again only after it changes.
+    parsed: Arc<Mutex<Option<ParsedDaemonState>>>,
+    #[cfg(test)]
+    parses: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ParsedDaemonState {
+    identity: StateFileIdentity,
+    state: Arc<ProxyDaemonState>,
+}
+
+/// What changes when the state file is rewritten or replaced: its inode,
+/// size, and modification and change times to the nanosecond.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateFileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl StateFileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -115,14 +156,21 @@ impl UnixForwarderGuard {
             state_path: state_path.into(),
             expected_uid,
             target,
+            parsed: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            parses: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     /// Resolve the backend the configured user daemon currently advertises for
     /// this guard's listener, after checking that the state file and the daemon
-    /// process both belong to the expected user.
+    /// process both belong to the expected user. Those checks run for every
+    /// connection; only reading and parsing an unchanged file is skipped.
     pub fn resolve(&self) -> Result<SocketAddr, ProxyError> {
-        let state = read_forwarder_daemon_state(&self.state_path, self.expected_uid)?;
+        let (file, metadata) =
+            crate::platform::open_forwarder_daemon_state(&self.state_path, self.expected_uid)?;
+        let identity = StateFileIdentity::of(&metadata);
+        let state = self.parsed_state(identity, file, &metadata)?;
         validate_forwarder_daemon_state(
             &state,
             self.expected_uid,
@@ -130,6 +178,36 @@ impl UnixForwarderGuard {
             process_is_running,
             process_owner_uid,
         )
+    }
+
+    fn parsed_state(
+        &self,
+        identity: StateFileIdentity,
+        file: std::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> Result<Arc<ProxyDaemonState>, ProxyError> {
+        let mut parsed = self.parsed.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(cached) = parsed.as_ref().filter(|cached| cached.identity == identity) {
+            return Ok(Arc::clone(&cached.state));
+        }
+        #[cfg(test)]
+        self.parses
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let state = Arc::new(crate::platform::read_open_forwarder_daemon_state(
+            file,
+            metadata,
+            &self.state_path,
+        )?);
+        *parsed = Some(ParsedDaemonState {
+            identity,
+            state: Arc::clone(&state),
+        });
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_parses(&self) -> usize {
+        self.parses.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
