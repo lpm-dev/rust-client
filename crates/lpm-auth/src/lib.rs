@@ -480,12 +480,67 @@ fn clear_stored_credential_under_store_lock(
     kind: CredentialKind,
     keychain_clear: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    let cleared = clear_credential_spelling_under_store_lock(registry, kind, keychain_clear);
+    combine_credential_results([cleared, retire_slashed_login_under_store_lock(registry)])
+}
+
+/// Clears the `kind` credential stored under exactly this spelling of the
+/// registry, leaving a login under its trailing-slash spelling alone.
+fn clear_credential_spelling_under_store_lock(
+    registry: &str,
+    kind: CredentialKind,
+    keychain_clear: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let file_key = kind.file_key(registry);
     // A failed delete must leave surviving backend bytes unreadable.
     credential_authority::set(registry, kind, CredentialAuthority::Revoked)
         .map_err(|error| format!("failed to record credential revocation: {error}"))?;
     combine_credential_results([keychain_clear(), clear_token_from_file(&file_key)])?;
     credential_authority::clear(registry, kind)
+}
+
+/// Removes a login an earlier release stored under the registry's
+/// trailing-slash spelling. Once a credential under the registry key is
+/// cleared, that login would otherwise look like the one to move there.
+fn retire_slashed_login_under_store_lock(registry: &str) -> Result<(), String> {
+    if SLASHED_REGISTRY_KEYS.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    let slashed = slashed_registry(registry);
+    with_slashed_registry_keys(|| {
+        combine_credential_results([
+            clear_credential_spelling_under_store_lock(&slashed, CredentialKind::Access, || {
+                clear_credential_from_keychain(&slashed, CredentialKind::Access)
+            }),
+            clear_credential_spelling_under_store_lock(&slashed, CredentialKind::Refresh, || {
+                clear_credential_from_keychain(&slashed, CredentialKind::Refresh)
+            }),
+            clear_token_expiry_checked(&slashed),
+        ])
+    })
+}
+
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "tests keep the system keychain untouched"
+    )
+)]
+fn clear_credential_from_keychain(registry: &str, kind: CredentialKind) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = (registry, kind);
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    match kind {
+        CredentialKind::Access => clear_token_from_keychain(registry),
+        CredentialKind::Refresh => {
+            clear_password_from_keychain_account(&scoped_refresh_account(registry))
+        }
+    }
 }
 
 fn with_credential_store_lock<T, E: From<String>>(
@@ -554,17 +609,9 @@ pub(crate) fn clear_stored_access_token_unlocked(registry_url: &str) -> Result<(
 }
 
 fn clear_stored_access_token_under_store_lock(registry_url: &str) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || Ok(()))
-    }
-
-    #[cfg(not(test))]
-    {
-        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || {
-            clear_token_from_keychain(registry_url)
-        })
-    }
+    clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || {
+        clear_credential_from_keychain(registry_url, CredentialKind::Access)
+    })
 }
 
 pub(crate) fn clear_stored_refresh_token_unlocked(registry_url: &str) -> Result<(), String> {
@@ -572,18 +619,9 @@ pub(crate) fn clear_stored_refresh_token_unlocked(registry_url: &str) -> Result<
 }
 
 fn clear_stored_refresh_token_under_store_lock(registry_url: &str) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || Ok(()))
-    }
-
-    #[cfg(not(test))]
-    {
-        let account = scoped_refresh_account(registry_url);
-        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || {
-            clear_password_from_keychain_account(&account)
-        })
-    }
+    clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || {
+        clear_credential_from_keychain(registry_url, CredentialKind::Refresh)
+    })
 }
 
 pub(crate) fn clear_rejected_refresh_session_if_current(
@@ -632,17 +670,7 @@ pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), Strin
     let access_result = clear_stored_access_token_unlocked(registry_url);
     let refresh_result = clear_stored_refresh_token_unlocked(registry_url);
     let expiry_result = clear_token_expiry_checked(registry_url);
-    // A login that an earlier release stored under the registry's
-    // trailing-slash spelling, and that nothing has read since, goes too.
-    let slashed = slashed_registry(registry_url);
-    let slashed_result = with_slashed_registry_keys(|| {
-        combine_credential_results([
-            clear_stored_access_token_unlocked(&slashed),
-            clear_stored_refresh_token_unlocked(&slashed),
-            clear_token_expiry_checked(&slashed),
-        ])
-    });
-    combine_credential_results([access_result, refresh_result, expiry_result, slashed_result])
+    combine_credential_results([access_result, refresh_result, expiry_result])
 }
 
 /// Clear all local login state for a registry.
@@ -700,18 +728,7 @@ pub fn clear_rejected_legacy_session_if_current(
             }
 
             let expiry_result = clear_token_expiry_checked(registry_url);
-            #[cfg(test)]
-            let access_result = clear_stored_credential_under_store_lock(
-                registry_url,
-                CredentialKind::Access,
-                || Ok(()),
-            );
-            #[cfg(not(test))]
-            let access_result = clear_stored_credential_under_store_lock(
-                registry_url,
-                CredentialKind::Access,
-                || clear_token_from_keychain(registry_url),
-            );
+            let access_result = clear_stored_access_token_under_store_lock(registry_url);
             combine_credential_results([access_result, expiry_result])?;
             Ok(true)
         })
@@ -948,7 +965,7 @@ fn get_stored_credential_with_backend_result(
     with_credential_store_lock(|| {
         match get_stored_credential_with_backend_unlocked(registry, kind, notice)? {
             Some(stored) => Ok(Some(stored)),
-            None => move_slashed_login_credential_unlocked(registry, kind),
+            None => move_slashed_login_unlocked(registry, kind),
         }
     })
 }
@@ -973,14 +990,13 @@ pub(crate) fn registry_key(registry: &str) -> &str {
 /// Runs `action` with credential keys derived from the registry exactly as
 /// given, as releases did before keys dropped the trailing slash.
 fn with_slashed_registry_keys<T>(action: impl FnOnce() -> T) -> T {
-    struct Restore;
+    struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
-            SLASHED_REGISTRY_KEYS.with(|slashed| slashed.set(false));
+            SLASHED_REGISTRY_KEYS.with(|slashed| slashed.set(self.0));
         }
     }
-    SLASHED_REGISTRY_KEYS.with(|slashed| slashed.set(true));
-    let _restore = Restore;
+    let _restore = Restore(SLASHED_REGISTRY_KEYS.with(|slashed| slashed.replace(true)));
     action()
 }
 
@@ -990,61 +1006,100 @@ fn slashed_registry(registry: &str) -> String {
     format!("{}/", registry.trim_end_matches('/'))
 }
 
-/// Moves a credential that a login with a trailing-slash registry stored
-/// before keys dropped the slash, with its expiry metadata, to the key the
-/// registry has now. The caller holds the credential store lock.
-fn move_slashed_login_credential_unlocked(
+/// Moves a login that a release keying credentials by the registry's exact
+/// spelling stored under its trailing-slash spelling to the key the registry
+/// has now, and returns its `kind` credential. The access and refresh tokens
+/// move together with the session metadata, and only while the registry key
+/// holds no login of its own, so credentials from two logins never pair up.
+/// The caller holds the credential store lock and found no `kind` credential
+/// under the registry key.
+fn move_slashed_login_unlocked(
     registry: &str,
     kind: CredentialKind,
 ) -> Result<Option<StoredToken>, CredentialReadError> {
     let slashed = slashed_registry(registry);
-    let Some(stored) = with_slashed_registry_keys(|| {
-        get_stored_credential_with_backend_unlocked(&slashed, kind, || {})
-    })?
-    else {
+    let read_slashed = |kind| {
+        with_slashed_registry_keys(|| {
+            get_stored_credential_with_backend_unlocked(&slashed, kind, || {})
+        })
+    };
+    let Some(requested) = read_slashed(kind)? else {
         return Ok(None);
     };
     let canonical = registry.trim_end_matches('/');
-    let written = set_credential_with_keychain_writer_unlocked(
-        canonical,
-        kind,
-        &stored.token,
-        || match kind {
-            CredentialKind::Access => set_token_in_keychain(canonical, &stored.token),
-            CredentialKind::Refresh => {
-                set_password_in_keychain_account(&scoped_refresh_account(canonical), &stored.token)
-            }
-        },
-    );
-    let backend = match written {
+    // A record under the registry key, even a revocation a failed clear left,
+    // means that key's login was in use, so the slashed one isn't adopted.
+    for kind in [kind, kind.other()] {
+        if credential_authority::read(canonical, kind)?.is_some() {
+            return Ok(None);
+        }
+    }
+    if get_stored_credential_with_backend_unlocked(canonical, kind.other(), || {})?.is_some() {
+        return Ok(None);
+    }
+    let other = read_slashed(kind.other())?;
+
+    let backend = match write_moved_credential_unlocked(canonical, kind, &requested.token) {
         Ok(backend) => backend,
         Err(error) => {
-            tracing::warn!("could not move a login stored under {slashed}: {error}");
-            return Ok(Some(stored));
+            tracing::warn!("could not move the login stored under {slashed}: {error}");
+            return Ok(Some(requested));
         }
     };
+    if let Some(other) = &other
+        && let Err(error) = write_moved_credential_unlocked(canonical, kind.other(), &other.token)
+    {
+        tracing::warn!("could not move the login stored under {slashed}: {error}");
+        if let Err(error) = clear_credential_spelling(canonical, kind) {
+            tracing::warn!(
+                "could not undo a partial move of the login stored under {slashed}: {error}"
+            );
+        }
+        return Ok(Some(requested));
+    }
     if let Err(error) = mutate_token_expiries(HomeWrite::AddsNothing, |expiries| {
         match expiries.remove(&slashed) {
             Some(metadata) => {
-                expiries.entry(canonical.to_owned()).or_insert(metadata);
+                expiries.insert(canonical.to_owned(), metadata);
                 true
             }
-            None => false,
+            None => expiries.remove(canonical).is_some(),
         }
     }) {
         tracing::warn!("could not move the session metadata stored under {slashed}: {error}");
     }
-    let cleared = with_slashed_registry_keys(|| match kind {
-        CredentialKind::Access => clear_stored_access_token_under_store_lock(&slashed),
-        CredentialKind::Refresh => clear_stored_refresh_token_under_store_lock(&slashed),
+    let cleared = with_slashed_registry_keys(|| {
+        combine_credential_results([
+            clear_credential_spelling(&slashed, kind),
+            clear_credential_spelling(&slashed, kind.other()),
+        ])
     });
     if let Err(error) = cleared {
         tracing::warn!("could not remove the login stored under {slashed}: {error}");
     }
     Ok(Some(StoredToken {
-        token: stored.token,
+        token: requested.token,
         backend,
     }))
+}
+
+fn write_moved_credential_unlocked(
+    registry: &str,
+    kind: CredentialKind,
+    token: &str,
+) -> Result<AuthStorageBackend, String> {
+    set_credential_with_keychain_writer_unlocked(registry, kind, token, || match kind {
+        CredentialKind::Access => set_token_in_keychain(registry, token),
+        CredentialKind::Refresh => {
+            set_password_in_keychain_account(&scoped_refresh_account(registry), token)
+        }
+    })
+}
+
+fn clear_credential_spelling(registry: &str, kind: CredentialKind) -> Result<(), String> {
+    clear_credential_spelling_under_store_lock(registry, kind, || {
+        clear_credential_from_keychain(registry, kind)
+    })
 }
 
 fn get_stored_credential_with_backend_unlocked(
@@ -3163,6 +3218,108 @@ mod tests {
                 get_token("https://registry.example/").as_deref(),
                 Some("access")
             );
+        });
+    }
+
+    #[test]
+    fn a_trailing_slash_login_is_not_merged_into_the_login_under_the_registry_key() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            set_token("https://registry.example", "account-a-access").unwrap();
+            with_slashed_registry_keys(|| {
+                set_token("https://registry.example/", "account-b-access").unwrap();
+                set_refresh_token("https://registry.example/", "account-b-refresh").unwrap();
+            });
+
+            assert_eq!(get_refresh_token("https://registry.example"), None);
+            assert_eq!(
+                get_token("https://registry.example").as_deref(),
+                Some("account-a-access")
+            );
+            assert_eq!(get_refresh_token("https://registry.example"), None);
+        });
+    }
+
+    #[test]
+    fn a_trailing_slash_login_moves_its_tokens_and_session_metadata_together() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            set_session_access_token_expiry("https://registry.example", "2000-01-01T00:00:00Z");
+            with_slashed_registry_keys(|| {
+                set_token("https://registry.example/", "access").unwrap();
+                set_refresh_token("https://registry.example/", "refresh").unwrap();
+                set_session_access_token_expiry(
+                    "https://registry.example/",
+                    "2099-01-01T00:00:00Z",
+                );
+            });
+
+            assert_eq!(
+                get_refresh_token("https://registry.example").as_deref(),
+                Some("refresh")
+            );
+
+            assert_eq!(
+                with_slashed_registry_keys(|| (
+                    get_stored_access_token("https://registry.example/"),
+                    get_refresh_token("https://registry.example/"),
+                )),
+                (None, None),
+                "both slashed tokens move with the first read"
+            );
+            assert_eq!(
+                get_token("https://registry.example").as_deref(),
+                Some("access")
+            );
+            assert!(!should_refresh_session_access_token(
+                "https://registry.example"
+            ));
+        });
+    }
+
+    #[test]
+    fn a_trailing_slash_login_does_not_return_once_the_newer_login_is_rejected() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            with_slashed_registry_keys(|| {
+                set_token("https://registry.example/", "account-a-access").unwrap();
+                set_refresh_token("https://registry.example/", "account-a-refresh").unwrap();
+            });
+            set_token("https://registry.example", "account-b-access").unwrap();
+            set_refresh_token("https://registry.example", "account-b-refresh").unwrap();
+
+            clear_rejected_refresh_session_if_current(
+                "https://registry.example",
+                Some("account-b-access"),
+                "account-b-refresh",
+                || {},
+                || {},
+            )
+            .unwrap();
+
+            assert_eq!(get_token("https://registry.example"), None);
+            assert_eq!(get_refresh_token("https://registry.example"), None);
+        });
+    }
+
+    #[test]
+    fn a_trailing_slash_login_does_not_replace_a_revoked_credential() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            with_slashed_registry_keys(|| {
+                set_token("https://registry.example/", "account-a-access").unwrap();
+                set_refresh_token("https://registry.example/", "account-a-refresh").unwrap();
+            });
+            // As a clear that failed after recording the revocation leaves it.
+            credential_authority::set(
+                "https://registry.example",
+                CredentialKind::Access,
+                credential_authority::CredentialAuthority::Revoked,
+            )
+            .unwrap();
+
+            assert_eq!(get_token("https://registry.example"), None);
+            assert_eq!(get_refresh_token("https://registry.example"), None);
         });
     }
 

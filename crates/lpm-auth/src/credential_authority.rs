@@ -19,6 +19,13 @@ impl CredentialKind {
         }
     }
 
+    pub(super) fn other(self) -> Self {
+        match self {
+            Self::Access => Self::Refresh,
+            Self::Refresh => Self::Access,
+        }
+    }
+
     pub(super) fn file_key(self, registry: &str) -> String {
         let registry = super::registry_key(registry);
         match self {
