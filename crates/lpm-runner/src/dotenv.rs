@@ -1667,12 +1667,14 @@ mod tests {
     #[test]
     fn single_quoted_values_read_the_same_when_run_as_when_imported() {
         let content = "NOTE='abc' # trailing note\n\
+                       APP_NAME='Tolga's App'\n\
                        PEM='-----BEGIN KEY-----\nline=one\n-----END KEY-----'\n\
                        AFTER=yes\n";
         let run = parse_env_str(content);
 
         assert_eq!(run, lpm_vault::parse_env_content(content));
         assert_eq!(run["NOTE"], "abc");
+        assert_eq!(run["APP_NAME"], "Tolga's App");
         assert_eq!(
             run["PEM"],
             "-----BEGIN KEY-----\nline=one\n-----END KEY-----"

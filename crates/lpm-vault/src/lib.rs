@@ -1922,7 +1922,24 @@ fn append_unescaped_double_quoted(output: &mut String, value: &str, pending_esca
     }
 }
 
+/// Reads a value after its opening single quote. The value ends at the next
+/// single quote when only blanks or a comment follow it. Other text after it
+/// on the same line makes that quote part of the value, which then reads as
+/// written, without its outer quotes when it ends with one, as dotenv reads
+/// `'Tolga's App'`.
 fn parse_single_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+    if let Some(close_idx) = value.find('\'') {
+        let after = value[close_idx + 1..].trim_start_matches(is_dotenv_blank);
+        if after.is_empty() || after.starts_with('#') {
+            return value[..close_idx].to_owned();
+        }
+        let written = value.trim_end_matches(is_dotenv_blank);
+        return match written.strip_suffix('\'') {
+            Some(inner) => inner.to_owned(),
+            None => format!("'{written}"),
+        };
+    }
+
     let mut collected = String::with_capacity(value.len());
     let mut fragment = value;
 
@@ -2169,6 +2186,19 @@ KEY3=no-quotes"#;
         let vars = parse_env_content(content);
         assert_eq!(vars["DB_HOST"], "localhost");
         assert_eq!(vars["API_KEY"], "sk-123");
+    }
+
+    #[test]
+    fn a_single_quote_inside_a_one_line_value_stays_in_the_value() {
+        let vars = parse_env_content(
+            "APP_NAME='Tolga's App'\nPAIR='a' 'b'\nTAIL='x' y\nNOTE='abc'  # note\nNEXT=1\n",
+        );
+
+        assert_eq!(vars["APP_NAME"], "Tolga's App");
+        assert_eq!(vars["PAIR"], "a' 'b");
+        assert_eq!(vars["TAIL"], "'x' y");
+        assert_eq!(vars["NOTE"], "abc");
+        assert_eq!(vars["NEXT"], "1");
     }
 
     #[test]
