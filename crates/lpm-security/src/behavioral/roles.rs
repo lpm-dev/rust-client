@@ -210,7 +210,13 @@ impl EntryReferences {
             .saturating_mul(MATCHES_PER_REFERENCE_BYTE)
             .max(MATCHES_FLOOR);
         let mut unnamed = named.iter().filter(|named| !**named).count();
-        for reference in &self.0 {
+        // `names_directory` reads a directory's occurrences as
+        // `match_indices` finds them: left to right, each search starting
+        // where the last occurrence ended. One needle's matches all have its
+        // length, so an occurrence counts when it starts at or past the end
+        // of the last one that counted in the same reference.
+        let mut counted_until: Vec<(usize, usize)> = vec![(usize::MAX, 0); needles.len()];
+        for (reference_index, reference) in self.0.iter().enumerate() {
             for found in matcher.find_overlapping_iter(reference) {
                 if unnamed == 0 {
                     return named;
@@ -220,6 +226,11 @@ impl EntryReferences {
                 }
                 budget -= 1;
                 let slot = found.pattern().as_usize();
+                let (counted_in, until) = counted_until[slot];
+                let counted = counted_in != reference_index || found.start() >= until;
+                if counted {
+                    counted_until[slot] = (reference_index, found.end());
+                }
                 let mut whole_directory = None;
                 for &(path_index, kind) in &owners[slot] {
                     if named[path_index] {
@@ -228,7 +239,7 @@ impl EntryReferences {
                     let matched = match kind {
                         Needle::Anywhere => true,
                         Needle::WholeDirectory => *whole_directory.get_or_insert_with(|| {
-                            names_directory_at(reference, found.start(), found.end())
+                            counted && names_directory_at(reference, found.start(), found.end())
                         }),
                     };
                     if matched {
@@ -403,6 +414,10 @@ mod tests {
             "é",
             "x-y",
             "",
+            "aa",
+            "aaa",
+            "a a",
+            "test/a test/a",
         ];
         const GLUE: &[&str] = &[
             "", "./", " ", "/", ".", "node ", " && ", "@", "+", "~", "\"\"", ":", "-", "é",
@@ -430,7 +445,12 @@ mod tests {
             let paths: Vec<String> = (0..1 + rng.below(6))
                 .map(|_| {
                     let parts = 1 + rng.below(4);
-                    piece(&mut rng, parts).replace(' ', "")
+                    let path = piece(&mut rng, parts);
+                    if rng.below(2) == 0 {
+                        path
+                    } else {
+                        path.replace(' ', "")
+                    }
                 })
                 .collect();
             let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -453,6 +473,16 @@ mod tests {
             (
                 vec!["test/a"],
                 vec!["test/a.js", "test/a.js", "test/a.spec.js"],
+            ),
+            // An occurrence of an `index` file's directory that overlaps one
+            // already checked is never checked itself.
+            (
+                vec!["xtest/a test/a test/a"],
+                vec!["test/a test/a/index.js"],
+            ),
+            (
+                vec!["aaa/", "xaaa", "aaaa a"],
+                vec!["aa/index.js", "aaa/index.js"],
             ),
         ] {
             let references = EntryReferences(references.into_iter().map(String::from).collect());
