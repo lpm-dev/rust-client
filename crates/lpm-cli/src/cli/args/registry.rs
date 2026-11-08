@@ -64,11 +64,11 @@ pub(crate) struct PublishArgs {
     #[arg(long)]
     pub(crate) check: bool,
 
-    /// Wait for an LPM upload to become publicly available.
+    /// Wait for an LPM upload to become available, and say why if it doesn't.
     #[arg(long, conflicts_with_all = ["dry_run", "check"])]
     pub(crate) wait: bool,
 
-    /// Maximum time to wait for LPM publication review, in seconds.
+    /// Maximum time to wait for LPM publication, in seconds.
     #[arg(
         long = "wait-timeout",
         value_name = "SECONDS",

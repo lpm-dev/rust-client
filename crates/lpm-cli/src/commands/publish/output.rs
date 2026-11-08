@@ -1,6 +1,10 @@
-use super::types::{LpmPublicationStatus, PublishResult, PublishTarget};
+use super::types::{
+    LpmPublicationStatus, PublishResult, PublishTarget, SWIFT_RELEASE_REJECTED,
+    swift_rejection_reason, swift_rejection_remedy,
+};
 use crate::commands::publish_common::TarballFile;
 use crate::{install_ui, quality};
+use lpm_registry::SwiftReleaseState;
 use std::collections::HashMap;
 
 pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
@@ -54,6 +58,12 @@ pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
                     "reason": hold.reason.as_deref(),
                     "message": hold.message.as_deref(),
                     "final": hold.is_final,
+                })),
+                "swift": wait.swift.as_ref().map(|swift| serde_json::json!({
+                    "status": swift.status,
+                    "code": swift.code.as_deref(),
+                    "message": swift.message.as_deref(),
+                    "remedy": swift.remedy.as_deref(),
                 })),
                 "error": wait.error.as_deref(),
             }),
@@ -260,6 +270,70 @@ pub(super) fn format_lpm_publication_notice(
             "Upload succeeded. LPM.dev Registry returned an unrecognized publication status; public availability was not confirmed."
         )),
     }
+}
+
+/// Where a publish that doesn't wait points the publisher of a Swift
+/// release the Registry's Swift job is still preparing. Only `lpm publish`
+/// can offer `--wait`.
+pub(super) fn format_swift_preparation_hint(offer_wait: bool) -> install_ui::TerminalLine {
+    let hint = if offer_wait {
+        "LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected; next time, lpm publish --wait reports it here."
+    } else {
+        "LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected."
+    };
+    crate::install_ui::terminal_line!("  {}", install_ui::dim(hint))
+}
+
+/// Says LPM.dev Registry rejected the Swift release, why and what to fix,
+/// and, when the publish had other targets, how to publish it again to
+/// LPM.dev alone.
+pub(super) fn print_swift_release_rejection(
+    rejection: &SwiftReleaseState,
+    retry: Option<&PublishTarget>,
+) {
+    install_ui::warn(SWIFT_RELEASE_REJECTED);
+    for row in format_swift_release_rejection_details(rejection) {
+        install_ui::detail_line(row);
+    }
+    if let Some(target) = retry {
+        install_ui::detail_line(format_publish_retry_detail(target));
+    }
+}
+
+/// The `reason` and `fix` rows under a Swift release rejection. A reason
+/// that is Swift compiler output keeps its lines, each a row of its own.
+pub(super) fn format_swift_release_rejection_details(
+    rejection: &SwiftReleaseState,
+) -> Vec<install_ui::TerminalLine> {
+    let reason = install_ui::untrusted_lines(swift_rejection_reason(rejection));
+    let remedy = install_ui::untrusted_lines(swift_rejection_remedy(rejection));
+    let mut rows = Vec::with_capacity(reason.len() + remedy.len());
+    push_labeled_block(&mut rows, "reason", reason);
+    push_labeled_block(&mut rows, "fix", remedy);
+    rows
+}
+
+/// Rows like [`publish_detail`]'s whose value spans lines: the first line
+/// follows the label, and the rest line up under it.
+fn push_labeled_block(
+    rows: &mut Vec<install_ui::TerminalLine>,
+    label: &str,
+    lines: Vec<install_ui::TerminalFragment>,
+) {
+    let mut lines = lines.into_iter();
+    let label = format!("{label:<10}");
+    let first = lines.next();
+    rows.push(match &first {
+        Some(line) => crate::install_ui::terminal_line!("    {} {}", install_ui::dim(&label), line),
+        None => crate::install_ui::terminal_line!("    {}", install_ui::dim(label.trim_end())),
+    });
+    rows.extend(lines.map(|line| {
+        if line.is_empty() {
+            install_ui::TerminalLine::new("")
+        } else {
+            crate::install_ui::terminal_line!("               {}", line)
+        }
+    }));
 }
 
 pub(super) fn format_single_publish_success_summary(

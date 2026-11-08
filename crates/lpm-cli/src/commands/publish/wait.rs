@@ -61,8 +61,9 @@ pub(super) async fn wait_for_lpm_publication_with_oidc(
 /// Polls until the version is active, reaches a state further polls can't
 /// change, or `deadline` passes, a poll in flight included. Each hold is
 /// reported once as it appears or changes, again if it returns after
-/// clearing; one only a new version gets past ends the wait. A wait that
-/// runs out, or a poll that fails, reports what the last poll saw.
+/// clearing; one only a new version gets past ends the wait. Every result
+/// keeps what the poll it ended on saw; a wait that runs out, or a poll
+/// that fails, keeps what the last poll saw.
 pub(super) async fn poll_publication_snapshots<F, Fut>(
     mut fetch_snapshot: F,
     deadline: Instant,
@@ -82,21 +83,16 @@ where
             }
             Err(_) => break,
         };
-        if snapshot.status == LpmPublicationStatus::Active {
-            return PublicationWaitResult::active()
-                .with_current_latest_version(snapshot.current_latest_version);
-        }
-        if !matches!(
-            snapshot.status,
-            LpmPublicationStatus::PendingReview | LpmPublicationStatus::Processing
-        ) {
-            return PublicationWaitResult::terminal(snapshot.status)
-                .with_current_latest_version(snapshot.current_latest_version);
+        match snapshot.status {
+            LpmPublicationStatus::Active => {
+                return PublicationWaitResult::active().with_last_snapshot(Some(snapshot));
+            }
+            LpmPublicationStatus::PendingReview | LpmPublicationStatus::Processing => {}
+            _ => return PublicationWaitResult::terminal_snapshot(snapshot),
         }
         if let Some(hold) = &snapshot.hold {
             if hold.is_final {
-                return PublicationWaitResult::held(snapshot.status, hold.clone())
-                    .with_current_latest_version(snapshot.current_latest_version);
+                return PublicationWaitResult::held(snapshot);
             }
             if last.as_ref().and_then(|last| last.hold.as_ref()) != Some(hold) {
                 on_hold(hold);
@@ -111,11 +107,7 @@ where
         tokio::time::sleep_until(next_poll).await;
     }
 
-    match last {
-        Some(last) => PublicationWaitResult::timed_out(Some(last.status), last.hold)
-            .with_current_latest_version(last.current_latest_version),
-        None => PublicationWaitResult::timed_out(None, None),
-    }
+    PublicationWaitResult::timed_out(last)
 }
 
 #[cfg(test)]
@@ -123,7 +115,7 @@ mod tests {
     use super::*;
     use crate::oidc::OidcPublicationStatusToken;
 
-    use lpm_registry::PublicationHold;
+    use lpm_registry::{PublicationHold, SwiftReleaseState};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -137,6 +129,7 @@ mod tests {
             status,
             current_latest_version: Some("1.1.0".into()),
             hold,
+            swift: None,
         }
     }
 
@@ -423,6 +416,152 @@ mod tests {
         assert!(result.error.as_deref().is_some_and(|error| {
             error.contains("won't become available. LPM.dev Registry is holding it.")
         }));
+    }
+
+    const SWIFT_PREPARING: &str = "LPM is checking this release's manifests with Swift and signing its source archive. It can be installed once that finishes, usually within a minute.";
+    const COMPILER_OUTPUT: &str =
+        "Package.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^";
+    const SWIFT_REMEDY: &str = "Check that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release.";
+
+    fn swift_pending() -> SwiftReleaseState {
+        SwiftReleaseState {
+            status: "pending".into(),
+            code: None,
+            message: Some(SWIFT_PREPARING.into()),
+            remedy: None,
+        }
+    }
+
+    fn swift_rejected() -> SwiftReleaseState {
+        SwiftReleaseState {
+            status: "rejected".into(),
+            code: Some("invalid_manifest".into()),
+            message: Some(COMPILER_OUTPUT.into()),
+            remedy: Some(SWIFT_REMEDY.into()),
+        }
+    }
+
+    fn swift_snapshot(
+        status: LpmPublicationStatus,
+        hold: Option<PublicationHold>,
+        swift: SwiftReleaseState,
+    ) -> PublicationSnapshot {
+        PublicationSnapshot {
+            swift: Some(swift),
+            ..snapshot(status, hold)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stops_at_a_swift_rejection_with_its_reason_and_remedy() {
+        let preparing = hold("swift_artifacts", SWIFT_PREPARING, false);
+        let (fetch, polls) = scripted(vec![
+            swift_snapshot(
+                LpmPublicationStatus::Processing,
+                Some(preparing.clone()),
+                swift_pending(),
+            ),
+            swift_snapshot(LpmPublicationStatus::Rejected, None, swift_rejected()),
+        ]);
+        let mut reported = Vec::new();
+
+        let result = wait_for(fetch, Duration::from_secs(60), &mut reported).await;
+
+        assert_eq!(*polls.lock().unwrap(), 2, "the rejection ends the wait");
+        assert_eq!(
+            reported,
+            vec![preparing],
+            "the Swift job's hold is reported"
+        );
+        assert!(!result.success);
+        assert_eq!(result.status, Some(LpmPublicationStatus::Rejected));
+        assert_eq!(result.hold, None);
+        assert_eq!(result.swift, Some(swift_rejected()));
+        assert_eq!(result.swift_rejection(), Some(&swift_rejected()));
+        assert_eq!(result.current_latest_version.as_deref(), Some("1.1.0"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Upload succeeded, but LPM.dev Registry rejected the Swift release.\nPackage.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^\nCheck that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release."
+            )
+        );
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Do not publish this version again")),
+            "a rejected Swift release can be published again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_review_rejection_keeps_its_wording() {
+        let (fetch, polls) = scripted(vec![
+            snapshot(LpmPublicationStatus::PendingReview, None),
+            snapshot(LpmPublicationStatus::Rejected, None),
+        ]);
+
+        let result = wait_for(fetch, Duration::from_secs(60), &mut Vec::new()).await;
+
+        assert_eq!(*polls.lock().unwrap(), 2);
+        assert_eq!(result.status, Some(LpmPublicationStatus::Rejected));
+        assert_eq!(result.swift, None);
+        assert_eq!(result.swift_rejection(), None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Upload succeeded, but publication review rejected the version. Do not publish this version again."
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_registry_rejection_the_swift_job_made_reads_as_a_swift_rejection() {
+        let cases = [
+            (
+                LpmPublicationStatus::Rejected,
+                swift_pending(),
+                "Upload succeeded, but publication review rejected the version. Do not publish this version again.",
+            ),
+            (
+                LpmPublicationStatus::Quarantined,
+                swift_rejected(),
+                "Upload succeeded, but the uploaded version was quarantined. Do not publish this version again.",
+            ),
+        ];
+        for (status, swift, error) in cases {
+            let (fetch, _) = scripted(vec![swift_snapshot(status.clone(), None, swift.clone())]);
+
+            let result = wait_for(fetch, Duration::from_secs(60), &mut Vec::new()).await;
+
+            assert_eq!(result.status, Some(status));
+            assert_eq!(result.swift_rejection(), None);
+            assert_eq!(result.swift, Some(swift), "--json still gets the state");
+            assert_eq!(result.error.as_deref(), Some(error));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_runs_out_while_the_swift_job_prepares_keeps_its_state() {
+        let preparing = hold("swift_artifacts", SWIFT_PREPARING, false);
+        let (fetch, _) = scripted(vec![swift_snapshot(
+            LpmPublicationStatus::Processing,
+            Some(preparing.clone()),
+            swift_pending(),
+        )]);
+
+        let result = wait_for(fetch, Duration::from_secs(10), &mut Vec::new()).await;
+
+        assert_eq!(result.status, Some(LpmPublicationStatus::Processing));
+        assert_eq!(result.hold, Some(preparing));
+        assert_eq!(result.swift, Some(swift_pending()));
+        assert_eq!(result.swift_rejection(), None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(&*format!(
+                "Upload succeeded, but waiting for LPM.dev Registry publication timed out. The version isn't available yet. {SWIFT_PREPARING} Do not publish this version again."
+            ))
+        );
     }
 
     #[test]

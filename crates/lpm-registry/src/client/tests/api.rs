@@ -467,6 +467,10 @@ async fn publication_status_reads_a_hold_and_leaves_out_one_it_cant_read() {
             }),
         ),
         (serde_json::json!("held"), None),
+        (
+            serde_json::json!(["package_archived", "The package is archived.", true]),
+            None,
+        ),
         (serde_json::Value::Null, None),
     ];
     for (hold, expected) in cases {
@@ -491,6 +495,114 @@ async fn publication_status_reads_a_hold_and_leaves_out_one_it_cant_read() {
             .expect("a hold never fails the poll");
 
         assert_eq!(response.hold, expected, "{hold}");
+    }
+}
+
+#[tokio::test]
+async fn publication_status_reads_the_swift_job_state_and_leaves_out_one_it_cant_read() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let compiler_output = "Package.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^";
+    let remedy = "Check that `swift package dump-package` succeeds for every manifest. Publishing 1.2.3 again replaces this release.";
+    let state = |status: &str, code: Option<&str>, message: Option<&str>, remedy: Option<&str>| {
+        SwiftReleaseState {
+            status: status.into(),
+            code: code.map(Into::into),
+            message: message.map(Into::into),
+            remedy: remedy.map(Into::into),
+        }
+    };
+    let cases = [
+        (
+            Some(serde_json::json!({
+                "status": "pending",
+                "message": "LPM is checking this release's manifests with Swift."
+            })),
+            Some(state(
+                "pending",
+                None,
+                Some("LPM is checking this release's manifests with Swift."),
+                None,
+            )),
+        ),
+        (
+            Some(serde_json::json!({
+                "status": "rejected",
+                "code": "invalid_manifest",
+                "message": compiler_output,
+                "remedy": remedy
+            })),
+            Some(state(
+                "rejected",
+                Some("invalid_manifest"),
+                Some(compiler_output),
+                Some(remedy),
+            )),
+        ),
+        (
+            Some(serde_json::json!({
+                "status": "rejected",
+                "code": "a_code_this_client_does_not_know",
+                "message": "Rejected."
+            })),
+            Some(state(
+                "rejected",
+                Some("a_code_this_client_does_not_know"),
+                Some("Rejected."),
+                None,
+            )),
+        ),
+        (
+            Some(serde_json::json!({ "status": "a_future_status", "code": null })),
+            Some(state("a_future_status", None, None, None)),
+        ),
+        (
+            Some(serde_json::json!({
+                "status": "rejected",
+                "code": 7,
+                "message": ["not", "text"],
+                "remedy": false
+            })),
+            Some(state("rejected", None, None, None)),
+        ),
+        (
+            Some(serde_json::json!({ "status": 1, "message": "Rejected." })),
+            None,
+        ),
+        (Some(serde_json::json!({ "message": "Rejected." })), None),
+        (Some(serde_json::json!("rejected")), None),
+        (Some(serde_json::json!(["rejected"])), None),
+        (Some(serde_json::Value::Null), None),
+        (None, None),
+    ];
+    for (swift, expected) in cases {
+        let server = MockServer::start().await;
+        let mut body = serde_json::json!({
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3",
+            "status": "rejected",
+            "reviewStatus": "approved",
+            "hold": null,
+        });
+        if let Some(swift) = &swift {
+            body["swift"] = swift.clone();
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publication-status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let response = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .get_publication_status("@lpm.dev/owner.resolved", "1.2.3")
+            .await
+            .expect("a swift field never fails the poll");
+
+        assert_eq!(response.swift, expected, "{swift:?}");
+        assert_eq!(response.status, "rejected", "{swift:?}");
     }
 }
 
