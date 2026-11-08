@@ -29,9 +29,9 @@ use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use source::SourceTags;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use supply_chain::SupplyChainTags;
 
 /// Current schema version for `.lpm-security.json`.
@@ -545,6 +545,9 @@ pub fn nested_packages<'a>(
 /// lifecycle scripts or entry points name are read.
 struct WalkRules<'a> {
     contents: PackageDirectory<'a>,
+    /// An installed package's nested packages, which the walk checks every
+    /// entry against.
+    nested: HashSet<&'a Path>,
     /// A local source's lifecycle scripts and entry points.
     local_entries: Option<roles::EntryReferences>,
 }
@@ -556,8 +559,13 @@ impl<'a> WalkRules<'a> {
             .and_then(|manifest| manifest.ok().flatten())
             .and_then(|(_, content)| read_manifest(&content))
             .map(|(_, references)| references);
+        let nested = match contents {
+            PackageDirectory::Installed(nested) => nested.iter().map(PathBuf::as_path).collect(),
+            _ => HashSet::new(),
+        };
         Self {
             contents,
+            nested,
             local_entries,
         }
     }
@@ -570,9 +578,7 @@ impl<'a> WalkRules<'a> {
         };
         match self.contents {
             PackageDirectory::Published => true,
-            PackageDirectory::Installed(nested) => {
-                !nested.iter().any(|package| package == relative)
-            }
+            PackageDirectory::Installed(_) => !self.nested.contains(relative),
             PackageDirectory::LocalSource => {
                 if name == "node_modules" || is_git_dir_component(name) {
                     return false;
