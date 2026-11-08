@@ -40,6 +40,7 @@ pub mod project_glob;
 pub mod project_secret;
 pub mod project_state;
 pub mod provenance;
+pub mod registry_http;
 pub mod stored_env;
 pub mod symlink;
 pub mod terminal;
@@ -120,11 +121,17 @@ pub use project_state::{
     project_package_dirs, project_state_dir,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
+pub use registry_http::{
+    RegistryBodyKind, RegistryHttpError, RegistryKind, registry_error_body_message,
+};
 pub use symlink::{
     create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,
     remove_path_entry_counting_freed_bytes, remove_symlink_or_junction_entry,
 };
-pub use terminal::{sanitize_for_terminal, sanitize_terminal_inline, sanitize_terminal_multiline};
+pub use terminal::{
+    sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
+    sanitize_terminal_multiline,
+};
 pub use utf8_bom::{strip_utf8_bom_bytes, strip_utf8_bom_str};
 
 /// The LPM scope prefix. All LPM packages live under this scope.

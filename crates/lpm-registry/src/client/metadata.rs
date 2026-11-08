@@ -754,6 +754,12 @@ impl RegistryClient {
             LpmError::NotFound(detail) if detail.trim().is_empty() => LpmError::NotFound(format!(
                 "package '{name}' was not found in the npm registry"
             )),
+            LpmError::RegistryHttp(mut answer)
+                if answer.status == 404 && !answer.message_from_registry =>
+            {
+                answer.message = format!("package '{name}' was not found in the npm registry");
+                LpmError::RegistryHttp(answer)
+            }
             error => error,
         }
     }
@@ -1819,7 +1825,7 @@ impl RegistryClient {
                     }
                 }
             }
-            Err(LpmError::NotFound(_)) => {
+            Err(error) if error.is_not_found() => {
                 tracing::debug!("npm metadata miss via LPM upstream proxy: {name}");
             }
             Err(error) if Self::npm_proxy_can_fallback_to_direct(&error) => {
@@ -2718,7 +2724,8 @@ impl RegistryClient {
                     return finish!(Ok(metadata));
                 }
             }
-            Ok(_) | Err(LpmError::NotFound(_)) => {}
+            Ok(_) => {}
+            Err(error) if error.is_not_found() => {}
             Err(error) if Self::npm_proxy_can_fallback_to_direct(&error) => {}
             Err(error) => return finish!(Err(error)),
         }
@@ -3287,10 +3294,10 @@ impl RegistryClient {
                     }
                 }
             }
-            Err(error @ LpmError::NotFound(_)) if !allow_direct_fallback => {
+            Err(error) if error.is_not_found() && !allow_direct_fallback => {
                 return finish!(Err(error));
             }
-            Err(LpmError::NotFound(_)) => {}
+            Err(error) if error.is_not_found() => {}
             Err(error)
                 if allow_direct_fallback && Self::npm_proxy_can_fallback_to_direct(&error) => {}
             Err(error) => return finish!(Err(error)),
@@ -4279,7 +4286,7 @@ impl RegistryClient {
         let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
         let response = match self.send_with_retry_with_npmrc_auth(req, auth).await {
             Ok(response) => response,
-            Err(LpmError::NotFound(_)) => {
+            Err(error) if error.is_not_found() => {
                 cache.insert(cache_key, Vec::new());
                 return Ok(Vec::new());
             }
@@ -4433,7 +4440,7 @@ impl RegistryClient {
                     client.get_npm_metadata_direct(&name).await
                 };
 
-                if matches!(result, Err(LpmError::RateLimited { .. })) {
+                if result.as_ref().is_err_and(LpmError::is_rate_limited) {
                     // Atomically claim a halving step against `ceiling`
                     // via a CAS loop. Without this, two concurrent 429s
                     // can both read `current=8` before either decrements,

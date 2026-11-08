@@ -380,6 +380,10 @@ pub async fn run(
         let (metadata, allowed_versions) = match metadata_result {
             Ok(result) => result,
             Err(error) => {
+                // No other lookup with the same credential will succeed.
+                if error.is_credential_failure() {
+                    return Err(error);
+                }
                 let Some(&first_dependency_index) = job.dependency_indices.first() else {
                     return Err(LpmError::Registry(format!(
                         "internal upgrade planner error: metadata job for {} has no dependencies",

@@ -54,6 +54,42 @@ pub fn sanitize_for_terminal(input: &str) -> String {
     sanitize_terminal_inline(input).into_owned()
 }
 
+/// Text a server sent, fit for one LPM-owned terminal row and for `--json`:
+/// sanitized as [`sanitize_terminal_inline`] does, with each run of
+/// whitespace, line breaks included, collapsed to one space, and cut to at
+/// most `max_chars` characters with an ellipsis. A remote registry controls
+/// this text, so it can't add rows, move the cursor, or reorder what's shown.
+pub fn sanitize_server_text(input: &str, max_chars: usize) -> String {
+    let flattened: String = input
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let sanitized = sanitize_terminal_inline(&flattened);
+    let mut collapsed = String::with_capacity(sanitized.len());
+    for word in sanitized.split(' ').filter(|word| !word.is_empty()) {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut cut: String = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
+}
+
 fn sanitize_terminal(input: &str, whitespace: WhitespacePolicy) -> Cow<'_, str> {
     let mut output = None;
     let mut state = State::Ground;
@@ -197,7 +233,72 @@ fn push_neutralized_control(
     }
 }
 
+/// C0/C1 controls and DEL, and the Unicode format characters that reorder or
+/// hide what a terminal shows (bidi embeddings, overrides, isolates and marks,
+/// zero-width space, word joiner, BOM) or break the row (line and paragraph
+/// separators). Joiners U+200C/U+200D stay: scripts and emoji need them, and
+/// they can't reorder text.
 #[inline]
 fn is_terminal_control(ch: char) -> bool {
-    matches!(ch as u32, 0x00..=0x1f | 0x7f..=0x9f)
+    matches!(
+        ch as u32,
+        0x00..=0x1f
+            | 0x7f..=0x9f
+            | 0x061c
+            | 0x200b
+            | 0x200e
+            | 0x200f
+            | 0x2028..=0x202e
+            | 0x2060
+            | 0x2066..=0x2069
+            | 0xfeff
+    )
+}
+
+#[cfg(test)]
+mod server_text_tests {
+    use super::*;
+
+    #[test]
+    fn neutralizes_reordering_and_invisible_format_characters() {
+        for ch in [
+            '\u{202e}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}', '\u{200b}',
+            '\u{2060}', '\u{feff}', '\u{2028}', '\u{2029}',
+        ] {
+            let text = format!("evil{ch}gpj.exe");
+            assert_eq!(sanitize_terminal_inline(&text), "evil?gpj.exe", "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_joiners_scripts_and_emoji_need() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(sanitize_terminal_inline(family), family);
+        assert_eq!(
+            sanitize_terminal_inline("می\u{200c}خواهم"),
+            "می\u{200c}خواهم"
+        );
+    }
+
+    #[test]
+    fn server_text_is_one_row_without_escapes() {
+        let text = "denied\n\u{1b}[31m  fake hint\r\n\u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{7}";
+        assert_eq!(sanitize_server_text(text, 200), "denied fake hint link");
+    }
+
+    #[test]
+    fn server_text_is_cut_to_its_limit_with_an_ellipsis() {
+        let text = "a".repeat(50);
+        let cut = sanitize_server_text(&text, 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'));
+        assert_eq!(sanitize_server_text("short", 10), "short");
+        assert_eq!(sanitize_server_text("exactly-10", 10), "exactly-10");
+    }
+
+    #[test]
+    fn server_text_trims_and_collapses_whitespace() {
+        assert_eq!(sanitize_server_text("  a \t\t b  ", 50), "a b");
+        assert_eq!(sanitize_server_text("", 50), "");
+    }
 }

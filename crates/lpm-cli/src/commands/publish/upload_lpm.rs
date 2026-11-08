@@ -28,14 +28,15 @@ impl From<OtpFailure> for LpmError {
 /// Whether whoami's failure is lpm.dev refusing the token, which a retry
 /// with it won't get past.
 fn refuses_the_token(error: &LpmError) -> bool {
-    matches!(
-        error,
-        LpmError::AuthRequired
-            | LpmError::SessionExpired
-            | LpmError::EnvTokenRejected
-            | LpmError::Forbidden(_)
-            | LpmError::UnsupportedAuthSource { .. }
-    )
+    error.is_forbidden()
+        || error.http_status() == Some(401)
+        || matches!(
+            error,
+            LpmError::AuthRequired
+                | LpmError::SessionExpired
+                | LpmError::EnvTokenRejected
+                | LpmError::UnsupportedAuthSource { .. }
+        )
 }
 
 /// The second factor an lpm.dev publish sends.

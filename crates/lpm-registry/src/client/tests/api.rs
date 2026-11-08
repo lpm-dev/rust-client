@@ -277,11 +277,11 @@ async fn a_publish_preflight_refusal_is_the_error_any_request_s_failure_is() {
         let error = verdict.into_result().unwrap_err();
         match status {
             403 => assert!(
-                matches!(&error, LpmError::Forbidden(message) if message == body),
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 403 && answer.message == body),
                 "{error:?}"
             ),
             404 => assert!(
-                matches!(&error, LpmError::NotFound(message) if message == body),
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 404 && answer.message == body),
                 "{error:?}"
             ),
             429 => assert!(
@@ -294,7 +294,7 @@ async fn a_publish_preflight_refusal_is_the_error_any_request_s_failure_is() {
                 "{error:?}"
             ),
             _ => assert!(
-                matches!(&error, LpmError::Http { status: 409, message } if message == body),
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 409 && answer.message == body),
                 "{error:?}"
             ),
         }
@@ -742,7 +742,9 @@ async fn whoami_maps_403_to_forbidden_with_body() {
         .await;
 
     let result = client.whoami().await;
-    assert!(matches!(result, Err(LpmError::Forbidden(body)) if body == "forbidden-body"));
+    assert!(
+        matches!(result, Err(LpmError::RegistryHttp(answer)) if answer.status == 403 && answer.message == "forbidden-body")
+    );
 }
 
 #[tokio::test]
@@ -800,7 +802,9 @@ async fn whoami_maps_404_to_not_found_with_body() {
         .await;
 
     let result = client.whoami().await;
-    assert!(matches!(result, Err(LpmError::NotFound(body)) if body == "missing-user"));
+    assert!(
+        matches!(result, Err(LpmError::RegistryHttp(answer)) if answer.status == 404 && answer.message == "missing-user")
+    );
 }
 
 #[tokio::test]
@@ -1064,7 +1068,7 @@ async fn publish_package_does_not_treat_a_different_existing_version_as_success(
 
     assert!(matches!(
         result,
-        Err(LpmError::Http { status: 500, message }) if message == "publish boom"
+        Err(LpmError::RegistryHttp(answer)) if answer.status == 500 && answer.message == "publish boom"
     ));
 }
 
@@ -1556,7 +1560,7 @@ async fn publish_package_returns_http_500_when_version_missing_after_500() {
 
     assert!(matches!(
         result,
-        Err(LpmError::Http { status: 500, message }) if message == "publish boom"
+        Err(LpmError::RegistryHttp(answer)) if answer.status == 500 && answer.message == "publish boom"
     ));
 }
 

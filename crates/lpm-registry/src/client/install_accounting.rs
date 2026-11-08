@@ -89,13 +89,9 @@ impl RegistryClient {
             .await;
         match result {
             Ok(_) => return Ok(()),
-            Err(LpmError::Http {
-                status: 400,
-                ref message,
-            }) if serde_json::from_str::<serde_json::Value>(message).is_ok_and(|body| {
-                body.get("error").and_then(serde_json::Value::as_str)
-                    == Some("Request body must contain only a roots array")
-            }) => {}
+            Err(LpmError::RegistryHttp(ref answer))
+                if answer.status == 400
+                    && answer.message == "Request body must contain only a roots array" => {}
             Err(error) => return Err(error),
         }
         let roots = legacy_pool_roots(graph)?;

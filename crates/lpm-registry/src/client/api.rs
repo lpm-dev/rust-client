@@ -469,6 +469,7 @@ impl RegistryClient {
                 status,
                 retry_after_secs,
                 body,
+                ..
             }) => {
                 let json = serde_json::from_str::<serde_json::Value>(&body).ok();
                 let text = |field: &str| {
@@ -488,6 +489,7 @@ impl RegistryClient {
                     error,
                     body,
                     retry_after_secs,
+                    registry: self.base_url.clone(),
                 });
             }
         };
@@ -1145,7 +1147,7 @@ fn validate_search_registry_base(base_url: &str) -> Result<(), LpmError> {
 
 impl PublishPreflightVerdict {
     /// The accepted answer, or the refusal as the error any other request's
-    /// failure is (see [`super::transport::failed_answer_error`]), with the
+    /// failure is (see [`super::transport::lpm_refusal`]), with the
     /// Registry's message where its body gives one, and the body otherwise.
     pub fn into_result(self) -> Result<PublishPreflightResponse, LpmError> {
         match self {
@@ -1154,19 +1156,14 @@ impl PublishPreflightVerdict {
                 status,
                 body,
                 retry_after_secs,
+                registry,
                 ..
-            } => {
-                let message = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|json| json.get("error")?.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| body.clone());
-                Err(super::transport::failed_answer_error(
-                    status,
-                    &body,
-                    message,
-                    retry_after_secs,
-                ))
-            }
+            } => Err(super::transport::lpm_refusal(
+                status,
+                &body,
+                retry_after_secs,
+                &registry,
+            )),
         }
     }
 }

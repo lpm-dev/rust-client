@@ -679,8 +679,8 @@ async fn cli_bulk_global_update_reports_mixed_success_skip_and_failure_in_single
         missing["reason"]
             .as_str()
             .unwrap_or_default()
-            .contains("Not found"),
-        "failure reason should preserve the registry not-found response: {missing:?}"
+            .contains("missing-tool' was not found"),
+        "failure reason should name the package the registry didn't find: {missing:?}"
     );
 
     let final_manifest = read_for(&root).unwrap();

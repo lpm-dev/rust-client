@@ -501,8 +501,7 @@ async fn metadata_refresh_server_error_keeps_http_classification_and_lockfiles()
     assert_lockfile_unchanged(&project, &lockfiles);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("500")
-            && (stderr.contains("HTTP") || stderr.contains("Registry error"))
+        stderr.contains("answered 500 Internal Server Error")
             && !stderr.contains("Pinned artifact unavailable")
             && !stderr.contains("tarball not found"),
         "metadata refresh failure must retain its HTTP/registry classification:\n{stderr}"

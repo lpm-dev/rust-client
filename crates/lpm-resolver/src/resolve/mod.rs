@@ -22,7 +22,7 @@ pub use dispatch::{
     resolve_with_shared_cache_options_and_policy_roots,
 };
 #[allow(unused_imports)]
-pub use error::ResolveError;
+pub use error::{RegistryFetchFailure, ResolveError};
 pub(crate) use format::mark_optional_reachability;
 #[allow(unused_imports)]
 pub use peers::{

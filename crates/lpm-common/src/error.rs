@@ -357,6 +357,13 @@ pub enum LpmError {
     #[diagnostic(code(lpm::http))]
     Http { status: u16, message: String },
 
+    /// A registry's refusal of a request, with what the registry said. Its
+    /// `error_code` is the one its status always had, so `--json` consumers
+    /// keep matching `not_found`, `forbidden` and `http`.
+    #[error("{0}")]
+    #[diagnostic(code(lpm::registry_http))]
+    RegistryHttp(Box<crate::RegistryHttpError>),
+
     #[error("authentication required")]
     #[diagnostic(
         code(lpm::auth_required),
@@ -857,6 +864,66 @@ pub const TUNNEL_ACCESS_CODES: [&str; 4] = [
 ];
 
 impl LpmError {
+    /// Whether the registry said the thing asked for doesn't exist, or that
+    /// it hides it: a 404, however it was described.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            LpmError::NotFound(_) => true,
+            LpmError::RegistryHttp(answer) => answer.status == 404,
+            _ => false,
+        }
+    }
+
+    /// Whether the registry refused the credential's access: a 403.
+    pub fn is_forbidden(&self) -> bool {
+        match self {
+            LpmError::Forbidden(_) => true,
+            LpmError::RegistryHttp(answer) => answer.status == 403,
+            _ => false,
+        }
+    }
+
+    /// Whether the credential itself was refused, which no other request
+    /// with it will get past.
+    pub fn is_credential_failure(&self) -> bool {
+        matches!(
+            self,
+            LpmError::AuthRequired | LpmError::SessionExpired | LpmError::EnvTokenRejected
+        ) || matches!(self, LpmError::RegistryHttp(answer) if answer.status == 401)
+    }
+
+    /// Whether the registry asked the client to slow down.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            LpmError::RateLimited { .. } => true,
+            LpmError::RegistryHttp(answer) => answer.status == 429,
+            _ => false,
+        }
+    }
+
+    /// The HTTP status of a registry's refusal, when the error is one.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            LpmError::Http { status, .. } => Some(*status),
+            LpmError::RegistryHttp(answer) => Some(answer.status),
+            LpmError::NotFound(_) => Some(404),
+            LpmError::Forbidden(_) => Some(403),
+            LpmError::RateLimited { .. } => Some(429),
+            _ => None,
+        }
+    }
+
+    /// The same error naming what it was for, when it's a registry's
+    /// refusal that doesn't already.
+    pub fn with_registry_subject(self, subject: impl Into<String>) -> Self {
+        match self {
+            LpmError::RegistryHttp(answer) if answer.subject.is_none() => {
+                LpmError::RegistryHttp(Box::new(answer.with_subject(subject)))
+            }
+            other => other,
+        }
+    }
+
     /// Whether local secure storage, not the registry, failed: the saved
     /// credential exists but could not be read, so callers must not treat it
     /// as absent or fall back to another source.
@@ -913,6 +980,13 @@ impl LpmError {
             LpmError::PeerDependency(_) => "peer_dependency",
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
+            LpmError::RegistryHttp(answer) => match answer.status {
+                401 => "auth_required",
+                403 => "forbidden",
+                404 => "not_found",
+                429 => "rate_limited",
+                _ => "http",
+            },
             LpmError::AuthRequired => "auth_required",
             LpmError::EnvTokenRejected => "env_token_rejected",
             LpmError::CredentialStorage(_) => "credential_storage",
@@ -1144,6 +1218,54 @@ mod tests {
         assert!(help.to_string().contains("package.json scripts"));
     }
 
+    fn registry_http_error(status: u16) -> crate::RegistryHttpError {
+        crate::RegistryHttpError {
+            status,
+            registry: "https://lpm.dev".into(),
+            registry_kind: crate::RegistryKind::Lpm,
+            code: Some("VERSION_EXISTS".into()),
+            message: "Version 1.0.0 already exists.".into(),
+            message_from_registry: true,
+            body_kind: crate::RegistryBodyKind::Json,
+            request_id: None,
+            retry_after_secs: None,
+            notice: None,
+            subject: None,
+        }
+    }
+
+    #[test]
+    fn registry_refusals_keep_the_codes_their_statuses_always_had() {
+        for (status, code) in [
+            (401, "auth_required"),
+            (403, "forbidden"),
+            (404, "not_found"),
+            (429, "rate_limited"),
+            (409, "http"),
+            (503, "http"),
+        ] {
+            let error = LpmError::RegistryHttp(Box::new(registry_http_error(status)));
+            assert_eq!(error.error_code(), code, "{status}");
+            assert_eq!(error.http_status(), Some(status));
+        }
+        let not_found = LpmError::RegistryHttp(Box::new(registry_http_error(404)));
+        assert!(not_found.is_not_found());
+        assert!(!not_found.is_forbidden());
+        assert!(LpmError::NotFound("x".into()).is_not_found());
+        assert!(LpmError::RegistryHttp(Box::new(registry_http_error(403))).is_forbidden());
+        assert!(LpmError::RegistryHttp(Box::new(registry_http_error(429))).is_rate_limited());
+    }
+
+    #[test]
+    fn a_registry_refusal_shows_what_the_registry_said_and_what_it_was_for() {
+        let error = LpmError::RegistryHttp(Box::new(registry_http_error(409)))
+            .with_registry_subject("@lpm.dev/acme.ui@1.0.0");
+        assert_eq!(
+            error.to_string(),
+            "@lpm.dev/acme.ui@1.0.0: lpm.dev answered 409 Conflict: Version 1.0.0 already exists."
+        );
+    }
+
     #[test]
     fn error_code_covers_all_variants() {
         // Verify every variant returns a non-empty, unique error code
@@ -1165,6 +1287,7 @@ mod tests {
                 status: 500,
                 message: "x".into(),
             },
+            LpmError::RegistryHttp(Box::new(registry_http_error(409))),
             LpmError::AuthRequired,
             LpmError::CredentialStorage("x".into()),
             LpmError::CredentialStorageLocked("x".into()),

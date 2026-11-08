@@ -60,10 +60,10 @@ pub use provider::{
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{
-    CompiledPeerRules, PeerStageTiming, PeerWarning, ResolveError, ResolveResult, ResolvedPackage,
-    RootDependencies, RootResolution, SelectedPackageEvent, StageTiming, WorkspaceUnionStageTiming,
-    check_unmet_peers, resolve_dependencies, resolve_dependencies_routed,
-    resolve_dependencies_with_overrides, resolve_with_shared_cache,
+    CompiledPeerRules, PeerStageTiming, PeerWarning, RegistryFetchFailure, ResolveError,
+    ResolveResult, ResolvedPackage, RootDependencies, RootResolution, SelectedPackageEvent,
+    StageTiming, WorkspaceUnionStageTiming, check_unmet_peers, resolve_dependencies,
+    resolve_dependencies_routed, resolve_dependencies_with_overrides, resolve_with_shared_cache,
     resolve_with_shared_cache_options, resolve_with_shared_cache_options_and_policy,
     resolve_with_shared_cache_options_and_policy_roots, validate_allowed_versions_range,
     validate_allowed_versions_selector,

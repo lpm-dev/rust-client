@@ -1083,11 +1083,13 @@ pub(super) async fn resolve_lpm_install_preflight(
     let metadata = client.get_package_metadata(package_name).await?;
     match resolve_lpm_install_metadata_version(&metadata, package_name, range) {
         Ok(version) => Ok((metadata, version)),
-        Err(
-            LpmError::NotFound(_)
-            | LpmError::InvalidVersionRange(_)
-            | LpmError::PublicationUnavailable(_),
-        ) => {
+        Err(error)
+            if error.is_not_found()
+                || matches!(
+                    error,
+                    LpmError::InvalidVersionRange(_) | LpmError::PublicationUnavailable(_)
+                ) =>
+        {
             let metadata = client
                 .refetch_package_metadata_after_missing_version(package_name)
                 .await?;
@@ -1187,7 +1189,7 @@ fn preserved_source_targets(
             // Swift-only projects do not require a JavaScript manifest.
             let text = match read_manifest_text(path) {
                 Ok(text) => Some(text),
-                Err(LpmError::NotFound(_)) => None,
+                Err(error) if error.is_not_found() => None,
                 Err(error) => return Err(error),
             };
             if let Some(text) = text {

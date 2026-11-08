@@ -1064,6 +1064,8 @@ pub enum PublishPreflightVerdict {
         error: String,
         body: String,
         retry_after_secs: u64,
+        /// The registry that refused it.
+        registry: String,
     },
 }
 

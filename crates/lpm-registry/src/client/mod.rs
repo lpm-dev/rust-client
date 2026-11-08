@@ -26,6 +26,7 @@ mod auth;
 mod body;
 mod cache;
 mod config;
+mod error_body;
 mod firewall;
 mod history_cache;
 mod http;
@@ -80,7 +81,7 @@ use self::auth::{
     bearer_principal_fingerprint, cert_pem_fingerprint, principal_fingerprint,
 };
 use self::body::{
-    MAX_METADATA_BYTES, MAX_VERSION_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
+    MAX_METADATA_BYTES, MAX_VERSION_METADATA_BYTES, elapsed_millis,
     parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,
     read_capped_error_text,
 };

@@ -125,11 +125,78 @@ pub(super) fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
         .collect()
 }
 
+/// A registry refusing a metadata fetch for a reason that isn't the
+/// package's absence: the credential, a rate limit, or the registry's own
+/// refusal. It keeps its kind so the user is told to sign in, wait, or what
+/// the registry said, rather than to change a version range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryFetchFailure {
+    Http(Box<lpm_common::RegistryHttpError>),
+    AuthRequired,
+    SessionExpired,
+    EnvTokenRejected,
+    RateLimited { retry_after_secs: u64 },
+}
+
+impl RegistryFetchFailure {
+    /// The failure a registry error is, or None for one that isn't a
+    /// registry's refusal (a network error, an absent package).
+    pub fn from_lpm_error(error: &lpm_common::LpmError) -> Option<Self> {
+        use lpm_common::LpmError;
+        match error {
+            LpmError::RegistryHttp(answer) if answer.status != 404 => {
+                Some(Self::Http(answer.clone()))
+            }
+            LpmError::AuthRequired => Some(Self::AuthRequired),
+            LpmError::SessionExpired => Some(Self::SessionExpired),
+            LpmError::EnvTokenRejected => Some(Self::EnvTokenRejected),
+            LpmError::RateLimited { retry_after_secs } => Some(Self::RateLimited {
+                retry_after_secs: *retry_after_secs,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The error the CLI reports, naming the package the fetch was for.
+    pub fn into_lpm_error(self, package: &str) -> lpm_common::LpmError {
+        use lpm_common::LpmError;
+        match self {
+            Self::Http(answer) => {
+                LpmError::RegistryHttp(Box::new(answer.with_subject(package.to_owned())))
+            }
+            Self::AuthRequired => LpmError::AuthRequired,
+            Self::SessionExpired => LpmError::SessionExpired,
+            Self::EnvTokenRejected => LpmError::EnvTokenRejected,
+            Self::RateLimited { retry_after_secs } => LpmError::RateLimited { retry_after_secs },
+        }
+    }
+}
+
+impl std::fmt::Display for RegistryFetchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(answer) => write!(f, "{answer}"),
+            Self::AuthRequired => f.write_str("authentication required"),
+            Self::SessionExpired => f.write_str("session expired or revoked"),
+            Self::EnvTokenRejected => f.write_str("the registry rejected LPM_TOKEN"),
+            Self::RateLimited { retry_after_secs } => {
+                write!(f, "rate limited; retry after {retry_after_secs}s")
+            }
+        }
+    }
+}
+
 /// Errors from the resolution process.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     #[error("{0}")]
     Resolution(Box<ResolutionErrorContext>),
+
+    #[error("{package}: {failure}")]
+    Registry {
+        package: String,
+        failure: RegistryFetchFailure,
+    },
 
     #[error("no solution found:\n{0}")]
     NoSolution(String),

@@ -253,17 +253,29 @@ pub(super) async fn parse_capped_api_json_with_timing<T: serde::de::DeserializeO
     ))
 }
 
-/// Read an error-body response as UTF-8 text under the API-tier cap.
-///
-/// Returns the empty string on cap-overflow or read errors so the
-/// caller can still construct a typed error variant — the previous
-/// `response.text().await.unwrap_or_default()` shape is preserved
-/// but the buffer is now bounded.
-pub(super) async fn read_capped_error_text(response: reqwest::Response) -> String {
-    match read_capped_body(response, MAX_API_RESPONSE_BYTES, "error body").await {
-        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
-        Err(_) => String::new(),
+/// Read an error answer's body as UTF-8 text, keeping at most
+/// [`MAX_ERROR_BODY_BYTES`](super::error_body::MAX_ERROR_BODY_BYTES) of it:
+/// a registry's message comes first, and an oversized body, such as a
+/// proxy's page, must neither be buffered whole nor erase what came before
+/// the cap. A read that fails keeps what had arrived.
+pub(super) async fn read_capped_error_text(mut response: reqwest::Response) -> String {
+    let limit = super::error_body::MAX_ERROR_BODY_BYTES;
+    let mut buf = Vec::with_capacity(
+        response
+            .content_length()
+            .map_or(4096, |length| usize::try_from(length).unwrap_or(limit))
+            .min(limit),
+    );
+    while buf.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = limit - buf.len();
+                buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
     }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
@@ -308,10 +320,6 @@ pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
         }
         _ => None,
     }
-}
-
-pub(super) fn forbidden_error_from_body(body: String) -> LpmError {
-    parse_lpm_worker_error_body(&body).unwrap_or(LpmError::Forbidden(body))
 }
 
 pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {

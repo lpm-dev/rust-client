@@ -1898,7 +1898,7 @@ async fn direct_npm_metadata_empty_404_identifies_the_requested_package() {
 
     assert!(matches!(
         result,
-        Err(LpmError::NotFound(detail)) if detail.contains(name)
+        Err(LpmError::RegistryHttp(answer)) if answer.status == 404 && answer.message.contains(name)
     ));
 }
 
@@ -3178,8 +3178,8 @@ async fn parallel_fetch_per_entry_failures_do_not_abort_batch() {
     assert_eq!(results.len(), 3);
     assert!(results[0].1.is_ok(), "exists-one should succeed");
     match &results[1].1 {
-        Err(LpmError::NotFound(_)) => {}
-        other => panic!("missing should surface 404 as NotFound, got {other:?}"),
+        Err(error) if error.is_not_found() => {}
+        other => panic!("missing should surface 404 as not found, got {other:?}"),
     }
     assert!(results[2].1.is_ok(), "exists-two should succeed");
 }

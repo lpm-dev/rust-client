@@ -1,4 +1,6 @@
+use super::error_body::{AnswerFacts, RegistryOrigin, registry_refusal};
 use super::*;
+use lpm_common::RegistryKind;
 
 mod error_redaction;
 use error_redaction::{read_error_text_redacting, read_request_error_text};
@@ -87,12 +89,12 @@ impl RegistryClient {
                     retry_after_secs: retry_after_seconds(&response),
                 });
             }
-            let parsed = parse_capped_api_json::<serde_json::Value>(
-                response,
-                &format!("{operation} response"),
-            )
-            .await;
             if status == reqwest::StatusCode::UNAUTHORIZED {
+                let parsed = parse_capped_api_json::<serde_json::Value>(
+                    response,
+                    &format!("{operation} response"),
+                )
+                .await;
                 return Err(match &parsed {
                     Ok(body) => super::second_factor::second_factor_unauthorized_error(
                         body, command, operation,
@@ -100,14 +102,19 @@ impl RegistryClient {
                     Err(_) => LpmError::AuthRequired,
                 });
             }
-            let parsed = parsed?;
+            // A refusal keeps its status and code, and a proxy's HTML page
+            // reads as what it is rather than as unparseable JSON.
             if !status.is_success() {
-                let error = parsed
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown error");
-                return Err(LpmError::Registry(format!("{operation} failed: {error}")));
+                let origin = self.registry_origin(response.url());
+                let facts = AnswerFacts::from_headers(response.headers());
+                let body = read_capped_error_text(response).await;
+                return Err(registry_refusal(status.as_u16(), &facts, &body, &origin));
             }
+            let parsed = parse_capped_api_json::<serde_json::Value>(
+                response,
+                &format!("{operation} response"),
+            )
+            .await?;
             Ok((parsed, bearer))
         })
         .await
@@ -317,13 +324,18 @@ impl RegistryClient {
             })
             .await
         {
-            Err(
-                error @ (LpmError::NotFound(_)
-                | LpmError::PackageInstallDenied { .. }
-                | LpmError::Http {
-                    status: 403 | 404, ..
-                }),
-            ) => {
+            Err(error)
+                if error.is_not_found()
+                    || error.is_forbidden()
+                    || matches!(
+                        error,
+                        LpmError::PackageInstallDenied { .. }
+                            | LpmError::Http {
+                                status: 403 | 404,
+                                ..
+                            }
+                    ) =>
+            {
                 if attempts.load(std::sync::atomic::Ordering::Relaxed) == 1
                     && self
                         .recover_package_read_session(rejected_bearer.as_deref())
@@ -476,11 +488,13 @@ impl RegistryClient {
                 .build()
                 .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
             let headers = req.headers().clone();
+            let origin = self.registry_origin(req.url());
 
             let transfer = super::http::TransferClientProvider(self.http.as_ref());
             match lpm_http::send_with_replayable_redirects(&transfer, req, Some(payload)).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    let facts = AnswerFacts::from_headers(response.headers());
 
                     match status {
                         200..=299 | 304 => return Ok(PublishSafeResponse::Response(response)),
@@ -501,26 +515,14 @@ impl RegistryClient {
                         }
                         403 => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
-                            let duplicate_message = format!(
-                                "Version {published_version} already exists. You cannot overwrite versions."
-                            );
-                            if serde_json::from_str::<serde_json::Value>(&body)
-                                .ok()
-                                .and_then(|value| {
-                                    value
-                                        .get("error")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::to_owned)
-                                })
-                                .is_some_and(|message| message == duplicate_message)
-                            {
+                            if publish_refusal_is_version_exists(&body, published_version) {
                                 return Err(version_exists_error(published_version));
                             }
-                            return Err(forbidden_error_from_body(body));
+                            return Err(registry_refusal(status, &facts, &body, &origin));
                         }
                         404 => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
-                            return Err(LpmError::NotFound(body));
+                            return Err(registry_refusal(status, &facts, &body, &origin));
                         }
 
                         // S4: 500 — do NOT retry. Server may have stored the version.
@@ -549,36 +551,29 @@ impl RegistryClient {
                                 PublishReconciliation::Missing => {}
                             }
 
-                            return Err(LpmError::Http {
-                                status: 500,
-                                message: body_text,
-                            });
+                            return Err(registry_refusal(status, &facts, &body_text, &origin));
                         }
 
                         // Rate limit — respect Retry-After
                         429 => {
-                            let retry_after = parse_retry_after(&response);
-                            last_error = Some(LpmError::RateLimited {
-                                retry_after_secs: retry_after,
-                            });
-                            if attempt < MAX_RETRIES {
+                            let wanted = facts.retry_after_secs.unwrap_or(1);
+                            last_error = Some(registry_refusal(status, &facts, "", &origin));
+                            if attempt < MAX_RETRIES && wanted <= RETRY_MAX_DELAY.as_secs() {
                                 // Honor the test-only backoff override so
                                 // 429-flood retry-exhaustion tests don't
                                 // hang on the server-supplied Retry-After.
                                 let delay = backoff_override()
-                                    .unwrap_or_else(|| Duration::from_secs(retry_after));
+                                    .unwrap_or_else(|| Duration::from_secs(wanted));
                                 tokio::time::sleep(delay).await;
                                 continue;
                             }
+                            break;
                         }
 
                         // Retryable gateway errors only (NOT 500)
                         502..=504 => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
-                            last_error = Some(LpmError::Http {
-                                status,
-                                message: body,
-                            });
+                            last_error = Some(registry_refusal(status, &facts, &body, &origin));
                             match self
                                 .reconcile_publish_artifact(
                                     encoded_name,
@@ -608,10 +603,7 @@ impl RegistryClient {
                         // Other errors — fail immediately
                         _ => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
-                            return Err(LpmError::Http {
-                                status,
-                                message: body,
-                            });
+                            return Err(registry_refusal(status, &facts, &body, &origin));
                         }
                     }
                 }
@@ -667,7 +659,7 @@ impl RegistryClient {
         })?;
         let response = match self.send_with_retry(request).await {
             Ok(response) => response,
-            Err(LpmError::NotFound(_)) => return Ok(PublishReconciliation::Missing),
+            Err(error) if error.is_not_found() => return Ok(PublishReconciliation::Missing),
             Err(error) => {
                 return Err(LpmError::Registry(format!(
                     "publish recovery probe failed: {error}"
@@ -787,6 +779,7 @@ impl RegistryClient {
         P: lpm_http::ReplayableHttpClientProvider<Error = LpmError> + Sync,
     {
         let mut request = request;
+        let origin = self.registry_origin(request.url());
         self.route_to_npm_transport(&mut request);
         self.validate_base_url()?;
         self.validate_request_url(request.url())?;
@@ -841,6 +834,7 @@ impl RegistryClient {
                     tracing::event!(name: "headers_observed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64, status = u64::from(status));
                     let retried = matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
                         && attempt < MAX_RETRIES;
+                    let facts = AnswerFacts::from_headers(response.headers());
                     if failed == FailedAnswer::Response
                         && !matches!(status, 200..=299 | 304)
                         && !retried
@@ -849,6 +843,8 @@ impl RegistryClient {
                             status,
                             retry_after_secs: parse_retry_after(&response),
                             body: read_request_error_text(response, &request).await,
+                            facts,
+                            origin,
                         }));
                     }
 
@@ -856,27 +852,27 @@ impl RegistryClient {
                         200..=299 | 304 => return Ok(Answered::Success(response)),
 
                         // Non-retryable errors — fail immediately
-                        401 => return Err(LpmError::AuthRequired),
-                        403 | 404 => {
-                            let body = read_request_error_text(response, &request).await;
-                            return Err(failed_answer_error(status, &body, body.clone(), 0));
+                        401 if origin.kind == RegistryKind::Lpm => {
+                            return Err(LpmError::AuthRequired);
                         }
-
                         // Retryable: rate limit
                         429 => {
-                            let retry_after = parse_retry_after(&response);
-                            last_error =
-                                Some(failed_answer_error(status, "", String::new(), retry_after));
-                            if attempt < MAX_RETRIES {
+                            let wanted = facts.retry_after_secs.unwrap_or(1);
+                            last_error = Some(registry_refusal(status, &facts, "", &origin));
+                            // A wait longer than the backoff cap is the
+                            // registry's to choose; retrying sooner only
+                            // spends the attempts against the same limit.
+                            if attempt < MAX_RETRIES && wanted <= RETRY_MAX_DELAY.as_secs() {
                                 // Honor the test-only backoff override here
                                 // too — see the sibling site in publish-path.
                                 let delay = backoff_override()
-                                    .unwrap_or_else(|| Duration::from_secs(retry_after));
+                                    .unwrap_or_else(|| Duration::from_secs(wanted));
                                 tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 tokio::time::sleep(delay).await;
                                 tracing::event!(name: "backoff_end", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 continue;
                             }
+                            break;
                         }
 
                         // Retryable: server errors and timeouts
@@ -887,7 +883,7 @@ impl RegistryClient {
                             )
                             .await
                             .unwrap_or_default();
-                            last_error = Some(failed_answer_error(status, &body, body.clone(), 0));
+                            last_error = Some(registry_refusal(status, &facts, &body, &origin));
                             if attempt < MAX_RETRIES {
                                 let delay = backoff_delay(attempt);
                                 tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
@@ -900,7 +896,7 @@ impl RegistryClient {
                         // Other errors — fail immediately
                         _ => {
                             let body = read_request_error_text(response, &request).await;
-                            return Err(failed_answer_error(status, &body, body.clone(), 0));
+                            return Err(registry_refusal(status, &facts, &body, &origin));
                         }
                     }
                 }
@@ -940,6 +936,22 @@ impl RegistryClient {
     }
 }
 
+/// Whether a publish's 403 says the Registry has the version: by its
+/// `VERSION_EXISTS` code, or by the exact message registries that predate the
+/// code send.
+fn publish_refusal_is_version_exists(body: &str, version: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
+    field("code") == Some("VERSION_EXISTS")
+        || field("error")
+            == Some(
+                format!("Version {version} already exists. You cannot overwrite versions.")
+                    .as_str(),
+            )
+}
+
 /// A publish refused because the Registry has the version.
 pub(super) fn version_exists_error(version: &str) -> LpmError {
     LpmError::Registry(format!(
@@ -964,31 +976,40 @@ async fn read_publish_error_text(
     }
 }
 
-/// The error an answer that isn't a success, nor a 401, is: a 403 as
-/// forbidden, or as the error an LPM Worker's `body` names, a 404 as not
-/// found, a 429 as rate limited for `retry_after_secs`, any other as
-/// `Http`, each with `message`.
-pub(super) fn failed_answer_error(
+impl RegistryClient {
+    /// Which registry `url` is: the LPM registry, npm's, or another.
+    pub(super) fn registry_origin(&self, url: &reqwest::Url) -> RegistryOrigin {
+        RegistryOrigin::of(url, &self.base_url, &self.npm_registry_url)
+    }
+}
+
+/// The error the LPM registry's refusal is, from its status, body and the
+/// wait a 429 asked for, for an answer read outside the retry loop.
+pub(super) fn lpm_refusal(
     status: u16,
     body: &str,
-    message: String,
     retry_after_secs: u64,
+    registry: &str,
 ) -> LpmError {
-    match status {
-        403 => {
-            super::body::parse_lpm_worker_error_body(body).unwrap_or(LpmError::Forbidden(message))
-        }
-        404 => LpmError::NotFound(message),
-        429 => LpmError::RateLimited { retry_after_secs },
-        _ => LpmError::Http { status, message },
-    }
+    let origin = RegistryOrigin {
+        origin: reqwest::Url::parse(registry).map_or_else(
+            |_| registry.trim_end_matches('/').to_owned(),
+            |url| url.origin().ascii_serialization(),
+        ),
+        kind: RegistryKind::Lpm,
+    };
+    let facts = AnswerFacts {
+        retry_after_secs: Some(retry_after_secs),
+        ..AnswerFacts::default()
+    };
+    registry_refusal(status, &facts, body, &origin)
 }
 
 /// What the retry loop hands back for an answer that isn't a success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailedAnswer {
     /// An error: a 401 as `AuthRequired`, any other as
-    /// [`failed_answer_error`] makes it.
+    /// [`registry_refusal`] makes it.
     Error,
     /// [`Answered::Failed`]: one that isn't retried, and the last one that
     /// was.
@@ -1009,17 +1030,22 @@ impl Answered {
     pub(super) fn into_response(self) -> Result<reqwest::Response, LpmError> {
         match self {
             Self::Success(response) => Ok(response),
-            Self::Failed(FailedResponse { status: 401, .. }) => Err(LpmError::AuthRequired),
+            Self::Failed(FailedResponse {
+                status: 401,
+                origin:
+                    RegistryOrigin {
+                        kind: RegistryKind::Lpm,
+                        ..
+                    },
+                ..
+            }) => Err(LpmError::AuthRequired),
             Self::Failed(FailedResponse {
                 status,
-                retry_after_secs,
                 body,
-            }) => Err(failed_answer_error(
-                status,
-                &body,
-                body.clone(),
-                retry_after_secs,
-            )),
+                facts,
+                origin,
+                ..
+            }) => Err(registry_refusal(status, &facts, &body, &origin)),
         }
     }
 }
@@ -1032,6 +1058,8 @@ pub(super) struct FailedResponse {
     pub(super) status: u16,
     pub(super) retry_after_secs: u64,
     pub(super) body: String,
+    pub(super) facts: AnswerFacts,
+    pub(super) origin: RegistryOrigin,
 }
 
 /// Parse `Retry-After` header from a 429 response.
