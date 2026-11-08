@@ -19,7 +19,15 @@ impl CredentialKind {
         }
     }
 
+    pub(super) fn other(self) -> Self {
+        match self {
+            Self::Access => Self::Refresh,
+            Self::Refresh => Self::Access,
+        }
+    }
+
     pub(super) fn file_key(self, registry: &str) -> String {
+        let registry = super::registry_key(registry);
         match self {
             Self::Access => registry.to_owned(),
             Self::Refresh => format!("refresh:{registry}"),
@@ -212,7 +220,7 @@ fn credential_id(registry: &str, kind: CredentialKind) -> String {
     let mut digest = Sha256::new();
     digest.update(kind.label().as_bytes());
     digest.update([0]);
-    digest.update(registry.as_bytes());
+    digest.update(super::registry_key(registry).as_bytes());
     hex::encode(digest.finalize())
 }
 

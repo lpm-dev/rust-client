@@ -222,6 +222,45 @@ async fn assert_targeted_builtin_logout_preserves_primary_session(
 }
 
 #[tokio::test]
+async fn a_login_stored_under_a_trailing_slash_url_is_found_without_it() {
+    let project = TempProject::empty(r#"{"name":"auth-slash-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_authenticated_whoami("slashed-access", "testuser", "test@example.com")
+        .await;
+    // As `lpm login --registry <url>/` stored it before logins were keyed
+    // without the trailing slash.
+    let slashed = format!("{}/", mock.url());
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &slashed,
+            access_token: Some("slashed-access"),
+            refresh_token: Some("slashed-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["whoami", "--json"])
+        .output()
+        .expect("failed to run lpm whoami");
+
+    assert!(
+        output.status.success(),
+        "whoami missed the slashed login:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(parse_json_output(&output.stdout)["username"], "testuser");
+    let credentials = read_credentials(project.home());
+    assert_eq!(credentials[&mock.url()], "slashed-access");
+    assert!(
+        credentials.get(&slashed).is_none(),
+        "the slashed copy is moved, not left behind: {credentials:?}"
+    );
+}
+
+#[tokio::test]
 async fn whoami_recovers_session_from_refresh_token_only() {
     let project = TempProject::empty(r#"{"name":"auth-refresh-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

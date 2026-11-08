@@ -261,7 +261,10 @@ impl SessionManager {
     /// SessionManager itself reads `LPM_TOKEN` so that the source can
     /// be classified correctly.
     pub fn new(registry_url: impl Into<String>, explicit_flag_token: Option<String>) -> Self {
-        let registry_url = registry_url.into();
+        let mut registry_url = registry_url.into();
+        // Requests such as the refresh append `/api/...`, and stored logins
+        // are keyed without the slash.
+        registry_url.truncate(registry_url.trim_end_matches('/').len());
         // Eager classification is limited to env/flag. Keychain reads are
         // deferred to `ensure_classified`, called on the first method that
         // actually needs the cached value. On macOS the keychain IPC costs
