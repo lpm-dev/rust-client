@@ -182,6 +182,7 @@ pub use personal::{
     pull_env_bound_to_principal, pull_raw, pull_raw_bound, pull_raw_bound_to_principal,
     pull_raw_for_rotation, pull_raw_for_rotation_bound, pull_raw_for_rotation_bound_to_principal,
     push, push_raw, push_raw_with_options, push_raw_with_project_rotation,
+    push_rotated_project_key,
 };
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, MyPublicKeyState, OrgMemberKeyAccess, PendingPublicKey,

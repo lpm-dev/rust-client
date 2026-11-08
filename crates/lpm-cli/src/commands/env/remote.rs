@@ -277,16 +277,18 @@ pub(super) async fn env_share(
     )
     .await?;
 
-    if let Some(version) = result.version {
-        super::sync_payload::persist_org_sync_version(
-            &project_dir,
-            &vault_id,
-            org_slug,
-            version,
-            &registry_url,
-            &organization_id,
-        )?;
-    }
+    let checkpoint_warning = result.version.and_then(|version| {
+        super::sync_payload::org_sync_checkpoint_warning(
+            super::sync_payload::persist_org_sync_version(
+                &project_dir,
+                &vault_id,
+                org_slug,
+                version,
+                &registry_url,
+                &organization_id,
+            ),
+        )
+    });
 
     if json_output {
         let mut response = serde_json::json!({
@@ -295,8 +297,14 @@ pub(super) async fn env_share(
             "org": org_slug,
             "version": result.version,
         });
-        if !result.warnings.is_empty() {
-            response["warnings"] = serde_json::json!(result.warnings);
+        let warnings: Vec<_> = result
+            .warnings
+            .iter()
+            .map(|warning| serde_json::json!(warning))
+            .chain(checkpoint_warning.map(|warning| serde_json::json!(warning)))
+            .collect();
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
         }
         super::response::print_json_value(&response);
     } else {
@@ -307,6 +315,9 @@ pub(super) async fn env_share(
         ));
         for warning in &result.warnings {
             output::warn(&format!("{} {}", warning.message, warning.hint));
+        }
+        if let Some(warning) = checkpoint_warning {
+            output::warn(warning);
         }
     }
     Ok(())

@@ -114,11 +114,12 @@ pub(super) fn env_get(
     match value {
         Some(value) => {
             if json_output {
-                if reveal {
-                    println!("{}", serde_json::json!({"success": true, key: value}));
+                let shown = if reveal {
+                    value.as_str()
                 } else {
-                    println!("{}", serde_json::json!({"success": true, key: "••••••••"}));
-                }
+                    "••••••••"
+                };
+                println!("{}", env_get_json(key, shown));
             } else if reveal {
                 println!("{value}");
             } else {
@@ -137,6 +138,19 @@ pub(super) fn env_get(
         }
     }
     Ok(())
+}
+
+/// `key` and `value`, and for scripts written before those fields the value
+/// under the key's own name, unless that name is one of the fields.
+fn env_get_json(key: &str, shown: &str) -> serde_json::Value {
+    let mut object = serde_json::Map::with_capacity(4);
+    object.insert("success".to_owned(), true.into());
+    object.insert("key".to_owned(), key.into());
+    object.insert("value".to_owned(), shown.into());
+    if !matches!(key, "success" | "key" | "value") {
+        object.insert(key.to_owned(), shown.into());
+    }
+    serde_json::Value::Object(object)
 }
 
 pub(super) fn env_list(

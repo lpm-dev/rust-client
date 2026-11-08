@@ -225,6 +225,8 @@ pub(crate) fn authorize_companion(
 fn with_project_vault_transaction<T>(
     operation: impl FnOnce(&storage_transaction::VaultStorageDirectory) -> Result<T, String>,
 ) -> Result<T, String> {
+    #[cfg(debug_assertions)]
+    record_vault_transaction_for_test();
     storage_transaction::with_vault_transaction(|directory| {
         #[cfg(target_os = "macos")]
         if !force_file_vault_backend() {
@@ -232,6 +234,23 @@ fn with_project_vault_transaction<T>(
         }
         operation(directory)
     })
+}
+
+/// Appends a line to `LPM_TEST_VAULT_TRANSACTION_LOG` for each vault
+/// transaction, so workflow tests can count how often a command reads it.
+#[cfg(debug_assertions)]
+fn record_vault_transaction_for_test() {
+    use std::io::Write as _;
+    let Some(log_path) = std::env::var_os("LPM_TEST_VAULT_TRANSACTION_LOG") else {
+        return;
+    };
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = writeln!(log, "transaction");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +408,44 @@ pub fn try_get_run_environment_for_vault_id(
     })
 }
 
+/// Every environment's values and personal overrides from one read of the
+/// vault, for commands that look at several environments.
+#[derive(Debug, Default)]
+pub struct AllRunEnvironments {
+    pub values: EnvironmentMap,
+    pub overrides: HashMap<String, PersonalOverrides>,
+}
+
+impl AllRunEnvironments {
+    /// What [`try_get_run_environment`] reads for `environment`: an
+    /// environment without values of its own reads `default`'s values, but
+    /// only its own overrides. `None` reads `default` without a fallback.
+    pub fn run_environment(&self, environment: Option<&str>) -> RunEnvironment {
+        let name = environment.unwrap_or(lpm_env::DEFAULT_ENVIRONMENT);
+        let own = self.values.get(name);
+        let selected = if environment.is_some()
+            && lpm_env::reads_default_environment(name, own.is_some_and(|own| !own.is_empty()))
+        {
+            self.values.get(lpm_env::DEFAULT_ENVIRONMENT)
+        } else {
+            own
+        };
+        RunEnvironment {
+            values: selected.cloned().unwrap_or_default(),
+            overrides: self.overrides.get(name).cloned().unwrap_or_default(),
+        }
+    }
+}
+
+/// [`AllRunEnvironments`] for the project's vault; empty when it has none.
+pub fn try_get_all_run_environments(project_dir: &Path) -> Result<AllRunEnvironments, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(AllRunEnvironments::default());
+    };
+    let (values, overrides) = try_get_all_run_environments_for_vault_id(&vault_id)?;
+    Ok(AllRunEnvironments { values, overrides })
+}
+
 /// Every environment's values and personal overrides, read together in one
 /// lock, for a view of what each environment would run with.
 pub fn try_get_all_run_environments_for_vault_id(
@@ -401,7 +458,7 @@ pub fn try_get_all_run_environments_for_vault_id(
     })
 }
 
-type AllRunEnvironments = (
+type StoredRunEnvironments = (
     Option<EnvironmentMap>,
     std::collections::BTreeMap<String, PersonalOverrides>,
 );
@@ -409,7 +466,7 @@ type AllRunEnvironments = (
 fn read_all_run_environments_unlocked(
     directory: &storage_transaction::VaultStorageDirectory,
     vault_id: &str,
-) -> Result<AllRunEnvironments, String> {
+) -> Result<StoredRunEnvironments, String> {
     if force_file_vault_backend() {
         return fallback::read_all_run_environments_unlocked(directory, vault_id);
     }
@@ -1701,8 +1758,15 @@ fn write_all_environments(
 ///
 /// Public so callers like `vars init` can count variables before importing.
 pub fn parse_env_content(content: &str) -> HashMap<String, String> {
+    parse_env_entries(content).into_iter().collect()
+}
+
+/// The entries of a .env file in file order, a later one for the same key
+/// after an earlier one. `lpm run` reads files with this parser too, so a
+/// file runs with the values it imports with.
+pub fn parse_env_entries(content: &str) -> Vec<(String, String)> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let mut vars = HashMap::new();
+    let mut entries = Vec::new();
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
@@ -1721,12 +1785,12 @@ pub fn parse_env_content(content: &str) -> HashMap<String, String> {
             let value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
 
             if !key.is_empty() {
-                vars.insert(key, value);
+                entries.push((key, value));
             }
         }
     }
 
-    vars
+    entries
 }
 
 fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
@@ -1909,6 +1973,29 @@ fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_read_of_several_environments_matches_reading_each() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let project = tempfile::tempdir().unwrap();
+            set_env(project.path(), "default", &[("SHARED", "default")]).unwrap();
+            set_env(project.path(), "staging", &[("STAGING_ONLY", "staging")]).unwrap();
+            let all = try_get_all_run_environments(project.path()).unwrap();
+
+            for environment in [None, Some("default"), Some("staging"), Some("preview")] {
+                let together = all.run_environment(environment);
+                let alone = try_get_run_environment(project.path(), environment).unwrap();
+                assert_eq!(together.values, alone.values, "{environment:?}");
+                assert_eq!(together.overrides, alone.overrides, "{environment:?}");
+            }
+            assert_eq!(
+                all.run_environment(Some("preview")).values["SHARED"],
+                "default"
+            );
+            cleanup_vault(project.path());
+        });
+    }
 
     // The writers as tests call them, each with the source its action takes.
     fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
