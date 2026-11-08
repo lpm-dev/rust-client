@@ -75,14 +75,11 @@ impl<'a> Flow<'_, 'a> {
                     .copied()
                     .map_or(0, |value| self.path_fact(value, next));
                 if let Some(&(owner, index)) = self.parameters.get(&symbol) {
-                    let count = self.callers.get(&owner).map_or(0, Vec::len);
+                    let key = (owner, index);
+                    let count = self.arguments.get(&key).map_or(0, Vec::len);
                     for position in 0..count {
-                        let call = self.callers[&owner][position];
-                        if let Some(argument) =
-                            call.arguments.get(index).and_then(Argument::as_expression)
-                        {
-                            value |= self.path_fact(argument, next);
-                        }
+                        let argument = self.arguments[&key][position];
+                        value |= self.path_fact(argument, next);
                         if self.steps == 0 {
                             break;
                         }

@@ -240,12 +240,8 @@ impl<'s, 'a> Flow<'s, 'a> {
             }
             Expression::ArrayExpression(array) if !text_only => {
                 let mut value = 0;
-                for expression in array
-                    .elements
-                    .iter()
-                    .filter_map(ArrayExpressionElement::as_expression)
-                {
-                    value |= self.artifact(expression, next, text_only);
+                for &position in self.array_values(array).iter() {
+                    value |= self.artifact(super::array_value(array, position), next, text_only);
                     if self.steps == 0 {
                         break;
                     }
@@ -356,13 +352,10 @@ impl<'s, 'a> Flow<'s, 'a> {
                 let Some(target) = self.target(&call.callee, 0) else {
                     return false;
                 };
-                let count = self.returns.get(&target).map_or(0, Vec::len);
+                let count = self.non_null_returns.get(&target).map_or(0, Vec::len);
                 let mut found = false;
                 for index in 0..count {
-                    let value = self.returns[&target][index];
-                    if matches!(value.get_inner_expression(), Expression::NullLiteral(_)) {
-                        continue;
-                    }
+                    let value = self.non_null_returns[&target][index];
                     if !self.interpreter(value, depth + 1) {
                         return false;
                     }

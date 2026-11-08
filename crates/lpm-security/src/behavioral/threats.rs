@@ -120,7 +120,14 @@ pub(super) fn is_candidate(call: &CallExpression<'_>) -> bool {
 struct Flow<'s, 'a> {
     semantic: &'s Semantic<'a>,
     parameters: HashMap<SymbolId, (u32, usize)>,
-    callers: HashMap<u32, Vec<&'a CallExpression<'a>>>,
+    /// The arguments each function's calls pass at each position, by the
+    /// function's start and the position, in call order. Calls that omit
+    /// the argument cost no steps, so reading them from every call made
+    /// each parameter read cost the function's call count.
+    arguments: HashMap<(u32, usize), Vec<&'a Expression<'a>>>,
+    /// The values a function returns other than `null`, which
+    /// [`Flow::interpreter`] skips.
+    non_null_returns: HashMap<u32, Vec<&'a Expression<'a>>>,
     methods: HashMap<(u32, bool), HashMap<NameKey, Option<u32>>>,
     ancestry: ancestry::Ancestry,
     defaults: HashMap<SymbolId, &'a Expression<'a>>,
@@ -141,6 +148,10 @@ struct Flow<'s, 'a> {
     /// [`Flow::api`] reads it.
     destructured: HashMap<SymbolId, &'a str>,
     objects: RefCell<HashMap<usize, Rc<ObjectFields>>>,
+    /// Positions of each array literal's elements that aren't holes or
+    /// spreads, by its address. Holes cost no steps, so skipping them for
+    /// every candidate cost the array's length each time.
+    arrays: RefCell<HashMap<usize, Rc<[usize]>>>,
     /// Positions of each call's last two arguments that aren't spreads,
     /// by the call's address. Finding them skips every trailing spread.
     last_arguments: RefCell<HashMap<usize, [Option<usize>; 2]>>,
@@ -177,6 +188,14 @@ impl ObjectFields {
         }
         Self { positions, by_name }
     }
+}
+
+/// The element at `position`, which [`Flow::array_values`] found to be an
+/// expression.
+fn array_value<'e, 'a>(array: &'e ArrayExpression<'a>, position: usize) -> &'e Expression<'a> {
+    array.elements[position]
+        .as_expression()
+        .expect("array_values lists expression elements")
 }
 
 /// The value of the property at `position`, which [`ObjectFields`] found
@@ -230,6 +249,19 @@ impl<'s, 'a> Flow<'s, 'a> {
                 [positions.next(), positions.next()]
             });
         positions.map(|position| position.and_then(|p| call.arguments[p].as_expression()))
+    }
+
+    fn array_values(&self, array: &ArrayExpression<'_>) -> Rc<[usize]> {
+        let address = std::ptr::from_ref(array).addr();
+        Rc::clone(self.arrays.borrow_mut().entry(address).or_insert_with(|| {
+            array
+                .elements
+                .iter()
+                .enumerate()
+                .filter(|(_, element)| element.as_expression().is_some())
+                .map(|(position, _)| position)
+                .collect()
+        }))
     }
 
     fn symbol(&self, identifier: &IdentifierReference<'_>) -> Option<SymbolId> {
@@ -362,18 +394,15 @@ impl<'s, 'a> Flow<'s, 'a> {
                 if secret_name(identifier.name.as_str()) {
                     return SECRET;
                 }
-                let count = self.callers.get(&owner).map_or(0, Vec::len);
+                let key = (owner, index);
+                let count = self.arguments.get(&key).map_or(0, Vec::len);
                 let mut result = 0;
                 for position in 0..count {
                     if self.steps == 0 {
                         break;
                     }
-                    let call = self.callers[&owner][position];
-                    if let Some(argument) =
-                        call.arguments.get(index).and_then(Argument::as_expression)
-                    {
-                        result |= self.value(argument, next);
-                    }
+                    let argument = self.arguments[&key][position];
+                    result |= self.value(argument, next);
                 }
                 result
             }
@@ -413,15 +442,11 @@ impl<'s, 'a> Flow<'s, 'a> {
             }
             Expression::ArrayExpression(array) => {
                 let mut result = 0;
-                for value in array
-                    .elements
-                    .iter()
-                    .filter_map(ArrayExpressionElement::as_expression)
-                {
+                for &position in self.array_values(array).iter() {
                     if self.steps == 0 {
                         break;
                     }
-                    result |= self.value(value, next);
+                    result |= self.value(array_value(array, position), next);
                 }
                 result
             }
@@ -649,7 +674,8 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
     let mut flow = Flow {
         semantic,
         parameters: HashMap::new(),
-        callers: HashMap::new(),
+        arguments: HashMap::new(),
+        non_null_returns: HashMap::new(),
         methods: HashMap::new(),
         returns: HashMap::new(),
         report_writes: HashMap::new(),
@@ -664,6 +690,7 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
         over_budget: false,
         destructured: destructured_methods(semantic),
         objects: RefCell::new(HashMap::new()),
+        arrays: RefCell::new(HashMap::new()),
         last_arguments: RefCell::new(HashMap::new()),
         written: semantic
             .scoping()
@@ -747,7 +774,14 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
         if let AstKind::CallExpression(call) = node.kind()
             && let Some(target) = flow.target(&call.callee, 0)
         {
-            flow.callers.entry(target).or_default().push(call);
+            for (position, argument) in call.arguments.iter().enumerate() {
+                if let Some(argument) = argument.as_expression() {
+                    flow.arguments
+                        .entry((target, position))
+                        .or_default()
+                        .push(argument);
+                }
+            }
         }
     }
     for node in semantic.nodes().iter() {
@@ -786,6 +820,18 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
             flow.returns.entry(owner).or_default().push(value);
         }
     }
+    flow.non_null_returns = flow
+        .returns
+        .iter()
+        .map(|(&target, values)| {
+            let values = values
+                .iter()
+                .copied()
+                .filter(|value| !matches!(value.get_inner_expression(), Expression::NullLiteral(_)))
+                .collect();
+            (target, values)
+        })
+        .collect();
     flow.report_writes = reports::collect(&flow);
     flow
 }
@@ -1154,6 +1200,41 @@ mod tests {
         assert!(
             repeated_time < flat_time * 5,
             "repeated {repeated_time:?}, side by side {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn calls_without_the_argument_and_array_holes_are_skipped_once() {
+        // A candidate reading a parameter looked at every call of its
+        // function, and one reading an array at every element; calls that
+        // omit the argument and holes cost no steps, so every candidate
+        // paid for all of them.
+        let shapes = [
+            format!(
+                "require('fs');function f(x){{{}}}{}",
+                "fetch('https://e.example',{body:x});".repeat(4_000),
+                "f();".repeat(4_000)
+            ),
+            format!(
+                "require('fs');const a=[{}0];{}",
+                ",".repeat(40_000),
+                "fetch('https://e.example',{body:a});".repeat(4_000)
+            ),
+            format!(
+                "const cp=require('child_process');function g(){{{}return 'sh'}}{}",
+                "if(a)return null;".repeat(4_000),
+                "cp.spawn(g(),['x']);".repeat(4_000)
+            ),
+        ];
+        let side_by_side: Vec<String> = shapes
+            .iter()
+            .map(|source| "eval(a);".repeat(source.len() / 8 + 1))
+            .collect();
+        let shapes_time = time_to_analyze(&shapes);
+        let flat_time = time_to_analyze(&side_by_side);
+        assert!(
+            shapes_time < flat_time * 5,
+            "shapes {shapes_time:?}, side by side {flat_time:?}"
         );
     }
 
