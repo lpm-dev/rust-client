@@ -26,6 +26,7 @@ impl StreamOutput {
         id: &str,
         status: u16,
         headers: &HashMap<String, String>,
+        set_cookie: &[String],
         mut response: reqwest::Response,
     ) -> Result<StreamCapture, LpmError> {
         self.messages
@@ -33,6 +34,7 @@ impl StreamOutput {
                 id: id.to_string(),
                 status,
                 headers: headers.clone(),
+                set_cookie: set_cookie.to_vec(),
             })
             .await
             .map_err(|_| LpmError::Tunnel("response channel closed".into()))?;
@@ -112,7 +114,7 @@ mod tests {
         };
         let task = tokio::spawn(async move {
             output
-                .forward("stream", 200, &HashMap::new(), response)
+                .forward("stream", 200, &HashMap::new(), &[], response)
                 .await
         });
         assert!(matches!(

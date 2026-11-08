@@ -30,8 +30,11 @@ pub enum ClientMessage {
         id: String,
         /// HTTP status code.
         status: u16,
-        /// Response headers.
+        /// Response headers, one value per name.
         headers: HashMap<String, String>,
+        /// Every `Set-Cookie` value, when the response sets more than one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        set_cookie: Vec<String>,
         /// Response body (base64-encoded for binary safety).
         body: String,
     },
@@ -42,6 +45,8 @@ pub enum ClientMessage {
         id: String,
         status: u16,
         headers: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        set_cookie: Vec<String>,
     },
     /// One demand-limited response chunk, at most 64 KiB decoded.
     #[serde(rename = "http_response_chunk")]
@@ -372,6 +377,7 @@ mod tests {
             id: "req_001".to_string(),
             status: 200,
             headers,
+            set_cookie: Vec::new(),
             body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"ok"),
         };
         let json = serde_json::to_string(&msg).unwrap();
