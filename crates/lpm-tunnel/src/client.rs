@@ -739,9 +739,12 @@ fn activate_local_websocket(
     let reader_id = id;
     let reader_cancel = connection_cancel.clone();
     task_handles.spawn(async move {
-        let _slot = slot;
         if let (Some(ws_tx), Some(connected)) = (&ws_tx, connected) {
-            send_websocket_lifecycle_event(ws_tx, connected).await;
+            tokio::select! {
+                biased;
+                () = reader_cancel.cancelled() => {}
+                () = send_websocket_lifecycle_event(ws_tx, connected) => {}
+            }
         }
         let mut close_reason = "local WebSocket connection ended".to_string();
         let mut notify_relay = true;
@@ -806,13 +809,15 @@ fn activate_local_websocket(
                 }
             };
             if let Some(ref ws_tx) = ws_tx {
-                let _ = ws_tx.try_send(WsEvent::captured_frame(
-                    reader_id.clone(),
-                    FrameDirection::Outbound,
-                    &bytes,
-                    is_binary,
-                    chrono::Utc::now().to_rfc3339(),
-                ));
+                send_frame_preview(ws_tx, || {
+                    WsEvent::captured_frame(
+                        reader_id.clone(),
+                        FrameDirection::Outbound,
+                        &bytes,
+                        is_binary,
+                        chrono::Utc::now().to_rfc3339(),
+                    )
+                });
             }
             let json = match serialize_websocket_frame(&reader_id, &bytes, is_binary) {
                 Ok(json) => json,
@@ -837,29 +842,32 @@ fn activate_local_websocket(
             }
         }
         reader_cancel.cancel();
-        if let Some(ws_tx) = &ws_tx {
-            let reason = match &relay_close {
-                Some((_, reason)) => reason.clone(),
-                None => notify_relay.then(|| close_reason.clone()),
-            };
-            send_websocket_lifecycle_event(
-                ws_tx,
-                WsEvent::Closed {
-                    connection_id: reader_id.clone(),
-                    reason,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                },
-            )
-            .await;
-        }
+        let inspector_reason = match &relay_close {
+            Some((_, reason)) => reason.clone(),
+            None => notify_relay.then(|| close_reason.clone()),
+        };
+        // The relay hears of the close, and the slot frees, before a busy
+        // inspector is told.
         let _ = closed_tx.send(ClosedLocalWebSocket {
-            id: reader_id,
+            id: reader_id.clone(),
             generation,
             half: LocalWebSocketHalf::Reader,
             reason: close_reason,
             notify_relay,
             relay_close,
         });
+        drop(slot);
+        if let Some(ws_tx) = &ws_tx {
+            send_websocket_lifecycle_event(
+                ws_tx,
+                WsEvent::Closed {
+                    connection_id: reader_id,
+                    reason: inspector_reason,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await;
+        }
     });
 
     WebSocketConnection {
@@ -867,6 +875,23 @@ fn activate_local_websocket(
         priority_commands: priority_tx,
         cancel: connection_cancel,
         generation,
+    }
+}
+
+/// Inspector channel slots that frame previews leave free, so the connect and
+/// close events that keep the panel's connection count right rarely wait.
+const LIFECYCLE_EVENT_HEADROOM: usize = 32;
+
+/// Queues a frame preview for the inspector while the channel has room past
+/// [`LIFECYCLE_EVENT_HEADROOM`], building it only then. A dropped preview
+/// costs one row in the panel.
+#[inline]
+fn send_frame_preview(
+    ws_tx: &tokio::sync::mpsc::Sender<WsEvent>,
+    preview: impl FnOnce() -> WsEvent,
+) {
+    if ws_tx.capacity() > LIFECYCLE_EVENT_HEADROOM {
+        let _ = ws_tx.try_send(preview());
     }
 }
 
@@ -2551,15 +2576,16 @@ async fn try_connect_with_token(
                                         .await?;
                                         continue;
                                     }
-                                    // Capture inbound frame for inspector
                                     if let Some(ref ws_tx) = options.ws_tx {
-                                        let _ = ws_tx.try_send(WsEvent::captured_frame(
-                                            id.clone(),
-                                            FrameDirection::Inbound,
-                                            &decoded,
-                                            is_binary,
-                                            chrono::Utc::now().to_rfc3339(),
-                                        ));
+                                        send_frame_preview(ws_tx, || {
+                                            WsEvent::captured_frame(
+                                                id.clone(),
+                                                FrameDirection::Inbound,
+                                                &decoded,
+                                                is_binary,
+                                                chrono::Utc::now().to_rfc3339(),
+                                            )
+                                        });
                                     }
 
                                     let command = LocalWebSocketCommand::Frame {
@@ -5465,6 +5491,87 @@ mod tests {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frame_previews_leave_room_for_the_close_of_a_websocket_in_a_busy_inspector() {
+        const FRAMES: usize = 40;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..FRAMES {
+                socket
+                    .send(Message::Text(format!("frame {index}").into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (local_write, local_read) = socket.split();
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel(4);
+        let relay = tokio::spawn(async move { while relay_rx.recv().await.is_some() {} });
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The inspector reads nothing until the connection is over.
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(FRAMES);
+        let mut tasks = tokio::task::JoinSet::new();
+        let connection = activate_local_websocket(
+            &mut tasks,
+            LocalWebSocketActivation {
+                id: "hmr".into(),
+                generation: 1,
+                local_write,
+                local_read,
+                slot: Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+                relay_tx,
+                relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
+                ws_tx: Some(ws_tx),
+                connected: Some(WsEvent::Connected {
+                    connection_id: "hmr".into(),
+                    url: "/hmr".into(),
+                    headers: HashMap::new(),
+                    timestamp: String::new(),
+                }),
+                closed_tx,
+            },
+        );
+
+        let reader_closed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(closed) = closed_rx.recv().await {
+                if matches!(closed.half, LocalWebSocketHalf::Reader) {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            reader_closed.is_ok(),
+            "a full inspector channel held back the local close"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .expect("both local halves stop");
+        server.await.unwrap();
+        drop(connection);
+        relay.await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            matches!(events.first(), Some(WsEvent::Connected { .. }))
+                && matches!(events.last(), Some(WsEvent::Closed { .. })),
+            "{events:?}"
+        );
     }
 
     type LocalServer = fn(
