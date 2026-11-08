@@ -958,7 +958,7 @@ fn echo_upstream_reads_a_body_sent_after_its_head() {
 
 #[cfg(unix)]
 fn handle_echo_connection(stream: &mut std::net::TcpStream) {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     let Some(request) = read_whole_request(stream) else {
         return;
