@@ -461,6 +461,13 @@ async fn wait_for_detached_start(child: &mut std::process::Child) -> Result<Prox
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().map_err(LpmError::Io)? {
+            // Another session may have started the daemon at the same time;
+            // this child then exits because that one already owns the socket.
+            if let Ok(running) = read_status().await
+                && running.running
+            {
+                return Ok(running);
+            }
             return Err(LpmError::Script(format!(
                 "detached proxy daemon exited before becoming ready ({status}); run `lpm proxy start` in the foreground for details"
             )));

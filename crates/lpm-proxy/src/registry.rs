@@ -122,22 +122,6 @@ impl RouteRegistry {
         statuses
     }
 
-    pub(crate) fn routes_for_lease(&self, lease_id: RouteLeaseId) -> Vec<Route> {
-        let mut routes: Vec<Route> = self
-            .routes
-            .values()
-            .filter(|route| route.lease_id == lease_id)
-            .map(|route| Route {
-                host: route.host.clone(),
-                upstream_port: route.upstream_port,
-                project_dir: route.project_dir.clone(),
-                service: route.service.clone(),
-            })
-            .collect();
-        routes.sort_by(|left, right| left.host.cmp(&right.host));
-        routes
-    }
-
     pub(crate) fn restore_routes_for_lease(
         &mut self,
         lease_id: RouteLeaseId,

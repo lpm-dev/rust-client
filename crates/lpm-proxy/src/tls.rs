@@ -291,11 +291,17 @@ async fn serve_tls_http_connection(
     let _ = builder.serve_connection(io, service).with_upgrades().await;
 }
 
+/// Loads every route's certificate from disk, as a daemon with no current
+/// keys would.
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) fn refresh_tls_cert_store(
     cert_store: &TlsCertificateStore,
     routes: &[RouteStatus],
 ) -> Result<(), ProxyError> {
-    let mut keys_by_host = HashMap::with_capacity(routes.len());
+    cert_store.replace(certificate_map_for_routes(&HashMap::new(), routes)?)
+}
+
+fn hosts_by_project(routes: &[RouteStatus]) -> BTreeMap<PathBuf, Vec<String>> {
     let mut hosts_by_project = BTreeMap::<PathBuf, Vec<String>>::new();
     for route in routes {
         hosts_by_project
@@ -303,22 +309,58 @@ pub(crate) fn refresh_tls_cert_store(
             .or_default()
             .push(route.host.clone());
     }
-    for (project_dir, mut hosts) in hosts_by_project {
+    for hosts in hosts_by_project.values_mut() {
         hosts.sort_unstable();
         hosts.dedup();
-        let material = lpm_cert::load_project_https_material(&project_dir, &hosts)
-            .map_err(cert_error_to_tls)?;
-        let key = load_certified_key_bytes_with_lease(
-            &material.cert_pem,
-            &material.key_pem,
-            &project_dir.display().to_string(),
-            material.runtime_lease,
-        )?;
+    }
+    hosts_by_project
+}
+
+/// The certificate map for `routes`, keeping a project's current key when it
+/// already serves every one of the project's hosts. Only a project that
+/// gained a host reads its certificate files, so a route change neither
+/// waits on every project's files nor fails because another project's files
+/// moved, expired or were deleted. A project's restarted session releases
+/// its hosts first, so it picks up a renewed certificate.
+pub(crate) fn certificate_map_for_routes(
+    current_keys: &HashMap<String, Arc<CertifiedKey>>,
+    routes: &[RouteStatus],
+) -> Result<HashMap<String, Arc<CertifiedKey>>, ProxyError> {
+    let mut keys_by_host = HashMap::with_capacity(routes.len());
+    for (project_dir, hosts) in hosts_by_project(routes) {
+        let key = match served_by_one_key(current_keys, &hosts) {
+            Some(key) => key,
+            None => {
+                let material = lpm_cert::load_project_https_material(&project_dir, &hosts)
+                    .map_err(cert_error_to_tls)?;
+                load_certified_key_bytes_with_lease(
+                    &material.cert_pem,
+                    &material.key_pem,
+                    &project_dir.display().to_string(),
+                    material.runtime_lease,
+                )?
+            }
+        };
         for host in hosts {
             keys_by_host.insert(host, Arc::clone(&key));
         }
     }
-    cert_store.replace(keys_by_host)
+    Ok(keys_by_host)
+}
+
+fn served_by_one_key(
+    current_keys: &HashMap<String, Arc<CertifiedKey>>,
+    hosts: &[String],
+) -> Option<Arc<CertifiedKey>> {
+    let (first, rest) = hosts.split_first()?;
+    let key = current_keys.get(first)?;
+    rest.iter()
+        .all(|host| {
+            current_keys
+                .get(host)
+                .is_some_and(|other| Arc::ptr_eq(key, other))
+        })
+        .then(|| Arc::clone(key))
 }
 
 pub(crate) async fn prepare_tls_certificates_if_enabled(
@@ -494,7 +536,7 @@ fn parse_certified_key_bytes(
     Ok(certified_key)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, debug_assertions))]
 pub(crate) fn cert_covers_hostname(cert_path: &Path, host: &str) -> Result<bool, ProxyError> {
     let cert_pem =
         lpm_common::read_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
