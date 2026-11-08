@@ -2575,6 +2575,64 @@ mod tests {
         }
     }
 
+    fn nested(open: &str, middle: &str, close: &str, depth: usize) -> String {
+        let mut source = open.repeat(depth);
+        source.push_str(middle);
+        source.push_str(&close.repeat(depth));
+        source
+    }
+
+    #[test]
+    fn references_nested_thousands_of_scopes_deep_are_read_without_semantic_analysis() {
+        // Semantic analysis looks each reference up in every scope around
+        // it: 6,000 nested blocks with a reference in each took seconds.
+        let started = std::time::Instant::now();
+        for source in [
+            nested("{eval(y);", "", "}", 6_000),
+            nested("if(y){eval(y);", "", "}", 6_000),
+            nested("function f(a=y,b=", "0", "){eval(y)}", 3_000),
+        ] {
+            let result = analyze_on_a_worker_stack("index.js", source);
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, 1);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn references_nested_as_deeply_as_real_code_nests_them_are_analyzed() {
+        for source in [
+            nested("{eval(y);", "", "}", 200),
+            nested("function f(a=y,b=", "0", "){eval(y)}", 100),
+            "function f(){var a=1;".repeat(50) + &"a;".repeat(20_000) + &"}".repeat(50),
+        ] {
+            let result = analyze_on_a_worker_stack("index.js", source);
+            assert!(result.source.eval || result.files_scanned == 1);
+            assert_eq!(result.unparsed_files, 0);
+        }
+    }
+
+    #[test]
+    fn arrow_defaults_nested_too_deeply_to_parse_stop_in_one_pass() {
+        // A parse that reached the stack floor inside a speculative arrow
+        // function parse once read every level back down to the floor:
+        // gigabytes of arena memory and seconds for a 100 KB source.
+        let source = format!("x={};eval(y);", nested("(a=y,b=", "0", ")=>0", 20_000));
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", source);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn a_long_expression_chain_is_parsed_whole() {
         let result =

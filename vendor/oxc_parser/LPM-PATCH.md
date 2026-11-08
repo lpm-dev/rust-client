@@ -27,9 +27,16 @@ registry's release scan.
   go deeper than the frames between two tokens past it. Below the floor it
   records a fatal error, which moves the lexer to the end of the source, so
   every caller unwinds without reading more.
+- Once the floor is reached, every later token read records the fatal error
+  again. A speculative parse, such as an arrow function's parameters, rewinds
+  the fatal error away, and the parser then reads the other interpretation.
+  If only reads below the floor stopped, each nested speculation would read
+  back down to the floor: a source of arrow functions nested in parameter
+  defaults took seconds and gigabytes of arena memory to give up on.
 - `ParserReturn::stack_exhausted` reports it. It stays set even when a
   speculative parse rewinds the fatal error away, because the speculation's
   outcome, and so the AST, may then differ from a parse with more stack.
+  Callers discard a parse that reports it.
 
 `lpm-security`'s `behavioral/syntax.rs` sets the floor from the stack its
 thread has left, retries a source that runs out on a 64 MiB stack, and
