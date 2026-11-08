@@ -6,10 +6,11 @@
 //! followed by `.lpm-cache/meta.json`, `stdout.log` and `stderr.log`.
 
 use super::{
-    CacheMeta, MAX_CACHE_ARCHIVE_ENTRIES, MAX_CACHE_ENTRY_BYTES, MAX_CACHE_LOG_BYTES, append_bytes,
-    cache_entry_lock_path, check_archive_size_limits, create_private_cache_file, open_cache_entry,
-    open_cache_entry_file, open_task_cache, publish_cache_entry, read_cache_log, read_cache_meta,
-    read_entry_to_string, validate_archive_entry_type, validate_archive_path, validate_cache_key,
+    CacheMeta, MAX_CACHE_ARCHIVE_ENTRIES, MAX_CACHE_ENTRY_BYTES, MAX_CACHE_LOG_BYTES,
+    PublishedCacheEntry, append_bytes, cache_entry_lock_path, check_archive_size_limits,
+    create_private_cache_file, directory_identity, open_cache_entry, open_cache_entry_file,
+    open_task_cache, publish_cache_entry, read_cache_log, read_cache_meta, read_entry_to_string,
+    validate_archive_entry_type, validate_archive_path, validate_cache_key,
     validate_local_cache_entry, validate_text_entry_size, write_cache_meta,
     write_private_cache_file,
 };
@@ -29,26 +30,27 @@ fn archive_limits() -> lpm_extractor::TarArchiveLimits {
     }
 }
 
-/// Writes the remote-cache artifact for `key` to `writer` from the local
-/// cache entry, which holds the outputs as the task left them. The local
-/// entry must exist, as it does right after [`super::store_cache`].
+/// Writes the remote-cache artifact for the local cache entry `published` to
+/// `writer`, from the entry, which holds the outputs as the task left them.
+/// Fails when the key's entry is no longer the one that run published.
 ///
 /// Returns `writer`, after the gzip stream is finished, so a caller that
 /// hashes what it writes can take the digests from it.
 pub fn write_remote_artifact_from_local_entry<W: Write>(
-    key: &str,
+    published: &PublishedCacheEntry,
     writer: W,
 ) -> Result<W, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
-    write_remote_artifact_from_local_entry_with_root(&root, key, writer)
+    write_remote_artifact_from_local_entry_with_root(&root, published, writer)
 }
 
 pub(super) fn write_remote_artifact_from_local_entry_with_root<W: Write>(
     root: &LpmRoot,
-    key: &str,
+    published: &PublishedCacheEntry,
     writer: W,
 ) -> Result<W, LpmError> {
+    let key = published.key();
     validate_cache_key(key)?;
     let cache = open_task_cache(root, false)?.ok_or_else(|| {
         LpmError::Task(format!(
@@ -60,6 +62,12 @@ pub(super) fn write_remote_artifact_from_local_entry_with_root<W: Write>(
         let _entry_lock =
             lpm_common::acquire_single_file_shared_lock(cache_entry_lock_path(root, key)?)?;
         let entry = open_cache_entry(&cache, key)?;
+        if directory_identity(&entry.dir)? != published.identity {
+            return Err(LpmError::Task(format!(
+                "task cache entry {} was replaced after this run stored it",
+                entry.path.display()
+            )));
+        }
         let meta = read_cache_meta(&entry, key)?;
         let stdout = read_cache_log(&entry, "stdout.log")?;
         let stderr = read_cache_log(&entry, "stderr.log")?;
@@ -141,6 +149,7 @@ pub(super) fn store_cache_from_remote_artifact_with_root(
         publish_cache_entry(&cache, key, |staging| {
             write_local_entry_from_remote_artifact(staging, key, &mut artifact)
         })
+        .map(drop)
     })
 }
 

@@ -556,7 +556,39 @@ fn restore_cache_locked_if(
     }))
 }
 
-/// Store task outputs to cache.
+/// What [`store_cache`] did with a task's result.
+#[derive(Debug)]
+pub enum StoredCacheEntry {
+    /// The result is now the key's entry.
+    Published(PublishedCacheEntry),
+    /// A valid entry was already stored under the key, so it was kept and
+    /// holds another run's result.
+    KeptExisting,
+}
+
+/// The cache entry one [`store_cache`] call published. A remote artifact is
+/// built only from it, since the run's upload checks cover its own result
+/// and no other.
+#[derive(Debug)]
+pub struct PublishedCacheEntry {
+    key: String,
+    identity: (u64, u64),
+    // An identity is unique only while its directory exists, and Unix hands a
+    // removed directory's inode to the next one, so the entry is held open
+    // until the artifact is built from it. NTFS ids carry a reuse counter, and
+    // an open handle on Windows would keep the entry from being replaced.
+    #[cfg(unix)]
+    _held_open: Dir,
+}
+
+impl PublishedCacheEntry {
+    #[inline]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Stores task outputs to the cache, keeping an entry that is already valid.
 pub fn store_cache(
     key: &str,
     project_dir: &Path,
@@ -565,7 +597,7 @@ pub fn store_cache(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-) -> Result<(), LpmError> {
+) -> Result<StoredCacheEntry, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
     store_cache_with_root(
@@ -593,7 +625,7 @@ fn store_cache_with_root(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-) -> Result<(), LpmError> {
+) -> Result<StoredCacheEntry, LpmError> {
     validate_cache_key(key)?;
     validate_cache_log_len("stdout.log", stdout.as_bytes())?;
     validate_cache_log_len("stderr.log", stderr.as_bytes())?;
@@ -603,7 +635,7 @@ fn store_cache_with_root(
         let _entry_lock =
             lpm_common::acquire_single_file_exclusive_lock(cache_entry_lock_path(root, key)?)?;
         if validate_local_cache_entry(&cache, key).is_ok() {
-            return Ok(());
+            return Ok(StoredCacheEntry::KeptExisting);
         }
         let _project_lock = lpm_common::acquire_single_file_shared_lock(
             canonical_project_restore_lock_path(root, &canonical_project),
@@ -618,6 +650,7 @@ fn store_cache_with_root(
             stderr,
             duration_ms,
         )
+        .map(StoredCacheEntry::Published)
     })
 }
 
@@ -634,7 +667,7 @@ fn store_cache_locked(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-) -> Result<(), LpmError> {
+) -> Result<PublishedCacheEntry, LpmError> {
     publish_cache_entry(cache, key, |open| {
         write_private_cache_file(open, "stdout.log", stdout.as_bytes())?;
         write_private_cache_file(open, "stderr.log", stderr.as_bytes())?;
@@ -662,6 +695,12 @@ fn write_cache_meta(dir: &Dir, meta: &CacheMeta) -> Result<(), LpmError> {
     write_private_cache_file(dir, "meta.json", &meta_json)
 }
 
+fn directory_identity(directory: &Dir) -> Result<(u64, u64), LpmError> {
+    Ok(lpm_common::atomic_write::file_identity(
+        &directory.try_clone()?.into_std_file(),
+    )?)
+}
+
 /// Writes a cache entry into a private staging directory with `write`, then
 /// publishes it under `key`, replacing any entry already there. The caller
 /// holds the entry's exclusive lock.
@@ -669,23 +708,18 @@ fn publish_cache_entry(
     cache: &OpenTaskCache,
     key: &str,
     write: impl FnOnce(&Dir) -> Result<(), LpmError>,
-) -> Result<(), LpmError> {
+) -> Result<PublishedCacheEntry, LpmError> {
     let entry = cache.path.join(key);
     let (staging_name, staging) = create_private_cache_directory(&cache.tasks)?;
     #[cfg(test)]
     wait_for_cache_race_barrier(&CACHE_STORE_STAGING_RACE_BARRIER, &cache.path);
-    let identity = |directory: &Dir| -> Result<(u64, u64), LpmError> {
-        Ok(lpm_common::atomic_write::file_identity(
-            &directory.try_clone()?.into_std_file(),
-        )?)
-    };
     let mut staging = Some(staging);
     let mut staged_identity = None;
     let result = (|| {
         let open = staging.as_ref().expect("the staging directory is open");
         write(open)?;
         sync_open_directory(open)?;
-        let staged = identity(open)?;
+        let staged = directory_identity(open)?;
         staged_identity = Some(staged);
         // Windows can't rename a directory a handle holds open, so the
         // published entry is compared with the staged one by identity.
@@ -696,29 +730,35 @@ fn publish_cache_entry(
             .tasks
             .rename(Path::new(&staging_name), &cache.tasks, Path::new(key))?;
         sync_open_directory(&cache.tasks)?;
-        if identity(&cache.tasks.open_dir_nofollow(key)?)? != staged {
+        let published = cache.tasks.open_dir_nofollow(key)?;
+        if directory_identity(&published)? != staged {
             return Err(LpmError::Task(format!(
                 "task cache entry changed while it was published: {}",
                 entry.display()
             )));
         }
-        Ok(())
+        Ok(PublishedCacheEntry {
+            key: key.to_owned(),
+            identity: staged,
+            #[cfg(unix)]
+            _held_open: published,
+        })
     })();
     if result.is_err() {
         // Closed for the publication, the staging directory is cleaned up
         // only while its name still holds the one staged.
         let staging = staging.or_else(|| {
             let reopened = cache.tasks.open_dir_nofollow(&staging_name).ok()?;
-            (staged_identity.is_some() && identity(&reopened).ok() == staged_identity)
+            (staged_identity.is_some() && directory_identity(&reopened).ok() == staged_identity)
                 .then_some(reopened)
         });
         if let Some(staging) = staging {
             let _ = cleanup_private_cache_directory(&cache.tasks, &staging_name, staging);
         }
     }
-    result?;
+    let published = result?;
     tracing::debug!("cached task output to {}", entry.display());
-    Ok(())
+    Ok(published)
 }
 
 fn cleanup_private_cache_directory(parent: &Dir, name: &str, staging: Dir) -> Result<(), LpmError> {
@@ -2048,7 +2088,7 @@ mod tests {
             stdout: &str,
             stderr: &str,
             duration_ms: u64,
-        ) -> Result<(), LpmError> {
+        ) -> Result<StoredCacheEntry, LpmError> {
             store_cache_with_root(
                 &self.root,
                 key,
@@ -2609,7 +2649,7 @@ mod tests {
         write_build_outputs(project.path());
         let key = unique_key("artifact-from-entry");
         let outputs = ["dist/**".to_string()];
-        cache
+        let StoredCacheEntry::Published(published) = cache
             .store(
                 &key,
                 project.path(),
@@ -2619,7 +2659,10 @@ mod tests {
                 "err\n",
                 42,
             )
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("the first store of a key publishes its entry");
+        };
         // The artifact comes from the entry, so later changes to the
         // project's outputs don't reach it.
         fs::write(
@@ -2631,7 +2674,7 @@ mod tests {
         let artifact_path = project.path().join("artifact.tar.gz");
         let artifact = artifact::write_remote_artifact_from_local_entry_with_root(
             &cache.root,
-            &key,
+            &published,
             fs::File::create(&artifact_path).unwrap(),
         )
         .unwrap();
@@ -2653,6 +2696,64 @@ mod tests {
         assert_eq!(
             (hit.stdout.as_str(), hit.stderr.as_str()),
             ("out\n", "err\n")
+        );
+    }
+
+    #[test]
+    fn storing_a_key_whose_entry_is_valid_keeps_that_entry_and_says_so() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("kept-entry");
+        let outputs = ["dist/**".to_string()];
+        let first = cache
+            .store(&key, project.path(), "build", &outputs, "first\n", "", 1)
+            .unwrap();
+
+        let second = cache
+            .store(&key, project.path(), "build", &outputs, "second\n", "", 1)
+            .unwrap();
+
+        assert!(matches!(first, StoredCacheEntry::Published(_)));
+        assert!(matches!(second, StoredCacheEntry::KeptExisting));
+        let target = tempfile::tempdir().unwrap();
+        let hit = cache.restore(&key, target.path(), &outputs).unwrap();
+        assert_eq!(hit.stdout, "first\n");
+    }
+
+    #[test]
+    fn a_remote_artifact_is_not_built_from_an_entry_that_replaced_the_published_one() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("replaced-entry");
+        let outputs = ["dist/**".to_string()];
+        let StoredCacheEntry::Published(published) = cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap()
+        else {
+            panic!("the first store of a key publishes its entry");
+        };
+        let entries = cache.root.cache_tasks();
+        fs::rename(entries.join(&key), entries.join(format!("{key}-moved"))).unwrap();
+        fs::write(project.path().join("dist/index.js"), "another run's output").unwrap();
+        let replacement = cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        assert!(matches!(replacement, StoredCacheEntry::Published(_)));
+
+        let error = artifact::write_remote_artifact_from_local_entry_with_root(
+            &cache.root,
+            &published,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("was replaced after this run stored it"),
+            "{error}"
         );
     }
 

@@ -302,12 +302,12 @@ pub fn try_restore(
     }
 }
 
-/// Uploads the task's local cache entry, which must already be stored, in
-/// the background, so the next task doesn't wait for it.
+/// Uploads the local cache entry the task's run published, in the
+/// background, so the next task doesn't wait for it.
 /// [`finish_background_work`] waits for it before the command ends.
 pub fn try_store(
     client: &RemoteCacheClient,
-    key: &str,
+    published: lpm_task::cache::PublishedCacheEntry,
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
@@ -330,7 +330,7 @@ pub fn try_store(
         return;
     }
 
-    client.upload_in_background(key.to_owned(), duration_ms);
+    client.upload_in_background(published, duration_ms);
 }
 
 pub fn status_for_project(
@@ -779,23 +779,32 @@ impl RemoteCacheClient {
         Ok(Some(temp))
     }
 
-    fn upload_in_background(&self, key: String, duration_ms: u64) {
+    fn upload_in_background(
+        &self,
+        published: lpm_task::cache::PublishedCacheEntry,
+        duration_ms: u64,
+    ) {
         let client = self.clone();
         spawn_background(async move {
             let _slot = UPLOAD_SLOTS
                 .acquire()
                 .await
                 .expect("the upload slots are never closed");
-            if let Err(reason) = client.upload_local_entry(&key, duration_ms).await {
+            if let Err(reason) = client.upload_local_entry(published, duration_ms).await {
                 warn_once(&reason);
             }
         });
     }
 
-    /// Builds the artifact from the task's local cache entry, which holds
-    /// the outputs as the task left them, and uploads it. Earlier uploads may
-    /// have stopped or paused uploads while this one waited for a slot.
-    async fn upload_local_entry(&self, key: &str, duration_ms: u64) -> Result<(), String> {
+    /// Builds the artifact from the local cache entry the task's run
+    /// published, which holds the outputs as the task left them, and uploads
+    /// it. Earlier uploads may have stopped or paused uploads while this one
+    /// waited for a slot.
+    async fn upload_local_entry(
+        &self,
+        published: lpm_task::cache::PublishedCacheEntry,
+        duration_ms: u64,
+    ) -> Result<(), String> {
         if self.limits.uploads_refused() {
             return Ok(());
         }
@@ -803,10 +812,10 @@ impl RemoteCacheClient {
             self.skipping_while_busy(LimitedRequest::Upload);
             return Ok(());
         }
-        let entry_key = key.to_owned();
+        let key = published.key().to_owned();
         let signature_key = self.signature_key.clone();
         let (artifact, digests) = tokio::task::spawn_blocking(move || {
-            write_artifact_from_local_entry(&entry_key, signature_key.as_deref())
+            write_artifact_from_local_entry(&published, signature_key.as_deref())
         })
         .await
         .map_err(|e| format!("failed to create remote cache artifact: {e}"))??;
@@ -816,8 +825,14 @@ impl RemoteCacheClient {
             .map_err(|e| format!("failed to stat remote cache artifact: {e}"))?
             .len();
         self.check_upload_size(artifact_len)?;
-        self.upload_artifact(key, artifact.as_file(), artifact_len, &digests, duration_ms)
-            .await
+        self.upload_artifact(
+            &key,
+            artifact.as_file(),
+            artifact_len,
+            &digests,
+            duration_ms,
+        )
+        .await
     }
 
     fn check_upload_size(&self, artifact_len: u64) -> Result<(), String> {
@@ -1469,10 +1484,10 @@ fn redirect_target(
 /// clients' connection pools, and the TLS sessions in them, last from task to
 /// task and across the worker threads of a parallel run. A pooled connection
 /// belongs to the runtime that opened it, so a runtime per request would
-/// drop them all with it.
+/// drop them all with it. It has a worker per core, since each download's
+/// chunks are hashed and written on them while a parallel run restores.
 static REMOTE_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
         .thread_name("lpm-remote-cache")
         .enable_all()
         .build()
@@ -1604,7 +1619,7 @@ fn fill_local_cache_in_background(key: String, artifact: tempfile::NamedTempFile
 /// Writes the artifact for `key` from its local cache entry to a private
 /// temporary file, hashing it as it is written.
 fn write_artifact_from_local_entry(
-    key: &str,
+    published: &lpm_task::cache::PublishedCacheEntry,
     signature_key: Option<&str>,
 ) -> Result<(tempfile::NamedTempFile, ArtifactDigests), String> {
     let artifact = tempfile::NamedTempFile::new()
@@ -1617,7 +1632,7 @@ fn write_artifact_from_local_entry(
         std::io::BufWriter::with_capacity(UPLOAD_READ_BYTES, file),
         signature_key,
     )?;
-    let writer = lpm_task::cache::write_remote_artifact_from_local_entry(key, writer)
+    let writer = lpm_task::cache::write_remote_artifact_from_local_entry(published, writer)
         .map_err(|e| format!("failed to create remote cache artifact: {e}"))?;
     Ok((artifact, writer.finish()?))
 }
@@ -3059,15 +3074,92 @@ mod tests {
         }
     }
 
+    /// Publishes the local cache entry for `key` from `project`'s `dist`, as
+    /// a task's run does. The caller sets `LPM_HOME`.
+    fn publish_entry(project: &Path, key: &str, output: &str) -> lpm_task::cache::StoredCacheEntry {
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        std::fs::write(project.join("dist/out.txt"), output).unwrap();
+        lpm_task::cache::store_cache(key, project, "build", &["dist/**".to_owned()], "", "", 1)
+            .unwrap()
+    }
+
+    fn published(
+        stored: lpm_task::cache::StoredCacheEntry,
+    ) -> lpm_task::cache::PublishedCacheEntry {
+        match stored {
+            lpm_task::cache::StoredCacheEntry::Published(published) => published,
+            lpm_task::cache::StoredCacheEntry::KeptExisting => {
+                panic!("expected the store to publish the entry")
+            }
+        }
+    }
+
+    fn scoped_lpm_home(path: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([("LPM_HOME", path.as_os_str().to_owned())])
+    }
+
+    fn uploads_received(server: &wiremock::MockServer) -> usize {
+        REMOTE_RUNTIME
+            .block_on(server.received_requests())
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::PUT)
+            .count()
+    }
+
     fn store_with(client: &RemoteCacheClient) {
-        try_store(
-            client,
-            "abc123",
-            "",
-            "",
-            1,
-            &HashMap::new(),
-            &HashMap::new(),
+        let (lpm_home, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _env = scoped_lpm_home(lpm_home.path());
+        let entry = published(publish_entry(project.path(), "abc123", "output"));
+        try_store(client, entry, "", "", 1, &HashMap::new(), &HashMap::new());
+    }
+
+    #[test]
+    fn an_upload_sends_the_cache_entry_its_run_published() {
+        let (lpm_home, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _env = scoped_lpm_home(lpm_home.path());
+        let server = REMOTE_RUNTIME.block_on(wiremock::MockServer::start());
+        REMOTE_RUNTIME.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server),
+        );
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let key = "d".repeat(64);
+        let entry = published(publish_entry(project.path(), &key, "this run's output"));
+
+        try_store(&client, entry, "", "", 1, &HashMap::new(), &HashMap::new());
+        REMOTE_RUNTIME.block_on(finish_background_work(true));
+
+        assert_eq!(uploads_received(&server), 1);
+    }
+
+    #[test]
+    fn an_upload_skips_a_cache_entry_another_run_published() {
+        let (lpm_home, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _env = scoped_lpm_home(lpm_home.path());
+        let server = REMOTE_RUNTIME.block_on(wiremock::MockServer::start());
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let key = "c".repeat(64);
+        let entry = published(publish_entry(project.path(), &key, "this run's output"));
+        // Another run publishes under the key once this run's entry is gone,
+        // and a run after that keeps its entry.
+        let entries = LpmRoot::from_env().unwrap().cache_tasks();
+        std::fs::rename(entries.join(&key), entries.join(format!("{key}-moved"))).unwrap();
+        let refused = "written by a run whose upload was refused";
+        published(publish_entry(project.path(), &key, refused));
+        assert!(matches!(
+            publish_entry(project.path(), &key, "a later run's output"),
+            lpm_task::cache::StoredCacheEntry::KeptExisting
+        ));
+
+        try_store(&client, entry, "", "", 1, &HashMap::new(), &HashMap::new());
+        REMOTE_RUNTIME.block_on(finish_background_work(true));
+
+        assert_eq!(
+            uploads_received(&server),
+            0,
+            "uploaded an entry another run published"
         );
     }
 

@@ -799,7 +799,7 @@ fn store_cache_with_context(
         return Ok(false);
     }
 
-    lpm_task::cache::store_cache(
+    let stored = lpm_task::cache::store_cache(
         &expected.cache_key,
         request.project_dir,
         &expected.command,
@@ -809,10 +809,14 @@ fn store_cache_with_context(
         request.duration_ms,
     )?;
 
-    if let Some(remote_cache) = &expected.remote_cache {
+    // A kept entry is another run's result, which this run's upload checks
+    // don't cover.
+    if let (Some(remote_cache), lpm_task::cache::StoredCacheEntry::Published(published)) =
+        (&expected.remote_cache, stored)
+    {
         crate::commands::remote_cache::try_store(
             remote_cache,
-            &expected.cache_key,
+            published,
             request.stdout,
             request.stderr,
             request.duration_ms,
