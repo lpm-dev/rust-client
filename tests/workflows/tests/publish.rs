@@ -3447,6 +3447,7 @@ async fn publish_wait_json_reports_upload_and_active_publication_states() {
             "status": "active",
             "current_latest_version": "1.0.0",
             "hold": null,
+            "swift": null,
             "error": null
           },
           "duration_ms": 0
@@ -3701,6 +3702,492 @@ async fn publish_wait_failure_keeps_retry_guidance_for_other_failed_targets() {
         !combined.contains("Retry: lpm publish --lpm"),
         "the successfully uploaded immutable LPM version must not be republished:\n{combined}",
     );
+}
+
+const SWIFT_PREPARING: &str = "LPM is checking this release's manifests with Swift and signing its source archive. It can be installed once that finishes, usually within a minute.";
+const SWIFT_REMEDY: &str = "Check that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release.";
+
+/// The publication-status answer once the Registry's Swift job has
+/// rejected the release, with compiler output over several lines and
+/// terminal escape sequences a hostile message could carry.
+fn swift_rejected_status(package_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": package_name,
+        "version": "1.0.0",
+        "status": "rejected",
+        "reviewStatus": "approved",
+        "hold": null,
+        "swift": {
+            "status": "rejected",
+            "code": "invalid_manifest",
+            "message": "Package.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^\u{1b}]0;pwned\u{7}",
+            "remedy": SWIFT_REMEDY,
+        },
+        "currentLatestVersion": "0.9.0",
+    })
+}
+
+async fn mount_swift_upload_answer(mock: &MockRegistry, publishes: u64) {
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "processing",
+            "currentLatestVersion": "0.9.0",
+        })))
+        .expect(publishes)
+        .mount(mock.server())
+        .await;
+}
+
+fn swift_wait_fixture(package_name: &str) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{package_name}",
+  "version": "1.0.0",
+  "description": "Swift release rejection fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+    project
+}
+
+async fn publication_status_polls(mock: &MockRegistry) -> usize {
+    mock.server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/registry/-/package/publication-status")
+        .count()
+}
+
+#[tokio::test]
+async fn publish_wait_reports_a_swift_rejection_with_its_reason_and_what_to_fix() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.swift-rejected";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE_NAME,
+            "version": "1.0.0",
+            "status": "processing",
+            "reviewStatus": "approved",
+            "hold": { "reason": "swift_artifacts", "message": SWIFT_PREPARING, "final": false },
+            "swift": { "status": "pending", "message": SWIFT_PREPARING },
+            "currentLatestVersion": "0.9.0",
+        })))
+        .up_to_n_times(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(swift_rejected_status(PACKAGE_NAME)))
+        .mount(mock.server())
+        .await;
+    let project = swift_wait_fixture(PACKAGE_NAME);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--wait",
+        ])
+        .output()
+        .expect("run lpm publish --wait for a rejected Swift release");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a rejected Swift release fails the publish\nstderr: {stderr}"
+    );
+    assert_eq!(publication_status_polls(&mock).await, 2, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "{PACKAGE_NAME}@1.0.0 isn't available yet. {SWIFT_PREPARING}"
+        )),
+        "the Swift job's progress is reported while it runs:\n{stderr}"
+    );
+    let rejection = [
+        "! Upload succeeded, but LPM.dev Registry rejected the Swift release.",
+        "    reason     Package.swift:3:8: error: no such module 'Foo'",
+        "               import Foo",
+        "                      ^",
+        &format!("    fix        {SWIFT_REMEDY}"),
+    ]
+    .join("\n");
+    assert!(
+        stderr.contains(&rejection),
+        "the rejection says why, line by line, and what to fix:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("pwned") && !stderr.contains('\u{1b}') && !stderr.contains('\u{7}'),
+        "the Registry's text can't drive the terminal:\n{stderr:?}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("do not publish"),
+        "a rejected Swift release may be published again:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fix it, then publish the same version again to replace it"),
+        "the command's error says the version may be published again:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Publish again:"),
+        "a publish to LPM.dev alone is published again as it was run:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn publish_wait_json_reports_a_swift_rejection() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.swift-rejected-json";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(swift_rejected_status(PACKAGE_NAME)))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = swift_wait_fixture(PACKAGE_NAME);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--wait",
+        ])
+        .output()
+        .expect("run lpm publish --wait --json for a rejected Swift release");
+
+    assert!(
+        !output.status.success(),
+        "a rejected Swift release fails the publish"
+    );
+    let mut json = parse_json_output(&output.stdout);
+    json["results"][0]["duration_ms"] = serde_json::json!(0);
+    insta::assert_json_snapshot!(json, @r###"
+    {
+      "success": false,
+      "results": [
+        {
+          "registry": "lpm",
+          "success": true,
+          "error": null,
+          "publication_status": "rejected",
+          "current_latest_version": "0.9.0",
+          "publication_wait": {
+            "success": false,
+            "status": "rejected",
+            "current_latest_version": "0.9.0",
+            "hold": null,
+            "swift": {
+              "status": "rejected",
+              "code": "invalid_manifest",
+              "message": "Package.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^\u001b]0;pwned\u0007",
+              "remedy": "Check that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release."
+            },
+            "error": "Upload succeeded, but LPM.dev Registry rejected the Swift release.\nPackage.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^\u001b]0;pwned\u0007\nCheck that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release."
+          },
+          "duration_ms": 0
+        }
+      ]
+    }
+    "###);
+}
+
+#[tokio::test]
+async fn publish_wait_after_a_swift_rejection_offers_publishing_again_to_lpm_alone() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.swift-rejected-multi";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(swift_rejected_status(PACKAGE_NAME)))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = swift_wait_fixture(PACKAGE_NAME);
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"github":{"name":"@testuser/swift-rejected-multi"}}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--github",
+            "--wait",
+        ])
+        .output()
+        .expect("run a multi-target publish whose Swift release is rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "    fix        {SWIFT_REMEDY}\n  Publish again: lpm publish --lpm --wait"
+        )),
+        "the fixed release is published again to LPM.dev alone, waiting again:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Retry: lpm publish --github"),
+        "the failed GitHub upload keeps its own retry guidance:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn publish_after_a_swift_rejection_uploads_the_fixed_release_under_the_same_version() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.swift-republish";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 2).await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(swift_rejected_status(PACKAGE_NAME)))
+        .up_to_n_times(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE_NAME,
+            "version": "1.0.0",
+            "status": "active",
+            "reviewStatus": "approved",
+            "hold": null,
+            "currentLatestVersion": "1.0.0",
+        })))
+        .mount(mock.server())
+        .await;
+    let project = swift_wait_fixture(PACKAGE_NAME);
+    let publish = || {
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "publish",
+                "--yes",
+                "--token",
+                "test-token-123",
+                "--lpm",
+                "--wait",
+            ])
+            .output()
+            .expect("run lpm publish --wait")
+    };
+
+    let rejected = publish();
+    project.write_file("index.js", "module.exports = { fixed: true };");
+    let replaced = publish();
+
+    assert!(
+        !rejected.status.success(),
+        "the first release is rejected\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        replaced.status.success(),
+        "publishing the rejected version again replaces it\nstderr: {}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let publishes: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "PUT" && request.url.path().starts_with("/api/registry/")
+        })
+        .map(|request| serde_json::from_slice(&request.body).expect("publish payload"))
+        .collect();
+    assert_eq!(publishes.len(), 2, "both publishes reach the Registry");
+    let integrity = |payload: &serde_json::Value| {
+        payload["versions"]["1.0.0"]["dist"]["integrity"]
+            .as_str()
+            .expect("the publish names version 1.0.0 and its integrity")
+            .to_owned()
+    };
+    assert_ne!(
+        integrity(&publishes[0]),
+        integrity(&publishes[1]),
+        "the second publish sends the fixed artifact"
+    );
+}
+
+#[tokio::test]
+async fn publish_wait_that_times_out_while_the_swift_job_prepares_leaves_republishing_to_its_outcome()
+ {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.swift-still-preparing";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE_NAME,
+            "version": "1.0.0",
+            "status": "processing",
+            "reviewStatus": "approved",
+            "hold": { "reason": "swift_artifacts", "message": SWIFT_PREPARING, "final": false },
+            "swift": { "status": "pending", "message": SWIFT_PREPARING },
+            "currentLatestVersion": "0.9.0",
+        })))
+        .mount(mock.server())
+        .await;
+    let project = swift_wait_fixture(PACKAGE_NAME);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--wait",
+            "--wait-timeout",
+            "10",
+        ])
+        .output()
+        .expect("run lpm publish --wait that runs out while the Swift job prepares");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "waiting for LPM.dev Registry publication timed out. The version isn't available yet. {SWIFT_PREPARING} The package page shows whether the Swift release was published or rejected. Only a rejected Swift release can be published again under this version."
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "the upload succeeded, but LPM.dev Registry is still preparing the Swift release"
+        ),
+        "the command's error leaves republishing to the Swift job's outcome:\n{stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("do not publish"),
+        "the Swift job may yet reject the release:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn publish_without_wait_leaves_the_swift_hint_out_of_other_releases() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.processing-js";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    let project = swift_wait_fixture(PACKAGE_NAME);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish a JavaScript release the Registry answers processing");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Upload succeeded. The version is not available on LPM.dev Registry yet."),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Swift"),
+        "only a Swift release gets the Swift job's hint:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "swift-tests"),
+    ignore = "requires native Swift toolchain"
+)]
+async fn native_swift_publish_with_wait_leaves_the_swift_job_to_the_wait() {
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "@lpm.dev/testuser.swift-native",
+            "version": "1.0.0",
+            "status": "active",
+            "reviewStatus": "approved",
+            "hold": null,
+            "currentLatestVersion": "1.0.0",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = native_swift_publish_project();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--ignore-scripts",
+            "--token",
+            "test-token",
+            "--wait",
+        ])
+        .output()
+        .expect("publish a Swift package with --wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("checking the Swift manifests"),
+        "the wait reports the Swift job itself:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("LPM.dev Registry publication is active"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "swift-tests"),
+    ignore = "requires native Swift toolchain"
+)]
+async fn native_swift_publish_without_wait_says_where_the_swift_job_result_shows() {
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    mount_swift_upload_answer(&mock, 1).await;
+    let project = native_swift_publish_project();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--ignore-scripts",
+            "--token",
+            "test-token",
+        ])
+        .output()
+        .expect("publish a Swift package without --wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "  LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected; next time, lpm publish --wait reports it here."
+        ),
+        "{stderr}"
+    );
+    assert_eq!(publication_status_polls(&mock).await, 0);
 }
 
 #[tokio::test]

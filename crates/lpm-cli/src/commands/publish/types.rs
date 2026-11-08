@@ -1,7 +1,7 @@
 use crate::commands::publish_common::{NpmProvenanceAttachment, TarballFile, TarballHashes};
 use crate::oidc;
 use lpm_common::LpmError;
-use lpm_registry::{PublicationHold, PublicationStatusResponse};
+use lpm_registry::{PublicationHold, PublicationStatusResponse, SwiftReleaseState};
 use lpm_runner::lpm_json;
 /// Target registries for a publish operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +113,7 @@ pub(super) struct PublicationSnapshot {
     pub(super) status: LpmPublicationStatus,
     pub(super) current_latest_version: Option<String>,
     pub(super) hold: Option<PublicationHold>,
+    pub(super) swift: Option<SwiftReleaseState>,
 }
 
 impl From<PublicationStatusResponse> for PublicationSnapshot {
@@ -121,17 +122,56 @@ impl From<PublicationStatusResponse> for PublicationSnapshot {
             status: LpmPublicationStatus::from_registry_value(&response.status),
             current_latest_version: response.current_latest_version,
             hold: response.hold,
+            swift: response.swift,
         }
     }
 }
 
+/// Text the Registry sent, unless it's missing or blank.
+fn registry_text(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|text| !text.is_empty())
+}
+
+const HOLD_FALLBACK: &str = "LPM.dev Registry is holding it.";
+
 /// The Registry's account of a hold, or a stand-in where it gives none.
 pub(super) fn hold_explanation(hold: &PublicationHold) -> &str {
-    hold.message
-        .as_deref()
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .unwrap_or("LPM.dev Registry is holding it.")
+    registry_text(hold.message.as_deref()).unwrap_or(HOLD_FALLBACK)
+}
+
+pub(super) const SWIFT_RELEASE_REJECTED: &str =
+    "Upload succeeded, but LPM.dev Registry rejected the Swift release.";
+pub(super) const SWIFT_REASON_FALLBACK: &str = "LPM.dev Registry gave no reason.";
+pub(super) const SWIFT_REMEDY_FALLBACK: &str =
+    "Publishing this version again replaces the rejected release.";
+
+/// Why the Swift job rejected a release, as it put it, which can be Swift
+/// compiler output over several lines; a stand-in where it gives none.
+pub(super) fn swift_rejection_reason(rejection: &SwiftReleaseState) -> &str {
+    registry_text(rejection.message.as_deref()).unwrap_or(SWIFT_REASON_FALLBACK)
+}
+
+/// What the publisher can do about a rejected Swift release, or a stand-in
+/// where the Registry gives none.
+pub(super) fn swift_rejection_remedy(rejection: &SwiftReleaseState) -> &str {
+    registry_text(rejection.remedy.as_deref()).unwrap_or(SWIFT_REMEDY_FALLBACK)
+}
+
+/// Whether a wait that ended early last saw the Swift job still preparing
+/// the release, whose outcome then decides whether its version can be
+/// published again.
+fn swift_still_preparing(last: Option<&PublicationSnapshot>) -> bool {
+    last.and_then(|last| last.swift.as_ref())
+        .is_some_and(SwiftReleaseState::is_pending)
+}
+
+/// What a wait that ended early says about publishing the version again.
+fn republish_advice(swift_still_preparing: bool) -> &'static str {
+    if swift_still_preparing {
+        "The package page shows whether the Swift release was published or rejected. Only a rejected Swift release can be published again under this version."
+    } else {
+        "Do not publish this version again."
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,99 +180,145 @@ pub struct PublicationWaitResult {
     pub status: Option<LpmPublicationStatus>,
     pub current_latest_version: Option<String>,
     pub hold: Option<PublicationHold>,
+    pub swift: Option<SwiftReleaseState>,
     pub error: Option<String>,
+    /// Why the wait failed, which says whether the version can be
+    /// published again; `None` when it succeeded.
+    pub(super) failure: Option<PublicationFailure>,
 }
 
 impl PublicationWaitResult {
+    fn unsuccessful(failure: PublicationFailure, error: String) -> Self {
+        Self {
+            success: false,
+            status: None,
+            current_latest_version: None,
+            hold: None,
+            swift: None,
+            error: Some(error),
+            failure: Some(failure),
+        }
+    }
+
     pub(super) fn active() -> Self {
         Self {
             success: true,
             status: Some(LpmPublicationStatus::Active),
             current_latest_version: None,
             hold: None,
+            swift: None,
             error: None,
+            failure: None,
         }
     }
 
-    /// The Registry holds the version and only a new version gets past it.
-    pub(super) fn held(status: LpmPublicationStatus, hold: PublicationHold) -> Self {
+    /// The upload's own answer put the version in a state further polls
+    /// can't change.
+    pub(super) fn terminal(status: LpmPublicationStatus) -> Self {
+        let error = terminal_error(&status);
+        Self {
+            status: Some(status),
+            ..Self::unsuccessful(PublicationFailure::NotConfirmed, error)
+        }
+    }
+
+    /// The wait ends on a state further polls can't change, keeping all the
+    /// poll saw. A release the Swift job rejected says why and what to fix:
+    /// publishing the same version again replaces it. A publication
+    /// review's rejection has no Swift job rejection.
+    pub(super) fn terminal_snapshot(snapshot: PublicationSnapshot) -> Self {
+        let swift_rejection = snapshot.swift.as_ref().filter(|swift| {
+            snapshot.status == LpmPublicationStatus::Rejected && swift.is_rejected()
+        });
+        let result = match swift_rejection {
+            Some(rejection) => Self::unsuccessful(
+                PublicationFailure::SwiftReleaseRejected,
+                swift_rejection_error(rejection),
+            ),
+            None => Self::unsuccessful(
+                PublicationFailure::NotConfirmed,
+                terminal_error(&snapshot.status),
+            ),
+        };
+        result.with_last_snapshot(Some(snapshot))
+    }
+
+    /// The Registry holds the version and only a new version gets past it,
+    /// as the poll's hold says.
+    pub(super) fn held(snapshot: PublicationSnapshot) -> Self {
         let error = format!(
             "Upload succeeded, but this version won't become available. {} Do not publish this version again.",
-            hold_explanation(&hold)
+            snapshot
+                .hold
+                .as_ref()
+                .map_or(HOLD_FALLBACK, hold_explanation)
         );
-        Self {
-            success: false,
-            status: Some(status),
-            current_latest_version: None,
-            hold: Some(hold),
-            error: Some(error),
-        }
+        Self::unsuccessful(PublicationFailure::NotConfirmed, error)
+            .with_last_snapshot(Some(snapshot))
     }
 
-    pub(super) fn terminal(status: LpmPublicationStatus) -> Self {
-        let message = match status {
-            LpmPublicationStatus::ManualReview => "publication requires manual review",
-            LpmPublicationStatus::Rejected => "publication review rejected the version",
-            LpmPublicationStatus::Quarantined => "the uploaded version was quarantined",
-            LpmPublicationStatus::Unpublished => "the uploaded version was unpublished",
-            LpmPublicationStatus::Other(_) => {
-                "the Registry returned an unrecognized publication state"
-            }
-            LpmPublicationStatus::Active
-            | LpmPublicationStatus::PendingReview
-            | LpmPublicationStatus::Processing => "publication did not become active",
-        };
-        Self {
-            success: false,
-            status: Some(status),
-            current_latest_version: None,
-            hold: None,
-            error: Some(format!(
-                "Upload succeeded, but {message}. Do not publish this version again."
-            )),
-        }
-    }
-
-    /// The wait ended first; a hold the last poll saw says why.
-    pub(super) fn timed_out(
-        status: Option<LpmPublicationStatus>,
-        hold: Option<PublicationHold>,
-    ) -> Self {
-        let held = hold.as_ref().map_or_else(String::new, |hold| {
+    /// The wait ended first, keeping what the last poll saw, whose hold
+    /// says why.
+    pub(super) fn timed_out(last: Option<PublicationSnapshot>) -> Self {
+        let held = last
+            .as_ref()
+            .and_then(|last| last.hold.as_ref())
+            .map_or_else(String::new, |hold| {
+                format!(
+                    " The version isn't available yet. {}",
+                    hold_explanation(hold)
+                )
+            });
+        let preparing = swift_still_preparing(last.as_ref());
+        Self::unsuccessful(
+            PublicationFailure::for_early_end(preparing),
             format!(
-                " The version isn't available yet. {}",
-                hold_explanation(hold)
-            )
-        });
-        Self {
-            success: false,
-            status,
-            current_latest_version: None,
-            error: Some(format!(
-                "Upload succeeded, but waiting for LPM.dev Registry publication timed out.{held} Do not publish this version again."
-            )),
-            hold,
-        }
+                "Upload succeeded, but waiting for LPM.dev Registry publication timed out.{held} {}",
+                republish_advice(preparing)
+            ),
+        )
+        .with_last_snapshot(last)
     }
 
-    pub(super) fn request_failed(error: &LpmError) -> Self {
-        Self {
-            success: false,
-            status: None,
-            current_latest_version: None,
-            hold: None,
-            error: Some(format!(
-                "Upload succeeded, but LPM.dev Registry publication could not be checked: {error}. Do not publish this version again."
-            )),
-        }
+    /// A poll failed, keeping what the last one before it saw.
+    pub(super) fn request_failed(error: &LpmError, last: Option<PublicationSnapshot>) -> Self {
+        let preparing = swift_still_preparing(last.as_ref());
+        let was_preparing = if preparing {
+            " LPM.dev Registry was still preparing the Swift release."
+        } else {
+            ""
+        };
+        Self::unsuccessful(
+            PublicationFailure::for_early_end(preparing),
+            format!(
+                "Upload succeeded, but LPM.dev Registry publication could not be checked: {error}.{was_preparing} {}",
+                republish_advice(preparing)
+            ),
+        )
+        .with_last_snapshot(last)
     }
 
-    /// Keeps what the last poll saw: its status, hold and latest version.
+    /// The Swift job's rejection the wait ended on, if it ended on one.
+    pub(super) fn swift_rejection(&self) -> Option<&SwiftReleaseState> {
+        self.swift
+            .as_ref()
+            .filter(|_| self.failure == Some(PublicationFailure::SwiftReleaseRejected))
+    }
+
+    /// Keeps all the last poll saw: its status, hold, latest version and
+    /// the Swift job's state.
     pub(super) fn with_last_snapshot(mut self, last: Option<PublicationSnapshot>) -> Self {
-        if let Some(last) = last {
-            self.status = Some(last.status);
-            self.hold = last.hold;
-            self.current_latest_version = last.current_latest_version;
+        if let Some(PublicationSnapshot {
+            status,
+            current_latest_version,
+            hold,
+            swift,
+        }) = last
+        {
+            self.status = Some(status);
+            self.current_latest_version = current_latest_version;
+            self.hold = hold;
+            self.swift = swift;
         }
         self
     }
@@ -244,6 +330,28 @@ impl PublicationWaitResult {
         self.current_latest_version = current_latest_version;
         self
     }
+}
+
+fn terminal_error(status: &LpmPublicationStatus) -> String {
+    let message = match status {
+        LpmPublicationStatus::ManualReview => "publication requires manual review",
+        LpmPublicationStatus::Rejected => "publication review rejected the version",
+        LpmPublicationStatus::Quarantined => "the uploaded version was quarantined",
+        LpmPublicationStatus::Unpublished => "the uploaded version was unpublished",
+        LpmPublicationStatus::Other(_) => "the Registry returned an unrecognized publication state",
+        LpmPublicationStatus::Active
+        | LpmPublicationStatus::PendingReview
+        | LpmPublicationStatus::Processing => "publication did not become active",
+    };
+    format!("Upload succeeded, but {message}. Do not publish this version again.")
+}
+
+fn swift_rejection_error(rejection: &SwiftReleaseState) -> String {
+    format!(
+        "{SWIFT_RELEASE_REJECTED}\n{}\n{}",
+        swift_rejection_reason(rejection),
+        swift_rejection_remedy(rejection)
+    )
 }
 
 /// Result of publishing to a single registry.
@@ -258,6 +366,59 @@ pub struct PublishResult {
     pub current_latest_version: Option<String>,
     pub publication_wait: Option<PublicationWaitResult>,
     pub duration: std::time::Duration,
+}
+
+impl PublishResult {
+    /// Why the target's upload succeeded but its publication didn't, if it
+    /// didn't.
+    pub(super) fn publication_failure(&self) -> Option<PublicationFailure> {
+        if let Some(failure) = self.publication_wait.as_ref().and_then(|wait| wait.failure) {
+            return Some(failure);
+        }
+        self.publication_status
+            .as_ref()
+            .is_some_and(LpmPublicationStatus::is_terminal_rejection)
+            .then_some(PublicationFailure::NotConfirmed)
+    }
+}
+
+/// Why a publish whose upload succeeded still failed, which says whether
+/// the same version can be published again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublicationFailure {
+    /// The Registry didn't make the version available, and it keeps the
+    /// version number.
+    NotConfirmed,
+    /// The Registry's Swift job rejected the release, which publishing the
+    /// same version again replaces.
+    SwiftReleaseRejected,
+    /// The wait ended while the Swift job was still preparing the release:
+    /// only its rejection would free the version number.
+    SwiftReleaseStillPreparing,
+}
+
+impl PublicationFailure {
+    fn for_early_end(swift_still_preparing: bool) -> Self {
+        if swift_still_preparing {
+            Self::SwiftReleaseStillPreparing
+        } else {
+            Self::NotConfirmed
+        }
+    }
+
+    pub(super) fn summary(self) -> &'static str {
+        match self {
+            Self::NotConfirmed => {
+                "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again"
+            }
+            Self::SwiftReleaseRejected => {
+                "the upload succeeded, but LPM.dev Registry rejected the Swift release; fix it, then publish the same version again to replace it"
+            }
+            Self::SwiftReleaseStillPreparing => {
+                "the upload succeeded, but LPM.dev Registry is still preparing the Swift release; the package page shows whether it was published or rejected, and only a rejected one can be published again under this version"
+            }
+        }
+    }
 }
 
 /// Local package artifact prepared for publish-like uploads.

@@ -2,8 +2,9 @@ use super::orchestrator::lpm_package_url;
 use super::output::{
     format_dry_run_files_value, format_lpm_publication_notice,
     format_multi_publish_partial_summary, format_multi_publish_success_summary,
-    format_publish_retry_detail, format_single_publish_success_summary, publish_check_json,
-    publish_result_json,
+    format_publish_retry_detail, format_single_publish_success_summary,
+    format_swift_preparation_hint, format_swift_release_rejection_details,
+    format_swift_republish_detail, publish_check_json, publish_result_json,
 };
 use super::prepare::{
     MAX_PUBLISH_TARBALL_BYTES, prepare_publish_project_from_manifest, read_publish_manifest,
@@ -13,7 +14,10 @@ use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_j
 use super::skills::compute_published_skills_digest;
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets, validate_custom_publish_registry_url};
-use super::types::{LpmPublicationStatus, PublicationWaitResult, PublishResult, PublishTarget};
+use super::types::{
+    LpmPublicationStatus, PublicationFailure, PublicationSnapshot, PublicationWaitResult,
+    PublishResult, PublishTarget,
+};
 use super::version_data::integrity_to_sha512_hex;
 use crate::commands::publish_common;
 use crate::commands::skills::author;
@@ -928,10 +932,14 @@ fn publication_wait_failure_preserves_successful_upload_in_json() {
         auth: None,
         publication_status: Some(LpmPublicationStatus::PendingReview),
         current_latest_version: Some("1.1.0".to_string()),
-        publication_wait: Some(PublicationWaitResult::timed_out(
-            Some(LpmPublicationStatus::PendingReview),
-            None,
-        )),
+        publication_wait: Some(PublicationWaitResult::timed_out(Some(
+            PublicationSnapshot {
+                status: LpmPublicationStatus::PendingReview,
+                current_latest_version: Some("1.1.0".to_string()),
+                hold: None,
+                swift: None,
+            },
+        ))),
         duration: std::time::Duration::ZERO,
     };
 
@@ -941,6 +949,7 @@ fn publication_wait_failure_preserves_successful_upload_in_json() {
     assert_eq!(json["publication_wait"]["success"], false);
     assert_eq!(json["publication_wait"]["status"], "pending_review");
     assert_eq!(json["publication_wait"]["hold"], serde_json::Value::Null);
+    assert_eq!(json["publication_wait"]["swift"], serde_json::Value::Null);
 }
 
 #[test]
@@ -958,10 +967,12 @@ fn publication_wait_json_carries_the_registry_hold() {
         auth: None,
         publication_status: Some(LpmPublicationStatus::Processing),
         current_latest_version: None,
-        publication_wait: Some(PublicationWaitResult::held(
-            LpmPublicationStatus::Processing,
-            hold,
-        )),
+        publication_wait: Some(PublicationWaitResult::held(PublicationSnapshot {
+            status: LpmPublicationStatus::Processing,
+            current_latest_version: None,
+            hold: Some(hold),
+            swift: None,
+        })),
         duration: std::time::Duration::ZERO,
     };
 
@@ -976,6 +987,276 @@ fn publication_wait_json_carries_the_registry_hold() {
         })
     );
     assert_eq!(json["publication_wait"]["status"], "processing");
+}
+
+const SWIFT_COMPILER_OUTPUT: &str =
+    "Package.swift:3:8: error: no such module 'Foo'\nimport Foo\n       ^";
+const SWIFT_REMEDY: &str = "Check that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release.";
+
+fn swift_rejection(message: Option<&str>, remedy: Option<&str>) -> lpm_registry::SwiftReleaseState {
+    lpm_registry::SwiftReleaseState {
+        status: "rejected".into(),
+        code: Some("invalid_manifest".into()),
+        message: message.map(Into::into),
+        remedy: remedy.map(Into::into),
+    }
+}
+
+fn swift_rejected_wait(rejection: lpm_registry::SwiftReleaseState) -> PublicationWaitResult {
+    PublicationWaitResult::terminal_snapshot(PublicationSnapshot {
+        status: LpmPublicationStatus::Rejected,
+        current_latest_version: Some("0.9.0".into()),
+        hold: None,
+        swift: Some(rejection),
+    })
+}
+
+fn lpm_wait_result(wait: PublicationWaitResult) -> PublishResult {
+    PublishResult {
+        warnings: Vec::new(),
+        target: "lpm".into(),
+        success: true,
+        error: None,
+        auth: None,
+        publication_status: wait.status.clone(),
+        current_latest_version: wait.current_latest_version.clone(),
+        publication_wait: Some(wait),
+        duration: std::time::Duration::ZERO,
+    }
+}
+
+fn plain_rows(rows: Vec<crate::install_ui::TerminalLine>) -> Vec<String> {
+    rows.iter()
+        .map(|row| console::strip_ansi_codes(row).into_owned())
+        .collect()
+}
+
+#[test]
+fn publication_wait_json_carries_the_swift_job_rejection() {
+    let result = lpm_wait_result(swift_rejected_wait(swift_rejection(
+        Some(SWIFT_COMPILER_OUTPUT),
+        Some(SWIFT_REMEDY),
+    )));
+
+    let json = publish_result_json(&result);
+
+    assert_eq!(json["success"], true, "the upload itself succeeded");
+    assert_eq!(json["publication_status"], "rejected");
+    assert_eq!(json["publication_wait"]["success"], false);
+    assert_eq!(json["publication_wait"]["status"], "rejected");
+    assert_eq!(json["publication_wait"]["hold"], serde_json::Value::Null);
+    assert_eq!(
+        json["publication_wait"]["swift"],
+        serde_json::json!({
+            "status": "rejected",
+            "code": "invalid_manifest",
+            "message": SWIFT_COMPILER_OUTPUT,
+            "remedy": SWIFT_REMEDY,
+        })
+    );
+    let error = json["publication_wait"]["error"].as_str().unwrap();
+    assert!(error.contains(SWIFT_COMPILER_OUTPUT), "{error}");
+    assert!(error.ends_with(SWIFT_REMEDY), "{error}");
+    assert!(!error.contains("Do not publish"), "{error}");
+}
+
+#[test]
+fn publication_wait_json_keeps_swift_fields_the_registry_left_out_as_null() {
+    let result = lpm_wait_result(swift_rejected_wait(lpm_registry::SwiftReleaseState {
+        status: "rejected".into(),
+        code: None,
+        message: None,
+        remedy: None,
+    }));
+
+    let json = publish_result_json(&result);
+
+    assert_eq!(
+        json["publication_wait"]["swift"],
+        serde_json::json!({
+            "status": "rejected",
+            "code": null,
+            "message": null,
+            "remedy": null,
+        })
+    );
+}
+
+#[test]
+fn swift_rejection_rows_keep_compiler_output_lines_without_terminal_escapes() {
+    let message = "Package.swift:3:8: error: no such module \u{1b}[31m'Foo'\u{1b}[0m\r\nimport Foo\n       ^\u{1b}]0;pwned\u{7}\n\n\tnote: \u{1b}[2Jexpanded here\rrewritten";
+
+    let rows =
+        format_swift_release_rejection_details(&swift_rejection(Some(message), Some(SWIFT_REMEDY)));
+
+    for row in &rows {
+        assert!(
+            !row.contains("\u{1b}]"),
+            "an OSC sequence got through: {row:?}"
+        );
+        assert!(!row.contains("\u{1b}[31m"), "a color got through: {row:?}");
+        assert!(
+            !row.contains("\u{1b}[2J"),
+            "a screen clear got through: {row:?}"
+        );
+        assert!(
+            !row.contains("pwned"),
+            "an OSC payload got through: {row:?}"
+        );
+        assert!(
+            !row.contains(['\r', '\n', '\u{7}']),
+            "a control got through: {row:?}"
+        );
+    }
+    assert_eq!(
+        plain_rows(rows),
+        [
+            "    reason     Package.swift:3:8: error: no such module 'Foo'",
+            "               import Foo",
+            "                      ^",
+            "",
+            "               \tnote: expanded here?rewritten",
+            "    fix        Check that `swift package dump-package` succeeds for every manifest. Publishing 1.0.0 again replaces this release.",
+        ]
+    );
+}
+
+#[test]
+fn a_swift_rejection_without_text_still_says_why_and_what_to_fix() {
+    let rows = format_swift_release_rejection_details(&swift_rejection(None, Some("  ")));
+
+    assert_eq!(
+        plain_rows(rows),
+        [
+            "    reason     LPM.dev Registry gave no reason.",
+            "    fix        Publishing this version again replaces the rejected release.",
+        ]
+    );
+}
+
+#[test]
+fn a_swift_rejection_failure_says_to_publish_the_same_version_again_and_a_review_rejection_says_not_to()
+ {
+    let swift_rejected = lpm_wait_result(swift_rejected_wait(swift_rejection(
+        Some(SWIFT_COMPILER_OUTPUT),
+        Some(SWIFT_REMEDY),
+    )));
+    let review_rejected = lpm_wait_result(PublicationWaitResult::terminal_snapshot(
+        PublicationSnapshot {
+            status: LpmPublicationStatus::Rejected,
+            current_latest_version: None,
+            hold: None,
+            swift: None,
+        },
+    ));
+
+    let swift_failure = swift_rejected.publication_failure();
+    let review_failure = review_rejected.publication_failure();
+
+    assert_eq!(
+        swift_failure,
+        Some(PublicationFailure::SwiftReleaseRejected)
+    );
+    assert_eq!(
+        swift_failure.unwrap().summary(),
+        "the upload succeeded, but LPM.dev Registry rejected the Swift release; fix it, then publish the same version again to replace it"
+    );
+    assert_eq!(review_failure, Some(PublicationFailure::NotConfirmed));
+    assert!(
+        review_failure
+            .unwrap()
+            .summary()
+            .contains("do not publish the same version again")
+    );
+}
+
+#[test]
+fn a_swift_rejection_whose_text_sanitizes_to_nothing_falls_back_to_the_stand_ins() {
+    let rows = format_swift_release_rejection_details(&swift_rejection(
+        Some("\u{1b}]0;title\u{7}"),
+        Some("\u{1b}[0m\n\u{1b}[2J"),
+    ));
+
+    assert_eq!(
+        plain_rows(rows),
+        [
+            "    reason     LPM.dev Registry gave no reason.",
+            "    fix        Publishing this version again replaces the rejected release.",
+        ]
+    );
+}
+
+#[test]
+fn a_swift_rejection_drops_blank_lines_at_either_end_of_its_reason() {
+    let rows = format_swift_release_rejection_details(&swift_rejection(
+        Some("\u{1b}[0m\nPackage.swift:1:1: error: bad\n\t\n\u{1b}[0m"),
+        Some(SWIFT_REMEDY),
+    ));
+
+    assert_eq!(
+        plain_rows(rows),
+        [
+            "    reason     Package.swift:1:1: error: bad",
+            &format!("    fix        {SWIFT_REMEDY}"),
+        ]
+    );
+}
+
+#[test]
+fn a_wait_that_ended_while_the_swift_job_prepared_leaves_republishing_to_its_outcome() {
+    let preparing = lpm_wait_result(PublicationWaitResult::timed_out(Some(
+        PublicationSnapshot {
+            status: LpmPublicationStatus::Processing,
+            current_latest_version: None,
+            hold: None,
+            swift: Some(lpm_registry::SwiftReleaseState {
+                status: "pending".into(),
+                code: None,
+                message: None,
+                remedy: None,
+            }),
+        },
+    )));
+
+    let failure = preparing.publication_failure();
+
+    assert_eq!(
+        failure,
+        Some(PublicationFailure::SwiftReleaseStillPreparing)
+    );
+    assert_eq!(
+        failure.unwrap().summary(),
+        "the upload succeeded, but LPM.dev Registry is still preparing the Swift release; the package page shows whether it was published or rejected, and only a rejected one can be published again under this version"
+    );
+}
+
+#[test]
+fn a_swift_republish_detail_waits_for_the_swift_job_again() {
+    let detail = console::strip_ansi_codes(&format_swift_republish_detail()).into_owned();
+
+    assert_eq!(detail, "  Publish again: lpm publish --lpm --wait");
+}
+
+#[test]
+fn an_active_publication_is_no_publication_failure() {
+    let active = lpm_wait_result(PublicationWaitResult::active());
+
+    assert_eq!(active.publication_failure(), None);
+}
+
+#[test]
+fn swift_preparation_hint_points_to_the_package_page_and_offers_wait_only_to_lpm_publish() {
+    let plain =
+        |line: crate::install_ui::TerminalLine| console::strip_ansi_codes(&line).into_owned();
+
+    assert_eq!(
+        plain(format_swift_preparation_hint(true)),
+        "  LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected; next time, lpm publish --wait reports it here."
+    );
+    assert_eq!(
+        plain(format_swift_preparation_hint(false)),
+        "  LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected."
+    );
 }
 
 #[test]

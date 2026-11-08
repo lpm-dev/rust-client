@@ -814,6 +814,17 @@ pub fn multiline(text: &str) -> TerminalFragment {
     TerminalFragment(lpm_common::sanitize_terminal_multiline(text).into_owned())
 }
 
+/// The lines of an intentionally multiline, externally controlled block, as
+/// unstyled fields for rows of their own. Escape sequences and controls are
+/// neutralized as in [`multiline`], tabs stay, and LF or CRLF ends a line,
+/// so no line can style the terminal or rewrite another row.
+pub fn untrusted_lines(block: &str) -> Vec<TerminalFragment> {
+    lpm_common::sanitize_terminal_multiline(block)
+        .lines()
+        .map(|line| TerminalFragment(line.to_owned()))
+        .collect()
+}
+
 /// Dim helper — sanitizes the field before applying LPM-owned styling.
 pub fn dim(text: &str) -> TerminalFragment {
     TerminalFragment(lpm_common::sanitize_terminal_inline(text).dimmed())

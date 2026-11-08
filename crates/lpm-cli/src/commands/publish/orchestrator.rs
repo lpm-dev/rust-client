@@ -2,9 +2,10 @@ use super::npm_artifact::prepare_npm_target_artifact;
 use super::output::{
     DryRunSummary, format_lpm_publication_notice, format_multi_publish_partial_summary,
     format_multi_publish_success_summary, format_publish_retry_detail,
-    format_single_publish_success_summary, format_upload_message, lpm_visibility,
-    print_dry_run_summary, print_tarball_contents, print_upload_details, publish_check_json,
-    publish_detail, publish_result_json, tarball_files_json, visibility_from_access,
+    format_single_publish_success_summary, format_swift_preparation_hint, format_upload_message,
+    lpm_visibility, print_dry_run_summary, print_swift_release_rejection, print_tarball_contents,
+    print_upload_details, publish_check_json, publish_detail, publish_result_json,
+    tarball_files_json, visibility_from_access,
 };
 #[cfg(test)]
 use super::prepare::read_publish_manifest;
@@ -22,9 +23,9 @@ use super::secret_scan::run_publish_secret_scan;
 use super::skills::compute_published_skills_digest;
 use super::target::resolve_targets;
 use super::types::{
-    LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
-    PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
-    hold_explanation,
+    LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationFailure,
+    PublicationWaitResult, PublishProject, PublishQualityGateInput, PublishResult, PublishTarget,
+    ResolvedProvenance, hold_explanation,
 };
 use super::upload_lpm::{LpmPublishBody, OtpFailure, lpm_second_factor, publish_to_lpm};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
@@ -182,7 +183,7 @@ pub(crate) struct PublishExecutionReport {
     pub(crate) results: Vec<serde_json::Value>,
     json_output: bool,
     any_upload_failed: bool,
-    any_publication_failed: bool,
+    publication_failure: Option<PublicationFailure>,
     lifecycle_error: Option<String>,
 }
 
@@ -193,7 +194,7 @@ impl PublishExecutionReport {
             results: Vec::new(),
             json_output,
             any_upload_failed: false,
-            any_publication_failed: false,
+            publication_failure: None,
             lifecycle_error: None,
         }
     }
@@ -208,11 +209,8 @@ impl PublishExecutionReport {
             Err(LpmError::Registry(
                 "one or more publish targets failed".into(),
             ))
-        } else if self.any_publication_failed {
-            Err(LpmError::Registry(
-                "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again"
-                    .into(),
-            ))
+        } else if let Some(failure) = self.publication_failure {
+            Err(LpmError::Registry(failure.summary().into()))
         } else {
             Ok(())
         }
@@ -225,8 +223,8 @@ impl PublishExecutionReport {
         if self.any_upload_failed {
             return "one or more publish targets failed".into();
         }
-        if self.any_publication_failed {
-            return "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again".into();
+        if let Some(failure) = self.publication_failure {
+            return failure.summary().into();
         }
         "publish failed".into()
     }
@@ -1786,6 +1784,14 @@ async fn execute_prepared_inner(
                             {
                                 install_ui::warn_line(notice);
                             }
+                            if !wait_for_publication
+                                && detected_ecosystem == "swift"
+                                && publication_status == Some(LpmPublicationStatus::Processing)
+                            {
+                                install_ui::detail_line(format_swift_preparation_hint(
+                                    emit_summary,
+                                ));
+                            }
                             if !matches!(
                                 publication_status.as_ref(),
                                 Some(LpmPublicationStatus::Active)
@@ -2151,6 +2157,8 @@ async fn execute_prepared_inner(
             if !json_output {
                 if wait_result.success {
                     install_ui::done("LPM.dev Registry publication is active");
+                } else if let Some(rejection) = wait_result.swift_rejection() {
+                    print_swift_release_rejection(rejection, targets.len() > 1);
                 } else if let Some(error) = wait_result.error.as_deref() {
                     install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(error));
                 }
@@ -2161,16 +2169,8 @@ async fn execute_prepared_inner(
 
     // Final summary after every target has had a chance to publish.
     let any_failed = results.iter().any(|r| !r.success);
-    let any_publication_failed = results.iter().any(|result| {
-        result
-            .publication_status
-            .as_ref()
-            .is_some_and(LpmPublicationStatus::is_terminal_rejection)
-            || result
-                .publication_wait
-                .as_ref()
-                .is_some_and(|wait| !wait.success)
-    });
+    let publication_failure = results.iter().find_map(PublishResult::publication_failure);
+    let any_publication_failed = publication_failure.is_some();
     let upload_or_publication_failed = any_failed || any_publication_failed;
     let lifecycle_error = if upload_or_publication_failed {
         None
@@ -2246,7 +2246,7 @@ async fn execute_prepared_inner(
         results: results.iter().map(publish_result_json).collect(),
         json_output,
         any_upload_failed: any_failed,
-        any_publication_failed,
+        publication_failure,
         lifecycle_error,
     })
 }

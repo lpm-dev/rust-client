@@ -1112,8 +1112,13 @@ pub struct PublicationStatusResponse {
     pub current_latest_version: Option<String>,
     /// Why a version that passed its review isn't available yet. A hold
     /// this client can't read is left out rather than failing the poll.
-    #[serde(default, deserialize_with = "deserialize_publication_hold")]
+    #[serde(default, deserialize_with = "deserialize_lenient_object")]
     pub hold: Option<PublicationHold>,
+    /// Where the Registry's Swift job is with a Swift release it's preparing
+    /// or rejected. Other releases have none, and one this client can't read
+    /// is left out rather than failing the poll.
+    #[serde(default, deserialize_with = "deserialize_lenient_object")]
+    pub swift: Option<SwiftReleaseState>,
 }
 
 /// Why the Registry holds a version that passed its publication review.
@@ -1135,14 +1140,56 @@ pub struct PublicationHold {
     pub is_final: bool,
 }
 
-fn deserialize_publication_hold<'de, D>(
-    deserializer: D,
-) -> Result<Option<PublicationHold>, D::Error>
+/// What the Registry's Swift job has made of a Swift release: one it's
+/// still preparing, or one it rejected. `status` and `code` are kept as the
+/// Registry sends them, so values this client doesn't know still reach
+/// `--json`. One without a string `status` can't be read at all; each other
+/// field this client can't read is left out on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwiftReleaseState {
+    /// `pending` while the job prepares the release, `rejected` once it
+    /// refused it.
+    pub status: String,
+    /// Why the job rejected the release, such as `invalid_manifest`.
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
+    pub code: Option<String>,
+    /// What the job found: for a rejection, possibly Swift compiler output
+    /// over several lines.
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
+    pub message: Option<String>,
+    /// What the publisher can do about a rejection.
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
+    pub remedy: Option<String>,
+}
+
+impl SwiftReleaseState {
+    /// The job refused the release. It was never served, so the Registry
+    /// takes a publish of the same version again, which replaces it.
+    #[inline]
+    pub fn is_rejected(&self) -> bool {
+        self.status == "rejected"
+    }
+
+    /// The job is still preparing the release, which may yet be published
+    /// or rejected.
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
+}
+
+/// A JSON object read as `T`, or nothing for one that can't be. Anything
+/// but an object is nothing too: serde would otherwise read a struct from
+/// an array by position.
+fn deserialize_lenient_object<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+    Ok(value
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| serde_json::from_value(value).ok()))
 }
 
 fn deserialize_lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -1853,6 +1900,35 @@ impl From<DistInfo> for BlockedSetDist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_rejected_swift_job_state_is_a_rejection() {
+        let state = |status: &str| SwiftReleaseState {
+            status: status.into(),
+            code: None,
+            message: None,
+            remedy: None,
+        };
+
+        assert!(state("rejected").is_rejected());
+        assert!(!state("pending").is_rejected());
+        assert!(!state("Rejected").is_rejected());
+        assert!(!state("a_future_status").is_rejected());
+    }
+
+    #[test]
+    fn only_a_pending_swift_job_state_is_still_preparing() {
+        let state = |status: &str| SwiftReleaseState {
+            status: status.into(),
+            code: None,
+            message: None,
+            remedy: None,
+        };
+
+        assert!(state("pending").is_pending());
+        assert!(!state("rejected").is_pending());
+        assert!(!state("a_future_status").is_pending());
+    }
 
     #[test]
     fn behavioral_tags_read_custom_license_and_default_it_when_absent() {

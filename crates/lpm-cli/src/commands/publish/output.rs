@@ -1,6 +1,10 @@
-use super::types::{LpmPublicationStatus, PublishResult, PublishTarget};
+use super::types::{
+    LpmPublicationStatus, PublishResult, PublishTarget, SWIFT_REASON_FALLBACK,
+    SWIFT_RELEASE_REJECTED, SWIFT_REMEDY_FALLBACK, swift_rejection_reason, swift_rejection_remedy,
+};
 use crate::commands::publish_common::TarballFile;
 use crate::{install_ui, quality};
+use lpm_registry::SwiftReleaseState;
 use std::collections::HashMap;
 
 pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
@@ -54,6 +58,12 @@ pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
                     "reason": hold.reason.as_deref(),
                     "message": hold.message.as_deref(),
                     "final": hold.is_final,
+                })),
+                "swift": wait.swift.as_ref().map(|swift| serde_json::json!({
+                    "status": swift.status,
+                    "code": swift.code.as_deref(),
+                    "message": swift.message.as_deref(),
+                    "remedy": swift.remedy.as_deref(),
                 })),
                 "error": wait.error.as_deref(),
             }),
@@ -260,6 +270,91 @@ pub(super) fn format_lpm_publication_notice(
             "Upload succeeded. LPM.dev Registry returned an unrecognized publication status; public availability was not confirmed."
         )),
     }
+}
+
+/// Where a publish that doesn't wait points the publisher of a Swift
+/// release the Registry's Swift job is still preparing. Only `lpm publish`
+/// can offer `--wait`.
+pub(super) fn format_swift_preparation_hint(offer_wait: bool) -> install_ui::TerminalLine {
+    let hint = if offer_wait {
+        "LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected; next time, lpm publish --wait reports it here."
+    } else {
+        "LPM.dev Registry is checking the Swift manifests and signing the source archive, usually within a minute. The package page shows whether the release was published or rejected."
+    };
+    crate::install_ui::terminal_line!("  {}", install_ui::dim(hint))
+}
+
+/// Says LPM.dev Registry rejected the Swift release, why and what to fix.
+/// After a publish to several targets, it also says how to publish the
+/// fixed release to LPM.dev alone, waiting for the Swift job again.
+pub(super) fn print_swift_release_rejection(rejection: &SwiftReleaseState, other_targets: bool) {
+    install_ui::warn(SWIFT_RELEASE_REJECTED);
+    for row in format_swift_release_rejection_details(rejection) {
+        install_ui::detail_line(row);
+    }
+    if other_targets {
+        install_ui::detail_line(format_swift_republish_detail());
+    }
+}
+
+pub(super) fn format_swift_republish_detail() -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
+        "  {} {}",
+        install_ui::dim("Publish again:"),
+        install_ui::yellow("lpm publish --lpm --wait")
+    )
+}
+
+/// The `reason` and `fix` rows under a Swift release rejection. A reason
+/// that is Swift compiler output keeps its lines, each a row of its own.
+pub(super) fn format_swift_release_rejection_details(
+    rejection: &SwiftReleaseState,
+) -> Vec<install_ui::TerminalLine> {
+    let reason = printable_lines(swift_rejection_reason(rejection), SWIFT_REASON_FALLBACK);
+    let remedy = printable_lines(swift_rejection_remedy(rejection), SWIFT_REMEDY_FALLBACK);
+    let mut rows = Vec::with_capacity(reason.len() + remedy.len());
+    push_labeled_block(&mut rows, "reason", reason);
+    push_labeled_block(&mut rows, "fix", remedy);
+    rows
+}
+
+/// The lines of Registry text as they print, without blank lines at either
+/// end, or `fallback`'s when sanitizing leaves nothing to read.
+fn printable_lines(text: &str, fallback: &'static str) -> Vec<install_ui::TerminalFragment> {
+    let mut lines = install_ui::untrusted_lines(text);
+    let readable = |line: &install_ui::TerminalFragment| !line.trim().is_empty();
+    let Some(first) = lines.iter().position(readable) else {
+        return install_ui::untrusted_lines(fallback);
+    };
+    let last = lines.iter().rposition(readable).unwrap_or(first);
+    lines.truncate(last + 1);
+    lines.drain(..first);
+    lines
+}
+
+/// Rows like [`publish_detail`]'s whose value spans lines: the first line
+/// follows the label, and the rest line up under it.
+fn push_labeled_block(
+    rows: &mut Vec<install_ui::TerminalLine>,
+    label: &str,
+    lines: Vec<install_ui::TerminalFragment>,
+) {
+    let mut lines = lines.into_iter();
+    let Some(first) = lines.next() else {
+        return;
+    };
+    rows.push(crate::install_ui::terminal_line!(
+        "    {} {}",
+        install_ui::dim(&format!("{label:<10}")),
+        first
+    ));
+    rows.extend(lines.map(|line| {
+        if line.is_empty() {
+            install_ui::TerminalLine::new("")
+        } else {
+            crate::install_ui::terminal_line!("               {}", line)
+        }
+    }));
 }
 
 pub(super) fn format_single_publish_success_summary(
