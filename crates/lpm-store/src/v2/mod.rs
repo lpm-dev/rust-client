@@ -54,6 +54,7 @@ pub use build_cache::{
     BuildCacheKey, BuildKeyInputs, BuildPlatformFingerprint, BuildRuntimeFingerprint,
     BuildSandboxFingerprint, BuildScriptFingerprint,
 };
+pub use fs_util::is_staging_dir_name;
 pub use graph_key::{DepEdge, GraphKey, GraphKeyInputs, LinkerModeTag, PeerEntry};
 pub use link_meta::{
     LINK_META_FILENAME, LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaDep, LinkMetaPlatform,

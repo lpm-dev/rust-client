@@ -61,51 +61,54 @@ impl ResponseMemoryReservation {
     }
 }
 
-/// Allowed request headers (whitelist). Only these headers are forwarded from
-/// the relay to the local dev server. Any header starting with `x-` is also
-/// allowed to support custom webhook headers.
-const ALLOWED_HEADERS: &[&str] = &[
-    "content-type",
-    "content-length",
-    "content-encoding",
-    "accept",
-    "accept-encoding",
-    "accept-language",
-    "user-agent",
-    "cache-control",
-    "pragma",
-    "if-none-match",
-    "if-modified-since",
-    "last-event-id",
-    "range",
-    "cookie",
-    "authorization",
-    "origin",
-    "referer",
-    "stripe-signature",
+/// Request headers that describe the relay's connection rather than the
+/// request, and `host`, which is set to the verified local target. Every
+/// other header reaches the local service, as a webhook provider's signature
+/// headers must (`svix-signature`, `webhook-signature`, `stripe-signature`,
+/// …), and as a captured request's headers do on replay.
+const CONNECTION_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "expect",
+    "http2-settings",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-accept",
 ];
 
-/// Check if a header name is allowed through the proxy whitelist.
-///
-/// Allows explicitly whitelisted headers plus any `x-` prefixed header
-/// (for webhook signatures, forwarded-for, etc.). Always blocks `host`
-/// and `transfer-encoding` regardless.
+/// Whether a request header from the relay is forwarded to the local service.
 fn is_header_allowed(name: &str) -> bool {
-    let lower = name.to_lowercase();
+    !CONNECTION_HEADERS
+        .iter()
+        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
 
-    // Always block these — host is set to the verified target authority, transfer-encoding
-    // is hop-by-hop and must not be forwarded.
-    if lower == "host" || lower == "transfer-encoding" {
-        return false;
-    }
+/// The headers that a request's `Connection` header names, which apply to
+/// the relay's hop only.
+fn connection_nominated_headers(headers: &HashMap<String, String>) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
 
-    // Allow all x- prefixed headers (x-forwarded-for, x-requested-with,
-    // x-github-event, x-hub-signature-256, x-webhook-id, etc.)
-    if lower.starts_with("x-") {
-        return true;
-    }
-
-    ALLOWED_HEADERS.contains(&lower.as_str())
+fn forwards_request_header(name: &str, nominated: &[String]) -> bool {
+    is_header_allowed(name)
+        && !nominated
+            .iter()
+            .any(|token| name.eq_ignore_ascii_case(token))
 }
 
 /// Forward an HTTP request to the local dev server and return the response.
@@ -352,11 +355,9 @@ impl LocalRequest<'_> {
         );
         let mut builder = self.http_client.request(self.method.clone(), &local_url);
 
-        // Forward headers using a whitelist — only known-safe headers are forwarded
-        // to the local dev server. This prevents relay-injected or attacker-controlled
-        // headers from reaching the local service.
+        let nominated = connection_nominated_headers(self.headers);
         for (key, value) in self.headers {
-            if is_header_allowed(key) {
+            if forwards_request_header(key, &nominated) {
                 builder = builder.header(key.as_str(), value.as_str());
             }
         }
@@ -618,8 +619,9 @@ fn build_local_websocket_request(
             .map_err(|e| LpmError::Tunnel(format!("invalid Host header: {e}")))?,
     );
 
+    let nominated = connection_nominated_headers(headers);
     for (key, value) in headers {
-        if is_header_allowed(key) || key.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL) {
+        if forwards_request_header(key, &nominated) {
             let header_name = tokio_tungstenite::tungstenite::http::header::HeaderName::from_bytes(
                 key.as_bytes(),
             )
@@ -1130,13 +1132,50 @@ mod tests {
         assert!(!is_header_allowed("Host"));
         assert!(!is_header_allowed("transfer-encoding"));
         assert!(!is_header_allowed("Transfer-Encoding"));
-        // Unknown headers not in whitelist are blocked
         assert!(!is_header_allowed("connection"));
         assert!(!is_header_allowed("upgrade"));
         assert!(!is_header_allowed("proxy-authorization"));
         assert!(!is_header_allowed("te"));
         assert!(!is_header_allowed("trailer"));
         assert!(!is_header_allowed("keep-alive"));
+        assert!(!is_header_allowed("sec-websocket-key"));
+    }
+
+    #[test]
+    fn webhook_signature_cors_and_conditional_headers_reach_the_local_service() {
+        for name in [
+            "svix-id",
+            "svix-timestamp",
+            "svix-signature",
+            "webhook-id",
+            "webhook-signature",
+            "paddle-signature",
+            "linear-signature",
+            "access-control-request-method",
+            "access-control-request-headers",
+            "if-match",
+            "if-range",
+            "if-unmodified-since",
+            "sec-websocket-protocol",
+        ] {
+            assert!(is_header_allowed(name), "{name} must be forwarded");
+        }
+    }
+
+    #[test]
+    fn headers_named_by_connection_stay_on_the_relay_hop() {
+        let headers = HashMap::from([
+            (
+                "Connection".to_string(),
+                "keep-alive, X-Relay-Hop".to_string(),
+            ),
+            ("x-relay-hop".to_string(), "1".to_string()),
+            ("svix-signature".to_string(), "v1,abc".to_string()),
+        ]);
+        let nominated = connection_nominated_headers(&headers);
+
+        assert!(!forwards_request_header("x-relay-hop", &nominated));
+        assert!(forwards_request_header("svix-signature", &nominated));
     }
 
     #[test]

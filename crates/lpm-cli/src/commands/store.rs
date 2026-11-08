@@ -316,6 +316,8 @@ fn run_verify(
     let mut security_fix_failures = 0u32;
     let mut referenced_objects_ok = true;
     let v2_paths = lpm_store::v2::StoreV2Paths::from_lpm_root(lpm_root);
+    let v3_paths = lpm_store::v2::StoreV2Paths::from_lpm_root_v3(lpm_root);
+    let mut security_checked_objects = HashSet::new();
 
     for (entry_index, entry) in packages.iter().enumerate() {
         let StoreVerifyEntry {
@@ -334,6 +336,9 @@ fn run_verify(
         let safe_name = sanitize_for_terminal(name);
         let safe_version = sanitize_for_terminal(version);
 
+        // Virtual-store links strip `.lpm-security.json`; installs read the
+        // analysis from the shared object directory, so verify checks it there.
+        let mut security_cache_object_dir = None;
         if let Some(object_path) = object_path {
             let safe_object_path = sanitize_for_terminal(object_path);
             let Some(source_sri) = inline_integrity.as_deref() else {
@@ -344,9 +349,9 @@ fn run_verify(
                 continue;
             };
             let paths = if *store_version == Some(lpm_store::StoreVersion::V3) {
-                lpm_store::v2::StoreV2Paths::from_lpm_root_v3(lpm_root)
+                &v3_paths
             } else {
-                v2_paths.clone()
+                &v2_paths
             };
             let expected_object_path = match paths.relative_object_path(source_sri) {
                 Ok(path) => path,
@@ -398,6 +403,7 @@ fn run_verify(
                 ));
                 continue;
             }
+            security_cache_object_dir = paths.object_dir(source_sri).ok();
         }
 
         if let Err(error) = maintenance::verify_directory_chain(&lpm_root.store_root(), dir) {
@@ -520,7 +526,14 @@ fn run_verify(
 
             // Security cross-check: re-run behavioral analysis and compare with cached.
             // Read-only by default — only writes when --fix is passed.
-            let cached = lpm_security::behavioral::read_cached_analysis(dir);
+            let security_cache_dir = security_cache_object_dir.as_deref().unwrap_or(dir);
+            if security_cache_object_dir.is_some()
+                && !security_checked_objects.insert(security_cache_dir.to_path_buf())
+            {
+                verified += 1;
+                continue;
+            }
+            let cached = lpm_security::behavioral::read_cached_analysis(security_cache_dir);
             let fresh = lpm_security::behavioral::analyze_package(dir);
 
             match cached {
@@ -529,7 +542,7 @@ fn run_verify(
                         security_mismatches += 1;
                         if fix {
                             let fixed = match write_security_cache_for_verify(
-                                dir,
+                                security_cache_dir,
                                 &fresh,
                                 &safe_name,
                                 &safe_version,
@@ -562,7 +575,7 @@ fn run_verify(
                     security_mismatches += 1;
                     if fix {
                         let fixed = match write_security_cache_for_verify(
-                            dir,
+                            security_cache_dir,
                             &fresh,
                             &safe_name,
                             &safe_version,

@@ -315,8 +315,26 @@ fn preserve_item_decor(previous: &toml_edit::Item, replacement: &mut toml_edit::
     }
 }
 
+/// A TOML value as JSON. A datetime becomes its TOML text: serde would
+/// otherwise wrap it in the `toml` crate's private datetime marker.
 pub(super) fn config_value_to_json(value: &toml::Value) -> serde_json::Value {
-    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+    match value {
+        toml::Value::String(value) => serde_json::Value::String(value.clone()),
+        toml::Value::Integer(value) => serde_json::Value::from(*value),
+        toml::Value::Float(value) => serde_json::Number::from_f64(*value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        toml::Value::Boolean(value) => serde_json::Value::Bool(*value),
+        toml::Value::Datetime(value) => serde_json::Value::String(value.to_string()),
+        toml::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(config_value_to_json).collect())
+        }
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.clone(), config_value_to_json(value)))
+                .collect(),
+        ),
+    }
 }
 
 pub(crate) fn redact_config_json_value(key: &str, value: serde_json::Value) -> serde_json::Value {

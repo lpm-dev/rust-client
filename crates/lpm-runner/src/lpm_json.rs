@@ -596,6 +596,29 @@ pub struct TaskConfig {
     pub cache_portable: Option<bool>,
 }
 
+const DEFAULT_TASK_INPUTS: &[&str] = &[
+    "src/**",
+    "lib/**",
+    "app/**",
+    "pages/**",
+    "components/**",
+    "scripts/**",
+    "bin/**",
+    "*.js",
+    "*.cjs",
+    "*.mjs",
+    "*.ts",
+    "*.tsx",
+    "*.jsx",
+    "package.json",
+    "lpm.json",
+    "tsconfig.json",
+    "tsconfig.*.json",
+    "*.config.js",
+    "*.config.ts",
+    "*.config.mjs",
+];
+
 impl TaskConfig {
     /// Whether the task's cache key leaves out where the project is checked out.
     #[inline]
@@ -604,33 +627,32 @@ impl TaskConfig {
     }
 
     /// Get the effective inputs globs (defaults to common source dirs + config files if empty).
+    ///
+    /// A default input tree that this task declares as an output tree, such as
+    /// `lib/**` for `tsc --outDir lib`, is left out: those files are the task's
+    /// results, and hashing them would change the key every time it runs.
     pub fn effective_inputs(&self) -> Vec<String> {
-        if self.inputs.is_empty() {
-            vec![
-                "src/**".into(),
-                "lib/**".into(),
-                "app/**".into(),
-                "pages/**".into(),
-                "components/**".into(),
-                "scripts/**".into(),
-                "bin/**".into(),
-                "*.js".into(),
-                "*.cjs".into(),
-                "*.mjs".into(),
-                "*.ts".into(),
-                "*.tsx".into(),
-                "*.jsx".into(),
-                "package.json".into(),
-                "lpm.json".into(),
-                "tsconfig.json".into(),
-                "tsconfig.*.json".into(),
-                "*.config.js".into(),
-                "*.config.ts".into(),
-                "*.config.mjs".into(),
-            ]
-        } else {
-            self.inputs.clone()
+        if !self.inputs.is_empty() {
+            return self.inputs.clone();
         }
+        DEFAULT_TASK_INPUTS
+            .iter()
+            .filter(|pattern| !self.declares_output_tree(pattern))
+            .map(|pattern| (*pattern).to_owned())
+            .collect()
+    }
+
+    fn declares_output_tree(&self, input_tree: &str) -> bool {
+        let Some(directory) = input_tree.strip_suffix("/**") else {
+            return false;
+        };
+        self.outputs.iter().any(|output| {
+            let output = output.trim_start_matches("./");
+            output
+                .strip_suffix("/**")
+                .or_else(|| output.strip_suffix("/**/*"))
+                .is_some_and(|tree| tree.trim_end_matches('/') == directory)
+        })
     }
 
     /// Whether this task has upstream dependencies (`^` prefix).
@@ -1616,6 +1638,45 @@ mod tests {
         assert!(inputs.contains(&"package.json".to_string()));
         assert!(inputs.contains(&"*.js".to_string()));
         assert!(inputs.contains(&"lpm.json".to_string()));
+    }
+
+    #[test]
+    fn default_inputs_leave_out_a_tree_the_task_declares_as_output() {
+        let t = TaskConfig {
+            outputs: vec!["lib/**".into(), "./bin/**/*".into()],
+            ..Default::default()
+        };
+
+        let inputs = t.effective_inputs();
+
+        assert!(!inputs.contains(&"lib/**".to_string()));
+        assert!(!inputs.contains(&"bin/**".to_string()));
+        assert!(inputs.contains(&"src/**".to_string()));
+        assert!(inputs.contains(&"*.js".to_string()));
+    }
+
+    #[test]
+    fn default_inputs_keep_a_tree_when_only_some_of_its_files_are_outputs() {
+        let t = TaskConfig {
+            outputs: vec!["src/**/*.js".into(), "lib/index.js".into()],
+            ..Default::default()
+        };
+
+        let inputs = t.effective_inputs();
+
+        assert!(inputs.contains(&"src/**".to_string()));
+        assert!(inputs.contains(&"lib/**".to_string()));
+    }
+
+    #[test]
+    fn explicit_inputs_are_kept_even_when_they_overlap_outputs() {
+        let t = TaskConfig {
+            inputs: vec!["lib/**".into()],
+            outputs: vec!["lib/**".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(t.effective_inputs(), vec!["lib/**"]);
     }
 
     #[test]

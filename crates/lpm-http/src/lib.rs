@@ -675,6 +675,31 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     client_builder_with_redirect_limit(DEFAULT_REDIRECT_LIMIT)
 }
 
+/// Longest wait for a TCP and TLS connection when downloading an artifact.
+pub const ARTIFACT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Longest wait for the next bytes of an artifact download before the
+/// transfer counts as stalled.
+pub const ARTIFACT_READ_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build an asynchronous client for large downloads such as runtime archives,
+/// release binaries and tool tarballs.
+///
+/// A whole-request deadline would abort a healthy transfer on a slow link, so
+/// this bounds connection setup and each stalled read instead.
+pub fn artifact_download_client_builder() -> reqwest::ClientBuilder {
+    artifact_download_client_builder_with(ARTIFACT_CONNECT_TIMEOUT, ARTIFACT_READ_STALL_TIMEOUT)
+}
+
+fn artifact_download_client_builder_with(
+    connect_timeout: std::time::Duration,
+    read_stall_timeout: std::time::Duration,
+) -> reqwest::ClientBuilder {
+    client_builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_stall_timeout)
+}
+
 /// Build an asynchronous reqwest client with a caller-selected redirect limit,
 /// trusting the [bundled root certificates](bundled_root_certificates).
 pub fn client_builder_with_redirect_limit(limit: usize) -> reqwest::ClientBuilder {
@@ -818,6 +843,61 @@ pub fn error_chain(error: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn serve_body_in_slow_chunks(chunks: usize, gap: std::time::Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let header = format!("HTTP/1.1 200 OK\r\ncontent-length: {chunks}\r\n\r\n");
+            socket.write_all(header.as_bytes()).await.unwrap();
+            for _ in 0..chunks {
+                tokio::time::sleep(gap).await;
+                socket.write_all(b"x").await.unwrap();
+                socket.flush().await.unwrap();
+            }
+        });
+        format!("http://{address}/artifact")
+    }
+
+    #[tokio::test]
+    async fn artifact_download_finishes_a_slow_transfer_that_keeps_making_progress() {
+        let url = serve_body_in_slow_chunks(8, std::time::Duration::from_millis(60)).await;
+        let client = artifact_download_client_builder_with(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(250),
+        )
+        .build()
+        .unwrap();
+
+        let body = client
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(body.as_ref(), b"xxxxxxxx");
+    }
+
+    #[tokio::test]
+    async fn artifact_download_fails_when_the_transfer_stalls() {
+        let url = serve_body_in_slow_chunks(2, std::time::Duration::from_millis(600)).await;
+        let client = artifact_download_client_builder_with(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(150),
+        )
+        .build()
+        .unwrap();
+
+        let result = async { client.get(&url).send().await?.bytes().await }.await;
+
+        assert!(result.unwrap_err().is_timeout());
+    }
 
     #[derive(Clone)]
     struct DelayedClientProvider {

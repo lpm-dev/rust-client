@@ -1603,7 +1603,7 @@ fn append_collected_output_files<W: Write>(
     Ok(())
 }
 
-fn collect_output_files(
+pub(crate) fn collect_output_files(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<Vec<PathBuf>, LpmError> {

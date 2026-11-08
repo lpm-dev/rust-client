@@ -21,12 +21,12 @@ use super::root_fs::stream_as_root;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::root_fs::{
     changeable_by_others, create_missing_directories, open_for_copy, private_root_directory,
-    rename_onto, tee_as_root,
+    privileged_command, rename_onto, tee_as_root,
 };
 use lpm_common::LpmError;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Where the privileged forwarder's executable is copied from and to.
@@ -257,7 +257,11 @@ fn install_checked(
     let staging =
         private_root_directory(privileged, install_dir, std::ffi::OsStr::new(".staging"))?;
     let installed = install_staged_copy(executable, privileged, &staging, checks);
-    let cleanup = run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&staging));
+    let cleanup = run_checked_inherited(
+        privileged_command(privileged)
+            .args(["rm", "-rf"])
+            .arg(&staging),
+    );
     installed?;
     cleanup?;
     remove_stale_entries(executable, privileged)
@@ -279,18 +283,18 @@ fn create_root_owned_directory(install_dir: &Path, privileged: &Path) -> Result<
         )));
     }
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chown", "0:0"])
             .arg(install_dir),
     )?;
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chmod", "0755"])
             .arg(install_dir),
     )?;
     #[cfg(target_os = "macos")]
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chmod", "-N"])
             .arg(install_dir),
     )?;
@@ -316,14 +320,14 @@ fn install_staged_copy(
     } else {
         tee_as_root(privileged, open_for_copy(&executable.read_from)?, &staged)?;
         run_checked_inherited(
-            Command::new(privileged)
+            privileged_command(privileged)
                 .args(["chmod", "0755"])
                 .arg(&staged),
         )?;
     }
     // Let the installing user read, but not change, the staged copy to verify it.
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chmod", "0755"])
             .arg(staging),
     )?;
@@ -463,7 +467,7 @@ fn copy_bundle_as_root(
     }
 
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["mkdir", "-m", "0755"])
             .args(directories.iter().map(|relative| staged.join(relative))),
     )?;
@@ -488,7 +492,7 @@ fn copy_bundle_as_root(
     for (mode, files) in [("0755", &executables), ("0644", &others)] {
         if !files.is_empty() {
             run_checked_inherited(
-                Command::new(privileged)
+                privileged_command(privileged)
                     .arg("chmod")
                     .arg(mode)
                     .args(files.iter().map(|relative| staged.join(relative))),
@@ -643,25 +647,29 @@ fn swap_into_place(
     let mut previous_name = OsString::from(".previous.");
     previous_name.push(&executable.entry);
     let previous = executable.install_dir.join(previous_name);
-    run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&previous))?;
+    run_checked_inherited(
+        privileged_command(privileged)
+            .args(["rm", "-rf"])
+            .arg(&previous),
+    )?;
     let had_previous = std::fs::symlink_metadata(&destination).is_ok();
     if had_previous {
         run_checked_inherited(
-            Command::new(privileged)
+            privileged_command(privileged)
                 .arg("mv")
                 .arg(&destination)
                 .arg(&previous),
         )?;
     }
     if let Err(error) = run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .arg("mv")
             .arg(staged)
             .arg(&destination),
     ) {
         if had_previous {
             let _ = run_checked_inherited(
-                Command::new(privileged)
+                privileged_command(privileged)
                     .arg("mv")
                     .arg(&previous)
                     .arg(&destination),
@@ -669,7 +677,11 @@ fn swap_into_place(
         }
         return Err(error);
     }
-    run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&previous))
+    run_checked_inherited(
+        privileged_command(privileged)
+            .args(["rm", "-rf"])
+            .arg(&previous),
+    )
 }
 
 /// Remove anything in the install directory besides the current copy: copies
@@ -683,7 +695,7 @@ fn remove_stale_entries(
         let entry = entry.map_err(LpmError::Io)?;
         if entry.file_name() != executable.entry {
             run_checked_inherited(
-                Command::new(privileged)
+                privileged_command(privileged)
                     .args(["rm", "-rf"])
                     .arg(entry.path()),
             )?;
@@ -699,7 +711,7 @@ pub(super) fn uninstall_forwarder_executable(
     privileged: &Path,
 ) -> Result<(), LpmError> {
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["rm", "-rf"])
             .arg(install_dir),
     )

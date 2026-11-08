@@ -211,6 +211,7 @@ async fn run_tls_listener(
 ) {
     let capacity = Arc::new(tokio::sync::Semaphore::new(TLS_CONNECTION_LIMIT));
     let mut connections = tokio::task::JoinSet::new();
+    let mut backoff = crate::tcp_forward::AcceptBackoff::new();
 
     loop {
         while connections.try_join_next().is_some() {}
@@ -229,8 +230,19 @@ async fn run_tls_listener(
             _ = super::http::wait_for_shutdown(&mut shutdown) => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted else {
-            continue;
+        let stream = match accepted {
+            Ok((stream, _)) => {
+                backoff.reset();
+                stream
+            }
+            Err(_) => {
+                drop(permit);
+                tokio::select! {
+                    biased;
+                    _ = super::http::wait_for_shutdown(&mut shutdown) => break,
+                    () = tokio::time::sleep(backoff.next_delay()) => continue,
+                }
+            }
         };
         let acceptor = acceptor.clone();
         let state = state.clone();

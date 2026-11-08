@@ -148,7 +148,7 @@ fn npm_version_metadata(
 async fn mount_github_latest(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/repos/oxc-project/oxc/releases"))
-        .and(query_param("per_page", "20"))
+        .and(query_param("per_page", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             { "tag_name": "oxlint_v1.90.1" }
         ])))
@@ -157,7 +157,7 @@ async fn mount_github_latest(server: &MockServer) {
 
     Mock::given(method("GET"))
         .and(path("/repos/biomejs/biome/releases"))
-        .and(query_param("per_page", "20"))
+        .and(query_param("per_page", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             { "tag_name": "@biomejs/biome@2.6.5" }
         ])))

@@ -180,29 +180,28 @@ async fn local_managed_tool_rows() -> Result<Vec<ManagedToolRow>, LpmError> {
 
 async fn upstream_managed_tool_rows() -> Result<Vec<ManagedToolRow>, LpmError> {
     let plugin_latest = lpm_plugin::versions::get_all_latest_versions().await;
-    let mut rows = Vec::new();
-    for def in sorted_plugin_defs() {
+    let defs = sorted_plugin_defs();
+    let (plugin_upstreams, rolldown_upstream) = futures::join!(
+        futures::future::join_all(
+            defs.iter()
+                .map(|def| lpm_plugin::versions::peek_latest_from_github(def))
+        ),
+        lpm_plugin::peek_latest_engine_version("rolldown"),
+    );
+    let mut rows = Vec::with_capacity(defs.len() + 1);
+    for (def, upstream) in defs.into_iter().zip(plugin_upstreams) {
         let current = plugin_latest
             .get(def.name)
             .cloned()
             .unwrap_or_else(|| def.latest_version.to_string());
-        let upstream = match lpm_plugin::versions::peek_latest_from_github(def).await {
-            Ok(latest) => latest,
-            Err(error) => {
-                rows.push(managed_plugin_row(
-                    def,
-                    current.clone(),
-                    current,
-                    Some(error),
-                )?);
-                continue;
-            }
-        };
-        rows.push(managed_plugin_row(def, current, upstream, None)?);
+        rows.push(match upstream {
+            Ok(latest) => managed_plugin_row(def, current, latest, None)?,
+            Err(error) => managed_plugin_row(def, current.clone(), current, Some(error))?,
+        });
     }
 
     let current = lpm_plugin::get_latest_engine_version("rolldown")?;
-    match lpm_plugin::peek_latest_engine_version("rolldown").await {
+    match rolldown_upstream {
         Ok(latest) => rows.push(managed_engine_row("rolldown", current, latest, None)?),
         Err(error) => rows.push(managed_engine_row(
             "rolldown",

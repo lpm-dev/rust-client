@@ -14,6 +14,14 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// A command run through the privileged program, which looks up the program
+/// it runs in system directories only.
+pub(super) fn privileged_command(privileged: &Path) -> Command {
+    let mut command = Command::new(privileged);
+    command.env("PATH", crate::elevation::ROOT_COMMAND_PATH);
+    command
+}
+
 /// The `mv` flag that renames onto a target that is a link to a directory,
 /// replacing the link, instead of moving into the directory it points to.
 #[cfg(target_os = "linux")]
@@ -73,18 +81,18 @@ pub(super) fn create_missing_directories(
     }
     missing.reverse();
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["mkdir", "-m", "0755"])
             .args(&missing),
     )?;
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chown", "0:0"])
             .args(&missing),
     )?;
     #[cfg(target_os = "macos")]
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chmod", "-N"])
             .args(&missing),
     )?;
@@ -103,7 +111,7 @@ pub(super) fn private_root_directory(
     let mut template = OsString::from(prefix);
     template.push(".XXXXXX");
     let created = run_checked_output(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["mktemp", "-d"])
             .arg(parent.join(template)),
     )?;
@@ -117,11 +125,15 @@ pub(super) fn private_root_directory(
     }
     #[cfg(target_os = "macos")]
     if let Err(error) = run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["chmod", "-N"])
             .arg(&directory),
     ) {
-        let _ = run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&directory));
+        let _ = run_checked_inherited(
+            privileged_command(privileged)
+                .args(["rm", "-rf"])
+                .arg(&directory),
+        );
         return Err(error);
     }
     Ok(directory)
@@ -165,14 +177,18 @@ pub(super) fn write_root_file(
     let written = stream_as_root(privileged, &mut &contents[..], &temporary, u64::MAX)
         .and_then(|_| {
             run_checked_inherited(
-                Command::new(privileged)
+                privileged_command(privileged)
                     .arg("chmod")
                     .arg(mode)
                     .arg(&temporary),
             )
         })
         .and_then(|()| rename_onto(privileged, &temporary, destination));
-    let cleanup = run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&private));
+    let cleanup = run_checked_inherited(
+        privileged_command(privileged)
+            .args(["rm", "-rf"])
+            .arg(&private),
+    );
     written?;
     cleanup
 }
@@ -198,7 +214,7 @@ pub(super) fn rename_onto(privileged: &Path, from: &Path, to: &Path) -> Result<(
         }
     }
     run_checked_inherited(
-        Command::new(privileged)
+        privileged_command(privileged)
             .args(["mv", "-f", MV_ONTO_TARGET])
             .arg(from)
             .arg(to),
@@ -218,7 +234,7 @@ pub(super) fn stream_as_root(
 ) -> Result<Option<u64>, LpmError> {
     use std::io::Write as _;
 
-    let mut command = Command::new(privileged);
+    let mut command = privileged_command(privileged);
     command
         .arg("tee")
         .arg(destination)
@@ -257,7 +273,7 @@ pub(super) fn tee_as_root(
     destination: &Path,
 ) -> Result<(), LpmError> {
     run_checked_status(
-        Command::new(privileged)
+        privileged_command(privileged)
             .arg("tee")
             .arg(destination)
             .stdin(source)
@@ -423,6 +439,23 @@ mod tests {
                 .expect("a volume that ignores ownership is not trusted");
             assert!(reason.contains("ignores ownership"), "{reason}");
         }
+    }
+
+    #[test]
+    fn privileged_commands_look_up_programs_in_system_directories_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen-path");
+        let privileged = fake_privileged_runner(
+            dir.path(),
+            &format!("printf %s \"$PATH\" > '{}'\n", seen.display()),
+        );
+
+        run_checked_inherited(privileged_command(&privileged).arg("true")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            crate::elevation::ROOT_COMMAND_PATH
+        );
     }
 
     #[test]

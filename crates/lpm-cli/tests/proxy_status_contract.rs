@@ -796,7 +796,7 @@ fn proxy_start_http_redirect_port_redirects_registered_host_to_https_listener() 
         .send()
         .expect("request redirect listener");
 
-    assert_eq!(response.status(), reqwest::StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     let expected_location = format!("https://app.localhost:{tls_port}/login?next=/app");
     assert_eq!(
         response

@@ -197,7 +197,7 @@ where
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_FORWARDED_CONNECTIONS));
     tokio::spawn(async move {
-        let mut retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
+        let mut backoff = AcceptBackoff::new();
         loop {
             let permit = tokio::select! {
                 permit = Arc::clone(&connections).acquire_owned() => {
@@ -211,21 +211,19 @@ where
             };
             match accepted {
                 Ok((inbound, _)) => {
-                    retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
+                    backoff.reset();
                     let forwarding = forward(inbound);
                     tokio::spawn(async move {
                         forwarding.await;
                         drop(permit);
                     });
                 }
-                // Accept errors such as descriptor exhaustion persist; back off instead of spinning.
                 Err(_) => {
                     drop(permit);
                     tokio::select! {
-                        () = tokio::time::sleep(retry_delay) => {}
+                        () = tokio::time::sleep(backoff.next_delay()) => {}
                         _ = &mut shutdown_rx => break,
                     }
-                    retry_delay = (retry_delay * 2).min(ACCEPT_RETRY_MAX_DELAY);
                 }
             }
         }
@@ -240,6 +238,26 @@ where
 const MAX_FORWARDED_CONNECTIONS: usize = 1024;
 const ACCEPT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const ACCEPT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// The wait before a listener accepts again after a failed accept. Errors
+/// such as descriptor exhaustion persist, so retrying at once would spin.
+pub(crate) struct AcceptBackoff(Duration);
+
+impl AcceptBackoff {
+    pub(crate) fn new() -> Self {
+        Self(ACCEPT_RETRY_INITIAL_DELAY)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.0 = ACCEPT_RETRY_INITIAL_DELAY;
+    }
+
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let delay = self.0;
+        self.0 = (self.0 * 2).min(ACCEPT_RETRY_MAX_DELAY);
+        delay
+    }
+}
 
 async fn forward_tcp_connection(mut inbound: tokio::net::TcpStream, target_addr: SocketAddr) {
     let Ok(mut outbound) = tokio::net::TcpStream::connect(target_addr).await else {

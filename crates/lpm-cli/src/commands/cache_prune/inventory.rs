@@ -94,6 +94,9 @@ pub(super) fn walk_link_entries(
     };
     for entry in entries {
         let entry = entry.map_err(|error| super::prune_inspection_error(&root, error))?;
+        if lpm_store::v2::is_staging_dir_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let metadata = entry
             .metadata()

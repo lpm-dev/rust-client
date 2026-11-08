@@ -1365,31 +1365,12 @@ fn write_all_environments_unlocked(
 }
 
 /// Delete one or more secrets from the vault.
-pub fn delete(project_dir: &Path, keys: &[&str], source: &history::Source) -> Result<(), String> {
-    let vault_id = match vault_id::read_vault_id(project_dir) {
-        Some(id) => id,
-        None => return Err("no vault configured for this project".to_string()),
-    };
-
-    let project_name = vault_id::read_project_name(project_dir);
-    let project_path = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
-        .display()
-        .to_string();
-
-    mutate_secrets_env(
-        &vault_id,
-        &project_name,
-        &project_path,
-        "default",
-        |secrets| {
-            for key in keys {
-                secrets.remove(*key);
-            }
-        },
-        source,
-    )
+pub fn delete(
+    project_dir: &Path,
+    keys: &[&str],
+    source: &history::Source,
+) -> Result<Vec<String>, String> {
+    delete_env(project_dir, "default", keys, source)
 }
 
 /// Get a single secret from a specific environment.
@@ -1398,13 +1379,16 @@ pub fn try_get_env(project_dir: &Path, env: &str, key: &str) -> Result<Option<St
     Ok(secrets.get(key).cloned())
 }
 
-/// Delete secrets from a specific environment.
+/// Delete secrets from a specific environment, returning the keys it held.
+///
+/// Keys the environment doesn't hold, and an environment that doesn't exist,
+/// change nothing: the vault is not rewritten and no environment is created.
 pub fn delete_env(
     project_dir: &Path,
     env: &str,
     keys: &[&str],
     source: &history::Source,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Err("no vault configured for this project".to_string()),
@@ -1417,18 +1401,23 @@ pub fn delete_env(
         .display()
         .to_string();
 
-    mutate_secrets_env(
+    let removed = mutate_existing_secrets_env(
         &vault_id,
         &project_name,
         &project_path,
         env,
         |secrets| {
-            for key in keys {
-                secrets.remove(*key);
-            }
+            let removed: Vec<String> = keys
+                .iter()
+                .filter(|key| secrets.remove(**key).is_some())
+                .map(|key| (*key).to_owned())
+                .collect();
+            let changed = !removed.is_empty();
+            (removed, changed)
         },
         source,
-    )
+    )?;
+    Ok(removed.unwrap_or_default())
 }
 
 /// Import secrets from a .env file into the vault, as they're written there.
@@ -1649,6 +1638,37 @@ fn mutate_secrets_env<T>(
     {
         let _ = (project_name, project_path);
         fallback::mutate_vault_file_env(vault_id, env, operation, source)
+    }
+}
+
+fn mutate_existing_secrets_env<T>(
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    env: &str,
+    operation: impl FnOnce(&mut HashMap<String, String>) -> (T, bool),
+    source: &history::Source,
+) -> Result<Option<T>, String> {
+    if force_file_vault_backend() {
+        return fallback::mutate_existing_vault_file_env(vault_id, env, operation, source);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        keychain::mutate_existing_vault_env(
+            vault_id,
+            project_name,
+            project_path,
+            env,
+            operation,
+            source,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (project_name, project_path);
+        fallback::mutate_existing_vault_file_env(vault_id, env, operation, source)
     }
 }
 
@@ -1908,7 +1928,7 @@ mod tests {
         )
     }
 
-    fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
+    fn delete(project_dir: &Path, keys: &[&str]) -> Result<Vec<String>, String> {
         super::delete(
             project_dir,
             keys,
@@ -2209,6 +2229,31 @@ KEY3=no-quotes"#;
             assert!(secrets.contains_key("A"));
             assert!(!secrets.contains_key("B"));
             assert!(secrets.contains_key("C"));
+
+            cleanup_vault(dir.path());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn delete_reports_only_the_keys_it_removed_and_never_creates_an_environment() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("A", "1")]).unwrap();
+
+            let removed = delete(dir.path(), &["A", "MISSING"]).unwrap();
+            let from_missing_env = super::delete_env(
+                dir.path(),
+                "stagign",
+                &["A"],
+                &history::Source::new(history::Action::Delete),
+            )
+            .unwrap();
+
+            assert_eq!(removed, vec!["A".to_string()]);
+            assert!(from_missing_env.is_empty());
+            let environments = try_get_all_environments(dir.path()).expect("read vault");
+            assert!(!environments.contains_key("stagign"), "{environments:?}");
 
             cleanup_vault(dir.path());
         });

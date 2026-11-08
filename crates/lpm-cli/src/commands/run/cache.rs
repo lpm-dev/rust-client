@@ -756,15 +756,28 @@ pub(super) fn try_cache_store_with_context(
     }
 }
 
+fn warn_execution_context_changed(script_name: &str, expected: &CacheContext) {
+    let script_name = lpm_common::sanitize_terminal_inline(script_name);
+    match expected
+        .input_validation
+        .first_file_also_matched_by_outputs(&expected.task_config.outputs)
+    {
+        Ok(Some(path)) => tracing::warn!(
+            "task '{script_name}' writes {}, which its cache inputs also match, so it is never reused from the cache; set `inputs` in lpm.json to leave out generated files",
+            lpm_common::sanitize_terminal_inline(&path.display().to_string())
+        ),
+        _ => tracing::warn!(
+            "task cache contract, inputs, dependencies, or runtime changed while task '{script_name}' ran; skipping cache publication"
+        ),
+    }
+}
+
 fn store_cache_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
 ) -> Result<bool, LpmError> {
     if !execution_context_is_unchanged(expected)? {
-        tracing::warn!(
-            "task cache contract, inputs, dependencies, or runtime changed while task '{}' ran; skipping cache publication",
-            request.script_name
-        );
+        warn_execution_context_changed(request.script_name, expected);
         return Ok(false);
     }
     let current = match build_task_context(

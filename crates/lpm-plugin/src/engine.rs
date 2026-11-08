@@ -821,8 +821,7 @@ async fn install_under_lock_at(
 async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
     validate_fetch_url(url, "engine tarball")?;
 
-    let client = lpm_http::client_builder()
-        .timeout(std::time::Duration::from_secs(120))
+    let client = lpm_http::artifact_download_client_builder()
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 

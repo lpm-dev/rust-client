@@ -878,7 +878,6 @@ fn start_restart_service(
             name,
             color: context.color_map.get(name).copied().unwrap_or(RESET),
             service_index,
-            shutdown_state: context.shutdown_state,
             event_tx: context.event_tx,
             endpoint_candidates: Some(endpoint_candidates.clone()),
         },

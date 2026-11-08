@@ -93,7 +93,8 @@ fn is_workspace_root(dir: &Path) -> bool {
     let pkg_json = dir.join("package.json");
     if let Ok(content) =
         lpm_common::read_text_file_capped(&pkg_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Ok(doc) =
+            serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
     {
         return doc.get("workspaces").is_some();
     }
@@ -397,6 +398,28 @@ mod tests {
         let dirs = find_bin_dirs(dir.path());
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0], bin);
+    }
+
+    #[test]
+    fn bin_discovery_stops_at_workspace_root_whose_package_json_has_a_byte_order_mark() {
+        let root = tempfile::tempdir().unwrap();
+        let outside_bin = root.path().join("node_modules/.bin");
+        let workspace = root.path().join("workspace");
+        let workspace_bin = workspace.join("node_modules/.bin");
+        let member = workspace.join("packages/app");
+        fs::create_dir_all(&outside_bin).unwrap();
+        fs::create_dir_all(&workspace_bin).unwrap();
+        fs::create_dir_all(&member).unwrap();
+        fs::write(
+            workspace.join("package.json"),
+            "\u{feff}{\"workspaces\": [\"packages/*\"]}",
+        )
+        .unwrap();
+        fs::write(member.join("package.json"), "{}").unwrap();
+
+        let dirs = find_bin_dirs(&member);
+
+        assert_eq!(dirs, vec![workspace_bin]);
     }
 
     #[test]

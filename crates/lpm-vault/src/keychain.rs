@@ -1666,6 +1666,38 @@ pub(crate) fn mutate_vault_env<T>(
     })
 }
 
+/// Keychain counterpart of `fallback::mutate_existing_vault_file_env`.
+pub(crate) fn mutate_existing_vault_env<T>(
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    env: &str,
+    operation: impl FnOnce(&mut SecretMap) -> (T, bool),
+    source: &crate::history::Source,
+) -> Result<Option<T>, String> {
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        recover_project_transaction(&mut KeychainProjectStorage)?;
+        let recording = crate::history::scope::begin(vault_id, source);
+        let mut environments =
+            read_mutation_base(&mut KeychainProjectStorage, directory, vault_id)?;
+        let Some(secrets) = environments.get_mut(env) else {
+            return Ok(None);
+        };
+        let (result, changed) = operation(secrets);
+        if changed {
+            write_all_environments_with_storage_after_recovery(
+                &mut KeychainProjectStorage,
+                vault_id,
+                project_name,
+                project_path,
+                std::borrow::Cow::Owned(environments),
+                &recording,
+            )?;
+        }
+        Ok(Some(result))
+    })
+}
+
 fn warn_if_large(size: usize) {
     if let Some(warning) = large_env_warning(size) {
         tracing::warn!("{warning}");

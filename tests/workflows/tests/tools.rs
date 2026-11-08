@@ -2175,6 +2175,30 @@ fn bench_no_runner_under_json_emits_error_envelope_on_stdout() {
     );
 }
 
+#[test]
+fn test_with_a_watching_vitest_under_json_is_rejected_instead_of_hanging() {
+    let project = TempProject::empty(
+        r#"{"name":"test-watch-json","version":"1.0.0","devDependencies":{"vitest":"3.0.0"}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "test", "--", "--watch"])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .expect("failed to run lpm --json test -- --watch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json test --watch must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"].as_str().is_some_and(
+            |error| error.contains("--watch cannot be combined with --json for lpm test")
+        ),
+        "{envelope}"
+    );
+}
+
 // ─── one-member watch IS allowed (hands off to single-package) ──
 //
 // The previous blanket reject contradicted the documented

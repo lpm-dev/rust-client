@@ -49,8 +49,24 @@ fn select_elevation_backend(
     }
 }
 
+/// The root-owned `sudo` at a fixed system path, never one found on `PATH`,
+/// where a project's `node_modules/.bin` could supply a look-alike.
+#[cfg(unix)]
+pub(crate) fn trusted_sudo() -> Option<&'static Path> {
+    match select_elevation_backend(ElevationPlatform::Unix, trusted_sudo_candidate) {
+        Some(ElevationBackend::Sudo(sudo)) => Some(Path::new(sudo)),
+        _ => None,
+    }
+}
+
+/// System directories that commands run through `sudo` are looked up in,
+/// so the caller's `PATH` can't choose what runs as root.
+#[cfg(unix)]
+pub(crate) const ROOT_COMMAND_PATH: &str =
+    "/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin";
+
 #[cfg(any(test, unix))]
-fn trusted_sudo_not_found_message(helper: &str) -> String {
+pub(crate) fn trusted_sudo_not_found_message(helper: &str) -> String {
     format!(
         "LPM CLI did not find a trusted sudo executable for the privileged {helper} helper. Candidate paths: {}",
         TRUSTED_SUDO_PATHS.join(", ")

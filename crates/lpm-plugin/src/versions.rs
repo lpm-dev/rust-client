@@ -23,7 +23,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 const GITHUB_API_BASE_ENV: &str = "LPM_PLUGIN_GITHUB_API_BASE";
-const GITHUB_API_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
+/// A release list page of 100 is about 5 MB for repositories with long
+/// release notes and many assets, such as `biomejs/biome`.
+const GITHUB_API_RESPONSE_CAP_BYTES: usize = 16 * 1024 * 1024;
+/// GitHub's largest page: unauthenticated callers get 60 requests an hour,
+/// so each page should carry as many releases as it can.
+const GITHUB_RELEASES_PER_PAGE: u32 = 100;
 
 #[derive(Debug, serde::Deserialize)]
 struct GithubRelease {
@@ -279,7 +284,8 @@ async fn peek_latest_from_github_at(
         url.push_str(&owner);
         url.push('/');
         url.push_str(&repo);
-        url.push_str("/releases?per_page=20");
+        write!(url, "/releases?per_page={GITHUB_RELEASES_PER_PAGE}")
+            .expect("writing to a String cannot fail");
         if page > 1 {
             write!(url, "&page={page}").expect("writing to a String cannot fail");
         }

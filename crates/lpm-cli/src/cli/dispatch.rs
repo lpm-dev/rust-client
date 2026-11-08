@@ -343,15 +343,18 @@ async fn async_main(cli: Cli) -> Result<()> {
     // block that lived here pre-existing is gone.
     //
     let explicit_flag_token = cli.token.clone();
-    let session_registry_url = match &command {
+    let session_registry_url: std::borrow::Cow<'_, str> = match &command {
         Commands::Setup(args) => match &args.action {
             SetupAction::Ci {
                 registry: Some(registry),
                 ..
-            } => registry.as_str(),
-            _ => registry_url,
+            } => commands::npmrc::setup_registry_service_base(registry).map_or(
+                std::borrow::Cow::Borrowed(registry.as_str()),
+                std::borrow::Cow::Owned,
+            ),
+            _ => registry_url.into(),
         },
-        _ => registry_url,
+        _ => registry_url.into(),
     };
     let session_manager =
         lpm_auth::SessionManager::new(session_registry_url.to_string(), explicit_flag_token);

@@ -2028,6 +2028,99 @@ fn wait_for_task_marker(
 }
 
 #[test]
+fn run_in_a_member_ignores_a_sibling_member_with_a_broken_manifest() {
+    let project = TempProject::empty(
+        r#"{"name":"broken-sibling-root","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","scripts":{"hello":"node -e \"console.log('hello-from-app')\""}}"#,
+    );
+    project.write_file("packages/broken/package.json", "{ not json");
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .args(["run", "hello"])
+        .output()
+        .expect("run a member script");
+
+    assert!(
+        output.status.success(),
+        "a sibling's broken manifest stopped an unrelated run\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("hello-from-app"));
+}
+
+fn counting_build_project(name: &str, outputs: &str, output_file: &str) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"{name}","version":"1.0.0","scripts":{{"build":"node build.js"}}}}"#
+    ));
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"tasks":{{"build":{{"cache":true,"outputs":{outputs}}}}}}}"#),
+    );
+    project.write_file("src/index.ts", "export const value = 1;\n");
+    project.write_file(
+        "build.js",
+        &format!(
+            r#"const fs = require('fs');
+const path = require('path');
+fs.mkdirSync(path.dirname('{output_file}'), {{recursive: true}});
+fs.writeFileSync('{output_file}', 'built ' + Date.now());
+fs.appendFileSync('runs.log', 'run\n');"#
+        ),
+    );
+    project
+}
+
+fn run_build_task(project: &TempProject) -> String {
+    let output = lpm(project)
+        .args(["run", "build"])
+        .output()
+        .expect("run cached build task");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "build failed:\n{combined}");
+    combined
+}
+
+#[test]
+fn task_with_default_inputs_is_reused_from_cache_when_it_writes_to_a_default_input_tree() {
+    let project =
+        counting_build_project("default-input-output-tree", r#"["lib/**"]"#, "lib/index.js");
+
+    run_build_task(&project);
+    let second = run_build_task(&project);
+
+    assert_eq!(
+        project.read_file("runs.log"),
+        "run\n",
+        "second run must be restored from the cache:\n{second}"
+    );
+    assert!(project.read_file("lib/index.js").starts_with("built "));
+}
+
+#[test]
+fn task_whose_outputs_overlap_its_inputs_names_the_overlapping_file() {
+    let project = counting_build_project(
+        "input-output-overlap",
+        r#"["src/generated/**"]"#,
+        "src/generated/value.js",
+    );
+
+    let first = run_build_task(&project);
+
+    assert!(
+        first.contains("writes src/generated/value.js, which its cache inputs also match"),
+        "overlap warning must name the generated file:\n{first}"
+    );
+}
+
+#[test]
 fn successful_task_remains_successful_when_cache_publication_fails() {
     let project = TempProject::empty(
         r#"{

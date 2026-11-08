@@ -1956,6 +1956,47 @@ async fn http_frontend_forwards_any_local_host_to_the_resolved_upstream() {
 }
 
 #[tokio::test]
+async fn http_proxy_keeps_the_declared_length_of_a_head_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 12345\r\ncontent-type: application/zip\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = stream.read(&mut request).await;
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let frontend = start_http_frontend_on_listener(
+        listener,
+        lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, upstream_port),
+    )
+    .unwrap();
+
+    let response = reqwest::Client::new()
+        .head(format!("http://127.0.0.1:{}/archive.zip", frontend.port()))
+        .header("host", "localhost")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some("12345")
+    );
+    frontend.shutdown();
+}
+
+#[tokio::test]
 async fn http_proxy_times_out_when_upstream_never_sends_response_headers() {
     use tokio::io::AsyncReadExt;
 
@@ -2217,13 +2258,26 @@ async fn http_redirect_rewrites_registered_host_to_https_without_open_redirect()
         .await
         .unwrap();
 
-    assert_eq!(response.status(), reqwest::StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(
         response
             .headers()
             .get(reqwest::header::LOCATION)
             .and_then(|value| value.to_str().ok()),
         Some("https://app.localhost:9443/hello?x=1")
+    );
+
+    let posted = client
+        .post(format!("http://127.0.0.1:{}/submit", redirect.port()))
+        .header("host", "app.localhost")
+        .body("form=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        posted.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT,
+        "a redirected POST must keep its method, and a browser must not cache the HTTPS port"
     );
 
     let unknown = client

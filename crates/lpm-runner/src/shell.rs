@@ -186,10 +186,12 @@ impl Drop for StopSignalRegistrations {
 pub(crate) fn register_stop_signals(
     stop_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<StopSignalRegistrations, LpmError> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
-    let mut registrations = StopSignalRegistrations(Vec::with_capacity(2));
-    for signal in [SIGINT, SIGTERM] {
+    // The server runs in its own process group, so a closed terminal's SIGHUP
+    // reaches only LPM CLI, which must stop the server rather than exit.
+    let mut registrations = StopSignalRegistrations(Vec::with_capacity(4));
+    for signal in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
         let registration =
             signal_hook::flag::register(signal, std::sync::Arc::clone(stop_requested)).map_err(
                 |error| LpmError::Script(format!("failed to install dev signal handlers: {error}")),
@@ -256,9 +258,33 @@ pub(crate) fn spawn_shell_cancellable(
     }
 }
 
+/// How long a launched dev server has to open its endpoint, and what happens
+/// when it doesn't.
+#[derive(Clone, Copy, Debug)]
+pub struct EndpointDiscovery {
+    pub timeout: std::time::Duration,
+    /// Whether the session needs the endpoint, for HTTPS, network access, a
+    /// tunnel, or a proxy route. A server that opens none in time is then
+    /// stopped. Otherwise discovery just stops looking, and a server that
+    /// never listens, such as `tsc --watch`, keeps running.
+    pub required: bool,
+}
+
+impl EndpointDiscovery {
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub const fn required(required: bool) -> Self {
+        Self {
+            timeout: Self::DEFAULT_TIMEOUT,
+            required,
+        }
+    }
+}
+
 pub fn spawn_shell_with_endpoint(
     cmd: &ShellCommand,
     requested_port: Option<u16>,
+    discovery: EndpointDiscovery,
     stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_endpoint: EndpointResultCallback,
     on_shutdown_started: Option<crate::ShutdownStartedCallback>,
@@ -266,6 +292,7 @@ pub fn spawn_shell_with_endpoint(
     spawn_shell_with_endpoint_using(
         cmd,
         requested_port,
+        discovery,
         stop_requested,
         on_endpoint,
         on_shutdown_started,
@@ -276,6 +303,7 @@ pub fn spawn_shell_with_endpoint(
 fn spawn_shell_with_endpoint_using<T>(
     cmd: &ShellCommand,
     requested_port: Option<u16>,
+    discovery: EndpointDiscovery,
     stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_endpoint: EndpointResultCallback,
     mut on_shutdown_started: Option<crate::ShutdownStartedCallback>,
@@ -287,9 +315,12 @@ where
     #[cfg(unix)]
     let _stop_signal_registrations = register_stop_signals(&stop_requested)?;
     let mut command = shell_process(cmd.command)?;
+    // The server runs in its own process group, outside the terminal's
+    // foreground group, where switching the terminal to raw mode for key
+    // shortcuts would stop it with `SIGTTOU`. It gets no terminal input.
     command
         .current_dir(cmd.cwd)
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     strip_inherited_env_hooks(&mut command);
@@ -325,6 +356,7 @@ where
     // on a fresh descendant walk from the original shell.
     let resolved_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<DevEndpoint>));
     let resolver_owner = std::sync::Arc::clone(&resolved_owner);
+    let deadline = std::time::Instant::now() + discovery.timeout;
     let resolver_handle = std::thread::spawn(move || {
         let result = crate::dev_endpoint::resolve_spawned_endpoint_until(
             &resolver_project_dir,
@@ -332,7 +364,7 @@ where
             None,
             requested_port,
             &candidate_rx,
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            deadline,
             || {
                 resolver_child_exited.load(std::sync::atomic::Ordering::Acquire)
                     || resolver_stop_requested.load(std::sync::atomic::Ordering::Acquire)
@@ -340,6 +372,10 @@ where
         );
         let result = match result {
             Err(error) if error == crate::dev_endpoint::ENDPOINT_DISCOVERY_CANCELLED => Ok(None),
+            Err(error) if !discovery.required && std::time::Instant::now() >= deadline => {
+                tracing::debug!("dev server endpoint discovery stopped: {error}");
+                Ok(None)
+            }
             result => result,
         };
         if result.is_err() {
@@ -1277,6 +1313,53 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    fn run_without_listening(required: bool) -> (ExitStatus, Result<Option<DevEndpoint>, String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
+
+        let status = spawn_shell_with_endpoint(
+            &ShellCommand {
+                command: "sleep 1; exit 0",
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            EndpointDiscovery {
+                timeout: std::time::Duration::from_millis(200),
+                required,
+            },
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Box::new(move |result| {
+                let _ = endpoint_tx.send(result);
+            }),
+            None,
+        )
+        .unwrap();
+        (status, endpoint_rx.recv().unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_server_that_never_listens_keeps_running_when_no_endpoint_is_needed() {
+        let (status, endpoint) = run_without_listening(false);
+
+        assert!(status.success(), "the server was stopped: {status:?}");
+        assert!(matches!(endpoint, Ok(None)), "{endpoint:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_server_that_never_listens_is_stopped_when_the_endpoint_is_needed() {
+        let (status, endpoint) = run_without_listening(true);
+
+        assert!(!status.success(), "the server kept running: {status:?}");
+        assert!(endpoint.is_err(), "{endpoint:?}");
+    }
+
     #[test]
     fn endpoint_aware_shell_cleans_background_pipe_holders_after_the_shell_exits() {
         let dir = tempfile::tempdir().unwrap();
@@ -1292,6 +1375,7 @@ mod tests {
                 envs: &envs,
             },
             None,
+            EndpointDiscovery::required(true),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Box::new(|_| {}),
             None,
@@ -1338,6 +1422,7 @@ mod tests {
                 envs: &envs,
             },
             None,
+            EndpointDiscovery::required(true),
             stop_requested,
             Box::new(|_| {}),
             Some(Box::new(move || {
@@ -1392,6 +1477,7 @@ mod tests {
                 envs: &envs,
             },
             None,
+            EndpointDiscovery::required(true),
             stop_requested,
             Box::new(|_| {}),
             Some(Box::new(|| {

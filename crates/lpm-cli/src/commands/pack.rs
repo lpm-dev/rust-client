@@ -378,16 +378,7 @@ async fn pack_workspace(
         return Ok(());
     }
     let (mut unmet, mut ready) = selected_schedule_state(&graph, &targets)?;
-    let mut result_order = vec![0; graph.len()];
-    for (order, index) in graph
-        .topological_levels()
-        .map_err(|error| LpmError::Script(error.to_string()))?
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        result_order[index] = order;
-    }
+    let result_order = result_order(&graph);
     let runtimes = InstalledRuntimes::new(&workspace.root)?;
     let mut prepared = Vec::with_capacity(graph.len());
     for (index, member) in graph.members.iter().enumerate() {
@@ -535,4 +526,17 @@ fn emit_human_summary(
             "{tool}: {succeeded} passed, {failed} failed out of {total} packages in {duration}"
         ));
     }
+}
+
+/// Each member's position in the JSON envelope: workspace dependency order.
+/// A cycle among members the selection leaves out has no such order, and
+/// must not fail the run, so those workspaces list members in workspace order.
+fn result_order(graph: &lpm_task::graph::WorkspaceGraph) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..graph.len()).collect();
+    if let Ok(levels) = graph.topological_levels() {
+        for (position, index) in levels.into_iter().flatten().enumerate() {
+            order[index] = position;
+        }
+    }
+    order
 }

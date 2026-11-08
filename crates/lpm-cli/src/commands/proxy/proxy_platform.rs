@@ -6,12 +6,21 @@ use super::proxy_service::{
     reject_conflicting_privileged_forwarder_owner, reject_removing_foreign_privileged_forwarder,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::root_fs::write_root_file;
+use super::root_fs::{privileged_command, write_root_file};
 use lpm_common::LpmError;
 use std::path::Path;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 use std::process::Command;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn trusted_sudo() -> Result<&'static Path, LpmError> {
+    crate::elevation::trusted_sudo().ok_or_else(|| {
+        LpmError::Script(crate::elevation::trusted_sudo_not_found_message(
+            "proxy forwarder",
+        ))
+    })
+}
 
 #[cfg(target_os = "macos")]
 pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
@@ -119,7 +128,7 @@ pub(super) fn install_privileged_forwarder_platform(
         spec.config.target_uid,
         spec.replace_existing,
     )?;
-    let sudo = Path::new("sudo");
+    let sudo = trusted_sudo()?;
     install_forwarder_executable(&spec.executable, sudo)?;
     write_root_file(
         sudo,
@@ -143,6 +152,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
     spec: &PrivilegedForwarderSpec,
 ) -> Result<(), LpmError> {
     reject_removing_foreign_privileged_forwarder(&spec.config_path, spec.config.target_uid)?;
+    let sudo = trusted_sudo()?;
     let unit = linux_systemd_unit_name(spec.label);
     let state = run_checked_output(Command::new("systemctl").args([
         "show",
@@ -151,22 +161,27 @@ pub(super) fn uninstall_privileged_forwarder_platform(
         &unit,
     ]))?;
     if String::from_utf8_lossy(&state.stdout).trim() != "not-found" {
-        run_checked_inherited(Command::new("sudo").args(["systemctl", "disable", "--now", &unit]))?;
+        run_checked_inherited(privileged_command(sudo).args([
+            "systemctl",
+            "disable",
+            "--now",
+            &unit,
+        ]))?;
     }
     run_checked_inherited(
-        Command::new("sudo")
+        privileged_command(sudo)
             .arg("rm")
             .arg("-f")
             .arg(&spec.service_path),
     )?;
     run_checked_inherited(
-        Command::new("sudo")
+        privileged_command(sudo)
             .arg("rm")
             .arg("-f")
             .arg(&spec.config_path),
     )?;
-    run_checked_inherited(Command::new("sudo").args(["systemctl", "daemon-reload"]))?;
-    uninstall_forwarder_executable(spec.executable.install_dir(), Path::new("sudo"))
+    run_checked_inherited(privileged_command(sudo).args(["systemctl", "daemon-reload"]))?;
+    uninstall_forwarder_executable(spec.executable.install_dir(), sudo)
 }
 
 #[cfg(target_os = "macos")]
@@ -178,7 +193,7 @@ pub(super) fn install_privileged_forwarder_platform(
         spec.config.target_uid,
         spec.replace_existing,
     )?;
-    let sudo = Path::new("sudo");
+    let sudo = trusted_sudo()?;
     install_forwarder_executable(&spec.executable, sudo)?;
     write_root_file(
         sudo,
@@ -195,14 +210,14 @@ pub(super) fn install_privileged_forwarder_platform(
         "0644",
     )?;
     let target = macos_system_launchctl_target(spec.label);
-    run_macos_bootout(Command::new("sudo").args(["launchctl", "bootout", &target]))?;
+    run_macos_bootout(privileged_command(sudo).args(["launchctl", "bootout", &target]))?;
     run_checked_inherited(
-        Command::new("sudo")
+        privileged_command(sudo)
             .args(["launchctl", "bootstrap", "system"])
             .arg(&spec.service_path),
     )?;
-    run_checked_inherited(Command::new("sudo").args(["launchctl", "enable", &target]))?;
-    run_checked_inherited(Command::new("sudo").args(["launchctl", "kickstart", "-k", &target]))
+    run_checked_inherited(privileged_command(sudo).args(["launchctl", "enable", &target]))?;
+    run_checked_inherited(privileged_command(sudo).args(["launchctl", "kickstart", "-k", &target]))
 }
 
 #[cfg(target_os = "macos")]
@@ -210,21 +225,22 @@ pub(super) fn uninstall_privileged_forwarder_platform(
     spec: &PrivilegedForwarderSpec,
 ) -> Result<(), LpmError> {
     reject_removing_foreign_privileged_forwarder(&spec.config_path, spec.config.target_uid)?;
+    let sudo = trusted_sudo()?;
     let target = macos_system_launchctl_target(spec.label);
-    run_macos_bootout(Command::new("sudo").args(["launchctl", "bootout", &target]))?;
+    run_macos_bootout(privileged_command(sudo).args(["launchctl", "bootout", &target]))?;
     run_checked_inherited(
-        Command::new("sudo")
+        privileged_command(sudo)
             .arg("rm")
             .arg("-f")
             .arg(&spec.service_path),
     )?;
     run_checked_inherited(
-        Command::new("sudo")
+        privileged_command(sudo)
             .arg("rm")
             .arg("-f")
             .arg(&spec.config_path),
     )?;
-    uninstall_forwarder_executable(spec.executable.install_dir(), Path::new("sudo"))
+    uninstall_forwarder_executable(spec.executable.install_dir(), sudo)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -664,9 +680,17 @@ pub(super) fn systemd_path_value(path: &Path) -> String {
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn install_linux_forwarder_unit(program: &Path, unit: &str) -> Result<(), LpmError> {
-    run_checked_inherited(Command::new(program).args(["systemctl", "daemon-reload"]))?;
-    run_checked_inherited(Command::new(program).args(["systemctl", "enable", unit]))?;
-    run_checked_inherited(Command::new(program).args(["systemctl", "restart", unit]))?;
+    let systemctl = |args: &[&str]| {
+        let mut command = Command::new(program);
+        command
+            .env("PATH", crate::elevation::ROOT_COMMAND_PATH)
+            .arg("systemctl")
+            .args(args);
+        command
+    };
+    run_checked_inherited(&mut systemctl(&["daemon-reload"]))?;
+    run_checked_inherited(&mut systemctl(&["enable", unit]))?;
+    run_checked_inherited(&mut systemctl(&["restart", unit]))?;
     Ok(())
 }
 

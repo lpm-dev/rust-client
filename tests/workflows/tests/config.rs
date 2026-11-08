@@ -582,6 +582,61 @@ fn config_set_signatures_true_persists_boolean() {
 }
 
 #[test]
+fn generic_config_set_rejects_non_boolean_auto_build_and_security_summary_values() {
+    for key in ["autoBuild", "noSecuritySummary"] {
+        let project = TempProject::empty(r#"{"name":"config-bools","version":"1.0.0"}"#);
+
+        let rejected = lpm(&project)
+            .args(["config", "set", key, "ture"])
+            .output()
+            .expect("failed to run lpm config set");
+        let accepted = lpm(&project)
+            .args(["config", "set", key, "true"])
+            .output()
+            .expect("failed to run lpm config set");
+
+        assert!(
+            !rejected.status.success(),
+            "`{key} = ture` must be rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains(&format!("invalid value for configuration key `{key}`")),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(
+            accepted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+    }
+}
+
+#[test]
+fn config_get_json_reports_a_saved_datetime_as_its_toml_text() {
+    let project = TempProject::empty(r#"{"name":"config-datetime","version":"1.0.0"}"#);
+    seed_config(&project, "custom-stamp = 1979-05-27T07:32:00Z\n");
+
+    let output = lpm(&project)
+        .args(["--json", "config", "get", "custom-stamp"])
+        .output()
+        .expect("failed to run lpm config get");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["value"],
+        serde_json::json!("1979-05-27T07:32:00Z"),
+        "{envelope}"
+    );
+}
+
+#[test]
 fn config_get_signatures_json_returns_boolean() {
     let project = TempProject::empty(r#"{"name":"config-signatures","version":"1.0.0"}"#);
     seed_config(&project, "signatures = true\n");

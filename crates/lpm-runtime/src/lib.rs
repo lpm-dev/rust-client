@@ -106,10 +106,7 @@ impl RuntimeInstallContext {
             return None;
         }
         if self.http_client.is_none() {
-            match lpm_http::client_builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-            {
+            match lpm_http::artifact_download_client_builder().build() {
                 Ok(client) => self.http_client = Some(client),
                 Err(e) => {
                     tracing::warn!("failed to create HTTP client for runtime install: {e}");
