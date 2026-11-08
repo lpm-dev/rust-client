@@ -1852,18 +1852,37 @@ impl PackageAnalyzer {
         };
 
         let mut tests = TagTotals::default();
-        for result in std::mem::take(&mut self.tests) {
-            if references.name(&result.path) {
+        let test_results = std::mem::take(&mut self.tests);
+        let native_artifacts = std::mem::take(&mut self.native_artifacts);
+        let test_addons: Vec<&str> = native_artifacts
+            .iter()
+            .map(String::as_str)
+            .filter(|path| roles::is_test_path(path))
+            .collect();
+        let queried: Vec<&str> = test_results
+            .iter()
+            .map(|result| result.path.as_str())
+            .chain(test_addons.iter().copied())
+            .collect();
+        let named = references.names(&queried);
+        let (named_results, named_addons) = named.split_at(test_results.len());
+        let named_addons: std::collections::HashMap<&str, bool> = test_addons
+            .iter()
+            .copied()
+            .zip(named_addons.iter().copied())
+            .collect();
+        for (result, named) in test_results.into_iter().zip(named_results.iter().copied()) {
+            if named {
                 self.runtime.add(result);
             } else {
                 tests.add(result);
             }
         }
-        for path in std::mem::take(&mut self.native_artifacts) {
-            if roles::is_test_path(&path) && !references.name(&path) {
-                tests.add_native_artifact(&path);
+        for path in &native_artifacts {
+            if named_addons.get(path.as_str()) == Some(&false) {
+                tests.add_native_artifact(path);
             } else {
-                self.runtime.add_native_artifact(&path);
+                self.runtime.add_native_artifact(path);
             }
         }
 
@@ -2688,6 +2707,32 @@ mod tests {
 
         assert!(result.source.eval);
         assert_eq!(result.unparsed_files, 0);
+    }
+
+    #[test]
+    fn test_files_are_matched_against_the_manifest_in_one_pass() {
+        // Each test file and test-path addon searched every manifest
+        // reference for its path: 5,000 addons against a 16 MiB manifest
+        // took minutes.
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "main": "test/".repeat(200_000),
+        }))
+        .unwrap();
+        let finish = |addons: usize| {
+            let mut analyzer = PackageAnalyzer::default();
+            for index in 0..addons {
+                analyzer.note_native_artifact(format!("test/a{index}.node"));
+            }
+            let started = std::time::Instant::now();
+            let analysis = analyzer.finish(Some(&manifest));
+            (started.elapsed(), analysis)
+        };
+        let (one, _) = finish(1);
+        let (many, _) = finish(5_000);
+        assert!(
+            many < one * 5 + std::time::Duration::from_millis(100),
+            "5,000 addons {many:?}, one {one:?}"
+        );
     }
 
     #[test]
