@@ -42,6 +42,13 @@ impl Platform {
         Ok(Platform { os, arch })
     }
 
+    /// Why Node.js can't be installed on this host, if it can't: nodejs.org
+    /// publishes glibc builds only, which can't run on musl systems such as
+    /// Alpine.
+    pub fn node_unavailable_reason(&self) -> Option<&'static str> {
+        node_unavailable_reason_for(lpm_common::platform::detect_libc())
+    }
+
     /// Node.js distribution filename suffix.
     /// e.g., "darwin-arm64", "linux-x64", "win-x64"
     pub fn node_suffix(&self) -> String {
@@ -116,9 +123,22 @@ fn detect_avx2() -> bool {
     }
 }
 
+pub(crate) fn node_unavailable_reason_for(libc: Option<&str>) -> Option<&'static str> {
+    (libc == Some("musl")).then_some(
+        "nodejs.org publishes no Node.js build for musl libc (Alpine); install Node with the system package manager, for example `apk add nodejs`",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_is_unavailable_on_musl_hosts_only() {
+        assert!(node_unavailable_reason_for(Some("musl")).is_some());
+        assert!(node_unavailable_reason_for(Some("glibc")).is_none());
+        assert!(node_unavailable_reason_for(None).is_none());
+    }
 
     #[test]
     fn current_platform_succeeds_on_known_os() {

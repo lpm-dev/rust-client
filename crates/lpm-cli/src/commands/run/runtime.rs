@@ -27,10 +27,36 @@ pub async fn prepare_runtime(
     project_dir: &Path,
     json_output: bool,
 ) -> Result<ManagedRuntimeHint, LpmError> {
-    let detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+    let detected = detect_runtime_selectors_with_workspace_root(project_dir)?;
     let hint = ensure_detected_runtimes(detected).await;
     validate_runtime(project_dir, &hint, json_output)?;
     Ok(hint)
+}
+
+/// The project's runtime selectors, with the workspace root's selector for
+/// each runtime the project doesn't select itself: workspace members inherit
+/// root pins. Both are read before anything installs, so a root runtime the
+/// member overrides is never downloaded.
+fn detect_runtime_selectors_with_workspace_root(
+    project_dir: &Path,
+) -> Result<Vec<lpm_runtime::detect::DetectedRuntimeVersion>, LpmError> {
+    let mut detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+    let Some(root) = lpm_workspace::find_workspace_root(project_dir)
+        .ok()
+        .flatten()
+        .filter(|root| root != project_dir)
+    else {
+        return Ok(detected);
+    };
+    for inherited in lpm_runtime::detect::detect_runtime_versions(&root)? {
+        let selected_here = detected
+            .iter()
+            .any(|own| own.runtime == inherited.runtime && own.is_runtime_selector());
+        if inherited.is_runtime_selector() && !selected_here {
+            detected.push(inherited);
+        }
+    }
+    Ok(detected)
 }
 
 /// Validate the Node resolved from the exact PATH constructed for scripts.
@@ -176,5 +202,70 @@ pub async fn ensure_detected_runtimes(
     match bin_dirs.len() {
         0 => ManagedRuntimeHint::Absent,
         _ => ManagedRuntimeHint::Resolved(bin_dirs),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_with_root_pins(root_pins: &str, member_pins: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("lpm.json"), root_pins).unwrap();
+        let member = dir.path().join("packages/web");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"web"}"#).unwrap();
+        if let Some(pins) = member_pins {
+            std::fs::write(member.join("lpm.json"), pins).unwrap();
+        }
+        dir
+    }
+
+    fn selected_specs(project: &Path) -> Vec<(lpm_runtime::detect::RuntimeKind, String)> {
+        let mut specs: Vec<_> = detect_runtime_selectors_with_workspace_root(project)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.is_runtime_selector())
+            .map(|entry| (entry.runtime, entry.spec))
+            .collect();
+        specs.sort_by_key(|(runtime, _)| format!("{runtime:?}"));
+        specs
+    }
+
+    #[test]
+    fn a_member_inherits_the_workspace_root_runtime_pins() {
+        let dir = workspace_with_root_pins(r#"{"runtime":{"node":"22.12.0"}}"#, None);
+
+        assert_eq!(
+            selected_specs(&dir.path().join("packages/web")),
+            vec![(
+                lpm_runtime::detect::RuntimeKind::Node,
+                "22.12.0".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_member_pin_overrides_only_its_own_runtime() {
+        let dir = workspace_with_root_pins(
+            r#"{"runtime":{"node":"22.12.0","bun":"1.2.0"}}"#,
+            Some(r#"{"runtime":{"node":"20.18.0"}}"#),
+        );
+
+        assert_eq!(
+            selected_specs(&dir.path().join("packages/web")),
+            vec![
+                (lpm_runtime::detect::RuntimeKind::Bun, "1.2.0".to_string()),
+                (
+                    lpm_runtime::detect::RuntimeKind::Node,
+                    "20.18.0".to_string()
+                ),
+            ]
+        );
     }
 }

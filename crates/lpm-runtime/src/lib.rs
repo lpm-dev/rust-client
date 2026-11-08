@@ -155,6 +155,21 @@ async fn ensure_one_runtime(
 
     let clean_spec = clean_lookup_spec(runtime, spec);
 
+    // A glibc build installed here, by an earlier release or a shared home
+    // directory, would sit first on PATH and fail every script.
+    if runtime == detect::RuntimeKind::Node
+        && let Some(reason) = install_context
+            .platform()
+            .and_then(platform::Platform::node_unavailable_reason)
+    {
+        tracing::warn!("not using a managed Node.js runtime: {reason}");
+        return RuntimeStatus::NotInstalled {
+            runtime,
+            spec: clean_spec,
+            source,
+        };
+    }
+
     if let Ok(installed) = list_installed(runtime)
         && let Some(version) = find_matching_installed(runtime, spec, &installed)
         && let Ok(bin_dir) = bin_dir(runtime, &version)

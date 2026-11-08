@@ -130,7 +130,7 @@ pub async fn refresh_cache_now() {
         Ok(home) => home,
         Err(_) => return,
     };
-    let Some(mut refresh) = prepare_background_refresh(&account_home) else {
+    let Some(refresh) = prepare_background_refresh(&account_home) else {
         return;
     };
 
@@ -142,25 +142,41 @@ pub async fn refresh_cache_now() {
     //
     // npm registry is the primary source; GitHub Releases is the
     // fallback. See `release_lookup::probe_release` for cascade rules.
-    let _ = probe_release(channel, &mut refresh.cache).await;
-    let _ = write_cache_at(&refresh.path, &refresh.cache);
+    let mut probed = refresh.cache.clone();
+    let _ = probe_release(channel, &mut probed).await;
+    publish_background_refresh(&account_home, &refresh, &probed);
 }
 
 struct BackgroundRefresh {
     path: std::path::PathBuf,
     cache: crate::release_lookup::UpdateCache,
-    _operation_lock: lpm_common::SingleFileExclusiveLockHandle,
 }
 
+/// Reads the cache a background refresh starts from, or `None` while a
+/// self-update runs: it writes the cache itself. The self-update lock is not
+/// held through the probe, which can take 20 seconds, so `lpm self-update`
+/// run right after the update notice doesn't find the lock taken.
 fn prepare_background_refresh(account_home: &Path) -> Option<BackgroundRefresh> {
-    let operation_lock = try_acquire_self_update_lock(account_home).ok().flatten()?;
+    let _operation_lock = try_acquire_self_update_lock(account_home).ok().flatten()?;
     let path = account_home.join(".lpm").join("update-check.json");
     let cache = read_cache_at(&path).unwrap_or_default();
-    Some(BackgroundRefresh {
-        path,
-        cache,
-        _operation_lock: operation_lock,
-    })
+    Some(BackgroundRefresh { path, cache })
+}
+
+/// Writes a background probe's result under the self-update lock, unless a
+/// self-update holds it or wrote the cache since the refresh read it.
+fn publish_background_refresh(
+    account_home: &Path,
+    refresh: &BackgroundRefresh,
+    probed: &crate::release_lookup::UpdateCache,
+) {
+    let Some(_operation_lock) = try_acquire_self_update_lock(account_home).ok().flatten() else {
+        return;
+    };
+    if read_cache_at(&refresh.path).unwrap_or_default() != refresh.cache {
+        return;
+    }
+    let _ = write_cache_at(&refresh.path, probed);
 }
 
 fn format_notice(current: &str, latest: &str) -> String {
@@ -263,6 +279,41 @@ mod tests {
     }
 
     #[test]
+    fn a_self_update_can_start_while_a_background_refresh_probes() {
+        let account_home = tempfile::tempdir().unwrap();
+        let account_home = std::fs::canonicalize(account_home.path()).unwrap();
+
+        let _refresh = prepare_background_refresh(&account_home).unwrap();
+
+        assert!(
+            crate::commands::self_update::try_acquire_self_update_lock(&account_home)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_background_refresh_does_not_overwrite_a_cache_written_during_its_probe() {
+        let account_home = tempfile::tempdir().unwrap();
+        let account_home = std::fs::canonicalize(account_home.path()).unwrap();
+        let refresh = prepare_background_refresh(&account_home).unwrap();
+        let mut written_meanwhile = refresh.cache.clone();
+        written_meanwhile.record_success_for(ReleaseChannel::Stable, "1.0.0".into(), 1_700_000_300);
+        write_cache_at(&refresh.path, &written_meanwhile).unwrap();
+        let mut probed = refresh.cache.clone();
+        probed.record_success_for(ReleaseChannel::Stable, "0.9.0".into(), 1_700_000_200);
+
+        publish_background_refresh(&account_home, &refresh, &probed);
+
+        assert_eq!(
+            read_cache_at(&refresh.path)
+                .unwrap()
+                .latest_for(ReleaseChannel::Stable),
+            "1.0.0"
+        );
+    }
+
+    #[test]
     fn background_refresh_preserves_the_other_release_channel_fields() {
         let account_home = tempfile::tempdir().unwrap();
         let account_home = std::fs::canonicalize(account_home.path()).unwrap();
@@ -283,12 +334,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut refresh = prepare_background_refresh(&account_home).unwrap();
-        refresh
-            .cache
-            .record_success_for(ReleaseChannel::Stable, "0.74.2".into(), 1_700_000_200);
-        write_cache_at(&refresh.path, &refresh.cache).unwrap();
-        drop(refresh);
+        let refresh = prepare_background_refresh(&account_home).unwrap();
+        let mut probed = refresh.cache.clone();
+        probed.record_success_for(ReleaseChannel::Stable, "0.74.2".into(), 1_700_000_200);
+        publish_background_refresh(&account_home, &refresh, &probed);
         let persisted = read_cache_at(&cache_path).unwrap();
         let persisted_json = serde_json::to_value(&persisted).unwrap();
 
