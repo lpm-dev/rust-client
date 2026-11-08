@@ -89,7 +89,12 @@ impl TaskRunReport {
 }
 
 pub(super) fn print_task_result(result: &TaskResult) {
-    let name = lpm_common::sanitize_terminal_inline(&result.name);
+    print_task_result_as(result, &result.name);
+}
+
+/// Prints `result` under `label`, such as `member:task` in a workspace run.
+pub(super) fn print_task_result_as(result: &TaskResult, label: &str) {
+    let name = lpm_common::sanitize_terminal_inline(label);
     if result.skipped {
         install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}   {}",

@@ -268,6 +268,7 @@ fn execute_single_package_task_plan(
             pkg_scripts,
             &initially_failed_tasks,
             session,
+            None,
         )
     } else {
         // Sequential: run tasks in topological order (deps before dependents)

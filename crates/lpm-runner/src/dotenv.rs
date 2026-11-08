@@ -787,7 +787,12 @@ pub(crate) fn load_project_env_layers(
         );
     }
 
-    let (vault_vars, overrides) = crate::env_access::read(|| match policy {
+    let read_key = crate::env_access::VaultReadKey {
+        project_dir: project_dir.to_path_buf(),
+        env_name: env_name.map(ToOwned::to_owned),
+        with_overrides: matches!(policy, OverridePolicy::Apply),
+    };
+    let (vault_vars, overrides) = crate::env_access::read_vault(read_key, || match policy {
         OverridePolicy::Apply => lpm_vault::try_get_run_environment(project_dir, env_name)
             .map(|run| (run.values, run.overrides)),
         OverridePolicy::Exclude => match env_name {

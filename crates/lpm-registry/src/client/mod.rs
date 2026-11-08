@@ -92,7 +92,7 @@ use self::projection::{ProjectionFacts, ProjectionSource};
 #[cfg(test)]
 use self::state::CacheContent;
 use self::state::{
-    CacheValidator, CachedClient, MetadataCacheEntry, MetadataCacheMutation,
+    CacheValidator, CachedClient, DefaultClient, MetadataCacheEntry, MetadataCacheMutation,
     MetadataCommandCachePolicy, MetadataMemoryEntry, TlsMaterialBudget,
 };
 use self::state::{LazyIdentityCert, LazyIdentityMaterial, MAX_NPMRC_TLS_CLIENT_SETS};

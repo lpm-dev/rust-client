@@ -6,7 +6,8 @@ use super::cache::{
 use super::format::{
     TaskOutputPolicy, TaskResult, TaskRunReport, format_failed_task_output_footer,
     format_failed_task_output_header, format_run_failure_detail, print_captured_stderr,
-    print_json_summary, print_results_summary, print_task_result, print_task_stdout, task_failure,
+    print_json_summary, print_results_summary, print_task_result_as, print_task_stdout,
+    task_failure,
 };
 use super::task::{is_meta_task, run_task, run_task_captured_with_reserved_stdout};
 use crate::install_ui;
@@ -66,7 +67,15 @@ pub(super) fn run_tasks_parallel(
     pkg_scripts: Option<&HashMap<String, String>>,
     initially_failed_tasks: &HashSet<String>,
     session: Option<Arc<lpm_auth::SessionManager>>,
+    prefix_scope: Option<&str>,
 ) -> Result<TaskRunReport, LpmError> {
+    // Workspace members name their tasks `member:task` in prefixes and
+    // results, since members running at once can share task names.
+    let label = |name: &str| match prefix_scope {
+        Some(scope) => format!("{scope}:{name}"),
+        None => name.to_owned(),
+    };
+    let print_result = |result: &TaskResult| print_task_result_as(result, &label(&result.name));
     let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
     let _env_access_binding = env_access.bind();
     let json_output = output_policy.reserve_stdout;
@@ -128,7 +137,7 @@ pub(super) fn run_tasks_parallel(
                     cached: false,
                     skipped: true,
                 });
-                print_task_result(all_results.last().unwrap());
+                print_result(all_results.last().unwrap());
                 failed_tasks.insert(task.clone());
             }
         }
@@ -169,7 +178,7 @@ pub(super) fn run_tasks_parallel(
                     cached: false,
                     skipped: false,
                 });
-                print_task_result(all_results.last().unwrap());
+                print_result(all_results.last().unwrap());
                 continue;
             }
 
@@ -216,7 +225,7 @@ pub(super) fn run_tasks_parallel(
                 {
                     cache_identities.insert(task_name.clone(), identity);
                 }
-                print_task_result(all_results.last().unwrap());
+                print_result(all_results.last().unwrap());
                 continue;
             }
 
@@ -271,7 +280,7 @@ pub(super) fn run_tasks_parallel(
                             cached: false,
                             skipped: false,
                         });
-                        print_task_result(all_results.last().unwrap());
+                        print_result(all_results.last().unwrap());
                     }
                     Err(error) => {
                         let (exit_code, phase) = task_failure(&error);
@@ -285,7 +294,7 @@ pub(super) fn run_tasks_parallel(
                             cached: false,
                             skipped: false,
                         });
-                        print_task_result(all_results.last().unwrap());
+                        print_result(all_results.last().unwrap());
                         failed_tasks.insert(task_name.clone());
                     }
                 }
@@ -309,7 +318,7 @@ pub(super) fn run_tasks_parallel(
                             cached: false,
                             skipped: false,
                         });
-                        print_task_result(all_results.last().unwrap());
+                        print_result(all_results.last().unwrap());
                     }
                     Err(error) => {
                         let (exit_code, phase) = task_failure(&error);
@@ -323,7 +332,7 @@ pub(super) fn run_tasks_parallel(
                             cached: false,
                             skipped: false,
                         });
-                        print_task_result(all_results.last().unwrap());
+                        print_result(all_results.last().unwrap());
                         failed_tasks.insert(task_name.clone());
                     }
                 }
@@ -364,6 +373,7 @@ pub(super) fn run_tasks_parallel(
                         let session = session.clone();
                         let is_stream = stream && !json_output;
                         let color = chunk_colors[ci].clone();
+                        let prefix = label(task_name);
                         let dependency_identities = if no_cache {
                             None
                         } else {
@@ -458,7 +468,7 @@ pub(super) fn run_tasks_parallel(
                                         cmd,
                                         &args,
                                         mode.as_deref(),
-                                        &name,
+                                        &prefix,
                                         &color,
                                         &hint_clone,
                                         config_clone.as_deref(),
@@ -469,7 +479,7 @@ pub(super) fn run_tasks_parallel(
                                         &name,
                                         &args,
                                         mode.as_deref(),
-                                        &name,
+                                        &prefix,
                                         &color,
                                         &hint_clone,
                                         config_clone.as_deref(),
@@ -588,7 +598,7 @@ pub(super) fn run_tasks_parallel(
                                 for output in [&stdout, &stderr] {
                                     lpm_runner::shell::print_prefixed_output(
                                         output,
-                                        &result.name,
+                                        &label(&result.name),
                                         &chunk_colors[i],
                                     );
                                 }
@@ -612,7 +622,7 @@ pub(super) fn run_tasks_parallel(
                             if let Some(cache_identity) = cache_identity {
                                 cache_identities.insert(result.name.clone(), cache_identity);
                             }
-                            print_task_result(&result);
+                            print_result(&result);
                             all_results.push(result);
                         }
                         Ok(Err(error)) => {
@@ -672,7 +682,7 @@ pub(super) fn run_tasks_parallel(
                         cached: false,
                         skipped: true,
                     });
-                    print_task_result(all_results.last().unwrap());
+                    print_result(all_results.last().unwrap());
                 }
             }
         }

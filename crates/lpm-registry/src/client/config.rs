@@ -331,8 +331,8 @@ impl RegistryClient {
         )
     }
 
-    /// Create a new registry client with default settings.
-    pub fn new() -> Self {
+    /// The default-TLS client set, built when a request first needs it.
+    pub(super) fn build_default_cached_client() -> CachedClient {
         // reqwest honours HTTPS_PROXY / HTTP_PROXY / ALL_PROXY by
         // default. A compromised CI runner or shell rc that exports
         // these can silently route every registry request — including
@@ -340,8 +340,8 @@ impl RegistryClient {
         // attacker proxy. We don't disable the env-proxy support
         // (legitimate corporate proxies depend on it) but we DO log
         // a one-shot warn so operators can spot unexpected proxy
-        // contamination. Logged at warn level so default tracing
-        // surfaces it; fires once per process per construction.
+        // contamination. It fires when the clients are built, so only
+        // commands that send registry requests show it.
         for var in [
             "HTTPS_PROXY",
             "https_proxy",
@@ -361,15 +361,19 @@ impl RegistryClient {
                 break;
             }
         }
-        let http = HttpClients::from_default_client_set(
-            Self::build_http_client_set_with_tls_and_identity(
-                CONNECT_TIMEOUT,
-                READ_TIMEOUT,
-                &TlsOverrides::default(),
-                None,
-            )
-            .expect("default TLS config never fails to build"),
-        );
+        Self::build_http_client_set_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            &TlsOverrides::default(),
+            None,
+        )
+        .expect("default TLS config never fails to build")
+        .cached(None)
+    }
+
+    /// Create a new registry client with default settings.
+    pub fn new() -> Self {
+        let http = HttpClients::with_default_built_on_first_use();
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
         // `None` here is a graceful degradation: if we can't even resolve a
@@ -726,7 +730,7 @@ impl RegistryClient {
             .collect();
         let built_client_sets = std::sync::atomic::AtomicUsize::new(eager_map.len());
         let http = Arc::new(HttpClients {
-            default: default_cached,
+            default: DefaultClient::built(default_cached),
             eager: eager_map,
             lazy,
             built_client_sets,

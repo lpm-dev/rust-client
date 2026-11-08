@@ -258,7 +258,7 @@ fn http_clients_eager_hit_overrides_default() {
     let mut eager = HashMap::new();
     eager.insert(origin.clone(), cached(per_origin_client));
     let http = Arc::new(HttpClients {
-        default: cached(default),
+        default: DefaultClient::built(cached(default)),
         eager,
         lazy: HashMap::new(),
         built_client_sets: std::sync::atomic::AtomicUsize::new(1),
@@ -285,7 +285,7 @@ fn http_clients_eager_hit_overrides_default() {
         "eager origin must dispatch to its registered client"
     );
     assert!(
-        std::ptr::eq(other, &client.http.default.client),
+        std::ptr::eq(other, &client.http.default.get().client),
         "non-eager origin must dispatch to default"
     );
 }
@@ -420,7 +420,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
         cached_with_manual_origin("target"),
     );
     let clients = HttpClients {
-        default: cached(reqwest::Client::new()),
+        default: DefaultClient::built(cached(reqwest::Client::new())),
         eager,
         lazy: HashMap::new(),
         built_client_sets: std::sync::atomic::AtomicUsize::new(2),
@@ -501,7 +501,7 @@ async fn retry_transport_reselects_origin_specific_clients_across_redirects() {
         cached_for_origin("target"),
     );
     let http = Arc::new(HttpClients {
-        default: cached(reqwest::Client::new()),
+        default: DefaultClient::built(cached(reqwest::Client::new())),
         eager,
         lazy: HashMap::new(),
         built_client_sets: std::sync::atomic::AtomicUsize::new(2),
@@ -542,7 +542,7 @@ fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
     let mut eager = HashMap::new();
     eager.insert(key_no_port.clone(), cached(per_origin_client));
     let http = Arc::new(HttpClients {
-        default: cached(default),
+        default: DefaultClient::built(cached(default)),
         eager,
         lazy: HashMap::new(),
         built_client_sets: std::sync::atomic::AtomicUsize::new(1),
@@ -561,7 +561,7 @@ fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
         .for_url_no_build("https://host.internal:8443/bar");
     let stored = &client.http.eager.get(&key_no_port).unwrap().client;
     assert!(std::ptr::eq(picked_443, stored));
-    assert!(std::ptr::eq(picked_8443, &client.http.default.client));
+    assert!(std::ptr::eq(picked_8443, &client.http.default.get().client));
 }
 
 #[tokio::test]
@@ -596,7 +596,7 @@ async fn http_clients_lazy_builds_and_memoizes() {
     };
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let http = Arc::new(HttpClients {
-        default: cached(default),
+        default: DefaultClient::built(cached(default)),
         eager: HashMap::new(),
         lazy: lazy_cells(&tls),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
@@ -650,7 +650,7 @@ async fn unrelated_origins_bypass_a_busy_lazy_tls_builder() {
         ..TlsOverrides::default()
     };
     let clients = Arc::new(HttpClients {
-        default: cached(reqwest::Client::new()),
+        default: DefaultClient::built(cached(reqwest::Client::new())),
         eager: HashMap::new(),
         lazy: lazy_cells(&tls),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
@@ -687,7 +687,7 @@ async fn unrelated_origins_bypass_a_busy_lazy_tls_builder() {
 async fn http_clients_no_per_origin_tls_falls_through_to_default() {
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let http = Arc::new(HttpClients {
-        default: cached(default.clone()),
+        default: DefaultClient::built(cached(default.clone())),
         eager: HashMap::new(),
         lazy: HashMap::new(),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
@@ -739,7 +739,7 @@ async fn http_clients_per_origin_certfile_xor_is_fatal_at_build() {
     };
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let http = Arc::new(HttpClients {
-        default: cached(default),
+        default: DefaultClient::built(cached(default)),
         eager: HashMap::new(),
         lazy: lazy_cells(&tls),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
@@ -795,7 +795,7 @@ async fn http_clients_unreached_half_config_does_not_break_unrelated_lookup() {
     };
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let http = Arc::new(HttpClients {
-        default: cached(default),
+        default: DefaultClient::built(cached(default)),
         eager: HashMap::new(),
         lazy: lazy_cells(&tls),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),

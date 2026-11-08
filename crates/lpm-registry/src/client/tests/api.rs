@@ -1785,6 +1785,18 @@ fn publish_upload_debug_leaves_out_its_presigned_url() {
     );
 }
 
+#[test]
+fn a_registry_client_builds_its_default_clients_on_first_use() {
+    let client = RegistryClient::new();
+    assert!(!client.http.default.is_built());
+
+    let _ = client
+        .http
+        .for_url_no_build("https://registry.npmjs.org/react");
+
+    assert!(client.http.default.is_built());
+}
+
 fn client_with_read_timeout(server_uri: &str, read_timeout: Duration) -> RegistryClient {
     let mut client = RegistryClient::new()
         .with_base_url(server_uri)
