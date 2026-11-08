@@ -9,15 +9,6 @@ pub(super) fn entry_exists(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-pub(super) fn removed_size(path: &Path) -> u64 {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) => 0,
-        Ok(metadata) if metadata.is_file() => metadata.len(),
-        Ok(_) => crate::commands::cache::dir_size(path).unwrap_or(0),
-        Err(_) => 0,
-    }
-}
-
 pub(super) fn ensure_directory(path: &Path) -> Result<(), LpmError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata) => {

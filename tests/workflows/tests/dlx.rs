@@ -35,6 +35,34 @@ fn seed_lockfile_identity(
         .expect("failed to seed dlx cache lockfile");
 }
 
+/// The dlx cache entries in the project's LPM home. An entry's directory
+/// name hashes its target and caller policy, so tests find it rather than
+/// compute it.
+fn dlx_entries(project: &TempProject) -> Vec<std::path::PathBuf> {
+    let root = LpmRoot::from_dir(project.home().join(".lpm"));
+    let Ok(entries) = std::fs::read_dir(root.cache_dlx()) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_dir()
+                && path.extension().is_none()
+                && !path.file_name().unwrap().to_string_lossy().starts_with('.')
+        })
+        .collect()
+}
+
+fn dlx_entry(project: &TempProject) -> std::path::PathBuf {
+    let mut entries = dlx_entries(project);
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected one dlx cache entry: {entries:?}"
+    );
+    entries.pop().unwrap()
+}
+
 fn make_dlx_tool_tarball(name: &str, version: &str) -> Vec<u8> {
     let body = format!("#!/usr/bin/env node\nconsole.log('version:{version}');\n").into_bytes();
     make_tarball_from_pkg_json(
@@ -148,9 +176,7 @@ async fn dlx_cache_hit_executes_cached_binary_without_extending_ttl() {
         .output()
         .unwrap();
     assert_dlx_success(&first);
-    let root = LpmRoot::from_dir(project.home().join(".lpm"));
-    let cache_dir = lpm_runner::dlx::dlx_cache_dir_at(&root, spec);
-    let package_json = cache_dir.join("package.json");
+    let package_json = dlx_entry(&project).join("package.json");
     let before = SystemTime::now() - Duration::from_secs(60);
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -513,8 +539,7 @@ async fn dlx_failed_refresh_preserves_the_previous_entry_and_install_time() {
         .output()
         .unwrap();
     assert_dlx_success(&first);
-    let root = LpmRoot::from_dir(project.home().join(".lpm"));
-    let entry = lpm_runner::dlx::dlx_cache_dir_at(&root, "dlx-refresh-failure-tool");
+    let entry = dlx_entry(&project);
     let marker = entry.join("package.json");
     let bytes = std::fs::read(&marker).unwrap();
     let modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
@@ -806,6 +831,39 @@ fn wait_for_marker(path: &std::path::Path, child: &mut std::process::Child) {
 }
 
 #[tokio::test]
+async fn dlx_sweeps_a_stale_entry_while_the_cache_is_idle() {
+    let project = TempProject::empty(r#"{"name":"dlx-idle-sweep","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mount_lifetime_tool(&mock, "dlx-stale-tool").await;
+    mount_lifetime_tool(&mock, "dlx-later-tool").await;
+    let first = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-stale-tool"])
+        .output()
+        .unwrap();
+    assert_dlx_success(&first);
+    let stale = dlx_entry(&project);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(stale.join("package.json"))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(48 * 3600))
+        .unwrap();
+    // The first run's sweep was this hour, so the next would otherwise wait.
+    let _ = std::fs::remove_file(stale.parent().unwrap().join(".sweep-at"));
+
+    let later = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-later-tool"])
+        .output()
+        .unwrap();
+
+    assert_dlx_success(&later);
+    assert!(
+        !stale.exists(),
+        "an entry past its TTL outlived a dlx run on an idle cache"
+    );
+}
+
+#[tokio::test]
 async fn dlx_active_entry_survives_expiry_sweep_and_cache_cleanup() {
     let project = TempProject::empty(r#"{"name":"dlx-active-cache","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -824,8 +882,7 @@ async fn dlx_active_entry_survives_expiry_sweep_and_cache_cleanup() {
         .spawn()
         .unwrap();
     wait_for_marker(&ready, &mut child);
-    let root = LpmRoot::from_dir(project.home().join(".lpm"));
-    let entry = lpm_runner::dlx::dlx_cache_dir_at(&root, "dlx-active-tool");
+    let entry = dlx_entry(&project);
     std::fs::OpenOptions::new()
         .write(true)
         .open(entry.join("package.json"))
@@ -1103,9 +1160,8 @@ async fn dlx_rejects_packages_without_a_usable_executable_before_cache_promotion
             "unusable package did not report a bounded error: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let root = LpmRoot::from_dir(project.home().join(".lpm"));
         assert!(
-            !lpm_runner::dlx::dlx_cache_dir_at(&root, "dlx-no-bin-tool").exists(),
+            dlx_entries(&project).is_empty(),
             "unusable installation was promoted"
         );
     }
@@ -1127,8 +1183,7 @@ async fn dlx_refresh_preserves_the_previous_executable_when_the_replacement_has_
         .output()
         .unwrap();
     assert_dlx_success(&first);
-    let root = LpmRoot::from_dir(project.home().join(".lpm"));
-    let entry = lpm_runner::dlx::dlx_cache_dir_at(&root, "dlx-refresh-bin-tool");
+    let entry = dlx_entry(&project);
     let marker = entry.join("package.json");
     let before = std::fs::read(&marker).unwrap();
     let modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
@@ -1223,6 +1278,44 @@ async fn dlx_rechecks_dependency_engines_when_a_warm_cache_uses_another_node() {
 }
 
 #[tokio::test]
+async fn dlx_keeps_a_cached_tool_for_each_project_that_runs_it() {
+    let project = TempProject::empty(r#"{"name":"dlx-first","version":"1.0.0"}"#);
+    let other = project.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("package.json"),
+        r#"{"name":"dlx-second","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mock = MockRegistry::start().await;
+    mount_published_dlx_tool(
+        &mock,
+        "dlx-shared-tool",
+        "1.0.0",
+        &iso8601_n_secs_ago(72 * 3600),
+    )
+    .await;
+    let run = |directory: &std::path::Path| {
+        let output = lpm_with_registry(&project, &mock.url())
+            .current_dir(directory)
+            .args(["dlx", "dlx-shared-tool@1.0.0"])
+            .output()
+            .unwrap();
+        assert_dlx_success(&output);
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    run(project.path());
+    run(&other);
+    let again = run(project.path());
+
+    assert!(
+        again.contains("Reusing dlx cache entry"),
+        "running the tool in another project replaced this project's cache entry:\n{again}"
+    );
+}
+
+#[tokio::test]
 async fn dlx_store_files_survive_pruning_during_execution_and_warm_reuse() {
     let project = TempProject::empty(r#"{"name":"dlx-prune","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -1287,10 +1380,20 @@ async fn dlx_rechecks_authorization_after_waiting_for_the_cache_entry() {
         .unwrap();
     assert_dlx_success(&first);
     let root = LpmRoot::from_dir(project.home().join(".lpm"));
-    let lock = root.cache_dlx().join(".entry-locks").join(format!(
-        "{}.lock",
-        lpm_runner::dlx::deterministic_hash("dlx-revoked-tool")
-    ));
+    let mut locks: Vec<_> = std::fs::read_dir(root.cache_dlx().join(".entry-locks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "lock")
+        })
+        .collect();
+    assert_eq!(
+        locks.len(),
+        1,
+        "expected the first run's entry lock: {locks:?}"
+    );
+    let lock = locks.pop().unwrap();
     let guard = lpm_common::acquire_exclusive_lock(lock).unwrap();
     let stderr = project.path().join("waiting.stderr");
     let mut child = support::lpm_spawnable_with_registry(&project, &mock.url())

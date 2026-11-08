@@ -99,26 +99,38 @@ pub(super) fn confirm_before_apply(
 }
 
 fn planned_actions(checks: &[Check]) -> Result<Vec<String>, LpmError> {
+    ordered_fixes(checks)
+        .into_iter()
+        .map(|(action, check)| planned_action_label(action, check))
+        .collect()
+}
+
+/// Each distinct fix of a failing or warning check, once. Pinned runtimes are
+/// installed first: without them an install's scripts and native builds run
+/// with whatever Node is on PATH, and its result wouldn't match the project.
+/// Other fixes keep the order of their checks.
+fn ordered_fixes(checks: &[Check]) -> Vec<(DoctorFix, &Check)> {
     let mut seen = HashSet::with_capacity(checks.len());
-    let mut actions = Vec::with_capacity(checks.len());
+    let mut fixes: Vec<_> = checks
+        .iter()
+        .filter(|check| !matches!(check.severity, Severity::Pass))
+        .filter_map(|check| check.entry.auto_fix.map(|action| (action, check)))
+        .filter(|(action, check)| {
+            let target = action
+                .requires_target()
+                .then_some(check.fix_target.as_ref());
+            seen.insert((*action, target))
+        })
+        .collect();
+    fixes.sort_by_key(|(action, _)| !installs_a_runtime(*action));
+    fixes
+}
 
-    for check in checks {
-        if matches!(check.severity, Severity::Pass) {
-            continue;
-        }
-        if let Some(action) = check.entry.auto_fix {
-            let target = if action.requires_target() {
-                check.fix_target.as_ref()
-            } else {
-                None
-            };
-            if seen.insert((action, target)) {
-                actions.push(planned_action_label(action, check)?);
-            }
-        }
-    }
-
-    Ok(actions)
+fn installs_a_runtime(action: DoctorFix) -> bool {
+    matches!(
+        action,
+        DoctorFix::InstallNodeSpec | DoctorFix::InstallNode22 | DoctorFix::InstallBunSpec
+    )
 }
 
 fn planned_action_label(action: DoctorFix, check: &Check) -> Result<String, LpmError> {
@@ -145,23 +157,9 @@ pub(super) async fn apply(
     }
 
     let mut report = FixReport::default();
-    let mut attempted = HashSet::with_capacity(checks.len());
     let mut runtime_context = RuntimeInstallContext::default();
 
-    for check in checks {
-        if matches!(check.severity, Severity::Pass) {
-            continue;
-        }
-        let Some(action) = check.entry.auto_fix else {
-            continue;
-        };
-        let target = action
-            .requires_target()
-            .then_some(check.fix_target.as_ref());
-        if !attempted.insert((action, target)) {
-            continue;
-        }
-
+    for (action, check) in ordered_fixes(checks) {
         let result = apply_one(
             action,
             check,
@@ -403,6 +401,32 @@ mod tests {
         assert_eq!(
             planned_actions(&checks).unwrap(),
             vec!["remove lpm.lockb".to_string(), "lpm install".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_fixes_run_before_the_install_that_needs_them() {
+        let checks = vec![
+            Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "drift"),
+            Check::warn_with_fix_target(
+                &doctor_catalog::NODE_PINNED_UNMET,
+                "node 22.5 missing",
+                FixTarget::NodeSpec("22.5".into()),
+            ),
+            Check::warn_with_fix_target(
+                &doctor_catalog::BUN_PINNED_UNMET,
+                "bun 1.2 missing",
+                FixTarget::BunSpec("1.2".into()),
+            ),
+        ];
+
+        assert_eq!(
+            planned_actions(&checks).unwrap(),
+            vec![
+                "lpm use node@22.5".to_string(),
+                "lpm use bun@1.2".to_string(),
+                "lpm install".to_string(),
+            ]
         );
     }
 

@@ -98,6 +98,17 @@ struct EngineSidecar {
     packages: Vec<EngineSidecarPackage>,
     layout_sha256: String,
     verified_at_unix: u64,
+    /// Each file's metadata when the layout last hashed to `layout_sha256`.
+    /// While every file still matches, reuse skips hashing the layout,
+    /// which for tsgo and rolldown is tens of megabytes on every run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layout_snapshot: Option<Vec<EngineFileSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EngineFileSnapshot {
+    path: String,
+    snapshot: crate::sidecar::BinarySnapshot,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +150,7 @@ impl EngineSidecar {
             packages,
             layout_sha256: layout_sha256.into(),
             verified_at_unix: now_unix(),
+            layout_snapshot: None,
         }
     }
 }
@@ -1197,7 +1209,7 @@ fn validate_for_reuse(
     expected_entry_rel_path: &str,
     expected_packages: &[ResolvedEngineInstallAsset],
 ) -> EngineReuseDecision {
-    let sidecar = match read_sidecar(sidecar_path) {
+    let mut sidecar = match read_sidecar(sidecar_path) {
         Ok(sidecar) => sidecar,
         Err(reason) => return EngineReuseDecision::Miss(reason),
     };
@@ -1241,11 +1253,48 @@ fn validate_for_reuse(
             return EngineReuseDecision::Miss(EngineMissReason::EntryMissing);
         }
     }
+    let snapshot = snapshot_directory_tree(install_dir);
+    if snapshot.is_some() && sidecar.layout_snapshot == snapshot {
+        return EngineReuseDecision::Hit;
+    }
     match hash_directory_tree(install_dir) {
-        Ok(observed) if observed == sidecar.layout_sha256 => EngineReuseDecision::Hit,
+        Ok(observed) if observed == sidecar.layout_sha256 => {
+            // The snapshot taken before hashing is recorded, so a file
+            // changed while it was hashed misses the next time.
+            if snapshot.is_some() {
+                sidecar.layout_snapshot = snapshot;
+                if let Err(error) = write_sidecar_atomic(sidecar_path, &sidecar) {
+                    tracing::debug!(
+                        sidecar = %sidecar_path.display(),
+                        %error,
+                        "failed to record the engine layout snapshot after hash validation"
+                    );
+                }
+            }
+            EngineReuseDecision::Hit
+        }
         Ok(_) => EngineReuseDecision::Miss(EngineMissReason::LayoutHashMismatch),
         Err(_) => EngineReuseDecision::Miss(EngineMissReason::LayoutHashMismatch),
     }
+}
+
+/// Each layout file's metadata, in path order, without reading the files.
+/// `None` when a file can't be described.
+fn snapshot_directory_tree(root: &Path) -> Option<Vec<EngineFileSnapshot>> {
+    let mut rel_files = Vec::new();
+    collect_files(root, root, &mut rel_files).ok()?;
+    rel_files.sort();
+    rel_files
+        .into_iter()
+        .map(|rel| {
+            let snapshot =
+                crate::sidecar::BinarySnapshot::from_entry_path(&root.join(&rel)).ok()??;
+            Some(EngineFileSnapshot {
+                path: normalize_rel_path(&rel),
+                snapshot,
+            })
+        })
+        .collect()
 }
 
 fn read_sidecar(sidecar_path: &Path) -> Result<EngineSidecar, EngineMissReason> {
@@ -1281,7 +1330,14 @@ fn compute_sha256(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAYOUT_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn hash_directory_tree(root: &Path) -> Result<String, LpmError> {
+    #[cfg(test)]
+    LAYOUT_HASHES.with(|hashes| hashes.set(hashes.get() + 1));
     let mut rel_files = Vec::new();
     collect_files(root, root, &mut rel_files)?;
     rel_files.sort();
@@ -1589,6 +1645,46 @@ mod tests {
         );
         write_sidecar_atomic(&install_dir.join(ENGINE_SIDECAR_FILE_NAME), &sidecar).unwrap();
         entry_path
+    }
+
+    fn validate_fake_engine(install_dir: &Path) -> EngineReuseDecision {
+        validate_for_reuse(
+            &install_dir.join(ENGINE_SIDECAR_FILE_NAME),
+            install_dir,
+            "tsgo",
+            "1.0.0",
+            "darwin-arm64",
+            "lib/tsgo",
+            &[ResolvedEngineInstallAsset {
+                install_subdir: "".into(),
+                tarball_url: "https://example.test/native-preview.tgz".into(),
+                tarball_integrity: "sha512-test".into(),
+            }],
+        )
+    }
+
+    #[test]
+    fn an_unchanged_engine_is_reused_without_hashing_its_files_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path().join("tsgo").join("1.0.0").join("darwin-arm64");
+        install_fake_engine(dir.path(), "lib/tsgo");
+
+        assert_eq!(validate_fake_engine(&install_dir), EngineReuseDecision::Hit);
+        let hashed = LAYOUT_HASHES.with(std::cell::Cell::get);
+        assert_eq!(validate_fake_engine(&install_dir), EngineReuseDecision::Hit);
+        assert_eq!(LAYOUT_HASHES.with(std::cell::Cell::get), hashed);
+
+        // A changed file no longer matches its recorded snapshot, so the
+        // layout is hashed again and the change is caught.
+        std::fs::write(
+            install_dir.join("lib/lib.d.ts"),
+            b"declare const y: number;",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_fake_engine(&install_dir),
+            EngineReuseDecision::Miss(EngineMissReason::LayoutHashMismatch)
+        );
     }
 
     #[test]
