@@ -708,7 +708,16 @@ pub(crate) async fn run_start(
                 }
             }
         } else {
-            connect.await
+            // Without the interactive controls, a stop signal would end the
+            // process before the capture session closes and its last batch
+            // of captured requests is written.
+            tokio::select! {
+                result = &mut connect => result,
+                () = wait_for_stop_signal() => {
+                    tunnel_cancel.cancel();
+                    connect.await
+                }
+            }
         }
     } else {
         tokio::pin!(connect);
@@ -1562,6 +1571,29 @@ fn untrack_prefix(repository: CaptureRepository) -> &'static str {
     match repository {
         CaptureRepository::Project | CaptureRepository::Around => "git rm --cached",
         CaptureRepository::Lpm => "git -C .lpm rm --cached",
+    }
+}
+
+/// Resolves on Ctrl+C or, on Unix, SIGTERM.
+async fn wait_for_stop_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

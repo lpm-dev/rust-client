@@ -2859,6 +2859,12 @@ async fn try_connect_with_token(
         }
     }
 
+    // The relay connection is gone, so no response can be delivered: cancel
+    // in-flight requests and drop their credit senders, or an open event
+    // stream waits for credit until the shutdown timeout.
+    for forward in http_forwards.into_values() {
+        forward.cancel.cancel();
+    }
     shutdown_websocket_tasks(
         ws_connections,
         closing_websockets,

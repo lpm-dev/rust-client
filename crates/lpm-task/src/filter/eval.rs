@@ -255,29 +255,41 @@ impl<'a> FilterEngine<'a> {
 
     /// Directory glob. The literal prefix is canonicalized against the
     /// workspace root, then `globset` matches the suffix against each
-    /// member's relative path.
+    /// member's path relative to that prefix. The prefix itself never enters
+    /// the pattern, so a workspace path with `[`, `*` or `?` in it, such as
+    /// `app[2]`, can't change what the suffix matches.
     fn eval_path_glob(&self, pattern: &str) -> Result<PackageBits, FilterError> {
         // Strip the `./` or `../` prefix and verify the literal portion
         // does not escape the workspace root.
         let (literal_prefix, glob_suffix) = split_glob_pattern(pattern);
         let literal_canonical = canonicalize_workspace_path(self.workspace_root, &literal_prefix)?;
-
-        // Reconstruct the full glob pattern relative to the workspace root
-        // for matching against each member.
-        let full_pattern = if glob_suffix.is_empty() {
-            literal_canonical.to_string_lossy().to_string()
+        let matcher = if glob_suffix.is_empty() {
+            None
         } else {
-            format!("{}/{}", literal_canonical.display(), glob_suffix)
+            Some(self.get_or_compile_glob(&glob_suffix)?)
         };
-        let matcher = self.get_or_compile_glob(&full_pattern)?;
 
         let mut bits = PackageBits::empty(self.graph.len());
         for (idx, node) in self.graph.members.iter().enumerate() {
-            let path_str = node.path.canonicalize().map_or_else(
-                |_| node.path.to_string_lossy().to_string(),
-                |p| p.to_string_lossy().to_string(),
-            );
-            if matcher.is_match(&path_str) {
+            let member_path = node
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| node.path.clone());
+            let Ok(relative) = member_path.strip_prefix(&literal_canonical) else {
+                continue;
+            };
+            let selected = match &matcher {
+                None => relative.as_os_str().is_empty(),
+                Some(matcher) => {
+                    let relative = relative
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    !relative.is_empty() && matcher.is_match(&relative)
+                }
+            };
+            if selected {
                 bits.set(idx);
             }
         }
@@ -1645,6 +1657,33 @@ mod tests {
             Err(FilterError::PathEscape(_)) => {}
             other => panic!("expected PathEscape, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn path_glob_matches_members_under_a_workspace_path_with_glob_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("app[2]");
+        let mut members = Vec::new();
+        for name in ["web", "api"] {
+            let path = workspace_root.join("apps").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            let mut entry = member(name, &[]);
+            entry.path = path;
+            members.push(entry);
+        }
+        let ws = Workspace {
+            root: workspace_root.clone(),
+            root_package: PackageJson::default(),
+            members,
+        };
+        let graph = WorkspaceGraph::from_workspace(&ws);
+        let engine = FilterEngine::new(&graph, &workspace_root);
+
+        let selected = engine
+            .evaluate(&[FilterExpr::PathGlob("./apps/*".into())])
+            .unwrap();
+
+        assert_eq!(selected.len(), 2);
     }
 
     #[test]

@@ -109,8 +109,55 @@ pub fn task_levels(
     tasks: &HashMap<String, TaskConfig>,
     requested: &[String],
 ) -> Result<Vec<Vec<String>>, String> {
+    task_schedule(scripts, tasks, requested).map(|schedule| schedule.levels)
+}
+
+/// The two ways a run can order its tasks.
+pub struct TaskSchedule {
+    /// Dependency levels, each sorted by command-line order, for runs that
+    /// start a level's tasks together.
+    pub levels: Vec<Vec<String>>,
+    /// The order of a sequential run: each requested task in command-line
+    /// order, right after its prerequisites that haven't run yet. A
+    /// prerequisite of a later task doesn't run before an earlier task.
+    pub sequential: Vec<String>,
+}
+
+pub fn task_schedule(
+    scripts: &HashMap<String, String>,
+    tasks: &HashMap<String, TaskConfig>,
+    requested: &[String],
+) -> Result<TaskSchedule, String> {
     let graph = build_task_graph_nodes(scripts, tasks, requested)?;
-    let mut levels = dag::topological_levels(&graph)?;
+    let levels = sorted_levels(&graph, requested)?;
+    let mut sequential = Vec::with_capacity(graph.len());
+    let mut visited = HashSet::with_capacity(graph.len());
+    for task in requested {
+        push_after_prerequisites(task, &graph, &mut visited, &mut sequential);
+    }
+    Ok(TaskSchedule { levels, sequential })
+}
+
+fn push_after_prerequisites(
+    task: &str,
+    graph: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+    order: &mut Vec<String>,
+) {
+    if !visited.insert(task.to_owned()) {
+        return;
+    }
+    for prerequisite in graph.get(task).into_iter().flatten() {
+        push_after_prerequisites(prerequisite, graph, visited, order);
+    }
+    order.push(task.to_owned());
+}
+
+fn sorted_levels(
+    graph: &HashMap<String, Vec<String>>,
+    requested: &[String],
+) -> Result<Vec<Vec<String>>, String> {
+    let mut levels = dag::topological_levels(graph)?;
     let requested_rank: HashMap<&str, usize> = requested
         .iter()
         .enumerate()
@@ -137,6 +184,17 @@ pub fn task_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sequential_run_keeps_command_line_order_and_runs_prerequisites_just_in_time() {
+        let scripts = scripts(&[("build", "b"), ("deploy", "d"), ("notify", "n")]);
+        let tasks = tasks(&[("deploy", &["build"])]);
+
+        let schedule =
+            task_schedule(&scripts, &tasks, &["deploy".into(), "notify".into()]).unwrap();
+
+        assert_eq!(schedule.sequential, vec!["build", "deploy", "notify"]);
+    }
 
     /// Helper: build a scripts map from `(name, command)` pairs.
     fn scripts(entries: &[(&str, &str)]) -> HashMap<String, String> {

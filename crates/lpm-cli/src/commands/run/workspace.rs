@@ -33,6 +33,7 @@ struct WorkspaceMemberTaskPlan {
     config: WorkspaceMemberTaskConfig,
     requested_tasks: Vec<String>,
     task_levels: Vec<Vec<String>>,
+    sequential_tasks: Vec<String>,
     direct_workspace_task_dependencies: HashMap<String, Vec<WorkspaceTaskRef>>,
 }
 
@@ -265,7 +266,10 @@ fn build_workspace_task_schedule(
                 workspace_graph.members[member_idx].name
             ))
         })?;
-        let task_levels = lpm_runner::task_graph::task_levels(
+        let lpm_runner::task_graph::TaskSchedule {
+            levels: task_levels,
+            sequential: sequential_tasks,
+        } = lpm_runner::task_graph::task_schedule(
             &config.package_scripts,
             config.tasks(),
             &requested_tasks,
@@ -283,6 +287,7 @@ fn build_workspace_task_schedule(
             config,
             requested_tasks,
             task_levels,
+            sequential_tasks,
             direct_workspace_task_dependencies,
         })));
     }
@@ -848,9 +853,8 @@ fn run_workspace_package(
             &member_task_plan.task_levels
         } else {
             serial_levels = member_task_plan
-                .task_levels
+                .sequential_tasks
                 .iter()
-                .flatten()
                 .cloned()
                 .map(|task| vec![task])
                 .collect::<Vec<_>>();
@@ -875,17 +879,12 @@ fn run_workspace_package(
             session,
         )
     } else {
-        let topo_order: Vec<String> = member_task_plan
-            .task_levels
-            .iter()
-            .flatten()
-            .cloned()
-            .collect();
+        let topo_order = &member_task_plan.sequential_tasks;
         run_tasks_sequential(
             member_dir,
             workspace_contract,
             workspace_dependency_identities,
-            &topo_order,
+            topo_order,
             extra_args,
             env_mode,
             continue_on_error,
