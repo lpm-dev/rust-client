@@ -52,12 +52,14 @@ const SEMANTIC_LEVEL_STACK: usize = if cfg!(debug_assertions) {
 /// the parser recursing, touches a small fraction of its reservation.
 const SEMANTIC_MAX_STACK: usize = 256 * 1024 * 1024;
 
-/// Lookups semantic analysis may spend resolving names, per byte of
-/// source and for any source. Resolving a reference looks for its name in
-/// each scope around it, and a reference in a function's parameters is
-/// looked up again for each function around it, so a source that nests
-/// thousands of scopes around each of its references makes the analysis
-/// quadratic. Real code nests a few scopes deep.
+/// Lookups semantic analysis may spend binding and resolving names, per
+/// byte of source and for any source. Resolving a reference looks for its
+/// name in each scope around it, and a reference in a function's
+/// parameters is looked up again for each function around it. A `var`,
+/// or a function declared in a block, is recorded in each block between
+/// it and its function. A source that nests thousands of scopes around
+/// each of its names makes the analysis quadratic. Real code nests a few
+/// scopes deep.
 const RESOLUTION_LOOKUPS_PER_BYTE: u64 = 16;
 const RESOLUTION_LOOKUPS_FLOOR: u64 = 1 << 20;
 
@@ -74,11 +76,29 @@ struct LiteralSpans<'s> {
     scopes: u64,
     /// Function parameter lists around the node being visited.
     parameter_lists: u64,
+    /// Scopes around the node being visited, up to the nearest function
+    /// or the program: the blocks a `var` there is recorded in.
+    block_scopes: u64,
+    /// `block_scopes` of each function the visit is inside.
+    outer_block_scopes: Vec<u64>,
     /// The most lookups semantic analysis can make resolving the
     /// references visited so far.
     resolution_lookups: u64,
     /// The visitor reached the stack floor and skips the rest.
     stopped: bool,
+}
+
+/// Whether nodes of this kind get a scope that `var` declarations are
+/// hoisted to. Treating another scope as one would undercount the blocks
+/// a `var` is recorded in.
+fn is_var_scope(kind: AstKind<'_>) -> bool {
+    matches!(
+        kind,
+        AstKind::Program(_)
+            | AstKind::Function(_)
+            | AstKind::ArrowFunctionExpression(_)
+            | AstKind::StaticBlock(_)
+    )
 }
 
 /// Whether semantic analysis gives nodes of this kind a scope of their own.
@@ -165,24 +185,44 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
         }
         self.depth += 1;
         self.max_depth = self.max_depth.max(self.depth);
-        match kind {
-            AstKind::IdentifierReference(_) => {
-                self.resolution_lookups = self
-                    .resolution_lookups
-                    .saturating_add(self.scopes.saturating_mul(1 + self.parameter_lists));
+        let lookups = match kind {
+            AstKind::IdentifierReference(_) => self.scopes.saturating_mul(1 + self.parameter_lists),
+            // A `var` is recorded in every block up to its function, and a
+            // function declared in a block is hoisted out of them. A `let`
+            // or `const` costs less, but counting it the same keeps the
+            // bound an upper one.
+            AstKind::BindingIdentifier(_)
+            | AstKind::VariableDeclarator(_)
+            | AstKind::Function(_) => self.block_scopes,
+            _ => 0,
+        };
+        self.resolution_lookups = self.resolution_lookups.saturating_add(lookups);
+        if let AstKind::FormalParameters(_) = kind {
+            self.parameter_lists += 1;
+        }
+        if has_scope(kind) {
+            self.scopes += 1;
+            if is_var_scope(kind) {
+                self.outer_block_scopes
+                    .push(std::mem::take(&mut self.block_scopes));
+            } else {
+                self.block_scopes += 1;
             }
-            AstKind::FormalParameters(_) => self.parameter_lists += 1,
-            _ if has_scope(kind) => self.scopes += 1,
-            _ => {}
         }
     }
 
     fn leave_node(&mut self, kind: AstKind<'a>) {
         self.depth -= 1;
-        match kind {
-            AstKind::FormalParameters(_) => self.parameter_lists -= 1,
-            _ if has_scope(kind) => self.scopes -= 1,
-            _ => {}
+        if let AstKind::FormalParameters(_) = kind {
+            self.parameter_lists -= 1;
+        }
+        if has_scope(kind) {
+            self.scopes -= 1;
+            if is_var_scope(kind) {
+                self.block_scopes = self.outer_block_scopes.pop().unwrap_or(0);
+            } else {
+                self.block_scopes -= 1;
+            }
         }
     }
 
@@ -266,6 +306,8 @@ fn parse_above(
         max_depth: 0,
         scopes: 0,
         parameter_lists: 0,
+        block_scopes: 0,
+        outer_block_scopes: Vec::new(),
         resolution_lookups: 0,
         stopped: false,
     };
@@ -454,6 +496,8 @@ mod tests {
             max_depth: 0,
             scopes: 0,
             parameter_lists: 0,
+            block_scopes: 0,
+            outer_block_scopes: Vec::new(),
             resolution_lookups: 0,
             stopped: false,
         };

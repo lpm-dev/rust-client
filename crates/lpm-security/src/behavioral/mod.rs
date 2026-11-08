@@ -2604,11 +2604,37 @@ mod tests {
     }
 
     #[test]
+    fn var_declarations_nested_thousands_of_scopes_deep_are_read_without_semantic_analysis() {
+        // Semantic analysis records each `var` name in every block between
+        // it and its function, so names declared a thousand blocks deep
+        // cost a thousand map entries each, with no reference to count.
+        let vars: String = (0..5_000).map(|i| format!("var x{i};")).collect();
+        let nested_vars = format!("{}eval(y);", nested("{", &vars, "}", 1_000));
+        let flat = format!("{}eval(y);", "var x;".repeat(nested_vars.len() / 6));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.js", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", nested_vars);
+        let nested_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "nested {nested_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
     fn references_nested_as_deeply_as_real_code_nests_them_are_analyzed() {
         for source in [
             nested("{eval(y);", "", "}", 200),
             nested("function f(a=y,b=", "0", "){eval(y)}", 100),
             "function f(){var a=1;".repeat(50) + &"a;".repeat(20_000) + &"}".repeat(50),
+            "function f(){".to_owned()
+                + &nested("if(y){", &"var v=eval(y);".repeat(2_000), "}", 6)
+                + "}",
         ] {
             let result = analyze_on_a_worker_stack("index.js", source);
             assert!(result.source.eval || result.files_scanned == 1);
