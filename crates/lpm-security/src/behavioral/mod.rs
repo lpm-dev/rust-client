@@ -2627,6 +2627,28 @@ mod tests {
     }
 
     #[test]
+    fn labelled_jumps_inside_thousands_of_labels_are_read_without_semantic_analysis() {
+        // Semantic analysis looks each labelled `break` up in the stack of
+        // labels around it.
+        let labels: String = (0..4_000).map(|i| format!("a{i}:")).collect();
+        let source = format!("{labels}{{{}eval(y);}}", "break a0;".repeat(20_000));
+        let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.js", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", source);
+        let labelled_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            labelled_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "labelled {labelled_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
     fn references_nested_as_deeply_as_real_code_nests_them_are_analyzed() {
         for source in [
             nested("{eval(y);", "", "}", 200),

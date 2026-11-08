@@ -57,9 +57,10 @@ const SEMANTIC_MAX_STACK: usize = 256 * 1024 * 1024;
 /// name in each scope around it, and a reference in a function's
 /// parameters is looked up again for each function around it. A `var`,
 /// or a function declared in a block, is recorded in each block between
-/// it and its function. A source that nests thousands of scopes around
-/// each of its names makes the analysis quadratic. Real code nests a few
-/// scopes deep.
+/// it and its function, and a labelled `break` or `continue` is looked up
+/// in the labels around it. A source that nests thousands of scopes or
+/// labels around each of its names makes the analysis quadratic. Real
+/// code nests a few deep.
 const RESOLUTION_LOOKUPS_PER_BYTE: u64 = 16;
 const RESOLUTION_LOOKUPS_FLOOR: u64 = 1 << 20;
 
@@ -81,6 +82,8 @@ struct LiteralSpans<'s> {
     block_scopes: u64,
     /// `block_scopes` of each function the visit is inside.
     outer_block_scopes: Vec<u64>,
+    /// Labelled statements around the node being visited.
+    labels: u64,
     /// The most lookups semantic analysis can make resolving the
     /// references visited so far.
     resolution_lookups: u64,
@@ -194,11 +197,14 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
             AstKind::BindingIdentifier(_)
             | AstKind::VariableDeclarator(_)
             | AstKind::Function(_) => self.block_scopes,
+            AstKind::BreakStatement(_) | AstKind::ContinueStatement(_) => self.labels,
             _ => 0,
         };
         self.resolution_lookups = self.resolution_lookups.saturating_add(lookups);
-        if let AstKind::FormalParameters(_) = kind {
-            self.parameter_lists += 1;
+        match kind {
+            AstKind::FormalParameters(_) => self.parameter_lists += 1,
+            AstKind::LabeledStatement(_) => self.labels += 1,
+            _ => {}
         }
         if has_scope(kind) {
             self.scopes += 1;
@@ -213,8 +219,10 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
 
     fn leave_node(&mut self, kind: AstKind<'a>) {
         self.depth -= 1;
-        if let AstKind::FormalParameters(_) = kind {
-            self.parameter_lists -= 1;
+        match kind {
+            AstKind::FormalParameters(_) => self.parameter_lists -= 1,
+            AstKind::LabeledStatement(_) => self.labels -= 1,
+            _ => {}
         }
         if has_scope(kind) {
             self.scopes -= 1;
@@ -308,6 +316,7 @@ fn parse_above(
         parameter_lists: 0,
         block_scopes: 0,
         outer_block_scopes: Vec::new(),
+        labels: 0,
         resolution_lookups: 0,
         stopped: false,
     };
@@ -498,6 +507,7 @@ mod tests {
             parameter_lists: 0,
             block_scopes: 0,
             outer_block_scopes: Vec::new(),
+            labels: 0,
             resolution_lookups: 0,
             stopped: false,
         };
