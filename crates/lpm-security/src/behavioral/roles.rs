@@ -151,7 +151,11 @@ impl EntryReferences {
             return named;
         }
         let mut needles: Vec<&str> = Vec::new();
-        let mut owners: Vec<Vec<(usize, Needle)>> = Vec::new();
+        // The paths still waiting on each needle, anywhere and as a whole
+        // directory. A tarball can repeat an entry, so many paths can share
+        // a needle; each list empties the first time it can be answered,
+        // and an occurrence answers a whole list at once.
+        let mut owners: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
         let mut index_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (path_index, path) in paths.iter().enumerate() {
             let (directory, name) = match path.rsplit_once('/') {
@@ -190,10 +194,13 @@ impl EntryReferences {
                 }
                 let slot = *index_of.entry(needle).or_insert_with(|| {
                     needles.push(needle);
-                    owners.push(Vec::new());
+                    owners.push((Vec::new(), Vec::new()));
                     needles.len() - 1
                 });
-                owners[slot].push((path_index, kind));
+                match kind {
+                    Needle::Anywhere => owners[slot].0.push(path_index),
+                    Needle::WholeDirectory => owners[slot].1.push(path_index),
+                }
             }
         }
         if needles.is_empty() {
@@ -231,18 +238,16 @@ impl EntryReferences {
                 if counted {
                     counted_until[slot] = (reference_index, found.end());
                 }
-                let mut whole_directory = None;
-                for &(path_index, kind) in &owners[slot] {
-                    if named[path_index] {
-                        continue;
-                    }
-                    let matched = match kind {
-                        Needle::Anywhere => true,
-                        Needle::WholeDirectory => *whole_directory.get_or_insert_with(|| {
-                            counted && names_directory_at(reference, found.start(), found.end())
-                        }),
-                    };
-                    if matched {
+                let (anywhere, whole_directory) = &mut owners[slot];
+                let mut answered = std::mem::take(anywhere);
+                if !whole_directory.is_empty()
+                    && counted
+                    && names_directory_at(reference, found.start(), found.end())
+                {
+                    answered.append(whole_directory);
+                }
+                for path_index in answered {
+                    if !named[path_index] {
                         named[path_index] = true;
                         unnamed -= 1;
                     }
@@ -507,5 +512,27 @@ mod tests {
         let references = EntryReferences(vec!["a/".repeat(20_000)]);
         assert!(!references.name("zzz/q.js"));
         assert_eq!(references.names(&paths), vec![true; paths.len()]);
+    }
+
+    #[test]
+    fn paths_sharing_a_needle_are_resolved_once_each() {
+        // A tarball can repeat an entry: thousands of copies of one path
+        // shared a needle, and every occurrence of it revisited them all
+        // while one unnamed path kept the pass going.
+        let references = EntryReferences(vec!["test/a ".repeat(100_000)]);
+        let time = |copies: usize| {
+            let mut paths = vec!["test/a.node"; copies];
+            paths.push("test/z.node");
+            let started = std::time::Instant::now();
+            let named = references.names(&paths);
+            assert_eq!(named.iter().filter(|named| **named).count(), copies);
+            started.elapsed()
+        };
+        let one = time(1);
+        let many = time(5_000);
+        assert!(
+            many < one * 5 + std::time::Duration::from_millis(50),
+            "5,000 copies {many:?}, one {one:?}"
+        );
     }
 }
