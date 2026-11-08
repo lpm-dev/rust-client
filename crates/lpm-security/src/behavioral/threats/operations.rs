@@ -1,7 +1,6 @@
-use super::{Flow, MAX_DEPTH, MAX_STEPS, callee, member, name, named_member};
+use super::{Flow, MAX_DEPTH, callee, member, name, named_member};
 use oxc_ast::{AstKind, StaticPropertyName, ast::*};
-use oxc_semantic::{NodeId, Semantic, SymbolId};
-use oxc_span::GetSpan;
+use oxc_semantic::{Semantic, SymbolId};
 use oxc_str::JSStr;
 use std::collections::HashMap;
 
@@ -57,16 +56,8 @@ impl<'s, 'a> Flow<'s, 'a> {
                     }
                     AstKind::VariableDeclarator(variable) => {
                         let mut api = self.api(variable.init.as_ref()?, next)?;
-                        if let BindingPattern::ObjectPattern(pattern) = &variable.id {
-                            api.method = Some(pattern.properties.iter().find_map(|property| {
-                                if matches!(&property.value, BindingPattern::BindingIdentifier(binding) if binding.symbol_id.get() == Some(symbol)) {
-                                    match &property.key {
-                                        PropertyKey::StaticIdentifier(key) => Some(key.name.as_str()),
-                                        PropertyKey::StringLiteral(key) => key.value.as_str(),
-                                        _ => None,
-                                    }
-                                } else { None }
-                            })?);
+                        if let BindingPattern::ObjectPattern(_) = &variable.id {
+                            api.method = Some(self.destructured.get(&symbol).copied()?);
                         } else if !matches!(&variable.id, BindingPattern::BindingIdentifier(_)) {
                             return None;
                         }
@@ -156,20 +147,15 @@ impl<'s, 'a> Flow<'s, 'a> {
                     api.module == "path" && matches!(api.method, Some("join" | "resolve"))
                 }) =>
             {
-                let args: Vec<_> = call
-                    .arguments
-                    .iter()
-                    .filter_map(Argument::as_expression)
-                    .collect();
-                if let Some(last) = args.last()
+                let last_two = self.last_two_arguments(call);
+                if let Some(last) = last_two[0]
                     && self.credential_path(last, depth + 1)
                 {
                     return true;
                 }
-                let literals: Vec<_> = args
+                let literals: Vec<_> = last_two
                     .iter()
-                    .rev()
-                    .take(2)
+                    .flatten()
                     .map(|arg| {
                         if let Expression::StringLiteral(s) = arg.get_inner_expression() {
                             s.value.as_str()
@@ -254,12 +240,8 @@ impl<'s, 'a> Flow<'s, 'a> {
             }
             Expression::ArrayExpression(array) if !text_only => {
                 let mut value = 0;
-                for expression in array
-                    .elements
-                    .iter()
-                    .filter_map(ArrayExpressionElement::as_expression)
-                {
-                    value |= self.artifact(expression, next, text_only);
+                for &position in self.array_values(array).iter() {
+                    value |= self.artifact(super::array_value(array, position), next, text_only);
                     if self.steps == 0 {
                         break;
                     }
@@ -370,13 +352,10 @@ impl<'s, 'a> Flow<'s, 'a> {
                 let Some(target) = self.target(&call.callee, 0) else {
                     return false;
                 };
-                let count = self.returns.get(&target).map_or(0, Vec::len);
+                let count = self.non_null_returns.get(&target).map_or(0, Vec::len);
                 let mut found = false;
                 for index in 0..count {
-                    let value = self.returns[&target][index];
-                    if matches!(value.get_inner_expression(), Expression::NullLiteral(_)) {
-                        continue;
-                    }
+                    let value = self.non_null_returns[&target][index];
                     if !self.interpreter(value, depth + 1) {
                         return false;
                     }
@@ -425,73 +404,6 @@ enum PathKey<'a> {
     Literal(JSStr<'a>),
 }
 
-pub(super) fn terminators(semantic: &Semantic<'_>) -> HashMap<u32, u32> {
-    semantic
-        .nodes()
-        .iter()
-        .filter_map(|node| {
-            let (block, statements) = match node.kind() {
-                AstKind::BlockStatement(block) => (block.span.start, &block.body),
-                AstKind::FunctionBody(body) => (body.span.start, &body.statements),
-                AstKind::Program(program) => (0, &program.body),
-                _ => return None,
-            };
-            statements
-                .iter()
-                .find(|statement| {
-                    matches!(
-                        statement,
-                        Statement::ReturnStatement(_) | Statement::ThrowStatement(_)
-                    )
-                })
-                .map(|statement| (block, statement.span().end))
-        })
-        .collect()
-}
-
-pub(super) fn reachable(
-    semantic: &Semantic<'_>,
-    terminators: &HashMap<u32, u32>,
-    id: NodeId,
-) -> bool {
-    let start = semantic.nodes().kind(id).span().start;
-    for kind in semantic.nodes().ancestor_kinds(id) {
-        let block = match kind {
-            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => break,
-            AstKind::IfStatement(statement) => {
-                if let Expression::BooleanLiteral(test) = statement.test.get_inner_expression() {
-                    if !test.value
-                        && statement
-                            .consequent
-                            .span()
-                            .contains_inclusive(oxc_span::Span::new(start, start))
-                    {
-                        return false;
-                    }
-                    if test.value
-                        && statement.alternate.as_ref().is_some_and(|alternate| {
-                            alternate
-                                .span()
-                                .contains_inclusive(oxc_span::Span::new(start, start))
-                        })
-                    {
-                        return false;
-                    }
-                }
-                continue;
-            }
-            AstKind::BlockStatement(block) => block.span.start,
-            AstKind::FunctionBody(body) => body.span.start,
-            AstKind::Program(_) => 0,
-            _ => continue,
-        };
-        if terminators.get(&block).is_some_and(|end| *end <= start) {
-            return false;
-        }
-    }
-    true
-}
-
 pub(super) fn has_candidates(semantic: &Semantic<'_>) -> bool {
     semantic.nodes().iter().any(|node| match node.kind() {
         AstKind::CallExpression(call) => matches!(
@@ -532,19 +444,11 @@ pub(super) fn analyze(flow: &mut Flow<'_, '_>, facts: &mut crate::behavioral::bi
                 call.arguments.get(1).and_then(Argument::as_expression),
             )
         {
-            let block = semantic
-                .nodes()
-                .ancestor_kinds(node.id())
-                .find_map(|kind| match kind {
-                    AstKind::BlockStatement(block) => Some(block.span.start),
-                    AstKind::FunctionBody(body) => Some(body.span.start),
-                    AstKind::Program(_) => Some(0),
-                    _ => None,
-                });
-            if !reachable(semantic, &flow.terminators, node.id()) {
+            let block = flow.ancestry.block(semantic, node.id());
+            if !flow.ancestry.reachable(node.id()) {
                 continue;
             }
-            flow.steps = MAX_STEPS;
+            flow.begin_candidate();
             if let Some(key) = flow.path_key(path, 0) {
                 writes
                     .entry((block, key))
@@ -576,10 +480,10 @@ pub(super) fn analyze(flow: &mut Flow<'_, '_>, facts: &mut crate::behavioral::bi
         {
             continue;
         }
-        if !reachable(semantic, &flow.terminators, node.id()) {
+        if !flow.ancestry.reachable(node.id()) {
             continue;
         }
-        flow.steps = MAX_STEPS;
+        flow.begin_candidate();
         let code = if flow.global(function, "eval") {
             arguments.first()
         } else {
@@ -614,15 +518,7 @@ pub(super) fn analyze(flow: &mut Flow<'_, '_>, facts: &mut crate::behavioral::bi
         {
             continue;
         }
-        let block = semantic
-            .nodes()
-            .ancestor_kinds(node.id())
-            .find_map(|kind| match kind {
-                AstKind::BlockStatement(block) => Some(block.span.start),
-                AstKind::FunctionBody(body) => Some(body.span.start),
-                AstKind::Program(_) => Some(0),
-                _ => None,
-            });
+        let block = flow.ancestry.block(semantic, node.id());
         let mut paths = Vec::with_capacity(2);
         if let Some(path) = arguments.first().and_then(Argument::as_expression) {
             paths.push(path);

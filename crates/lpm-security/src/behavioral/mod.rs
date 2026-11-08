@@ -2575,6 +2575,112 @@ mod tests {
         }
     }
 
+    fn nested(open: &str, middle: &str, close: &str, depth: usize) -> String {
+        let mut source = open.repeat(depth);
+        source.push_str(middle);
+        source.push_str(&close.repeat(depth));
+        source
+    }
+
+    #[test]
+    fn references_nested_thousands_of_scopes_deep_are_read_without_semantic_analysis() {
+        // Semantic analysis looks each reference up in every scope around
+        // it: 6,000 nested blocks with a reference in each took seconds.
+        let started = std::time::Instant::now();
+        for source in [
+            nested("{eval(y);", "", "}", 6_000),
+            nested("if(y){eval(y);", "", "}", 6_000),
+            nested("function f(a=y,b=", "0", "){eval(y)}", 3_000),
+        ] {
+            let result = analyze_on_a_worker_stack("index.js", source);
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, 1);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn var_declarations_nested_thousands_of_scopes_deep_are_read_without_semantic_analysis() {
+        // Semantic analysis records each `var` name in every block between
+        // it and its function, so names declared a thousand blocks deep
+        // cost a thousand map entries each, with no reference to count.
+        let vars: String = (0..5_000).map(|i| format!("var x{i};")).collect();
+        let nested_vars = format!("{}eval(y);", nested("{", &vars, "}", 1_000));
+        let flat = format!("{}eval(y);", "var x;".repeat(nested_vars.len() / 6));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.js", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", nested_vars);
+        let nested_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "nested {nested_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn labelled_jumps_inside_thousands_of_labels_are_read_without_semantic_analysis() {
+        // Semantic analysis looks each labelled `break` up in the stack of
+        // labels around it.
+        let labels: String = (0..4_000).map(|i| format!("a{i}:")).collect();
+        let source = format!("{labels}{{{}eval(y);}}", "break a0;".repeat(20_000));
+        let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.js", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", source);
+        let labelled_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            labelled_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "labelled {labelled_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn references_nested_as_deeply_as_real_code_nests_them_are_analyzed() {
+        for source in [
+            nested("{eval(y);", "", "}", 200),
+            nested("function f(a=y,b=", "0", "){eval(y)}", 100),
+            "function f(){var a=1;".repeat(50) + &"a;".repeat(20_000) + &"}".repeat(50),
+            "function f(){".to_owned()
+                + &nested("if(y){", &"var v=eval(y);".repeat(2_000), "}", 6)
+                + "}",
+        ] {
+            let result = analyze_on_a_worker_stack("index.js", source);
+            assert!(result.source.eval || result.files_scanned == 1);
+            assert_eq!(result.unparsed_files, 0);
+        }
+    }
+
+    #[test]
+    fn arrow_defaults_nested_too_deeply_to_parse_stop_in_one_pass() {
+        // A parse that reached the stack floor inside a speculative arrow
+        // function parse once read every level back down to the floor:
+        // gigabytes of arena memory and seconds for a 100 KB source.
+        let source = format!("x={};eval(y);", nested("(a=y,b=", "0", ")=>0", 20_000));
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", source);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn a_long_expression_chain_is_parsed_whole() {
         let result =

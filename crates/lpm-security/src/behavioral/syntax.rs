@@ -1,7 +1,7 @@
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
-use oxc_ast::ast::{JSXText, RegExpLiteral, StringLiteral, TemplateElement};
-use oxc_ast_visit::Visit;
+use oxc_ast::ast::{Expression, JSXText, RegExpLiteral, Statement, StringLiteral, TemplateElement};
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{SourceType, Span};
 use regex::Regex;
@@ -22,6 +22,13 @@ pub(super) struct SourceContext<'s> {
 /// per token, the literal visitor once per node, so this covers the frames
 /// between two checks and the unwinding after one fails.
 const STACK_RED_ZONE: usize = 256 * 1024;
+
+/// How far below the stack floor the literal visitor gives up on a node
+/// by unwinding. Expressions and statements, which deep nesting recurses
+/// through, stop at the floor itself without unwinding; only recursion
+/// through other nodes gets this far. The red zone below the floor holds
+/// it.
+const UNWIND_BELOW_FLOOR: usize = 64 * 1024;
 
 /// Stack for a parse that ran out of the stack its caller had left. A
 /// source that runs out of this too is read without parsing; an adversary
@@ -45,6 +52,18 @@ const SEMANTIC_LEVEL_STACK: usize = if cfg!(debug_assertions) {
 /// the parser recursing, touches a small fraction of its reservation.
 const SEMANTIC_MAX_STACK: usize = 256 * 1024 * 1024;
 
+/// Lookups semantic analysis may spend binding and resolving names, per
+/// byte of source and for any source. Resolving a reference looks for its
+/// name in each scope around it, and a reference in a function's
+/// parameters is looked up again for each function around it. A `var`,
+/// or a function declared in a block, is recorded in each block between
+/// it and its function, and a labelled `break` or `continue` is looked up
+/// in the labels around it. A source that nests thousands of scopes or
+/// labels around each of its names makes the analysis quadratic. Real
+/// code nests a few deep.
+const RESOLUTION_LOOKUPS_PER_BYTE: u64 = 16;
+const RESOLUTION_LOOKUPS_FLOOR: u64 = 1 << 20;
+
 /// A visitor stopped at the stack floor.
 struct StackExhausted;
 
@@ -54,11 +73,82 @@ struct LiteralSpans<'s> {
     stack_floor: usize,
     depth: usize,
     max_depth: usize,
+    /// Scopes around the node being visited.
+    scopes: u64,
+    /// Function parameter lists around the node being visited.
+    parameter_lists: u64,
+    /// Scopes around the node being visited, up to the nearest function
+    /// or the program: the blocks a `var` there is recorded in.
+    block_scopes: u64,
+    /// `block_scopes` of each function the visit is inside.
+    outer_block_scopes: Vec<u64>,
+    /// Labelled statements around the node being visited.
+    labels: u64,
+    /// The most lookups semantic analysis can make resolving the
+    /// references visited so far.
+    resolution_lookups: u64,
+    /// The visitor reached the stack floor and skips the rest.
+    stopped: bool,
+}
+
+/// Whether nodes of this kind get a scope that `var` declarations are
+/// hoisted to. Treating another scope as one would undercount the blocks
+/// a `var` is recorded in.
+fn is_var_scope(kind: AstKind<'_>) -> bool {
+    matches!(
+        kind,
+        AstKind::Program(_)
+            | AstKind::Function(_)
+            | AstKind::ArrowFunctionExpression(_)
+            | AstKind::StaticBlock(_)
+    )
+}
+
+/// Whether semantic analysis gives nodes of this kind a scope of their own.
+fn has_scope(kind: AstKind<'_>) -> bool {
+    matches!(
+        kind,
+        AstKind::Program(_)
+            | AstKind::BlockStatement(_)
+            | AstKind::ForStatement(_)
+            | AstKind::ForInStatement(_)
+            | AstKind::ForOfStatement(_)
+            | AstKind::SwitchStatement(_)
+            | AstKind::CatchClause(_)
+            | AstKind::WithStatement(_)
+            | AstKind::Function(_)
+            | AstKind::ArrowFunctionExpression(_)
+            | AstKind::Class(_)
+            | AstKind::StaticBlock(_)
+            | AstKind::TSEnumBody(_)
+            | AstKind::TSTypeAliasDeclaration(_)
+            | AstKind::TSInterfaceDeclaration(_)
+            | AstKind::TSCallSignatureDeclaration(_)
+            | AstKind::TSConstructSignatureDeclaration(_)
+            | AstKind::TSMethodSignature(_)
+            | AstKind::TSConstructorType(_)
+            | AstKind::TSFunctionType(_)
+            | AstKind::TSConditionalType(_)
+            | AstKind::TSMappedType(_)
+            | AstKind::TSExternalModuleDeclaration(_)
+            | AstKind::TSNamespaceDeclaration(_)
+            | AstKind::TSGlobalDeclaration(_)
+    )
 }
 
 impl LiteralSpans<'_> {
     fn note_value(&mut self, value: Option<&str>) {
         self.random_literal |= value.is_some_and(super::supply_chain::looks_random);
+    }
+
+    /// Whether the visitor reached the stack floor. Expressions and
+    /// statements are the nodes deep nesting recurses through, and skipping
+    /// them there returns up the stack. Unwinding instead costs microseconds
+    /// a frame, and a crafted source can put tens of thousands of frames
+    /// above the floor.
+    fn reached_floor(&mut self) -> bool {
+        self.stopped |= stack_address() < self.stack_floor;
+        self.stopped
     }
 }
 
@@ -80,16 +170,68 @@ fn stack_address() -> usize {
 }
 
 impl<'a> Visit<'a> for LiteralSpans<'_> {
-    fn enter_node(&mut self, _kind: AstKind<'a>) {
-        if stack_address() < self.stack_floor {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.reached_floor() {
+            walk::walk_expression(self, expression);
+        }
+    }
+
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.reached_floor() {
+            walk::walk_statement(self, statement);
+        }
+    }
+
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        if stack_address() < self.stack_floor.saturating_sub(UNWIND_BELOW_FLOOR) {
             std::panic::resume_unwind(Box::new(StackExhausted));
         }
         self.depth += 1;
         self.max_depth = self.max_depth.max(self.depth);
+        let lookups = match kind {
+            AstKind::IdentifierReference(_) => self.scopes.saturating_mul(1 + self.parameter_lists),
+            // A `var` is recorded in every block up to its function, and a
+            // function declared in a block is hoisted out of them. A `let`
+            // or `const` costs less, but counting it the same keeps the
+            // bound an upper one.
+            AstKind::BindingIdentifier(_)
+            | AstKind::VariableDeclarator(_)
+            | AstKind::Function(_) => self.block_scopes,
+            AstKind::BreakStatement(_) | AstKind::ContinueStatement(_) => self.labels,
+            _ => 0,
+        };
+        self.resolution_lookups = self.resolution_lookups.saturating_add(lookups);
+        match kind {
+            AstKind::FormalParameters(_) => self.parameter_lists += 1,
+            AstKind::LabeledStatement(_) => self.labels += 1,
+            _ => {}
+        }
+        if has_scope(kind) {
+            self.scopes += 1;
+            if is_var_scope(kind) {
+                self.outer_block_scopes
+                    .push(std::mem::take(&mut self.block_scopes));
+            } else {
+                self.block_scopes += 1;
+            }
+        }
     }
 
-    fn leave_node(&mut self, _kind: AstKind<'a>) {
+    fn leave_node(&mut self, kind: AstKind<'a>) {
         self.depth -= 1;
+        match kind {
+            AstKind::FormalParameters(_) => self.parameter_lists -= 1,
+            AstKind::LabeledStatement(_) => self.labels -= 1,
+            _ => {}
+        }
+        if has_scope(kind) {
+            self.scopes -= 1;
+            if is_var_scope(kind) {
+                self.block_scopes = self.outer_block_scopes.pop().unwrap_or(0);
+            } else {
+                self.block_scopes -= 1;
+            }
+        }
     }
 
     fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
@@ -133,6 +275,9 @@ enum Unparsed {
     OutOfStack,
     /// Its AST is too deep for semantic analysis on any stack it's given.
     TooDeep,
+    /// Resolving its names would take more lookups than a source its size
+    /// is given.
+    TooManyNestedReferences,
 }
 
 /// Parses `source` and runs the syntax passes over it, masking its comments
@@ -167,13 +312,29 @@ fn parse_above(
         stack_floor,
         depth: 0,
         max_depth: 0,
+        scopes: 0,
+        parameter_lists: 0,
+        block_scopes: 0,
+        outer_block_scopes: Vec::new(),
+        labels: 0,
+        resolution_lookups: 0,
+        stopped: false,
     };
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         literals.visit_program(&parsed.program);
     }))
     .map_err(|_| Unparsed::OutOfStack)?;
+    if literals.stopped {
+        return Err(Unparsed::OutOfStack);
+    }
     let random_literal = (!parsed.fatal_error).then_some(literals.random_literal);
     let complete = !parsed.fatal_error && !parsed.diagnostics.has_errors();
+    let resolution_budget = (source.len() as u64)
+        .saturating_mul(RESOLUTION_LOOKUPS_PER_BYTE)
+        .max(RESOLUTION_LOOKUPS_FLOOR);
+    if complete && literals.resolution_lookups > resolution_budget {
+        return Err(Unparsed::TooManyNestedReferences);
+    }
     let calls = if complete {
         let semantic_stack = literals
             .max_depth
@@ -192,6 +353,9 @@ fn parse_above(
     } else {
         None
     };
+    // Rules that ran out of steps keep what they found, but the file's
+    // coverage is incomplete.
+    let complete = complete && !calls.as_ref().is_some_and(|calls| calls.over_budget);
     Ok(Parsed {
         executable,
         complete,
@@ -227,7 +391,7 @@ fn parse(
     if let Some(floor) = current_stack_floor() {
         match parse_above(source, source_type, stripped, complete_input, floor) {
             Ok(parsed) => return Some(parsed),
-            Err(Unparsed::TooDeep) => return None,
+            Err(Unparsed::TooDeep | Unparsed::TooManyNestedReferences) => return None,
             Err(Unparsed::OutOfStack) => {}
         }
     }
@@ -309,5 +473,74 @@ impl<'s> SourceContext<'s> {
                             .is_some_and(|byte| matches!(byte, b'.' | b'$')))
             })
             .map(|matched| matched.start())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Visits `source` with the floor `room` bytes below where the visit
+    /// starts, on a stack deep enough to parse it, and returns whether the
+    /// visitor stopped at the floor and whether it unwound.
+    fn visit_with_floor_below_here(source: String, room: usize) -> (bool, bool) {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || visit_with_floor(&source, room))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn visit_with_floor(source: &str, room: usize) -> (bool, bool) {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
+        assert!(!parsed.stack_exhausted);
+        let mut executable = source.as_bytes().to_vec();
+        let mut literals = LiteralSpans {
+            executable: &mut executable,
+            random_literal: false,
+            stack_floor: stack_address().saturating_sub(room),
+            depth: 0,
+            max_depth: 0,
+            scopes: 0,
+            parameter_lists: 0,
+            block_scopes: 0,
+            outer_block_scopes: Vec::new(),
+            labels: 0,
+            resolution_lookups: 0,
+            stopped: false,
+        };
+        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            literals.visit_program(&parsed.program);
+        }))
+        .is_err();
+        (literals.stopped, unwound)
+    }
+
+    #[test]
+    fn a_visitor_that_reaches_the_floor_inside_nested_expressions_returns_without_unwinding() {
+        // The parser reads a left-deep chain without recursing, so only the
+        // visitor goes deep; unwinding from its floor cost a second.
+        for source in [
+            format!("x=a{};", ".b".repeat(20_000)),
+            format!("x=a{};", "/b".repeat(20_000)),
+            format!("x={}0{};", "f(".repeat(20_000), ")".repeat(20_000)),
+            format!("{}0;{}", "{".repeat(20_000), "}".repeat(20_000)),
+        ] {
+            let start = source[..40].to_owned();
+            assert_eq!(
+                visit_with_floor_below_here(source, 64 * 1024),
+                (true, false),
+                "{start}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_visitor_with_room_for_the_whole_source_visits_it_all() {
+        let (stopped, unwound) =
+            visit_with_floor_below_here(format!("x=a{};", ".b".repeat(200)), 1024 * 1024);
+        assert!(!stopped && !unwound);
     }
 }

