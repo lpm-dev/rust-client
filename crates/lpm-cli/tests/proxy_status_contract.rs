@@ -933,14 +933,37 @@ fn spawn_echo_upstream() -> u16 {
 }
 
 #[cfg(unix)]
+#[test]
+fn echo_upstream_reads_a_body_sent_after_its_head() {
+    use std::io::{Read, Write};
+
+    // The proxy can write a request's head and body separately; a single
+    // read then saw only the head and echoed an empty body.
+    let port = spawn_echo_upstream();
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to echo");
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nhost: a\r\ncontent-length: 5\r\n\r\n")
+        .expect("write head");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    stream.write_all(b"hello").expect("write body");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read echo response");
+    assert!(
+        response.ends_with("POST /x hello host=- proto=-"),
+        "{response}"
+    );
+}
+
+#[cfg(unix)]
 fn handle_echo_connection(stream: &mut std::net::TcpStream) {
     use std::io::{Read, Write};
 
-    let mut buffer = [0u8; 8192];
-    let Ok(read) = stream.read(&mut buffer) else {
+    let Some(request) = read_whole_request(stream) else {
         return;
     };
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let request = String::from_utf8_lossy(&request);
     let mut request_line = request
         .lines()
         .next()
@@ -974,6 +997,46 @@ fn handle_echo_connection(stream: &mut std::net::TcpStream) {
         response_body
     );
     let _ = stream.write_all(response.as_bytes());
+}
+
+/// Reads one request: its head, then the body its `content-length` or
+/// chunked encoding declares, however many reads that takes.
+#[cfg(unix)]
+fn read_whole_request(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok()?;
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let complete = |request: &[u8]| {
+        let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+        let body = &request[head_end + 4..];
+        if head
+            .lines()
+            .any(|line| line == "transfer-encoding: chunked")
+        {
+            return body.ends_with(b"0\r\n\r\n");
+        }
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        body.len() >= length
+    };
+    while !complete(&request) {
+        let read = stream.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    Some(request)
 }
 
 #[cfg(unix)]
