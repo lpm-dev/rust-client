@@ -202,6 +202,24 @@ pub fn try_compute_script_hash_with_phase_bodies(
     }))
 }
 
+/// A file waiting in the delegate graph walk's queue.
+struct Queued {
+    rel: PathBuf,
+    depth: usize,
+    /// The file that queued this one queued another after it.
+    followed: bool,
+    /// Which file's candidates this was: the files the walk read, numbered
+    /// in order.
+    batch: usize,
+}
+
+/// Hashes the files a delegate reaches, breadth first, in sorted order
+/// among each file's imports, at most [`MAX_DELEGATE_GRAPH_FILES`] of them.
+///
+/// A file's imports join the queue behind everything already in it, so of
+/// them only as many as the walk can still read matter, and whether any are
+/// left when it stops, which decides the limit marker. Queueing every
+/// import cost a path per candidate and a sort, for files of any size.
 fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
     let Some(entry_rel) = normalize_relative_path(rel_path) else {
         hasher.update([DELEGATE_SEP]);
@@ -214,84 +232,175 @@ fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str
     let root = store_pkg_dir
         .canonicalize()
         .unwrap_or_else(|_| store_pkg_dir.to_path_buf());
-    let mut queue = VecDeque::from([(entry_rel, 0usize)]);
+    let mut queued_paths = HashSet::from([entry_rel.clone()]);
+    let mut queue = VecDeque::from([Queued {
+        rel: entry_rel,
+        depth: 0,
+        followed: false,
+        batch: 0,
+    }]);
     let mut seen = HashSet::new();
     let mut visited = 0usize;
+    let mut batches = 0usize;
+    let mut last_queueing_batch = 0usize;
 
-    while let Some((rel, depth)) = queue.pop_front() {
-        if visited >= MAX_DELEGATE_GRAPH_FILES {
-            hasher.update([DELEGATE_GRAPH_SEP]);
-            hasher.update(b"<delegate-graph-file-limit>");
-            break;
-        }
-        if !seen.insert(rel.clone()) {
-            continue;
-        }
+    while let Some(file) = queue.pop_front() {
+        seen.insert(file.rel.clone());
         visited += 1;
+        batches += 1;
+        let batch = batches;
 
-        let rel_display = path_to_slash_string(&rel);
-        hasher.update([DELEGATE_SEP]);
-        hasher.update(rel_display.as_bytes());
-        hasher.update([FIELD_SEP]);
-
-        let abs = store_pkg_dir.join(&rel);
-        let canonical = match abs.canonicalize() {
-            Ok(path) => path,
-            Err(_) => {
-                hasher.update(b"<delegate-unreadable>");
-                continue;
+        hash_delegate_file(hasher, store_pkg_dir, &root, &file, |bytes, base| {
+            let remaining = MAX_DELEGATE_GRAPH_FILES - visited;
+            let next = select_candidates(bytes, base, remaining, &seen, &queued_paths);
+            if next.any {
+                last_queueing_batch = batch;
             }
-        };
-        if !canonical.starts_with(&root) {
-            hasher.update(b"<delegate-outside-package>");
-            continue;
-        }
-
-        let bytes = match std::fs::read(&canonical) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                hasher.update(b"<delegate-unreadable>");
-                continue;
+            for (rel, followed) in next.kept {
+                queued_paths.insert(rel.clone());
+                queue.push_back(Queued {
+                    rel,
+                    depth: file.depth + 1,
+                    followed,
+                    batch,
+                });
             }
-        };
-        let mut inner = Sha256::new();
-        inner.update(&bytes);
-        hasher.update(inner.finalize());
+        });
 
-        if depth >= MAX_DELEGATE_GRAPH_DEPTH {
-            hasher.update([DELEGATE_GRAPH_SEP]);
-            hasher.update(b"<delegate-graph-depth-limit>");
-            continue;
-        }
-
-        let mut next =
-            discover_local_js_dependencies(&bytes, rel.parent().unwrap_or(Path::new("")));
-        next.sort();
-        for candidate in next {
-            if !seen.contains(&candidate) {
-                queue.push_back((candidate, depth + 1));
+        if visited == MAX_DELEGATE_GRAPH_FILES {
+            // The walk's next pop would find something left in its queue.
+            if file.followed || last_queueing_batch > file.batch {
+                hasher.update([DELEGATE_GRAPH_SEP]);
+                hasher.update(b"<delegate-graph-file-limit>");
             }
+            break;
         }
     }
 }
 
-fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf> {
+/// Hashes one file of the graph and, unless it is at the depth limit, hands
+/// its bytes and directory to `queue_imports`.
+fn hash_delegate_file(
+    hasher: &mut Sha256,
+    store_pkg_dir: &Path,
+    root: &Path,
+    file: &Queued,
+    queue_imports: impl FnOnce(&[u8], &Path),
+) {
+    let rel_display = path_to_slash_string(&file.rel);
+    hasher.update([DELEGATE_SEP]);
+    hasher.update(rel_display.as_bytes());
+    hasher.update([FIELD_SEP]);
+
+    let abs = store_pkg_dir.join(&file.rel);
+    let Ok(canonical) = abs.canonicalize() else {
+        hasher.update(b"<delegate-unreadable>");
+        return;
+    };
+    if !canonical.starts_with(root) {
+        hasher.update(b"<delegate-outside-package>");
+        return;
+    }
+    let Ok(bytes) = std::fs::read(&canonical) else {
+        hasher.update(b"<delegate-unreadable>");
+        return;
+    };
+    let mut inner = Sha256::new();
+    inner.update(&bytes);
+    hasher.update(inner.finalize());
+
+    if file.depth >= MAX_DELEGATE_GRAPH_DEPTH {
+        hasher.update([DELEGATE_GRAPH_SEP]);
+        hasher.update(b"<delegate-graph-depth-limit>");
+        return;
+    }
+    queue_imports(&bytes, file.rel.parent().unwrap_or(Path::new("")));
+}
+
+/// What one file adds to the walk's queue.
+struct Selected {
+    /// Whether it queues anything, a file already waiting included.
+    any: bool,
+    /// The files it queues that the walk can still read, in order, each
+    /// with whether another of its candidates follows it.
+    kept: Vec<(PathBuf, bool)>,
+}
+
+/// The candidates of `bytes` not yet read, as the walk would queue them in
+/// sorted order: up to `remaining` of those not already waiting, and
+/// enough about the rest to know which of them another follows.
+fn select_candidates(
+    bytes: &[u8],
+    base_dir: &Path,
+    remaining: usize,
+    seen: &HashSet<PathBuf>,
+    queued: &HashSet<PathBuf>,
+) -> Selected {
+    let mut any = false;
+    // One more than can be read, so the last one read knows whether
+    // another new candidate follows it.
+    let mut smallest_new = std::collections::BTreeSet::new();
+    let mut largest_waiting: Option<PathBuf> = None;
+    for_each_local_js_dependency(bytes, base_dir, |candidate| {
+        if seen.contains(&candidate) {
+            return;
+        }
+        any = true;
+        if remaining == 0 {
+            return;
+        }
+        if queued.contains(&candidate) {
+            if largest_waiting
+                .as_ref()
+                .is_none_or(|largest| candidate > *largest)
+            {
+                largest_waiting = Some(candidate);
+            }
+            return;
+        }
+        if smallest_new.len() <= remaining
+            || smallest_new
+                .last()
+                .is_some_and(|largest| candidate < *largest)
+        {
+            smallest_new.insert(candidate);
+            if smallest_new.len() > remaining + 1 {
+                smallest_new.pop_last();
+            }
+        }
+    });
+    let more_new = smallest_new.len() > remaining;
+    let new: Vec<PathBuf> = smallest_new.into_iter().take(remaining).collect();
+    let last = new.len().saturating_sub(1);
+    let kept = new
+        .into_iter()
+        .enumerate()
+        .map(|(index, rel)| {
+            let followed = more_new
+                || index < last
+                || largest_waiting
+                    .as_ref()
+                    .is_some_and(|largest| *largest > rel);
+            (rel, followed)
+        })
+        .collect();
+    Selected { any, kept }
+}
+
+/// Calls `found` with every local candidate the imports in `bytes` can
+/// resolve to, in no particular order and possibly more than once.
+fn for_each_local_js_dependency(bytes: &[u8], base_dir: &Path, mut found: impl FnMut(PathBuf)) {
     let text = String::from_utf8_lossy(bytes);
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
     for regex in import_regexes() {
         for capture in regex.captures_iter(&text) {
             let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
             };
             for candidate in resolve_local_js_specifier(base_dir, spec) {
-                if seen.insert(candidate.clone()) {
-                    out.push(candidate);
-                }
+                found(candidate);
             }
         }
     }
-    out
 }
 
 pub(crate) fn import_regexes() -> &'static [regex::Regex] {
@@ -1039,5 +1148,189 @@ mod tests {
     #[test]
     fn hex_lower_multibyte() {
         assert_eq!(hex_lower(&[0xab, 0xcd, 0xef, 0x12, 0x34]), "abcdef1234");
+    }
+
+    // The walk as it was before it bounded what it queues, kept to check
+    // that the bounded walk hashes every graph the same.
+    fn old_hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
+        let Some(entry_rel) = normalize_relative_path(rel_path) else {
+            hasher.update([DELEGATE_SEP]);
+            hasher.update(rel_path.as_bytes());
+            hasher.update([FIELD_SEP]);
+            hasher.update(b"<delegate-path-invalid>");
+            return;
+        };
+
+        let root = store_pkg_dir
+            .canonicalize()
+            .unwrap_or_else(|_| store_pkg_dir.to_path_buf());
+        let mut queue = VecDeque::from([(entry_rel, 0usize)]);
+        let mut seen = HashSet::new();
+        let mut visited = 0usize;
+
+        while let Some((rel, depth)) = queue.pop_front() {
+            if visited >= MAX_DELEGATE_GRAPH_FILES {
+                hasher.update([DELEGATE_GRAPH_SEP]);
+                hasher.update(b"<delegate-graph-file-limit>");
+                break;
+            }
+            if !seen.insert(rel.clone()) {
+                continue;
+            }
+            visited += 1;
+
+            let rel_display = path_to_slash_string(&rel);
+            hasher.update([DELEGATE_SEP]);
+            hasher.update(rel_display.as_bytes());
+            hasher.update([FIELD_SEP]);
+
+            let abs = store_pkg_dir.join(&rel);
+            let canonical = match abs.canonicalize() {
+                Ok(path) => path,
+                Err(_) => {
+                    hasher.update(b"<delegate-unreadable>");
+                    continue;
+                }
+            };
+            if !canonical.starts_with(&root) {
+                hasher.update(b"<delegate-outside-package>");
+                continue;
+            }
+
+            let bytes = match std::fs::read(&canonical) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    hasher.update(b"<delegate-unreadable>");
+                    continue;
+                }
+            };
+            let mut inner = Sha256::new();
+            inner.update(&bytes);
+            hasher.update(inner.finalize());
+
+            if depth >= MAX_DELEGATE_GRAPH_DEPTH {
+                hasher.update([DELEGATE_GRAPH_SEP]);
+                hasher.update(b"<delegate-graph-depth-limit>");
+                continue;
+            }
+
+            let mut next =
+                discover_local_js_dependencies(&bytes, rel.parent().unwrap_or(Path::new("")));
+            next.sort();
+            for candidate in next {
+                if !seen.contains(&candidate) {
+                    queue.push_back((candidate, depth + 1));
+                }
+            }
+        }
+    }
+
+    fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for regex in import_regexes() {
+            for capture in regex.captures_iter(&text) {
+                let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+                    continue;
+                };
+                for candidate in resolve_local_js_specifier(base_dir, spec) {
+                    if seen.insert(candidate.clone()) {
+                        out.push(candidate);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_bounded_walk_hashes_every_graph_as_queueing_every_import_did() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for case in 0..160 {
+            let dir = tempfile::tempdir().unwrap();
+            let files = 1 + rng.below(if case % 4 == 0 { 320 } else { 40 });
+            let fan_out = 1 + rng.below(9);
+            let place = |index: usize| match index % 5 {
+                0 => format!("d{}/index.js", index % 7),
+                1 => format!("d{}/f{index}.js", index % 7),
+                _ => format!("f{index}.js"),
+            };
+            for index in 0..files {
+                let path = place(index);
+                let in_dir = path.contains('/');
+                let mut body = String::new();
+                for _ in 0..rng.below(fan_out + 1) {
+                    let target = rng.below(files + files / 4 + 1);
+                    let up = if in_dir { "../" } else { "./" };
+                    let spec = match rng.below(6) {
+                        0 => format!("{up}f{target}"),
+                        1 => format!("{up}f{target}.js"),
+                        2 => format!("{up}d{}", target % 7),
+                        3 => format!("{up}d{}/f{target}", target % 7),
+                        4 => format!("{up}missing{target}"),
+                        _ => "./".to_owned(),
+                    };
+                    body.push_str(&match rng.below(3) {
+                        0 => format!("require('{spec}');\n"),
+                        1 => format!("import x from '{spec}';\n"),
+                        _ => format!("export {{ y }} from \"{spec}\";\n"),
+                    });
+                }
+                let full = dir.path().join(&path);
+                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                std::fs::write(full, body).unwrap();
+            }
+            let entry = place(rng.below(files));
+            assert_same_hash(dir.path(), &entry, &format!("case {case}: {files} files"));
+        }
+        // Chains past the depth limit, and graphs that reach exactly as
+        // many files as the walk reads, one fewer, and one more.
+        for (files, links) in [
+            (20, 1),
+            (40, 2),
+            (127, 1),
+            (128, 1),
+            (129, 1),
+            (128, 3),
+            (129, 3),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            for index in 0..files {
+                let body: String = (1..=links)
+                    .filter(|step| index + step < files)
+                    .map(|step| format!("require('./f{}');\n", index + step))
+                    .collect();
+                std::fs::write(dir.path().join(format!("f{index}.js")), body).unwrap();
+            }
+            assert_same_hash(
+                dir.path(),
+                "f0.js",
+                &format!("{files} files, {links} links"),
+            );
+        }
+    }
+
+    fn assert_same_hash(dir: &Path, entry: &str, label: &str) {
+        {
+            let mut old = Sha256::new();
+            old_hash_delegate_graph(&mut old, dir, entry);
+            let mut new = Sha256::new();
+            hash_delegate_graph(&mut new, dir, entry);
+            assert_eq!(
+                hex_lower(&new.finalize()),
+                hex_lower(&old.finalize()),
+                "{label}, entry {entry}"
+            );
+        }
     }
 }
