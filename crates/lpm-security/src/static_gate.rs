@@ -169,6 +169,9 @@ pub fn classify_with_context(script: &str, ctx: Option<&ManifestContext<'_>>) ->
     if script.trim().is_empty() {
         return StaticTier::Amber;
     }
+    if script.len() > MAX_SCRIPT_BYTES {
+        return StaticTier::Red;
+    }
 
     // Step 1 — raw-string red prefilter.
     if contains_unicode_control_chars(script) || contains_powershell_red_literal(script) {
@@ -350,36 +353,179 @@ pub(crate) fn normalize_operators(s: &str) -> String {
     out
 }
 
+/// A lifecycle script longer than this is red without being read. Real
+/// lifecycle scripts are a few hundred bytes; one this long can't be
+/// reviewed, and each command string nested in it is read again at
+/// every nesting level.
+const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+
+/// The words of a tokenized script, and where each simple command ends.
+///
+/// A red check reads a command word and the arguments after it, up to
+/// the next compound operator. Any word may be the command, so wrappers
+/// such as `corepack pnpm install` can't hide one. A check that rereads
+/// the arguments for every word would be quadratic in a script that
+/// repeats a command word, so the checks read per-position tables built
+/// in one right-to-left pass instead.
+struct Words<'a> {
+    words: Vec<&'a str>,
+    /// Each word's [`command_name`].
+    names: Vec<String>,
+    /// Whether each word is a compound operator ([`is_compound_op`]).
+    operators: Vec<bool>,
+}
+
+impl<'a> Words<'a> {
+    fn new(tokens: &'a [String]) -> Self {
+        Self {
+            words: tokens.iter().map(String::as_str).collect(),
+            names: tokens.iter().map(|token| command_name(token)).collect(),
+            operators: tokens.iter().map(|token| is_compound_op(token)).collect(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Whether position `index` holds an argument of the command before
+    /// it: a word that isn't a compound operator.
+    fn is_argument(&self, index: usize) -> bool {
+        index < self.words.len() && !self.operators[index]
+    }
+
+    /// For each position, the first position at or after it, within the
+    /// same simple command, whose word `matches`. Two entries past the
+    /// end keep lookups of `index + 2` in bounds.
+    fn next_matching(&self, matches: impl Fn(&str) -> bool) -> Vec<Option<usize>> {
+        let mut next = vec![None; self.len() + 2];
+        let mut found = None;
+        for index in (0..self.len()).rev() {
+            if self.operators[index] {
+                found = None;
+            } else if matches(self.words[index]) {
+                found = Some(index);
+            }
+            next[index] = found;
+        }
+        next
+    }
+
+    /// True when the word at `index` is where a shell would look for a
+    /// command name rather than an argument to an earlier command.
+    fn is_command_position(&self, index: usize) -> bool {
+        let Some(previous) = index.checked_sub(1) else {
+            return true;
+        };
+        self.operators[previous]
+            || is_environment_assignment(self.words[previous])
+            || matches!(
+                self.names[previous].as_str(),
+                "env"
+                    | "exec"
+                    | "command"
+                    | "corepack"
+                    | "sudo"
+                    | "time"
+                    | "nice"
+                    | "nohup"
+                    | "xargs"
+                    | "npx"
+                    | "bunx"
+                    | "pnpx"
+                    | "dlx"
+                    | "x"
+            )
+    }
+}
+
+/// The positional arguments of a command whose arguments start at a
+/// given position: everything up to `--` that isn't a flag or a flag's
+/// value.
+struct Positionals {
+    /// The first positional at or after each position.
+    first: Vec<Option<usize>>,
+}
+
+impl Positionals {
+    fn new(words: &Words<'_>, unknown: UnknownFlags) -> Self {
+        let mut first = vec![None; words.len() + 2];
+        for index in (0..words.len()).rev() {
+            if !words.is_argument(index) {
+                continue;
+            }
+            let word = words.words[index];
+            first[index] = if word == "--" {
+                None
+            } else if word.starts_with('-') {
+                let takes_value = VALUE_FLAGS.contains(&word)
+                    || (unknown == UnknownFlags::TakeAValue && !word.contains('='));
+                if !takes_value {
+                    first[index + 1]
+                } else if words.is_argument(index + 1) {
+                    first[index + 2]
+                } else {
+                    None
+                }
+            } else {
+                Some(index)
+            };
+        }
+        Self { first }
+    }
+
+    /// The first positional of the arguments starting at `start`.
+    fn first(&self, start: usize) -> Option<usize> {
+        self.first.get(start).copied().flatten()
+    }
+
+    /// The positional after the one at `positional`.
+    fn after(&self, positional: usize) -> Option<usize> {
+        self.first(positional + 1)
+    }
+
+    /// For each positional, whether it or a later positional of the same
+    /// command satisfies `matches`.
+    fn any_from(&self, words: &Words<'_>, matches: impl Fn(&str) -> bool) -> Vec<bool> {
+        let mut any = vec![false; words.len() + 1];
+        for index in (0..words.len()).rev() {
+            any[index] =
+                matches(words.words[index]) || self.after(index).is_some_and(|next| any[next]);
+        }
+        any
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Step 3 — tokenized red checks
 // ─────────────────────────────────────────────────────────────────────
 
-fn tokens_match_red_at(tokens: &[String], shell_depth: usize) -> bool {
-    if any_token_is_red_command(tokens) {
+fn words_match_red_at(words: &Words<'_>, shell_depth: usize) -> bool {
+    if any_token_is_red_command(words) {
         return true;
     }
-    if has_node_eval(tokens) {
+    if has_node_eval(words) {
         return true;
     }
-    if has_pipe_to_shell(tokens) {
+    if has_pipe_to_shell(words) {
         return true;
     }
-    if has_nested_package_manager(tokens) {
+    if has_nested_package_manager(words) {
         return true;
     }
-    if has_script_policy_override(tokens) {
+    if has_script_policy_override(words) {
         return true;
     }
-    if has_red_shell_command_string(tokens, shell_depth) {
+    if has_red_shell_command_string(words, shell_depth) {
         return true;
     }
-    if has_dangerous_rm(tokens) {
+    if has_dangerous_rm(words) {
         return true;
     }
-    if has_dangerous_chmod(tokens) {
+    if has_dangerous_chmod(words) {
         return true;
     }
-    if has_dangerous_redirect(tokens) {
+    if has_dangerous_redirect(words) {
         return true;
     }
     false
@@ -389,8 +535,8 @@ fn tokens_match_red_at(tokens: &[String], shell_depth: usize) -> bool {
 /// them. Case-insensitive because `iex` is a PowerShell alias and
 /// pwsh is case-insensitive; the others are checked against their
 /// canonical lowercase spellings out of an abundance of caution.
-fn any_token_is_red_command(tokens: &[String]) -> bool {
-    tokens.iter().any(|t| {
+fn any_token_is_red_command(words: &Words<'_>) -> bool {
+    words.words.iter().any(|t| {
         let lc = t.to_ascii_lowercase();
         matches!(lc.as_str(), "iex" | "nc" | "netcat" | "ncat" | "eval")
     })
@@ -414,21 +560,23 @@ fn any_token_is_red_command(tokens: &[String]) -> bool {
 /// classification here so the script can land Green (via
 /// [`matches_node_eval_softfail_green`]) or Amber via the fallback,
 /// per the default-amber-unless-explicit-extension rule.
-fn has_node_eval(tokens: &[String]) -> bool {
-    for (i, t) in tokens.iter().enumerate() {
-        if t != "node" {
+fn has_node_eval(words: &Words<'_>) -> bool {
+    // Each scan stops at the first word that isn't a flag, and `node`
+    // isn't one, so scans from different `node` words never overlap.
+    for (i, t) in words.words.iter().enumerate() {
+        if *t != "node" {
             continue;
         }
-        for (j, follower) in tokens.iter().enumerate().skip(i + 1) {
-            if is_compound_op(follower) {
+        for (j, follower) in words.words.iter().enumerate().skip(i + 1) {
+            if words.operators[j] {
                 break;
             }
-            if follower == "-e" || follower == "--eval" {
+            if *follower == "-e" || *follower == "--eval" {
                 // The next token (after this flag) is the eval body.
                 // If it's a safe softfail wrapper, don't red on this
                 // `-e`; keep scanning (the outer for-loop covers the
                 // unlikely "two node -e's in one script" case).
-                if let Some(body) = tokens.get(j + 1)
+                if let Some(body) = words.words.get(j + 1)
                     && parse_softfail_wrapper(body).is_some()
                 {
                     break;
@@ -545,29 +693,23 @@ fn parse_softfail_wrapper(body: &str) -> Option<String> {
 /// `|` pipe operator whose RHS is a shell, and whose LHS contains
 /// either a fetcher (`curl` / `wget` / `fetch`) or a `base64 -d` /
 /// `base64 --decode`.
-fn has_pipe_to_shell(tokens: &[String]) -> bool {
+fn has_pipe_to_shell(words: &Words<'_>) -> bool {
     const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish"];
 
-    for (i, t) in tokens.iter().enumerate() {
-        if t != "|" {
-            continue;
-        }
-        let Some(next) = tokens.get(i + 1) else {
-            continue;
-        };
-        if !SHELLS.contains(&next.as_str()) {
-            continue;
-        }
-        let prior = &tokens[..i];
-        let has_fetcher = prior
-            .iter()
-            .any(|p| matches!(p.as_str(), "curl" | "wget" | "fetch"));
-        let has_base64_decode = prior
-            .windows(2)
-            .any(|w| w[0] == "base64" && matches!(w[1].as_str(), "-d" | "--decode"));
-        if has_fetcher || has_base64_decode {
+    let mut prior_fetches = false;
+    let mut prior_decodes = false;
+    for (i, t) in words.words.iter().enumerate() {
+        if *t == "|"
+            && (prior_fetches || prior_decodes)
+            && words
+                .words
+                .get(i + 1)
+                .is_some_and(|next| SHELLS.contains(next))
+        {
             return true;
         }
+        prior_fetches |= matches!(*t, "curl" | "wget" | "fetch");
+        prior_decodes |= matches!(*t, "-d" | "--decode") && i > 0 && words.words[i - 1] == "base64";
     }
     false
 }
@@ -584,18 +726,95 @@ fn has_pipe_to_shell(tokens: &[String]) -> bool {
 /// and `pnpm -C dir add` are caught while `npm run install` is not.
 /// Any token can be the command, so wrappers (`corepack pnpm install`)
 /// do not hide it either.
-fn has_nested_package_manager(tokens: &[String]) -> bool {
-    tokens.iter().enumerate().any(|(index, token)| {
-        let Some(manager) = NestedManager::for_command(&command_name(token)) else {
-            return false;
-        };
-        let args: Vec<&str> = tokens[index + 1..]
-            .iter()
-            .take_while(|arg| !is_compound_op(arg))
-            .map(String::as_str)
-            .collect();
-        manager.reaches_other_packages(&args, is_command_position(tokens, index))
+fn has_nested_package_manager(words: &Words<'_>) -> bool {
+    let managers: Vec<(usize, NestedManager)> = words
+        .names
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| NestedManager::for_command(name).map(|m| (index, m)))
+        .collect();
+    if managers.is_empty() {
+        return false;
+    }
+    let arguments = ManagerArguments::new(words);
+    managers.into_iter().any(|(index, manager)| {
+        manager.reaches_other_packages(&arguments, index + 1, words.is_command_position(index))
     })
+}
+
+/// What [`NestedManager::reaches_other_packages`] reads from the
+/// arguments that start at each position.
+struct ManagerArguments<'w, 'a> {
+    words: &'w Words<'a>,
+    /// Indexed by [`UnknownFlags`].
+    positionals: [Positionals; 2],
+    yarn_install_verb_from: [Vec<bool>; 2],
+    remote_module_from: [Vec<bool>; 2],
+    next_download_request: Vec<Option<usize>>,
+    next_double_dash: Vec<Option<usize>>,
+    next_query_flag: Vec<Option<usize>>,
+    positions: std::collections::HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'w, 'a> ManagerArguments<'w, 'a> {
+    fn new(words: &'w Words<'a>) -> Self {
+        let positionals = [
+            Positionals::new(words, UnknownFlags::TakeNoValue),
+            Positionals::new(words, UnknownFlags::TakeAValue),
+        ];
+        let yarn_install_verb = |word: &str| YARN_INSTALL_VERBS.contains(&word);
+        let yarn_install_verb_from = [
+            positionals[0].any_from(words, yarn_install_verb),
+            positionals[1].any_from(words, yarn_install_verb),
+        ];
+        let remote_module_from = [
+            positionals[0].any_from(words, is_remote_module_specifier),
+            positionals[1].any_from(words, is_remote_module_specifier),
+        ];
+        let mut positions: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (index, word) in words.words.iter().enumerate() {
+            positions.entry(word).or_default().push(index);
+        }
+        Self {
+            words,
+            positionals,
+            yarn_install_verb_from,
+            remote_module_from,
+            next_download_request: words.next_matching(is_download_request),
+            next_double_dash: words.next_matching(|word| word == "--"),
+            next_query_flag: words.next_matching(is_query_flag),
+            positions,
+        }
+    }
+
+    /// The first position at or after `start` holding `word`.
+    fn position_of(&self, word: &str, start: usize) -> Option<usize> {
+        let positions = self.positions.get(word)?;
+        positions
+            .get(positions.partition_point(|&position| position < start))
+            .copied()
+    }
+
+    /// [`runner_fetches_explicitly`] for the arguments starting at `start`.
+    fn runner_fetches_explicitly(&self, start: usize) -> bool {
+        let double_dash = self.next_double_dash.get(start).copied().flatten();
+        let requests_download = self
+            .next_download_request
+            .get(start)
+            .copied()
+            .flatten()
+            .is_some_and(|request| double_dash.is_none_or(|double_dash| request < double_dash));
+        let spec = self.positionals[UnknownFlags::TakeNoValue as usize]
+            .first(start)
+            .or_else(|| {
+                double_dash
+                    .map(|double_dash| double_dash + 1)
+                    .filter(|&index| self.words.is_argument(index))
+            })
+            .map(|index| self.words.words[index]);
+        requests_download || spec.is_some_and(is_explicit_package_spec)
+    }
 }
 
 /// Global flags across npm / pnpm / yarn / bun / deno / lpm whose value
@@ -636,27 +855,6 @@ enum UnknownFlags {
     TakeAValue,
 }
 
-/// Positional arguments up to `--`, skipping flags and flag values.
-fn positional_args<'a>(args: &[&'a str], unknown: UnknownFlags) -> Vec<&'a str> {
-    let mut positionals = Vec::new();
-    let mut skip_value = false;
-    for &arg in args {
-        if std::mem::take(&mut skip_value) {
-            continue;
-        }
-        if arg == "--" {
-            break;
-        }
-        if arg.starts_with('-') {
-            skip_value = VALUE_FLAGS.contains(&arg)
-                || (unknown == UnknownFlags::TakeAValue && !arg.contains('='));
-            continue;
-        }
-        positionals.push(arg);
-    }
-    positionals
-}
-
 /// Lowercased basename of a command token without a Windows launcher
 /// extension, so `/usr/local/bin/npm` and `node_modules\.bin\npm.cmd`
 /// both read as `npm`.
@@ -670,33 +868,6 @@ fn command_name(token: &str) -> String {
         }
     }
     name
-}
-
-/// True when `tokens[index]` is where a shell would look for a command
-/// name rather than an argument to an earlier command.
-fn is_command_position(tokens: &[String], index: usize) -> bool {
-    let Some(previous) = index.checked_sub(1).map(|i| tokens[i].as_str()) else {
-        return true;
-    };
-    is_compound_op(previous)
-        || is_environment_assignment(previous)
-        || matches!(
-            command_name(previous).as_str(),
-            "env"
-                | "exec"
-                | "command"
-                | "corepack"
-                | "sudo"
-                | "time"
-                | "nice"
-                | "nohup"
-                | "xargs"
-                | "npx"
-                | "bunx"
-                | "pnpx"
-                | "dlx"
-                | "x"
-        )
 }
 
 pub(crate) fn is_environment_assignment(token: &str) -> bool {
@@ -826,36 +997,51 @@ impl NestedManager {
         })
     }
 
-    /// `args` are every token after the command up to the next compound
-    /// operator. A flag LPM doesn't know may or may not take a value, so
-    /// both readings are checked.
-    fn reaches_other_packages(&self, args: &[&str], at_command_position: bool) -> bool {
+    /// The command's arguments are every word from `start` up to the
+    /// next compound operator. A flag LPM doesn't know may or may not
+    /// take a value, so both readings are checked.
+    fn reaches_other_packages(
+        &self,
+        arguments: &ManagerArguments<'_, '_>,
+        start: usize,
+        at_command_position: bool,
+    ) -> bool {
         self.reaches_with(
-            args,
-            &positional_args(args, UnknownFlags::TakeNoValue),
+            arguments,
+            start,
+            UnknownFlags::TakeNoValue,
             at_command_position,
-        ) || self.reaches_with(
-            args,
-            &positional_args(args, UnknownFlags::TakeAValue),
-            false,
-        )
+        ) || self.reaches_with(arguments, start, UnknownFlags::TakeAValue, false)
     }
 
-    fn reaches_with(&self, args: &[&str], positionals: &[&str], at_command_position: bool) -> bool {
-        let subcommand = positionals.first().copied();
+    fn reaches_with(
+        &self,
+        arguments: &ManagerArguments<'_, '_>,
+        start: usize,
+        unknown: UnknownFlags,
+        at_command_position: bool,
+    ) -> bool {
+        let words = &arguments.words.words;
+        let positionals = &arguments.positionals[unknown as usize];
+        let first = positionals.first(start);
+        let second = first.and_then(|first| positionals.after(first));
+        let subcommand = first.map(|first| words[first]);
         let subcommand_in = |verbs: &[&str]| subcommand.is_some_and(|s| verbs.contains(&s));
-        let runs_initializer = subcommand_in(INITIALIZER_VERBS) && positionals.len() > 1;
-        let runner_args = || {
-            let index = args.iter().position(|arg| Some(*arg) == subcommand);
-            index.map_or(&[][..], |index| &args[index + 1..])
+        let runs_initializer = subcommand_in(INITIALIZER_VERBS) && second.is_some();
+        // The runner's arguments start after the first word spelled like
+        // the subcommand, which may be an earlier flag's value.
+        let runner_fetches = || {
+            subcommand
+                .and_then(|subcommand| arguments.position_of(subcommand, start))
+                .is_some_and(|index| arguments.runner_fetches_explicitly(index + 1))
         };
         match self {
             Self::Runner => true,
-            Self::LocalFirstRunner => runner_fetches_explicitly(args),
+            Self::LocalFirstRunner => arguments.runner_fetches_explicitly(start),
             Self::Npm => {
                 subcommand_in(NPM_INSTALL_VERBS)
                     || runs_initializer
-                    || (subcommand_in(&["exec", "x"]) && runner_fetches_explicitly(runner_args()))
+                    || (subcommand_in(&["exec", "x"]) && runner_fetches())
             }
             Self::Pnpm => subcommand_in(PNPM_INSTALL_VERBS) || runs_initializer,
             Self::Lpm => subcommand_in(LPM_INSTALL_VERBS),
@@ -863,24 +1049,41 @@ impl NestedManager {
             Self::Bun => {
                 subcommand_in(BUN_INSTALL_VERBS)
                     || runs_initializer
-                    || matches!(positionals, ["pm", "trust", ..])
-                    || (subcommand == Some("x") && runner_fetches_explicitly(runner_args()))
+                    || (subcommand == Some("pm") && second.is_some_and(|s| words[s] == "trust"))
+                    || (subcommand == Some("x") && runner_fetches())
             }
             Self::Deno => {
                 subcommand_in(DENO_INSTALL_VERBS)
-                    || (subcommand == Some("x") && runner_fetches_explicitly(runner_args()))
-                    || positionals
-                        .iter()
-                        .any(|arg| is_remote_module_specifier(arg))
+                    || (subcommand == Some("x") && runner_fetches())
+                    || first
+                        .is_some_and(|first| arguments.remote_module_from[unknown as usize][first])
             }
-            Self::Yarn => match positionals {
-                [] => at_command_position && !args.iter().any(|arg| is_query_flag(arg)),
-                ["workspace", _, subcommand, ..] => YARN_INSTALL_VERBS.contains(subcommand),
-                ["workspaces", "foreach", rest @ ..] => {
-                    rest.iter().any(|arg| YARN_INSTALL_VERBS.contains(arg))
+            Self::Yarn => {
+                let Some(first) = first else {
+                    return at_command_position
+                        && arguments
+                            .next_query_flag
+                            .get(start)
+                            .copied()
+                            .flatten()
+                            .is_none();
+                };
+                let third = second.and_then(|second| positionals.after(second));
+                if words[first] == "workspace"
+                    && let Some(third) = third
+                {
+                    YARN_INSTALL_VERBS.contains(&words[third])
+                } else if words[first] == "workspaces"
+                    && let Some(second) = second
+                    && words[second] == "foreach"
+                {
+                    third.is_some_and(|rest| {
+                        arguments.yarn_install_verb_from[unknown as usize][rest]
+                    })
+                } else {
+                    subcommand_in(YARN_INSTALL_VERBS) || runs_initializer
                 }
-                _ => subcommand_in(YARN_INSTALL_VERBS) || runs_initializer,
-            },
+            }
         }
     }
 }
@@ -889,15 +1092,8 @@ impl NestedManager {
 /// is local, and download it otherwise; lifecycle scripts have no TTY,
 /// so npm assumes `--yes`. From the script text alone, only an explicit
 /// download request can be told apart from a local tool like `npx tsc`.
-fn runner_fetches_explicitly(args: &[&str]) -> bool {
-    let requests_download = args.iter().take_while(|arg| **arg != "--").any(|arg| {
-        matches!(*arg, "-y" | "--yes" | "-p" | "--package") || arg.starts_with("--package=")
-    });
-    let spec = positional_args(args, UnknownFlags::TakeNoValue)
-        .first()
-        .copied()
-        .or_else(|| args.iter().skip_while(|arg| **arg != "--").nth(1).copied());
-    requests_download || spec.is_some_and(is_explicit_package_spec)
+fn is_download_request(arg: &str) -> bool {
+    matches!(arg, "-y" | "--yes" | "-p" | "--package") || arg.starts_with("--package=")
 }
 
 /// `name@1.2.3`, `@scope/name@latest`, `npm:x`, `github:x`, URLs and
@@ -923,13 +1119,13 @@ fn is_remote_module_specifier(arg: &str) -> bool {
 /// LPM sets `npm_config_ignore_scripts` / `pnpm_config_ignore_scripts`
 /// / `YARN_ENABLE_SCRIPTS` for every dependency script; a script that
 /// overrides them is deliberately reopening that door.
-fn has_script_policy_override(tokens: &[String]) -> bool {
-    tokens.iter().any(|token| {
+fn has_script_policy_override(words: &Words<'_>) -> bool {
+    words.words.iter().any(|token| {
         let token = token.to_ascii_lowercase();
         is_script_approval_flag(&token)
             || is_script_policy_assignment(&token)
             || is_powershell_guard_reference(&token)
-    }) || removes_script_guard(tokens)
+    }) || removes_script_guard(words)
 }
 
 /// Variables LPM sets to keep nested installs from running scripts.
@@ -960,42 +1156,49 @@ fn is_powershell_guard_reference(token: &str) -> bool {
 
 /// `unset npm_config_ignore_scripts`, `env -u npm_config_ignore_scripts …`
 /// and `env -i …` drop the guard as surely as setting it to `false`.
-fn removes_script_guard(tokens: &[String]) -> bool {
-    tokens.iter().enumerate().any(|(index, token)| {
-        let mut args = tokens[index + 1..]
-            .iter()
-            .map(String::as_str)
-            .take_while(|arg| !is_compound_op(arg));
-        match command_name(token).as_str() {
-            "unset" => args.any(is_script_guard_variable),
-            "env" => {
-                while let Some(arg) = args.next() {
-                    match arg {
-                        "-i" | "--ignore-environment" | "-" => return true,
-                        "-u" | "--unset" => {
-                            if args.next().is_some_and(is_script_guard_variable) {
-                                return true;
-                            }
-                        }
-                        _ if arg.starts_with("--unset=") => {
-                            if is_script_guard_variable(&arg["--unset=".len()..]) {
-                                return true;
-                            }
-                        }
-                        _ if arg.starts_with("-u") => {
-                            if is_script_guard_variable(&arg[2..]) {
-                                return true;
-                            }
-                        }
-                        _ if arg.starts_with('-') || is_environment_assignment(arg) => {}
-                        _ => return false,
-                    }
-                }
-                false
+fn removes_script_guard(words: &Words<'_>) -> bool {
+    let has = |command: &str| words.names.iter().any(|name| name == command);
+    if !has("unset") && !has("env") {
+        return false;
+    }
+    let next_guard = words.next_matching(is_script_guard_variable);
+    // `env_drops_guard[k]`: `env` drops a guard when its options start
+    // at `k`. `env` reads options until its command, and an option such
+    // as `-u` takes the next word, which may itself be spelled `env`.
+    let mut env_drops_guard = vec![false; words.len() + 2];
+    for index in (0..words.len()).rev() {
+        if !words.is_argument(index) {
+            continue;
+        }
+        let arg = words.words[index];
+        env_drops_guard[index] = match arg {
+            "-i" | "--ignore-environment" | "-" => true,
+            "-u" | "--unset" => {
+                words.is_argument(index + 1)
+                    && (is_script_guard_variable(words.words[index + 1])
+                        || env_drops_guard[index + 2])
+            }
+            _ if arg.starts_with("--unset=") => {
+                is_script_guard_variable(&arg["--unset=".len()..]) || env_drops_guard[index + 1]
+            }
+            _ if arg.starts_with("-u") => {
+                is_script_guard_variable(&arg[2..]) || env_drops_guard[index + 1]
+            }
+            _ if arg.starts_with('-') || is_environment_assignment(arg) => {
+                env_drops_guard[index + 1]
             }
             _ => false,
-        }
-    })
+        };
+    }
+    words
+        .names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| match name.as_str() {
+            "unset" => next_guard[index + 1].is_some(),
+            "env" => env_drops_guard[index + 1],
+            _ => false,
+        })
 }
 
 fn is_script_approval_flag(token: &str) -> bool {
@@ -1047,87 +1250,183 @@ const MAX_SHELL_COMMAND_DEPTH: usize = 4;
 /// token to the outer tokenizer, so a red command inside it would
 /// otherwise read as an opaque argument. An encoded PowerShell command
 /// cannot be read at all and is red on its own.
-fn has_red_shell_command_string(tokens: &[String], depth: usize) -> bool {
-    tokens.iter().enumerate().any(|(index, token)| {
-        let args: Vec<&str> = tokens[index + 1..]
-            .iter()
-            .map(String::as_str)
-            .take_while(|arg| !is_compound_op(arg))
-            .collect();
-        match command_string(&command_name(token), &args) {
+fn has_red_shell_command_string(words: &Words<'_>, depth: usize) -> bool {
+    let commands: Vec<usize> = (0..words.len())
+        .filter(|&index| runs_command_string(&words.names[index]))
+        .collect();
+    if commands.is_empty() {
+        return false;
+    }
+    let strings = CommandStrings::new(words);
+    // Several command words can lead to the same body (`sh -o sh -c
+    // '<body>'`), and reading a body is linear in its length, so each
+    // one is read once.
+    let mut read = std::collections::HashSet::new();
+    for index in commands {
+        match strings.command_string(&words.names[index], index + 1) {
+            Some(CommandString::Encoded) => return true,
             Some(CommandString::Body(body)) => {
-                depth >= MAX_SHELL_COMMAND_DEPTH || script_is_red(body, depth + 1)
+                if !read.insert(body) {
+                    continue;
+                }
+                if depth >= MAX_SHELL_COMMAND_DEPTH
+                    || script_is_red(&words.words[body.word][body.offset..], depth + 1)
+                {
+                    return true;
+                }
             }
-            Some(CommandString::Encoded) => true,
-            None => false,
+            None => {}
         }
-    })
+    }
+    false
 }
 
-enum CommandString<'a> {
-    Body(&'a str),
+const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish"];
+
+/// Whether [`CommandStrings::command_string`] can find a command string
+/// for a command with this [`command_name`].
+fn runs_command_string(command: &str) -> bool {
+    POSIX_SHELLS.contains(&command)
+        || matches!(
+            command,
+            "cmd" | "pwsh" | "powershell" | "npx" | "npx-cli.js" | "npm" | "npm-cli.js"
+        )
+}
+
+/// A command string: the text of a word, from a byte offset on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CommandBody {
+    word: usize,
+    offset: usize,
+}
+
+impl CommandBody {
+    fn word(word: usize) -> Self {
+        Self { word, offset: 0 }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommandString {
+    Body(CommandBody),
     Encoded,
 }
 
-/// The command string `command args…` is told to execute, if any.
-fn command_string<'a>(command: &str, args: &[&'a str]) -> Option<CommandString<'a>> {
-    const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish"];
-    match command {
-        shell if POSIX_SHELLS.contains(&shell) => {
-            posix_command_string(args).map(CommandString::Body)
+/// Where the command string of a shell, `cmd`, PowerShell or a package
+/// runner is, for the arguments that start at each position.
+struct CommandStrings<'w, 'a> {
+    words: &'w Words<'a>,
+    posix: Vec<Option<CommandBody>>,
+    powershell: Vec<Option<CommandString>>,
+    next_cmd_switch: Vec<Option<usize>>,
+    next_runner_call: Vec<Option<usize>>,
+    positionals: Positionals,
+}
+
+impl<'w, 'a> CommandStrings<'w, 'a> {
+    fn new(words: &'w Words<'a>) -> Self {
+        Self {
+            words,
+            posix: posix_command_strings(words),
+            powershell: powershell_command_strings(words),
+            next_cmd_switch: words.next_matching(|arg| {
+                arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k")
+            }),
+            next_runner_call: words.next_matching(|arg| {
+                matches!(arg, "--" | "-c" | "--call") || arg.starts_with("--call=")
+            }),
+            positionals: Positionals::new(words, UnknownFlags::TakeNoValue),
         }
-        "cmd" => {
-            let index = args
-                .iter()
-                .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))?;
-            args.get(index + 1).copied().map(CommandString::Body)
+    }
+
+    /// The command string `command` is told to execute when its
+    /// arguments start at `start`, if any.
+    fn command_string(&self, command: &str, start: usize) -> Option<CommandString> {
+        match command {
+            shell if POSIX_SHELLS.contains(&shell) => self.posix[start].map(CommandString::Body),
+            "cmd" => {
+                let switch = self.next_cmd_switch[start]?;
+                self.words
+                    .is_argument(switch + 1)
+                    .then(|| CommandString::Body(CommandBody::word(switch + 1)))
+            }
+            "pwsh" | "powershell" => self.powershell[start],
+            "npx" | "npx-cli.js" => self.runner_call_body(start).map(CommandString::Body),
+            "npm" | "npm-cli.js"
+                if self
+                    .positionals
+                    .first(start)
+                    .is_some_and(|first| matches!(self.words.words[first], "exec" | "x")) =>
+            {
+                self.runner_call_body(start).map(CommandString::Body)
+            }
+            _ => None,
         }
-        "pwsh" | "powershell" => powershell_command_string(args),
-        "npx" | "npx-cli.js" => runner_call_body(args).map(CommandString::Body),
-        "npm" | "npm-cli.js"
-            if matches!(
-                positional_args(args, UnknownFlags::TakeNoValue).first(),
-                Some(&("exec" | "x"))
-            ) =>
-        {
-            runner_call_body(args).map(CommandString::Body)
+    }
+
+    /// The `-c` / `--call` body an `npx` / `npm exec` runner executes.
+    fn runner_call_body(&self, start: usize) -> Option<CommandBody> {
+        let call = self.next_runner_call[start]?;
+        let arg = self.words.words[call];
+        if arg == "--" {
+            return None;
         }
-        _ => None,
+        if arg.starts_with("--call=") {
+            return Some(CommandBody {
+                word: call,
+                offset: "--call=".len(),
+            });
+        }
+        (self.words.is_argument(call + 1) && self.words.words[call + 1] != "--")
+            .then(|| CommandBody::word(call + 1))
     }
 }
 
-/// The `-c` body of a POSIX shell, after any other options (`-e`, `-o
-/// pipefail`, `--login`) and an optional `--` that follows `-c`.
-fn posix_command_string<'a>(args: &[&'a str]) -> Option<&'a str> {
-    let mut args = args.iter().copied();
-    while let Some(arg) = args.next() {
-        match arg {
-            "--" => return None,
+/// For each position, the `-c` body of a POSIX shell whose options start
+/// there, after any other options (`-e`, `-o pipefail`, `--login`) and
+/// an optional `--` that follows `-c`.
+fn posix_command_strings(words: &Words<'_>) -> Vec<Option<CommandBody>> {
+    let mut body = vec![None; words.len() + 2];
+    for index in (0..words.len()).rev() {
+        if !words.is_argument(index) {
+            continue;
+        }
+        let arg = words.words[index];
+        body[index] = match arg {
+            "--" => None,
             "-o" | "+o" | "-O" | "+O" => {
-                args.next();
-            }
-            _ if arg.starts_with("--") || arg.starts_with('+') => {}
-            _ if arg.starts_with('-') => {
-                if arg.contains('c') {
-                    let body = args.next()?;
-                    return if body == "--" {
-                        args.next()
-                    } else {
-                        Some(body)
-                    };
+                if words.is_argument(index + 1) {
+                    body[index + 2]
+                } else {
+                    None
                 }
             }
-            _ => return None,
-        }
+            _ if arg.starts_with("--") || arg.starts_with('+') => body[index + 1],
+            _ if arg.starts_with('-') => {
+                if !arg.contains('c') {
+                    body[index + 1]
+                } else if !words.is_argument(index + 1) {
+                    None
+                } else if words.words[index + 1] == "--" {
+                    words
+                        .is_argument(index + 2)
+                        .then(|| CommandBody::word(index + 2))
+                } else {
+                    Some(CommandBody::word(index + 1))
+                }
+            }
+            _ => None,
+        };
     }
-    None
+    body
 }
 
-/// The command string of `pwsh` / `powershell`: the value of `-Command`
-/// (or any prefix of it, `-c` included), or the first non-option argument,
-/// which Windows PowerShell runs as a command. `-EncodedCommand` (`-e`,
-/// `-ec`, `-enc`, …) is reported as encoded; `-File` runs a file.
-fn powershell_command_string<'a>(args: &[&'a str]) -> Option<CommandString<'a>> {
+/// For each position, the command string of `pwsh` / `powershell` whose
+/// options start there: the value of `-Command` (or any prefix of it,
+/// `-c` included), or the first non-option argument, which Windows
+/// PowerShell runs as a command. `-EncodedCommand` (`-e`, `-ec`, `-enc`,
+/// …) is reported as encoded; `-File` runs a file.
+fn powershell_command_strings(words: &Words<'_>) -> Vec<Option<CommandString>> {
     const VALUE_OPTIONS: &[&str] = &[
         "executionpolicy",
         "ep",
@@ -1142,41 +1441,35 @@ fn powershell_command_string<'a>(args: &[&'a str]) -> Option<CommandString<'a>> 
         "of",
         "settingsfile",
     ];
-    let mut args = args.iter().copied();
-    while let Some(arg) = args.next() {
+    let mut command = vec![None; words.len() + 2];
+    for index in (0..words.len()).rev() {
+        if !words.is_argument(index) {
+            continue;
+        }
+        let arg = words.words[index];
         let Some(option) = arg.strip_prefix('-').or_else(|| arg.strip_prefix('/')) else {
-            return Some(CommandString::Body(arg));
+            command[index] = Some(CommandString::Body(CommandBody::word(index)));
+            continue;
         };
         let option = option.to_ascii_lowercase();
         let abbreviates = |full: &str| !option.is_empty() && full.starts_with(option.as_str());
-        if abbreviates("encodedcommand") || option == "ec" {
-            return Some(CommandString::Encoded);
-        }
-        if abbreviates("command") || abbreviates("commandwithargs") || option == "cwa" {
-            return args.next().map(CommandString::Body);
-        }
-        if abbreviates("file") {
-            return None;
-        }
-        if VALUE_OPTIONS.contains(&option.as_str()) {
-            args.next();
-        }
+        command[index] = if abbreviates("encodedcommand") || option == "ec" {
+            Some(CommandString::Encoded)
+        } else if abbreviates("command") || abbreviates("commandwithargs") || option == "cwa" {
+            words
+                .is_argument(index + 1)
+                .then(|| CommandString::Body(CommandBody::word(index + 1)))
+        } else if abbreviates("file") {
+            None
+        } else if !VALUE_OPTIONS.contains(&option.as_str()) {
+            command[index + 1]
+        } else if words.is_argument(index + 1) {
+            command[index + 2]
+        } else {
+            None
+        };
     }
-    None
-}
-
-/// The `-c` / `--call` body an `npx` / `npm exec` runner executes.
-fn runner_call_body<'a>(args: &[&'a str]) -> Option<&'a str> {
-    let mut args = args.iter().copied().take_while(|arg| *arg != "--");
-    while let Some(arg) = args.next() {
-        if let Some(body) = arg.strip_prefix("--call=") {
-            return Some(body);
-        }
-        if matches!(arg, "-c" | "--call") {
-            return args.next();
-        }
-    }
-    None
+    command
 }
 
 fn script_is_red(script: &str, depth: usize) -> bool {
@@ -1192,59 +1485,51 @@ fn script_is_red(script: &str, depth: usize) -> bool {
 /// `node_modules\.bin\npm.cmd install x` gets a second, red-only pass
 /// with backslashes read as `/`.
 fn normalized_is_red(normalized: &str, tokens: &[String], depth: usize) -> bool {
-    tokens_match_red_at(tokens, depth)
+    words_match_red_at(&Words::new(tokens), depth)
         || (normalized.contains('\\')
             && shlex::split(&normalized.replace('\\', "/"))
-                .is_some_and(|tokens| tokens_match_red_at(&tokens, depth)))
+                .is_some_and(|tokens| words_match_red_at(&Words::new(&tokens), depth)))
 }
 
 /// `rm -rf ~` / `rm -rf /` / `rm -rf $HOME` / `rm -rf *` and close
 /// variants. We require BOTH `-r` and `-f` (in any flag spelling)
 /// before considering targets — `rm foo.txt` without `-r` is not in
 /// this red class.
-fn has_dangerous_rm(tokens: &[String]) -> bool {
-    for (i, t) in tokens.iter().enumerate() {
-        if t != "rm" {
+fn has_dangerous_rm(words: &Words<'_>) -> bool {
+    if !words.words.contains(&"rm") {
+        return false;
+    }
+    // Read right to left, so the flags and targets after each position
+    // are known when an `rm` is reached.
+    let (mut recursive, mut force, mut dangerous_target) = (false, false, false);
+    for (index, word) in words.words.iter().enumerate().rev() {
+        if words.operators[index] {
+            (recursive, force, dangerous_target) = (false, false, false);
             continue;
         }
-        let mut saw_r = false;
-        let mut saw_f = false;
-        let mut targets: Vec<&str> = Vec::new();
-        for follower in tokens.iter().skip(i + 1) {
-            if is_compound_op(follower) {
-                break;
-            }
-            if let Some(flag) = follower.strip_prefix('-') {
-                if flag.is_empty() || flag == "-" {
-                    continue;
-                }
-                // Long-form `--recursive` / `--force`.
-                if flag == "-recursive" || flag == "recursive" {
-                    saw_r = true;
-                    continue;
-                }
-                if flag == "-force" || flag == "force" {
-                    saw_f = true;
-                    continue;
-                }
-                // Short-form clusters like `-rf`, `-fr`, `-Rf`.
-                for c in flag.chars() {
-                    if c == 'r' || c == 'R' {
-                        saw_r = true;
-                    }
-                    if c == 'f' {
-                        saw_f = true;
-                    }
-                }
-                continue;
-            }
-            targets.push(follower.as_str());
-        }
-        if !(saw_r && saw_f) {
-            continue;
-        }
-        if targets.iter().any(|t| is_dangerous_rm_target(t)) {
+        if *word == "rm" && recursive && force && dangerous_target {
             return true;
+        }
+        let Some(flag) = word.strip_prefix('-') else {
+            dangerous_target |= is_dangerous_rm_target(word);
+            continue;
+        };
+        if flag.is_empty() || flag == "-" {
+            continue;
+        }
+        // Long-form `--recursive` / `--force`.
+        if flag == "-recursive" || flag == "recursive" {
+            recursive = true;
+            continue;
+        }
+        if flag == "-force" || flag == "force" {
+            force = true;
+            continue;
+        }
+        // Short-form clusters like `-rf`, `-fr`, `-Rf`.
+        for c in flag.chars() {
+            recursive |= c == 'r' || c == 'R';
+            force |= c == 'f';
         }
     }
     false
@@ -1277,33 +1562,26 @@ fn is_dangerous_rm_target(target: &str) -> bool {
 /// anything further from the script text alone. Relative paths skip
 /// the red classification (they might still land in Amber via the
 /// generic fallback).
-fn has_dangerous_chmod(tokens: &[String]) -> bool {
-    for (i, t) in tokens.iter().enumerate() {
-        if t != "chmod" {
+fn has_dangerous_chmod(words: &Words<'_>) -> bool {
+    if !words.words.contains(&"chmod") {
+        return false;
+    }
+    // Read right to left, so the modes and targets after each position
+    // are known when a `chmod` is reached. Some chmod implementations
+    // accept flags like `-R`; they're opaque, neither mode nor target.
+    let (mut dangerous_mode, mut outside_target) = (false, false);
+    for (index, word) in words.words.iter().enumerate().rev() {
+        if words.operators[index] {
+            (dangerous_mode, outside_target) = (false, false);
             continue;
         }
-        let mut saw_dangerous_mode = false;
-        let mut targets: Vec<&str> = Vec::new();
-        for follower in tokens.iter().skip(i + 1) {
-            if is_compound_op(follower) {
-                break;
-            }
-            if is_dangerous_chmod_mode(follower) {
-                saw_dangerous_mode = true;
-                continue;
-            }
-            if follower.starts_with('-') {
-                // Some chmod implementations accept flags like `-R`;
-                // treat as opaque and keep scanning for the target.
-                continue;
-            }
-            targets.push(follower.as_str());
-        }
-        if !saw_dangerous_mode {
-            continue;
-        }
-        if targets.iter().any(|t| is_outside_package_target(t)) {
+        if *word == "chmod" && dangerous_mode && outside_target {
             return true;
+        }
+        if is_dangerous_chmod_mode(word) {
+            dangerous_mode = true;
+        } else if !word.starts_with('-') {
+            outside_target |= is_outside_package_target(word);
         }
     }
     false
@@ -1332,12 +1610,12 @@ fn is_outside_package_target(target: &str) -> bool {
 /// persistence-establishing redirects into user dotfiles or privileged
 /// system paths. A postinstall writing into these locations is
 /// malware-shaped regardless of what's being written.
-fn has_dangerous_redirect(tokens: &[String]) -> bool {
-    for (i, t) in tokens.iter().enumerate() {
-        if t != ">>" && t != ">" {
+fn has_dangerous_redirect(words: &Words<'_>) -> bool {
+    for (i, t) in words.words.iter().enumerate() {
+        if *t != ">>" && *t != ">" {
             continue;
         }
-        let Some(target) = tokens.get(i + 1) else {
+        let Some(target) = words.words.get(i + 1) else {
             continue;
         };
         if is_dangerous_redirect_target(target) {
@@ -3333,6 +3611,62 @@ mod tests {
         assert_eq!(
             tier_with_ctx("node install.js && echo done", &c),
             StaticTier::Amber
+        );
+    }
+
+    /// `unit` repeated to just under [`MAX_SCRIPT_BYTES`], then `tail`.
+    fn repeated_up_to_the_cap(unit: &str, tail: &str) -> String {
+        let room = MAX_SCRIPT_BYTES - tail.len();
+        let mut script = unit.repeat(room / unit.len());
+        script.push_str(tail);
+        script
+    }
+
+    #[test]
+    fn a_script_longer_than_any_real_lifecycle_script_is_red_without_being_read() {
+        let script = "echo a ".repeat(MAX_SCRIPT_BYTES / 7 + 1);
+        assert!(script.len() > MAX_SCRIPT_BYTES);
+        assert_eq!(tier(&script), StaticTier::Red);
+        assert_eq!(
+            tier(&"echo a ".repeat(MAX_SCRIPT_BYTES / 7 - 1)),
+            StaticTier::Amber
+        );
+    }
+
+    #[test]
+    fn a_script_repeating_one_word_thousands_of_times_is_read_in_one_pass() {
+        // Each shape once made a red check reread every word after each
+        // repetition: a 64 KiB script took seconds, and the check still
+        // has to reach the red command at the end.
+        let shapes = [
+            ("'a' \"b\" ", "curl x | sh"),
+            ("echo a\n", "rm -rf ~"),
+            ("A=1 ", "npm install left-pad"),
+            ("sh -o ", "sh -c 'curl x | sh'"),
+            ("cmd ", "cmd /c \"curl x | sh\""),
+            ("pwsh -ep ", "pwsh -Command 'iex x'"),
+            ("npx ", "npx -c 'curl x | sh'"),
+            ("npm --prefix ", "npm exec --yes left-pad"),
+            (
+                "yarn workspaces foreach ",
+                "yarn workspaces foreach install",
+            ),
+            ("deno ", "deno jsr:@evil/x"),
+            ("env -u ", "env -u npm_config_ignore_scripts node x.js"),
+            ("unset ", "unset npm_config_ignore_scripts"),
+            ("rm ", "rm -rf ~"),
+            ("chmod ", "chmod +x /usr/local/bin/x"),
+            ("| sh ", "curl x | sh"),
+        ];
+        let started = std::time::Instant::now();
+        for (unit, red) in shapes {
+            let script = repeated_up_to_the_cap(unit, red);
+            assert_eq!(tier(&script), StaticTier::Red, "{unit:?} … {red:?}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
         );
     }
 }
