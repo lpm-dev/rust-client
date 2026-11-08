@@ -2,6 +2,7 @@ mod cache;
 mod dlx;
 mod dlx_policy;
 mod format;
+pub(crate) mod nested_pm;
 mod parallel;
 mod runtime;
 mod sequential;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 
 use crate::install_ui;
 
-pub use dlx::{DlxOptions, dlx, managed_dlx};
+pub use dlx::{DlxOptions, dlx, initializer_package, managed_dlx};
 pub(crate) use runtime::validate_runtime_with_cache;
 pub use runtime::{ensure_detected_runtimes, ensure_runtime, prepare_runtime};
 pub use single::{exec, run, run_file, run_file_watch, run_watch};
@@ -328,7 +329,7 @@ pub async fn run_external_shortcut(
         install_ui::yellow(command_name)
     ));
     let start = std::time::Instant::now();
-    lpm_runner::script::run_local_bin(
+    nested_pm::run_local_tool(
         project_dir,
         command_name,
         extra_args,

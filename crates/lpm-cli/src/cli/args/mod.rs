@@ -406,6 +406,10 @@ pub(crate) enum Commands {
     /// Run a package binary without installing it into the project.
     Dlx(network::DlxArgs),
 
+    /// Run a package initializer, like `npm create`: `lpm create vite`
+    /// runs `create-vite` through `lpm dlx`.
+    Create(network::CreateArgs),
+
     /// Materialize a single workspace member's deploy closure into a
     /// self-contained output directory ready for `COPY --from=pruned` in a
     /// Dockerfile.
@@ -606,6 +610,11 @@ pub(crate) enum Commands {
     /// Hidden OXC transform helper for the LPM TypeScript runtime.
     #[command(name = "internal-ts-transform", hide = true)]
     InternalTsTransform(build::InternalTsTransformArgs),
+
+    /// Hidden target of the package-manager shims `lpm dlx` and
+    /// `lpm exec` put on a tool's PATH.
+    #[command(name = "internal-nested-pm", hide = true)]
+    InternalNestedPm(build::InternalNestedPmArgs),
 
     /// Hidden registry helper: the code signals of a published release,
     /// from its gzipped tarball on stdin, as JSON.

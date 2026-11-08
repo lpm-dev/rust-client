@@ -1378,3 +1378,145 @@ async fn dlx_engine_checks_distinguish_installed_and_skipped_optional_dependenci
         }
     }
 }
+
+/// A scaffolder that writes a project, approves its dependency's build
+/// for pnpm, and installs it with npm, like `create-protoyard`.
+#[cfg(unix)]
+const SCAFFOLDER: &[u8] = br#"#!/usr/bin/env node
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const target = path.resolve(process.argv[2]);
+fs.mkdirSync(target, { recursive: true });
+fs.writeFileSync(path.join(target, 'package.json'), JSON.stringify({ name: 'app', version: '1.0.0', dependencies: { 'scripted-dep': '1.0.0' } }));
+fs.writeFileSync(path.join(target, 'pnpm-workspace.yaml'), 'allowBuilds:\n  scripted-dep: true\n');
+fs.writeFileSync(path.join(target, 'user-agent.txt'), process.env.npm_config_user_agent || '');
+const result = spawnSync('npm', ['install', '--no-audit', '--no-fund'], { cwd: target, stdio: 'inherit' });
+process.exit(result.status === null ? 1 : result.status);
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dlx_tool_npm_install_runs_through_lpm_and_reports_the_approvals_it_wrote() {
+    let project = TempProject::empty(r#"{"name":"caller","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let scaffolder = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"create-fixture-app","version":"1.0.0","bin":{"create-fixture-app":"bin/create.js"}}),
+        &[("bin/create.js", SCAFFOLDER)],
+    );
+    mock.with_package_published_at(
+        "create-fixture-app",
+        "1.0.0",
+        &scaffolder,
+        &iso8601_n_secs_ago(72 * 3600),
+    )
+    .await;
+    let dependency = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name":"scripted-dep",
+            "version":"1.0.0",
+            "scripts":{"postinstall":"node -e \"require('fs').writeFileSync(require('path').join(process.env.INIT_CWD,'POSTINSTALL_RAN'),'')\""}
+        }),
+        &[],
+    );
+    mock.with_package_published_at(
+        "scripted-dep",
+        "1.0.0",
+        &dependency,
+        &iso8601_n_secs_ago(72 * 3600),
+    )
+    .await;
+
+    // The nested `lpm install` reads the user's registry like any install.
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!("registry={}/\n", mock.url()),
+    )
+    .unwrap();
+    let fake_npm = project.home().join("fake-npm-bin");
+    std::fs::create_dir_all(&fake_npm).unwrap();
+    std::fs::write(fake_npm.join("npm"), "#!/bin/sh\necho \"fake-npm $*\"\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fake_npm.join("npm"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(fake_npm).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("PATH", path)
+        .args(["dlx", "create-fixture-app@1.0.0", "my-app"])
+        .output()
+        .unwrap();
+    assert_dlx_success(&output);
+
+    let app = project.path().join("my-app");
+    assert!(
+        app.join("lpm.lock").is_file(),
+        "npm install must have been handled by lpm install"
+    );
+    assert!(!app.join("package-lock.json").exists());
+    assert!(
+        !app.join("POSTINSTALL_RAN").exists(),
+        "the dependency script must stay blocked until approved in LPM"
+    );
+    let user_agent = std::fs::read_to_string(app.join("user-agent.txt")).unwrap();
+    let tokens: Vec<&str> = user_agent.split_whitespace().collect();
+    assert!(
+        matches!(tokens.as_slice(), [lpm, "npm/?", "node/?", _, _] if lpm.starts_with("lpm/")),
+        "{user_agent}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("create-fixture-app@1.0.0 ran 1 package-manager command"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("npm install --no-audit --no-fund  →  handled by lpm install  (in my-app)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("my-app/pnpm-workspace.yaml  allowBuilds: scripted-dep"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn create_runs_the_initializer_package_with_its_arguments() {
+    let project = TempProject::empty(r#"{"name":"caller","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let initializer = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"create-hello","version":"1.0.0","bin":{"create-hello":"bin/create.js"}}),
+        &[(
+            "bin/create.js",
+            b"#!/usr/bin/env node\nconsole.log('create-hello:' + process.argv.slice(2).join(' '));\n",
+        )],
+    );
+    mock.with_package_published_at(
+        "create-hello",
+        "1.0.0",
+        &initializer,
+        &iso8601_n_secs_ago(72 * 3600),
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "create",
+            "hello@1.0.0",
+            "my-app",
+            "--template",
+            "react",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert_dlx_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("create-hello:my-app --template react -v"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

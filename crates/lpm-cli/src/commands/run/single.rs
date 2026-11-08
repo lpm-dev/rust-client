@@ -456,7 +456,7 @@ pub async fn exec(
         install_ui::yellow(command_name)
     ));
     let start = std::time::Instant::now();
-    lpm_runner::script::run_local_bin(
+    super::nested_pm::run_local_tool(
         project_dir,
         command_name,
         extra_args,

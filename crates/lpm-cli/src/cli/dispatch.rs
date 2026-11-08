@@ -32,6 +32,13 @@ use super::helpers::{
 };
 
 pub(crate) fn run() -> Result<()> {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(manager) = commands::run::nested_pm::launcher_manager(&exe)
+    {
+        commands::run::nested_pm::exit_with_shim(manager, std::env::args_os().skip(1).collect());
+    }
+
     // Color policy must initialize BEFORE any styled output, including
     // the `--version` fast path (which prints an `update_check` notice)
     // and the bare-`lpm install` fast lane below (which prints a header
@@ -217,6 +224,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             exit_with_lpm_error(&error, true);
         }
         return Ok(());
+    }
+
+    if let Commands::InternalNestedPm(args) = &command {
+        commands::run::nested_pm::exit_with_shim(&args.manager, args.args.clone());
     }
 
     if let Commands::InternalTsTransform(args) = &command {
@@ -982,7 +993,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
 
             if packages.is_empty() {
-                let workspace_root_default = lpm_workspace::read_package_json(
+                let manifest_declares_workspaces = lpm_workspace::read_package_json(
                     &cwd.join("package.json"),
                 )
                 .map_err(|error| {
@@ -991,9 +1002,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                     ))
                 })?
                 .workspaces
-                .is_some()
-                    || install_state::has_pnpm_workspace_yaml(&cwd);
-                let recursive_install = recursive || (workspace_root_default && !no_recursive);
+                .is_some();
+                let recursive_install = recursive
+                    || (!no_recursive
+                        && (manifest_declares_workspaces
+                            || install_state::pnpm_workspace_declares_packages(&cwd)));
 
                 if catalog.is_some() {
                     return Err(lpm_common::LpmError::Script(
@@ -2280,6 +2293,38 @@ async fn async_main(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Create(args) => {
+            let network_args::CreateArgs {
+                initializer,
+                refresh,
+                allow_new,
+                min_release_age,
+                min_release_age_exclude,
+                args,
+            } = args;
+            let package = commands::run::initializer_package(&initializer)?;
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let min_release_age_override = match min_release_age.as_deref() {
+                Some(s) => Some(release_age_config::parse_duration(s)?),
+                None => None,
+            };
+            commands::run::dlx(
+                &client,
+                &cwd,
+                &package,
+                commands::run::DlxOptions {
+                    extra_args: &args,
+                    refresh,
+                    allow_new,
+                    strict_integrity: false,
+                    min_release_age_override,
+                    min_release_age_exclude: &min_release_age_exclude,
+                    inherit_caller_context: true,
+                    reserve_stdout: cli.json,
+                },
+            )
+            .await
+        }
         Commands::Filter(args) => {
             let lifecycle_args::FilterArgs {
                 exprs,
@@ -3259,6 +3304,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             std::process::exit(0);
         }
         Commands::InternalTsTransform(_)
+        | Commands::InternalNestedPm(_)
         | Commands::InternalVerifyRelease(_)
         | Commands::InternalPackageSignals(_) => {
             unreachable!("handled before async command dispatch")
