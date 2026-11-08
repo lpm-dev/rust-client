@@ -420,6 +420,53 @@ server.listen(process.env.PORT, '127.0.0.1', () => {
 
 #[cfg(unix)]
 #[test]
+fn dev_leaves_the_hosts_file_untouched_when_the_dev_command_rejects_the_port() {
+    let project = TempProject::empty(
+        r#"{"name":"local-domain-port","version":"1.0.0","scripts":{"dev":"vite --port 5173"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"proxy":{"host":"shop.test"}}"#);
+    project.write_file("hosts", "127.0.0.1 localhost\n");
+    let hosts_path = project.path().join("hosts");
+    let mut proxy = lpm_spawnable(&project)
+        .args(["proxy", "start", "--tls-port", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn lpm proxy start");
+    wait_for_proxy_running(&project, &mut proxy);
+
+    let output = lpm(&project)
+        .args([
+            "dev",
+            "--no-install",
+            "--no-open",
+            "--yes",
+            "--port",
+            "4000",
+        ])
+        .env("LPM_CERT_TEST_TRUST_STORE_DIR", trust_store_dir(&project))
+        .env("LPM_HOSTS_FILE", &hosts_path)
+        .timeout(Duration::from_secs(60))
+        .output()
+        .expect("run lpm dev with a conflicting port");
+    stop_proxy(&project, &mut proxy);
+
+    assert!(
+        !output.status.success(),
+        "the conflicting port must stop the session\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hosts_path).unwrap(),
+        "127.0.0.1 localhost\n",
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn dev_aborts_non_interactive_non_localhost_host_without_hosts_file_consent() {
     let project = TempProject::empty(r#"{"name":"local-domain-dev","version":"1.0.0"}"#);
     project.write_file(

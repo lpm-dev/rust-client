@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -310,16 +310,59 @@ const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
+/// Holds taken while the dashboard draws the terminal. Orchestrator output
+/// written then would land under the dashboard and garble it; the dashboard
+/// gets the same logs and status through its event stream.
+static DASHBOARD_TERMINAL_HOLDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Keeps orchestrator output off the terminal while the dashboard draws it.
+#[must_use = "the terminal is released when the hold is dropped"]
+pub struct DashboardTerminalHold(());
+
+impl DashboardTerminalHold {
+    pub fn acquire() -> Self {
+        DASHBOARD_TERMINAL_HOLDS.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+
+impl Drop for DashboardTerminalHold {
+    fn drop(&mut self) {
+        DASHBOARD_TERMINAL_HOLDS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether the dashboard draws the terminal, so other output must stay off it.
+pub fn dashboard_owns_terminal() -> bool {
+    DASHBOARD_TERMINAL_HOLDS.load(Ordering::Acquire) > 0
+}
+
+macro_rules! terminal_eprintln {
+    ($($arg:tt)*) => {
+        if !dashboard_owns_terminal() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+macro_rules! terminal_println {
+    ($($arg:tt)*) => {
+        if !dashboard_owns_terminal() {
+            println!($($arg)*);
+        }
+    };
+}
+
 fn ui_paint(color: &str, text: &str) -> String {
     format!("{color}{text}{RESET}")
 }
 
 fn ui_phase(msg: &str) {
-    eprintln!("  {} {msg}", ui_paint(CYAN, "›"));
+    terminal_eprintln!("  {} {msg}", ui_paint(CYAN, "›"));
 }
 
 fn ui_warn(msg: &str) {
-    eprintln!("  {} {msg}", ui_paint(YELLOW, "!"));
+    terminal_eprintln!("  {} {msg}", ui_paint(YELLOW, "!"));
 }
 
 fn ui_service_prefix(color: &str, name: &str) -> String {
@@ -329,7 +372,7 @@ fn ui_service_prefix(color: &str, name: &str) -> String {
 
 fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, msg: &str) {
     let msg = sanitize_terminal_inline(msg);
-    eprintln!(
+    terminal_eprintln!(
         "  {} {} {msg}",
         ui_paint(status_color, glyph),
         ui_service_prefix(color, name),
@@ -338,7 +381,7 @@ fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, m
 
 fn ui_service_note(color: &str, name: &str, msg: &str) {
     let msg = sanitize_terminal_inline(msg);
-    eprintln!("  {} {msg}", ui_service_prefix(color, name));
+    terminal_eprintln!("  {} {msg}", ui_service_prefix(color, name));
 }
 
 fn ui_format_duration(duration: Duration) -> String {
@@ -1181,17 +1224,23 @@ fn assign_service_ports(
         if !needs_managed_port && config.port.is_none() {
             continue;
         }
-        let requested_port = is_primary
-            .then_some(primary_port)
-            .flatten()
+        let cli_port = is_primary.then_some(primary_port).flatten();
+        let command_port = is_primary.then_some(primary_command_port).flatten();
+        let requested_port = cli_port
             .or_else(|| port_overrides.get(name).copied())
             .or(config.port)
-            .or_else(|| is_primary.then_some(primary_command_port).flatten());
+            .or(command_port);
         let Some(port) =
             requested_port.or_else(|| needs_managed_port.then_some(HOST_ONLY_DEFAULT_PORT_START))
         else {
             continue;
         };
+        // `--port` applies to one run, and a port written into the command
+        // can't move, so neither leaves a saved assignment behind: a saved
+        // reassignment of either would replace the project's port on every
+        // later run.
+        let reassignment_is_saved =
+            cli_port.is_none() && !(command_port.is_some() && requested_port == command_port);
 
         match reserve_service_port(port, &reserved_ports, port_allocation)? {
             ServicePortReservation::Conflict(reason) => {
@@ -1220,7 +1269,9 @@ fn assign_service_ports(
                 }
                 port_map.insert(name.clone(), next);
                 reserved_ports.insert(next, name.clone());
-                port_allocation.write_override(project_dir, name, next);
+                if reassignment_is_saved {
+                    port_allocation.write_override(project_dir, name, next);
+                }
             }
             ServicePortReservation::Acquired(lease) => {
                 leases.push(lease);
@@ -1389,12 +1440,12 @@ pub fn run_services_with_config(
         .collect();
 
     // Print startup banner with port reassignment info
-    eprintln!();
+    terminal_eprintln!();
     if let Some(notice) = crate::dotenv::personal_override_notice(
         loaded.layers.override_count(),
         loaded.env_name.as_deref().unwrap_or("default"),
     ) {
-        eprintln!("  {}", lpm_common::color::Painted::dimmed(&notice));
+        terminal_eprintln!("  {}", lpm_common::color::Painted::dimmed(&notice));
         crate::dotenv::log_personal_override_names(loaded.layers.overrides());
     }
     for name in &service_names {
@@ -1435,7 +1486,7 @@ pub fn run_services_with_config(
             command,
         ));
     }
-    eprintln!();
+    terminal_eprintln!();
 
     // Shutdown state: 0 = running, 1 = graceful shutdown (SIGTERM), 2+ = force kill (SIGKILL)
     let shutdown_state = Arc::new(AtomicU8::new(0));
@@ -1870,7 +1921,7 @@ fn spawn_output_readers(
                     }
                     let safe_name = sanitize_terminal_inline(&name);
                     let safe_line = sanitize_terminal_inline(line);
-                    println!("  {color}[{safe_name}]{RESET} {safe_line}");
+                    terminal_println!("  {color}[{safe_name}]{RESET} {safe_line}");
                     if let Some(ref tx) = event_tx {
                         let _ = tx.try_send(OrchestratorEvent::ServiceLog {
                             service_index,
@@ -1897,7 +1948,7 @@ fn spawn_output_readers(
                     }
                     let safe_name = sanitize_terminal_inline(&name);
                     let safe_line = sanitize_terminal_inline(line);
-                    eprintln!("  {color}[{safe_name}]{RESET} {safe_line}");
+                    terminal_eprintln!("  {color}[{safe_name}]{RESET} {safe_line}");
                     if let Some(ref tx) = event_tx {
                         let _ = tx.try_send(OrchestratorEvent::ServiceLog {
                             service_index,
@@ -2025,11 +2076,11 @@ fn ctrlc_handler(
             if prev == 0 {
                 // After SIGHUP the terminal is gone, and writing to it fails.
                 if signal != SIGHUP {
-                    eprintln!();
+                    terminal_eprintln!();
                     ui_warn("Stopping services...");
                 }
             } else {
-                eprintln!();
+                terminal_eprintln!();
                 ui_warn("Force-killing services...");
                 force_kill_children(&kids);
                 break;
@@ -2088,7 +2139,7 @@ fn shutdown_children_ordered(
 
     if force {
         let mut locked = children.lock();
-        eprintln!();
+        terminal_eprintln!();
         ui_warn(&format!("Force-killing {count} services..."));
         for (name, child) in locked.iter_mut() {
             force_kill_service_tree(child);
@@ -2097,7 +2148,7 @@ fn shutdown_children_ordered(
         return;
     }
 
-    eprintln!();
+    terminal_eprintln!();
     ui_warn(&format!("Stopping {count} services..."));
 
     // Build the shutdown order: reverse topological levels (dependents first)
@@ -3080,6 +3131,52 @@ mod tests {
         assert_eq!(assigned_ports.reassignments["web"].new, assigned);
     }
 
+    fn busy_port_reassignment_is_saved(
+        primary_port: Option<u16>,
+        primary_command_port: Option<u16>,
+        declared_port: Option<u16>,
+    ) -> bool {
+        let dir = tempfile::TempDir::new().unwrap();
+        let services = HashMap::from([(
+            "web".to_string(),
+            ServiceConfig {
+                command: "true".to_string(),
+                port: declared_port,
+                primary: true,
+                ..Default::default()
+            },
+        )]);
+        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+            lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
+            dir.path().join("port-leases"),
+        )
+        .unwrap();
+
+        let assigned = assign_service_ports(
+            dir.path(),
+            &services,
+            &mut allocation,
+            primary_port,
+            primary_command_port,
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(assigned.reassignments.contains_key("web"));
+        allocation.read_overrides(dir.path()).contains_key("web")
+    }
+
+    #[test]
+    fn a_busy_cli_or_command_port_is_reassigned_for_the_run_without_being_saved() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = listener.local_addr().unwrap().port();
+
+        assert!(!busy_port_reassignment_is_saved(Some(busy), None, None));
+        assert!(!busy_port_reassignment_is_saved(None, Some(busy), None));
+        assert!(busy_port_reassignment_is_saved(None, None, Some(busy)));
+    }
+
     #[test]
     fn assign_service_ports_manages_the_implicit_primary_service_without_configured_port() {
         let mut services = HashMap::new();
@@ -3271,6 +3368,19 @@ mod tests {
             stderr_lines.iter().any(|l| l.contains("STDERR_LINE")),
             "should capture stderr, got: {stderr_lines:?}"
         );
+    }
+
+    #[test]
+    fn a_dashboard_hold_keeps_output_off_the_terminal_until_every_hold_is_released() {
+        let first = DashboardTerminalHold::acquire();
+        let second = DashboardTerminalHold::acquire();
+        assert!(dashboard_owns_terminal());
+
+        drop(first);
+        assert!(dashboard_owns_terminal(), "one hold remains");
+
+        drop(second);
+        assert!(!dashboard_owns_terminal());
     }
 
     #[test]

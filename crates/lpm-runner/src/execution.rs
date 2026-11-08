@@ -123,37 +123,58 @@ impl ExecutionSignals {
 
     /// Preserve the foreground group so interactive children can read stdin.
     pub fn run(&self, command: &mut Command) -> Result<ExitStatus, LpmError> {
-        self.check()?;
-        // Registered before the spawn, so an exit that happens first still
-        // leaves a wakeup behind.
-        #[cfg(unix)]
-        let wake = ChildOrStopWake::new()?;
+        let wait = self.prepare_wait()?;
         let mut child = crate::env_access::spawn(command)?;
+        wait.wait(&mut child)
+    }
+
+    /// Prepares to wait on a child that the caller spawns next. Created
+    /// before the spawn, so an exit that happens first still wakes the wait.
+    pub fn prepare_wait(&self) -> Result<ChildWait<'_>, LpmError> {
+        self.check()?;
+        Ok(ChildWait {
+            signals: self,
+            #[cfg(unix)]
+            wake: ChildOrStopWake::new()?,
+        })
+    }
+}
+
+/// A wait on one child that forwards SIGINT and SIGTERM to it and its
+/// descendants, then reports the interruption as exit code 128 + signal.
+pub struct ChildWait<'a> {
+    signals: &'a ExecutionSignals,
+    #[cfg(unix)]
+    wake: ChildOrStopWake,
+}
+
+impl ChildWait<'_> {
+    pub fn wait(self, child: &mut std::process::Child) -> Result<ExitStatus, LpmError> {
         #[cfg(not(unix))]
         let started = std::time::Instant::now();
         loop {
             #[cfg(unix)]
-            wake.clear();
-            if self.is_stopped() {
+            self.wake.clear();
+            if self.signals.is_stopped() {
                 #[cfg(unix)]
                 crate::ports::stop_child_process_tree(
-                    &mut child,
-                    self.signal.load(Ordering::Acquire) as i32,
+                    child,
+                    self.signals.signal.load(Ordering::Acquire) as i32,
                 )?;
                 #[cfg(not(unix))]
-                crate::ports::terminate_child_process_tree(&mut child)?;
-                self.check()?;
+                crate::ports::terminate_child_process_tree(child)?;
+                self.signals.check()?;
             }
             match child.try_wait() {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = crate::ports::terminate_child_process_tree(&mut child);
+                    let _ = crate::ports::terminate_child_process_tree(child);
                     return Err(error.into());
                 }
             }
             #[cfg(unix)]
-            wake.wait();
+            self.wake.wait();
             #[cfg(not(unix))]
             std::thread::sleep(std::time::Duration::from_millis(
                 if started.elapsed() < std::time::Duration::from_millis(100) {
