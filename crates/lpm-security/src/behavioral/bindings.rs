@@ -17,6 +17,9 @@ pub(super) struct CallFacts {
     pub unresolved_evaluation: Option<usize>,
     /// Every call or construction `evaluation` and `unresolved_evaluation` found.
     pub evaluation_calls: usize,
+    /// The threat rules ran out of the steps a file of this size is given,
+    /// so they may have missed a flow.
+    pub over_budget: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,6 +192,64 @@ fn is_static_string(expression: &Expression<'_>, depth: usize) -> bool {
     }
 }
 
+/// Answers the analysis reuses within one file. Several questions follow
+/// a binding to its declaration and read the whole object or pattern
+/// there, and a file can ask them of the same declaration once per call:
+/// quadratic in a file that repeats one call, and worse when objects
+/// spread each other.
+#[derive(Default)]
+struct Memo {
+    /// [`shell_option`] by expression address and depth.
+    shell: HashMap<(usize, usize), Option<bool>>,
+    /// [`has_local_eval_method`]'s scan of an object literal or class
+    /// body, by its address.
+    local_eval: HashMap<usize, bool>,
+    /// For each binding a declarator destructures from an object, the
+    /// property name [`origin`] reads: the first property of the
+    /// declarator's own pattern that binds it and has a static name.
+    destructured: HashMap<SymbolId, String>,
+    /// Set once the assignment rounds settle: from then on an expression's
+    /// [`origin`] at a depth never changes, and a conditional or logical
+    /// expression that branches at every level asks for each node up to
+    /// 2⁸ times.
+    settled: bool,
+    origins: std::cell::RefCell<HashMap<(usize, usize), Option<Origin>>>,
+}
+
+impl Memo {
+    fn new(semantic: &Semantic<'_>) -> Self {
+        let mut destructured = HashMap::new();
+        for node in semantic.nodes().iter() {
+            let AstKind::VariableDeclarator(variable) = node.kind() else {
+                continue;
+            };
+            let BindingPattern::ObjectPattern(pattern) = &variable.id else {
+                continue;
+            };
+            for property in &pattern.properties {
+                let BindingPattern::BindingIdentifier(binding) = &property.value else {
+                    continue;
+                };
+                let Some(symbol) = binding.symbol_id.get() else {
+                    continue;
+                };
+                if let Some(name) = property.key.static_name()
+                    && let Some(name) = name.as_str()
+                    && semantic.scoping().symbol_declaration(symbol) == node.id()
+                {
+                    destructured
+                        .entry(symbol)
+                        .or_insert_with(|| name.to_owned());
+                }
+            }
+        }
+        Self {
+            destructured,
+            ..Self::default()
+        }
+    }
+}
+
 fn required_module(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> Option<Origin> {
     let Expression::Identifier(identifier) = call.callee.get_inner_expression() else {
         return None;
@@ -203,12 +264,33 @@ fn origin(
     expression: &Expression<'_>,
     semantic: &Semantic<'_>,
     assignments: &HashMap<SymbolId, Origin>,
+    memo: &Memo,
     depth: usize,
 ) -> Option<Origin> {
     if depth >= 8 {
         return None;
     }
-    match expression.get_inner_expression() {
+    let expression = expression.get_inner_expression();
+    if !memo.settled {
+        return origin_of(expression, semantic, assignments, memo, depth);
+    }
+    let key = (std::ptr::from_ref(expression).addr(), depth);
+    if let Some(&known) = memo.origins.borrow().get(&key) {
+        return known;
+    }
+    let result = origin_of(expression, semantic, assignments, memo, depth);
+    memo.origins.borrow_mut().insert(key, result);
+    result
+}
+
+fn origin_of(
+    expression: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    assignments: &HashMap<SymbolId, Origin>,
+    memo: &Memo,
+    depth: usize,
+) -> Option<Origin> {
+    match expression {
         Expression::Identifier(identifier) => {
             let reference = semantic
                 .scoping()
@@ -251,15 +333,11 @@ fn origin(
                     let initial = variable
                         .init
                         .as_ref()
-                        .and_then(|init| origin(init, semantic, assignments, depth + 1));
-                    let initial = if let BindingPattern::ObjectPattern(pattern) = &variable.id {
-                        pattern.properties.iter().find_map(|property| {
-                            if matches!(&property.value, BindingPattern::BindingIdentifier(binding) if binding.symbol_id.get() == Some(symbol)) {
-                                Some(initial?.member(property.key.static_name()?.as_str()?))
-                            } else {
-                                None
-                            }
-                        })
+                        .and_then(|init| origin(init, semantic, assignments, memo, depth + 1));
+                    let initial = if let BindingPattern::ObjectPattern(_) = &variable.id {
+                        initial
+                            .zip(memo.destructured.get(&symbol))
+                            .map(|(initial, name)| initial.member(name))
                     } else {
                         initial
                     };
@@ -269,20 +347,21 @@ fn origin(
             }
         }
         Expression::StaticMemberExpression(member) => Some(
-            origin(&member.object, semantic, assignments, depth + 1)?
+            origin(&member.object, semantic, assignments, memo, depth + 1)?
                 .member(member.property.name.as_str()),
         ),
         Expression::ComputedMemberExpression(member) => {
             let property = static_string(&member.expression, 0)?;
             Some(
-                origin(&member.object, semantic, assignments, depth + 1)?.member(property.as_ref()),
+                origin(&member.object, semantic, assignments, memo, depth + 1)?
+                    .member(property.as_ref()),
             )
         }
         Expression::CallExpression(call) => {
             if let Some(module) = required_module(call, semantic) {
                 return Some(module);
             }
-            let callee = origin(&call.callee, semantic, assignments, depth + 1)?;
+            let callee = origin(&call.callee, semantic, assignments, memo, depth + 1)?;
             if callee.contains(Module::Loader, Method::CreateRequire) {
                 return Some(Origin::new(Module::Loader, Method::Require));
             }
@@ -291,28 +370,42 @@ fn origin(
                     call.arguments.first()?.as_expression()?,
                     semantic,
                     assignments,
+                    memo,
                     depth + 1,
                 );
             }
             None
         }
         Expression::AwaitExpression(awaited) => {
-            origin(&awaited.argument, semantic, assignments, depth + 1)
+            origin(&awaited.argument, semantic, assignments, memo, depth + 1)
         }
         Expression::ImportExpression(import) => module(static_string(&import.source, 0)?.as_ref()),
         Expression::SequenceExpression(sequence) => origin(
             sequence.expressions.last()?,
             semantic,
             assignments,
+            memo,
             depth + 1,
         ),
         Expression::ConditionalExpression(conditional) => union(
-            origin(&conditional.consequent, semantic, assignments, depth + 1),
-            origin(&conditional.alternate, semantic, assignments, depth + 1),
+            origin(
+                &conditional.consequent,
+                semantic,
+                assignments,
+                memo,
+                depth + 1,
+            ),
+            origin(
+                &conditional.alternate,
+                semantic,
+                assignments,
+                memo,
+                depth + 1,
+            ),
         ),
         Expression::LogicalExpression(logical) => union(
-            origin(&logical.left, semantic, assignments, depth + 1),
-            origin(&logical.right, semantic, assignments, depth + 1),
+            origin(&logical.left, semantic, assignments, memo, depth + 1),
+            origin(&logical.right, semantic, assignments, memo, depth + 1),
         ),
         _ => None,
     }
@@ -341,14 +434,15 @@ fn is_invocation_helper(
     expression: &Expression<'_>,
     semantic: &Semantic<'_>,
     assignments: &HashMap<SymbolId, Origin>,
+    memo: &Memo,
     depth: usize,
 ) -> bool {
     if depth >= 8 {
         return false;
     }
     if let Some(receiver) = invocation_receiver(expression) {
-        return origin(receiver, semantic, assignments, 0).is_some_and(Origin::evaluates)
-            || is_invocation_helper(receiver, semantic, assignments, depth + 1);
+        return origin(receiver, semantic, assignments, memo, 0).is_some_and(Origin::evaluates)
+            || is_invocation_helper(receiver, semantic, assignments, memo, depth + 1);
     }
     let Expression::Identifier(identifier) = expression.get_inner_expression() else {
         return false;
@@ -367,41 +461,47 @@ fn is_invocation_helper(
         return false;
     };
     matches!(&variable.id, BindingPattern::BindingIdentifier(_))
-        && variable
-            .init
-            .as_ref()
-            .is_some_and(|initial| is_invocation_helper(initial, semantic, assignments, depth + 1))
+        && variable.init.as_ref().is_some_and(|initial| {
+            is_invocation_helper(initial, semantic, assignments, memo, depth + 1)
+        })
 }
 
 fn indirect_evaluation(
     call: &CallExpression<'_>,
     semantic: &Semantic<'_>,
     assignments: &HashMap<SymbolId, Origin>,
+    memo: &Memo,
 ) -> bool {
     let Some(receiver) = invocation_receiver(&call.callee) else {
         return false;
     };
-    if origin(receiver, semantic, assignments, 0).is_some_and(Origin::evaluates) {
+    if origin(receiver, semantic, assignments, memo, 0).is_some_and(Origin::evaluates) {
         return true;
     }
     // Borrowed call/apply helpers invoke their supplied receiver, not their original owner.
     call.arguments
         .first()
         .and_then(Argument::as_expression)
-        .and_then(|argument| origin(argument, semantic, assignments, 0))
+        .and_then(|argument| origin(argument, semantic, assignments, memo, 0))
         .is_some_and(Origin::evaluates)
-        && is_invocation_helper(receiver, semantic, assignments, 0)
+        && is_invocation_helper(receiver, semantic, assignments, memo, 0)
 }
 
 fn shell_option(
     expression: &Expression<'_>,
     semantic: &Semantic<'_>,
+    memo: &mut Memo,
     depth: usize,
 ) -> Option<bool> {
     if depth >= 8 {
         return None;
     }
-    match expression.get_inner_expression() {
+    let expression = expression.get_inner_expression();
+    let key = (std::ptr::from_ref(expression).addr(), depth);
+    if let Some(&known) = memo.shell.get(&key) {
+        return known;
+    }
+    let result = match expression {
         Expression::ObjectExpression(options) => {
             options
                 .properties
@@ -421,12 +521,12 @@ fn shell_option(
                         }
                     }
                     ObjectPropertyKind::SpreadProperty(spread) => {
-                        shell_option(&spread.argument, semantic, depth + 1)
+                        shell_option(&spread.argument, semantic, memo, depth + 1)
                     }
                     _ => None,
                 })
         }
-        Expression::Identifier(identifier) => {
+        Expression::Identifier(identifier) => (|| {
             let reference = semantic
                 .scoping()
                 .get_reference(identifier.reference_id.get()?);
@@ -436,23 +536,25 @@ fn shell_option(
             let AstKind::VariableDeclarator(variable) = semantic.nodes().kind(declaration) else {
                 return None;
             };
-            shell_option(variable.init.as_ref()?, semantic, depth + 1)
-        }
+            shell_option(variable.init.as_ref()?, semantic, memo, depth + 1)
+        })(),
         Expression::ConditionalExpression(conditional) => {
-            let left = shell_option(&conditional.consequent, semantic, depth + 1);
-            let right = shell_option(&conditional.alternate, semantic, depth + 1);
+            let left = shell_option(&conditional.consequent, semantic, memo, depth + 1);
+            let right = shell_option(&conditional.alternate, semantic, memo, depth + 1);
             left.zip(right).map(|(a, b)| a || b).or(left).or(right)
         }
         _ => None,
-    }
+    };
+    memo.shell.insert(key, result);
+    result
 }
 
-fn has_shell_option(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> bool {
+fn has_shell_option(call: &CallExpression<'_>, semantic: &Semantic<'_>, memo: &mut Memo) -> bool {
     call.arguments
         .iter()
         .skip(1)
         .filter_map(Argument::as_expression)
-        .any(|argument| shell_option(argument, semantic, 0) == Some(true))
+        .any(|argument| shell_option(argument, semantic, memo, 0) == Some(true))
 }
 
 fn dynamic_argument(argument: Option<&Expression<'_>>) -> bool {
@@ -466,36 +568,17 @@ fn has_local_eval_method(
     object: &Expression<'_>,
     semantic: &Semantic<'_>,
     mutated: &HashSet<SymbolId>,
+    memo: &mut Memo,
     depth: usize,
 ) -> bool {
     if depth >= 8 {
         return false;
     }
     match object.get_inner_expression() {
-        Expression::ObjectExpression(object) => object
-            .properties
-            .iter()
-            .rev()
-            .find_map(|property| match property {
-                ObjectPropertyKind::SpreadProperty(_) => Some(false),
-                ObjectPropertyKind::ObjectProperty(property)
-                    if property
-                        .key
-                        .static_name()
-                        .is_some_and(|name| name.as_js_str() == "eval") =>
-                {
-                    Some(
-                        property.kind == PropertyKind::Init
-                            && matches!(
-                                property.value.get_inner_expression(),
-                                Expression::FunctionExpression(_)
-                                    | Expression::ArrowFunctionExpression(_)
-                            ),
-                    )
-                }
-                _ => None,
-            })
-            .unwrap_or(false),
+        Expression::ObjectExpression(object) => *memo
+            .local_eval
+            .entry(std::ptr::from_ref(object).addr())
+            .or_insert_with(|| object_has_eval_method(object)),
         Expression::Identifier(identifier) => {
             let Some(symbol) = identifier
                 .reference_id
@@ -511,10 +594,9 @@ fn has_local_eval_method(
             let AstKind::VariableDeclarator(variable) = semantic.nodes().kind(declaration) else {
                 return false;
             };
-            variable
-                .init
-                .as_ref()
-                .is_some_and(|value| has_local_eval_method(value, semantic, mutated, depth + 1))
+            variable.init.as_ref().is_some_and(|value| {
+                has_local_eval_method(value, semantic, mutated, memo, depth + 1)
+            })
         }
         Expression::NewExpression(instance) => {
             let Some(identifier) = instance
@@ -538,22 +620,57 @@ fn has_local_eval_method(
             let AstKind::Class(class) = semantic.nodes().kind(declaration) else {
                 return false;
             };
-            class.body.body.iter().any(|element| {
-                matches!(element,
-                ClassElement::MethodDefinition(method)
-                    if !method.r#static && method.kind == MethodDefinitionKind::Method
-                        && method.decorators.is_empty()
-                        && method.key.static_name().is_some_and(|name| name.as_js_str() == "eval"))
-            })
+            *memo
+                .local_eval
+                .entry(std::ptr::from_ref(class).addr())
+                .or_insert_with(|| {
+                    class.body.body.iter().any(|element| {
+                        matches!(element,
+                        ClassElement::MethodDefinition(method)
+                            if !method.r#static && method.kind == MethodDefinitionKind::Method
+                                && method.decorators.is_empty()
+                                && method.key.static_name().is_some_and(|name| name.as_js_str() == "eval"))
+                    })
+                })
         }
         _ => false,
     }
+}
+
+/// Whether an object literal's own `eval` is a plain function: the last
+/// `eval` property, unless a spread follows it.
+fn object_has_eval_method(object: &ObjectExpression<'_>) -> bool {
+    object
+        .properties
+        .iter()
+        .rev()
+        .find_map(|property| match property {
+            ObjectPropertyKind::SpreadProperty(_) => Some(false),
+            ObjectPropertyKind::ObjectProperty(property)
+                if property
+                    .key
+                    .static_name()
+                    .is_some_and(|name| name.as_js_str() == "eval") =>
+            {
+                Some(
+                    property.kind == PropertyKind::Init
+                        && matches!(
+                            property.value.get_inner_expression(),
+                            Expression::FunctionExpression(_)
+                                | Expression::ArrowFunctionExpression(_)
+                        ),
+                )
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn unresolved_eval_call(
     callee: &Expression<'_>,
     semantic: &Semantic<'_>,
     mutated: &HashSet<SymbolId>,
+    memo: &mut Memo,
 ) -> bool {
     let object = match callee.get_inner_expression() {
         Expression::StaticMemberExpression(member) if member.property.name == "eval" => {
@@ -566,7 +683,7 @@ fn unresolved_eval_call(
         }
         _ => return false,
     };
-    !has_local_eval_method(object, semantic, mutated, 0)
+    !has_local_eval_method(object, semantic, mutated, memo, 0)
 }
 
 pub(super) fn mark_mutated_receiver(
@@ -705,6 +822,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
     // The analysis walks every node, and oxc builds the node store only on request.
     let built = SemanticBuilder::new().with_build_nodes(true).build(program);
     let semantic = &built.semantic;
+    let mut memo = Memo::new(semantic);
     let mut assignments = HashMap::new();
     let mut mutated_receivers = HashSet::new();
     // Union possible assignments without assuming execution order or following control flow.
@@ -751,7 +869,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
             if round == 0 {
                 mutated_receivers.insert(symbol);
             }
-            if let Some(value) = origin(&assignment.right, semantic, &assignments, 0) {
+            if let Some(value) = origin(&assignment.right, semantic, &assignments, &memo, 0) {
                 let previous = assignments.entry(symbol).or_insert(Origin(0));
                 let combined = previous.0 | value.0;
                 changed |= previous.0 != combined;
@@ -762,6 +880,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
             break;
         }
     }
+    memo.settled = true;
     let mut facts = CallFacts::default();
     for node in semantic.nodes().iter() {
         match node.kind() {
@@ -769,7 +888,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                 facts.dynamic_load.get_or_insert(import.span.start as usize);
             }
             AstKind::NewExpression(expression) => {
-                if origin(&expression.callee, semantic, &assignments, 0)
+                if origin(&expression.callee, semantic, &assignments, &memo, 0)
                     .is_some_and(|value| value.0 & Origin::FUNCTION.0 != 0)
                 {
                     facts
@@ -779,13 +898,18 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                 }
             }
             AstKind::CallExpression(call) => {
-                let mut value = origin(&call.callee, semantic, &assignments, 0);
+                let mut value = origin(&call.callee, semantic, &assignments, &memo, 0);
                 if value.is_some_and(Origin::evaluates)
-                    || indirect_evaluation(call, semantic, &assignments)
+                    || indirect_evaluation(call, semantic, &assignments, &memo)
                 {
                     facts.evaluation.get_or_insert(call.span.start as usize);
                     facts.evaluation_calls += 1;
-                } else if unresolved_eval_call(&call.callee, semantic, &mutated_receivers) {
+                } else if unresolved_eval_call(
+                    &call.callee,
+                    semantic,
+                    &mutated_receivers,
+                    &mut memo,
+                ) {
                     facts
                         .unresolved_evaluation
                         .get_or_insert(call.span.start as usize);
@@ -796,7 +920,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                         .arguments
                         .first()
                         .and_then(Argument::as_expression)
-                        .and_then(|argument| origin(argument, semantic, &assignments, 0));
+                        .and_then(|argument| origin(argument, semantic, &assignments, &memo, 0));
                 }
                 let global_name = call
                     .callee
@@ -839,7 +963,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                                 || value.contains(Module::Process, Method::Exec)
                                 || value.contains(Module::Process, Method::ExecSync)
                         })
-                        || has_shell_option(call, semantic);
+                        || has_shell_option(call, semantic, &mut memo);
                     if shell {
                         facts.shell.get_or_insert(call.span.start as usize);
                     }

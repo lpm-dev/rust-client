@@ -192,6 +192,9 @@ fn parse_above(
     } else {
         None
     };
+    // Rules that ran out of steps keep what they found, but the file's
+    // coverage is incomplete.
+    let complete = complete && !calls.as_ref().is_some_and(|calls| calls.over_budget);
     Ok(Parsed {
         executable,
         complete,

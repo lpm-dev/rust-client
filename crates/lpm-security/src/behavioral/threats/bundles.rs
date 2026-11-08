@@ -28,7 +28,7 @@ fn module_id(expression: &Expression<'_>) -> Option<u64> {
 }
 
 impl Bundles {
-    pub(super) fn collect(semantic: &Semantic<'_>) -> Self {
+    pub(super) fn collect(semantic: &Semantic<'_>, ancestry: &super::ancestry::Ancestry) -> Self {
         let mut result = Self::default();
         for node in semantic.nodes().iter() {
             match node.kind() {
@@ -46,15 +46,9 @@ impl Bundles {
                     let Some(index) = symbol(semantic, &slot.expression) else {
                         continue;
                     };
-                    let function =
-                        semantic
-                            .nodes()
-                            .ancestor_kinds(node.id())
-                            .find_map(|kind| match kind {
-                                AstKind::Function(function) => Some(function),
-                                _ => None,
-                            });
-                    let Some(function) = function else { continue };
+                    let Some(function) = ancestry.function(semantic, node.id()) else {
+                        continue;
+                    };
                     let Some(parameter) = function.params.items.first() else {
                         continue;
                     };
@@ -94,29 +88,26 @@ impl Bundles {
                     let Some(export) = property.key.static_name() else {
                         continue;
                     };
-                    let mut module = None;
-                    for kind in semantic.nodes().ancestor_kinds(node.id()) {
-                        match kind {
-                            AstKind::ObjectProperty(factory) if module.is_none() => {
-                                if let PropertyKey::NumericLiteral(key) = &factory.key {
-                                    module = Some(key.value as u64);
-                                }
-                            }
-                            AstKind::VariableDeclarator(table) if module.is_some() => {
-                                let Some(module) = module else { continue };
-                                if let BindingPattern::BindingIdentifier(table) = &table.id
-                                    && let Some(table) = table.symbol_id.get()
-                                {
-                                    result
-                                        .exports
-                                        .entry((table, module))
-                                        .or_default()
-                                        .insert(export.as_js_str().as_bytes().into(), class);
-                                }
-                                break;
-                            }
-                            _ => {}
-                        }
+                    let Some(factory) = ancestry.numeric_property(node.id()) else {
+                        continue;
+                    };
+                    let AstKind::ObjectProperty(ObjectProperty {
+                        key: PropertyKey::NumericLiteral(key),
+                        ..
+                    }) = semantic.nodes().kind(factory)
+                    else {
+                        continue;
+                    };
+                    let module = key.value as u64;
+                    if let Some(table) = ancestry.declarator(semantic, factory)
+                        && let BindingPattern::BindingIdentifier(table) = &table.id
+                        && let Some(table) = table.symbol_id.get()
+                    {
+                        result
+                            .exports
+                            .entry((table, module))
+                            .or_default()
+                            .insert(export.as_js_str().as_bytes().into(), class);
                     }
                 }
                 _ => {}

