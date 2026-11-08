@@ -176,6 +176,7 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
             )
         );
     }
+    print_reach_lines(blocked.reach.as_ref());
     if blocked.binding_drift {
         println!(
             "    {} {}",
@@ -184,6 +185,58 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     println!();
+}
+
+/// `Reaches:` lines for an approval card. Nothing for a scan that found
+/// nothing; a note for rows captured before the scan existed.
+pub(super) fn print_reach_lines(reach: Option<&lpm_security::reach::ScriptReach>) {
+    let Some(reach) = reach else {
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "    {:<14}{}",
+                install_ui::dim("Reaches:"),
+                install_ui::dim("not analyzed; run `lpm install` to scan"),
+            )
+        );
+        return;
+    };
+    let mut lines: Vec<String> = reach.findings.iter().map(ToString::to_string).collect();
+    if reach.incomplete {
+        lines.push("not fully scanned (file, size or package-boundary limit)".into());
+    }
+    for (index, line) in lines.iter().enumerate() {
+        let label = if index == 0 { "Reaches:" } else { "" };
+        println!(
+            "{}",
+            install_ui::terminal_line!(
+                "    {:<14}{}",
+                install_ui::dim(label),
+                lpm_common::sanitize_terminal_inline(line),
+            )
+        );
+    }
+    if reach.requires_individual_review() {
+        println!(
+            "    {} {}",
+            "!".yellow(),
+            "reaches beyond its own package — review it on its own; `--yes` and the triage advisor skip it"
+                .yellow()
+        );
+    }
+}
+
+/// Short list-row suffix for rows that need individual review.
+pub(super) fn reach_marker(
+    reach: Option<&lpm_security::reach::ScriptReach>,
+) -> install_ui::TerminalLine {
+    match reach {
+        Some(reach) if !reach.requires_individual_review() => install_ui::TerminalLine::new(""),
+        Some(_) => {
+            install_ui::terminal_line!("  {}", install_ui::yellow("[reaches beyond its package]"))
+        }
+        None => install_ui::terminal_line!("  {}", install_ui::dim("[reach not analyzed]")),
+    }
 }
 
 pub(super) fn truncate_for_display(s: &str, max: usize) -> String {

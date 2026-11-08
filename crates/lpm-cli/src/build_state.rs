@@ -185,6 +185,12 @@ pub struct BlockedPackage {
     /// "deny" | "allow"` where classification is not applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_tier: Option<StaticTier>,
+    /// What the package's install-time code and manifest reach beyond
+    /// the package (see [`lpm_security::reach`]). `None` for rows
+    /// captured before the scan existed; bulk approval treats those as
+    /// unanalyzed and refuses them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<lpm_security::reach::ScriptReach>,
     /// Publisher-identity snapshot at capture time. Populated by
     /// (provenance drift). `None` in/P2/P3 state, and for packages
     /// whose registry response contains no attestation bundle.
@@ -956,6 +962,7 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             // populates `static_tier` from the
             // worst-wins reduction above.
             static_tier,
+            reach: Some(lpm_security::reach::analyze(pkg_dir, &phase_bodies)),
             // forwarded from the install
             // pipeline's per-package provenance fetch. Populated
             // for EVERY blocked package that went through the
@@ -1010,6 +1017,10 @@ pub(crate) fn normalize_blocked_packages(packages: &mut Vec<BlockedPackage>) {
         }
         prior.static_tier = match (prior.static_tier, next.static_tier) {
             (Some(a), Some(b)) => Some(a.worse_of(b)),
+            _ => None,
+        };
+        prior.reach = match (prior.reach.take(), next.reach.as_ref()) {
+            (Some(a), Some(b)) => Some(a.merged(b)),
             _ => None,
         };
         prior.binding_drift |= next.binding_drift;
@@ -1546,6 +1557,7 @@ mod tests {
             // pre-existing tests behave unchanged. Dedicated tests
             // below exercise the populated path.
             static_tier: None,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -1855,6 +1867,7 @@ mod tests {
             // fields: left None in this pre-existing roundtrip
             // test so the assertion stays byte-identical to  the             // original shape.
             static_tier: None,
+            reach: None,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -2526,6 +2539,13 @@ mod tests {
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
             static_tier: Some(StaticTier::Amber),
+            reach: Some(lpm_security::reach::ScriptReach {
+                findings: vec![lpm_security::reach::ReachFinding::StartsPackageManager {
+                    manager: "npm".into(),
+                    file: "install.js".into(),
+                }],
+                incomplete: false,
+            }),
             provenance_at_capture: Some(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:lovell/sharp".into()),
@@ -2556,6 +2576,7 @@ mod tests {
             phases_present: vec!["postinstall".into()],
             binding_drift: false,
             static_tier: Some(StaticTier::Amber),
+            reach: None,
             provenance_at_capture: Some(ProvenanceSnapshot {
                 present: true,
                 publisher: Some("github:puppeteer/puppeteer".into()),
@@ -3299,6 +3320,7 @@ mod tests {
     fn tiered(name: &str, tier: lpm_security::triage::StaticTier) -> BlockedPackage {
         let mut b = make_blocked(name, "1.0.0", None, Some("sha256-x"));
         b.static_tier = Some(tier);
+        b.reach = Some(lpm_security::reach::ScriptReach::default());
         b
     }
 

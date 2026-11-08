@@ -432,6 +432,7 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
                         "phases_present": ["postinstall"],
                         "binding_drift": false,
                         "static_tier": "green",
+                        "reach": {{}},
                         "published_at": "2026-05-14T00:00:00Z"
                     }}
                 ]

@@ -291,7 +291,7 @@ fn contains_powershell_red_literal(s: &str) -> bool {
 /// substitution `<(…)`) is left untouched; this is a deliberately
 /// conservative list focused on the operators that gate the red
 /// patterns matched by the classifier.
-fn normalize_operators(s: &str) -> String {
+pub(crate) fn normalize_operators(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     let mut chars = s.chars().peekable();
     let mut in_single_quote = false;
@@ -699,7 +699,7 @@ fn is_command_position(tokens: &[String], index: usize) -> bool {
         )
 }
 
-fn is_environment_assignment(token: &str) -> bool {
+pub(crate) fn is_environment_assignment(token: &str) -> bool {
     token.split_once('=').is_some_and(|(name, _)| {
         !name.is_empty()
             && !name.starts_with(|c: char| c.is_ascii_digit())

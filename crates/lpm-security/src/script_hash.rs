@@ -294,7 +294,7 @@ fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf>
     out
 }
 
-fn import_regexes() -> &'static [regex::Regex] {
+pub(crate) fn import_regexes() -> &'static [regex::Regex] {
     static REGEXES: OnceLock<Vec<regex::Regex>> = OnceLock::new();
     REGEXES.get_or_init(|| {
         [
@@ -339,7 +339,7 @@ fn js_resolution_candidates(path: PathBuf) -> Vec<PathBuf> {
     out
 }
 
-fn normalize_relative_path(path: impl AsRef<Path>) -> Option<PathBuf> {
+pub(crate) fn normalize_relative_path(path: impl AsRef<Path>) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.as_ref().components() {
         match component {
@@ -360,7 +360,7 @@ fn normalize_relative_path(path: impl AsRef<Path>) -> Option<PathBuf> {
     }
 }
 
-fn path_to_slash_string(path: &Path) -> String {
+pub(crate) fn path_to_slash_string(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
             Component::Normal(part) => Some(part.to_string_lossy()),

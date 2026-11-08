@@ -1896,6 +1896,39 @@ fn triage_promotes_green_tier_without_manifest_binding() {
 }
 
 #[test]
+fn triage_does_not_auto_run_green_package_whose_binding_gyp_runs_bun_install() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+    let store = PackageStore::at(dir.path().join("store"));
+    let pkg_dir = write_scripted_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
+    std::fs::write(
+        pkg_dir.join("binding.gyp"),
+        "{'targets':[{'target_name':'x','variables':{'v':'<!(bun install)'}}]}\n",
+    )
+    .unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
+    let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+    let reason = evaluate_trust(
+        &pkg_dir,
+        "some-native-pkg",
+        "1.0.0",
+        None,
+        &scripts,
+        &policy,
+        dir.path(),
+        ScriptPolicy::Triage,
+        false,
+        &crate::capability::CapabilitySet::default(),
+        &crate::capability::UserBound::default(),
+        None,
+    );
+    assert_eq!(reason, TrustReason::Untrusted);
+}
+
+#[test]
 fn triage_does_not_auto_trust_node_delegate_without_manifest_binding() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();

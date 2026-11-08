@@ -17,6 +17,7 @@
 pub mod behavioral;
 pub mod provenance;
 pub mod query;
+pub mod reach;
 pub mod script_hash;
 pub mod static_gate;
 pub mod triage;

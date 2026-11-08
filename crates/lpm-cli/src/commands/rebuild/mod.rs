@@ -417,6 +417,7 @@ async fn run_under_store_lock(
         // trust path (*active only under
         // [`ScriptPolicy::Triage`]).
         let trust_reason = evaluate_trust_with_hash(
+            &pkg_dir,
             script_hash.as_deref(),
             &lp.name,
             &lp.version,

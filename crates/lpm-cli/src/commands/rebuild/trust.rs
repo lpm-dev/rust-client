@@ -248,6 +248,7 @@ pub(crate) fn evaluate_trust(
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
     evaluate_trust_with_hash(
+        package_dir,
         script_hash.as_deref(),
         name,
         version,
@@ -265,6 +266,7 @@ pub(crate) fn evaluate_trust(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_trust_with_hash(
+    package_dir: &Path,
     script_hash: Option<&str>,
     name: &str,
     version: &str,
@@ -291,6 +293,13 @@ pub(super) fn evaluate_trust_with_hash(
         advisor_approvals,
         script_hash,
     );
+    let candidate = if candidate == TrustReason::GreenTierUnderTriage
+        && green_package_reaches_beyond_itself(package_dir, scripts)
+    {
+        TrustReason::Untrusted
+    } else {
+        candidate
+    };
     let after_force = if force_security_floor && candidate.is_trusted() {
         TrustReason::SuspendedByForceFloor
     } else {
@@ -385,6 +394,20 @@ pub(super) fn evaluate_trust_unsuspended(
     }
 
     TrustReason::Untrusted
+}
+
+/// Green auto-run never runs a package that needs individual review: a
+/// `node-gyp rebuild` whose `binding.gyp` expands `<!(bun install)` is
+/// Green by its command alone.
+fn green_package_reaches_beyond_itself(
+    package_dir: &Path,
+    scripts: &HashMap<String, String>,
+) -> bool {
+    let phase_bodies: Vec<(String, String)> = lpm_security::EXECUTED_INSTALL_PHASES
+        .iter()
+        .filter_map(|phase| Some(((*phase).to_string(), scripts.get(*phase)?.clone())))
+        .collect();
+    lpm_security::reach::analyze(package_dir, &phase_bodies).requires_individual_review()
 }
 
 /// Worst execution tier across the active lifecycle phases.
