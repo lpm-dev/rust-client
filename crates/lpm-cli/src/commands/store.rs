@@ -113,31 +113,18 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    let v1_bytes = if v1_existed {
-        maintenance::removed_size(&v1)
-    } else {
-        0
+    // Counted while removing, so the store is walked once and a file
+    // hard-linked within it counts once.
+    let remove = |path: &std::path::Path, existed: bool| -> Result<u64, LpmError> {
+        if existed {
+            Ok(lpm_common::remove_path_entry_counting_freed_bytes(path)?)
+        } else {
+            Ok(0)
+        }
     };
-    let v2_bytes = if v2_existed {
-        maintenance::removed_size(&v2)
-    } else {
-        0
-    };
-    let v3_bytes = if v3_existed {
-        maintenance::removed_size(&v3)
-    } else {
-        0
-    };
-
-    if v1_existed {
-        lpm_common::remove_path_entry(&v1)?;
-    }
-    if v2_existed {
-        lpm_common::remove_path_entry(&v2)?;
-    }
-    if v3_existed {
-        lpm_common::remove_path_entry(&v3)?;
-    }
+    let v1_bytes = remove(&v1, v1_existed)?;
+    let v2_bytes = remove(&v2, v2_existed)?;
+    let v3_bytes = remove(&v3, v3_existed)?;
 
     let bytes_before = v1_bytes + v2_bytes + v3_bytes;
 

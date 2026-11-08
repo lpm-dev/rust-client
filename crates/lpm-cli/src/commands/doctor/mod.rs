@@ -337,6 +337,9 @@ async fn run_inner(
         tokio::spawn(async move { check_plugins(&plugins).await })
     });
     let global_task = all.then(|| tokio::task::spawn_blocking(check_global_installs));
+    // The scan parses every link sidecar in the store, so it runs while the
+    // network probes and the checks below do.
+    let store_orphan_task = all.then(|| tokio::task::spawn_blocking(check_store_orphans));
 
     // === Infrastructure: registry + auth (Extended) ===
     //
@@ -527,65 +530,14 @@ async fn run_inner(
     }
 
     // === Virtual-store orphan stats (Extended) ===
-    //
-    // (preplan). Cheap but cross-project
-    // hygiene rather than core breakage — only surface under `--all`.
-    // Walks v2 and v3 `.lpm-link-meta.json` sidecars
-    // + the registered-projects set, surfaces a count of orphans not
-    // reachable from any project.
-    if all && let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
-        let mut orphan_links = 0usize;
-        let mut orphan_objects = 0usize;
-        let mut analysis_unavailable = None;
-        let stores = [
-            lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, lpm_store::StoreVersion::V2),
-            lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, lpm_store::StoreVersion::V3),
-        ];
-        match crate::commands::cache_prune::compute_prune_stats_for_stores(&lpm_root, &stores) {
-            Ok(stats_by_store) => {
-                for stats in stats_by_store {
-                    match stats.analysis {
-                        crate::commands::cache_prune::PruneAnalysis::Available => {
-                            orphan_links += stats.link_entries_orphaned;
-                            orphan_objects += stats.object_entries_orphaned;
-                        }
-                        crate::commands::cache_prune::PruneAnalysis::RegistryMissing => {
-                            analysis_unavailable.get_or_insert_with(|| {
-                                "known-projects registry is missing; reachability is unknown"
-                                    .to_string()
-                            });
-                        }
-                        crate::commands::cache_prune::PruneAnalysis::RegistryCorrupt(reason) => {
-                            analysis_unavailable.get_or_insert_with(|| {
-                                format!("known-projects registry is corrupt: {reason}")
-                            });
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                analysis_unavailable.get_or_insert_with(|| format!("store scan failed: {error}"));
-            }
-        }
-        if let Some(reason) = analysis_unavailable {
-            checks.push(Check::warn(
+    if let Some(store_orphans) = store_orphan_task {
+        match store_orphans.await {
+            Ok(Some(check)) => checks.push(check),
+            Ok(None) => {}
+            Err(error) => checks.push(Check::warn(
                 &doctor_catalog::STORE_ORPHAN_ANALYSIS_UNAVAILABLE,
-                &reason,
-            ));
-        } else {
-            if orphan_links == 0 && orphan_objects == 0 {
-                checks.push(Check::pass(&doctor_catalog::V2_STORE_ORPHANS, "no orphans"));
-            } else {
-                checks.push(Check::warn(
-                    &doctor_catalog::V2_STORE_ORPHANS,
-                    &format!(
-                        "{orphan_links} link orphan{} + {orphan_objects} object orphan{}; \
-                         run: lpm cache prune --apply",
-                        if orphan_links == 1 { "" } else { "s" },
-                        if orphan_objects == 1 { "" } else { "s" },
-                    ),
-                ));
-            }
+                &format!("store scan failed: {error}"),
+            )),
         }
     }
 
@@ -1186,6 +1138,61 @@ fn check_store_accessibility() -> Result<String, String> {
         }
         Err(error) => Err(format!("cannot inspect {}: {error}", root.display())),
     }
+}
+
+/// Counts store entries no registered project reaches. Cross-project hygiene
+/// rather than breakage, so only `--all` runs it. Walks the v2 and v3
+/// `.lpm-link-meta.json` sidecars and the registered-projects set.
+fn check_store_orphans() -> Option<Check> {
+    let lpm_root = lpm_common::LpmRoot::from_env().ok()?;
+    let mut orphan_links = 0usize;
+    let mut orphan_objects = 0usize;
+    let mut analysis_unavailable = None;
+    let stores = [
+        lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, lpm_store::StoreVersion::V2),
+        lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, lpm_store::StoreVersion::V3),
+    ];
+    match crate::commands::cache_prune::compute_prune_stats_for_stores(&lpm_root, &stores) {
+        Ok(stats_by_store) => {
+            for stats in stats_by_store {
+                match stats.analysis {
+                    crate::commands::cache_prune::PruneAnalysis::Available => {
+                        orphan_links += stats.link_entries_orphaned;
+                        orphan_objects += stats.object_entries_orphaned;
+                    }
+                    crate::commands::cache_prune::PruneAnalysis::RegistryMissing => {
+                        analysis_unavailable.get_or_insert_with(|| {
+                            "known-projects registry is missing; reachability is unknown"
+                                .to_string()
+                        });
+                    }
+                    crate::commands::cache_prune::PruneAnalysis::RegistryCorrupt(reason) => {
+                        analysis_unavailable.get_or_insert_with(|| {
+                            format!("known-projects registry is corrupt: {reason}")
+                        });
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            analysis_unavailable.get_or_insert_with(|| format!("store scan failed: {error}"));
+        }
+    }
+    Some(if let Some(reason) = analysis_unavailable {
+        Check::warn(&doctor_catalog::STORE_ORPHAN_ANALYSIS_UNAVAILABLE, &reason)
+    } else if orphan_links == 0 && orphan_objects == 0 {
+        Check::pass(&doctor_catalog::V2_STORE_ORPHANS, "no orphans")
+    } else {
+        Check::warn(
+            &doctor_catalog::V2_STORE_ORPHANS,
+            &format!(
+                "{orphan_links} link orphan{} + {orphan_objects} object orphan{}; \
+                 run: lpm cache prune --apply",
+                if orphan_links == 1 { "" } else { "s" },
+                if orphan_objects == 1 { "" } else { "s" },
+            ),
+        )
+    })
 }
 
 async fn probe_auth(

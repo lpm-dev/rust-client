@@ -618,6 +618,41 @@ fn store_clean_on_empty_store_reports_idempotent_success() {
     assert_eq!(envelope["removed_bytes"], serde_json::json!(0));
 }
 
+#[cfg(unix)]
+#[test]
+fn store_clean_counts_a_hard_linked_file_once_and_never_an_outside_link() {
+    let project = TempProject::empty(r#"{"name":"store-clean-links","version":"1.0.0"}"#);
+    let v3 = store_root(&project).join("v3");
+    std::fs::create_dir_all(v3.join("blobs")).unwrap();
+    std::fs::create_dir_all(v3.join("trees/pkg")).unwrap();
+    // A blob and the tree file hard-linked to it share 4096 bytes.
+    std::fs::write(v3.join("blobs/aa"), vec![b'a'; 4096]).unwrap();
+    std::fs::hard_link(v3.join("blobs/aa"), v3.join("trees/pkg/index.js")).unwrap();
+    // A blob a project still links to stays on disk.
+    std::fs::write(v3.join("blobs/bb"), vec![b'b'; 1000]).unwrap();
+    let outside = project.path().join("linked-from-a-project.js");
+    std::fs::hard_link(v3.join("blobs/bb"), &outside).unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "store", "clean"])
+        .output()
+        .expect("failed to run lpm store clean --json");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["v3_removed_bytes"],
+        serde_json::json!(4096),
+        "{envelope}"
+    );
+    assert!(!v3.exists());
+    assert_eq!(std::fs::read(&outside).unwrap().len(), 1000);
+}
+
 #[test]
 fn store_clean_rejects_deep_flag_without_removing_entries() {
     let project = TempProject::empty(r#"{"name":"store-clean-flags","version":"1.0.0"}"#);

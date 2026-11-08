@@ -87,6 +87,111 @@ pub fn remove_path_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Removes `path` as [`remove_path_entry`] does and returns how many bytes
+/// that frees, in one walk. A file counts when the link removed is its last,
+/// so a file hard-linked elsewhere in the tree counts once, and one that is
+/// also linked from outside it doesn't count. Directories are walked through
+/// open handles and links are never followed, as `remove_dir_all` does.
+///
+/// On platforms without link counts every file counts at its full size.
+pub fn remove_path_entry_counting_freed_bytes(path: &Path) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if is_symlink_or_junction(&metadata) {
+        remove_link(path, &metadata)?;
+        return Ok(0);
+    }
+    if !metadata.is_dir() {
+        let freed = freed_by_unlinking(&metadata);
+        std::fs::remove_file(path)?;
+        return Ok(freed);
+    }
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "cannot remove a directory without a name: {}",
+                path.display()
+            ),
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let freed = {
+        let directory = cap_fs_ext::DirExt::open_dir_nofollow(&parent, name)?;
+        clear_directory_counting_freed_bytes(&directory)?
+    };
+    parent.remove_dir(name)?;
+    Ok(freed)
+}
+
+fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io::Result<u64> {
+    use cap_fs_ext::DirExt as _;
+
+    let mut freed = 0u64;
+    for entry in directory.entries()? {
+        let name = entry?.file_name();
+        let metadata = directory.symlink_metadata(&name)?;
+        if metadata.is_dir() && !cap_metadata_is_link(&metadata) {
+            let child = directory.open_dir_nofollow(&name)?;
+            freed = freed.saturating_add(clear_directory_counting_freed_bytes(&child)?);
+            drop(child);
+            directory.remove_dir(&name)?;
+        } else {
+            if metadata.is_file() {
+                freed = freed.saturating_add(cap_freed_by_unlinking(&metadata));
+            }
+            directory.remove_file_or_symlink(&name)?;
+        }
+    }
+    Ok(freed)
+}
+
+/// What unlinking a file frees: its bytes, once its last link goes.
+#[cfg(unix)]
+fn freed_by_unlinking(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    if metadata.nlink() <= 1 {
+        metadata.len()
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn freed_by_unlinking(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+#[cfg(unix)]
+fn cap_freed_by_unlinking(metadata: &cap_std::fs::Metadata) -> u64 {
+    use cap_std::fs::MetadataExt as _;
+    if metadata.nlink() <= 1 {
+        metadata.len()
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn cap_freed_by_unlinking(metadata: &cap_std::fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+#[cfg(not(windows))]
+fn cap_metadata_is_link(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_symlink()
+}
+
+#[cfg(windows)]
+fn cap_metadata_is_link(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 /// Remove a symbolic link or directory junction without removing its target.
 ///
 /// This function returns an error if `path` is not a link. It never removes a
@@ -369,6 +474,25 @@ mod tests {
 #[cfg(test)]
 mod entry_removal_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn counting_removal_never_follows_a_link_out_of_the_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("nested")).unwrap();
+        std::fs::write(tree.join("nested/file"), b"12345").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("nested/link")).unwrap();
+
+        let freed = super::remove_path_entry_counting_freed_bytes(&tree).unwrap();
+
+        assert_eq!(freed, 5);
+        assert!(!tree.exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
+    }
 
     #[test]
     fn remove_symlink_or_junction_entry_preserves_the_link_target() {

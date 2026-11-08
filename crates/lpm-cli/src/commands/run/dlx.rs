@@ -315,6 +315,15 @@ async fn install_dlx_target(
     .await
 }
 
+/// The cache entry's key: the target, and the receipt of the caller policy
+/// its install ran under, when that policy allows reuse.
+fn dlx_entry_key<'a>(cache_key: &'a str, receipt: Option<&str>) -> std::borrow::Cow<'a, str> {
+    match receipt {
+        Some(receipt) => std::borrow::Cow::Owned(format!("{cache_key}\0{receipt}")),
+        None => std::borrow::Cow::Borrowed(cache_key),
+    }
+}
+
 fn cached_dlx_identity(
     install: &lpm_runner::isolate::IsolatedInstall,
     target: &DlxTarget,
@@ -478,18 +487,21 @@ async fn dlx_under_store_lock(
     } else {
         registry_dlx_target(package_spec)
     };
-    let cache_dir = lpm_runner::dlx::dlx_cache_dir(&target.cache_key)?;
     lpm_common::with_shared_lock_async(root.cache_root().join(".dlx.lock"), async {
-        let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
-            &target.install_spec, cache_dir, std::time::Duration::from_secs(lpm_runner::dlx::CACHE_TTL_SECS),
-        );
         let caller_policy = if options.inherit_caller_context {
             Some(super::dlx_policy::authorize(client, &caller_root, &options)?)
         } else { None };
         let receipt = caller_policy.as_ref().and_then(|policy| policy.receipt.as_deref());
+        // Each caller policy has its own entry, so running a tool in another
+        // project doesn't replace the entry this one reuses.
+        let entry_key = dlx_entry_key(&target.cache_key, receipt);
+        let cache_dir = lpm_runner::dlx::dlx_cache_dir(&entry_key)?;
+        let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
+            &target.install_spec, cache_dir, std::time::Duration::from_secs(lpm_runner::dlx::CACHE_TTL_SECS),
+        );
         let cache_parent = install.root().parent().ok_or_else(|| LpmError::Script("dlx cache has no parent".into()))?;
         lpm_runner::dlx::create_cache_dir(cache_parent)?;
-        let lock_path = cache_parent.join(".entry-locks").join(format!("{}.lock", lpm_runner::dlx::deterministic_hash(&target.cache_key)));
+        let lock_path = cache_parent.join(".entry-locks").join(format!("{}.lock", lpm_runner::dlx::deterministic_hash(&entry_key)));
         let mut force_refresh = options.refresh;
         let mut prepared_generation = None;
         install_ui::phase_line(crate::install_ui::terminal_line!("Resolving {}", install_ui::yellow(package_spec)));

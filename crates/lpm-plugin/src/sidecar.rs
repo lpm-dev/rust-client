@@ -112,6 +112,12 @@ impl BinarySnapshot {
         Self::from_metadata_and_path(&metadata, Some(path))
     }
 
+    /// The snapshot of `path` itself, a link rather than its target.
+    pub(crate) fn from_entry_path(path: &Path) -> std::io::Result<Option<Self>> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        Self::from_metadata_and_path(&metadata, Some(path))
+    }
+
     fn from_metadata_and_path(
         metadata: &std::fs::Metadata,
         _path: Option<&Path>,
