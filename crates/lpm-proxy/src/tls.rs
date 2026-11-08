@@ -3,6 +3,18 @@ use super::*;
 const TLS_CONNECTION_LIMIT: usize = 64;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Requests one HTTP/2 connection carries at once. A dev server serving
+/// unbundled modules gets hundreds of requests per page, which HTTP/1.1
+/// spreads over a browser's six connections per host.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
+/// How often an idle HTTP/2 connection is pinged, and how long the proxy
+/// waits for the answer before closing it, so a vanished client doesn't
+/// keep one of the connection slots.
+const H2_KEEP_ALIVE: Duration = Duration::from_secs(20);
+/// Offered in this order: a browser that speaks HTTP/2 takes it, and one that
+/// opens a WebSocket opens an HTTP/1.1 connection for it, as the proxy
+/// doesn't advertise WebSockets over HTTP/2.
+const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 #[derive(Clone, Default)]
 pub(crate) struct TlsCertificateStore {
@@ -137,7 +149,10 @@ async fn start_tls_frontend_with_key(
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(FixedTlsCertResolver { key }));
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    server_config.alpn_protocols = ALPN_PROTOCOLS
+        .iter()
+        .map(|protocol| protocol.to_vec())
+        .collect();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
     let state = Arc::new(
         HttpProxyState::for_upstream(upstream.clone(), "https").with_shutdown(shutdown_tx.clone()),
@@ -188,7 +203,10 @@ fn start_tls_proxy_on_listener(
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(TlsCertResolver { store: cert_store }));
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    server_config.alpn_protocols = ALPN_PROTOCOLS
+        .iter()
+        .map(|protocol| protocol.to_vec())
+        .collect();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
     let state = Arc::new(
         HttpProxyState::with_forwarded_proto(registry, "https").with_shutdown(shutdown_tx.clone()),
@@ -271,6 +289,7 @@ async fn serve_tls_http_connection(
     else {
         return;
     };
+    let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
     let io = hyper_util::rt::TokioIo::new(tls_stream);
     let service =
         hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
@@ -283,6 +302,18 @@ async fn serve_tls_http_connection(
                 Ok::<_, Infallible>(response)
             }
         });
+    if negotiated_h2 {
+        let mut builder =
+            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+            .max_header_list_size(u32::try_from(HTTP_HEAD_CAP_BYTES).unwrap_or(u32::MAX))
+            .keep_alive_interval(Some(H2_KEEP_ALIVE))
+            .keep_alive_timeout(H2_KEEP_ALIVE);
+        let _ = builder.serve_connection(io, service).await;
+        return;
+    }
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
         .timer(hyper_util::rt::TokioTimer::new())

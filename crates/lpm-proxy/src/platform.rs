@@ -229,15 +229,16 @@ fn primary_gid_of(uid: u32) -> Result<libc::gid_t, ProxyError> {
     }
 }
 
+/// Opens the daemon's state file without following links, and checks that it
+/// is a regular file that only `expected_uid` owns and can access.
 #[cfg(unix)]
-pub(crate) fn read_forwarder_daemon_state(
+pub(crate) fn open_forwarder_daemon_state(
     path: &Path,
     expected_uid: u32,
-) -> Result<ProxyDaemonState, ProxyError> {
-    use std::io::Read;
+) -> Result<(std::fs::File, std::fs::Metadata), ProxyError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         // O_NONBLOCK keeps a FIFO planted at the path from blocking the open.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -274,6 +275,16 @@ pub(crate) fn read_forwarder_daemon_state(
             path.display()
         )));
     }
+    Ok((file, metadata))
+}
+
+#[cfg(unix)]
+pub(crate) fn read_open_forwarder_daemon_state(
+    mut file: std::fs::File,
+    metadata: &std::fs::Metadata,
+    path: &Path,
+) -> Result<ProxyDaemonState, ProxyError> {
+    use std::io::Read;
 
     let cap_u64 = lpm_common::STATE_FILE_SIZE_CAP_BYTES;
     let cap = usize::try_from(cap_u64).map_err(|_| {
