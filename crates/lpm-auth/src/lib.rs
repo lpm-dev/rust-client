@@ -632,7 +632,17 @@ pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), Strin
     let access_result = clear_stored_access_token_unlocked(registry_url);
     let refresh_result = clear_stored_refresh_token_unlocked(registry_url);
     let expiry_result = clear_token_expiry_checked(registry_url);
-    combine_credential_results([access_result, refresh_result, expiry_result])
+    // A login that an earlier release stored under the registry's
+    // trailing-slash spelling, and that nothing has read since, goes too.
+    let slashed = slashed_registry(registry_url);
+    let slashed_result = with_slashed_registry_keys(|| {
+        combine_credential_results([
+            clear_stored_access_token_unlocked(&slashed),
+            clear_stored_refresh_token_unlocked(&slashed),
+            clear_token_expiry_checked(&slashed),
+        ])
+    });
+    combine_credential_results([access_result, refresh_result, expiry_result, slashed_result])
 }
 
 /// Clear all local login state for a registry.
@@ -936,8 +946,105 @@ fn get_stored_credential_with_backend_result(
     notice: impl FnOnce(),
 ) -> Result<Option<StoredToken>, CredentialReadError> {
     with_credential_store_lock(|| {
-        get_stored_credential_with_backend_unlocked(registry, kind, notice)
+        match get_stored_credential_with_backend_unlocked(registry, kind, notice)? {
+            Some(stored) => Ok(Some(stored)),
+            None => move_slashed_login_credential_unlocked(registry, kind),
+        }
     })
+}
+
+thread_local! {
+    /// Set while this thread reads or clears a login stored before
+    /// credentials were keyed without the registry's trailing slash.
+    static SLASHED_REGISTRY_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The spelling of `registry` that credentials and their metadata are keyed
+/// by: without trailing slashes, so `https://lpm.dev/` and `https://lpm.dev`
+/// name one login.
+pub(crate) fn registry_key(registry: &str) -> &str {
+    if SLASHED_REGISTRY_KEYS.with(std::cell::Cell::get) {
+        registry
+    } else {
+        registry.trim_end_matches('/')
+    }
+}
+
+/// Runs `action` with credential keys derived from the registry exactly as
+/// given, as releases did before keys dropped the trailing slash.
+fn with_slashed_registry_keys<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SLASHED_REGISTRY_KEYS.with(|slashed| slashed.set(false));
+        }
+    }
+    SLASHED_REGISTRY_KEYS.with(|slashed| slashed.set(true));
+    let _restore = Restore;
+    action()
+}
+
+/// How a login from `registry` was keyed when it was stored under its
+/// trailing-slash spelling.
+fn slashed_registry(registry: &str) -> String {
+    format!("{}/", registry.trim_end_matches('/'))
+}
+
+/// Moves a credential that a login with a trailing-slash registry stored
+/// before keys dropped the slash, with its expiry metadata, to the key the
+/// registry has now. The caller holds the credential store lock.
+fn move_slashed_login_credential_unlocked(
+    registry: &str,
+    kind: CredentialKind,
+) -> Result<Option<StoredToken>, CredentialReadError> {
+    let slashed = slashed_registry(registry);
+    let Some(stored) = with_slashed_registry_keys(|| {
+        get_stored_credential_with_backend_unlocked(&slashed, kind, || {})
+    })?
+    else {
+        return Ok(None);
+    };
+    let canonical = registry.trim_end_matches('/');
+    let written = set_credential_with_keychain_writer_unlocked(
+        canonical,
+        kind,
+        &stored.token,
+        || match kind {
+            CredentialKind::Access => set_token_in_keychain(canonical, &stored.token),
+            CredentialKind::Refresh => {
+                set_password_in_keychain_account(&scoped_refresh_account(canonical), &stored.token)
+            }
+        },
+    );
+    let backend = match written {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!("could not move a login stored under {slashed}: {error}");
+            return Ok(Some(stored));
+        }
+    };
+    if let Err(error) = mutate_token_expiries(HomeWrite::AddsNothing, |expiries| {
+        match expiries.remove(&slashed) {
+            Some(metadata) => {
+                expiries.entry(canonical.to_owned()).or_insert(metadata);
+                true
+            }
+            None => false,
+        }
+    }) {
+        tracing::warn!("could not move the session metadata stored under {slashed}: {error}");
+    }
+    let cleared = with_slashed_registry_keys(|| match kind {
+        CredentialKind::Access => clear_stored_access_token_under_store_lock(&slashed),
+        CredentialKind::Refresh => clear_stored_refresh_token_under_store_lock(&slashed),
+    });
+    if let Err(error) = cleared {
+        tracing::warn!("could not remove the login stored under {slashed}: {error}");
+    }
+    Ok(Some(StoredToken {
+        token: stored.token,
+        backend,
+    }))
 }
 
 fn get_stored_credential_with_backend_unlocked(
@@ -1525,7 +1632,9 @@ pub fn read_token_expiries() -> std::collections::HashMap<String, TokenExpiry> {
 /// Store a token expiry reminder.
 pub fn set_token_expiry(registry: &str, expires: &str) {
     if let Err(error) = mutate_token_expiries(HomeWrite::Adds, |expiries| {
-        let entry = expiries.entry(registry.to_string()).or_default();
+        let entry = expiries
+            .entry(registry_key(registry).to_owned())
+            .or_default();
         entry.expires = expires.to_string();
         entry.reminded_7d = false;
         entry.reminded_1d = false;
@@ -1548,7 +1657,9 @@ pub(crate) fn set_session_access_token_expiry_checked(
     expires_at: &str,
 ) -> Result<(), String> {
     mutate_token_expiries(HomeWrite::Adds, |expiries| {
-        let entry = expiries.entry(registry.to_string()).or_default();
+        let entry = expiries
+            .entry(registry_key(registry).to_owned())
+            .or_default();
         entry.session_access_expires_at = Some(expires_at.to_string());
         entry.expires.clear();
         entry.reminded_7d = false;
@@ -1560,7 +1671,7 @@ pub(crate) fn set_session_access_token_expiry_checked(
 fn session_access_token_expiry(registry: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let expiries = read_token_expiries();
     let expiry = expiries
-        .get(registry)?
+        .get(registry_key(registry))?
         .session_access_expires_at
         .as_deref()?;
 
@@ -1602,7 +1713,7 @@ pub fn clear_token_expiry(registry: &str) {
 /// Remove token-expiry metadata and report storage failures to the caller.
 pub fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
     mutate_token_expiries(HomeWrite::AddsNothing, |expiries| {
-        expiries.remove(registry).is_some()
+        expiries.remove(registry_key(registry)).is_some()
     })
 }
 
@@ -1663,14 +1774,16 @@ pub struct TokenExpiry {
 /// Check if a registry has OTP/2FA enabled (set during login).
 pub fn is_otp_required(registry: &str) -> bool {
     read_token_expiries()
-        .get(registry)
+        .get(registry_key(registry))
         .is_some_and(|e| e.otp_required)
 }
 
 /// Set the OTP/2FA preference for a registry.
 pub fn set_otp_required(registry: &str, required: bool) {
     if let Err(error) = mutate_token_expiries(HomeWrite::Adds, |expiries| {
-        let entry = expiries.entry(registry.to_string()).or_default();
+        let entry = expiries
+            .entry(registry_key(registry).to_owned())
+            .or_default();
         entry.otp_required = required;
         true
     }) {
@@ -1686,14 +1799,14 @@ const REFRESH_ACCOUNT_PREFIX: &str = "lpm-refresh";
 
 fn scoped_refresh_account(registry_url: &str) -> String {
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(registry_url.as_bytes());
+    let hash = Sha256::digest(registry_key(registry_url).as_bytes());
     format!("{}:{}", REFRESH_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
 }
 
 pub(crate) fn session_lock_path(registry_url: &str) -> Result<PathBuf, String> {
     use sha2::{Digest, Sha256};
 
-    let hash = Sha256::digest(registry_url.as_bytes());
+    let hash = Sha256::digest(registry_key(registry_url).as_bytes());
     let lpm_dir = lpm_dir()?;
     let lock_dir = lpm_dir.join("locks");
     std::fs::create_dir_all(&lock_dir).map_err(|error| format!("lock mkdir error: {error}"))?;
@@ -1825,7 +1938,7 @@ pub async fn store_rotated_access_token_if_current(
                 || set_token_in_keychain(registry, replacement),
             )?;
             mutate_token_expiries(HomeWrite::Adds, |expiries| {
-                let entry = expiries.entry(registry.to_owned()).or_default();
+                let entry = expiries.entry(registry_key(registry).to_owned()).or_default();
                 entry.reminded_7d = false;
                 entry.reminded_1d = false;
                 if refresh.is_some() {
@@ -2067,7 +2180,7 @@ fn is_npmjs_token_key(key: &str) -> bool {
 
 fn scoped_account(registry_url: &str) -> String {
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(registry_url.as_bytes());
+    let hash = Sha256::digest(registry_key(registry_url).as_bytes());
     format!("{}:{}", KEYCHAIN_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
 }
 
@@ -2990,6 +3103,86 @@ mod tests {
                 get_token_from_file("https://registry.example").as_deref(),
                 Some("relocated-token")
             );
+        });
+    }
+
+    #[test]
+    fn both_spellings_of_a_registry_name_one_login() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+
+            set_token("https://registry.example/", "access").unwrap();
+            set_refresh_token("https://registry.example/", "refresh").unwrap();
+            set_session_access_token_expiry("https://registry.example/", "2099-01-01T00:00:00Z");
+
+            assert_eq!(
+                get_token("https://registry.example").as_deref(),
+                Some("access")
+            );
+            assert_eq!(
+                get_refresh_token("https://registry.example").as_deref(),
+                Some("refresh")
+            );
+            assert!(!should_refresh_session_access_token(
+                "https://registry.example"
+            ));
+        });
+    }
+
+    #[test]
+    fn a_login_stored_under_a_trailing_slash_moves_to_the_registry_key() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            // As a release that keyed logins by the exact spelling stored it.
+            with_slashed_registry_keys(|| {
+                set_token("https://registry.example/", "access").unwrap();
+                set_refresh_token("https://registry.example/", "refresh").unwrap();
+                set_session_access_token_expiry(
+                    "https://registry.example/",
+                    "2099-01-01T00:00:00Z",
+                );
+            });
+
+            assert_eq!(
+                get_token("https://registry.example").as_deref(),
+                Some("access")
+            );
+            assert_eq!(
+                get_refresh_token("https://registry.example").as_deref(),
+                Some("refresh")
+            );
+            assert!(!should_refresh_session_access_token(
+                "https://registry.example"
+            ));
+            assert_eq!(
+                with_slashed_registry_keys(|| get_stored_access_token("https://registry.example/")),
+                None,
+                "the slashed copy is removed once moved"
+            );
+            assert_eq!(
+                get_token("https://registry.example/").as_deref(),
+                Some("access")
+            );
+        });
+    }
+
+    #[test]
+    fn logging_out_also_clears_a_login_stored_under_a_trailing_slash() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            with_slashed_registry_keys(|| {
+                set_token("https://registry.example/", "access").unwrap();
+                set_refresh_token("https://registry.example/", "refresh").unwrap();
+            });
+
+            clear_login_state("https://registry.example").unwrap();
+
+            assert_eq!(
+                with_slashed_registry_keys(|| get_stored_access_token("https://registry.example/")),
+                None
+            );
+            assert_eq!(get_token("https://registry.example"), None);
+            assert_eq!(get_refresh_token("https://registry.example"), None);
         });
     }
 
@@ -4074,9 +4267,11 @@ mod tests {
 
     #[test]
     fn scoped_account_matches_mcp_known_answer_vectors() {
+        // Both spellings of a registry share one account; the MCP server
+        // derives the same names to read the login.
         for (registry_url, expected_account) in [
             ("https://lpm.dev", "auth-token:bd90fc32d95766d5"),
-            ("https://lpm.dev/", "auth-token:89f54e26677b97ec"),
+            ("https://lpm.dev/", "auth-token:bd90fc32d95766d5"),
             ("http://localhost:3000", "auth-token:f1de9e489ba88cb1"),
             ("http://127.0.0.1:8787", "auth-token:b1a61bf29a38ff36"),
             (
@@ -4086,6 +4281,12 @@ mod tests {
         ] {
             assert_eq!(scoped_account(registry_url), expected_account);
         }
+        // The account a release before canonical keys used for the slashed
+        // spelling, which the MCP server still tries for such logins.
+        assert_eq!(
+            with_slashed_registry_keys(|| scoped_account("https://lpm.dev/")),
+            "auth-token:89f54e26677b97ec"
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -319,10 +319,14 @@ async fn async_main(cli: Cli) -> Result<()> {
     // thinking it means `warn` would get the fail-closed posture
     // they did NOT ask for, with no signal that their intent
     // didn't take effect.
+    // Paths such as `/api/cli/exchange` are appended to it, and stored logins
+    // are keyed without the trailing slash.
     let registry_url = cli
         .registry
         .as_deref()
-        .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+        .map_or(lpm_common::DEFAULT_REGISTRY_URL, |url| {
+            url.trim_end_matches('/')
+        });
 
     let setup_ci_target = match preflight_setup_ci(
         &command,
