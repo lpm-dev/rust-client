@@ -574,6 +574,50 @@ fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
     );
 }
 
+// ── build_lifecycle_environment tests ────────────────────────
+
+#[test]
+fn lifecycle_environment_disables_nested_install_scripts_over_inherited_values() {
+    let mut parent = super::sandbox_env::ChildEnvironment::new();
+    for (name, value) in [
+        ("PATH", "/usr/bin"),
+        ("NPM_CONFIG_IGNORE_SCRIPTS", "false"),
+        ("npm_config_ignore_scripts", "false"),
+        ("Pnpm_Config_Ignore_Scripts", "false"),
+        ("yarn_enable_scripts", "true"),
+        ("YARN_ENABLE_SCRIPTS", "1"),
+    ] {
+        parent.insert(name.into(), value.into());
+    }
+    let envs = super::script_execution::build_lifecycle_environment(
+        &parent,
+        Path::new("/project"),
+        Path::new("/tmp"),
+        None,
+    );
+    let policy: Vec<(String, String)> = envs
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with("ignore_scripts") || name.ends_with("enable_scripts")
+        })
+        .collect();
+    assert_eq!(
+        policy,
+        [
+            ("npm_config_ignore_scripts".to_string(), "true".to_string()),
+            ("pnpm_config_ignore_scripts".to_string(), "true".to_string()),
+            ("YARN_ENABLE_SCRIPTS".to_string(), "false".to_string()),
+        ]
+    );
+}
+
 // ── build_sanitized_env tests ────────────────────────────────
 
 #[test]

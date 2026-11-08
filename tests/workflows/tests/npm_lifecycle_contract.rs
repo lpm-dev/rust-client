@@ -395,6 +395,65 @@ async fn dependency_lifecycle_phases_receive_the_installed_package_context() {
     }
 }
 
+const SCRIPT_POLICY_PROBE: &str = r#"const fs=require('fs');
+const policy=Object.fromEntries(Object.entries(process.env).filter(([name])=>/(ignore|enable)_scripts$/i.test(name)));
+fs.writeFileSync('policy.json',JSON.stringify(policy));
+"#;
+
+async fn nested_install_policy_seen_by_dependency_script(rebuild_args: &[&str]) {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({"name":"policy-probe","version":"1.0.0","scripts":{"postinstall":"node probe.cjs"}}),
+            &[("probe.cjs", SCRIPT_POLICY_PROBE.as_bytes())],
+        )
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"policy-probe":"1.0.0"}}"#,
+    );
+    support::write_signed_unlock_for(&project, project.path(), &["scripts-allow", "sandbox-none"]);
+    registry_command(&project, &registry)
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .assert()
+        .success();
+    let mut command = registry_command(&project, &registry);
+    command
+        .args(["rebuild", "--all"])
+        .args(rebuild_args)
+        .env("NPM_CONFIG_IGNORE_SCRIPTS", "false")
+        .env("pnpm_config_ignore_scripts", "false")
+        .env("YARN_ENABLE_SCRIPTS", "true");
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let policy: serde_json::Value =
+        serde_json::from_str(&project.read_file("node_modules/policy-probe/policy.json")).unwrap();
+    assert_eq!(
+        policy,
+        serde_json::json!({
+            "npm_config_ignore_scripts": "true",
+            "pnpm_config_ignore_scripts": "true",
+            "YARN_ENABLE_SCRIPTS": "false",
+        }),
+        "rebuild {rebuild_args:?}"
+    );
+}
+
+#[tokio::test]
+async fn dependency_scripts_without_sandbox_get_nested_install_scripts_disabled_over_inherited_values()
+ {
+    nested_install_policy_seen_by_dependency_script(&["--no-sandbox"]).await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn sandboxed_dependency_scripts_get_nested_install_scripts_disabled() {
+    nested_install_policy_seen_by_dependency_script(&[]).await;
+}
+
 async fn dependency_binary_fixture(linker: &str, root_conflict: bool) {
     let registry = MockRegistry::start().await;
     registry
