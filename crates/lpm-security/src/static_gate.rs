@@ -163,14 +163,14 @@ pub fn classify_for_execution(script: &str) -> StaticTier {
 /// pre-existing Red checks and Green allowlist run unchanged, so
 /// passing context never softens the floor.
 pub fn classify_with_context(script: &str, ctx: Option<&ManifestContext<'_>>) -> StaticTier {
+    if script.len() > MAX_SCRIPT_BYTES {
+        return StaticTier::Red;
+    }
     // Empty / whitespace-only bodies don't run anything; treat as
     // Amber (the caller probably should have short-circuited already,
     // but fail conservative rather than silently green).
     if script.trim().is_empty() {
         return StaticTier::Amber;
-    }
-    if script.len() > MAX_SCRIPT_BYTES {
-        return StaticTier::Red;
     }
 
     // Step 1 — raw-string red prefilter.
@@ -3627,6 +3627,7 @@ mod tests {
         let script = "echo a ".repeat(MAX_SCRIPT_BYTES / 7 + 1);
         assert!(script.len() > MAX_SCRIPT_BYTES);
         assert_eq!(tier(&script), StaticTier::Red);
+        assert_eq!(tier(&" ".repeat(MAX_SCRIPT_BYTES + 1)), StaticTier::Red);
         assert_eq!(
             tier(&"echo a ".repeat(MAX_SCRIPT_BYTES / 7 - 1)),
             StaticTier::Amber
