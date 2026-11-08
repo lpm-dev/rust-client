@@ -638,30 +638,16 @@ pub(super) fn try_cache_hit_with_context(
         }
     }
 
-    if let Some(remote_cache) = &ctx.remote_cache
-        && let Some(hit) = crate::commands::remote_cache::try_restore(
+    // A remote hit also fills the local cache, from the downloaded artifact.
+    Ok(ctx.remote_cache.as_ref().and_then(|remote_cache| {
+        crate::commands::remote_cache::try_restore(
             remote_cache,
             &ctx.cache_key,
             project_dir,
             &ctx.task_config.outputs,
             || execution_context_is_unchanged(ctx),
         )
-    {
-        if let Err(error) = lpm_task::cache::store_cache(
-            &ctx.cache_key,
-            project_dir,
-            &hit.meta.command,
-            &ctx.task_config.outputs,
-            &hit.stdout,
-            &hit.stderr,
-            hit.meta.duration_ms,
-        ) {
-            tracing::warn!("failed to populate local task cache from remote hit: {error}");
-        }
-        return Ok(Some(hit));
-    }
-
-    Ok(None)
+    }))
 }
 
 /// Whether the task's inputs and the runtimes its key names are unchanged.
@@ -776,10 +762,9 @@ fn store_cache_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
 ) -> Result<bool, LpmError> {
-    if !execution_context_is_unchanged(expected)? {
-        warn_execution_context_changed(request.script_name, expected);
-        return Ok(false);
-    }
+    // The rebuild rereads what the input snapshot doesn't cover, such as env
+    // files and vault values. The execution context is checked after it, so
+    // that one check also covers the time the rebuild took.
     let current = match build_task_context(
         request.project_dir,
         request.workspace_contract,
@@ -795,11 +780,8 @@ fn store_cache_with_context(
         Some(current) => current,
         None => return Ok(false),
     };
-    if !cache_context_is_unchanged(&current)? {
-        tracing::warn!(
-            "task cache contract, inputs, or dependencies changed while task '{}' was revalidated; skipping cache publication",
-            request.script_name
-        );
+    if !execution_context_is_unchanged(expected)? {
+        warn_execution_context_changed(request.script_name, expected);
         return Ok(false);
     }
     if current.cache_key != expected.cache_key {
@@ -831,9 +813,6 @@ fn store_cache_with_context(
         crate::commands::remote_cache::try_store(
             remote_cache,
             &expected.cache_key,
-            request.project_dir,
-            &expected.command,
-            &expected.task_config.outputs,
             request.stdout,
             request.stderr,
             request.duration_ms,

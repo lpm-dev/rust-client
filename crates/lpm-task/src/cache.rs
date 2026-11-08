@@ -635,6 +635,41 @@ fn store_cache_locked(
     stderr: &str,
     duration_ms: u64,
 ) -> Result<(), LpmError> {
+    publish_cache_entry(cache, key, |open| {
+        write_private_cache_file(open, "stdout.log", stdout.as_bytes())?;
+        write_private_cache_file(open, "stderr.log", stderr.as_bytes())?;
+        let output_file_count = if output_globs.is_empty() {
+            0
+        } else {
+            let mut archive = create_private_cache_file(open, "outputs.tar.gz")?;
+            create_archive_in_file(project_dir, output_globs, &mut archive)?
+        };
+        write_cache_meta(
+            open,
+            &CacheMeta {
+                command: command.to_string(),
+                cache_key: key.to_string(),
+                duration_ms,
+                output_file_count,
+            },
+        )
+    })
+}
+
+fn write_cache_meta(dir: &Dir, meta: &CacheMeta) -> Result<(), LpmError> {
+    let meta_json = serde_json::to_vec_pretty(meta)
+        .map_err(|error| LpmError::Task(format!("failed to serialize cache meta: {error}")))?;
+    write_private_cache_file(dir, "meta.json", &meta_json)
+}
+
+/// Writes a cache entry into a private staging directory with `write`, then
+/// publishes it under `key`, replacing any entry already there. The caller
+/// holds the entry's exclusive lock.
+fn publish_cache_entry(
+    cache: &OpenTaskCache,
+    key: &str,
+    write: impl FnOnce(&Dir) -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
     let entry = cache.path.join(key);
     let (staging_name, staging) = create_private_cache_directory(&cache.tasks)?;
     #[cfg(test)]
@@ -648,23 +683,7 @@ fn store_cache_locked(
     let mut staged_identity = None;
     let result = (|| {
         let open = staging.as_ref().expect("the staging directory is open");
-        write_private_cache_file(open, "stdout.log", stdout.as_bytes())?;
-        write_private_cache_file(open, "stderr.log", stderr.as_bytes())?;
-        let output_file_count = if output_globs.is_empty() {
-            0
-        } else {
-            let mut archive = create_private_cache_file(open, "outputs.tar.gz")?;
-            create_archive_in_file(project_dir, output_globs, &mut archive)?
-        };
-        let meta = CacheMeta {
-            command: command.to_string(),
-            cache_key: key.to_string(),
-            duration_ms,
-            output_file_count,
-        };
-        let meta_json = serde_json::to_vec_pretty(&meta)
-            .map_err(|error| LpmError::Task(format!("failed to serialize cache meta: {error}")))?;
-        write_private_cache_file(open, "meta.json", &meta_json)?;
+        write(open)?;
         sync_open_directory(open)?;
         let staged = identity(open)?;
         staged_identity = Some(staged);
@@ -1003,43 +1022,6 @@ fn create_remote_artifact_locked(args: RemoteArtifactCreate<'_>) -> Result<(), L
             .sync_parent(),
         |file| write_remote_artifact(&args, file, &output_files),
     )
-}
-
-/// Create a portable remote-cache artifact through an already-open file.
-///
-/// Callers that already own a private temporary file can keep hashing and
-/// upload bound to that same descriptor instead of reopening its pathname.
-pub fn create_remote_artifact_in_file(
-    args: RemoteArtifactCreate<'_>,
-    artifact: &mut std::fs::File,
-) -> Result<(), LpmError> {
-    let root = LpmRoot::from_env()
-        .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
-    validate_cache_key(args.key)?;
-    validate_cache_log_len("stdout.log", args.stdout.as_bytes())?;
-    validate_cache_log_len("stderr.log", args.stderr.as_bytes())?;
-    let canonical_project = canonical_project_dir(args.project_dir)?;
-    lpm_common::with_shared_lock(root.cache_clean_lock(), || {
-        let _project_lock = lpm_common::acquire_single_file_shared_lock(
-            canonical_project_restore_lock_path(&root, &canonical_project),
-        )?;
-        let canonical_args = RemoteArtifactCreate {
-            key: args.key,
-            project_dir: &canonical_project,
-            command: args.command,
-            output_globs: args.output_globs,
-            stdout: args.stdout,
-            stderr: args.stderr,
-            duration_ms: args.duration_ms,
-            artifact_path: args.artifact_path,
-        };
-        let output_files = remote_artifact_output_files(
-            canonical_args.project_dir,
-            canonical_args.output_globs,
-            canonical_args.artifact_path,
-        )?;
-        write_remote_artifact(&canonical_args, artifact, &output_files)
-    })
 }
 
 fn remote_artifact_output_files(
@@ -1853,7 +1835,10 @@ const MAX_CACHE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CACHE_ARCHIVE_ENTRIES: usize = 100_000;
 
 const RESTORE_TEMP_PREFIX: &str = ".lpm-cache-restore-";
+mod artifact;
 mod restore;
+
+pub use artifact::{store_cache_from_remote_artifact, write_remote_artifact_from_local_entry};
 
 #[cfg(test)]
 use restore::{
@@ -2592,6 +2577,189 @@ mod tests {
             fs::read_to_string(dir.path().join("dist/index.js")).unwrap(),
             "remote output"
         );
+    }
+
+    fn write_build_outputs(project: &Path) {
+        fs::create_dir_all(project.join("dist/nested")).unwrap();
+        fs::write(project.join("dist/index.js"), "entry").unwrap();
+        fs::write(project.join("dist/nested/chunk.js"), "chunk").unwrap();
+        let long_name = format!("dist/{}.js", "n".repeat(120));
+        fs::write(project.join(long_name), "long name").unwrap();
+    }
+
+    fn assert_build_outputs(project: &Path) {
+        assert_eq!(
+            fs::read_to_string(project.join("dist/index.js")).unwrap(),
+            "entry"
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("dist/nested/chunk.js")).unwrap(),
+            "chunk"
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(format!("dist/{}.js", "n".repeat(120)))).unwrap(),
+            "long name"
+        );
+    }
+
+    #[test]
+    fn a_remote_artifact_built_from_the_local_entry_restores_the_same_outputs() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("artifact-from-entry");
+        let outputs = ["dist/**".to_string()];
+        cache
+            .store(
+                &key,
+                project.path(),
+                "build",
+                &outputs,
+                "out\n",
+                "err\n",
+                42,
+            )
+            .unwrap();
+        // The artifact comes from the entry, so later changes to the
+        // project's outputs don't reach it.
+        fs::write(
+            project.path().join("dist/index.js"),
+            "changed after the run",
+        )
+        .unwrap();
+
+        let artifact_path = project.path().join("artifact.tar.gz");
+        let artifact = artifact::write_remote_artifact_from_local_entry_with_root(
+            &cache.root,
+            &key,
+            fs::File::create(&artifact_path).unwrap(),
+        )
+        .unwrap();
+        drop(artifact);
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+
+        let hit = cache
+            .restore_remote(&key, &artifact_path, project.path(), &outputs)
+            .unwrap();
+        assert_build_outputs(project.path());
+        assert_eq!(
+            (
+                hit.meta.command.as_str(),
+                hit.meta.duration_ms,
+                hit.meta.output_file_count
+            ),
+            ("build", 42, 3)
+        );
+        assert_eq!(
+            (hit.stdout.as_str(), hit.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+    }
+
+    #[test]
+    fn a_remote_artifact_fills_the_local_entry_without_reading_the_project() {
+        let cache = TestCache::new();
+        let source = tempfile::tempdir().unwrap();
+        write_build_outputs(source.path());
+        let key = unique_key("entry-from-artifact");
+        let outputs = ["dist/**".to_string()];
+        let artifact_path = source.path().join("artifact.tar.gz");
+        cache
+            .create_remote(RemoteArtifactCreate {
+                key: &key,
+                project_dir: source.path(),
+                command: "build",
+                output_globs: &outputs,
+                stdout: "out\n",
+                stderr: "err\n",
+                duration_ms: 7,
+                artifact_path: &artifact_path,
+            })
+            .unwrap();
+
+        artifact::store_cache_from_remote_artifact_with_root(
+            &cache.root,
+            &key,
+            fs::File::open(&artifact_path).unwrap(),
+        )
+        .unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let hit = cache.restore(&key, target.path(), &outputs).unwrap();
+        assert_build_outputs(target.path());
+        assert_eq!(
+            (hit.meta.command.as_str(), hit.meta.output_file_count),
+            ("build", 3)
+        );
+        assert_eq!(
+            (hit.stdout.as_str(), hit.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+    }
+
+    #[test]
+    fn a_remote_artifact_leaves_a_valid_local_entry_in_place() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("entry-kept");
+        let outputs = ["dist/**".to_string()];
+        cache
+            .store(&key, project.path(), "local", &outputs, "", "", 1)
+            .unwrap();
+        let artifact_path = project.path().join("artifact.tar.gz");
+        cache
+            .create_remote(RemoteArtifactCreate {
+                key: &key,
+                project_dir: project.path(),
+                command: "remote",
+                output_globs: &outputs,
+                stdout: "",
+                stderr: "",
+                duration_ms: 1,
+                artifact_path: &artifact_path,
+            })
+            .unwrap();
+
+        artifact::store_cache_from_remote_artifact_with_root(
+            &cache.root,
+            &key,
+            fs::File::open(&artifact_path).unwrap(),
+        )
+        .unwrap();
+
+        let hit = cache.restore(&key, project.path(), &outputs).unwrap();
+        assert_eq!(hit.meta.command, "local");
+    }
+
+    #[test]
+    fn a_remote_artifact_for_another_key_never_becomes_a_local_entry() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let artifact_path = project.path().join("artifact.tar.gz");
+        cache
+            .create_remote(RemoteArtifactCreate {
+                key: "aaaa",
+                project_dir: project.path(),
+                command: "build",
+                output_globs: &["dist/**".into()],
+                stdout: "",
+                stderr: "",
+                duration_ms: 1,
+                artifact_path: &artifact_path,
+            })
+            .unwrap();
+
+        let error = artifact::store_cache_from_remote_artifact_with_root(
+            &cache.root,
+            "bbbb",
+            fs::File::open(&artifact_path).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("key mismatch"), "{error}");
+        assert!(!cache.has_hit("bbbb"));
     }
 
     #[test]
