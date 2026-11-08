@@ -3,8 +3,8 @@ use super::output::{
     format_dry_run_files_value, format_lpm_publication_notice,
     format_multi_publish_partial_summary, format_multi_publish_success_summary,
     format_publish_retry_detail, format_single_publish_success_summary,
-    format_swift_preparation_hint, format_swift_release_rejection_details, publish_check_json,
-    publish_result_json,
+    format_swift_preparation_hint, format_swift_release_rejection_details,
+    format_swift_republish_detail, publish_check_json, publish_result_json,
 };
 use super::prepare::{
     MAX_PUBLISH_TARBALL_BYTES, prepare_publish_project_from_manifest, read_publish_manifest,
@@ -1135,7 +1135,8 @@ fn a_swift_rejection_without_text_still_says_why_and_what_to_fix() {
 }
 
 #[test]
-fn a_swift_rejection_lets_the_same_version_be_published_again() {
+fn a_swift_rejection_failure_says_to_publish_the_same_version_again_and_a_review_rejection_says_not_to()
+ {
     let swift_rejected = lpm_wait_result(swift_rejected_wait(swift_rejection(
         Some(SWIFT_COMPILER_OUTPUT),
         Some(SWIFT_REMEDY),
@@ -1167,6 +1168,73 @@ fn a_swift_rejection_lets_the_same_version_be_published_again() {
             .summary()
             .contains("do not publish the same version again")
     );
+}
+
+#[test]
+fn a_swift_rejection_whose_text_sanitizes_to_nothing_falls_back_to_the_stand_ins() {
+    let rows = format_swift_release_rejection_details(&swift_rejection(
+        Some("\u{1b}]0;title\u{7}"),
+        Some("\u{1b}[0m\n\u{1b}[2J"),
+    ));
+
+    assert_eq!(
+        plain_rows(rows),
+        [
+            "    reason     LPM.dev Registry gave no reason.",
+            "    fix        Publishing this version again replaces the rejected release.",
+        ]
+    );
+}
+
+#[test]
+fn a_swift_rejection_drops_blank_lines_at_either_end_of_its_reason() {
+    let rows = format_swift_release_rejection_details(&swift_rejection(
+        Some("\u{1b}[0m\nPackage.swift:1:1: error: bad\n\t\n\u{1b}[0m"),
+        Some(SWIFT_REMEDY),
+    ));
+
+    assert_eq!(
+        plain_rows(rows),
+        [
+            "    reason     Package.swift:1:1: error: bad",
+            &format!("    fix        {SWIFT_REMEDY}"),
+        ]
+    );
+}
+
+#[test]
+fn a_wait_that_ended_while_the_swift_job_prepared_leaves_republishing_to_its_outcome() {
+    let preparing = lpm_wait_result(PublicationWaitResult::timed_out(Some(
+        PublicationSnapshot {
+            status: LpmPublicationStatus::Processing,
+            current_latest_version: None,
+            hold: None,
+            swift: Some(lpm_registry::SwiftReleaseState {
+                status: "pending".into(),
+                code: None,
+                message: None,
+                remedy: None,
+            }),
+        },
+    )));
+
+    let failure = preparing.publication_failure();
+
+    assert_eq!(
+        failure,
+        Some(PublicationFailure::SwiftReleaseStillPreparing)
+    );
+    assert_eq!(
+        failure.unwrap().summary(),
+        "the upload succeeded, but LPM.dev Registry is still preparing the Swift release; the package page shows whether it was published or rejected, and only a rejected one can be published again under this version"
+    );
+}
+
+#[test]
+fn a_swift_republish_detail_waits_for_the_swift_job_again() {
+    let detail = console::strip_ansi_codes(&format_swift_republish_detail()).into_owned();
+
+    assert_eq!(detail, "  Publish again: lpm publish --lpm --wait");
 }
 
 #[test]

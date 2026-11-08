@@ -43,7 +43,7 @@ pub(super) async fn wait_for_lpm_publication_with_oidc(
         .transpose()
     {
         Ok(token) => token.flatten(),
-        Err(error) => return PublicationWaitResult::request_failed(&error),
+        Err(error) => return PublicationWaitResult::request_failed(&error, None),
     };
     let status_client;
     let wait_client = if let Some(token) = status_token {
@@ -79,7 +79,7 @@ where
         let snapshot = match tokio::time::timeout_at(deadline, fetch_snapshot()).await {
             Ok(Ok(snapshot)) => snapshot,
             Ok(Err(error)) => {
-                return PublicationWaitResult::request_failed(&error).with_last_snapshot(last);
+                return PublicationWaitResult::request_failed(&error, last);
             }
             Err(_) => break,
         };
@@ -113,6 +113,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::publish::types::PublicationFailure;
     use crate::oidc::OidcPublicationStatusToken;
 
     use lpm_registry::{PublicationHold, SwiftReleaseState};
@@ -542,7 +543,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_wait_that_runs_out_while_the_swift_job_prepares_keeps_its_state() {
+    async fn a_wait_that_runs_out_while_the_swift_job_prepares_leaves_republishing_to_its_outcome()
+    {
         let preparing = hold("swift_artifacts", SWIFT_PREPARING, false);
         let (fetch, _) = scripted(vec![swift_snapshot(
             LpmPublicationStatus::Processing,
@@ -557,10 +559,72 @@ mod tests {
         assert_eq!(result.swift, Some(swift_pending()));
         assert_eq!(result.swift_rejection(), None);
         assert_eq!(
+            result.failure,
+            Some(PublicationFailure::SwiftReleaseStillPreparing)
+        );
+        assert_eq!(
             result.error.as_deref(),
             Some(&*format!(
-                "Upload succeeded, but waiting for LPM.dev Registry publication timed out. The version isn't available yet. {SWIFT_PREPARING} Do not publish this version again."
+                "Upload succeeded, but waiting for LPM.dev Registry publication timed out. The version isn't available yet. {SWIFT_PREPARING} The package page shows whether the Swift release was published or rejected. Only a rejected Swift release can be published again under this version."
             ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_poll_while_the_swift_job_prepares_leaves_republishing_to_its_outcome() {
+        let mut answered = false;
+        let fetch = || {
+            let first = !std::mem::replace(&mut answered, true);
+            std::future::ready(if first {
+                Ok(swift_snapshot(
+                    LpmPublicationStatus::Processing,
+                    Some(hold("swift_artifacts", SWIFT_PREPARING, false)),
+                    swift_pending(),
+                ))
+            } else {
+                Err(LpmError::Network("connection reset".into()))
+            })
+        };
+
+        let result = poll_publication_snapshots(
+            fetch,
+            Instant::now() + Duration::from_secs(60),
+            POLL,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(result.swift, Some(swift_pending()));
+        assert_eq!(
+            result.failure,
+            Some(PublicationFailure::SwiftReleaseStillPreparing)
+        );
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("could not be checked"), "{error}");
+        assert!(
+            error.ends_with(
+                "LPM.dev Registry was still preparing the Swift release. The package page shows whether the Swift release was published or rejected. Only a rejected Swift release can be published again under this version."
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_runs_out_on_anything_but_the_swift_job_keeps_the_version() {
+        let cooldown = hold("release_cooldown", "Its release cooldown ends soon.", false);
+        let (fetch, _) = scripted(vec![snapshot(
+            LpmPublicationStatus::Processing,
+            Some(cooldown),
+        )]);
+
+        let result = wait_for(fetch, Duration::from_secs(10), &mut Vec::new()).await;
+
+        assert_eq!(result.failure, Some(PublicationFailure::NotConfirmed));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.ends_with("Do not publish this version again."))
         );
     }
 

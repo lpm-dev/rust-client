@@ -2158,10 +2158,7 @@ async fn execute_prepared_inner(
                 if wait_result.success {
                     install_ui::done("LPM.dev Registry publication is active");
                 } else if let Some(rejection) = wait_result.swift_rejection() {
-                    print_swift_release_rejection(
-                        rejection,
-                        (targets.len() > 1).then_some(&PublishTarget::Lpm),
-                    );
+                    print_swift_release_rejection(rejection, targets.len() > 1);
                 } else if let Some(error) = wait_result.error.as_deref() {
                     install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(error));
                 }

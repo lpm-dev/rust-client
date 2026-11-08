@@ -1,6 +1,6 @@
 use super::types::{
-    LpmPublicationStatus, PublishResult, PublishTarget, SWIFT_RELEASE_REJECTED,
-    swift_rejection_reason, swift_rejection_remedy,
+    LpmPublicationStatus, PublishResult, PublishTarget, SWIFT_REASON_FALLBACK,
+    SWIFT_RELEASE_REJECTED, SWIFT_REMEDY_FALLBACK, swift_rejection_reason, swift_rejection_remedy,
 };
 use crate::commands::publish_common::TarballFile;
 use crate::{install_ui, quality};
@@ -284,20 +284,25 @@ pub(super) fn format_swift_preparation_hint(offer_wait: bool) -> install_ui::Ter
     crate::install_ui::terminal_line!("  {}", install_ui::dim(hint))
 }
 
-/// Says LPM.dev Registry rejected the Swift release, why and what to fix,
-/// and, when the publish had other targets, how to publish it again to
-/// LPM.dev alone.
-pub(super) fn print_swift_release_rejection(
-    rejection: &SwiftReleaseState,
-    retry: Option<&PublishTarget>,
-) {
+/// Says LPM.dev Registry rejected the Swift release, why and what to fix.
+/// After a publish to several targets, it also says how to publish the
+/// fixed release to LPM.dev alone, waiting for the Swift job again.
+pub(super) fn print_swift_release_rejection(rejection: &SwiftReleaseState, other_targets: bool) {
     install_ui::warn(SWIFT_RELEASE_REJECTED);
     for row in format_swift_release_rejection_details(rejection) {
         install_ui::detail_line(row);
     }
-    if let Some(target) = retry {
-        install_ui::detail_line(format_publish_retry_detail(target));
+    if other_targets {
+        install_ui::detail_line(format_swift_republish_detail());
     }
+}
+
+pub(super) fn format_swift_republish_detail() -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
+        "  {} {}",
+        install_ui::dim("Publish again:"),
+        install_ui::yellow("lpm publish --lpm --wait")
+    )
 }
 
 /// The `reason` and `fix` rows under a Swift release rejection. A reason
@@ -305,12 +310,26 @@ pub(super) fn print_swift_release_rejection(
 pub(super) fn format_swift_release_rejection_details(
     rejection: &SwiftReleaseState,
 ) -> Vec<install_ui::TerminalLine> {
-    let reason = install_ui::untrusted_lines(swift_rejection_reason(rejection));
-    let remedy = install_ui::untrusted_lines(swift_rejection_remedy(rejection));
+    let reason = printable_lines(swift_rejection_reason(rejection), SWIFT_REASON_FALLBACK);
+    let remedy = printable_lines(swift_rejection_remedy(rejection), SWIFT_REMEDY_FALLBACK);
     let mut rows = Vec::with_capacity(reason.len() + remedy.len());
     push_labeled_block(&mut rows, "reason", reason);
     push_labeled_block(&mut rows, "fix", remedy);
     rows
+}
+
+/// The lines of Registry text as they print, without blank lines at either
+/// end, or `fallback`'s when sanitizing leaves nothing to read.
+fn printable_lines(text: &str, fallback: &'static str) -> Vec<install_ui::TerminalFragment> {
+    let mut lines = install_ui::untrusted_lines(text);
+    let readable = |line: &install_ui::TerminalFragment| !line.trim().is_empty();
+    let Some(first) = lines.iter().position(readable) else {
+        return install_ui::untrusted_lines(fallback);
+    };
+    let last = lines.iter().rposition(readable).unwrap_or(first);
+    lines.truncate(last + 1);
+    lines.drain(..first);
+    lines
 }
 
 /// Rows like [`publish_detail`]'s whose value spans lines: the first line
@@ -321,12 +340,14 @@ fn push_labeled_block(
     lines: Vec<install_ui::TerminalFragment>,
 ) {
     let mut lines = lines.into_iter();
-    let label = format!("{label:<10}");
-    let first = lines.next();
-    rows.push(match &first {
-        Some(line) => crate::install_ui::terminal_line!("    {} {}", install_ui::dim(&label), line),
-        None => crate::install_ui::terminal_line!("    {}", install_ui::dim(label.trim_end())),
-    });
+    let Some(first) = lines.next() else {
+        return;
+    };
+    rows.push(crate::install_ui::terminal_line!(
+        "    {} {}",
+        install_ui::dim(&format!("{label:<10}")),
+        first
+    ));
     rows.extend(lines.map(|line| {
         if line.is_empty() {
             install_ui::TerminalLine::new("")

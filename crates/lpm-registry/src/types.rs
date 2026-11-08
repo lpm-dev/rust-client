@@ -1169,6 +1169,13 @@ impl SwiftReleaseState {
     pub fn is_rejected(&self) -> bool {
         self.status == "rejected"
     }
+
+    /// The job is still preparing the release, which may yet be published
+    /// or rejected.
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
 }
 
 /// A JSON object read as `T`, or nothing for one that can't be. Anything
@@ -1907,6 +1914,20 @@ mod tests {
         assert!(!state("pending").is_rejected());
         assert!(!state("Rejected").is_rejected());
         assert!(!state("a_future_status").is_rejected());
+    }
+
+    #[test]
+    fn only_a_pending_swift_job_state_is_still_preparing() {
+        let state = |status: &str| SwiftReleaseState {
+            status: status.into(),
+            code: None,
+            message: None,
+            remedy: None,
+        };
+
+        assert!(state("pending").is_pending());
+        assert!(!state("rejected").is_pending());
+        assert!(!state("a_future_status").is_pending());
     }
 
     #[test]
