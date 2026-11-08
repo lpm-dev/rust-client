@@ -17,6 +17,7 @@ pub(super) struct Ancestry {
     block: Vec<Option<NodeId>>,
     numeric_property: Vec<Option<NodeId>>,
     declarator: Vec<Option<NodeId>>,
+    for_of_left: Vec<Option<NodeId>>,
 }
 
 impl Ancestry {
@@ -31,6 +32,7 @@ impl Ancestry {
             block: vec![None; len],
             numeric_property: vec![None; len],
             declarator: vec![None; len],
+            for_of_left: vec![None; len],
         };
         for (id, node) in nodes.iter_enumerated() {
             if id == NodeId::ROOT {
@@ -77,6 +79,14 @@ impl Ancestry {
                 AstKind::VariableDeclarator(_) => Some(parent),
                 _ => ancestry.declarator[up],
             };
+            ancestry.for_of_left[child] = match parent_kind {
+                AstKind::ForOfStatement(statement)
+                    if statement.left.span().contains_inclusive(node.kind().span()) =>
+                {
+                    Some(parent)
+                }
+                _ => ancestry.for_of_left[up],
+            };
         }
         ancestry
     }
@@ -120,6 +130,18 @@ impl Ancestry {
     /// The nearest object property with a numeric key around the node.
     pub(super) fn numeric_property(&self, id: NodeId) -> Option<NodeId> {
         self.numeric_property[id.index()]
+    }
+
+    /// The nearest `for…of` whose left side holds the node.
+    pub(super) fn for_of_left<'a>(
+        &self,
+        semantic: &Semantic<'a>,
+        id: NodeId,
+    ) -> Option<&'a ForOfStatement<'a>> {
+        match semantic.nodes().kind(self.for_of_left[id.index()]?) {
+            AstKind::ForOfStatement(statement) => Some(statement),
+            _ => None,
+        }
     }
 
     /// The nearest variable declarator around the node.
@@ -299,6 +321,17 @@ mod tests {
                     AstKind::VariableDeclarator(_)
                 )),
             );
+            let span = node.kind().span();
+            assert_eq!(
+                ancestry.for_of_left[id.index()],
+                walked(semantic, id, |kind| matches!(
+                    kind,
+                    AstKind::ForOfStatement(statement)
+                        if statement.left.span().contains_inclusive(span)
+                )),
+                "{source}: for_of_left({:?})",
+                node.kind().debug_name()
+            );
         }
         assert!(
             unreachable > 0 || !source.contains("dead"),
@@ -325,6 +358,7 @@ mod tests {
             "var t = {1: {a: () => C, 2: {b: () => C}}, x: {3: () => C}}; class C {}",
             "var m = {}; function r(i) { return m[i].call(m[i].call(0)) } var w = function () { m[i].call(1) };",
             "for (const [k] of Object.entries(o)) { eval(k) } while (0) { eval(a) } do { return } while (1); eval(after)",
+            "var x; for (const y of a) { var z; for (x of b) {} for (var w of c) { var v; } }",
         ] {
             assert_matches_walks(source);
         }

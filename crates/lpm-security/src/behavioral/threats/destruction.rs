@@ -1,6 +1,5 @@
 use super::{Flow, MAX_DEPTH, named_member};
 use oxc_ast::{AstKind, ast::*};
-use oxc_span::GetSpan;
 
 const ROOT: u8 = 1;
 const ENTRIES: u8 = 2;
@@ -44,16 +43,10 @@ impl<'a> Flow<'_, 'a> {
                     self.semantic.nodes().kind(declaration)
                     && variable.init.is_none()
                 {
-                    let iterable = self.semantic.nodes().ancestor_kinds(declaration).find_map(
-                        |kind| match kind {
-                            AstKind::ForOfStatement(statement)
-                                if statement.left.span().contains_inclusive(variable.span) =>
-                            {
-                                Some(&statement.right)
-                            }
-                            _ => None,
-                        },
-                    );
+                    let iterable = self
+                        .ancestry
+                        .for_of_left(self.semantic, declaration)
+                        .map(|statement| &statement.right);
                     return iterable.map_or(0, |value| {
                         if self.path_fact(value, next) == ENTRIES {
                             ENTRY
