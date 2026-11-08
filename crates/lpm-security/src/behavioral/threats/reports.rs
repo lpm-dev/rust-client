@@ -1,6 +1,6 @@
 use super::{CREDENTIAL_FILE, Flow, MAX_DEPTH, member};
 use oxc_ast::{AstKind, ast::*};
-use oxc_semantic::{NodeId, Semantic, SymbolId};
+use oxc_semantic::{NodeId, SymbolId};
 use oxc_span::GetSpan;
 use oxc_str::JSStr;
 use std::collections::{HashMap, HashSet};
@@ -11,15 +11,9 @@ pub(super) struct Write<'a> {
     value: &'a Expression<'a>,
 }
 
-fn owner(semantic: &Semantic<'_>, id: NodeId) -> u32 {
-    semantic
-        .nodes()
-        .ancestor_kinds(id)
-        .find_map(|kind| match kind {
-            AstKind::Function(function) => Some(function.span.start),
-            AstKind::ArrowFunctionExpression(function) => Some(function.span.start),
-            _ => None,
-        })
+fn owner(flow: &Flow<'_, '_>, id: NodeId) -> u32 {
+    flow.ancestry
+        .function_or_arrow_start(flow.semantic, id)
         .unwrap_or(0)
 }
 
@@ -59,9 +53,7 @@ pub(super) fn collect<'a>(flow: &Flow<'_, 'a>) -> HashMap<SymbolId, Vec<Write<'a
         else {
             continue;
         };
-        if assignment.operator.as_str() != "="
-            || !super::operations::reachable(flow.semantic, &flow.terminators, node.id())
-        {
+        if assignment.operator.as_str() != "=" || !flow.ancestry.reachable(node.id()) {
             continue;
         }
         writes.entry(symbol).or_default().push(Write {
@@ -81,13 +73,13 @@ pub(super) fn collect<'a>(flow: &Flow<'_, 'a>) -> HashMap<SymbolId, Vec<Write<'a
         ) {
             return false;
         }
-        let function = owner(flow.semantic, declaration);
+        let function = owner(flow, declaration);
         let safe = flow
             .semantic
             .scoping()
             .get_resolved_references(*symbol)
             .all(|reference| {
-                if reference.is_write() || owner(flow.semantic, reference.node_id()) != function {
+                if reference.is_write() || owner(flow, reference.node_id()) != function {
                     return false;
                 }
                 let mut ancestors = flow.semantic.nodes().ancestor_kinds(reference.node_id());

@@ -1,6 +1,5 @@
 use super::{Flow, MAX_DEPTH, named_member};
 use oxc_ast::{AstKind, ast::*};
-use oxc_span::GetSpan;
 
 const ROOT: u8 = 1;
 const ENTRIES: u8 = 2;
@@ -44,16 +43,10 @@ impl<'a> Flow<'_, 'a> {
                     self.semantic.nodes().kind(declaration)
                     && variable.init.is_none()
                 {
-                    let iterable = self.semantic.nodes().ancestor_kinds(declaration).find_map(
-                        |kind| match kind {
-                            AstKind::ForOfStatement(statement)
-                                if statement.left.span().contains_inclusive(variable.span) =>
-                            {
-                                Some(&statement.right)
-                            }
-                            _ => None,
-                        },
-                    );
+                    let iterable = self
+                        .ancestry
+                        .for_of_left(self.semantic, declaration)
+                        .map(|statement| &statement.right);
                     return iterable.map_or(0, |value| {
                         if self.path_fact(value, next) == ENTRIES {
                             ENTRY
@@ -75,14 +68,11 @@ impl<'a> Flow<'_, 'a> {
                     .copied()
                     .map_or(0, |value| self.path_fact(value, next));
                 if let Some(&(owner, index)) = self.parameters.get(&symbol) {
-                    let count = self.callers.get(&owner).map_or(0, Vec::len);
+                    let key = (owner, index);
+                    let count = self.arguments.get(&key).map_or(0, Vec::len);
                     for position in 0..count {
-                        let call = self.callers[&owner][position];
-                        if let Some(argument) =
-                            call.arguments.get(index).and_then(Argument::as_expression)
-                        {
-                            value |= self.path_fact(argument, next);
-                        }
+                        let argument = self.arguments[&key][position];
+                        value |= self.path_fact(argument, next);
                         if self.steps == 0 {
                             break;
                         }
