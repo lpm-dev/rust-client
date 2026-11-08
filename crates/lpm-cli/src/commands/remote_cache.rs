@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
-use std::io::{IsTerminal, Read, Seek, Write};
+use std::io::{IsTerminal, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -302,13 +302,12 @@ pub fn try_restore(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Uploads the local cache entry the task's run published, in the
+/// background, so the next task doesn't wait for it.
+/// [`finish_background_work`] waits for it before the command ends.
 pub fn try_store(
     client: &RemoteCacheClient,
-    key: &str,
-    project_dir: &Path,
-    command: &str,
-    output_globs: &[String],
+    published: lpm_task::cache::PublishedCacheEntry,
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
@@ -331,17 +330,7 @@ pub fn try_store(
         return;
     }
 
-    if let Err(reason) = client.store(
-        key,
-        project_dir,
-        command,
-        output_globs,
-        stdout,
-        stderr,
-        duration_ms,
-    ) {
-        warn_once(&reason);
-    }
+    client.upload_in_background(published, duration_ms);
 }
 
 pub fn status_for_project(
@@ -569,12 +558,15 @@ impl RemoteCacheClient {
     /// Sends a request with the current bearer, once more with a refreshed
     /// one if the server rejects it. `request` names the run-time request
     /// kind whose failures stop the remote cache; a status check names none.
-    async fn send_authenticated<T>(
+    async fn send_authenticated<T, F>(
         &self,
         request: Option<LimitedRequest>,
         unauthorized_message: &str,
-        send: impl AsyncFn(String) -> Result<T, RemoteCacheRequestError>,
-    ) -> Result<T, String> {
+        send: impl Fn(String) -> F,
+    ) -> Result<T, String>
+    where
+        F: Future<Output = Result<T, RemoteCacheRequestError>>,
+    {
         let bearer = self.auth.bearer().await?;
         let result = match send(bearer).await {
             Err(RemoteCacheRequestError::Unauthorized) => {
@@ -632,16 +624,36 @@ impl RemoteCacheClient {
         output_globs: &[String],
         validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
-        block_on_remote(self.restore_async(key, project_dir, output_globs, validate))
+        let Some(artifact) = block_on_remote(self.clone().fetch_verified_artifact(key.to_owned()))?
+        else {
+            return Ok(None);
+        };
+        let file = artifact
+            .as_file()
+            .try_clone()
+            .map_err(|e| format!("failed to retain verified remote cache artifact: {e}"))?;
+        let hit = lpm_task::cache::restore_remote_artifact_from_file_if(
+            key,
+            file,
+            project_dir,
+            output_globs,
+            validate,
+        )
+        .map_err(|e| format!("remote cache artifact could not be restored: {e}"))?;
+        if hit.is_some() {
+            fill_local_cache_in_background(key.to_owned(), artifact);
+        }
+        Ok(hit)
     }
 
-    async fn restore_async(
-        &self,
-        key: &str,
-        project_dir: &Path,
-        output_globs: &[String],
-        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
-    ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
+    /// Looks the artifact up and downloads it to a private temporary file,
+    /// which it returns only once the content hash, and the signature when a
+    /// key is configured, pass.
+    async fn fetch_verified_artifact(
+        self,
+        key: String,
+    ) -> Result<Option<tempfile::NamedTempFile>, String> {
+        let key = key.as_str();
         let client = lookup_client()?;
         let url = self.artifact_url(key)?;
         let mut retried = false;
@@ -650,23 +662,23 @@ impl RemoteCacheClient {
                 .send_authenticated(
                     Some(LimitedRequest::Lookup),
                     "remote cache authorization failed",
-                    async |bearer: String| {
-                        let response = client
+                    |bearer: String| {
+                        let request = client
                             .get(url.clone())
                             .bearer_auth(bearer)
-                            .header(DOWNLOAD_REDIRECT_HEADER, "1")
-                            .send()
-                            .await
-                            .map_err(|error| {
+                            .header(DOWNLOAD_REDIRECT_HEADER, "1");
+                        async move {
+                            let response = request.send().await.map_err(|error| {
                                 RemoteCacheRequestError::from_send(
                                     "remote cache lookup failed",
                                     &error,
                                 )
                             })?;
-                        if response.status() == StatusCode::UNAUTHORIZED {
-                            Err(RemoteCacheRequestError::Unauthorized)
-                        } else {
-                            Ok(response)
+                            if response.status() == StatusCode::UNAUTHORIZED {
+                                Err(RemoteCacheRequestError::Unauthorized)
+                            } else {
+                                Ok(response)
+                            }
                         }
                     },
                 )
@@ -764,78 +776,63 @@ impl RemoteCacheClient {
             };
             verify_artifact_tag(key, &tag, &digests.hmac_tag)?;
         }
-
-        let artifact = temp
-            .as_file()
-            .try_clone()
-            .map_err(|e| format!("failed to retain verified remote cache artifact: {e}"))?;
-        lpm_task::cache::restore_remote_artifact_from_file_if(
-            key,
-            artifact,
-            project_dir,
-            output_globs,
-            validate,
-        )
-        .map_err(|e| format!("remote cache artifact could not be restored: {e}"))
+        Ok(Some(temp))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn store(
+    fn upload_in_background(
         &self,
-        key: &str,
-        project_dir: &Path,
-        command: &str,
-        output_globs: &[String],
-        stdout: &str,
-        stderr: &str,
+        published: lpm_task::cache::PublishedCacheEntry,
         duration_ms: u64,
-    ) -> Result<(), String> {
-        block_on_remote(self.store_async(
-            key,
-            project_dir,
-            command,
-            output_globs,
-            stdout,
-            stderr,
-            duration_ms,
-        ))
+    ) {
+        let client = self.clone();
+        spawn_background(async move {
+            let _slot = UPLOAD_SLOTS
+                .acquire()
+                .await
+                .expect("the upload slots are never closed");
+            if let Err(reason) = client.upload_local_entry(published, duration_ms).await {
+                warn_once(&reason);
+            }
+        });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn store_async(
+    /// Builds the artifact from the local cache entry the task's run
+    /// published, which holds the outputs as the task left them, and uploads
+    /// it. Earlier uploads may have stopped or paused uploads while this one
+    /// waited for a slot.
+    async fn upload_local_entry(
         &self,
-        key: &str,
-        project_dir: &Path,
-        command: &str,
-        output_globs: &[String],
-        stdout: &str,
-        stderr: &str,
+        published: lpm_task::cache::PublishedCacheEntry,
         duration_ms: u64,
     ) -> Result<(), String> {
-        let mut artifact = tempfile::NamedTempFile::new()
-            .map_err(|e| format!("failed to create remote cache artifact temp file: {e}"))?;
-        let artifact_path = artifact.path().to_path_buf();
-        let artifact_args = lpm_task::cache::RemoteArtifactCreate {
-            key,
-            project_dir,
-            command,
-            output_globs,
-            stdout,
-            stderr,
-            duration_ms,
-            artifact_path: &artifact_path,
-        };
-        lpm_task::cache::create_remote_artifact_in_file(artifact_args, artifact.as_file_mut())
-            .map_err(|e| format!("failed to create remote cache artifact: {e}"))?;
-
+        if self.limits.uploads_refused() {
+            return Ok(());
+        }
+        if self.limits.uploads_paused() {
+            self.skipping_while_busy(LimitedRequest::Upload);
+            return Ok(());
+        }
+        let key = published.key().to_owned();
+        let signature_key = self.signature_key.clone();
+        let (artifact, digests) = tokio::task::spawn_blocking(move || {
+            write_artifact_from_local_entry(&published, signature_key.as_deref())
+        })
+        .await
+        .map_err(|e| format!("failed to create remote cache artifact: {e}"))??;
         let artifact_len = artifact
             .as_file()
             .metadata()
             .map_err(|e| format!("failed to stat remote cache artifact: {e}"))?
             .len();
         self.check_upload_size(artifact_len)?;
-        self.upload_artifact(key, artifact.as_file(), artifact_len, duration_ms)
-            .await
+        self.upload_artifact(
+            &key,
+            artifact.as_file(),
+            artifact_len,
+            &digests,
+            duration_ms,
+        )
+        .await
     }
 
     fn check_upload_size(&self, artifact_len: u64) -> Result<(), String> {
@@ -855,13 +852,10 @@ impl RemoteCacheClient {
         key: &str,
         artifact: &File,
         artifact_len: u64,
+        digests: &ArtifactDigests,
         duration_ms: u64,
     ) -> Result<(), String> {
         let client = http_client()?;
-        let hash_file = artifact
-            .try_clone()
-            .map_err(|e| format!("failed to retain remote cache artifact for hashing: {e}"))?;
-        let digests = hash_artifact(hash_file, self.signature_key.as_deref())?;
         let url = self.artifact_url(key)?;
         let mut retried = false;
         loop {
@@ -869,53 +863,28 @@ impl RemoteCacheClient {
                 .send_authenticated(
                     Some(LimitedRequest::Upload),
                     "remote cache upload was not authorized",
-                    async |bearer: String| {
-                        let mut body_file = artifact.try_clone().map_err(|error| {
-                            RemoteCacheRequestError::Message(format!(
-                                "failed to retain remote cache artifact for upload: {error}"
-                            ))
-                        })?;
-                        body_file.rewind().map_err(|error| {
-                            RemoteCacheRequestError::Message(format!(
-                                "failed to rewind remote cache artifact for upload: {error}"
-                            ))
-                        })?;
-                        let mut request = client
-                            .put(url.clone())
-                            .bearer_auth(bearer)
-                            .header(CONTENT_LENGTH, artifact_len.to_string())
-                            .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
-                            .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
-                            .header(
-                                ARTIFACT_CLIENT_CI_HEADER,
-                                if is_ci_environment() { "1" } else { "0" },
-                            )
-                            .header(
-                                ARTIFACT_CLIENT_INTERACTIVE_HEADER,
-                                if std::io::stdout().is_terminal() {
-                                    "1"
-                                } else {
-                                    "0"
-                                },
-                            )
-                            .body(Body::wrap_stream(
-                                tokio_util::io::ReaderStream::with_capacity(
-                                    tokio::fs::File::from_std(body_file),
-                                    UPLOAD_READ_BYTES,
-                                ),
-                            ));
-
-                        if let Some(tag) = digests.hmac_tag.as_deref() {
-                            request = request.header(ARTIFACT_TAG_HEADER, tag);
-                        }
-
-                        let response = request.send().await.map_err(|error| {
-                            RemoteCacheRequestError::from_send("remote cache upload failed", &error)
-                        })?;
-                        if response.status() == StatusCode::UNAUTHORIZED {
-                            Err(RemoteCacheRequestError::Unauthorized)
-                        } else {
-                            Ok(response)
+                    |bearer: String| {
+                        let request = upload_request(
+                            client,
+                            &url,
+                            bearer,
+                            artifact,
+                            artifact_len,
+                            digests,
+                            duration_ms,
+                        );
+                        async move {
+                            let response = request?.send().await.map_err(|error| {
+                                RemoteCacheRequestError::from_send(
+                                    "remote cache upload failed",
+                                    &error,
+                                )
+                            })?;
+                            if response.status() == StatusCode::UNAUTHORIZED {
+                                Err(RemoteCacheRequestError::Unauthorized)
+                            } else {
+                                Ok(response)
+                            }
                         }
                     },
                 )
@@ -1186,10 +1155,10 @@ struct FetchedRemoteStatus {
 
 impl RemoteCacheClient {
     fn fetch_status(&self) -> Result<FetchedRemoteStatus, String> {
-        block_on_remote(self.fetch_status_async())
+        block_on_remote(self.clone().fetch_status_async())
     }
 
-    async fn fetch_status_async(&self) -> Result<FetchedRemoteStatus, String> {
+    async fn fetch_status_async(self) -> Result<FetchedRemoteStatus, String> {
         let client = http_client()?;
         let url = self.status_url()?;
         let rejected = match self.auth {
@@ -1201,22 +1170,20 @@ impl RemoteCacheClient {
             }
         };
         let response = self
-            .send_authenticated(None, rejected, async |bearer: String| {
-                let response = client
-                    .get(url.clone())
-                    .bearer_auth(bearer)
-                    .send()
-                    .await
-                    .map_err(|error| {
+            .send_authenticated(None, rejected, |bearer: String| {
+                let request = client.get(url.clone()).bearer_auth(bearer);
+                async move {
+                    let response = request.send().await.map_err(|error| {
                         RemoteCacheRequestError::Message(format!(
                             "remote cache status failed: {}",
                             lpm_http::display_error(&error)
                         ))
                     })?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    Err(RemoteCacheRequestError::Unauthorized)
-                } else {
-                    Ok(response)
+                    if response.status() == StatusCode::UNAUTHORIZED {
+                        Err(RemoteCacheRequestError::Unauthorized)
+                    } else {
+                        Ok(response)
+                    }
                 }
             })
             .await?;
@@ -1446,6 +1413,56 @@ async fn fetch_redirected_artifact(
     }
 }
 
+/// One upload attempt's request, reading the artifact from its start.
+fn upload_request(
+    client: &Client,
+    url: &reqwest::Url,
+    bearer: String,
+    artifact: &File,
+    artifact_len: u64,
+    digests: &ArtifactDigests,
+    duration_ms: u64,
+) -> Result<reqwest::RequestBuilder, RemoteCacheRequestError> {
+    let mut body_file = artifact.try_clone().map_err(|error| {
+        RemoteCacheRequestError::Message(format!(
+            "failed to retain remote cache artifact for upload: {error}"
+        ))
+    })?;
+    body_file.rewind().map_err(|error| {
+        RemoteCacheRequestError::Message(format!(
+            "failed to rewind remote cache artifact for upload: {error}"
+        ))
+    })?;
+    let mut request = client
+        .put(url.clone())
+        .bearer_auth(bearer)
+        .header(CONTENT_LENGTH, artifact_len.to_string())
+        .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
+        .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
+        .header(
+            ARTIFACT_CLIENT_CI_HEADER,
+            if is_ci_environment() { "1" } else { "0" },
+        )
+        .header(
+            ARTIFACT_CLIENT_INTERACTIVE_HEADER,
+            if std::io::stdout().is_terminal() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .body(Body::wrap_stream(
+            tokio_util::io::ReaderStream::with_capacity(
+                tokio::fs::File::from_std(body_file),
+                UPLOAD_READ_BYTES,
+            ),
+        ));
+    if let Some(tag) = digests.hmac_tag.as_deref() {
+        request = request.header(ARTIFACT_TAG_HEADER, tag);
+    }
+    Ok(request)
+}
+
 /// Where a lookup's redirect leads: its location, resolved against the
 /// lookup's URL, which may not leave HTTPS.
 fn redirect_target(
@@ -1463,9 +1480,26 @@ fn redirect_target(
     Ok(target)
 }
 
+/// Remote-cache requests run on one runtime for the whole process, so the
+/// clients' connection pools, and the TLS sessions in them, last from task to
+/// task and across the worker threads of a parallel run. A pooled connection
+/// belongs to the runtime that opened it, so a runtime per request would
+/// drop them all with it. It has a worker per core, since each download's
+/// chunks are hashed and written on them while a parallel run restores.
+static REMOTE_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name("lpm-remote-cache")
+        .enable_all()
+        .build()
+        .expect("the remote cache runtime builds")
+});
+
+static LOOKUP_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(build_lookup_client);
+static HTTP_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(build_http_client);
+
 /// The client for lookups, which leaves redirects to
 /// `fetch_redirected_artifact`, so the token never follows one.
-fn lookup_client() -> Result<Client, String> {
+fn build_lookup_client() -> Result<Client, String> {
     lpm_http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
@@ -1474,7 +1508,7 @@ fn lookup_client() -> Result<Client, String> {
         .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))
 }
 
-fn http_client() -> Result<Client, String> {
+fn build_http_client() -> Result<Client, String> {
     lpm_http::client_builder()
         .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
         .timeout(REMOTE_CACHE_TIMEOUT)
@@ -1482,19 +1516,169 @@ fn http_client() -> Result<Client, String> {
         .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))
 }
 
-/// Run remote-cache I/O from the synchronous task-cache paths.
-///
-/// Inside LPM's runtime this blocks in place on the runtime's own reactor,
-/// rather than using `reqwest::blocking`, whose per-client thread and runtime
-/// must not be started from inside an async runtime.
-fn block_on_remote<F: Future>(future: F) -> F::Output {
+fn lookup_client() -> Result<&'static Client, String> {
+    LOOKUP_CLIENT.as_ref().map_err(Clone::clone)
+}
+
+fn http_client() -> Result<&'static Client, String> {
+    HTTP_CLIENT.as_ref().map_err(Clone::clone)
+}
+
+/// How many uploads build their artifact and send it at once.
+static UPLOAD_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Uploads and local cache fills still running after the task they came
+/// from, until [`finish_background_work`] waits for them.
+static BACKGROUND_WORK: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Runs remote-cache I/O on [`REMOTE_RUNTIME`] and waits for it from the
+/// synchronous task-cache paths, which run on LPM's runtime or on a parallel
+/// run's worker threads.
+fn block_on_remote<T, F>(future: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    REMOTE_RUNTIME.spawn(async move {
+        let _ = sender.send(future.await);
+    });
+    let wait = move || {
+        receiver
+            .recv()
+            .unwrap_or_else(|_| Err("remote cache request stopped unexpectedly".into()))
+    };
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a current-thread runtime for remote cache I/O builds")
-            .block_on(future),
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
+fn spawn_background(work: impl Future<Output = ()> + Send + 'static) {
+    let handle = REMOTE_RUNTIME.spawn(work);
+    let mut pending = BACKGROUND_WORK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    pending.retain(|handle| !handle.is_finished());
+    pending.push(handle);
+}
+
+/// Waits for the remote cache uploads and local cache fills the command
+/// started, so it doesn't exit while they run. Says so when that takes a
+/// moment, unless the command prints JSON.
+pub async fn finish_background_work(json: bool) {
+    const QUIET_WAIT: Duration = Duration::from_millis(500);
+    let mut announced = json;
+    loop {
+        let pending = std::mem::take(
+            &mut *BACKGROUND_WORK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        if pending.is_empty() {
+            return;
+        }
+        let wait = async {
+            for handle in pending {
+                let _ = handle.await;
+            }
+        };
+        tokio::pin!(wait);
+        if !announced && tokio::time::timeout(QUIET_WAIT, &mut wait).await.is_ok() {
+            continue;
+        }
+        if !announced {
+            install_ui::phase("finishing remote cache uploads");
+            announced = true;
+        }
+        wait.await;
+    }
+}
+
+fn fill_local_cache_in_background(key: String, artifact: tempfile::NamedTempFile) {
+    spawn_background(async move {
+        let filled = tokio::task::spawn_blocking(move || {
+            let file = artifact.as_file().try_clone()?;
+            lpm_task::cache::store_cache_from_remote_artifact(&key, file)
+        })
+        .await;
+        match filled {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("failed to populate local task cache from remote hit: {error}");
+            }
+            Err(error) => {
+                tracing::warn!("failed to populate local task cache from remote hit: {error}");
+            }
+        }
+    });
+}
+
+/// Writes the artifact for `key` from its local cache entry to a private
+/// temporary file, hashing it as it is written.
+fn write_artifact_from_local_entry(
+    published: &lpm_task::cache::PublishedCacheEntry,
+    signature_key: Option<&str>,
+) -> Result<(tempfile::NamedTempFile, ArtifactDigests), String> {
+    let artifact = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("failed to create remote cache artifact temp file: {e}"))?;
+    let file = artifact
+        .as_file()
+        .try_clone()
+        .map_err(|e| format!("failed to open remote cache artifact temp file: {e}"))?;
+    let writer = DigestWriter::new(
+        std::io::BufWriter::with_capacity(UPLOAD_READ_BYTES, file),
+        signature_key,
+    )?;
+    let writer = lpm_task::cache::write_remote_artifact_from_local_entry(published, writer)
+        .map_err(|e| format!("failed to create remote cache artifact: {e}"))?;
+    Ok((artifact, writer.finish()?))
+}
+
+/// Passes writes through to `inner` while it computes the artifact's
+/// content hash and, with a key, its signature.
+struct DigestWriter<W> {
+    inner: W,
+    sha: Sha256,
+    mac: Option<HmacSha256>,
+}
+
+impl<W: Write> DigestWriter<W> {
+    fn new(inner: W, signature_key: Option<&str>) -> Result<Self, String> {
+        Ok(Self {
+            inner,
+            sha: Sha256::new(),
+            mac: signature_key.map(new_hmac).transpose()?,
+        })
+    }
+
+    fn finish(mut self) -> Result<ArtifactDigests, String> {
+        self.inner
+            .flush()
+            .map_err(|e| format!("failed to write remote cache artifact: {e}"))?;
+        Ok(ArtifactDigests {
+            sha256_hex: hex::encode(self.sha.finalize()),
+            hmac_tag: self
+                .mac
+                .map(|mac| format_hmac_tag(&mac.finalize().into_bytes())),
+        })
+    }
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.sha.update(&buffer[..written]);
+        if let Some(mac) = self.mac.as_mut() {
+            mac.update(&buffer[..written]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1637,32 +1821,6 @@ async fn copy_response_to_temp(
 
     temp.flush()
         .map_err(|e| format!("failed to flush remote cache artifact: {e}"))?;
-
-    Ok(ArtifactDigests {
-        sha256_hex: hex::encode(sha.finalize()),
-        hmac_tag: mac.map(|mac| format_hmac_tag(&mac.finalize().into_bytes())),
-    })
-}
-
-fn hash_artifact(mut file: File, signature_key: Option<&str>) -> Result<ArtifactDigests, String> {
-    file.rewind()
-        .map_err(|e| format!("failed to rewind remote cache artifact: {e}"))?;
-    let mut sha = Sha256::new();
-    let mut mac = signature_key.map(new_hmac).transpose()?;
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|e| format!("failed to hash remote cache artifact: {e}"))?;
-        if read == 0 {
-            break;
-        }
-        sha.update(&buffer[..read]);
-        if let Some(mac) = mac.as_mut() {
-            mac.update(&buffer[..read]);
-        }
-    }
 
     Ok(ArtifactDigests {
         sha256_hex: hex::encode(sha.finalize()),
@@ -1869,10 +2027,18 @@ fn warn_once(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
+
+    fn test_digests() -> ArtifactDigests {
+        ArtifactDigests {
+            sha256_hex: hex::encode(Sha256::digest(b"artifact")),
+            hmac_tag: None,
+        }
+    }
 
     #[test]
     fn remote_io_runs_outside_the_runtime_and_on_its_threads() {
-        assert_eq!(block_on_remote(async { 7 }), 7);
+        assert_eq!(block_on_remote(async { Ok(7) }), Ok(7));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1882,16 +2048,24 @@ mod tests {
         let on_block_on_thread = runtime.block_on(async {
             block_on_remote(async {
                 tokio::task::yield_now().await;
-                8
+                Ok(8)
             })
         });
         let on_worker = runtime.block_on(async {
-            tokio::spawn(async { block_on_remote(async { 9 }) })
+            tokio::spawn(async { block_on_remote(async { Ok(9) }) })
                 .await
                 .unwrap()
         });
+        let on_current_thread = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { block_on_remote(async { Ok(10) }) });
 
-        assert_eq!((on_block_on_thread, on_worker), (8, 9));
+        assert_eq!(
+            (on_block_on_thread, on_worker, on_current_thread),
+            (Ok(8), Ok(9), Ok(10))
+        );
     }
 
     #[test]
@@ -2020,20 +2194,6 @@ mod tests {
     fn artifact_sha_rejects_mismatch() {
         let err = verify_artifact_sha(&"0".repeat(64), &"1".repeat(64)).unwrap_err();
         assert!(err.contains("content-hash"));
-    }
-
-    #[test]
-    fn artifact_hash_uses_the_open_file_after_its_path_is_replaced() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("artifact");
-        std::fs::write(&path, "verified").unwrap();
-        let open = File::open(&path).unwrap();
-        std::fs::rename(&path, directory.path().join("moved")).unwrap();
-        std::fs::write(&path, "replacement").unwrap();
-
-        let digest = hash_artifact(open, None).unwrap();
-
-        assert_eq!(digest.sha256_hex, hex::encode(Sha256::digest(b"verified")));
     }
 
     #[test]
@@ -2318,6 +2478,51 @@ mod tests {
         }
     }
 
+    /// A cache server that answers every lookup with 404 on kept-alive
+    /// connections, counting the connections it accepts.
+    fn counting_miss_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while matches!(stream.read(&mut byte), Ok(1)) {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            head.clear();
+                            if stream
+                                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (url, connections)
+    }
+
+    #[test]
+    fn remote_cache_lookups_reuse_one_connection() {
+        let (url, connections) = counting_miss_server();
+        let client = test_client(&format!("{url}/v8"), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        for key in ["a", "b", "c"] {
+            let restored = client.restore(&key.repeat(64), project.path(), &[], || Ok(true));
+            assert!(matches!(restored, Ok(None)), "lookup {key} was not a miss");
+        }
+
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn uploads_only_artifacts_within_the_cache_servers_cap() {
         let client = test_client("http://127.0.0.1:9/v8", MIB);
@@ -2366,11 +2571,8 @@ mod tests {
     async fn treats_a_streamed_artifact_past_the_cache_servers_cap_as_a_miss() {
         let url = chunked_artifact_server(2 * MIB);
         let client = test_client(&format!("{url}/v8"), MIB);
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
 
         match restored {
             Err(error) => assert_eq!(
@@ -2386,7 +2588,7 @@ mod tests {
         let mut artifact = tempfile::tempfile().unwrap();
         artifact.write_all(b"artifact").unwrap();
         let uploaded = client
-            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .upload_artifact(&"a".repeat(64), &artifact, 8, &test_digests(), 10)
             .await;
         (client, uploaded)
     }
@@ -2435,11 +2637,8 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_cache_server_stops_the_cache_for_the_run() {
         let client = test_client(&closed_local_port(), MIB);
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
 
         let Err(message) = restored else {
             panic!("an unreachable lookup is reported");
@@ -2462,7 +2661,7 @@ mod tests {
         artifact.write_all(b"artifact").unwrap();
 
         let uploaded = client
-            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .upload_artifact(&"a".repeat(64), &artifact, 8, &test_digests(), 10)
             .await;
 
         let message = uploaded.expect_err("an unreachable upload is reported");
@@ -2483,11 +2682,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
 
         let Err(message) = restored else {
             panic!("a rejected token is reported");
@@ -2538,11 +2734,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
 
         assert!(matches!(restored, Ok(None)));
         assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
@@ -2581,11 +2774,8 @@ mod tests {
             .mount(&server)
             .await;
         let (client, _) = upload_to(&server).await;
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"b".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("b".repeat(64)).await;
 
         assert!(matches!(restored, Ok(None)));
         server.verify().await;
@@ -2630,11 +2820,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
 
         assert!(matches!(restored, Ok(None)));
         assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
@@ -2726,7 +2913,7 @@ mod tests {
         artifact.write_all(b"artifact").unwrap();
 
         let uploaded = client
-            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .upload_artifact(&"a".repeat(64), &artifact, 8, &test_digests(), 10)
             .await;
 
         assert_eq!(uploaded, Ok(()));
@@ -2747,11 +2934,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             limits.refuse_lookups();
         });
-        let project = tempfile::tempdir().unwrap();
 
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
 
         assert!(matches!(restored, Ok(None)));
         server.verify().await;
@@ -2878,7 +3062,7 @@ mod tests {
             });
 
             let uploaded = client
-                .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+                .upload_artifact(&"a".repeat(64), &artifact, 8, &test_digests(), 10)
                 .await;
 
             pause.await.unwrap();
@@ -2890,19 +3074,92 @@ mod tests {
         }
     }
 
+    /// Publishes the local cache entry for `key` from `project`'s `dist`, as
+    /// a task's run does. The caller sets `LPM_HOME`.
+    fn publish_entry(project: &Path, key: &str, output: &str) -> lpm_task::cache::StoredCacheEntry {
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        std::fs::write(project.join("dist/out.txt"), output).unwrap();
+        lpm_task::cache::store_cache(key, project, "build", &["dist/**".to_owned()], "", "", 1)
+            .unwrap()
+    }
+
+    fn published(
+        stored: lpm_task::cache::StoredCacheEntry,
+    ) -> lpm_task::cache::PublishedCacheEntry {
+        match stored {
+            lpm_task::cache::StoredCacheEntry::Published(published) => published,
+            lpm_task::cache::StoredCacheEntry::KeptExisting => {
+                panic!("expected the store to publish the entry")
+            }
+        }
+    }
+
+    fn scoped_lpm_home(path: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([("LPM_HOME", path.as_os_str().to_owned())])
+    }
+
+    fn uploads_received(server: &wiremock::MockServer) -> usize {
+        REMOTE_RUNTIME
+            .block_on(server.received_requests())
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::PUT)
+            .count()
+    }
+
     fn store_with(client: &RemoteCacheClient) {
-        let project = tempfile::tempdir().unwrap();
-        try_store(
-            client,
-            "abc123",
-            project.path(),
-            "build",
-            &[],
-            "",
-            "",
-            1,
-            &HashMap::new(),
-            &HashMap::new(),
+        let (lpm_home, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _env = scoped_lpm_home(lpm_home.path());
+        let entry = published(publish_entry(project.path(), "abc123", "output"));
+        try_store(client, entry, "", "", 1, &HashMap::new(), &HashMap::new());
+    }
+
+    #[test]
+    fn an_upload_sends_the_cache_entry_its_run_published() {
+        let (lpm_home, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _env = scoped_lpm_home(lpm_home.path());
+        let server = REMOTE_RUNTIME.block_on(wiremock::MockServer::start());
+        REMOTE_RUNTIME.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server),
+        );
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let key = "d".repeat(64);
+        let entry = published(publish_entry(project.path(), &key, "this run's output"));
+
+        try_store(&client, entry, "", "", 1, &HashMap::new(), &HashMap::new());
+        REMOTE_RUNTIME.block_on(finish_background_work(true));
+
+        assert_eq!(uploads_received(&server), 1);
+    }
+
+    #[test]
+    fn an_upload_skips_a_cache_entry_another_run_published() {
+        let (lpm_home, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _env = scoped_lpm_home(lpm_home.path());
+        let server = REMOTE_RUNTIME.block_on(wiremock::MockServer::start());
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let key = "c".repeat(64);
+        let entry = published(publish_entry(project.path(), &key, "this run's output"));
+        // Another run publishes under the key once this run's entry is gone,
+        // and a run after that keeps its entry.
+        let entries = LpmRoot::from_env().unwrap().cache_tasks();
+        std::fs::rename(entries.join(&key), entries.join(format!("{key}-moved"))).unwrap();
+        let refused = "written by a run whose upload was refused";
+        published(publish_entry(project.path(), &key, refused));
+        assert!(matches!(
+            publish_entry(project.path(), &key, "a later run's output"),
+            lpm_task::cache::StoredCacheEntry::KeptExisting
+        ));
+
+        try_store(&client, entry, "", "", 1, &HashMap::new(), &HashMap::new());
+        REMOTE_RUNTIME.block_on(finish_background_work(true));
+
+        assert_eq!(
+            uploads_received(&server),
+            0,
+            "uploaded an entry another run published"
         );
     }
 
@@ -3007,10 +3264,7 @@ mod tests {
     }
 
     async fn look_up_at(client: &RemoteCacheClient) {
-        let project = tempfile::tempdir().unwrap();
-        let restored = client
-            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact("a".repeat(64)).await;
         assert!(matches!(restored, Ok(None)));
     }
 
@@ -3128,12 +3382,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
-        let project = tempfile::tempdir().unwrap();
 
         let started = Instant::now();
-        let restored = client
-            .restore_async(&key, project.path(), &[], || Ok(true))
-            .await;
+        let restored = client.clone().fetch_verified_artifact(key.clone()).await;
 
         assert!(matches!(restored, Ok(None)));
         assert!(started.elapsed() >= wait + retry_jitter(&key, wait));
@@ -3182,7 +3433,9 @@ mod tests {
         artifact.write_all(b"artifact").unwrap();
 
         let started = Instant::now();
-        let uploaded = client.upload_artifact(&key, &artifact, 8, 10).await;
+        let uploaded = client
+            .upload_artifact(&key, &artifact, 8, &test_digests(), 10)
+            .await;
 
         assert_eq!(uploaded, Ok(()));
         assert!(started.elapsed() >= wait + retry_jitter(&key, wait));
@@ -3238,9 +3491,14 @@ mod tests {
     /// The expected values were computed with Python's `hashlib` and `hmac`.
     #[test]
     fn artifact_digest_and_signature_tag_match_independently_computed_values() {
-        let mut file = tempfile::tempfile().unwrap();
-        std::io::Write::write_all(&mut file, &b"remote cache artifact kat\n".repeat(64)).unwrap();
-        let digests = hash_artifact(file, Some("remote-cache-kat-key")).unwrap();
+        let mut writer = DigestWriter::new(Vec::new(), Some("remote-cache-kat-key")).unwrap();
+        // Written in uneven pieces, as a gzip encoder writes.
+        for piece in b"remote cache artifact kat\n".repeat(64).chunks(37) {
+            writer.write_all(piece).unwrap();
+        }
+        let written = writer.inner.clone();
+        let digests = writer.finish().unwrap();
+        assert_eq!(written, b"remote cache artifact kat\n".repeat(64));
         assert_eq!(
             digests.sha256_hex,
             "8b30bef40bf5a5cd3c55cbbbf7f19b98315cf5bf1ecd4375f8c830f2b9123688"

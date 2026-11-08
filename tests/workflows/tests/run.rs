@@ -3339,6 +3339,107 @@ async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
     );
 }
 
+/// Accepts every upload after `delay`, noting when each one arrived.
+struct SlowUploadResponder {
+    arrived_ms: Arc<Mutex<Vec<u128>>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for SlowUploadResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.arrived_ms
+            .lock()
+            .expect("upload arrival mutex poisoned")
+            .push(unix_millis());
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "urls": [] }))
+            .set_delay(self.delay)
+    }
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_millis()
+}
+
+#[tokio::test]
+async fn a_slow_remote_cache_upload_does_not_hold_up_the_next_task() {
+    let upload_delay = std::time::Duration::from_secs(3);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let arrived_ms = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(SlowUploadResponder {
+            arrived_ms: Arc::clone(&arrived_ms),
+            delay: upload_delay,
+        })
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "slow-upload",
+        "version": "1.0.0",
+        "scripts": {
+            "first": "node -e \"require('fs').mkdirSync('dist',{recursive:true}); require('fs').writeFileSync('dist/first.txt','built')\"",
+            "second": "node -e \"require('fs').writeFileSync('second-started', String(Date.now()))\""
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{ "enabled": true, "url": "{}/v8" }},
+            "tasks": {{ "first": {{ "cache": true, "outputs": ["dist/**"] }} }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let started = std::time::Instant::now();
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "first", "second"])
+        .output()
+        .expect("failed to run lpm run first second");
+    let elapsed = started.elapsed();
+
+    assert!(
+        output.status.success(),
+        "run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let upload_arrived = *arrived_ms
+        .lock()
+        .expect("upload arrival mutex poisoned")
+        .first()
+        .unwrap_or_else(|| {
+            panic!(
+                "the first task's outputs were not uploaded:\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let second_started: u128 = project.read_file("second-started").trim().parse().unwrap();
+    assert!(
+        second_started < upload_arrived + upload_delay.as_millis() - 1000,
+        "the second task waited for the first task's upload: it started {} ms after the upload arrived",
+        second_started.saturating_sub(upload_arrived),
+    );
+    assert!(
+        elapsed >= upload_delay,
+        "the run exited after {elapsed:?}, before its upload finished",
+    );
+}
+
 #[tokio::test]
 async fn run_remote_cache_restores_from_the_storage_a_lookup_is_redirected_to_without_the_token() {
     let server = MockServer::start().await;

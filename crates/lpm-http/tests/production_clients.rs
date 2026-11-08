@@ -481,9 +481,7 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     assert_body_contains(&coolify, "pub(super) fn new(", "lpm_http::client_builder()");
 
     let remote_cache = read_workspace_source("crates/lpm-cli/src/commands/remote_cache.rs");
-    assert_body_contains(
-        &remote_cache,
-        "fn http_client()",
-        "lpm_http::client_builder()",
-    );
+    for builder in ["fn build_lookup_client()", "fn build_http_client()"] {
+        assert_body_contains(&remote_cache, builder, "lpm_http::client_builder()");
+    }
 }

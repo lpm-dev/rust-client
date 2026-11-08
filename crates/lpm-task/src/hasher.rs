@@ -851,7 +851,7 @@ fn collect_input_files(
                             ))
                         })?;
                     let mut file = open_project_file_nofollow(&project, resolved_relative)?;
-                    let content_hash = sha256_hex_reader(&mut file).map_err(|error| {
+                    let content_hash = file_content_hash(&mut file).map_err(|error| {
                         LpmError::Task(format!(
                             "failed to hash task cache input {}: {error}",
                             entry.display()
@@ -1101,7 +1101,7 @@ fn hash_implicit_project_file(
             "task cache {kind} file '{name}' is not a regular file"
         )));
     }
-    let hash = sha256_hex_reader(&mut file.into_std()).map_err(|error| {
+    let hash = file_content_hash(&mut file.into_std()).map_err(|error| {
         LpmError::Task(format!(
             "failed to hash task cache {kind} file '{name}': {error}"
         ))
@@ -1116,6 +1116,92 @@ fn hash_implicit_file_value(hasher: &mut Sha256, kind: &str, name: &str, value: 
         7,
         &[kind.as_bytes(), name.as_bytes(), value.as_bytes()],
     );
+}
+
+/// The SHA-256 of an open input file. A file hashed earlier in this process
+/// that still has the same device, inode, size and change times reuses that
+/// hash: a run hashes its inputs before and after each task, and tasks share
+/// the default inputs.
+fn file_content_hash(file: &mut std::fs::File) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        content_memo::hash(file, std::time::SystemTime::now())
+    }
+    #[cfg(not(unix))]
+    {
+        sha256_hex_reader(file)
+    }
+}
+
+#[cfg(unix)]
+mod content_memo {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// A file changed this recently is always read. Filesystems that keep
+    /// whole-second times would give a second same-size write within one
+    /// tick the identity of the first.
+    const SETTLED_AFTER: Duration = Duration::from_secs(2);
+    /// Bounds the memo in a long watch session, where each edit adds an entry.
+    const MAX_ENTRIES: usize = 200_000;
+
+    #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+    pub(super) struct ContentIdentity {
+        dev: u64,
+        ino: u64,
+        size: u64,
+        mtime: (i64, i64),
+        ctime: (i64, i64),
+    }
+
+    impl ContentIdentity {
+        pub(super) fn of(metadata: &std::fs::Metadata) -> Self {
+            Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                size: metadata.size(),
+                mtime: (metadata.mtime(), metadata.mtime_nsec()),
+                ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            }
+        }
+
+        /// The kernel sets the change time on every write and metadata
+        /// change, and nothing can set it back, unlike the modification time.
+        fn settled_at(&self, now: SystemTime) -> bool {
+            let (seconds, nanos) = self.ctime;
+            let Ok(seconds) = u64::try_from(seconds) else {
+                return false;
+            };
+            let changed = UNIX_EPOCH + Duration::new(seconds, u32::try_from(nanos).unwrap_or(0));
+            now.duration_since(changed)
+                .is_ok_and(|age| age >= SETTLED_AFTER)
+        }
+    }
+
+    pub(super) static MEMO: LazyLock<Mutex<HashMap<ContentIdentity, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn hash(file: &mut std::fs::File, now: SystemTime) -> std::io::Result<String> {
+        let identity = ContentIdentity::of(&file.metadata()?);
+        if let Some(hash) = MEMO
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&identity)
+        {
+            return Ok(hash.clone());
+        }
+        let hash = super::sha256_hex_reader(file)?;
+        if identity.settled_at(now) && ContentIdentity::of(&file.metadata()?) == identity {
+            let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+            if memo.len() >= MAX_ENTRIES {
+                memo.clear();
+            }
+            memo.insert(identity, hash.clone());
+        }
+        Ok(hash)
+    }
 }
 
 /// Compute SHA-256 hex string of a file using streaming reads.
@@ -1189,6 +1275,49 @@ mod hex {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    fn hash_later(path: &Path) -> String {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        content_memo::hash(&mut fs::File::open(path).unwrap(), later).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_settled_input_reuses_its_hash_until_its_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.txt");
+        fs::write(&input, "first").unwrap();
+        let identity = content_memo::ContentIdentity::of(&fs::metadata(&input).unwrap());
+        content_memo::MEMO
+            .lock()
+            .unwrap()
+            .insert(identity, "memoized".into());
+
+        assert_eq!(hash_later(&input), "memoized");
+
+        // A same-size rewrite changes the change time, so the file is read.
+        fs::write(&input, "other").unwrap();
+        assert_eq!(hash_later(&input), sha256_hex_file(&input).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recently_changed_input_is_hashed_again_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.txt");
+        fs::write(&input, "fresh").unwrap();
+        let identity = content_memo::ContentIdentity::of(&fs::metadata(&input).unwrap());
+
+        let hash = content_memo::hash(
+            &mut fs::File::open(&input).unwrap(),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(hash, sha256_hex_file(&input).unwrap());
+        assert!(!content_memo::MEMO.lock().unwrap().contains_key(&identity));
+    }
 
     fn compute_cache_key(
         project_dir: &Path,

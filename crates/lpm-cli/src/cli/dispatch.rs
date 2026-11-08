@@ -3325,6 +3325,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
     }
     .await;
+    commands::remote_cache::finish_background_work(cli.json).await;
 
     super::install_timeline::finish(if result.is_ok() { "success" } else { "error" });
 
