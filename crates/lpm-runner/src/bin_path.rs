@@ -306,14 +306,11 @@ pub(crate) fn build_path_from_bin_dirs(
 ) -> lpm_runtime::detect::DetectionResult<String> {
     let separator = if cfg!(windows) { ";" } else { ":" };
 
-    let mut parts: Vec<String> = bin_dirs
-        .iter()
-        .filter_map(|dir| utf8_path_entry(dir))
-        .collect();
+    let mut parts: Vec<String> = bin_dirs.iter().filter_map(|dir| path_entry(dir)).collect();
 
     match hint {
         ManagedRuntimeHint::Resolved(bins) => {
-            parts.extend(bins.iter().filter_map(|bin| utf8_path_entry(&bin.bin_dir)));
+            parts.extend(bins.iter().filter_map(|bin| path_entry(&bin.bin_dir)));
         }
         ManagedRuntimeHint::Absent => {
             // Caller confirmed no managed runtime — skip the silent detect.
@@ -326,18 +323,25 @@ pub(crate) fn build_path_from_bin_dirs(
     if let Some(inherited) = std::env::var_os("PATH")
         && !inherited.is_empty()
     {
-        parts.extend(std::env::split_paths(&inherited).filter_map(|entry| utf8_path_entry(&entry)));
+        parts.extend(std::env::split_paths(&inherited).filter_map(|entry| path_entry(&entry)));
     }
 
     Ok(parts.join(separator))
 }
 
-fn utf8_path_entry(dir: &Path) -> Option<String> {
-    let entry = dir.to_str();
+/// `dir` written as one PATH entry, quoted where Windows needs it, or `None`
+/// for a directory that isn't valid UTF-8 or that the platform's PATH can't
+/// hold, as a Unix directory with `:` in its name.
+fn path_entry(dir: &Path) -> Option<String> {
+    let entry = std::env::join_paths([dir])
+        .ok()
+        .and_then(|entry| entry.into_string().ok());
     if entry.is_none() {
-        tracing::debug!("leaving a PATH entry that isn't valid UTF-8 out of the child's PATH");
+        tracing::debug!(
+            "leaving a directory that can't be a UTF-8 PATH entry out of the child's PATH"
+        );
     }
-    entry.map(ToOwned::to_owned)
+    entry
 }
 
 /// Detect if the project has pinned managed runtimes that are installed locally.
@@ -386,7 +390,7 @@ fn detect_one_managed_runtime_bin(
             matched,
             detected.source_label()
         );
-        utf8_path_entry(&bin_dir)
+        path_entry(&bin_dir)
     } else {
         None
     }
@@ -396,6 +400,29 @@ fn detect_one_managed_runtime_bin(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn a_bin_directory_holding_the_path_separator_never_splits_into_two_path_entries() {
+        let project = tempfile::tempdir().unwrap();
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let bin = project
+            .path()
+            .join(format!("tools{separator}special"))
+            .join(".bin");
+
+        let path = build_path_from_bin_dirs(
+            project.path(),
+            std::slice::from_ref(&bin),
+            &ManagedRuntimeHint::Absent,
+        )
+        .unwrap();
+
+        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert!(!entries.contains(&project.path().join("tools")), "{path}");
+        // Windows quotes an entry holding `;`, and Unix has no way to write
+        // one holding `:`, so it is left out there.
+        assert_eq!(entries.contains(&bin), cfg!(windows), "{path}");
+    }
 
     #[test]
     fn find_bin_dirs_single_project() {

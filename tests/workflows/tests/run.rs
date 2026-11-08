@@ -206,6 +206,37 @@ fn run_keeps_the_inherited_path_when_an_entry_is_not_valid_utf8() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn run_keeps_a_quoted_inherited_path_entry_that_holds_a_semicolon() {
+    let project =
+        TempProject::empty(r#"{"name":"quoted-path","scripts":{"probe":"lpm-probe-helper"}}"#);
+    let tools = project.path().join("tools;special");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(
+        tools.join("lpm-probe-helper.cmd"),
+        "@echo off\r\necho helper-ran\r\n",
+    )
+    .unwrap();
+    let mut path = std::ffi::OsString::from("\"");
+    path.push(&tools);
+    path.push("\";");
+    path.push(std::env::var_os("PATH").unwrap());
+
+    let output = lpm(&project)
+        .env("PATH", path)
+        .args(["run", "probe"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("helper-ran"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn concurrent_workspace_members_label_every_output_line_with_their_member() {
     let project = TempProject::empty(r#"{"name":"concurrent-output","workspaces":["packages/*"]}"#);
