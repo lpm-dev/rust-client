@@ -831,6 +831,39 @@ fn wait_for_marker(path: &std::path::Path, child: &mut std::process::Child) {
 }
 
 #[tokio::test]
+async fn dlx_sweeps_a_stale_entry_while_the_cache_is_idle() {
+    let project = TempProject::empty(r#"{"name":"dlx-idle-sweep","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mount_lifetime_tool(&mock, "dlx-stale-tool").await;
+    mount_lifetime_tool(&mock, "dlx-later-tool").await;
+    let first = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-stale-tool"])
+        .output()
+        .unwrap();
+    assert_dlx_success(&first);
+    let stale = dlx_entry(&project);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(stale.join("package.json"))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(48 * 3600))
+        .unwrap();
+    // The first run's sweep was this hour, so the next would otherwise wait.
+    let _ = std::fs::remove_file(stale.parent().unwrap().join(".sweep-at"));
+
+    let later = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-later-tool"])
+        .output()
+        .unwrap();
+
+    assert_dlx_success(&later);
+    assert!(
+        !stale.exists(),
+        "an entry past its TTL outlived a dlx run on an idle cache"
+    );
+}
+
+#[tokio::test]
 async fn dlx_active_entry_survives_expiry_sweep_and_cache_cleanup() {
     let project = TempProject::empty(r#"{"name":"dlx-active-cache","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

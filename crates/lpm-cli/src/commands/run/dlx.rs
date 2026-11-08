@@ -487,15 +487,25 @@ async fn dlx_under_store_lock(
     } else {
         registry_dlx_target(package_spec)
     };
+    let caller_policy = if options.inherit_caller_context {
+        Some(super::dlx_policy::authorize(
+            client,
+            &caller_root,
+            &options,
+        )?)
+    } else {
+        None
+    };
+    let receipt = caller_policy
+        .as_ref()
+        .and_then(|policy| policy.receipt.as_deref());
+    // Each caller policy has its own entry, so running a tool in another
+    // project doesn't replace the entry this one reuses.
+    let entry_key = dlx_entry_key(&target.cache_key, receipt);
+    // The cache's migration and sweep run only while no dlx run holds it, so
+    // before this one takes its hold.
+    let cache_dir = lpm_runner::dlx::dlx_cache_dir(&entry_key)?;
     lpm_common::with_shared_lock_async(root.cache_root().join(".dlx.lock"), async {
-        let caller_policy = if options.inherit_caller_context {
-            Some(super::dlx_policy::authorize(client, &caller_root, &options)?)
-        } else { None };
-        let receipt = caller_policy.as_ref().and_then(|policy| policy.receipt.as_deref());
-        // Each caller policy has its own entry, so running a tool in another
-        // project doesn't replace the entry this one reuses.
-        let entry_key = dlx_entry_key(&target.cache_key, receipt);
-        let cache_dir = lpm_runner::dlx::dlx_cache_dir(&entry_key)?;
         let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
             &target.install_spec, cache_dir, std::time::Duration::from_secs(lpm_runner::dlx::CACHE_TTL_SECS),
         );
