@@ -483,6 +483,9 @@ struct LocalWebSocketActivation {
     relay_tx: tokio::sync::mpsc::Sender<RelayWebSocketMessage>,
     relay_memory: Arc<tokio::sync::Semaphore>,
     ws_tx: Option<tokio::sync::mpsc::Sender<WsEvent>>,
+    /// The inspector's `Connected` event, sent by the reader before its
+    /// `Closed` event so the two can't arrive out of order.
+    connected: Option<WsEvent>,
     closed_tx: tokio::sync::mpsc::UnboundedSender<ClosedLocalWebSocket>,
 }
 
@@ -644,6 +647,7 @@ fn activate_local_websocket(
         relay_tx,
         relay_memory,
         ws_tx,
+        connected,
         closed_tx,
     } = activation;
     let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<LocalWebSocketCommand>(64);
@@ -736,6 +740,9 @@ fn activate_local_websocket(
     let reader_cancel = connection_cancel.clone();
     task_handles.spawn(async move {
         let _slot = slot;
+        if let (Some(ws_tx), Some(connected)) = (&ws_tx, connected) {
+            send_websocket_lifecycle_event(ws_tx, connected).await;
+        }
         let mut close_reason = "local WebSocket connection ended".to_string();
         let mut notify_relay = true;
         let mut relay_close = None;
@@ -771,13 +778,6 @@ fn activate_local_websocket(
                     notify_relay = false;
                     let reason = frame.as_ref().map(|frame| frame.reason.to_string());
                     let code = frame.as_ref().map(|frame| u16::from(frame.code));
-                    if let Some(ref ws_tx) = ws_tx {
-                        let _ = ws_tx.try_send(WsEvent::Closed {
-                            connection_id: reader_id.clone(),
-                            reason: reason.clone(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        });
-                    }
                     relay_close = Some((code, reason.clone()));
                     close_reason = reason.map_or_else(
                         || "local WebSocket closed".to_string(),
@@ -837,6 +837,21 @@ fn activate_local_websocket(
             }
         }
         reader_cancel.cancel();
+        if let Some(ws_tx) = &ws_tx {
+            let reason = match &relay_close {
+                Some((_, reason)) => reason.clone(),
+                None => notify_relay.then(|| close_reason.clone()),
+            };
+            send_websocket_lifecycle_event(
+                ws_tx,
+                WsEvent::Closed {
+                    connection_id: reader_id.clone(),
+                    reason,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await;
+        }
         let _ = closed_tx.send(ClosedLocalWebSocket {
             id: reader_id,
             generation,
@@ -853,6 +868,20 @@ fn activate_local_websocket(
         cancel: connection_cancel,
         generation,
     }
+}
+
+/// Deliver a connect or close event even when frame previews have filled the
+/// inspector channel; frames may be dropped, but a lost lifecycle event leaves
+/// the connection counted as open.
+async fn send_websocket_lifecycle_event(
+    ws_tx: &tokio::sync::mpsc::Sender<WsEvent>,
+    event: WsEvent,
+) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(WEBSOCKET_SEND_TIMEOUT_SECS),
+        ws_tx.send(event),
+    )
+    .await;
 }
 
 /// Options for connecting to the tunnel relay.
@@ -1245,13 +1274,18 @@ fn extract_response_data(response: &ClientMessage) -> (u16, HashMap<String, Stri
         ClientMessage::HttpResponse {
             status,
             headers,
+            set_cookie,
             body,
             ..
         } => {
             let decoded_body =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
                     .unwrap_or_default();
-            (*status, headers.clone(), decoded_body)
+            let mut headers = headers.clone();
+            if !set_cookie.is_empty() {
+                headers.insert("set-cookie".to_owned(), set_cookie.join("\n"));
+            }
+            (*status, headers, decoded_body)
         }
         _ => (0, HashMap::new(), Vec::new()),
     }
@@ -2676,6 +2710,16 @@ async fn try_connect_with_token(
                                 relay_tx: relay_tx.clone(),
                                 relay_memory: Arc::clone(&relay_websocket_memory),
                                 ws_tx: options.ws_tx.clone(),
+                                connected: options
+                                    .ws_tx
+                                    .as_ref()
+                                    .and_then(|_| captured_websocket_headers(&completed.headers))
+                                    .map(|headers| WsEvent::Connected {
+                                        connection_id: completed.id.clone(),
+                                        url: completed.url,
+                                        headers,
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }),
                                 closed_tx: closed_local_ws_tx.clone(),
                             },
                         );
@@ -2691,17 +2735,6 @@ async fn try_connect_with_token(
                         })?;
                         if send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err() {
                             break;
-                        }
-                        if let (Some(ws_tx), Some(headers)) = (
-                            options.ws_tx.as_ref(),
-                            captured_websocket_headers(&completed.headers),
-                        ) {
-                            let _ = ws_tx.try_send(WsEvent::Connected {
-                                connection_id: completed.id,
-                                url: completed.url,
-                                headers,
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                            });
                         }
                     }
                     Err(error) => {
@@ -4388,6 +4421,7 @@ mod tests {
             id: "req-1".to_string(),
             status: 200,
             headers: headers.clone(),
+            set_cookie: Vec::new(),
             body: body_b64,
         };
 
@@ -4395,6 +4429,20 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(resp_headers.get("content-type").unwrap(), "text/plain");
         assert_eq!(resp_body, b"hello");
+    }
+
+    #[test]
+    fn inspector_capture_lists_every_cookie_the_response_set() {
+        let response = ClientMessage::HttpResponse {
+            id: "req-cookies".to_string(),
+            status: 200,
+            headers: HashMap::from([("set-cookie".to_string(), "csrf=xyz".to_string())]),
+            set_cookie: vec!["session=abc".to_string(), "csrf=xyz".to_string()],
+            body: String::new(),
+        };
+
+        let (_, headers, _) = extract_response_data(&response);
+        assert_eq!(headers["set-cookie"], "session=abc\ncsrf=xyz");
     }
 
     #[test]
@@ -5389,6 +5437,7 @@ mod tests {
                 relay_tx,
                 relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
                 ws_tx: None,
+                connected: None,
                 closed_tx,
             },
         );
@@ -5416,6 +5465,139 @@ mod tests {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         server.await.unwrap();
+    }
+
+    type LocalServer = fn(
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> futures_util::future::BoxFuture<'static, ()>;
+
+    async fn closed_event_after(
+        server_behavior: LocalServer,
+        visitor_closes: bool,
+    ) -> Vec<WsEvent> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            server_behavior(socket).await;
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (local_write, local_read) = socket.split();
+        let (relay_tx, _relay_rx) = tokio::sync::mpsc::channel(4);
+        let (closed_tx, _closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(256);
+        let mut tasks = tokio::task::JoinSet::new();
+        let connection = activate_local_websocket(
+            &mut tasks,
+            LocalWebSocketActivation {
+                id: "hmr".into(),
+                generation: 1,
+                local_write,
+                local_read,
+                slot: Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+                relay_tx,
+                relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
+                ws_tx: Some(ws_tx),
+                connected: Some(WsEvent::Connected {
+                    connection_id: "hmr".into(),
+                    url: "/hmr".into(),
+                    headers: HashMap::new(),
+                    timestamp: String::new(),
+                }),
+                closed_tx,
+            },
+        );
+        if visitor_closes {
+            connection
+                .priority_commands
+                .send(LocalWebSocketCommand::Close {
+                    code: Some(1000),
+                    reason: None,
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .expect("both local halves stop");
+        server.await.unwrap();
+        drop(connection);
+        let mut events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn closed_events(events: &[WsEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, WsEvent::Closed { connection_id, .. } if connection_id == "hmr"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_dev_server_restart_closes_the_websocket_in_the_inspector() {
+        let events =
+            closed_event_after(|socket| Box::pin(async move { drop(socket) }), false).await;
+        assert_eq!(closed_events(&events), 1, "{events:?}");
+        assert!(
+            matches!(events.first(), Some(WsEvent::Connected { .. }))
+                && matches!(events.last(), Some(WsEvent::Closed { .. })),
+            "the panel would keep counting a socket whose close arrived first: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_visitor_close_closes_the_websocket_in_the_inspector() {
+        let events = closed_event_after(
+            |mut socket| {
+                Box::pin(async move {
+                    while let Some(Ok(message)) = socket.next().await {
+                        if message.is_close() {
+                            break;
+                        }
+                    }
+                    let _ = socket.flush().await;
+                })
+            },
+            true,
+        )
+        .await;
+        assert_eq!(closed_events(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dev_server_close_frame_closes_the_websocket_once() {
+        let events = closed_event_after(
+            |mut socket| {
+                Box::pin(async move {
+                    socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Normal,
+                            reason: "restarting".into(),
+                        })))
+                        .await
+                        .unwrap();
+                    while let Some(Ok(_)) = socket.next().await {}
+                })
+            },
+            false,
+        )
+        .await;
+        assert_eq!(closed_events(&events), 1, "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            WsEvent::Closed { reason: Some(reason), .. } if reason == "restarting"
+        )));
     }
 
     async fn assert_local_close_handshake(server_initiates: bool, code: Option<u16>) {
@@ -5466,6 +5648,7 @@ mod tests {
                 relay_tx,
                 relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
                 ws_tx: None,
+                connected: None,
                 closed_tx,
             },
         );

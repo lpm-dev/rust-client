@@ -207,14 +207,7 @@ async fn forward_request_inner(
     };
 
     let status = response.status().as_u16();
-
-    // Collect response headers
-    let mut resp_headers = HashMap::new();
-    for (key, value) in response.headers() {
-        if let Ok(v) = value.to_str() {
-            resp_headers.insert(key.to_string(), v.to_string());
-        }
-    }
+    let (resp_headers, set_cookie) = relay_response_headers(response.headers());
 
     let is_event_stream = resp_headers.get("content-type").is_some_and(|value| {
         value
@@ -223,12 +216,15 @@ async fn forward_request_inner(
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
     });
     if is_event_stream && let Some(output) = stream {
-        let capture = output.forward(id, status, &resp_headers, response).await?;
+        let capture = output
+            .forward(id, status, &resp_headers, &set_cookie, response)
+            .await?;
         return Ok(ForwardedResponse {
             message: ClientMessage::HttpResponse {
                 id: id.clone(),
                 status,
                 headers: resp_headers,
+                set_cookie,
                 body: base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
                     capture.body,
@@ -312,6 +308,7 @@ async fn forward_request_inner(
             id: id.clone(),
             status,
             headers: resp_headers,
+            set_cookie,
             body: body_b64,
         },
         memory_permit: reservation.and_then(|reservation| reservation.permit),
@@ -404,6 +401,46 @@ fn describe_endpoint(target: &lpm_common::LocalTarget) -> String {
     }
 }
 
+/// Convert local response headers to the relay's one-value-per-name map.
+///
+/// Repeated fields are joined with `", "`, which HTTP defines as equivalent for
+/// every field except `Set-Cookie` (RFC 9110 section 5.3, RFC 6265 section 3).
+/// Cookies therefore travel as a separate list when there is more than one. The
+/// map still keeps the last cookie, so a relay that predates the list delivers
+/// the same single cookie it always has.
+fn relay_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut map = HashMap::with_capacity(headers.keys_len());
+    let mut set_cookie = Vec::new();
+    for name in headers.keys() {
+        let mut values = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok());
+        if name == reqwest::header::SET_COOKIE {
+            set_cookie.extend(values.map(str::to_owned));
+            if let Some(last) = set_cookie.last() {
+                map.insert(name.as_str().to_owned(), last.clone());
+            }
+            if set_cookie.len() < 2 {
+                set_cookie.clear();
+            }
+            continue;
+        }
+        let Some(first) = values.next() else {
+            continue;
+        };
+        let mut joined = first.to_owned();
+        for value in values {
+            joined.push_str(", ");
+            joined.push_str(value);
+        }
+        map.insert(name.as_str().to_owned(), joined);
+    }
+    (map, set_cookie)
+}
+
 /// Create an HTTP response for when the local server is unreachable.
 pub fn bad_gateway_response(request_id: &str) -> ClientMessage {
     let mut headers = HashMap::new();
@@ -413,6 +450,7 @@ pub fn bad_gateway_response(request_id: &str) -> ClientMessage {
         id: request_id.to_string(),
         status: 502,
         headers,
+        set_cookie: Vec::new(),
         body: base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             b"502 Bad Gateway: local dev server is not running",
@@ -430,6 +468,7 @@ pub fn service_unavailable_response(request_id: &str) -> ClientMessage {
         id: request_id.to_string(),
         status: 503,
         headers,
+        set_cookie: Vec::new(),
         body: base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             b"Tunnel local forwarding is busy; retry shortly",
@@ -450,6 +489,7 @@ pub fn auto_ack_response(request_id: &str) -> ClientMessage {
         id: request_id.to_string(),
         status: 200,
         headers,
+        set_cookie: Vec::new(),
         body: base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             br#"{"ok":true}"#,
@@ -471,6 +511,7 @@ fn response_too_large(request_id: &str, size: u64) -> ClientMessage {
         id: request_id.to_string(),
         status: 502,
         headers,
+        set_cookie: Vec::new(),
         body: base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             body_text.as_bytes(),
@@ -805,6 +846,94 @@ mod tests {
         assert_eq!(decoded, b"id: event-1231\ndata: new\n\n");
     }
 
+    async fn serve_once(response: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 1024];
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        address
+    }
+
+    fn get_request(id: &str) -> ServerMessage {
+        ServerMessage::HttpRequest {
+            id: id.into(),
+            method: "GET".into(),
+            url: "/".into(),
+            headers: HashMap::new(),
+            body: String::new(),
+            accepted_requests: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_response_headers_reach_the_relay_with_every_value() {
+        let address = serve_once(
+            "HTTP/1.1 200 OK\r\n\
+             Set-Cookie: session=abc; Path=/; HttpOnly\r\n\
+             Set-Cookie: csrf=xyz; Expires=Wed, 21 Oct 2026 07:28:00 GMT\r\n\
+             Link: </app.js>; rel=preload\r\n\
+             Link: </app.css>; rel=preload\r\n\
+             Vary: Accept\r\n\
+             Vary: Cookie\r\n\
+             Content-Length: 0\r\n\r\n",
+        )
+        .await;
+        let response = forward_request(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+            &get_request("cookies"),
+        )
+        .await
+        .unwrap();
+
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["set_cookie"],
+            serde_json::json!([
+                "session=abc; Path=/; HttpOnly",
+                "csrf=xyz; Expires=Wed, 21 Oct 2026 07:28:00 GMT"
+            ])
+        );
+        assert_eq!(
+            wire["headers"]["link"],
+            "</app.js>; rel=preload, </app.css>; rel=preload"
+        );
+        assert_eq!(wire["headers"]["vary"], "Accept, Cookie");
+        // A relay that predates the cookie list still delivers one cookie.
+        assert_eq!(
+            wire["headers"]["set-cookie"],
+            "csrf=xyz; Expires=Wed, 21 Oct 2026 07:28:00 GMT"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_cookie_is_sent_only_in_the_header_map() {
+        let address =
+            serve_once("HTTP/1.1 200 OK\r\nSet-Cookie: session=abc\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        let response = forward_request(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+            &get_request("one-cookie"),
+        )
+        .await
+        .unwrap();
+
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["headers"]["set-cookie"], "session=abc");
+        assert!(wire.get("set_cookie").is_none(), "{wire}");
+    }
+
     #[tokio::test]
     async fn event_stream_chunks_and_inspector_capture_are_bounded() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -875,6 +1004,41 @@ mod tests {
                 .len(),
             64 * 1024
         );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_response_starts_with_every_cookie() {
+        let address = serve_once(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             Set-Cookie: a=1\r\n\
+             Set-Cookie: b=2\r\n\
+             Content-Length: 0\r\n\r\n",
+        )
+        .await;
+        let (messages, mut output) = tokio::sync::mpsc::channel(1);
+        let (_credits, credit_rx) = tokio::sync::mpsc::channel(1);
+        let forward = tokio::spawn(async move {
+            forward_request_inner(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+                None,
+                &get_request("stream-cookies"),
+                None,
+                Some(crate::http_stream::StreamOutput {
+                    messages,
+                    credits: credit_rx,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                }),
+            )
+            .await
+        });
+
+        let Some(ClientMessage::HttpResponseStart { set_cookie, .. }) = output.recv().await else {
+            panic!("expected the stream to start")
+        };
+        assert_eq!(set_cookie, ["a=1", "b=2"]);
+        forward.abort();
     }
 
     #[tokio::test]
