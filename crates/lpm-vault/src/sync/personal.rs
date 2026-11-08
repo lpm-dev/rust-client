@@ -401,6 +401,54 @@ pub async fn push_raw_with_project_rotation(
     options: PersonalPushOptions<'_>,
     rotate_project_key: bool,
 ) -> Result<PushResponse, SyncError> {
+    push_raw_inner(
+        registry_url,
+        auth_token,
+        vault_id,
+        secrets_json,
+        options,
+        rotate_project_key,
+        None,
+    )
+    .await
+}
+
+/// Rewrites `pulled`, the vault as this principal just pulled it, under a new
+/// project key. The write is conditional on `pulled`'s version on the server,
+/// so the vault isn't pulled and decrypted a second time to check it.
+pub async fn push_rotated_project_key(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+    pulled: &PulledPersonalVault,
+    revoke_ci: bool,
+) -> Result<PushResponse, SyncError> {
+    push_raw_inner(
+        registry_url,
+        auth_token,
+        vault_id,
+        &pulled.raw_json,
+        PersonalPushOptions {
+            expected_version: Some(pulled.version),
+            expected_principal_id: Some(&pulled.principal_id),
+            force: false,
+            metadata: None,
+        },
+        revoke_ci,
+        Some(pulled),
+    )
+    .await
+}
+
+async fn push_raw_inner(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+    secrets_json: &str,
+    options: PersonalPushOptions<'_>,
+    rotate_project_key: bool,
+    pulled: Option<&PulledPersonalVault>,
+) -> Result<PushResponse, SyncError> {
     const MAX_FORCE_PUSH_ATTEMPTS: usize = 3;
 
     if options.expected_principal_id.is_some_and(str::is_empty) {
@@ -464,10 +512,21 @@ pub async fn push_raw_with_project_rotation(
         let principal_id = stable_principal_id
             .as_deref()
             .ok_or("personal cloud env principal is unavailable")?;
+        let fetched;
         let remote = if base_revision.is_some() && !recreate_missing {
-            let pulled =
-                pull_raw_bound_to_principal(registry_url, auth_token, vault_id, Some(principal_id))
+            let pulled = match pulled.filter(|pulled| Some(pulled.version) == base_revision) {
+                Some(pulled) => pulled,
+                None => {
+                    fetched = pull_raw_bound_to_principal(
+                        registry_url,
+                        auth_token,
+                        vault_id,
+                        Some(principal_id),
+                    )
                     .await?;
+                    &fetched
+                }
+            };
             if Some(pulled.version) != base_revision {
                 if options.force
                     && attempt + 1 < attempt_limit
@@ -486,9 +545,7 @@ pub async fn push_raw_with_project_rotation(
             None
         };
         let origin = personal_crypto::registry_origin(registry_url)?;
-        let prior_envelope = remote
-            .as_ref()
-            .and_then(|pulled| pulled.key_envelope.as_ref());
+        let prior_envelope = remote.and_then(|pulled| pulled.key_envelope.as_ref());
         let project = if let Some(envelope) = prior_envelope.filter(|_| !rotate_project_key) {
             personal_crypto::open_project_key(envelope, registry_url, principal_id, vault_id)?
         } else {

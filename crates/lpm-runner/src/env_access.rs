@@ -184,6 +184,26 @@ pub(crate) fn read_vault(
     }
 }
 
+/// Reads with `action`, as a read of the run would, and keeps the values it
+/// returns for each key, so the run's later reads of them use these.
+/// Without a run there is nothing to keep, so nothing is read.
+pub(crate) fn read_vaults<T>(
+    action: impl FnOnce() -> Result<(T, Vec<(VaultReadKey, VaultValues)>), String>,
+) -> Result<Option<T>, String> {
+    let Some(scope) = CURRENT.with_borrow(Clone::clone) else {
+        return Ok(None);
+    };
+    scope.read(|| {
+        let (result, values) = action()?;
+        scope
+            .vault_reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(values);
+        Ok(Some(result))
+    })
+}
+
 pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Child> {
     let scope = CURRENT.with_borrow(Clone::clone);
     match scope {

@@ -931,6 +931,36 @@ pub fn load_project_env_layers_for_resolved(
     )
 }
 
+/// Reads every environment's vault values once for the current run, as
+/// `env check` does before it loads each environment. `environments` picks
+/// the environments from the vault's own list, and what each runs with is
+/// kept, so loading them doesn't read the vault again. `None` outside a run.
+pub fn read_vault_environments_for_run(
+    project_dir: &Path,
+    environments: impl FnOnce(&lpm_vault::EnvironmentMap) -> Vec<lpm_env::ResolvedEnv>,
+) -> Result<Option<Vec<lpm_env::ResolvedEnv>>, String> {
+    crate::env_access::read_vaults(|| {
+        let all = lpm_vault::try_get_all_run_environments(project_dir)?;
+        let resolved = environments(&all.values);
+        let values = resolved
+            .iter()
+            .map(|environment| {
+                let mode = resolved_load_mode(environment);
+                let run = all.run_environment(mode);
+                (
+                    crate::env_access::VaultReadKey {
+                        project_dir: project_dir.to_path_buf(),
+                        env_name: mode.map(ToOwned::to_owned),
+                        with_overrides: true,
+                    },
+                    (run.values, run.overrides),
+                )
+            })
+            .collect();
+        Ok((resolved, values))
+    })
+}
+
 pub(crate) fn resolved_load_mode(resolved: &lpm_env::ResolvedEnv) -> Option<&str> {
     if resolved.implicit_default {
         None
@@ -1196,85 +1226,15 @@ fn parse_env_str_with_case_policy(
     content: &str,
     case_insensitive: bool,
 ) -> HashMap<String, String> {
-    // Strip UTF-8 BOM if present — editors like Notepad prepend it, corrupting the first key
-    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-
     let mut vars = HashMap::new();
     let mut names = std::collections::BTreeMap::new();
-    let mut lines = content.lines();
-
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim_start_matches(lpm_vault::is_dotenv_blank);
-
-        // Skip empty lines and comments
-        if lpm_vault::is_dotenv_blank_line(trimmed) || trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Strip optional `export ` prefix
-        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-
-        // Find the first `=` separator
-        let eq_pos = match trimmed.find('=') {
-            Some(pos) => pos,
-            None => continue,
-        };
-
-        let key = lpm_vault::trim_dotenv_blanks(&trimmed[..eq_pos]).to_string();
-        if key.is_empty() {
-            continue;
-        }
+    for (key, value) in lpm_vault::parse_env_entries(content) {
         if case_insensitive && let Some(previous) = names.insert(EnvName::new(&key), key.clone()) {
             vars.remove(&previous);
         }
-
-        let raw_value = trimmed[eq_pos + 1..].trim_start_matches(lpm_vault::is_dotenv_blank);
-
-        if let Some(rest) = raw_value.strip_prefix('"') {
-            let value = lpm_vault::parse_double_quoted_env_value(rest, &mut lines);
-            vars.insert(key, value);
-        } else {
-            let value = unquote(lpm_vault::trim_dotenv_blanks(raw_value));
-            vars.insert(key, value);
-        }
+        vars.insert(key, value);
     }
-
     vars
-}
-
-/// Remove surrounding quotes from a value.
-///
-/// - `"hello world"` → `hello world`
-/// - `'hello world'` → `hello world`
-/// - `hello world` → `hello world` (no change)
-fn unquote(s: &str) -> String {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        let mut value = String::with_capacity(s.len() - 2);
-        let mut chars = s[1..s.len() - 1].chars();
-        while let Some(character) = chars.next() {
-            if character != '\\' {
-                value.push(character);
-                continue;
-            }
-            match chars.next() {
-                Some('n') => value.push('\n'),
-                Some('r') => value.push('\r'),
-                Some('t') => value.push('\t'),
-                Some('"') => value.push('"'),
-                Some('\\') => value.push('\\'),
-                Some(other) => {
-                    value.push('\\');
-                    value.push(other);
-                }
-                None => value.push('\\'),
-            }
-        }
-        return value;
-    }
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        return s[1..s.len() - 1].to_string();
-    }
-    s.to_string()
 }
 
 /// Load environment variables from a sequence of `.env` files.
@@ -1702,6 +1662,24 @@ mod tests {
             parse_env_str(content),
             lpm_vault::parse_env_content(content)
         );
+    }
+
+    #[test]
+    fn single_quoted_values_read_the_same_when_run_as_when_imported() {
+        let content = "NOTE='abc' # trailing note\n\
+                       APP_NAME='Tolga's App'\n\
+                       PEM='-----BEGIN KEY-----\nline=one\n-----END KEY-----'\n\
+                       AFTER=yes\n";
+        let run = parse_env_str(content);
+
+        assert_eq!(run, lpm_vault::parse_env_content(content));
+        assert_eq!(run["NOTE"], "abc");
+        assert_eq!(run["APP_NAME"], "Tolga's App");
+        assert_eq!(
+            run["PEM"],
+            "-----BEGIN KEY-----\nline=one\n-----END KEY-----"
+        );
+        assert!(!run.contains_key("line"), "{run:?}");
     }
 
     #[test]

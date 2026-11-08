@@ -265,13 +265,24 @@ pub(super) fn vars_check(
             )
         })?;
 
-    // Discover all environments via the canonical resolver.
-    // This produces a consistent, deduplicated list from config + vault,
-    // with legacy vault keys surfaced separately (never collapsed).
-    let all_envs = check_environments(env_input, lpm_config.as_ref(), || {
-        lpm_vault::try_get_all_environments(project_dir)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))
-    })?;
+    // One read of the vault lists its environments and gives each one's
+    // values to the loads below, instead of a read per environment.
+    let env_access = lpm_runner::env_access::EnvAccessScope::default();
+    let _env_access_binding = env_access.bind();
+    let all_envs = match env_input {
+        Some(_) => check_environments(env_input, lpm_config.as_ref(), || Ok(HashMap::new()))?,
+        None => lpm_runner::dotenv::read_vault_environments_for_run(project_dir, |vault_envs| {
+            let empty_env_map = HashMap::new();
+            let config = lpm_config.as_ref();
+            lpm_env::resolver::list_all(
+                config.map_or(&empty_env_map, |c| &c.env),
+                config.and_then(|c| c.environments.as_ref()),
+                vault_envs,
+            )
+        })
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?
+        .unwrap_or_default(),
+    };
     struct Checked {
         name: String,
         total: usize,
@@ -485,17 +496,13 @@ pub(super) fn vars_validate(
     let content =
         lpm_common::read_text_file_capped(&example_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
 
-    // Parse .env.example — extract key names (values are ignored)
-    let required_keys: Vec<String> = content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !trimmed.starts_with('#')
-        })
-        .filter_map(|line| {
-            let trimmed = line.trim().strip_prefix("export ").unwrap_or(line.trim());
-            trimmed.split_once('=').map(|(k, _)| k.trim().to_string())
-        })
+    // The key names, in file order, read as `env import` and `lpm run` read
+    // the file.
+    let mut seen = std::collections::HashSet::new();
+    let required_keys: Vec<String> = lpm_vault::parse_env_entries(&content)
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| seen.insert(key.clone()))
         .collect();
 
     let secrets = lpm_vault::try_get_all(project_dir)

@@ -57,9 +57,8 @@ pub(super) async fn rotate_personal_key(
         })
         .await?;
     let environment_names = validate_rotation_payload(&pulled.raw_json).map_err(LpmError::Env)?;
-    let raw_json = std::sync::Arc::new(pulled.raw_json);
-    let pulled_principal_id = pulled.principal_id;
-    let current_version = pulled.version;
+    let pulled = std::sync::Arc::new(pulled);
+    let pulled_principal_id = pulled.principal_id.clone();
     let project_dir = project_dir.to_path_buf();
 
     if !json_output {
@@ -69,9 +68,8 @@ pub(super) async fn rotate_personal_key(
     let (result, registry_url) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
-            let raw_json = std::sync::Arc::clone(&raw_json);
+            let pulled = std::sync::Arc::clone(&pulled);
             let pulled_registry_url = pulled_registry_url.clone();
-            let pulled_principal_id = pulled_principal_id.clone();
             let expected_principal_id = expected_principal_id.clone();
             let project_dir = project_dir.clone();
             async move {
@@ -86,21 +84,15 @@ pub(super) async fn rotate_personal_key(
                     &registry_url,
                     expected_principal_id.as_deref(),
                 )?;
-                let result = lpm_vault::sync::push_raw_with_project_rotation(
+                let result = lpm_vault::sync::push_rotated_project_key(
                     &registry_url,
                     &auth_token,
                     &vault_id,
-                    raw_json.as_str(),
-                    lpm_vault::sync::PersonalPushOptions {
-                        expected_version: Some(current_version),
-                        expected_principal_id: Some(&pulled_principal_id),
-                        force: false,
-                        metadata: None,
-                    },
+                    &pulled,
                     revoke_ci,
                 )
                 .await?;
-                if result.principal_id.as_deref() != Some(pulled_principal_id.as_str()) {
+                if result.principal_id.as_deref() != Some(pulled.principal_id.as_str()) {
                     return Err(lpm_vault::sync::SyncError::from(
                         "the personal cloud vault principal changed during key rotation",
                     ));
@@ -333,17 +325,19 @@ async fn env_rotate_org_key(
         ));
     }
 
-    super::sync_payload::persist_org_sync_version(
-        &project_dir,
-        &vault_id,
-        org_slug,
-        version,
-        &registry_url,
-        &pulled_principal_id,
-    )?;
+    let checkpoint_warning = super::sync_payload::org_sync_checkpoint_warning(
+        super::sync_payload::persist_org_sync_version(
+            &project_dir,
+            &vault_id,
+            org_slug,
+            version,
+            &registry_url,
+            &pulled_principal_id,
+        ),
+    );
 
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
             "status": "rotated",
             "org": org_slug,
@@ -352,13 +346,20 @@ async fn env_rotate_org_key(
             "previous_content_key_version": pulled_content_key_version,
             "environment_count": environment_names.len(),
             "environments": environment_names,
-        }));
+        });
+        if let Some(warning) = checkpoint_warning {
+            response["warnings"] = serde_json::json!([warning]);
+        }
+        super::response::print_json_value(&response);
     } else {
         output::success_line(crate::install_ui::terminal_line!(
             "organization env encryption key rotated for {} (content-key version {})",
             install_ui::bold(org_slug),
             install_ui::bold(&content_key_version.to_string()),
         ));
+        if let Some(warning) = checkpoint_warning {
+            output::warn(warning);
+        }
     }
 
     Ok(())

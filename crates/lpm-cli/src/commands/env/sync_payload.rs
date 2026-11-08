@@ -243,6 +243,20 @@ struct RemotePullPayload {
 /// Returns `Ok(Some(config))` on a clean parse and `Ok(None)` when the file is
 /// absent. Syntax, read, and semantic-validation failures are errors because
 /// aliases and schema metadata participate in the pushed payload.
+/// The warning for an organization write the server acknowledged but whose
+/// local revision checkpoint couldn't be stored. The write stays successful,
+/// as a personal one does: running it again would only meet a version
+/// conflict.
+pub(super) fn org_sync_checkpoint_warning(
+    checkpoint_result: Result<(), LpmError>,
+) -> Option<&'static str> {
+    checkpoint_result
+        .is_err()
+        .then_some(MANIFEST_CHECKPOINT_WARNING)
+}
+
+const MANIFEST_CHECKPOINT_WARNING: &str = "The remote update succeeded, but the project revision checkpoint could not be stored. Restore the original project's lpm.json and write access to its .lpm directory, then pull the latest revision.";
+
 pub(super) fn personal_sync_checkpoint_warnings(
     local_key_checkpoint_failed: bool,
     manifest_result: Result<(), LpmError>,
@@ -252,7 +266,7 @@ pub(super) fn personal_sync_checkpoint_warnings(
         warnings.push("The remote update succeeded, but the local key checkpoint could not be stored. Restore local storage access, then pull the latest project revision.");
     }
     if manifest_result.is_err() {
-        warnings.push("The remote update succeeded, but the project revision checkpoint could not be stored. Restore the original project's lpm.json and write access to its .lpm directory, then pull the latest revision.");
+        warnings.push(MANIFEST_CHECKPOINT_WARNING);
     }
     warnings
 }

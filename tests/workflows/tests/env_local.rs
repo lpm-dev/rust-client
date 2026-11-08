@@ -313,6 +313,44 @@ fn env_trailing_json_applies_to_success_and_error_output() {
 }
 
 #[test]
+fn env_get_json_keeps_its_envelope_for_a_key_named_success() {
+    let project = TempProject::empty(r#"{"name":"env-get-json"}"#);
+    for pair in ["success=s3cret", "API_TOKEN=token"] {
+        lpm(&project).args(["env", "set", pair]).assert().success();
+    }
+
+    let reserved = lpm(&project)
+        .args(["env", "get", "success", "--json", "--reveal"])
+        .output()
+        .unwrap();
+    assert!(reserved.status.success());
+    let reserved = parse_json_stdout(&reserved, "env get --json");
+    insta::assert_json_snapshot!(reserved, @r###"
+    {
+      "success": true,
+      "key": "success",
+      "value": "s3cret"
+    }
+    "###);
+
+    let masked = lpm(&project)
+        .args(["env", "get", "API_TOKEN", "--json"])
+        .output()
+        .unwrap();
+    assert!(masked.status.success());
+    let masked = parse_json_stdout(&masked, "env get --json");
+    // The value stays under the key's own name too, as before.
+    insta::assert_json_snapshot!(masked, @r###"
+    {
+      "success": true,
+      "key": "API_TOKEN",
+      "value": "••••••••",
+      "API_TOKEN": "••••••••"
+    }
+    "###);
+}
+
+#[test]
 fn env_json_print_and_ci_export_report_the_resolved_environment() {
     let project = TempProject::empty(r#"{"name":"env-json-outputs"}"#);
     project.write_file(".env", "VALUE=fixture-only\n");
@@ -1344,6 +1382,31 @@ fn env_diff_local_vs_local_reports_added_removed_and_changed_keys() {
 // ─── validate (vs .env.example) ────────────────────────────────────────
 
 #[test]
+fn env_validate_reads_env_example_with_the_import_parser() {
+    let project = TempProject::empty(r#"{"name":"env-validate-parser","version":"1.0.0"}"#);
+    // A byte-order mark and a quoted value that spans lines, whose second
+    // line looks like an assignment.
+    write_dotenv(
+        &project,
+        ".env.example",
+        "\u{feff}API_KEY=\nCERT=\"-----BEGIN-----\nline=example\n-----END-----\"\n",
+    );
+    for pair in ["API_KEY=value", "CERT=certificate"] {
+        lpm(&project).args(["env", "set", pair]).assert().success();
+    }
+
+    let output = lpm(&project)
+        .args(["--json", "env", "validate"])
+        .output()
+        .expect("failed to run lpm env validate --json");
+
+    let envelope = parse_json_stdout(&output, "env validate --json");
+    assert!(output.status.success(), "{envelope}");
+    assert_eq!(envelope["required"], serde_json::json!(2), "{envelope}");
+    assert_eq!(envelope["missing"], serde_json::json!([]), "{envelope}");
+}
+
+#[test]
 fn env_validate_json_exits_nonzero_and_reports_missing_keys() {
     let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
 
@@ -1589,6 +1652,62 @@ fn env_check_json_exits_nonzero_and_reports_invalid_environment() {
     assert_eq!(envelope["environments"][0]["environment"], "default");
     assert_eq!(envelope["environments"][0]["errors"][0]["key"], "REQUIRED");
     insta::assert_json_snapshot!("env_check_json_invalid", envelope);
+}
+
+fn vault_transactions(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |log| log.lines().count())
+}
+
+#[test]
+fn env_check_reads_the_vault_once_for_every_environment() {
+    let project = TempProject::empty(r#"{"name":"env-check-reads","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"TOKEN":{"required":true}}}}"#,
+    );
+    for env in ["default", "staging", "preview"] {
+        lpm(&project)
+            .args(["env", "set", &format!("--env={env}"), "TOKEN=value"])
+            .assert()
+            .success();
+    }
+    let log = project.path().join("vault-transactions.log");
+
+    let output = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["--json", "env", "check"])
+        .output()
+        .unwrap();
+
+    let envelope = parse_json_stdout(&output, "env check --json");
+    assert!(output.status.success(), "{envelope}");
+    assert_eq!(envelope["environments"].as_array().unwrap().len(), 3);
+    assert_eq!(vault_transactions(&log), 1);
+}
+
+#[test]
+fn a_run_reads_the_vault_once_for_all_its_tasks() {
+    let project = TempProject::empty(
+        r#"{"name":"run-vault-reads","scripts":{"first":"echo first","second":"echo second","third":"echo third"}}"#,
+    );
+    lpm(&project)
+        .args(["env", "set", "TOKEN=value"])
+        .assert()
+        .success();
+    let log = project.path().join("vault-transactions.log");
+
+    let output = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["run", "first", "second", "third", "--parallel"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(vault_transactions(&log), 1);
 }
 
 #[test]

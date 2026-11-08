@@ -4483,6 +4483,17 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
         0,
         "the signed rotation pull must supply the principal and version preconditions",
     );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/vaults/vault-rotate-123/sync"
+            })
+            .count(),
+        1,
+        "the write is checked against the pulled version on the server, so one pull is enough",
+    );
     assert_eq!(body["expectedVersion"], 7);
     assert_eq!(body["expectedPrincipalId"], "account-1");
     assert_eq!(body["ciphertextRevision"], 8);
@@ -6737,6 +6748,79 @@ fn prepare_org_share_project(
     );
     let (private_key, _, public_key_b64, fingerprint) = seed_org_sharing_key(project, &mock.url());
     (private_key, public_key_b64, fingerprint)
+}
+
+#[tokio::test]
+async fn env_share_keeps_success_when_only_the_local_checkpoint_fails() {
+    let project = TempProject::empty(r#"{"name":"org-share-checkpoint","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let auth_token = "org-share-checkpoint-token";
+    let vault_id = "vault-org-share-checkpoint";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    mount_org_member_keys(
+        &mock,
+        auth_token,
+        ORG_ROTATION_SLUG,
+        &public_key_b64,
+        &fingerprint,
+    )
+    .await;
+    // The cloud write succeeds while lpm.json starts naming another vault,
+    // so the local revision checkpoint can't be stored.
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .respond_with(CheckpointFailingCommitResponse {
+            manifest: project.path().join("lpm.json"),
+            home: project.home().to_path_buf(),
+            fail_key_checkpoint: false,
+            response: signed_sync_response(
+                serde_json::json!({
+                    "status": "shared",
+                    "version": 1,
+                    "contentKeyVersion": 1,
+                }),
+                auth_token,
+                vault_id,
+                TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+            ),
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
+        .output()
+        .expect("run organization share");
+
+    assert!(
+        output.status.success(),
+        "an acknowledged cloud write must stay successful:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let value = parse_clean_json_stdout(&output);
+    assert_eq!(value["success"], true);
+    assert_eq!(value["version"], 1);
+    let warnings = value["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{value}");
+    assert!(
+        warnings[0].as_str().unwrap().contains("checkpoint"),
+        "{value}"
+    );
 }
 
 #[tokio::test]
