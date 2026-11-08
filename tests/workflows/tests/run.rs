@@ -172,6 +172,92 @@ fn late_env_denial_during_cache_publication_never_reports_success() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn run_keeps_the_inherited_path_when_an_entry_is_not_valid_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project =
+        TempProject::empty(r#"{"name":"non-utf8-path","scripts":{"probe":"lpm-probe-helper"}}"#);
+    let tools = project.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let helper = tools.join("lpm-probe-helper");
+    std::fs::write(&helper, "#!/bin/sh\necho helper-ran\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // APFS refuses names that aren't UTF-8, so the odd entry needn't exist.
+    let mut path = std::ffi::OsString::from(std::ffi::OsStr::from_bytes(b"/nonexistent-\xff"));
+    path.push(":");
+    path.push(&tools);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap());
+
+    let output = lpm(&project)
+        .env("PATH", path)
+        .args(["run", "probe"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("helper-ran"),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn concurrent_workspace_members_label_every_output_line_with_their_member() {
+    let project = TempProject::empty(r#"{"name":"concurrent-output","workspaces":["packages/*"]}"#);
+    for name in ["alpha", "beta"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({
+                "name": name,
+                "scripts": { "build": "node print.js" }
+            })
+            .to_string(),
+        );
+        // Each member prints in steps, so lines from the two interleave.
+        project.write_file(
+            &format!("packages/{name}/print.js"),
+            &format!(
+                "let i = 0; const t = setInterval(() => {{ console.log('{name}-line-' + i); \
+                 if (++i === 4) clearInterval(t); }}, 40);"
+            ),
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["run", "build", "--all", "--workspace-concurrency", "2"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["alpha", "beta"] {
+        let lines: Vec<&str> = printed
+            .lines()
+            .filter(|line| line.contains(&format!("{name}-line-")))
+            .collect();
+        assert_eq!(lines.len(), 4, "{printed}");
+        for line in lines {
+            assert!(
+                line.contains(&format!("{name}:build")),
+                "a concurrent member's line has no member label: {line:?}\n{printed}"
+            );
+        }
+    }
+}
+
 #[test]
 fn workspace_env_denial_stops_later_members_even_with_no_bail() {
     for flags in [&[][..], &["--parallel", "--stream"][..]] {

@@ -638,6 +638,9 @@ pub async fn run_workspace(
             // order as slots free up, so a slow member never holds idle slots
             // the way a batch waiting for its slowest member would.
             let slots = MemberSlots::new(workspace_concurrency);
+            // Members running at once would mix their raw output on the
+            // terminal, so their lines carry `member:task` prefixes instead.
+            let member_stream = stream || (workspace_concurrency > 1 && !json_output);
             // An error, such as a denied environment, stops members that
             // haven't started, even with `--no-bail`.
             let stopped = AtomicBool::new(false);
@@ -695,7 +698,7 @@ pub async fn run_workspace(
                                 no_cache,
                                 parallel,
                                 continue_on_error,
-                                stream,
+                                member_stream,
                                 json_output,
                                 member_runtime_hint.as_ref(),
                                 member_task_plan.as_ref(),
@@ -877,6 +880,7 @@ fn run_workspace_package(
             Some(&member_task_config.package_scripts),
             initially_failed_tasks,
             session,
+            Some(member_name),
         )
     } else {
         let topo_order = &member_task_plan.sequential_tasks;

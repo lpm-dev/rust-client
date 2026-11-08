@@ -536,6 +536,40 @@ pub(super) struct CachedClient {
     pub(super) identity_fp: Option<Arc<str>>,
 }
 
+/// The client set for origins without TLS configuration of their own. A
+/// registry client without TLS overrides builds it on first use, so a command
+/// that never reaches a registry, such as `lpm run`, doesn't parse the bundled
+/// root certificates for each of its clients.
+pub(super) struct DefaultClient(std::sync::OnceLock<CachedClient>);
+
+impl DefaultClient {
+    pub(super) fn built(client: CachedClient) -> Self {
+        Self(std::sync::OnceLock::from(client))
+    }
+
+    pub(super) fn on_first_use() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    pub(super) fn get(&self) -> &CachedClient {
+        self.0
+            .get_or_init(RegistryClient::build_default_cached_client)
+    }
+
+    /// The identity fingerprint, without building a client set that would
+    /// carry none.
+    pub(super) fn identity_fp(&self) -> Option<&str> {
+        self.0
+            .get()
+            .and_then(|client| client.identity_fp.as_deref())
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_built(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
 pub(super) struct LazyIdentityMaterial {
     pub(super) cert_pem: Arc<Vec<u8>>,
     pub(super) fingerprint: Arc<str>,
@@ -568,7 +602,7 @@ pub(super) struct LazyIdentityCert {
 /// Explicit non-default ports are separate origins. A portless npmrc
 /// key never widens TLS state to an explicitly different port.
 pub struct HttpClients {
-    pub(super) default: CachedClient,
+    pub(super) default: DefaultClient,
     pub(super) eager: HashMap<OriginKey, CachedClient>,
     pub(super) lazy: HashMap<OriginKey, tokio::sync::OnceCell<Result<CachedClient, Arc<str>>>>,
     pub(super) built_client_sets: std::sync::atomic::AtomicUsize,

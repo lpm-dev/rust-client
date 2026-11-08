@@ -296,25 +296,24 @@ pub fn build_path_with_bins_bounded(
     build_path_from_bin_dirs(start_dir, &bin_dirs, hint).map_err(Into::into)
 }
 
+/// The child's environment is UTF-8, as its schema checks need, so a PATH
+/// entry that isn't valid UTF-8 is left out on its own. The rest of the
+/// inherited PATH is kept, where reading it as one string would lose all of it.
 pub(crate) fn build_path_from_bin_dirs(
     start_dir: &Path,
     bin_dirs: &[PathBuf],
     hint: &ManagedRuntimeHint,
 ) -> lpm_runtime::detect::DetectionResult<String> {
-    let existing_path = std::env::var("PATH").unwrap_or_default();
     let separator = if cfg!(windows) { ";" } else { ":" };
 
     let mut parts: Vec<String> = bin_dirs
         .iter()
-        .map(|p| p.to_string_lossy().to_string())
+        .filter_map(|dir| utf8_path_entry(dir))
         .collect();
 
     match hint {
         ManagedRuntimeHint::Resolved(bins) => {
-            parts.extend(
-                bins.iter()
-                    .map(|bin| bin.bin_dir.to_string_lossy().to_string()),
-            );
+            parts.extend(bins.iter().filter_map(|bin| utf8_path_entry(&bin.bin_dir)));
         }
         ManagedRuntimeHint::Absent => {
             // Caller confirmed no managed runtime — skip the silent detect.
@@ -324,11 +323,21 @@ pub(crate) fn build_path_from_bin_dirs(
         }
     }
 
-    if !existing_path.is_empty() {
-        parts.push(existing_path);
+    if let Some(inherited) = std::env::var_os("PATH")
+        && !inherited.is_empty()
+    {
+        parts.extend(std::env::split_paths(&inherited).filter_map(|entry| utf8_path_entry(&entry)));
     }
 
     Ok(parts.join(separator))
+}
+
+fn utf8_path_entry(dir: &Path) -> Option<String> {
+    let entry = dir.to_str();
+    if entry.is_none() {
+        tracing::debug!("leaving a PATH entry that isn't valid UTF-8 out of the child's PATH");
+    }
+    entry.map(ToOwned::to_owned)
 }
 
 /// Detect if the project has pinned managed runtimes that are installed locally.
@@ -377,7 +386,7 @@ fn detect_one_managed_runtime_bin(
             matched,
             detected.source_label()
         );
-        Some(bin_dir.to_string_lossy().to_string())
+        utf8_path_entry(&bin_dir)
     } else {
         None
     }

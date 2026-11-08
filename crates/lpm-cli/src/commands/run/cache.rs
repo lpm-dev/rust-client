@@ -763,8 +763,10 @@ fn store_cache_with_context(
     expected: &CacheContext,
 ) -> Result<bool, LpmError> {
     // The rebuild rereads what the input snapshot doesn't cover, such as env
-    // files and vault values. The execution context is checked after it, so
-    // that one check also covers the time the rebuild took.
+    // files and vault values, from disk and the vault rather than from the
+    // run's earlier reads. The execution context is checked after it, so that
+    // one check also covers the time the rebuild took.
+    let fresh_vault_reads = lpm_runner::env_access::fresh_vault_reads();
     let current = match build_task_context(
         request.project_dir,
         request.workspace_contract,
@@ -780,6 +782,7 @@ fn store_cache_with_context(
         Some(current) => current,
         None => return Ok(false),
     };
+    drop(fresh_vault_reads);
     if !execution_context_is_unchanged(expected)? {
         warn_execution_context_changed(request.script_name, expected);
         return Ok(false);

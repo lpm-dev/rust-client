@@ -146,9 +146,20 @@ impl HttpClients {
     }
 
     /// Build an `HttpClients` around one client set with empty eager/lazy maps.
+    #[cfg(test)]
     pub(super) fn from_default_client_set(clients: HttpClientSet) -> Arc<Self> {
+        Self::with_default(DefaultClient::built(clients.cached(None)))
+    }
+
+    /// An `HttpClients` without TLS overrides, whose default client set is
+    /// built by the first request.
+    pub(super) fn with_default_built_on_first_use() -> Arc<Self> {
+        Self::with_default(DefaultClient::on_first_use())
+    }
+
+    fn with_default(default: DefaultClient) -> Arc<Self> {
         Arc::new(Self {
-            default: clients.cached(None),
+            default,
             eager: HashMap::new(),
             lazy: HashMap::new(),
             built_client_sets: std::sync::atomic::AtomicUsize::new(0),
@@ -166,7 +177,7 @@ impl HttpClients {
     /// the default. Sync, infallible — suitable for hot paths.
     fn cached_for_url_no_build(&self, url: &str) -> &CachedClient {
         let Some(origin) = OriginKey::from_request_url(url) else {
-            return &self.default;
+            return self.default.get();
         };
         self.cached_for_origin_no_build(&origin)
     }
@@ -175,7 +186,7 @@ impl HttpClients {
         if let Some(c) = self.eager.get(origin) {
             return c;
         }
-        &self.default
+        self.default.get()
     }
 
     /// Public-API variant returning the underlying `reqwest::Client`.
@@ -209,7 +220,7 @@ impl HttpClients {
     /// BEFORE the actual lazy dispatch.
     pub fn identity_fp_for_url(&self, url: &str) -> Option<&str> {
         let Some(origin) = OriginKey::from_request_url(url) else {
-            return self.default.identity_fp.as_deref();
+            return self.default.identity_fp();
         };
         self.identity_fp_for_origin(&origin)
     }
@@ -231,7 +242,7 @@ impl HttpClients {
                 Err(_) => "identity-unavailable",
             });
         }
-        self.default.identity_fp.as_deref()
+        self.default.identity_fp()
     }
 
     fn lazy_identity_material(
@@ -313,7 +324,7 @@ impl HttpClients {
 
     async fn for_url_pool(&self, url: &str, pool: ClientPool) -> Result<reqwest::Client, LpmError> {
         let Some(origin) = OriginKey::from_request_url(url) else {
-            return Ok(self.select_pool_client(&self.default, pool));
+            return Ok(self.select_pool_client(self.default.get(), pool));
         };
         self.for_origin_pool(&origin, pool).await
     }
@@ -332,7 +343,7 @@ impl HttpClients {
             return Ok(select(c));
         }
         let Some(per_origin_tls) = self.tls_overrides.per_origin.get(origin) else {
-            return Ok(select(&self.default));
+            return Ok(select(self.default.get()));
         };
         let preloaded_cert_pem = match self.lazy_identity_material(origin) {
             Some(Ok(material)) => Some(Arc::clone(&material.cert_pem)),
