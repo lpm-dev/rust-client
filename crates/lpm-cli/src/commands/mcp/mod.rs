@@ -23,16 +23,19 @@ pub(crate) enum McpAction {
     Status,
 }
 
+/// `explicit_token` is the `--token` the command runs with, which the
+/// commands `lpm mcp serve` runs for its local tools need too.
 pub async fn run(
     client: &RegistryClient,
     action: McpAction,
     json_output: bool,
+    explicit_token: Option<&str>,
 ) -> Result<(), LpmError> {
     match action {
         McpAction::Setup { name } => setup(client, name.as_deref(), json_output).await,
         McpAction::Serve => {
             require_stdio_transport(std::io::stdin().is_terminal(), json_output)?;
-            serve::serve(client).await
+            serve::serve(client, explicit_token).await
         }
         McpAction::Remove { name } => remove(&name, json_output).await,
         McpAction::Status => status(json_output).await,

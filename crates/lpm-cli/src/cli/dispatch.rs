@@ -2102,7 +2102,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             commands::swift_registry::run(&session, registry_url, cli.json, force).await
         },
         Commands::Mcp(args) => {
-            commands::mcp::run(&client, args.action, cli.json).await
+            commands::mcp::run(&client, args.action, cli.json, cli.token.as_deref()).await
         },
         Commands::Use(args) => {
             let lifecycle_args::UseArgs {

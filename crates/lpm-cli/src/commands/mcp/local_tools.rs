@@ -5,6 +5,7 @@ use lpm_common::PackageName;
 use lpm_common::process_output::CaptureSession;
 use lpm_registry::RegistryClient;
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -202,11 +203,20 @@ pub(super) struct LocalTools {
     /// The registry options this server runs with, which each command it
     /// runs takes too, since a `--registry` flag isn't inherited.
     global_args: Vec<String>,
+    /// The `--token` this server runs with. Each command gets it as
+    /// `LPM_TOKEN`, which ranks above a stored login as the flag does, and
+    /// stays out of the command line, where other users can read it.
+    token: Option<SecretString>,
     permits: Arc<tokio::sync::Semaphore>,
+    spawn: Spawn,
 }
 
 impl LocalTools {
-    pub(super) fn new(executable: PathBuf, client: &RegistryClient) -> Self {
+    pub(super) fn new(
+        executable: PathBuf,
+        client: &RegistryClient,
+        explicit_token: Option<String>,
+    ) -> Self {
         let mut global_args = vec![format!("--registry={}", client.base_url())];
         if client.allow_insecure() {
             global_args.push("--insecure".to_owned());
@@ -214,7 +224,11 @@ impl LocalTools {
         Self {
             executable,
             global_args,
+            token: explicit_token
+                .filter(|token| !token.is_empty())
+                .map(SecretString::from),
             permits: Arc::new(tokio::sync::Semaphore::new(CONCURRENT_COMMANDS)),
+            spawn: std::process::Command::spawn,
         }
     }
 
@@ -233,11 +247,26 @@ impl LocalTools {
         invocation
             .args
             .splice(0..0, self.global_args.iter().cloned());
-        let Ok(_permit) = self.permits.acquire().await else {
+        let command = format!("lpm {}", tool.command());
+        let permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return tool_error(format!("`{command}` was cancelled.")),
+            permit = self.permits.acquire() => permit,
+        };
+        let Ok(_permit) = permit else {
             return tool_error(format!("`{}` is unavailable", tool.name()));
         };
-        let command = format!("lpm {}", tool.command());
-        match run(&self.executable, invocation, tool.timeout(), cancel).await {
+        let token = self.token.as_ref().map(ExposeSecret::expose_secret);
+        match run(
+            &self.executable,
+            invocation,
+            token,
+            tool.timeout(),
+            cancel,
+            self.spawn,
+        )
+        .await
+        {
             Ok(Ran::Finished(output)) => result_of(tool, &command, &output),
             Ok(Ran::TimedOut) => tool_error(format!(
                 "`{command}` didn't finish within {} minutes and was stopped.",
@@ -424,6 +453,9 @@ fn plain_value<'a>(field: &str, value: &'a str) -> Result<&'a str, String> {
     Ok(value)
 }
 
+/// Starts a command's process. Tests count starts through it.
+type Spawn = fn(&mut std::process::Command) -> std::io::Result<std::process::Child>;
+
 enum Ran {
     Finished(std::process::Output),
     TimedOut,
@@ -435,9 +467,14 @@ enum Ran {
 async fn run(
     executable: &Path,
     invocation: Invocation,
+    token: Option<&str>,
     timeout: Duration,
     cancel: CancellationToken,
+    spawn: Spawn,
 ) -> std::io::Result<Ran> {
+    if cancel.is_cancelled() {
+        return Ok(Ran::Cancelled);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let stop_on_drop = StopOnDrop(Arc::clone(&stop));
     let mut command = std::process::Command::new(executable);
@@ -445,6 +482,9 @@ async fn run(
         .args(&invocation.args)
         .current_dir(&invocation.project)
         .env("NO_COLOR", "1");
+    if let Some(token) = token {
+        command.env("LPM_TOKEN", token);
+    }
     let deadline = Instant::now() + timeout;
     let watcher = {
         let stop = Arc::clone(&stop);
@@ -457,16 +497,21 @@ async fn run(
     let outcome = tokio::task::spawn_blocking(move || {
         let mut timed_out = false;
         let mut session = CaptureSession::default();
-        let output = session.capture_output(&mut command, OUTPUT_LIMIT, |_| {
-            if worker_stop.load(Ordering::Acquire) {
-                return Some(STOP_SIGNAL);
-            }
-            if Instant::now() >= deadline {
-                timed_out = true;
-                return Some(STOP_SIGNAL);
-            }
-            None
-        });
+        let output = session.capture_output_with_spawn(
+            &mut command,
+            OUTPUT_LIMIT,
+            |_| {
+                if worker_stop.load(Ordering::Acquire) {
+                    return Some(STOP_SIGNAL);
+                }
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    return Some(STOP_SIGNAL);
+                }
+                None
+            },
+            spawn,
+        );
         (output, timed_out)
     })
     .await;
@@ -539,6 +584,7 @@ fn result_of(tool: LocalTool, command: &str, output: &std::process::Output) -> C
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
 
     fn arguments(value: serde_json::Value) -> JsonObject {
         value.as_object().cloned().unwrap()
@@ -786,8 +832,10 @@ mod tests {
                 project: project.path().to_path_buf(),
                 args: Vec::new(),
             },
+            None,
             Duration::from_millis(300),
             CancellationToken::new(),
+            std::process::Command::spawn,
         )
         .await
         .unwrap();
@@ -798,6 +846,126 @@ mod tests {
         assert!(
             !marker.exists(),
             "a background process the command started must be stopped with it"
+        );
+    }
+
+    /// An executable script in `dir` that runs `body`.
+    #[cfg(unix)]
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("tool.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    static STARTS_WHILE_QUEUED: AtomicUsize = AtomicUsize::new(0);
+    static STARTS_AFTER_CANCEL: AtomicUsize = AtomicUsize::new(0);
+
+    fn spawn_counting_queued(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        STARTS_WHILE_QUEUED.fetch_add(1, Ordering::SeqCst);
+        command.spawn()
+    }
+
+    fn spawn_counting_cancelled(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        STARTS_AFTER_CANCEL.fetch_add(1, Ordering::SeqCst);
+        command.spawn()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_cancelled_while_it_waits_for_a_slot_never_starts_its_command() {
+        let project = tempfile::tempdir().unwrap();
+        let tool = script(project.path(), r#"echo '{"success":true}'"#);
+        let mut tools = LocalTools::new(tool, &RegistryClient::new(), None);
+        tools.spawn = spawn_counting_queued;
+        let busy = Arc::clone(&tools.permits)
+            .acquire_many_owned(CONCURRENT_COMMANDS as u32)
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let arguments = serde_json::json!({ "projectPath": project.path().to_str().unwrap() });
+
+        let (result, ()) = tokio::join!(
+            tools.call(
+                LocalTool::Audit,
+                arguments.as_object().cloned(),
+                cancel.clone()
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel.cancel();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(busy);
+            },
+        );
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            STARTS_WHILE_QUEUED.load(Ordering::SeqCst),
+            0,
+            "a call cancelled while queued must not start its command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_cancelled_before_its_command_starts_never_starts_it() {
+        let project = tempfile::tempdir().unwrap();
+        let tool = script(project.path(), "exit 0");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let ran = run(
+            &tool,
+            Invocation {
+                project: project.path().to_path_buf(),
+                args: Vec::new(),
+            },
+            None,
+            Duration::from_secs(60),
+            cancel,
+            spawn_counting_cancelled,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(ran, Ran::Cancelled));
+        assert_eq!(STARTS_AFTER_CANCEL.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commands_run_with_the_servers_explicit_token_as_lpm_token() {
+        let project = tempfile::tempdir().unwrap();
+        let tool = script(
+            project.path(),
+            r#"printf '{"success":true,"token":"%s","args":"%s"}' "$LPM_TOKEN" "$*""#,
+        );
+        let tools = LocalTools::new(tool, &RegistryClient::new(), Some("flag-token".to_owned()));
+        let arguments = serde_json::json!({ "projectPath": project.path().to_str().unwrap() });
+
+        let result = tools
+            .call(
+                LocalTool::Audit,
+                arguments.as_object().cloned(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        let text = serde_json::to_value(&result.content[0]).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["token"], "flag-token");
+        assert!(
+            !report["args"].as_str().unwrap().contains("flag-token"),
+            "the token must stay out of the command line: {report}"
         );
     }
 
@@ -812,8 +980,10 @@ mod tests {
                 project: project.path().to_path_buf(),
                 args: vec![r#"{"success":true}"#.to_owned()],
             },
+            None,
             Duration::from_secs(60),
             CancellationToken::new(),
+            std::process::Command::spawn,
         )
         .await
         .unwrap();
@@ -843,8 +1013,10 @@ mod tests {
                 project: project.path().to_path_buf(),
                 args: vec!["30".to_owned()],
             },
+            None,
             Duration::from_secs(60),
             cancel,
+            std::process::Command::spawn,
         )
         .await
         .unwrap();

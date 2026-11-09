@@ -17,11 +17,18 @@ const INSTRUCTIONS: &str = "LPM.dev is a package registry for JavaScript and Swi
 - Check a project's installed dependencies with lpm_audit.
 Registry tools read what the LPM.dev account signed in with `lpm login` can read, and public packages without one.";
 
-pub(super) async fn serve(client: &RegistryClient) -> Result<(), LpmError> {
+pub(super) async fn serve(
+    client: &RegistryClient,
+    explicit_token: Option<&str>,
+) -> Result<(), LpmError> {
     super::remove_retired_runtime();
     let server = LpmServer {
         hosted: HostedRegistry::new(client.clone_with_config()),
-        local: LocalTools::new(std::env::current_exe()?, client),
+        local: LocalTools::new(
+            std::env::current_exe()?,
+            client,
+            explicit_token.map(str::to_owned),
+        ),
     };
     let running = server
         .serve(rmcp::transport::stdio_pipes())
