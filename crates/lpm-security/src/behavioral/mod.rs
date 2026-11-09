@@ -1866,7 +1866,7 @@ impl PackageAnalyzer {
             .collect();
         let named = references.names(&queried);
         let (named_results, named_addons) = named.split_at(test_results.len());
-        let named_addons: std::collections::HashMap<&str, bool> = test_addons
+        let named_addons: HashMap<&str, bool> = test_addons
             .iter()
             .copied()
             .zip(named_addons.iter().copied())

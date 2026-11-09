@@ -139,6 +139,12 @@ enum Needle {
 const MATCHES_PER_REFERENCE_BYTE: usize = 4;
 const MATCHES_FLOOR: usize = 1 << 20;
 
+/// Bytes of distinct needles [`EntryReferences::names`] builds a matcher
+/// for before it names every path. The matcher's memory grows with them,
+/// and thousands of test paths kilobytes long would cost gigabytes; the
+/// most a real package's test files need is about 13 KB.
+const MAX_NEEDLE_BYTES: usize = 1 << 20;
+
 impl EntryReferences {
     /// [`EntryReferences::name`] for each of `paths`, in one pass over the
     /// references. Asking `name` for every test file searched every
@@ -156,6 +162,7 @@ impl EntryReferences {
         // a needle; each list empties the first time it can be answered,
         // and an occurrence answers a whole list at once.
         let mut owners: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        let mut needle_bytes = 0usize;
         let mut index_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (path_index, path) in paths.iter().enumerate() {
             let (directory, name) = match path.rsplit_once('/') {
@@ -193,6 +200,7 @@ impl EntryReferences {
                     continue;
                 }
                 let slot = *index_of.entry(needle).or_insert_with(|| {
+                    needle_bytes += needle.len();
                     needles.push(needle);
                     owners.push((Vec::new(), Vec::new()));
                     needles.len() - 1
@@ -205,6 +213,9 @@ impl EntryReferences {
         }
         if needles.is_empty() {
             return named;
+        }
+        if needle_bytes > MAX_NEEDLE_BYTES {
+            return vec![true; paths.len()];
         }
         let Ok(matcher) = aho_corasick::AhoCorasick::builder()
             .match_kind(aho_corasick::MatchKind::Standard)
@@ -534,5 +545,19 @@ mod tests {
             many < one * 5 + std::time::Duration::from_millis(50),
             "5,000 copies {many:?}, one {one:?}"
         );
+    }
+
+    #[test]
+    fn test_paths_too_long_to_build_a_matcher_for_are_all_named() {
+        // Thousands of test paths kilobytes long made a matcher of
+        // gigabytes; past the needle cap every path counts as package code.
+        let padding = "x".repeat(4_000);
+        let paths: Vec<String> = (0..300)
+            .map(|i| format!("test/{i}{padding}.node"))
+            .collect();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let references = EntryReferences(vec!["main.js".to_owned()]);
+        assert!(paths.iter().all(|path| !references.name(path)));
+        assert_eq!(references.names(&paths), vec![true; paths.len()]);
     }
 }
