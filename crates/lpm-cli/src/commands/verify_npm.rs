@@ -31,10 +31,11 @@ const NOT_YET_CODES: [&str; 3] = ["PACKAGE_NOT_FOUND", "TOKEN_NOT_FOUND", "NPM_U
 /// it's removed. After any other failure it stays: npm refuses to publish a
 /// package for 24 hours after it was unpublished, and "Check npm" in the
 /// LPM.dev settings can still find it.
-const FINAL_CODES: [&str; 5] = [
+/// `NPM_ACCOUNT_LINKED` isn't one: unlinking the npm account from the other
+/// LPM.dev account lets "Check npm" pass with the same package.
+const FINAL_CODES: [&str; 4] = [
     "WRONG_PUBLISHER",
     "PUBLISHED_BEFORE_TOKEN",
-    "NPM_ACCOUNT_LINKED",
     "NO_TOKEN",
     "INVALID_NPM_USERNAME",
 ];
@@ -64,12 +65,14 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     }
 
     let package_name = format!("@{npm_username}/{}", issued.package_name);
-    // A package of that name the person already had keeps its versions and
-    // its `latest`: the proof adds one version and removes only that one.
+    // A package with versions of the person's own keeps them and its
+    // `latest`: the proof adds one version and removes only that one. A
+    // package holding only proofs, as an earlier run can leave, is lpm's to
+    // remove whole.
     let existed = npm_package_document(&http, NPM_REGISTRY_URL, &package_name, npm_token.token())
         .await?
-        .is_some();
-    let version = proof_version();
+        .is_some_and(|document| has_own_versions(&document, &issued.field));
+    let version = proof_version(issued.issued_at.as_deref());
     let manifest = proof_manifest(&package_name, &version, &issued);
     let tarball = proof_tarball(&manifest)?;
     let hashes = compute_hashes(&tarball);
@@ -140,7 +143,12 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             Ok(())
         }
         Err(error) => {
-            explain_cleanup_after_failure(&package_name, &npm_username, &cleanup, json_output);
+            let advice = cleanup_advice(&package_name, &version, &npm_username, &cleanup);
+            if json_output {
+                eprintln!("{}", lpm_common::sanitize_terminal_inline(&advice));
+            } else {
+                install_ui::warn_untrusted(&advice);
+            }
             Err(error)
         }
     }
@@ -184,12 +192,28 @@ fn explain_waiting_name(issued: &NpmVerificationToken, npm_username: &str) {
 }
 
 /// npm never takes a version number twice, even after an unpublish, so
-/// each proof gets its own.
-fn proof_version() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+/// each token's proof gets its own: the second the token was issued, as the
+/// website's manual steps use, so "Check npm" and its unpublish command
+/// name the version the CLI published.
+fn proof_version(issued_at: Option<&str>) -> String {
+    let seconds = issued_at
+        .and_then(|issued| chrono::DateTime::parse_from_rfc3339(issued).ok())
+        .map(|issued| issued.timestamp())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
     format!("1.0.{seconds}")
+}
+
+/// Whether the package has a version that isn't an lpm proof.
+fn has_own_versions(document: &serde_json::Value, field: &str) -> bool {
+    document
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|versions| {
+            versions
+                .values()
+                .any(|manifest| manifest.get(field).is_none())
+        })
 }
 
 fn proof_manifest(
@@ -301,6 +325,10 @@ async fn wait_for_proof(
                     .map_or(interval, Duration::from_secs)
             }
             other if registry_code(other).is_some_and(|code| NOT_YET_CODES.contains(&code)) => {
+                interval
+            }
+            LpmError::Network(_) => interval,
+            LpmError::RegistryHttp(answer) if answer.code.is_none() && answer.status >= 500 => {
                 interval
             }
             _ => return Err(error),
@@ -568,28 +596,24 @@ fn npm_write(
     }
 }
 
-/// After a failed proof, what became of the package and what to do next.
-/// With `--json` it goes to stderr, so stdout keeps the error alone.
-fn explain_cleanup_after_failure(
+/// After a failed proof, what became of the proof version and what to do
+/// next. The command names only that version, so a package the person
+/// already had keeps its others.
+fn cleanup_advice(
     package_name: &str,
+    version: &str,
     npm_username: &str,
     cleanup: &Cleanup,
-    json_output: bool,
-) {
-    let unpublish = format!("npm unpublish {package_name} --force");
-    let advice = match cleanup {
-        Cleanup::Removed => return,
+) -> String {
+    let unpublish = format!("npm unpublish {package_name}@{version} --force");
+    match cleanup {
+        Cleanup::Removed => format!("Removed {package_name}@{version} from npm."),
         Cleanup::Kept => format!(
-            "LPM.dev couldn't confirm the proof yet, so {package_name} stays on npm. To finish without publishing again, select \"Check npm\" under npm account in your LPM.dev settings with the npm username {npm_username} within 24 hours. Then run `{unpublish}`."
+            "{package_name}@{version} stays on npm. Once you fix what stopped the proof, select \"Check npm\" under npm account in your LPM.dev settings with the npm username {npm_username} within 24 hours. Then run `{unpublish}`."
         ),
         Cleanup::Failed(error) => format!(
-            "Could not remove {package_name} from npm ({error}). Run `{unpublish}` within 72 hours."
+            "Could not remove {package_name}@{version} from npm ({error}). Run `{unpublish}` within 72 hours."
         ),
-    };
-    if json_output {
-        eprintln!("{}", lpm_common::sanitize_terminal_inline(&advice));
-    } else {
-        install_ui::warn_untrusted(&advice);
     }
 }
 
@@ -647,7 +671,7 @@ fn report(
     match unpublish_error {
         None => install_ui::done_untrusted(&format!("Removed {package_name}@{version} from npm")),
         Some(error) => install_ui::warn_untrusted(&format!(
-            "Could not remove {package_name}@{version} from npm ({error}). Run `npm unpublish {package_name}@{version}` within 72 hours."
+            "Could not remove {package_name}@{version} from npm ({error}). Run `npm unpublish {package_name}@{version} --force` within 72 hours."
         )),
     }
 }
@@ -663,6 +687,7 @@ mod tests {
     fn issued() -> NpmVerificationToken {
         NpmVerificationToken {
             token: "a".repeat(32),
+            issued_at: Some("2026-11-09T12:00:00.000Z".into()),
             expires_at: "2026-11-10T12:00:00.000Z".into(),
             package_name: "lpm-verify".into(),
             field: "lpmVerification".into(),
@@ -693,10 +718,56 @@ mod tests {
     }
 
     #[test]
-    fn each_proof_gets_a_version_npm_hasnt_seen() {
-        let version = proof_version();
-        let patch: u64 = version.strip_prefix("1.0.").unwrap().parse().unwrap();
-        assert!(patch > 1_790_000_000);
+    fn a_proof_s_version_is_the_second_its_token_was_issued() {
+        assert_eq!(
+            proof_version(Some("2026-11-09T12:00:00.000Z")),
+            "1.0.1794225600"
+        );
+        let fallback: u64 = proof_version(None)
+            .strip_prefix("1.0.")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(fallback > 1_790_000_000);
+    }
+
+    #[test]
+    fn a_package_holding_only_proofs_is_lpm_s_to_remove() {
+        let proofs_only = serde_json::json!({
+            "versions": {
+                "1.0.1": { "lpmVerification": "a" },
+                "1.0.2": { "lpmVerification": "b" },
+            }
+        });
+        let with_own = serde_json::json!({
+            "versions": {
+                "1.0.1": { "lpmVerification": "a" },
+                "2.3.0": { "main": "index.js" },
+            }
+        });
+        assert!(!has_own_versions(&proofs_only, "lpmVerification"));
+        assert!(has_own_versions(&with_own, "lpmVerification"));
+    }
+
+    #[test]
+    fn cleanup_advice_names_only_the_proof_s_version() {
+        let kept = cleanup_advice("@me/lpm-verify", "1.0.7", "me", &Cleanup::Kept);
+        let failed = cleanup_advice(
+            "@me/lpm-verify",
+            "1.0.7",
+            "me",
+            &Cleanup::Failed(LpmError::Network("down".into())),
+        );
+        let removed = cleanup_advice("@me/lpm-verify", "1.0.7", "me", &Cleanup::Removed);
+        for advice in [&kept, &failed] {
+            assert!(
+                advice.contains("npm unpublish @me/lpm-verify@1.0.7 --force"),
+                "{advice}"
+            );
+            assert!(!advice.contains("lpm-verify --force"), "{advice}");
+        }
+        assert!(kept.contains("Check npm"));
+        assert_eq!(removed, "Removed @me/lpm-verify@1.0.7 from npm.");
     }
 
     #[tokio::test]
@@ -1031,7 +1102,7 @@ mod tests {
                 subject: None,
             }))
         };
-        for code in ["WRONG_PUBLISHER", "NPM_ACCOUNT_LINKED", "NO_TOKEN"] {
+        for code in ["WRONG_PUBLISHER", "NO_TOKEN"] {
             assert!(proof_is_final(&refusal(code)), "{code}");
         }
         for code in [
@@ -1039,10 +1110,43 @@ mod tests {
             "TOKEN_NOT_FOUND",
             "NPM_UNAVAILABLE",
             "RATE_LIMITED",
+            "NPM_ACCOUNT_LINKED",
         ] {
             assert!(!proof_is_final(&refusal(code)), "{code}");
         }
         assert!(!proof_is_final(&LpmError::Network("timed out".into())));
+    }
+
+    #[tokio::test]
+    async fn keeps_checking_through_a_server_error_without_a_code() {
+        let registry = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-verification/verify"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+            .up_to_n_times(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-verification/verify"))
+            .respond_with(verify_answer(
+                200,
+                serde_json::json!({ "npmUsername": "me", "username": "me", "claimed": "me" }),
+            ))
+            .mount(&registry)
+            .await;
+        let client = RegistryClient::new()
+            .with_base_url(registry.uri())
+            .with_token("session-token");
+
+        let proof = wait_for_proof(
+            &client,
+            "me",
+            Duration::from_secs(30),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.claimed.as_deref(), Some("me"));
     }
 
     #[tokio::test]

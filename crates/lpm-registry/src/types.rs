@@ -993,6 +993,10 @@ pub struct CheckNameResponse {
 #[serde(rename_all = "camelCase")]
 pub struct NpmVerificationToken {
     pub token: String,
+    /// When the token was issued; the proof's version is `1.0.<its seconds>`
+    /// on the website and in the CLI alike.
+    #[serde(default)]
+    pub issued_at: Option<String>,
     pub expires_at: String,
     /// The proof package's name under the npm user's scope: `lpm-verify`.
     pub package_name: String,
