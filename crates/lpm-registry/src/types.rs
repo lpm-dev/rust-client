@@ -1024,6 +1024,10 @@ pub struct NpmVerificationResult {
     /// The username the account waits for, which this npm account can't claim.
     #[serde(default)]
     pub unclaimable: Option<String>,
+    /// The username the account waited for, which it can no longer take
+    /// because it published under its current one.
+    #[serde(default)]
+    pub locked: Option<String>,
 }
 
 // ─── Auth ──────────────────────────────────────────────────────────

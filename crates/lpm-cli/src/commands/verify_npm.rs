@@ -27,6 +27,27 @@ const PROOF_WAIT: Duration = Duration::from_secs(90);
 const PROOF_CHECK_INTERVAL: Duration = Duration::from_secs(6);
 /// Registry codes that mean npm hasn't served the package yet.
 const NOT_YET_CODES: [&str; 3] = ["PACKAGE_NOT_FOUND", "TOKEN_NOT_FOUND", "NPM_UNAVAILABLE"];
+/// Registry codes after which the published package can prove nothing, so
+/// it's removed. After any other failure it stays: npm refuses to publish a
+/// package for 24 hours after it was unpublished, and "Check npm" in the
+/// LPM.dev settings can still find it.
+const FINAL_CODES: [&str; 5] = [
+    "WRONG_PUBLISHER",
+    "PUBLISHED_BEFORE_TOKEN",
+    "NPM_ACCOUNT_LINKED",
+    "NO_TOKEN",
+    "INVALID_NPM_USERNAME",
+];
+/// The dist-tag of a proof in a package the person already had, so its
+/// `latest` stays where it was.
+const PROOF_TAG: &str = "lpm-verify";
+
+/// What became of the proof package after the proof.
+enum Cleanup {
+    Removed,
+    Kept,
+    Failed(LpmError),
+}
 
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
     let npm_token = npm_auth::resolve_token_auth()?;
@@ -43,6 +64,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     }
 
     let package_name = format!("@{npm_username}/{}", issued.package_name);
+    // A package of that name the person already had keeps its versions and
+    // its `latest`: the proof adds one version and removes only that one.
+    let existed = npm_package_document(&http, NPM_REGISTRY_URL, &package_name, npm_token.token())
+        .await?
+        .is_some();
     let version = proof_version();
     let manifest = proof_manifest(&package_name, &version, &issued);
     let tarball = proof_tarball(&manifest)?;
@@ -60,7 +86,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         &hashes,
         None,
         "public",
-        "latest",
+        if existed { PROOF_TAG } else { "latest" },
         NPM_REGISTRY_URL,
         false,
         json_output,
@@ -79,26 +105,50 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     }
     let proof = wait_for_proof(client, &npm_username, PROOF_WAIT, PROOF_CHECK_INTERVAL).await;
 
-    if !json_output {
-        install_ui::phase_untrusted(&format!("Removing {package_name} from npm"));
-    }
-    let unpublished = unpublish_npm_package(
-        &http,
-        NPM_REGISTRY_URL,
-        &package_name,
-        npm_token.token(),
-        json_output,
-    )
-    .await;
+    let cleanup = if proof.is_ok() || proof.as_ref().is_err_and(proof_is_final) {
+        if !json_output {
+            install_ui::phase_untrusted(&format!("Removing {package_name}@{version} from npm"));
+        }
+        let removed = if existed {
+            unpublish_npm_version(
+                &http,
+                NPM_REGISTRY_URL,
+                &package_name,
+                &version,
+                npm_token.token(),
+                json_output,
+            )
+            .await
+        } else {
+            unpublish_npm_package(
+                &http,
+                NPM_REGISTRY_URL,
+                &package_name,
+                npm_token.token(),
+                json_output,
+            )
+            .await
+        };
+        removed.map_or_else(Cleanup::Failed, |()| Cleanup::Removed)
+    } else {
+        Cleanup::Kept
+    };
 
-    let proof = proof?;
-    report(
-        &proof,
-        &package_name,
-        unpublished.as_ref().err(),
-        json_output,
-    );
-    Ok(())
+    match proof {
+        Ok(proof) => {
+            report(&proof, &package_name, &version, &cleanup, json_output);
+            Ok(())
+        }
+        Err(error) => {
+            explain_cleanup_after_failure(&package_name, &npm_username, &cleanup, json_output);
+            Err(error)
+        }
+    }
+}
+
+/// Whether a proof failure is one waiting or trying again won't change.
+fn proof_is_final(error: &LpmError) -> bool {
+    registry_code(error).is_some_and(|code| FINAL_CODES.contains(&code))
 }
 
 fn npm_http_client() -> Result<reqwest::Client, LpmError> {
@@ -117,16 +167,20 @@ fn explain_waiting_name(issued: &NpmVerificationToken, npm_username: &str) {
         return;
     };
     let claimants = &issued.pending_username_npm_accounts;
-    if claimants.is_empty() || claimants.iter().any(|name| name == npm_username) {
+    if claimants.iter().any(|name| name == npm_username) {
         install_ui::detail_untrusted(&format!(
             "You're waiting for the username {pending}; this proof gives it to you."
         ));
-        return;
+    } else if claimants.is_empty() {
+        install_ui::warn_untrusted(&format!(
+            "{pending} isn't held for an npm user any more. Choose it again under Account in your LPM.dev settings."
+        ));
+    } else {
+        install_ui::warn_untrusted(&format!(
+            "{pending} is held for the npm user {}, but you're signed in to npm as {npm_username}. This proves {npm_username} and leaves {pending} waiting.",
+            claimants.join(" or ")
+        ));
     }
-    install_ui::warn_untrusted(&format!(
-        "{pending} is held for the npm user {}, but you're signed in to npm as {npm_username}. This proves {npm_username} and leaves {pending} waiting.",
-        claimants.join(" or ")
-    ));
 }
 
 /// npm never takes a version number twice, even after an unpublish, so
@@ -241,6 +295,11 @@ async fn wait_for_proof(
         };
         let pause = match &error {
             LpmError::RateLimited { retry_after_secs } => Duration::from_secs(*retry_after_secs),
+            LpmError::RegistryHttp(answer) if answer.code.as_deref() == Some("RATE_LIMITED") => {
+                answer
+                    .retry_after_secs
+                    .map_or(interval, Duration::from_secs)
+            }
             other if registry_code(other).is_some_and(|code| NOT_YET_CODES.contains(&code)) => {
                 interval
             }
@@ -253,29 +312,33 @@ async fn wait_for_proof(
     }
 }
 
-/// Unpublishes the whole proof package, as `npm unpublish <name> --force`
-/// does: reads its revision, then deletes that revision. npm asks for the
-/// account's second factor here as it does to publish.
-async fn unpublish_npm_package(
+/// npm's own escaping of a scoped name: `@scope%2Fname`.
+fn escaped_npm_name(package_name: &str) -> String {
+    package_name.replacen('/', "%2F", 1)
+}
+
+/// The package's document as npm keeps it for writes, with its revision,
+/// or None when npm has no such package.
+async fn npm_package_document(
     http: &reqwest::Client,
     registry_url: &str,
     package_name: &str,
     token: &str,
-    json_output: bool,
-) -> Result<(), LpmError> {
-    let registry_url = registry_url.trim_end_matches('/');
-    // npm's own escaping of a scoped name: `@scope%2Fname`.
-    let encoded = package_name.replacen('/', "%2F", 1);
-    let document_url = format!("{registry_url}/{encoded}?write=true");
+) -> Result<Option<serde_json::Value>, LpmError> {
+    let url = format!(
+        "{}/{}?write=true",
+        registry_url.trim_end_matches('/'),
+        escaped_npm_name(package_name)
+    );
     let response = http
-        .get(&document_url)
+        .get(&url)
         .bearer_auth(token)
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .send()
         .await
         .map_err(|e| LpmError::Network(format!("npm request failed: {e}")))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(());
+        return Ok(None);
     }
     if !response.status().is_success() {
         return Err(LpmError::Registry(format!(
@@ -283,95 +346,264 @@ async fn unpublish_npm_package(
             response.status()
         )));
     }
-    let document = read_capped_json(response).await?;
-    let revision = document
+    read_capped_json(response).await.map(Some)
+}
+
+fn revision_of(document: &serde_json::Value, package_name: &str) -> Result<String, LpmError> {
+    document
         .get("_rev")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LpmError::Registry(format!("npm sent no revision of {package_name}")))?;
-    let delete_url = format!(
-        "{registry_url}/{encoded}/-rev/{}",
-        urlencoding::encode(revision)
-    );
+        .map(str::to_owned)
+        .ok_or_else(|| LpmError::Registry(format!("npm sent no revision of {package_name}")))
+}
 
-    let delete = |otp: Option<&str>| {
-        let mut request = web_auth::add_npm_web_auth_headers(
-            http.delete(&delete_url).bearer_auth(token),
-            web_auth::NPM_COMMAND_UNPUBLISH,
-        );
-        if let Some(code) = otp {
-            request = request.header("npm-otp", code);
+/// Sends an npm write, answering npm's ask for the account's second factor
+/// once and keeping the code for the writes after it.
+async fn send_npm_write(
+    request: impl Fn(Option<&str>) -> reqwest::RequestBuilder,
+    registry_url: &str,
+    package_name: &str,
+    otp: &mut Option<String>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let send = |code: Option<&str>| {
+        let request = request(code);
+        async move {
+            request
+                .send()
+                .await
+                .map_err(|e| LpmError::Network(format!("npm request failed: {e}")))
         }
-        request.send()
     };
-    let response = delete(None)
-        .await
-        .map_err(|e| LpmError::Network(format!("npm unpublish failed: {e}")))?;
+    let response = send(otp.as_deref()).await?;
     if response.status().is_success() {
         return Ok(());
     }
     if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Err(LpmError::Registry(format!(
-            "npm refused to unpublish {package_name} with HTTP {}",
-            response.status()
-        )));
+        return Err(npm_write_refused(package_name, response.status()));
     }
 
     let asks_for_otp = publish_npm::is_otp_required(response.status(), response.headers());
     let body = read_capped_json(response)
         .await
         .unwrap_or(serde_json::Value::Null);
-    let otp = if let Some(challenge) =
-        web_auth::parse_web_auth_challenge_from_body(&body, registry_url)
-    {
-        if json_output || !web_auth::terminal_is_interactive() {
-            return Err(npm_second_factor_needed(package_name));
-        }
-        web_auth::complete_web_auth_challenge(
-            &challenge,
-            "unpublish",
-            json_output,
-            true,
-            Duration::from_secs(5 * 60),
-            Duration::from_secs(1),
-        )
-        .await?
-    } else if asks_for_otp {
-        if json_output || !web_auth::terminal_is_interactive() {
-            return Err(npm_second_factor_needed(package_name));
-        }
-        publish_npm::prompt_npm_otp()?
-    } else {
+    let challenge = web_auth::parse_web_auth_challenge_from_body(&body, registry_url);
+    if challenge.is_none() && !asks_for_otp {
         return Err(LpmError::Registry(format!(
-            "npm refused to unpublish {package_name}: the token may lack permission"
+            "npm refused to change {package_name}: the token may lack permission"
         )));
+    }
+    if json_output || !web_auth::terminal_is_interactive() {
+        return Err(LpmError::Registry(format!(
+            "npm asks for your second factor to change {package_name}, and this command isn't interactive"
+        )));
+    }
+    let code = match challenge {
+        Some(challenge) => {
+            web_auth::complete_web_auth_challenge(
+                &challenge,
+                "unpublish",
+                json_output,
+                true,
+                Duration::from_secs(5 * 60),
+                Duration::from_secs(1),
+            )
+            .await?
+        }
+        None => publish_npm::prompt_npm_otp()?,
     };
-
-    let retry = delete(Some(&otp))
-        .await
-        .map_err(|e| LpmError::Network(format!("npm unpublish failed: {e}")))?;
+    let retry = send(Some(&code)).await?;
+    *otp = Some(code);
     if retry.status().is_success() {
         Ok(())
     } else {
-        Err(LpmError::Registry(format!(
-            "npm refused to unpublish {package_name} with HTTP {}",
-            retry.status()
-        )))
+        Err(npm_write_refused(package_name, retry.status()))
     }
 }
 
-fn npm_second_factor_needed(package_name: &str) -> LpmError {
+fn npm_write_refused(package_name: &str, status: reqwest::StatusCode) -> LpmError {
     LpmError::Registry(format!(
-        "npm asks for your second factor to unpublish {package_name}, and this command isn't interactive"
+        "npm refused to change {package_name} with HTTP {status}"
     ))
+}
+
+/// Unpublishes the whole proof package, as `npm unpublish <name> --force`
+/// does: reads its revision, then deletes that revision.
+async fn unpublish_npm_package(
+    http: &reqwest::Client,
+    registry_url: &str,
+    package_name: &str,
+    token: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let Some(document) = npm_package_document(http, registry_url, package_name, token).await?
+    else {
+        return Ok(());
+    };
+    let revision = revision_of(&document, package_name)?;
+    let url = format!(
+        "{}/{}/-rev/{}",
+        registry_url.trim_end_matches('/'),
+        escaped_npm_name(package_name),
+        urlencoding::encode(&revision)
+    );
+    send_npm_write(
+        |otp| npm_write(http.delete(&url), token, otp),
+        registry_url,
+        package_name,
+        &mut None,
+        json_output,
+    )
+    .await
+}
+
+/// Unpublishes one version of a package that keeps others, as
+/// `npm unpublish <name>@<version>` does: writes the document without the
+/// version and the tags that named it, then deletes the version's tarball.
+/// Only the registry's own host gets the token.
+async fn unpublish_npm_version(
+    http: &reqwest::Client,
+    registry_url: &str,
+    package_name: &str,
+    version: &str,
+    token: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let registry_url = registry_url.trim_end_matches('/');
+    let Some(mut document) = npm_package_document(http, registry_url, package_name, token).await?
+    else {
+        return Ok(());
+    };
+    let Some(versions) = document
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Err(LpmError::Registry(format!(
+            "npm sent no versions of {package_name}"
+        )));
+    };
+    let Some(removed) = versions.remove(version) else {
+        return Ok(());
+    };
+    if versions.is_empty() {
+        return unpublish_npm_package(http, registry_url, package_name, token, json_output).await;
+    }
+    let remaining_highest = versions
+        .keys()
+        .filter_map(|key| {
+            lpm_semver::Version::parse(key)
+                .ok()
+                .map(|parsed| (parsed, key.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, key)| key);
+    if let Some(tags) = document
+        .get_mut("dist-tags")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let was_latest = tags.get("latest").and_then(serde_json::Value::as_str) == Some(version);
+        tags.retain(|_, target| target.as_str() != Some(version));
+        if was_latest && let Some(highest) = remaining_highest {
+            tags.insert("latest".into(), serde_json::Value::String(highest));
+        }
+    }
+    if let Some(object) = document.as_object_mut() {
+        object.remove("_revisions");
+        object.remove("_attachments");
+    }
+    let tarball_path = removed
+        .pointer("/dist/tarball")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|tarball| reqwest::Url::parse(tarball).ok())
+        .map(|tarball| tarball.path().to_owned())
+        .ok_or_else(|| {
+            LpmError::Registry(format!("npm sent no tarball for {package_name}@{version}"))
+        })?;
+
+    let mut otp = None;
+    let revision = revision_of(&document, package_name)?;
+    let document_url = format!(
+        "{registry_url}/{}/-rev/{}",
+        escaped_npm_name(package_name),
+        urlencoding::encode(&revision)
+    );
+    send_npm_write(
+        |code| npm_write(http.put(&document_url).json(&document), token, code),
+        registry_url,
+        package_name,
+        &mut otp,
+        json_output,
+    )
+    .await?;
+
+    let Some(updated) = npm_package_document(http, registry_url, package_name, token).await? else {
+        return Ok(());
+    };
+    let tarball_url = format!(
+        "{registry_url}{tarball_path}/-rev/{}",
+        urlencoding::encode(&revision_of(&updated, package_name)?)
+    );
+    send_npm_write(
+        |code| npm_write(http.delete(&tarball_url), token, code),
+        registry_url,
+        package_name,
+        &mut otp,
+        json_output,
+    )
+    .await
+}
+
+fn npm_write(
+    request: reqwest::RequestBuilder,
+    token: &str,
+    otp: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = web_auth::add_npm_web_auth_headers(
+        request.bearer_auth(token),
+        web_auth::NPM_COMMAND_UNPUBLISH,
+    );
+    match otp {
+        Some(code) => request.header("npm-otp", code),
+        None => request,
+    }
+}
+
+/// After a failed proof, what became of the package and what to do next.
+/// With `--json` it goes to stderr, so stdout keeps the error alone.
+fn explain_cleanup_after_failure(
+    package_name: &str,
+    npm_username: &str,
+    cleanup: &Cleanup,
+    json_output: bool,
+) {
+    let unpublish = format!("npm unpublish {package_name} --force");
+    let advice = match cleanup {
+        Cleanup::Removed => return,
+        Cleanup::Kept => format!(
+            "LPM.dev couldn't confirm the proof yet, so {package_name} stays on npm. To finish without publishing again, select \"Check npm\" under npm account in your LPM.dev settings with the npm username {npm_username} within 24 hours. Then run `{unpublish}`."
+        ),
+        Cleanup::Failed(error) => format!(
+            "Could not remove {package_name} from npm ({error}). Run `{unpublish}` within 72 hours."
+        ),
+    };
+    if json_output {
+        eprintln!("{}", lpm_common::sanitize_terminal_inline(&advice));
+    } else {
+        install_ui::warn_untrusted(&advice);
+    }
 }
 
 fn report(
     proof: &NpmVerificationResult,
     package_name: &str,
-    unpublish_error: Option<&LpmError>,
+    version: &str,
+    cleanup: &Cleanup,
     json_output: bool,
 ) {
-    let unpublish_command = format!("npm unpublish {package_name} --force");
+    let unpublish_error = match cleanup {
+        Cleanup::Failed(error) => Some(error),
+        Cleanup::Removed | Cleanup::Kept => None,
+    };
     if json_output {
         let answer = serde_json::json!({
             "success": true,
@@ -380,8 +612,10 @@ fn report(
             "claimed": proof.claimed,
             "taken": proof.taken,
             "unclaimable": proof.unclaimable,
+            "locked": proof.locked,
             "package": package_name,
-            "unpublished": unpublish_error.is_none(),
+            "version": version,
+            "unpublished": matches!(cleanup, Cleanup::Removed),
             "unpublishError": unpublish_error.map(ToString::to_string),
         });
         println!(
@@ -397,6 +631,10 @@ fn report(
     ));
     if let Some(name) = &proof.claimed {
         install_ui::done_untrusted(&format!("Your username is now {name}"));
+    } else if let Some(name) = &proof.locked {
+        install_ui::warn_untrusted(&format!(
+            "You published under your current username, so it can't change to {name} any more."
+        ));
     } else if let Some(name) = &proof.taken {
         install_ui::warn_untrusted(&format!(
             "{name} was taken before you finished. Choose another username in your LPM.dev settings."
@@ -407,9 +645,9 @@ fn report(
         ));
     }
     match unpublish_error {
-        None => install_ui::done_untrusted(&format!("Removed {package_name} from npm")),
+        None => install_ui::done_untrusted(&format!("Removed {package_name}@{version} from npm")),
         Some(error) => install_ui::warn_untrusted(&format!(
-            "Could not remove {package_name} from npm ({error}). Run `{unpublish_command}` within 72 hours."
+            "Could not remove {package_name}@{version} from npm ({error}). Run `npm unpublish {package_name}@{version}` within 72 hours."
         )),
     }
 }
@@ -667,6 +905,182 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(registry_code(&error), Some("TOKEN_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn removing_a_proof_from_a_package_the_person_had_keeps_their_versions_and_latest() {
+        let npm = MockServer::start().await;
+        let tarball = format!("{}/@me/lpm-verify/-/lpm-verify-1.0.99.tgz", npm.uri());
+        Mock::given(method("GET"))
+            .and(path("/@me%2Flpm-verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_id": "@me/lpm-verify",
+                "_rev": "5-a",
+                "dist-tags": { "latest": "1.0.0", "lpm-verify": "1.0.99" },
+                "versions": {
+                    "1.0.0": { "dist": { "tarball": "https://registry.npmjs.org/@me/lpm-verify/-/lpm-verify-1.0.0.tgz" } },
+                    "1.0.99": { "dist": { "tarball": tarball } },
+                },
+                "_attachments": {},
+            })))
+            .up_to_n_times(1)
+            .mount(&npm)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/@me%2Flpm-verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_rev": "6-b",
+            })))
+            .mount(&npm)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/@me%2Flpm-verify/-rev/5-a"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&npm)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/@me/lpm-verify/-/lpm-verify-1.0.99.tgz/-rev/6-b"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&npm)
+            .await;
+
+        unpublish_npm_version(
+            &npm_http_client().unwrap(),
+            &npm.uri(),
+            "@me/lpm-verify",
+            "1.0.99",
+            "npm_token",
+            true,
+        )
+        .await
+        .unwrap();
+
+        let requests = npm.received_requests().await.unwrap();
+        let written = requests
+            .iter()
+            .find(|request| request.method == wiremock::http::Method::PUT)
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&written.body).unwrap();
+        assert_eq!(
+            document["versions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["1.0.0"]
+        );
+        assert_eq!(
+            document["dist-tags"],
+            serde_json::json!({ "latest": "1.0.0" })
+        );
+        assert!(document.get("_attachments").is_none());
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/@me%2Flpm-verify/-rev/5-a"
+                    || request.method != wiremock::http::Method::DELETE)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_only_version_unpublishes_the_package() {
+        let npm = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@me%2Flpm-verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_rev": "2-c",
+                "versions": { "1.0.99": { "dist": { "tarball": "https://registry.npmjs.org/x.tgz" } } },
+            })))
+            .mount(&npm)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/@me%2Flpm-verify/-rev/2-c"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&npm)
+            .await;
+
+        unpublish_npm_version(
+            &npm_http_client().unwrap(),
+            &npm.uri(),
+            "@me/lpm-verify",
+            "1.0.99",
+            "npm_token",
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn removes_the_package_only_after_a_refusal_that_trying_again_won_t_change() {
+        let refusal = |code: &str| {
+            LpmError::RegistryHttp(Box::new(lpm_common::RegistryHttpError {
+                status: 422,
+                registry: "https://lpm.dev".into(),
+                registry_kind: lpm_common::RegistryKind::Lpm,
+                code: Some(code.into()),
+                message: String::new(),
+                message_from_registry: true,
+                body_kind: lpm_common::RegistryBodyKind::Json,
+                request_id: None,
+                retry_after_secs: None,
+                notice: None,
+                subject: None,
+            }))
+        };
+        for code in ["WRONG_PUBLISHER", "NPM_ACCOUNT_LINKED", "NO_TOKEN"] {
+            assert!(proof_is_final(&refusal(code)), "{code}");
+        }
+        for code in [
+            "PACKAGE_NOT_FOUND",
+            "TOKEN_NOT_FOUND",
+            "NPM_UNAVAILABLE",
+            "RATE_LIMITED",
+        ] {
+            assert!(!proof_is_final(&refusal(code)), "{code}");
+        }
+        assert!(!proof_is_final(&LpmError::Network("timed out".into())));
+    }
+
+    #[tokio::test]
+    async fn waits_out_the_registry_s_rate_limit() {
+        let registry = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-verification/verify"))
+            .respond_with(
+                verify_answer(
+                    429,
+                    serde_json::json!({ "code": "RATE_LIMITED", "error": "Too many checks." }),
+                )
+                .insert_header("retry-after", "1"),
+            )
+            .up_to_n_times(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-verification/verify"))
+            .respond_with(verify_answer(
+                200,
+                serde_json::json!({ "npmUsername": "me", "username": "me", "claimed": "me" }),
+            ))
+            .mount(&registry)
+            .await;
+        let client = RegistryClient::new()
+            .with_base_url(registry.uri())
+            .with_token("session-token");
+
+        let proof = wait_for_proof(
+            &client,
+            "me",
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.claimed.as_deref(), Some("me"));
     }
 
     #[test]
