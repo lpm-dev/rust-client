@@ -149,7 +149,6 @@ impl HostedRegistry {
         if let Some(arguments) = arguments {
             params.insert("arguments".to_owned(), Value::Object(arguments));
         }
-        self.read_login_off_thread().await;
         let mut outcome = self
             .send(
                 "tools/call",
@@ -166,7 +165,7 @@ impl HostedRegistry {
             outcome,
             Err(HostedFailure::SignIn(_)
                 | HostedFailure::Request(LpmError::AuthRequired | LpmError::SessionExpired))
-        ) && self.login_changed().await
+        ) && self.login_changed()
         {
             outcome = self
                 .send(
@@ -186,29 +185,15 @@ impl HostedRegistry {
         }
     }
 
-    /// Read the stored login before a request needs it, on a blocking
-    /// thread: reading the credential store can wait on a macOS Keychain
-    /// prompt, which must not hold an async worker of a long-running server.
-    async fn read_login_off_thread(&self) {
-        let Some(session) = self.client.session().map(Arc::clone) else {
-            return;
-        };
-        let _ = tokio::task::spawn_blocking(move || session.current_source()).await;
-    }
-
-    /// Read the stored login again, on a blocking thread, and say whether it
-    /// differs from the one the failed request used.
-    async fn login_changed(&self) -> bool {
-        let Some(session) = self.client.session().map(Arc::clone) else {
+    /// Read the stored login again, and say whether it differs from the one
+    /// the failed request used.
+    fn login_changed(&self) -> bool {
+        let Some(session) = self.client.session() else {
             return false;
         };
-        tokio::task::spawn_blocking(move || {
-            let before = session.current_bearer_lazy().ok().flatten();
-            session.reread_stored_credentials().unwrap_or(false)
-                && session.current_bearer_lazy().ok().flatten() != before
-        })
-        .await
-        .unwrap_or(false)
+        let before = session.current_bearer_lazy().ok().flatten();
+        session.reread_stored_credentials().unwrap_or(false)
+            && session.current_bearer_lazy().ok().flatten() != before
     }
 
     async fn send(

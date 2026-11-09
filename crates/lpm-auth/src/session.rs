@@ -333,8 +333,10 @@ impl SessionManager {
         if self.classified.load(Ordering::Acquire) {
             return Ok(());
         }
-        if let Some(resolved) = classify_keychain_sources(&self.registry_url, |kind| {
-            self.emit_auth_storage_notice(kind);
+        if let Some(resolved) = credential_io(|| {
+            classify_keychain_sources(&self.registry_url, |kind| {
+                self.emit_auth_storage_notice(kind);
+            })
         })? && let Ok(mut guard) = self.cached.write()
         {
             *guard = Some(resolved);
@@ -374,8 +376,10 @@ impl SessionManager {
         {
             return Ok(rotation.refresh_token.clone());
         }
-        match crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
-            self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
+        match credential_io(|| {
+            crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
+                self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
+            })
         })
         .map_err(|error| error.into_lpm_error("failed to read stored refresh credential"))?
         {
@@ -391,8 +395,10 @@ impl SessionManager {
     }
 
     fn load_access_token(&self) -> Result<Option<String>, LpmError> {
-        crate::get_stored_access_token_with_interaction_notice(&self.registry_url, || {
-            self.emit_auth_storage_notice(AuthStorageAccessKind::AccessToken);
+        credential_io(|| {
+            crate::get_stored_access_token_with_interaction_notice(&self.registry_url, || {
+                self.emit_auth_storage_notice(AuthStorageAccessKind::AccessToken);
+            })
         })
         .map_err(|error| error.into_lpm_error("failed to read stored access credential"))
     }
@@ -773,12 +779,14 @@ impl SessionManager {
                 .do_silent_refresh(rejected_access.as_deref(), &current_refresh)
                 .await?;
             if self.persists_refreshed_session {
-                persist_refresh_backed_session_unlocked(
-                    &self.registry_url,
-                    &refreshed.token,
-                    &refreshed.refresh_token,
-                    &refreshed.expires_at,
-                )
+                credential_io(|| {
+                    persist_refresh_backed_session_unlocked(
+                        &self.registry_url,
+                        &refreshed.token,
+                        &refreshed.refresh_token,
+                        &refreshed.expires_at,
+                    )
+                })
                 .map_err(|error| {
                     LpmError::CredentialStorage(format!(
                         "failed to persist refreshed session: {error}"
@@ -830,8 +838,10 @@ impl SessionManager {
         {
             return Ok(false);
         }
-        let resolved = classify_keychain_sources(&self.registry_url, |kind| {
-            self.emit_auth_storage_notice(kind);
+        let resolved = credential_io(|| {
+            classify_keychain_sources(&self.registry_url, |kind| {
+                self.emit_auth_storage_notice(kind);
+            })
         })?;
         *self.cached.write().unwrap_or_else(|e| e.into_inner()) = resolved;
         self.classified.store(true, Ordering::Release);
@@ -842,11 +852,12 @@ impl SessionManager {
     /// metadata) and drop the in-memory cache. Used when the server
     /// authoritatively rejects the session.
     pub fn clear_session(&self) -> Result<(), LpmError> {
-        let result = crate::clear_login_state(&self.registry_url).map_err(|error| {
-            LpmError::CredentialStorage(format!(
-                "failed to clear rejected local session state: {error}"
-            ))
-        });
+        let result =
+            credential_io(|| crate::clear_login_state(&self.registry_url)).map_err(|error| {
+                LpmError::CredentialStorage(format!(
+                    "failed to clear rejected local session state: {error}"
+                ))
+            });
         self.clear_cached_session();
         result
     }
@@ -999,6 +1010,21 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
 /// If only a refresh token is present (access token wiped, keychain
 /// reset, etc.), we still seed an empty `StoredSession` placeholder so
 /// `refresh_now` can rotate it on the next auth-required request.
+/// Run work on stored credentials without holding an async worker. It can
+/// wait on another process's lock on the credential store, or on the user at
+/// a macOS Keychain prompt, which in a long-running process such as
+/// `lpm mcp serve` would stall every task the worker carries. On a
+/// multi-thread runtime the worker hands its tasks to another thread first;
+/// on a current-thread runtime, or outside one, the work runs in place.
+fn credential_io<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 fn classify_keychain_sources(
     registry_url: &str,
     mut notice: impl FnMut(AuthStorageAccessKind),
@@ -1814,6 +1840,55 @@ mod tests {
             Some("second-access")
         );
         assert!(manager.classified.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_refresh_waiting_on_credential_storage_leaves_the_async_worker_free() {
+        let _env = token_classify_isolate();
+        let registry = "https://blocked-store.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+        crate::set_refresh_token(registry, "stored-refresh").expect("refresh token should store");
+        let manager = std::sync::Arc::new(SessionManager::new(registry, None));
+        assert_eq!(
+            manager.current_source().unwrap(),
+            Some(TokenSource::StoredSession)
+        );
+        let lock_path = crate::session_lock_path("lpm-auth://credential-store").unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            lpm_common::paths::with_exclusive_lock(lock_path, || {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+        });
+        held_rx.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let refreshing = {
+            let manager = std::sync::Arc::clone(&manager);
+            runtime.spawn(async move { manager.refresh_now().await })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move { ran_tx.send(()).unwrap() });
+        let other_task_ran = ran_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let _ = runtime.block_on(refreshing);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+
+        assert!(
+            other_task_ran,
+            "a task must run while a refresh waits on credential storage"
+        );
     }
 
     #[test]
