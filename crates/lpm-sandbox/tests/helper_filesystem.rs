@@ -176,6 +176,97 @@ try {{
     )
 }
 
+const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+/// PowerShell that writes a line through the handle with value `handle`,
+/// which only exists in its process if it was inherited.
+fn ps_write_through_handle(handle: usize) -> String {
+    format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+try {{
+    $handle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new([IntPtr]{handle}, $false)
+    $stream = [System.IO.FileStream]::new($handle, [System.IO.FileAccess]::Write)
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes('written by the child')
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+    [Console]::WriteLine('WROTE')
+}} catch {{
+    [Console]::WriteLine('NO-HANDLE')
+}}
+"#
+    )
+}
+
+/// The helper runs with the user's full token, so any handle it passes to
+/// its AppContainer child is access the child's grants don't give.
+#[test]
+fn the_lifecycle_child_inherits_none_of_the_helper_s_other_handles() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("helper-only.txt");
+    fs::write(&target, "untouched").expect("seed file");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .expect("open the target");
+    // SAFETY: the handle stays open for the call.
+    let marked = unsafe {
+        SetHandleInformation(
+            file.as_raw_handle(),
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    };
+    assert_ne!(marked, 0, "mark the handle inheritable");
+    let script = ps_write_through_handle(file.as_raw_handle() as usize);
+
+    // Positive control: an unsandboxed child, started as the helper is,
+    // inherits the handle and can write through it.
+    let control = std::process::Command::new(POWERSHELL)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("spawn the control child");
+    assert_eq!(
+        fs::read_to_string(&target).expect("read the target"),
+        "written by the child",
+        "the probe can't write through an inherited handle; stdout: {}",
+        String::from_utf8_lossy(&control.stdout),
+    );
+    fs::write(&target, "untouched").expect("reset the target");
+
+    let mut argv = helper_argv_base();
+    argv.extend([
+        "--".into(),
+        POWERSHELL.into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        script,
+    ]);
+    let out = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&argv)
+        .output()
+        .expect("spawn helper");
+    drop(file);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && (stdout.contains("WROTE") || stdout.contains("NO-HANDLE")),
+        "the probe did not run; status: {:?}\nstdout: {stdout}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("read the target"),
+        "untouched",
+        "the AppContainer child wrote through a handle the helper inherited"
+    );
+}
+
 #[test]
 fn helper_writable_dir_grant_lets_lifecycle_child_create_file() {
     let tmp = tempfile::tempdir().expect("tempdir");

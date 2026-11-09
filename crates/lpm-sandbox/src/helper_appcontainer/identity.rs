@@ -410,7 +410,7 @@ mod tests {
         let kept = tree_with_a_file(root.path(), "kept");
         let dropped = tree_with_a_file(root.path(), "dropped");
         for tree in [&kept, &dropped] {
-            grant_dacl_ace_to_tree(tree, sid.0, FILE_GENERIC_READ, true).unwrap();
+            grant_dacl_ace_to_tree(tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
         }
         let record = root.path().join("grants.json");
         record_grants(&record, &[kept.clone(), dropped.clone()]).unwrap();
@@ -429,7 +429,7 @@ mod tests {
         let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
         let root = tempfile::tempdir().unwrap();
         let tree = tree_with_a_file(root.path(), "granted");
-        grant_dacl_ace_to_tree(&tree, sid.0, FILE_GENERIC_READ, true).unwrap();
+        grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
         let record = root.path().join("grants.json");
         record_grants(&record, std::slice::from_ref(&tree)).unwrap();
         let profiles = profile_list().expect("the user's AppContainer profile list");
@@ -472,7 +472,7 @@ mod tests {
         let tree = tree_with_a_file(root.path(), "swept");
         let file = tree.join("inner").join("file.txt");
         for sid in [live.0, dead.0, packages.Sid] {
-            grant_dacl_ace_to_tree(&tree, sid, FILE_GENERIC_READ, true).unwrap();
+            grant_dacl_ace_to_tree(&tree, None, sid, FILE_GENERIC_READ, true).unwrap();
         }
         let record = root.path().join("swept.json");
 
@@ -484,7 +484,7 @@ mod tests {
             assert!(grants(path, packages.Sid), "{}", path.display());
         }
         assert_eq!(read_record(&record), std::slice::from_ref(&tree));
-        grant_dacl_ace_to_tree(&tree, dead.0, FILE_GENERIC_READ, true).unwrap();
+        grant_dacl_ace_to_tree(&tree, None, dead.0, FILE_GENERIC_READ, true).unwrap();
         sweep_dead_grants(&record, std::slice::from_ref(&tree), live.0).unwrap();
         assert!(grants(&tree, dead.0), "a swept tree was swept again");
         delete_profile(&live_name);
@@ -496,7 +496,7 @@ mod tests {
         let dead = derive_appcontainer_sid(&unique_name("LpmSweepDead")).unwrap();
         let root = tempfile::tempdir().unwrap();
         let tree = tree_with_a_file(root.path(), "kept");
-        grant_dacl_ace_to_tree(&tree, dead.0, FILE_GENERIC_READ, true).unwrap();
+        grant_dacl_ace_to_tree(&tree, None, dead.0, FILE_GENERIC_READ, true).unwrap();
         let record = root.path().join("swept.json");
 
         sweep_dead_grants(&record, std::slice::from_ref(&tree), unlisted.0).unwrap();

@@ -11,8 +11,8 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, GetFileInformationByHandle,
-    READ_CONTROL, WRITE_DAC,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+    GetFileInformationByHandle, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -629,6 +629,149 @@ fn update_open_ace(
     }
 }
 
+/// A tree that receives a lifecycle grant: its root, opened once by path,
+/// and every entry below it, opened relative to that handle by
+/// [`walk::Target::below`]. Lifecycle scripts running at the same time can
+/// write inside the tree, so a name listed as a directory may be a junction
+/// by the time its entries are granted; a grant reached through it would
+/// land outside the tree and never be revoked.
+pub(super) struct GrantTree {
+    root: walk::Target,
+    path: PathBuf,
+}
+
+// SAFETY: threads only open entries relative to the root handle, which the
+// kernel serves concurrently; the handle is closed once, when the tree drops.
+unsafe impl Sync for GrantTree {}
+
+impl GrantTree {
+    /// Opens `path` for a grant. Links among its ancestors are followed, as
+    /// a configured root may sit below one, but a root that is itself a link
+    /// is refused.
+    pub(super) fn open(path: &Path) -> Result<Self, AppContainerError> {
+        let (handle, identity) = open_permissions(path, true)?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is live and the output is correctly sized.
+        if unsafe { GetFileInformationByHandle(handle.as_raw(), &mut info) } == 0 {
+            return Err(last_error("inspect a sandbox grant root"));
+        }
+        Ok(Self {
+            root: walk::Target {
+                handle,
+                identity,
+                directory: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            },
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Opens `path` for a grant from `base`, a writable root above it,
+    /// refusing a reparse point anywhere between the two: a script may turn
+    /// any directory below `base` into one.
+    pub(super) fn open_below(base: &Path, path: &Path) -> Result<Self, AppContainerError> {
+        let relative = path.strip_prefix(base).map_err(|_| {
+            failure(format!(
+                "{} is outside the writable root {}",
+                path.display(),
+                base.display()
+            ))
+        })?;
+        let (handle, identity) = open_permissions(base, false)?;
+        let base = walk::Target {
+            handle,
+            identity,
+            directory: true,
+        };
+        Ok(Self {
+            root: base.below(relative, path)?,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub(super) fn is_directory(&self) -> bool {
+        self.root.directory
+    }
+
+    pub(super) fn grant_root(&self, sid: PSID, grant: (u32, u32)) -> Result<(), AppContainerError> {
+        update_pinned_ace(&self.root.handle, &self.path, sid, Some(grant))
+    }
+
+    /// Grants `sid` on `path`, an entry below the root, opened without
+    /// passing through a reparse point anywhere below the root.
+    pub(super) fn grant_entry(
+        &self,
+        path: &Path,
+        sid: PSID,
+        grant: (u32, u32),
+    ) -> Result<(), AppContainerError> {
+        let relative = path.strip_prefix(&self.path).map_err(|_| {
+            failure(format!(
+                "{} is outside the sandbox grant root {}",
+                path.display(),
+                self.path.display()
+            ))
+        })?;
+        let entry = self.root.below(relative, path)?;
+        update_pinned_ace(&entry.handle, path, sid, Some(grant))
+    }
+}
+
+/// Denies `sid` reading `path` and removes any allow entry it has there,
+/// leaving every other entry and the file's inheritance as they were. The
+/// update holds the lock every DACL write here takes: runs of other packages
+/// deny and release their own SIDs on the same project secrets at the same
+/// time, and none may undo another's denial or lose a grant update.
+pub(super) fn deny_appcontainer_read(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let (handle, identity) = open_permissions(path, true)?;
+    let _lock = lock_object(identity)?;
+    let (old, _descriptor) = read_dacl(&handle, path)?;
+    let mut filtered = dacl_without_allowed_aces_for_sid(path, old, sid)?;
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        grfAccessMode: windows_sys::Win32::Security::Authorization::DENY_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_GROUP,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut denied = ptr::null_mut();
+    // SAFETY: the filtered ACL and the SID remain valid through the merge,
+    // which places the explicit deny ahead of every allow.
+    let error = unsafe { SetEntriesInAclW(1, &entry, filtered.as_mut_ptr().cast(), &mut denied) };
+    if error != ERROR_SUCCESS {
+        return Err(AppContainerError::MergeDacl {
+            path: path.to_path_buf(),
+            win32_error: error,
+        });
+    }
+    let _denied = LocalAllocGuard(denied.cast());
+    write_dacl(&handle, path, denied)
+}
+
+/// Removes the read denial [`deny_appcontainer_read`] gave `sid` on `path`,
+/// and nothing else, under the same lock.
+pub(super) fn remove_appcontainer_read_deny(
+    path: &Path,
+    sid: PSID,
+) -> Result<(), AppContainerError> {
+    let (handle, identity) = open_permissions(path, true)?;
+    let _lock = lock_object(identity)?;
+    let (old, _descriptor) = read_dacl(&handle, path)?;
+    let (mut filtered, removed) =
+        super::dacl_without_aces_where(path, old, ACCESS_DENIED_ACE_TYPE, |ace_sid| {
+            // SAFETY: both SIDs are valid for the comparison.
+            unsafe { EqualSid(ace_sid, sid) != 0 }
+        })?;
+    if removed > 0 {
+        write_dacl(&handle, path, filtered.as_mut_ptr().cast())?;
+    }
+    Ok(())
+}
+
 // Reject reparses during the kernel path lookup. Child traversal then uses
 // directory handles, because a pinned directory can still become a junction.
 fn pin_grant(entry: &Grant) -> Result<(Vec<walk::Target>, walk::Target), AppContainerError> {
@@ -806,6 +949,7 @@ pub(super) fn prepare<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::{GetSecurityDescriptorControl, SE_DACL_PROTECTED};
 
     #[test]
     fn metadata_grants_do_not_inherit_and_removal_preserves_other_capabilities() {

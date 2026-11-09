@@ -47,7 +47,33 @@ impl Target {
         }
         // The object manager uses \??\ for the Win32 extended-path prefix.
         name[1] = b'?' as u16;
-        Self::open_name(ptr::null_mut(), name, path, write, pin)
+        Self::open_name(ptr::null_mut(), name, path, write, pin, write)
+    }
+
+    /// Opens `relative`, a path of plain names below this directory, by a
+    /// lookup that starts at this handle and fails on a reparse point in any
+    /// component, so a junction or symlink swapped in after the names were
+    /// listed can't lead the open outside the tree. The entry is opened for
+    /// a permission update without denying delete sharing, and may have
+    /// several hard links.
+    pub(super) fn below(&self, relative: &Path, path: &Path) -> Result<Self, AppContainerError> {
+        let mut name = Vec::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(failure(format!(
+                    "{} is not a plain path below its sandbox grant root",
+                    path.display()
+                )));
+            };
+            if !name.is_empty() {
+                name.push(u16::from(b'\\'));
+            }
+            name.extend(part.encode_wide());
+        }
+        if name.is_empty() {
+            return Err(failure("a sandbox grant entry needs a name below its root"));
+        }
+        Self::open_name(self.handle.as_raw(), name, path, true, false, false)
     }
 
     pub(super) fn canonical_directory(&self) -> Result<PathBuf, AppContainerError> {
@@ -92,6 +118,7 @@ impl Target {
             path,
             true,
             true,
+            true,
         )
     }
 
@@ -101,6 +128,7 @@ impl Target {
         path: &Path,
         write: bool,
         pin: bool,
+        single_link: bool,
     ) -> Result<Self, AppContainerError> {
         let length = name
             .len()
@@ -172,7 +200,7 @@ impl Target {
             });
         }
         let directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        if write && !directory && info.nNumberOfLinks > 1 {
+        if single_link && !directory && info.nNumberOfLinks > 1 {
             return Err(failure(format!(
                 "{} has multiple hard links; approve a tool copy without hard links",
                 path.display()
