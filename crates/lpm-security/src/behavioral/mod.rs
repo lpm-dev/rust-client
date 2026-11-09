@@ -2735,8 +2735,11 @@ mod tests {
         };
         let (one, _) = finish(1);
         let (many, _) = finish(5_000);
+        // One pass takes about 3 times as long as a single addon, up to 8
+        // times on a loaded CI runner. A search per addon took over 1,000
+        // times as long, about 20 seconds.
         assert!(
-            many < one * 5 + std::time::Duration::from_millis(100),
+            many < one * 50 + std::time::Duration::from_secs(1),
             "5,000 addons {many:?}, one {one:?}"
         );
     }
