@@ -578,16 +578,22 @@ mod containment_filter_tests {
             )
         };
         assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
-        let program = build_terminal_injection_deny_filter().unwrap();
-
-        let status = in_filtered_child(&program, || {
+        // SAFETY: the path is NUL-terminated.
+        let not_a_terminal = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+        assert!(not_a_terminal >= 0);
+        // The filter matches the request, not the descriptor, so on a file
+        // that is no terminal only the filter answers EPERM: the kernel
+        // says ENOTTY. A pty would not tell them apart, as the kernel
+        // already refuses TIOCSTI on a terminal that isn't the caller's
+        // controlling one.
+        let probe = || {
             let byte = b'x';
-            // SAFETY: TIOCSTI reads one byte through the pointer.
-            if unsafe { libc::ioctl(device, libc::TIOCSTI, &byte) } != -1 {
-                return 1;
-            }
-            if errno() != libc::EPERM {
-                return 2;
+            for (code, request) in [(1, libc::TIOCSTI), (2, libc::TIOCLINUX)] {
+                // SAFETY: both requests read at most one byte through the pointer.
+                let result = unsafe { libc::ioctl(not_a_terminal, request, &byte) };
+                if result != -1 || errno() != libc::EPERM {
+                    return code;
+                }
             }
             let mut size = libc::winsize {
                 ws_row: 0,
@@ -600,15 +606,26 @@ mod containment_filter_tests {
                 return 3;
             }
             0
-        });
-        // SAFETY: both descriptors came from openpty above.
+        };
+        let program = build_terminal_injection_deny_filter().unwrap();
+
+        let unfiltered = in_child_under(&[], probe);
+        let filtered = in_filtered_child(&program, probe);
+        // SAFETY: the descriptors came from openpty and open above.
         unsafe {
+            libc::close(not_a_terminal);
             libc::close(device);
             libc::close(controller);
         }
         assert_eq!(
-            status, 0,
-            "1: TIOCSTI injected input; 2: the wrong errno; 3: an ordinary terminal ioctl failed"
+            unfiltered, 1,
+            "without the filter TIOCSTI must fail some other way, or the probe can't \
+             tell the filter's refusal from the kernel's"
+        );
+        assert_eq!(
+            filtered, 0,
+            "1: TIOCSTI was not refused by the filter; 2: TIOCLINUX was not; \
+             3: an ordinary terminal ioctl failed"
         );
     }
 }
