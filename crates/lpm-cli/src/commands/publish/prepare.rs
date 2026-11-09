@@ -1132,15 +1132,21 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     command.stderr = lpm_sandbox::SandboxStdio::Piped;
     let mut child = sandbox.spawn(command).map_err(swift_inspection_error)?;
     let Some(stdout) = child.stdout.take() else {
-        terminate_swift_manifest_child(&mut child);
+        let cleanup = terminate_swift_manifest_child(&mut child);
         return Err(swift_inspection_error(
-            "could not capture Swift compiler output",
+            crate::commands::rebuild::process_tree::with_survivors(
+                "could not capture Swift compiler output",
+                cleanup,
+            ),
         ));
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_swift_manifest_child(&mut child);
+        let cleanup = terminate_swift_manifest_child(&mut child);
         return Err(swift_inspection_error(
-            "could not capture Swift compiler output",
+            crate::commands::rebuild::process_tree::with_survivors(
+                "could not capture Swift compiler output",
+                cleanup,
+            ),
         ));
     };
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1152,8 +1158,10 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     ) {
         Ok(reader) => reader,
         Err(error) => {
-            terminate_swift_manifest_child(&mut child);
-            return Err(swift_inspection_error(error));
+            let cleanup = terminate_swift_manifest_child(&mut child);
+            return Err(swift_inspection_error(
+                crate::commands::rebuild::process_tree::with_survivors(error.to_string(), cleanup),
+            ));
         }
     };
     let stderr_reader = match spawn_bounded_swift_output_reader(
@@ -1164,9 +1172,11 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     ) {
         Ok(reader) => reader,
         Err(error) => {
-            terminate_swift_manifest_child(&mut child);
+            let cleanup = terminate_swift_manifest_child(&mut child);
             let _ = stdout_reader.join();
-            return Err(swift_inspection_error(error));
+            return Err(swift_inspection_error(
+                crate::commands::rebuild::process_tree::with_survivors(error.to_string(), cleanup),
+            ));
         }
     };
     // A process the kill missed can keep the output pipes open, so an
@@ -1263,9 +1273,12 @@ fn spawn_bounded_swift_output_reader(
         })
 }
 
-fn terminate_swift_manifest_child(child: &mut std::process::Child) {
-    crate::commands::rebuild::process_tree::kill_process_tree(child);
+fn terminate_swift_manifest_child(
+    child: &mut std::process::Child,
+) -> Result<(), lpm_sandbox::SurvivingProcesses> {
+    let cleanup = crate::commands::rebuild::process_tree::kill_process_tree(child);
     let _ = child.wait();
+    cleanup
 }
 
 #[cfg(test)]

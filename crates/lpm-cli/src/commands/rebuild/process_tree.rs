@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-pub(in crate::commands) fn kill_process_tree(child: &mut std::process::Child) {
+pub(in crate::commands) fn kill_process_tree(
+    child: &mut std::process::Child,
+) -> Result<(), lpm_sandbox::SurvivingProcesses> {
     #[cfg(unix)]
     {
         let pid = child.id();
@@ -33,7 +35,7 @@ pub(in crate::commands) fn kill_process_tree(child: &mut std::process::Child) {
         }
         // A descendant that left the group and lost its parent before the
         // snapshot is only reachable through the sandbox that started it.
-        lpm_sandbox::terminate_sandbox_tree(pid);
+        lpm_sandbox::terminate_sandbox_tree(pid)
     }
     #[cfg(not(unix))]
     {
@@ -45,8 +47,21 @@ pub(in crate::commands) fn kill_process_tree(child: &mut std::process::Child) {
         // `child.kill()` after, so the root child is reaped even if
         // the PID wasn't tracked (e.g. SandboxMode::Disabled +
         // NoopSandbox routed through here).
-        lpm_sandbox::terminate_sandbox_tree(child.id());
+        let survivors = lpm_sandbox::terminate_sandbox_tree(child.id());
         let _ = child.kill();
+        survivors
+    }
+}
+
+/// `message`, followed by what [`kill_process_tree`] could not end.
+pub(in crate::commands) fn with_survivors(
+    message: impl Into<String>,
+    cleanup: Result<(), lpm_sandbox::SurvivingProcesses>,
+) -> String {
+    let message = message.into();
+    match cleanup {
+        Ok(()) => message,
+        Err(survivors) => format!("{message}; {survivors}"),
     }
 }
 
@@ -357,9 +372,9 @@ pub(in crate::commands) fn wait_with_timeout_or_cancel(
     let started = Instant::now();
     loop {
         if cancelled.load(Ordering::Acquire) {
-            kill_process_tree(&mut child);
+            let cleanup = kill_process_tree(&mut child);
             let _ = child.wait();
-            return Err(cancellation_error.to_string());
+            return Err(with_survivors(cancellation_error, cleanup));
         }
         let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
             return finish_wait_with_cleanup(child, timeout, Ok(None));
@@ -381,9 +396,9 @@ fn finish_wait_with_cleanup(
 
     match wait_result {
         Err(error) => {
-            kill_process_tree(&mut child);
+            let cleanup = kill_process_tree(&mut child);
             let _ = child.wait();
-            Err(format!("wait error: {error}"))
+            Err(with_survivors(format!("wait error: {error}"), cleanup))
         }
         Ok(Some(status)) => {
             #[cfg(unix)]
@@ -395,15 +410,19 @@ fn finish_wait_with_cleanup(
                     libc::kill(-signed, libc::SIGKILL);
                 }
             }
-            lpm_sandbox::release_sandbox_tracker(pid);
+            lpm_sandbox::release_sandbox_tracker(pid)
+                .map_err(|survivors| format!("the script exited, but {survivors}"))?;
             Ok(status)
         }
         Ok(None) => {
-            kill_process_tree(&mut child);
+            let cleanup = kill_process_tree(&mut child);
             let _ = child.wait();
-            Err(format!(
-                "timeout after {}s — process group killed",
-                timeout.as_secs()
+            Err(with_survivors(
+                format!(
+                    "timeout after {}s — process group killed",
+                    timeout.as_secs()
+                ),
+                cleanup,
             ))
         }
     }
@@ -411,10 +430,28 @@ fn finish_wait_with_cleanup(
 
 #[cfg(all(test, unix))]
 mod wait_with_timeout_tests {
-    use super::{finish_wait_with_cleanup, wait_with_timeout};
+    use super::{finish_wait_with_cleanup, wait_with_timeout, with_survivors};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_cleanup_that_left_processes_running_says_how_many() {
+        let survivors = |count| Err(lpm_sandbox::SurvivingProcesses { count });
+
+        assert_eq!(
+            with_survivors("timeout after 5s", Ok(())),
+            "timeout after 5s"
+        );
+        assert_eq!(
+            with_survivors("timeout after 5s", survivors(1)),
+            "timeout after 5s; 1 process it started could not be ended"
+        );
+        assert_eq!(
+            with_survivors("interrupted", survivors(3)),
+            "interrupted; 3 processes it started could not be ended"
+        );
+    }
 
     #[test]
     fn wait_with_timeout_returns_success_for_short_lived_child() {

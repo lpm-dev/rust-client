@@ -73,48 +73,133 @@ impl ProfileMark {
             && lookup_denied(pid, &self.denied) == Some(true)
     }
 
-    /// Sends SIGKILL to every process carrying this mark until a sweep finds
-    /// none left. Returns how many marked processes were still found when
-    /// the sweep limit ran out.
-    fn end_marked_processes(&self) -> usize {
-        // SAFETY: getuid has no preconditions and cannot fail.
-        let uid = unsafe { libc::getuid() };
-        let mut pids = Vec::new();
-        let mut remaining = 0;
-        for sweep in 0..MAX_SWEEPS {
-            if sweep > 0 {
-                std::thread::sleep(SWEEP_PAUSE);
-            }
-            list_processes_of_real_user(uid, &mut pids);
-            remaining = 0;
-            for &pid in &pids {
-                if pid > 1 && self.is_on(pid) {
-                    remaining += 1;
-                    self.end(pid);
-                }
-            }
-            if remaining == 0 {
-                return 0;
-            }
-        }
-        remaining
-    }
-
-    /// Sends SIGKILL to `pid` while it carries this mark. The PID version is
-    /// read before the check that decides the kill, and the kill is bound
-    /// to it, so a PID that passes to another process in between is never
-    /// signalled: the kill lands only on the process that was checked.
-    fn end(&self, pid: libc::pid_t) {
+    /// Sends `signal` to `pid` while it carries this mark. The PID version
+    /// is read before the check that decides the signal, and the signal is
+    /// bound to it, so a PID that passes to another process in between is
+    /// never signalled: the signal lands only on the process that was
+    /// checked.
+    fn signal(&self, pid: libc::pid_t, signal: c_int) {
         if SIGNAL_ONE_PROCESS.is_none() {
-            // SAFETY: SIGKILL to one process this spawn started; ESRCH after
+            // SAFETY: a signal to one process this spawn started; ESRCH after
             // it exits on its own is harmless.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            unsafe { libc::kill(pid, signal) };
         } else if let Some(process) = ProcessIdentity::read(pid)
             && self.is_on(pid)
         {
-            process.kill();
+            process.signal(signal);
         }
     }
+}
+
+/// What a sweep needs from the kernel, as a trait so the sweep's logic can
+/// run against a modelled process table in tests.
+trait ProcessTable {
+    /// Fills `pids` with the processes this one may signal.
+    fn list(&mut self, pids: &mut Vec<libc::pid_t>);
+    fn is_marked(&self, pid: libc::pid_t) -> bool;
+    fn is_stopped(&self, pid: libc::pid_t) -> bool;
+    /// Sends `signal` to `pid` if it still carries the mark.
+    fn signal_marked(&mut self, pid: libc::pid_t, signal: c_int);
+    fn pause(&mut self);
+}
+
+/// The live process table, seen through one spawn's mark.
+struct MarkedProcesses<'a> {
+    mark: &'a ProfileMark,
+    uid: libc::uid_t,
+}
+
+impl ProcessTable for MarkedProcesses<'_> {
+    fn list(&mut self, pids: &mut Vec<libc::pid_t>) {
+        list_processes_of_real_user(self.uid, pids);
+    }
+
+    fn is_marked(&self, pid: libc::pid_t) -> bool {
+        pid > 1 && self.mark.is_on(pid)
+    }
+
+    fn is_stopped(&self, pid: libc::pid_t) -> bool {
+        process_status(pid) == Some(libc::SSTOP)
+    }
+
+    fn signal_marked(&mut self, pid: libc::pid_t, signal: c_int) {
+        self.mark.signal(pid, signal);
+    }
+
+    fn pause(&mut self) {
+        std::thread::sleep(SWEEP_PAUSE);
+    }
+}
+
+/// Ends every marked process. Returns how many were still found when the
+/// sweep limit ran out.
+///
+/// The processes are stopped before any is killed. A stopped process can't
+/// fork or signal, and it keeps its process slot: killing outright frees
+/// slots that a fork storm at the per-user limit refills from whichever
+/// processes the sweep hasn't reached yet, so the count never drops. A
+/// marked process another one resumed is stopped again on the next pass.
+fn end_marked_processes(table: &mut impl ProcessTable) -> usize {
+    let mut pids = Vec::new();
+    for sweep in 0..MAX_SWEEPS {
+        if sweep > 0 {
+            table.pause();
+        }
+        table.list(&mut pids);
+        let (mut marked, mut running) = (0, 0);
+        for &pid in &pids {
+            if table.is_marked(pid) {
+                marked += 1;
+                if !table.is_stopped(pid) {
+                    running += 1;
+                    table.signal_marked(pid, libc::SIGSTOP);
+                }
+            }
+        }
+        if marked == 0 {
+            return 0;
+        }
+        if running == 0 {
+            break;
+        }
+    }
+    let mut remaining = 0;
+    for sweep in 0..MAX_SWEEPS {
+        if sweep > 0 {
+            table.pause();
+        }
+        table.list(&mut pids);
+        remaining = 0;
+        for &pid in &pids {
+            if table.is_marked(pid) {
+                remaining += 1;
+                table.signal_marked(pid, libc::SIGKILL);
+            }
+        }
+        if remaining == 0 {
+            return 0;
+        }
+    }
+    remaining
+}
+
+/// The scheduler state (`SRUN`, `SSTOP`, ...) of a live process; `None`
+/// once it has exited.
+fn process_status(pid: libc::pid_t) -> Option<u32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = size_of::<libc::proc_bsdinfo>() as c_int;
+    // SAFETY: the buffer holds `size` writable bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: a full-size answer initialized the whole struct.
+    (written == size).then(|| unsafe { info.assume_init() }.pbi_status)
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -199,17 +284,17 @@ impl ProcessIdentity {
         pid_version(pid).map(|version| Self { pid, version })
     }
 
-    /// Sends SIGKILL to this process; once its PID belongs to another
+    /// Sends `signal` to this process; once its PID belongs to another
     /// process, the kernel refuses with ESRCH.
-    fn kill(self) {
-        let Some(signal) = *SIGNAL_ONE_PROCESS else {
+    fn signal(self, signal: c_int) {
+        let Some(signal_with_token) = *SIGNAL_ONE_PROCESS else {
             return;
         };
         let mut token = AuditToken([0; 8]);
         token.0[AUDIT_TOKEN_PID] = self.pid as u32;
         token.0[AUDIT_TOKEN_PID_VERSION] = self.version as u32;
         // SAFETY: the token outlives the call, which only reads it.
-        unsafe { signal(&mut token, libc::SIGKILL) };
+        unsafe { signal_with_token(&mut token, signal) };
     }
 }
 
@@ -286,20 +371,19 @@ pub(crate) fn track(pid: u32, mark: ProfileMark) {
 /// sits in the process tree, and forgets the spawn.
 ///
 /// Idempotent: a PID that isn't tracked is a no-op.
-pub(crate) fn terminate_sandbox_tree(pid: u32) {
+pub(crate) fn terminate_sandbox_tree(pid: u32) -> Result<(), crate::SurvivingProcesses> {
     let mark = TRACKED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&pid);
-    if let Some(mark) = mark {
-        let remaining = mark.end_marked_processes();
-        if remaining > 0 {
-            tracing::warn!(
-                pid,
-                remaining,
-                "lifecycle processes kept starting while their sandbox was ended"
-            );
-        }
+    let Some(mark) = mark else {
+        return Ok(());
+    };
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    match end_marked_processes(&mut MarkedProcesses { mark: &mark, uid }) {
+        0 => Ok(()),
+        count => Err(crate::SurvivingProcesses { count }),
     }
 }
 
@@ -388,7 +472,7 @@ mod tests {
         );
 
         track(root_pid, mark);
-        terminate_sandbox_tree(root_pid);
+        assert_eq!(terminate_sandbox_tree(root_pid), Ok(()));
 
         assert!(
             wait_until_gone(daemon),
@@ -416,7 +500,7 @@ mod tests {
         let kept = read_pid(&kept_file);
 
         track(ended_root_pid, ended_mark);
-        terminate_sandbox_tree(ended_root_pid);
+        assert_eq!(terminate_sandbox_tree(ended_root_pid), Ok(()));
 
         let ended_gone = wait_until_gone(ended);
         let kept_alive = is_running(kept);
@@ -435,6 +519,115 @@ mod tests {
             unsandboxed_alive,
             "ending a spawn killed an unsandboxed process"
         );
+    }
+
+    /// A process table at the per-user process limit, where every slot a
+    /// kill frees is taken at once by a child of a marked process that is
+    /// still running: a fork storm.
+    struct ForkStorm {
+        live: Vec<Modelled>,
+        limit: usize,
+        next_pid: libc::pid_t,
+        listings: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Modelled {
+        pid: libc::pid_t,
+        marked: bool,
+        stopped: bool,
+    }
+
+    impl ForkStorm {
+        fn new(marked: usize, unmarked: usize) -> Self {
+            let live = (0..marked + unmarked)
+                .map(|index| Modelled {
+                    pid: 100 + libc::pid_t::try_from(index).unwrap(),
+                    marked: index < marked,
+                    stopped: false,
+                })
+                .collect::<Vec<_>>();
+            Self {
+                limit: live.len(),
+                next_pid: 100 + libc::pid_t::try_from(live.len()).unwrap(),
+                live,
+                listings: 0,
+            }
+        }
+
+        fn find(&self, pid: libc::pid_t) -> Option<&Modelled> {
+            self.live.iter().find(|process| process.pid == pid)
+        }
+
+        fn marked_left(&self) -> usize {
+            self.live.iter().filter(|process| process.marked).count()
+        }
+    }
+
+    impl ProcessTable for ForkStorm {
+        fn list(&mut self, pids: &mut Vec<libc::pid_t>) {
+            self.listings += 1;
+            pids.clear();
+            pids.extend(self.live.iter().map(|process| process.pid));
+        }
+
+        fn is_marked(&self, pid: libc::pid_t) -> bool {
+            self.find(pid).is_some_and(|process| process.marked)
+        }
+
+        fn is_stopped(&self, pid: libc::pid_t) -> bool {
+            self.find(pid).is_some_and(|process| process.stopped)
+        }
+
+        fn signal_marked(&mut self, pid: libc::pid_t, signal: c_int) {
+            let Some(index) = self
+                .live
+                .iter()
+                .position(|process| process.pid == pid && process.marked)
+            else {
+                return;
+            };
+            match signal {
+                libc::SIGSTOP => self.live[index].stopped = true,
+                libc::SIGKILL => {
+                    self.live.remove(index);
+                    let forker_running = self
+                        .live
+                        .iter()
+                        .any(|process| process.marked && !process.stopped);
+                    if self.live.len() < self.limit && forker_running {
+                        self.live.push(Modelled {
+                            pid: self.next_pid,
+                            marked: true,
+                            stopped: false,
+                        });
+                        self.next_pid += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn pause(&mut self) {}
+    }
+
+    #[test]
+    fn a_fork_storm_that_refills_every_slot_a_kill_frees_is_still_ended() {
+        let mut storm = ForkStorm::new(20, 5);
+
+        let survivors = end_marked_processes(&mut storm);
+
+        assert_eq!(survivors, 0, "the storm outlasted every sweep");
+        assert_eq!(storm.marked_left(), 0);
+        assert_eq!(storm.live.len(), 5, "a process without the mark was ended");
+    }
+
+    #[test]
+    fn a_spawn_that_left_nothing_running_is_checked_with_one_listing() {
+        let mut quiet = ForkStorm::new(0, 30);
+
+        assert_eq!(end_marked_processes(&mut quiet), 0);
+        assert_eq!(quiet.listings, 1);
     }
 
     /// Answers like `proc_listpids` for a user running `running`.
@@ -504,10 +697,10 @@ mod tests {
             ..current
         };
 
-        earlier.kill();
+        earlier.signal(libc::SIGKILL);
         std::thread::sleep(Duration::from_millis(100));
         let spared = child.try_wait().unwrap().is_none();
-        current.kill();
+        current.signal(libc::SIGKILL);
         let status = child.wait().unwrap();
 
         assert!(
@@ -523,7 +716,7 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        terminate_sandbox_tree(unsandboxed.id());
+        assert_eq!(terminate_sandbox_tree(unsandboxed.id()), Ok(()));
         let alive = unsandboxed.try_wait().unwrap().is_none();
         let _ = unsandboxed.kill();
         let _ = unsandboxed.wait();

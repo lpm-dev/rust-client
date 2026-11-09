@@ -1437,7 +1437,9 @@ fn run_bounded(
 }
 
 fn terminate_started_child(child: &mut std::process::Child) {
-    crate::commands::rebuild::process_tree::kill_process_tree(child);
+    // The probe runs outside any Seatbelt profile, so no sweep can report
+    // survivors for it.
+    let _ = crate::commands::rebuild::process_tree::kill_process_tree(child);
     let _ = child.wait();
 }
 

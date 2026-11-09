@@ -976,11 +976,18 @@ fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
 /// Idempotent: PIDs without a tracked entry (Linux; Windows children
 /// that exited normally; sandboxed Windows lifecycle children) are
 /// silent no-ops. Always pair with `Child::kill()`.
-pub fn terminate_sandbox_tree(_pid: u32) {
+///
+/// # Errors
+///
+/// [`SurvivingProcesses`] on macOS when processes the spawn started were
+/// still running after every sweep.
+pub fn terminate_sandbox_tree(_pid: u32) -> Result<(), SurvivingProcesses> {
     #[cfg(target_os = "windows")]
     windows::terminate_sandbox_tree(_pid);
     #[cfg(target_os = "macos")]
-    seatbelt_tree::terminate_sandbox_tree(_pid);
+    return seatbelt_tree::terminate_sandbox_tree(_pid);
+    #[cfg(not(target_os = "macos"))]
+    Ok(())
 }
 
 /// Release the tracker entry for a child that exited normally (no
@@ -994,11 +1001,30 @@ pub fn terminate_sandbox_tree(_pid: u32) {
 /// releases the entry.
 ///
 /// Idempotent: missing entries are silent no-ops.
-pub fn release_sandbox_tracker(_pid: u32) {
+///
+/// # Errors
+///
+/// [`SurvivingProcesses`] as for [`terminate_sandbox_tree`]. The script
+/// should then count as failed: its processes outlived it.
+pub fn release_sandbox_tracker(_pid: u32) -> Result<(), SurvivingProcesses> {
     #[cfg(target_os = "windows")]
     windows::release_sandbox_tracker_entry(_pid);
     #[cfg(target_os = "macos")]
-    seatbelt_tree::terminate_sandbox_tree(_pid);
+    return seatbelt_tree::terminate_sandbox_tree(_pid);
+    #[cfg(not(target_os = "macos"))]
+    Ok(())
+}
+
+/// Processes a sandboxed spawn started that were still running when
+/// cleanup gave up on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{count} process{plural} it started could not be ended",
+    plural = if *count == 1 { "" } else { "es" }
+)]
+pub struct SurvivingProcesses {
+    /// How many were found by the last sweep.
+    pub count: usize,
 }
 
 /// Spawn a command in an OS process-tree container without applying
