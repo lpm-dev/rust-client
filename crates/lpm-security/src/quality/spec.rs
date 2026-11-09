@@ -101,7 +101,7 @@ const README: CheckSpec = archive(
     Documentation,
     6,
     "README",
-    "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, badges and HTML.",
+    "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, images, link URLs and HTML.",
 );
 const CHANGELOG: CheckSpec = archive(
     "changelog",
@@ -302,7 +302,7 @@ static SWIFT_CHECKS: [CheckSpec; 22] = [
         Documentation,
         10,
         "API docs",
-        "Write a /// doc comment of at least 20 characters directly above each public or open declaration outside Tests/. 80% of them earn 10 points, 50% earn 6, 20% earn 3.",
+        "Write a /// doc comment of at least 20 characters directly above each public or open declaration outside Tests/ and your test targets. 80% of them earn 10 points, 50% earn 6, 20% earn 3.",
     ),
     CHANGELOG,
     AGENT_SKILLS,
@@ -346,7 +346,7 @@ static SWIFT_CHECKS: [CheckSpec; 22] = [
         Api,
         6,
         "Tests",
-        "Add a test target whose directory holds a Swift file with an XCTestCase subclass or a @Test function.",
+        "Add a test target whose sources include a Swift file with an XCTestCase subclass or a @Test function.",
     ),
     TRUSTED_PUBLISHING,
     SIGNED_PROVENANCE,

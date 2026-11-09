@@ -19,7 +19,7 @@ expression: quality
       "maxPoints": 6,
       "status": "failed",
       "detail": "README.md has 20 characters of prose; 300 earn the points",
-      "tip": "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, badges and HTML."
+      "tip": "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, images, link URLs and HTML."
     },
     {
       "id": "readme-install",

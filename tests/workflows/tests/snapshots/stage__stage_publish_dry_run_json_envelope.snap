@@ -30,7 +30,7 @@ expression: envelope
         "maxPoints": 6,
         "status": "failed",
         "detail": "No README at the package root",
-        "tip": "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, badges and HTML."
+        "tip": "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, images, link URLs and HTML."
       },
       {
         "id": "readme-install",

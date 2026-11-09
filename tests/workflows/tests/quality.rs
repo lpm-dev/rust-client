@@ -255,5 +255,37 @@ async fn quality_reads_a_report_from_a_registry_without_categories_or_status() {
     assert!(stdout.contains("No types"), "{stdout}");
 }
 
+#[tokio::test]
+async fn quality_says_a_report_was_scored_under_earlier_rules() {
+    let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_quality_report(
+        "owner.widget",
+        serde_json::json!({
+            "name": "owner.widget", "status": "complete", "rulesVersion": null,
+            "score": 81, "maxScore": 100, "tier": "good",
+            "categories": {"code": {"score": 20, "max": 25}, "testing": {"score": 5, "max": 10}},
+            "checks": [
+                {"id": "has-types", "category": "code", "label": "Has types", "status": "passed", "passed": true, "points": 8, "maxPoints": 8},
+                {"id": "has-tests", "category": "testing", "label": "Has tests", "status": "failed", "passed": false, "points": 0, "maxPoints": 5, "detail": "No tests"}
+            ]
+        }),
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["quality", "owner.widget"])
+        .output()
+        .expect("failed to run lpm quality");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("81/100"), "{stdout}");
+    assert!(stdout.contains("earlier rules"), "{stdout}");
+    assert!(stdout.contains("Code"), "{stdout}");
+    assert!(stdout.contains("Testing"), "{stdout}");
+    assert!(!stdout.contains("\ncode"), "{stdout}");
+}
+
 #[path = "quality_contract/mod.rs"]
 mod contract;

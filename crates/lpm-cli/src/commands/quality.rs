@@ -82,8 +82,12 @@ pub async fn run(
     if let Some(status) = &report.status {
         print_field("status", install_ui::field(status));
     }
-    if let Some(rules) = report.rules_version {
-        print_field("rules", install_ui::field(&format!("v{rules}")));
+    match report.rules_version {
+        Some(rules) => print_field("rules", install_ui::field(&format!("v{rules}"))),
+        None if state == ReportState::Complete => {
+            print_field("rules", install_ui::dim("earlier rules"));
+        }
+        None => {}
     }
     if let Some(eco) = &report.ecosystem {
         print_field("ecosystem", eco);
@@ -154,14 +158,19 @@ impl ReportState {
 
 const CATEGORY_ORDER: &[&str] = &["documentation", "api", "provenance", "health"];
 
-/// A category's name as `lpm publish --check` and the package page show it.
+/// A category's name as `lpm publish --check` and the package page show it,
+/// those of reports scored under earlier rules included.
 fn category_label(category: &str) -> &str {
-    match Category::ALL
+    if let Some(known) = Category::ALL
         .into_iter()
         .find(|known| known.as_str() == category)
     {
-        Some(known) => known.label(),
-        None => category,
+        return known.label();
+    }
+    match category {
+        "code" | "code-quality" => "Code",
+        "testing" => "Testing",
+        other => other,
     }
 }
 
@@ -293,6 +302,13 @@ mod tests {
         assert_eq!(category_label("api"), "API");
         assert_eq!(category_label("health"), "Health");
         assert_eq!(category_label("legacy"), "legacy");
+    }
+
+    #[test]
+    fn categories_of_earlier_rules_read_as_the_package_page_shows_them() {
+        assert_eq!(category_label("code"), "Code");
+        assert_eq!(category_label("code-quality"), "Code");
+        assert_eq!(category_label("testing"), "Testing");
     }
 
     #[test]

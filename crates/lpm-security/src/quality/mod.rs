@@ -463,8 +463,6 @@ impl QualityCollector {
     }
 }
 
-/// A README's text, or `None` when it isn't UTF-8. A README cut at the size
-/// limit drops the character the cut split.
 /// A README's text, without a byte order mark, as LPM.dev Registry shows
 /// it; `None` when it isn't UTF-8. A README cut at the limit drops only a
 /// character the cut split.
