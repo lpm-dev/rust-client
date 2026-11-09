@@ -540,16 +540,20 @@ pub(crate) fn readable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
 }
 
 /// The directories the lifecycle child may write, in a fixed order: the
-/// package's own directory first, then the project's `node_modules` and
-/// `.husky`, the package's layout directory in `.lpm` when it has one
+/// package's own directory first, then the generated client directory of
+/// a hoisted `@prisma/client` ([`crate::hoisted_prisma_client_dir`]), the
+/// package's layout directory in `.lpm` when it has one
 /// ([`crate::package_layout_write_dir`]), the per-user caches, the scratch
 /// directory, and `sandboxWriteDirs` last. Matches the macOS Seatbelt
 /// `file-write*` block and the Linux landlock read-write rules.
 pub(crate) fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(8 + spec.extra_write_dirs.len());
     out.push(spec.package_dir.clone());
-    out.push(spec.project_dir.join("node_modules"));
-    out.push(spec.project_dir.join(".husky"));
+    out.extend(crate::hoisted_prisma_client_dir(
+        &spec.project_dir,
+        &spec.package_dir,
+        &spec.package_name,
+    ));
     out.extend(crate::package_layout_write_dir(
         &spec.project_dir,
         &spec.package_dir,
@@ -1023,14 +1027,30 @@ mod tests {
             set,
             vec![
                 spec.package_dir.clone(),
-                spec.project_dir.join("node_modules"),
-                spec.project_dir.join(".husky"),
                 spec.home_dir.join(".cache"),
                 spec.home_dir.join(".node-gyp"),
                 spec.home_dir.join(".npm"),
                 spec.tmpdir.clone(),
             ]
         );
+    }
+
+    #[test]
+    fn writable_set_grants_a_hoisted_prisma_client_only_its_generated_client_dir() {
+        let mut spec = make_spec();
+        let node_modules = spec.project_dir.join("node_modules");
+        spec.package_dir = node_modules.join("esbuild");
+        assert!(
+            !writable_allow_set(&spec)
+                .iter()
+                .any(|path| path.starts_with(&node_modules) && *path != spec.package_dir)
+        );
+
+        spec.package_name = "@prisma/client".into();
+        spec.package_dir = node_modules.join("@prisma").join("client");
+        let set = writable_allow_set(&spec);
+        assert_eq!(set[1], node_modules.join(".prisma"));
+        assert!(!set.contains(&node_modules));
     }
 
     #[test]
@@ -1051,7 +1071,7 @@ mod tests {
             .join(".lpm")
             .join("wrappers")
             .join("pkg@1.0.0");
-        assert_eq!(set[3], wrapper);
+        assert_eq!(set[1], wrapper);
         assert!(!set.contains(&spec.project_dir.join(".lpm")));
         assert!(!set.contains(&spec.project_dir.join(".lpm").join("wrappers")));
         assert_eq!(

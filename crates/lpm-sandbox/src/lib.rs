@@ -200,9 +200,11 @@ pub struct SandboxSpec {
     /// store directory. The primary writable root for lifecycle scripts.
     pub package_dir: PathBuf,
     /// Absolute path to the project root (the directory containing
-    /// `package.json`). Readable broadly; writable under narrow subpaths
-    /// (`node_modules`, `.husky`, and in `.lpm` only the running package's
-    /// own layout directory, [`package_layout_write_dir`]).
+    /// `package.json`). Readable broadly; writable under narrow subpaths:
+    /// in `node_modules` only the generated client of a hoisted
+    /// `@prisma/client` ([`hoisted_prisma_client_dir`]), and in `.lpm` only
+    /// the running package's own layout directory
+    /// ([`package_layout_write_dir`]).
     pub project_dir: PathBuf,
     /// Package identity for profile interpolation + denial messages.
     /// e.g. `"prisma"` or `"@napi-rs/canvas"`.
@@ -803,6 +805,9 @@ pub fn new_for_platform_with_options(
 
     validate_spec(&spec)?;
     config::validate_project_state_boundary(&spec, options.build_cache_isolation)?;
+    if !options.build_cache_isolation {
+        prepare_package_write_dirs(&spec)?;
+    }
     platform_backend(spec, mode, options)
 }
 
@@ -880,18 +885,51 @@ pub(crate) fn package_layout_write_dir(project_dir: &Path, package_dir: &Path) -
     Some(entry)
 }
 
+/// Where `@prisma/client`'s postinstall generates the client: `.prisma`
+/// in the `node_modules` holding the package.
+const PRISMA_GENERATED_DIR: &str = ".prisma";
+
+/// The project's `node_modules/.prisma`, when the running package is
+/// `@prisma/client` hoisted into the project's `node_modules`, as in the
+/// v1 hoisted layout: its postinstall generates the client there, beside
+/// the package. That is the only place in the project's `node_modules` a
+/// script may write. Unsandboxed LPM runs `node_modules/.bin` commands and
+/// follows the root package links, other packages' files can be hardlinks
+/// into the shared store, and any package other than `@prisma/client`
+/// could rewrite the generated client the app loads.
+pub(crate) fn hoisted_prisma_client_dir(
+    project_dir: &Path,
+    package_dir: &Path,
+    package_name: &str,
+) -> Option<PathBuf> {
+    let node_modules = project_dir.join("node_modules");
+    let hoisted_client = node_modules.join("@prisma").join("client");
+    (package_name == "@prisma/client" && package_dir == hoisted_client)
+        .then(|| node_modules.join(PRISMA_GENERATED_DIR))
+}
+
+/// Creates the directories one package's sandbox grants that may not
+/// exist yet: landlock and the Windows DACLs grant only existing paths,
+/// and the script can't create them itself, as their parent stays
+/// read-only. A link in their place is refused, not followed.
+fn prepare_package_write_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
+    let Some(dir) =
+        hoisted_prisma_client_dir(&spec.project_dir, &spec.package_dir, &spec.package_name)
+    else {
+        return Ok(());
+    };
+    let relative = Path::new("node_modules").join(PRISMA_GENERATED_DIR);
+    config::validate_project_write_dir(spec, &relative)?;
+    ensure_writable_dir_exists(&dir)?;
+    config::validate_project_write_dir(spec, &relative)
+}
+
 /// Ensure the "standard" writable subpaths referenced by the sandbox
-/// profile actually exist on disk, creating any that don't.
+/// profile actually exist on disk, creating any that don't: the per-user
+/// tool caches (`~/.cache`, `~/.node-gyp`, `~/.npm`), whose parent, the
+/// home directory, scripts can't write.
 ///
-/// Sandbox rules of the shape `(subpath "{project}/.husky")` allow
-/// writes INSIDE `.husky`, but creating `.husky` itself requires
-/// write on its parent (`{project}`) which we deliberately DON'T
-/// grant (scripts would gain write on the whole project tree).
-/// Scripts like `husky install` running on a fresh project would
-/// fail without this helper — they'd try to create `.husky`
-/// themselves and hit the sandbox rule gap.
-///
-/// also pre-creates every entry of `spec.extra_write_dirs`. Every
+/// Also pre-creates every entry of `spec.extra_write_dirs`. Every
 /// backend grants only paths that exist, so a user-declared
 /// `sandboxWriteDirs: ["build-output"]` entry that doesn't would be
 /// accepted by the validator and then denied at runtime: the script's
@@ -912,8 +950,6 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
     // standard-allow-set entries every backend renders into its
     // profile / ruleset / DACL grants.
     let builtin = [
-        spec.project_dir.join(".husky"),
-        spec.project_dir.join("node_modules"),
         spec.home_dir.join(".cache"),
         spec.home_dir.join(".node-gyp"),
         spec.home_dir.join(".npm"),
@@ -1539,7 +1575,7 @@ mod tests {
     #[test]
     fn prepare_writable_dirs_rejects_regular_file_builtin_root() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(".husky"), "private input").unwrap();
+        std::fs::write(root.path().join("node_modules"), "private input").unwrap();
         let spec = SandboxSpec {
             project_dir: root.path().to_path_buf(),
             package_dir: root.path().join("package"),
@@ -1561,7 +1597,7 @@ mod tests {
     fn prepare_writable_dirs_rejects_symlinked_builtin_root() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join(".husky")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("node_modules")).unwrap();
         let spec = SandboxSpec {
             project_dir: root.path().to_path_buf(),
             package_dir: root.path().join("package"),
@@ -1576,6 +1612,62 @@ mod tests {
             extra_write_dirs: vec![],
         };
         assert!(prepare_writable_dirs(&spec).is_err());
+    }
+
+    fn hoisted_spec(project: &Path, name: &str) -> SandboxSpec {
+        let mut package_dir = project.join("node_modules");
+        package_dir.extend(name.split('/'));
+        std::fs::create_dir_all(&package_dir).unwrap();
+        SandboxSpec {
+            package_dir,
+            project_dir: project.to_path_buf(),
+            package_name: name.into(),
+            package_version: "5.22.0".into(),
+            store_root: project.join("store"),
+            home_dir: project.join("home"),
+            tmpdir: project.join("tmpdir"),
+            read_project_full: false,
+            secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
+            extra_write_dirs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_hoisted_prisma_client_gets_its_generated_client_dir_prepared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+
+        prepare_package_write_dirs(&hoisted_spec(&project, "@prisma/client")).unwrap();
+
+        assert!(project.join("node_modules").join(".prisma").is_dir());
+    }
+
+    #[test]
+    fn other_hoisted_packages_get_nothing_prepared_beside_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+
+        prepare_package_write_dirs(&hoisted_spec(&project, "esbuild")).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(project.join("node_modules"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["esbuild"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_generated_client_dir_is_refused_rather_than_granted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let spec = hoisted_spec(&project, "@prisma/client");
+        std::os::unix::fs::symlink(outside.path(), project.join("node_modules").join(".prisma"))
+            .unwrap();
+
+        assert!(prepare_package_write_dirs(&spec).is_err());
     }
 
     #[test]
@@ -1608,14 +1700,17 @@ mod tests {
         prepare_writable_dirs(&spec).expect("prep must succeed");
 
         // Builtins:
-        assert!(project.join(".husky").exists(), "missing .husky");
+        assert!(
+            !project.join(".husky").exists(),
+            "dependency scripts get no git hooks directory to write"
+        );
         assert!(
             !project.join(".lpm").exists(),
             "the package dirs in .lpm are granted only where an install made them"
         );
         assert!(
-            project.join("node_modules").exists(),
-            "missing node_modules"
+            !project.join("node_modules").exists(),
+            "a package outside node_modules has no write access there to prepare"
         );
         assert!(home.join(".cache").exists(), "missing .cache");
         assert!(home.join(".node-gyp").exists(), "missing .node-gyp");

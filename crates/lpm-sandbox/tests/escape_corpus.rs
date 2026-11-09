@@ -192,6 +192,65 @@ fn block_read_of_project_state_file() {
     assert_sandbox_blocks_read(&fx, &target, &format!("cat {}", target.display()));
 }
 
+// -------- Project files unsandboxed tools run: git hooks, node_modules --------
+
+#[test]
+fn block_write_of_a_git_hook_into_the_project_husky_directory() {
+    if !sandbox_supported(SandboxMode::Enforce) {
+        return;
+    }
+    let fx = SandboxFixture::new("probe", "1.0.0").with_private_tmpdir();
+    let target = fx.project_dir.join(".husky").join("pre-commit");
+
+    assert_sandbox_blocks_write(&fx, &target, &format!("echo evil > {}", target.display()));
+}
+
+/// Moves the fixture's package into the project's `node_modules`, as the
+/// hoisted layout places it, beside `.bin` and every other package.
+fn hoist(fx: &mut SandboxFixture, name: &str) {
+    let package = fx.project_dir.join("node_modules").join(name);
+    std::fs::create_dir_all(&package).unwrap();
+    fx.spec.package_name = name.into();
+    fx.spec.package_dir = package.clone();
+    fx.pkg_dir = package;
+}
+
+#[test]
+fn block_a_hoisted_package_planting_a_bin_shim() {
+    if !sandbox_supported(SandboxMode::Enforce) {
+        return;
+    }
+    for name in ["esbuild", "@prisma/client"] {
+        let mut fx = SandboxFixture::new("probe", "1.0.0").with_private_tmpdir();
+        hoist(&mut fx, name);
+        let target = fx
+            .project_dir
+            .join("node_modules")
+            .join(".bin")
+            .join("node");
+
+        assert_sandbox_blocks_write(&fx, &target, &format!("echo evil > {}", target.display()));
+    }
+}
+
+#[test]
+fn block_a_hoisted_package_rewriting_another_package() {
+    if !sandbox_supported(SandboxMode::Enforce) {
+        return;
+    }
+    for name in ["esbuild", "@prisma/client"] {
+        let mut fx = SandboxFixture::new("probe", "1.0.0").with_private_tmpdir();
+        hoist(&mut fx, name);
+        let target = fx
+            .project_dir
+            .join("node_modules")
+            .join("typescript")
+            .join("index.js");
+
+        assert_sandbox_blocks_write(&fx, &target, &format!("echo evil > {}", target.display()));
+    }
+}
+
 // -------- Case 2: shell-startup persistence (~/.bashrc-shape) --------
 
 #[test]

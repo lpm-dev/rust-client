@@ -32,7 +32,7 @@ impl SandboxFixture {
     /// host home so platform backends can test against `~/.cache` etc.
     ///
     /// Calls [`lpm_sandbox::prepare_writable_dirs`] before returning so
-    /// the `.husky` / `.lpm` / `node_modules` / cache subpaths exist —
+    /// the home cache subpaths and `sandboxWriteDirs` entries exist —
     /// mirrors what the production build.rs path does. Fixtures
     /// therefore model "scripts modify a prepared environment," which
     /// IS the real lifecycle-script contract.

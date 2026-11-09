@@ -7,9 +7,9 @@
 //!
 //! Rule layout:
 //! - Project reads follow approved capabilities; toolchain and system reads stay available.
-//! - Writes narrow (package store dir + `node_modules` + `.husky` +
-//!   the package dirs in `.lpm` + known caches + temp + extras from
-//!   `sandboxWriteDirs`).
+//! - Writes narrow (package store dir + the package's own layout dir in
+//!   `.lpm` + `node_modules/.prisma` for a hoisted `@prisma/client` + known
+//!   caches + temp + extras from `sandboxWriteDirs`).
 //! - No blanket home-dir read — `~/.ssh`, `~/.aws`, `~/.config/**`
 //!   outside `~/.cache`/`~/.node-gyp`/`~/.npm` stay denied by default.
 //!
@@ -145,8 +145,13 @@ pub(crate) fn describe_rules_with_isolation(
     if build_cache_isolation {
         rules.push((spec.home_dir.join(".node-gyp"), RuleAccess::Read));
     } else {
-        rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));
-        rules.push((spec.project_dir.join(".husky"), RuleAccess::ReadWrite));
+        if let Some(path) = crate::hoisted_prisma_client_dir(
+            &spec.project_dir,
+            &spec.package_dir,
+            &spec.package_name,
+        ) {
+            rules.push((path, RuleAccess::ReadWrite));
+        }
         if let Some(path) = crate::package_layout_write_dir(&spec.project_dir, &spec.package_dir) {
             rules.push((path, RuleAccess::ReadWrite));
         }
@@ -222,19 +227,79 @@ mod tests {
     }
 
     #[test]
+    fn a_package_outside_the_project_cannot_write_the_project_node_modules() {
+        for package_dir in [
+            "/lpm-store/prisma@5.22.0",
+            "/home/u/proj/.lpm/wrappers/client@1.0.0/node_modules/client",
+        ] {
+            let mut outside = spec();
+            outside.package_dir = PathBuf::from(package_dir);
+            let rules = describe_rules(&outside);
+            assert!(
+                !contains_rule(&rules, "/home/u/proj/node_modules", RuleAccess::ReadWrite),
+                "{package_dir} could rewrite the project's bin shims and package links: {rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hoisted_prisma_client_writes_only_its_generated_client_beside_it() {
+        let mut prisma = spec();
+        prisma.package_name = "@prisma/client".into();
+        prisma.package_dir = PathBuf::from("/home/u/proj/node_modules/@prisma/client");
+        let rules = describe_rules(&prisma);
+
+        assert!(contains_rule(
+            &rules,
+            "/home/u/proj/node_modules/.prisma",
+            RuleAccess::ReadWrite
+        ));
+        assert!(
+            !contains_rule(&rules, "/home/u/proj/node_modules", RuleAccess::ReadWrite),
+            "a hoisted package could rewrite bin shims and other packages: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn other_hoisted_packages_write_nothing_in_the_project_node_modules() {
+        for (name, package_dir) in [
+            ("esbuild", "/home/u/proj/node_modules/esbuild"),
+            ("@scope/tool", "/home/u/proj/node_modules/@scope/tool"),
+            (
+                "@prisma/client",
+                "/home/u/proj/node_modules/app/node_modules/@prisma/client",
+            ),
+        ] {
+            let mut hoisted = spec();
+            hoisted.package_name = name.into();
+            hoisted.package_dir = PathBuf::from(package_dir);
+            let rules = describe_rules(&hoisted);
+            assert!(
+                !rules.iter().any(|(path, access)| {
+                    *access == RuleAccess::ReadWrite
+                        && path.starts_with("/home/u/proj/node_modules")
+                        && path != std::path::Path::new(package_dir)
+                }),
+                "{package_dir} may write beside itself in node_modules: {rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_scripts_cannot_write_the_project_git_hooks() {
+        let rules = describe_rules(&spec());
+        assert!(
+            !rules
+                .iter()
+                .any(|(path, _)| path.starts_with("/home/u/proj/.husky")),
+            "{rules:?}"
+        );
+    }
+
+    #[test]
     fn narrow_project_reads_preserve_writable_dependency_subpaths() {
         let rules = describe_rules(&spec());
         assert!(!contains_rule(&rules, "/home/u/proj", RuleAccess::Read));
-        assert!(contains_rule(
-            &rules,
-            "/home/u/proj/node_modules",
-            RuleAccess::ReadWrite
-        ));
-        assert!(contains_rule(
-            &rules,
-            "/home/u/proj/.husky",
-            RuleAccess::ReadWrite
-        ));
         for packages in [
             "/home/u/proj/.lpm/wrappers",
             "/home/u/proj/.lpm/hoisted/nested",

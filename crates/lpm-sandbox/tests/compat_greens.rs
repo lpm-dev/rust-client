@@ -1,7 +1,7 @@
 //! Green-tier compat corpus — each test runs a minimal fixture script
 //! that writes to the same shape of paths a real green-tier
 //! postinstall (node-gyp rebuild, electron-rebuild, tsc, prisma
-//! generate, husky install) would, and asserts the sandbox ALLOWS
+//! generate) would, and asserts the sandbox ALLOWS
 //! the writes under [`SandboxMode::Enforce`].
 //!
 //! These are MINIMAL fixtures: the CI lane exercises the real write
@@ -16,8 +16,7 @@
 //! | `node_gyp_rebuild` | node-gyp rebuild          | `{pkg}/build/Release/*.node`, `~/.node-gyp/`     |
 //! | `electron_rebuild` | @electron/rebuild         | same shape as node-gyp                           |
 //! | `tsc_inplace`      | tsc (project-local build) | `{pkg}/dist/*.js`                                |
-//! | `prisma_generate`  | prisma generate           | `{project}/node_modules/.prisma/client/*.js`     |
-//! | `husky_install`    | husky install             | `{project}/.husky/<hook>`                        |
+//! | `prisma_generate`  | prisma generate (hoisted) | `{project}/node_modules/.prisma/client/*.js`     |
 //! | `package_dirs_*`   | postinstall in a layout   | `{project}/.lpm/{wrappers,hoisted/nested}/...`   |
 //!
 //! If any of these tests fail after a sandbox allow-list rule change,
@@ -109,16 +108,19 @@ fn tsc_inplace_compile_shape_succeeds() {
 }
 
 #[test]
-fn prisma_generate_shape_succeeds() {
+fn prisma_generate_shape_succeeds_for_a_package_hoisted_into_the_project() {
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    let fx = SandboxFixture::new("prisma", "5.22.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // prisma generate writes to {project}/node_modules/.prisma/
-    // client/index.js. The path is NOT inside the package's own
-    // store dir — it's inside the project's node_modules. The sandbox
-    // explicitly allows writes to `{project}/node_modules`.
+    let fx = SandboxFixture::new("prisma", "5.22.0").with_private_tmpdir();
+    // In the hoisted layout the package itself lives in the project's
+    // node_modules, and prisma generate writes its client beside it.
+    let package = fx.project_dir.join("node_modules/@prisma/client");
+    std::fs::create_dir_all(&package).unwrap();
+    let mut spec = fx.spec.clone();
+    spec.package_name = "@prisma/client".into();
+    spec.package_dir = package.clone();
+    let sb = try_build_sandbox(spec, SandboxMode::Enforce).unwrap();
     let client_dir = fx.project_dir.join("node_modules/.prisma/client");
     let script = format!(
         "\
@@ -126,7 +128,7 @@ fn prisma_generate_shape_succeeds() {
         echo 'generated client' > {dir}/index.js",
         dir = client_dir.display(),
     );
-    let status = run_script(sb.as_ref(), &fx.pkg_dir, &script);
+    let status = run_script(sb.as_ref(), &package, &script);
     assert!(
         status.success(),
         "prisma-generate writes to {}/index.js under Enforce — {status:?}",
@@ -136,29 +138,65 @@ fn prisma_generate_shape_succeeds() {
 }
 
 #[test]
-fn husky_install_shape_succeeds() {
+fn a_package_outside_the_project_cannot_change_the_project_node_modules() {
+    // Unsandboxed LPM runs `node_modules/.bin` commands and follows the
+    // root package links, so a package that lives elsewhere (the store,
+    // `.lpm/wrappers`) must not be able to change either.
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    let fx = SandboxFixture::new("husky", "9.0.0");
+    let fx = SandboxFixture::new("planter", "1.0.0").with_private_tmpdir();
+    let node_modules = fx.project_dir.join("node_modules");
+    let bin = node_modules.join(".bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("tsc"), "#!/bin/sh\nexec real-tsc \"$@\"\n").unwrap();
+    std::fs::create_dir_all(fx.tmp_path().join("typescript")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        fx.tmp_path().join("typescript"),
+        node_modules.join("typescript"),
+    )
+    .unwrap();
     let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // husky install writes to {project}/.husky/<hook>. The sandbox
-    // explicitly allows `{project}/.husky`.
-    let husky = fx.project_dir.join(".husky");
-    let script = format!(
-        "\
-        mkdir -p {dir} && \
-        echo '#!/bin/sh' > {dir}/pre-commit && \
-        chmod +x {dir}/pre-commit",
-        dir = husky.display(),
+
+    for (attempt, script) in [
+        (
+            "overwrite a bin shim",
+            format!("echo evil > {}/tsc", bin.display()),
+        ),
+        (
+            "add a bin shim",
+            format!("echo evil > {}/node", bin.display()),
+        ),
+        (
+            "replace a package link",
+            format!(
+                "rm {nm}/typescript && mkdir {nm}/typescript",
+                nm = node_modules.display()
+            ),
+        ),
+        (
+            "write a generated directory",
+            format!("mkdir -p {}/.prisma/client", node_modules.display()),
+        ),
+    ] {
+        let status = run_script(sb.as_ref(), &fx.pkg_dir, &script);
+        assert!(!status.success(), "{attempt} was allowed: {status:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(bin.join("tsc")).unwrap(),
+        "#!/bin/sh\nexec real-tsc \"$@\"\n"
     );
-    let status = run_script(sb.as_ref(), &fx.pkg_dir, &script);
+    assert!(!bin.join("node").exists());
+    #[cfg(unix)]
     assert!(
-        status.success(),
-        "husky-install writes to {}/pre-commit under Enforce — {status:?}",
-        husky.display()
+        node_modules
+            .join("typescript")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink()
     );
-    assert!(husky.join("pre-commit").exists());
+    assert!(!node_modules.join(".prisma").exists());
 }
 
 #[test]

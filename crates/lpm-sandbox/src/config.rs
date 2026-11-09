@@ -1133,7 +1133,6 @@ pub(crate) fn validate_builtin_write_dirs(spec: &crate::SandboxSpec) -> Result<(
     let [wrappers, hoisted_nested] = lpm_common::project_package_dirs(Path::new(""));
     let project_names = [
         Path::new("node_modules"),
-        Path::new(".husky"),
         wrappers.as_path(),
         hoisted_nested.as_path(),
     ];
@@ -1142,20 +1141,29 @@ pub(crate) fn validate_builtin_write_dirs(spec: &crate::SandboxSpec) -> Result<(
         Path::new(".node-gyp"),
         Path::new(".npm"),
     ];
-    for (base, names) in [
-        (&spec.project_dir, &project_names[..]),
-        (&spec.home_dir, &home_names[..]),
-    ] {
-        let invalid = |name: &Path| SandboxError::InvalidSpec {
-            reason: format!(
-                "sandbox writable directory {} must use real directories without symlinks or reparse points",
-                base.join(name).display()
-            ),
-        };
-        let root = AuthorizedRoot::resolve(base).map_err(|_| invalid(Path::new("")))?;
-        for name in names {
-            root.resolve_descendant(name).map_err(|_| invalid(name))?;
-        }
+    validate_real_dirs(&spec.project_dir, &project_names)?;
+    validate_real_dirs(&spec.home_dir, &home_names)
+}
+
+/// Fails unless `relative`, below the project, is a real directory or
+/// doesn't exist yet, with no symlink or reparse point on the way to it.
+pub(crate) fn validate_project_write_dir(
+    spec: &crate::SandboxSpec,
+    relative: &Path,
+) -> Result<(), SandboxError> {
+    validate_real_dirs(&spec.project_dir, &[relative])
+}
+
+fn validate_real_dirs(base: &Path, names: &[&Path]) -> Result<(), SandboxError> {
+    let invalid = |name: &Path| SandboxError::InvalidSpec {
+        reason: format!(
+            "sandbox writable directory {} must use real directories without symlinks or reparse points",
+            base.join(name).display()
+        ),
+    };
+    let root = AuthorizedRoot::resolve(base).map_err(|_| invalid(Path::new("")))?;
+    for name in names {
+        root.resolve_descendant(name).map_err(|_| invalid(name))?;
     }
     Ok(())
 }
