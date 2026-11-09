@@ -21,6 +21,11 @@ const CHANGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long `lpm audit` may run.
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
+/// How long a stopped command has to stop what it started before it is
+/// killed. `lpm install` stops a lifecycle script's process group of its own,
+/// which a kill of the command's group doesn't reach.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
 /// The most output kept from each of a command's stdout and stderr.
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -497,7 +502,7 @@ async fn run(
     let outcome = tokio::task::spawn_blocking(move || {
         let mut timed_out = false;
         let mut session = CaptureSession::default();
-        let output = session.capture_output_with_spawn(
+        let output = session.capture_output_with_spawn_and_grace(
             &mut command,
             OUTPUT_LIMIT,
             |_| {
@@ -511,6 +516,7 @@ async fn run(
                 None
             },
             spawn,
+            STOP_GRACE,
         );
         (output, timed_out)
     })
