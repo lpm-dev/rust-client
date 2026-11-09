@@ -1,7 +1,7 @@
 //! Green-tier compat corpus — each test runs a minimal fixture script
 //! that writes to the same shape of paths a real green-tier
 //! postinstall (node-gyp rebuild, electron-rebuild, tsc, prisma
-//! generate, husky install) would, and asserts the sandbox ALLOWS
+//! generate) would, and asserts the sandbox ALLOWS
 //! the writes under [`SandboxMode::Enforce`].
 //!
 //! These are MINIMAL fixtures: the CI lane exercises the real write
@@ -17,7 +17,6 @@
 //! | `electron_rebuild` | @electron/rebuild         | same shape as node-gyp                           |
 //! | `tsc_inplace`      | tsc (project-local build) | `{pkg}/dist/*.js`                                |
 //! | `prisma_generate`  | prisma generate (hoisted) | `{project}/node_modules/.prisma/client/*.js`     |
-//! | `husky_install`    | husky install             | `{project}/.husky/<hook>`                        |
 //! | `package_dirs_*`   | postinstall in a layout   | `{project}/.lpm/{wrappers,hoisted/nested}/...`   |
 //!
 //! If any of these tests fail after a sandbox allow-list rule change,
@@ -119,6 +118,7 @@ fn prisma_generate_shape_succeeds_for_a_package_hoisted_into_the_project() {
     let package = fx.project_dir.join("node_modules/@prisma/client");
     std::fs::create_dir_all(&package).unwrap();
     let mut spec = fx.spec.clone();
+    spec.package_name = "@prisma/client".into();
     spec.package_dir = package.clone();
     let sb = try_build_sandbox(spec, SandboxMode::Enforce).unwrap();
     let client_dir = fx.project_dir.join("node_modules/.prisma/client");
@@ -197,32 +197,6 @@ fn a_package_outside_the_project_cannot_change_the_project_node_modules() {
             .is_symlink()
     );
     assert!(!node_modules.join(".prisma").exists());
-}
-
-#[test]
-fn husky_install_shape_succeeds() {
-    if !sandbox_supported(SandboxMode::Enforce) {
-        return;
-    }
-    let fx = SandboxFixture::new("husky", "9.0.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    // husky install writes to {project}/.husky/<hook>. The sandbox
-    // explicitly allows `{project}/.husky`.
-    let husky = fx.project_dir.join(".husky");
-    let script = format!(
-        "\
-        mkdir -p {dir} && \
-        echo '#!/bin/sh' > {dir}/pre-commit && \
-        chmod +x {dir}/pre-commit",
-        dir = husky.display(),
-    );
-    let status = run_script(sb.as_ref(), &fx.pkg_dir, &script);
-    assert!(
-        status.success(),
-        "husky-install writes to {}/pre-commit under Enforce — {status:?}",
-        husky.display()
-    );
-    assert!(husky.join("pre-commit").exists());
 }
 
 #[test]

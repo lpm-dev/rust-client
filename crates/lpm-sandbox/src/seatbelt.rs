@@ -1,8 +1,8 @@
 //! Seatbelt profile synthesis for the macOS `sandbox-exec` backend.
 //!
 //! Project reads follow approved capabilities; writes stay narrow (package store
-//! dir + `.husky` + the package's own layout dir in `.lpm` + `node_modules`
-//! for a package hoisted into it + known caches + temp),
+//! dir + the package's own layout dir in `.lpm` + `node_modules/.prisma` for
+//! a hoisted `@prisma/client` + known caches + temp),
 //! network allowed by default, process-fork + exec allowed so
 //! `node-gyp` children work.
 //!
@@ -73,7 +73,7 @@ pub(crate) fn render_profile_with_toolchain(
     //
     // Canonicalize only the base paths (which must exist on the
     // host) — their subpaths are constructed from the canonical
-    // bases below so `.husky`, `.cache`, etc. get the right prefix
+    // bases below so `.cache`, `.prisma`, etc. get the right prefix
     // whether or not those subpaths exist yet.
     let canon_package_dir = canonicalize_or_passthrough(&spec.package_dir, "package_dir")?;
     let canon_project_dir = canonicalize_or_passthrough(&spec.project_dir, "project_dir")?;
@@ -91,13 +91,15 @@ pub(crate) fn render_profile_with_toolchain(
     )?;
     let tmpdir = quoted_path(&canon_tmpdir, "tmpdir")?;
 
-    // node_modules / .husky / the package dirs in .lpm are subpaths of
+    // node_modules/.prisma and the package dirs in .lpm are subpaths of
     // the canonical project_dir.
-    let project_node_modules =
-        crate::project_node_modules_write_dir(&canon_project_dir, &canon_package_dir)
-            .map(|path| quoted_path(&path, "project_dir/node_modules"))
-            .transpose()?;
-    let project_husky = quoted_path(&canon_project_dir.join(".husky"), "project_dir/.husky")?;
+    let prisma_client = crate::hoisted_prisma_client_dir(
+        &canon_project_dir,
+        &canon_package_dir,
+        &spec.package_name,
+    )
+    .map(|path| quoted_path(&path, "project_dir/node_modules/.prisma"))
+    .transpose()?;
     let package_layout_dir =
         crate::package_layout_write_dir(&canon_project_dir, &canon_package_dir)
             .map(|path| quoted_path(&path, "package layout directory"))
@@ -127,8 +129,8 @@ pub(crate) fn render_profile_with_toolchain(
     out.push('\n');
 
     // file-read-metadata broadly. Required for path traversal: a
-    // script doing `mkdir -p $PROJECT/.husky` needs to stat each
-    // path component from `/` down to `.husky`'s parent. Without
+    // script doing `mkdir -p $HOME/.cache/tool` needs to stat each
+    // path component from `/` down to `.cache`'s parent. Without
     // broad metadata, the traversal denies on intermediate dirs
     // (`/private`, `/private/var`, etc.) regardless of what file-
     // read* narrows. Apple's own `bsd.sb` uses this pattern for
@@ -234,8 +236,8 @@ pub(crate) fn render_profile_with_toolchain(
 
     // file-write*: narrow but covers the greens. Must contain the
     // package's own store dir (the compat corpus tests write markers
-    // here), project `node_modules` only for a package hoisted into it
-    // (prisma generate beside it), `.husky` (husky install), the running
+    // here), `node_modules/.prisma` only for a hoisted `@prisma/client`
+    // (prisma generate beside it), the running
     // package's own layout directory in `.lpm` (the rest of `.lpm` is
     // LPM's state or other packages), `~/.cache` + `~/.node-gyp` +
     // `~/.npm` (tooling caches), and per-script scratch directory.
@@ -243,10 +245,9 @@ pub(crate) fn render_profile_with_toolchain(
     out.push_str("(allow file-write*\n");
     out.push_str(&format!("  (subpath {package_dir})\n"));
     if !build_cache_isolation {
-        if let Some(path) = &project_node_modules {
+        if let Some(path) = &prisma_client {
             out.push_str(&format!("  (subpath {path})\n"));
         }
-        out.push_str(&format!("  (subpath {project_husky})\n"));
         if let Some(path) = &package_layout_dir {
             out.push_str(&format!("  (subpath {path})\n"));
         }
@@ -682,16 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn profile_contains_project_subpaths_for_writable_greens() {
+    fn profile_reads_dependency_subpaths_but_not_project_state() {
         let p = render_profile(&spec(), false).unwrap();
-        assert!(
-            p.contains("/home/u/proj/node_modules"),
-            "node_modules must be writable for prisma generate: {p}"
-        );
-        assert!(
-            p.contains("/home/u/proj/.husky"),
-            ".husky must be writable for husky install: {p}"
-        );
         assert!(
             p.contains("(subpath \"/home/u/proj/.lpm/wrappers\")"),
             "the isolated layout's packages must be readable: {p}"
@@ -699,6 +692,43 @@ mod tests {
         assert!(
             !p.contains("(subpath \"/home/u/proj/.lpm\")"),
             "LPM's own project state must stay out of reach: {p}"
+        );
+    }
+
+    #[test]
+    fn dependency_scripts_cannot_write_the_project_git_hooks() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(!p.contains("/home/u/proj/.husky"), "{p}");
+    }
+
+    #[test]
+    fn a_hoisted_prisma_client_writes_only_its_generated_client_beside_it() {
+        let mut prisma = spec();
+        prisma.package_name = "@prisma/client".into();
+        prisma.package_dir = PathBuf::from("/home/u/proj/node_modules/@prisma/client");
+        let profile = render_profile(&prisma, false).unwrap();
+        let writes = write_section(&profile);
+
+        assert!(writes.contains("(subpath \"/home/u/proj/node_modules/.prisma\")"));
+        assert!(
+            !writes.contains("(subpath \"/home/u/proj/node_modules\")"),
+            "a hoisted package could rewrite bin shims and other packages: {writes}"
+        );
+    }
+
+    #[test]
+    fn other_hoisted_packages_write_nothing_beside_themselves() {
+        let mut hoisted = spec();
+        hoisted.package_name = "esbuild".into();
+        hoisted.package_dir = PathBuf::from("/home/u/proj/node_modules/esbuild");
+        let profile = render_profile(&hoisted, false).unwrap();
+        let writes = write_section(&profile);
+
+        assert!(writes.contains("(subpath \"/home/u/proj/node_modules/esbuild\")"));
+        assert_eq!(
+            writes.matches("/home/u/proj/node_modules").count(),
+            1,
+            "{writes}"
         );
     }
 
