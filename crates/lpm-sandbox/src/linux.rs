@@ -224,7 +224,7 @@ impl BackendPosture {
     /// denying UDP without landlock V4's TCP deny would create a
     /// Linux strict-posture variant the upstream contract doesn't
     /// promise. Every posture still installs
-    /// [`build_containment_filters`].
+    /// [`crate::seccomp::build_containment_filters`].
     ///
     /// The pre_exec closure consults this predicate to decide
     /// whether to call [`seccompiler::apply_filter`] before
@@ -490,10 +490,12 @@ impl Sandbox for LandlockSandbox {
         // invokes pre_exec once per spawn; the `take().ok_or(...)`
         // path below catches the hypothetical double-invocation.
         let mut ruleset_opt = Some(ruleset);
-        let containment_filters = build_containment_filters(self.virtualize_self_process_group)
-            .map_err(|error| SandboxError::ProfileRenderFailed {
-                reason: format!("process containment filter failed: {error}"),
-            })?;
+        let containment_filters = crate::seccomp::build_containment_filters(
+            self.virtualize_self_process_group,
+        )
+        .map_err(|error| SandboxError::ProfileRenderFailed {
+            reason: format!("process containment filter failed: {error}"),
+        })?;
         let mut process_filters = Some(containment_filters);
         let mut seccomp_opt = seccomp_program;
         let mut overlay_opt = overlay_spec;
@@ -825,18 +827,6 @@ fn build_parent_side_ruleset(
     Ok(ruleset)
 }
 
-/// The seccomp filters every enforce posture installs, whatever its network
-/// policy: the process-group lock, the `io_uring` deny and the terminal
-/// input-injection deny.
-fn build_containment_filters(
-    virtualize_self_process_group: bool,
-) -> Result<Vec<seccompiler::BpfProgram>, seccompiler::Error> {
-    let mut filters = crate::seccomp::build_process_group_filters(virtualize_self_process_group)?;
-    filters.push(crate::seccomp::build_io_uring_deny_filter()?);
-    filters.push(crate::seccomp::build_terminal_injection_deny_filter()?);
-    Ok(filters)
-}
-
 fn rule_access_bits(access: RuleAccess, abi: ABI, is_file: bool) -> BitFlags<AccessFs> {
     let valid = if is_file {
         AccessFs::from_file(abi)
@@ -1165,6 +1155,17 @@ mod tests {
             Err(SandboxError::KernelTooOld { .. }) => return,
             Err(e) => panic!("factory failed: {e:?}"),
         };
+        // x32's own `ioctl` entry, 514, which a rule on the x86_64 number
+        // never sees; a kernel without x32 would answer ENOSYS, not EPERM.
+        #[cfg(target_arch = "x86_64")]
+        let x32_probe = format!(
+            "if libc.syscall({x32_ioctl}, 0, {tiocsti}, ctypes.byref(byte)) != -1: sys.exit(5)\n\
+             if ctypes.get_errno() != errno.EPERM: sys.exit(6)\n",
+            x32_ioctl = 0x4000_0000 | 514,
+            tiocsti = libc::TIOCSTI,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let x32_probe = String::new();
         let probe = format!(
             "import ctypes, ctypes.util, errno, sys\n\
              libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)\n\
@@ -1172,6 +1173,7 @@ mod tests {
              if libc.syscall({io_uring_setup}, 4, params) >= 0: sys.exit(1)\n\
              if ctypes.get_errno() != errno.ENOSYS: sys.exit(2)\n\
              byte = ctypes.c_char(b'x')\n\
+             {x32_probe}\
              if libc.ioctl(0, {tiocsti}, ctypes.byref(byte)) != -1: sys.exit(3)\n\
              sys.exit(0 if ctypes.get_errno() == errno.EPERM else 4)\n",
             io_uring_setup = libc::SYS_io_uring_setup,
@@ -1188,7 +1190,8 @@ mod tests {
             status.code(),
             Some(0),
             "1: io_uring_setup created a ring; 2: it failed with an errno other than \
-             ENOSYS; 3: TIOCSTI succeeded; 4: TIOCSTI was not refused by the filter"
+             ENOSYS; 3: TIOCSTI succeeded; 4: TIOCSTI was not refused by the filter; \
+             5: the x32 ioctl succeeded; 6: it was not refused by the filter"
         );
     }
 

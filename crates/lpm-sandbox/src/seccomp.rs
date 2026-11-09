@@ -82,10 +82,13 @@
 //!
 //! # Filters every enforce posture installs
 //!
-//! The socket matrix above is strict-only. These are installed in the
-//! default and degraded postures too, because they keep the filesystem
-//! and process containment honest rather than deny network:
+//! The socket matrix above is strict-only. [`build_containment_filters`]
+//! assembles the filters installed in the default and degraded postures
+//! too, because they keep the filesystem and process containment honest
+//! rather than deny network:
 //!
+//! - [`build_x32_abi_deny_filter`] (x86_64) refuses every x32 syscall, so
+//!   no filter here can be bypassed through the x32 ABI. See below.
 //! - [`build_process_group_filters`] keeps every descendant in the
 //!   process group the kill-on-exit path signals.
 //! - [`build_io_uring_deny_filter`] answers the three `io_uring`
@@ -113,25 +116,18 @@
 //! i386 / 32-bit ARM use. seccompiler's `TargetArch` picks the
 //! right syscall number table at compile time.
 //!
-//! # x32 ABI mirror (x86_64 only)
+//! # x32 ABI (x86_64 only)
 //!
-//! On a host where `CONFIG_X86_X32_ABI=y` is enabled, an x32
-//! caller issues syscalls with the `__X32_SYSCALL_BIT`
-//! (`0x40000000`) OR'd into the syscall number. seccompiler's
-//! filter is keyed on the literal syscall number, so a
-//! plain x86_64-targeted filter does not match x32 calls —
-//! every rule is bypassed. To close the specific `socket(2)`
-//! bypass, the deny rules are also registered under
-//! `__X32_SYSCALL_BIT | SYS_socket` so the same family/type
-//! matrix applies to x32 socket() invocations. aarch64 has
-//! no x32 ABI so this mirror is x86_64-only.
-//!
-//! The broader x32 surface (every other syscall) remains
-//! unfiltered. We accept this trade-off because the script
-//! approval gate, landlock V4 filesystem rules, and seccomp
-//! socket gate together still cover the egress paths a
-//! lifecycle script would reach for; the x32 mirror closes
-//! the specific bypass that the audit harness reproduced.
+//! On a host where `CONFIG_X86_X32_ABI=y` is enabled, an x32 caller
+//! issues syscalls with `__X32_SYSCALL_BIT` (`0x40000000`) set in the
+//! number, under the same audit arch as x86_64, so a rule keyed on an
+//! x86_64 number never sees them. Registering each rule again under
+//! `__X32_SYSCALL_BIT | number` isn't enough either: syscalls that pass
+//! structures through have their own x32 entry, `ioctl` among them (16 on
+//! x86_64, 514 on x32). So every enforce posture refuses the whole x32 ABI
+//! with `EPERM` instead. Lifecycle scripts have no use for it, and most
+//! distribution kernels disable it already. 32-bit x86 calls carry another
+//! audit arch, which every seccompiler-built filter here kills.
 
 #![cfg(target_os = "linux")]
 
@@ -170,10 +166,7 @@ const TYPE_MASK: u64 = !((libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64);
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: i64 = 0x4000_0000;
 
-/// Build the deny rule vector for `socket(2)`. The same vector is
-/// registered under both `SYS_socket` and (on x86_64) the x32
-/// `__X32_SYSCALL_BIT | SYS_socket` key so the matrix applies to
-/// x32 callers too.
+/// Build the deny rule vector for `socket(2)`.
 fn build_socket_rules() -> Result<Vec<SeccompRule>, seccompiler::Error> {
     fn family_type(family: i32, ty: i32) -> Result<SeccompRule, seccompiler::Error> {
         Ok(SeccompRule::new(vec![
@@ -268,11 +261,6 @@ pub fn build_socket_deny_filter() -> Result<BpfProgram, seccompiler::Error> {
 
     rules.insert(libc::SYS_socket, build_socket_rules()?);
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        rules.insert(X32_SYSCALL_BIT | libc::SYS_socket, build_socket_rules()?);
-    }
-
     let filter = SeccompFilter::new(
         rules,
         // Default: allow. `socket(2)` calls that don't match any
@@ -349,30 +337,11 @@ mod tests {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn x32_syscall_mirror_registered_on_x86_64() {
-        // The filter must contain dispatch entries for both the
-        // x86_64 SYS_socket and the x32 mirror. seccompiler emits
-        // the dispatcher table inline; we exercise the public
-        // entrypoint and assume the program length grows with the
-        // mirror rule set. A regression that drops the x32 mirror
-        // would halve the per-rule dispatch length.
-        let with_mirror = build_socket_deny_filter().expect("filter compiles");
-        // Sanity floor — the rule set is 12 rules × 2 keys, each
-        // emitting multiple BPF instructions plus dispatch.
-        assert!(
-            with_mirror.len() > 40,
-            "x32-mirror filter must include both syscall keys; got {} instructions",
-            with_mirror.len(),
-        );
-    }
-
     #[test]
     fn x32_syscall_bit_constant_pinned() {
         // The kernel headers define __X32_SYSCALL_BIT as
-        // 0x40000000. A typo here silently disables the x32
-        // mirror without breaking compilation.
+        // 0x40000000. A typo here would aim the x32 deny at the
+        // wrong syscall numbers without breaking compilation.
         #[cfg(target_arch = "x86_64")]
         assert_eq!(X32_SYSCALL_BIT, 0x4000_0000);
     }
@@ -384,14 +353,11 @@ mod tests {
 /// send operations skip the syscalls the socket matrix and pre-6.10
 /// landlock see.
 pub(crate) fn build_io_uring_deny_filter() -> Result<BpfProgram, seccompiler::Error> {
-    let mut rules = BTreeMap::new();
-    for syscall in IO_URING_SYSCALLS {
-        rules.insert(syscall, Vec::new());
-        #[cfg(target_arch = "x86_64")]
-        rules.insert(X32_SYSCALL_BIT | syscall, Vec::new());
-    }
     let filter = SeccompFilter::new(
-        rules,
+        IO_URING_SYSCALLS
+            .into_iter()
+            .map(|syscall| (syscall, Vec::new()))
+            .collect(),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::ENOSYS as u32),
         TARGET_ARCH,
@@ -423,12 +389,8 @@ pub(crate) fn build_terminal_injection_deny_filter() -> Result<BpfProgram, secco
             )?])
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut by_syscall = BTreeMap::new();
-    by_syscall.insert(libc::SYS_ioctl, rules.clone());
-    #[cfg(target_arch = "x86_64")]
-    by_syscall.insert(X32_SYSCALL_BIT | libc::SYS_ioctl, rules);
     let filter = SeccompFilter::new(
-        by_syscall,
+        BTreeMap::from([(libc::SYS_ioctl, rules)]),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
         TARGET_ARCH,
@@ -440,23 +402,91 @@ pub(crate) fn build_terminal_injection_deny_filter() -> Result<BpfProgram, secco
 #[allow(clippy::unnecessary_cast)]
 const TERMINAL_INJECTION_IOCTLS: [u64; 2] = [libc::TIOCSTI as u64, libc::TIOCLINUX as u64];
 
+/// Refuse every x32 syscall with `EPERM`; see the module docs for why the
+/// whole ABI goes rather than a mirror of each rule. seccompiler matches
+/// whole syscall numbers only, so this filter is written as BPF directly.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn build_x32_abi_deny_filter() -> BpfProgram {
+    /// Offsets into `struct seccomp_data`.
+    const NR: u32 = 0;
+    const ARCH: u32 = 4;
+    /// `AUDIT_ARCH_X86_64` from `<linux/audit.h>`, which x32 calls carry too.
+    const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+
+    fn op(code: u32, jump_if_true: u8, jump_if_false: u8, k: u32) -> seccompiler::sock_filter {
+        seccompiler::sock_filter {
+            code: code as u16,
+            jt: jump_if_true,
+            jf: jump_if_false,
+            k,
+        }
+    }
+    let load = |offset| op(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, offset);
+    vec![
+        load(ARCH),
+        // Calls under another arch fall through to allow here; the
+        // seccompiler-built filters installed alongside kill them.
+        op(
+            libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+            0,
+            3,
+            AUDIT_ARCH_X86_64,
+        ),
+        load(NR),
+        op(
+            libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K,
+            0,
+            1,
+            X32_SYSCALL_BIT as u32,
+        ),
+        op(
+            libc::BPF_RET | libc::BPF_K,
+            0,
+            0,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        op(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ]
+}
+
+/// The seccomp filters every enforce posture installs, whatever its network
+/// policy, before any other: the x32 ABI deny (x86_64), the process-group
+/// lock, the `io_uring` deny and the terminal input-injection deny.
+pub(crate) fn build_containment_filters(
+    virtualize_self_process_group: bool,
+) -> Result<Vec<BpfProgram>, seccompiler::Error> {
+    let mut filters = Vec::with_capacity(5);
+    #[cfg(target_arch = "x86_64")]
+    filters.push(build_x32_abi_deny_filter());
+    filters.extend(build_process_group_filters(virtualize_self_process_group)?);
+    filters.push(build_io_uring_deny_filter()?);
+    filters.push(build_terminal_injection_deny_filter()?);
+    Ok(filters)
+}
+
 #[cfg(test)]
 mod containment_filter_tests {
     use super::*;
 
-    /// Forks a child that installs `program` and returns `probe`'s result as
-    /// its exit status, so the filter never touches the test process.
+    fn in_filtered_child(program: &BpfProgram, probe: impl Fn() -> i32) -> i32 {
+        in_child_under(std::slice::from_ref(program), probe)
+    }
+
+    /// Forks a child that installs `programs` and returns `probe`'s result
+    /// as its exit status, so the filters never touch the test process.
     /// `probe` must make only syscalls: it runs after a fork of a
     /// multithreaded process.
-    fn in_filtered_child(program: &BpfProgram, probe: impl Fn() -> i32) -> i32 {
+    fn in_child_under(programs: &[BpfProgram], probe: impl Fn() -> i32) -> i32 {
         // SAFETY: the child calls only syscalls and `_exit`, and the parent
         // waits for exactly the child it created.
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0);
             if pid == 0 {
-                if seccompiler::apply_filter(program).is_err() {
-                    libc::_exit(100);
+                for program in programs {
+                    if seccompiler::apply_filter(program).is_err() {
+                        libc::_exit(100);
+                    }
                 }
                 libc::_exit(probe());
             }
@@ -490,21 +520,46 @@ mod containment_filter_tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn x32_io_uring_syscalls_cannot_bypass_the_filter() {
-        let program = build_io_uring_deny_filter().unwrap();
-        let status = in_filtered_child(&program, || {
-            let mut params = [0_u8; 120];
-            // SAFETY: io_uring_setup reads and writes a 120-byte params struct.
-            let result = unsafe {
-                libc::syscall(
-                    X32_SYSCALL_BIT | libc::SYS_io_uring_setup,
-                    4,
-                    params.as_mut_ptr(),
-                )
-            };
-            i32::from(result != -1 || errno() != libc::ENOSYS)
-        });
-        assert_eq!(status, 0);
+    fn the_containment_filters_refuse_every_x32_syscall_and_still_run_native_ones() {
+        // Each filtered syscall's x86_64 number, x32's own `ioctl` entry
+        // (514), and an unfiltered syscall, all called with the x32 bit.
+        // A kernel without x32 answers ENOSYS, so only the filter yields
+        // EPERM. Every call names fd -1, so none can act if one gets past.
+        const X32_PROBES: [i64; 7] = [
+            514,
+            libc::SYS_ioctl,
+            libc::SYS_socket,
+            libc::SYS_setsid,
+            libc::SYS_setpgid,
+            libc::SYS_io_uring_setup,
+            libc::SYS_getpid,
+        ];
+        for virtualize in [false, true] {
+            let programs = build_containment_filters(virtualize).unwrap();
+            let status = in_child_under(&programs, || {
+                let byte = b'x';
+                for (index, number) in (1..).zip(X32_PROBES) {
+                    // SAFETY: fd -1 names no file; the byte outlives the call.
+                    let result = unsafe {
+                        libc::syscall(X32_SYSCALL_BIT | number, -1, libc::TIOCSTI, &byte)
+                    };
+                    if result != -1 || errno() != libc::EPERM {
+                        return index;
+                    }
+                }
+                // SAFETY: getppid has no preconditions.
+                if unsafe { libc::getppid() } > 0 {
+                    0
+                } else {
+                    50
+                }
+            });
+            assert_eq!(
+                status, 0,
+                "virtualize={virtualize}: 1-7 name the X32_PROBES entry that was not \
+                 refused with EPERM; 50: a native syscall failed"
+            );
+        }
     }
 
     #[test]
@@ -560,14 +615,11 @@ mod containment_filter_tests {
 
 /// Keep descendants in the process group established before the filter is installed.
 pub(crate) fn build_process_group_filter() -> Result<BpfProgram, seccompiler::Error> {
-    let mut rules = BTreeMap::new();
-    for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
-        rules.insert(syscall, Vec::new());
-        #[cfg(target_arch = "x86_64")]
-        rules.insert(X32_SYSCALL_BIT | syscall, Vec::new());
-    }
     let filter = SeccompFilter::new(
-        rules,
+        BTreeMap::from([
+            (libc::SYS_setsid, Vec::new()),
+            (libc::SYS_setpgid, Vec::new()),
+        ]),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
         TARGET_ARCH,
@@ -597,10 +649,6 @@ pub(crate) fn build_process_group_filters(
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
-    #[cfg(target_arch = "x86_64")]
-    for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
-        denied.insert(X32_SYSCALL_BIT | syscall, Vec::new());
-    }
     let deny = SeccompFilter::new(
         denied,
         SeccompAction::Allow,
@@ -740,16 +788,6 @@ mod process_group_tests {
         for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
             probe_group_change(syscall, false, false);
             probe_group_change(syscall, true, false);
-        }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn x32_group_syscalls_cannot_bypass_the_filter() {
-        for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
-            for virtualize in [false, true] {
-                probe_group_change(X32_SYSCALL_BIT | syscall, true, virtualize);
-            }
         }
     }
 }
