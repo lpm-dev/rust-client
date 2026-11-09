@@ -618,6 +618,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         }
         grant_dacl_ace_to_tree(
             dir,
+            outermost_writable_ancestor(dir, &args.writable_dirs),
             sid.0,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             /* strict_root */ false,
@@ -626,6 +627,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     for dir in &args.readable_dirs {
         grant_dacl_ace_to_tree(
             dir,
+            outermost_writable_ancestor(dir, &args.writable_dirs),
             sid.0,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             /* strict_root */ true,
@@ -634,6 +636,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     for dir in &args.writable_dirs {
         grant_dacl_ace_to_tree(
             dir,
+            outermost_writable_ancestor(dir, &args.writable_dirs),
             sid.0,
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
             /* strict_root */ true,
@@ -986,17 +989,21 @@ fn build_capability_attr(
 /// mask to `root` and every existing descendant.
 ///
 /// **Reparse-point handling.** A reparse-point root
-/// (junction / symlink / mount point) is refused. Descendants are
-/// granted through [`setup::GrantTree`], which opens each one relative
-/// to the root's handle by a lookup that fails on a reparse point in
-/// any component. Lifecycle scripts running at the same time can write
-/// inside these trees, so a directory listed during the walk may be a
-/// junction by the time its entries are granted.
+/// (junction / symlink / mount point) is refused, and so is a root
+/// reached through a reparse point below `beneath`, the outermost
+/// writable root above it ([`outermost_writable_ancestor`]): an earlier
+/// script could have turned any directory there into a junction.
+/// Descendants are granted through [`setup::GrantTree`], which opens
+/// each one relative to the root's handle by a lookup that fails on a
+/// reparse point in any component. Lifecycle scripts running at the same
+/// time can write inside these trees, so a directory listed during the
+/// walk may be a junction by the time its entries are granted.
 ///
 /// `SET_ACCESS` replaces prior explicit entries for this SID while
 /// preserving every other trustee's ACL entries.
 fn grant_dacl_ace_to_tree(
     root: &Path,
+    beneath: Option<&Path>,
     sid: PSID,
     access_mask: u32,
     strict_root: bool,
@@ -1071,7 +1078,11 @@ fn grant_dacl_ace_to_tree(
     //   command") is a clearer error surface than a hard sandbox-
     //   setup failure that prints a raw Win32 error code.
     let grant = (access_mask, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE);
-    let tree = setup::GrantTree::open(root).and_then(|tree| {
+    let tree = match beneath {
+        Some(base) => setup::GrantTree::open_below(base, root),
+        None => setup::GrantTree::open(root),
+    }
+    .and_then(|tree| {
         tree.grant_root(sid, grant)?;
         Ok(tree)
     });
@@ -1103,6 +1114,18 @@ fn grant_dacl_ace_to_tree(
     }
 
     Ok(())
+}
+
+/// The outermost of `writable` that holds `root` below it. Scripts can
+/// change any directory inside a writable root but none above the
+/// outermost one, so `root` is opened from there without following a
+/// link. `None` for a root no writable root holds.
+fn outermost_writable_ancestor<'a>(root: &Path, writable: &'a [PathBuf]) -> Option<&'a Path> {
+    writable
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|base| root != *base && root.starts_with(base))
+        .min_by_key(|base| base.components().count())
 }
 
 /// Calls `visit` on every entry below `root` that isn't a reparse point,
@@ -1834,6 +1857,82 @@ mod tests {
     }
 
     #[test]
+    fn a_root_inside_a_writable_tree_is_not_reached_through_a_junction_swapped_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("wrapper");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(wrapper.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(outside.join("pkg")).unwrap();
+        let before = aces(&outside.join("pkg"));
+        let sid = create_or_reuse_appcontainer_sid("LpmGrantRootBelowJunctionTest").unwrap();
+
+        // An earlier script, which could write the wrapper, swapped the
+        // directory holding this run's package root for a junction.
+        std::fs::remove_dir_all(wrapper.join("node_modules")).unwrap();
+        make_junction(&wrapper.join("node_modules"), &outside);
+        let package = wrapper.join("node_modules").join("pkg");
+        let writable = [wrapper, package.clone()];
+        let result = grant_dacl_ace_to_tree(
+            &package,
+            outermost_writable_ancestor(&package, &writable),
+            sid.0,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            true,
+        );
+
+        assert!(
+            matches!(result, Err(AppContainerError::ReparsePointRoot { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            aces(&outside.join("pkg")),
+            before,
+            "the grant followed a junction out of the writable tree"
+        );
+    }
+
+    #[test]
+    fn a_root_inside_a_writable_tree_is_granted_from_that_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("wrapper");
+        let package = wrapper.join("node_modules").join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("index.js"), b"").unwrap();
+        let before = aces(&package.join("index.js"));
+        let sid = create_or_reuse_appcontainer_sid("LpmGrantRootBelowWritableTest").unwrap();
+
+        grant_dacl_ace_to_tree(&package, Some(&wrapper), sid.0, FILE_GENERIC_READ, true).unwrap();
+
+        assert_ne!(
+            aces(&package.join("index.js")),
+            before,
+            "the package's files were not granted"
+        );
+    }
+
+    #[test]
+    fn a_root_is_opened_from_the_outermost_writable_root_holding_it() {
+        let wrapper = PathBuf::from(r"C:\p\.lpm\wrappers\a@1");
+        let package = wrapper.join("node_modules").join("a");
+        let scratch = PathBuf::from(r"C:\t\s");
+        let writable = [package.clone(), wrapper.clone(), scratch.clone()];
+
+        assert_eq!(
+            outermost_writable_ancestor(&package, &writable),
+            Some(wrapper.as_path())
+        );
+        assert_eq!(
+            outermost_writable_ancestor(&scratch.join("bin"), &writable),
+            Some(scratch.as_path())
+        );
+        assert_eq!(outermost_writable_ancestor(&wrapper, &writable), None);
+        assert_eq!(
+            outermost_writable_ancestor(Path::new(r"C:\p"), &writable),
+            None
+        );
+    }
+
+    #[test]
     fn concurrent_secret_denials_never_undo_each_other_and_leave_the_dacl_as_found() {
         let tmp = tempfile::tempdir().unwrap();
         let secret = tmp.path().join(".env");
@@ -2038,6 +2137,7 @@ mod tests {
             create_or_reuse_appcontainer_sid("LpmHelperSkipNonexistentTest").expect("derive SID");
         grant_dacl_ace_to_tree(
             &nonexistent,
+            None,
             sid.0,
             FILE_GENERIC_READ,
             /* strict_root */ true,
@@ -2066,7 +2166,7 @@ mod tests {
         std::fs::write(&child, b"tool").unwrap();
         let before = security_descriptor(&child);
         let sid = create_or_reuse_appcontainer_sid("LpmExistingToolAccessTest").unwrap();
-        grant_dacl_ace_to_tree(tmp.path(), sid.0, mask, false).unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, mask, false).unwrap();
         let after = security_descriptor(&child);
         assert_eq!(before, after);
     }
@@ -2129,7 +2229,7 @@ mod tests {
         std::fs::write(&child, b"tool").unwrap();
         let before = security_descriptor(&child);
         let sid = create_or_reuse_appcontainer_sid("LpmSplitToolAccessTest").unwrap();
-        grant_dacl_ace_to_tree(tmp.path(), sid.0, mask, false).unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, mask, false).unwrap();
         let after = security_descriptor(&child);
         assert_eq!(before, after);
     }
@@ -2165,7 +2265,7 @@ mod tests {
             .open(tmp.path())
             .unwrap();
         let sid = create_or_reuse_appcontainer_sid("LpmHeldDirectoryGrantTest").unwrap();
-        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true).unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, true).unwrap();
     }
 
     #[test]
@@ -2186,7 +2286,7 @@ mod tests {
         .unwrap();
         let after = security_descriptor(&child);
         assert_eq!(before, after);
-        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true).unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, true).unwrap();
         let walked = security_descriptor(&child);
         assert_ne!(before, walked);
     }
@@ -2204,6 +2304,7 @@ mod tests {
         let sid = create_or_reuse_appcontainer_sid("LpmHelperRegularDirTest").expect("derive SID");
         grant_dacl_ace_to_tree(
             tmp.path(),
+            None,
             sid.0,
             FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             /* strict_root */ true,
@@ -2264,7 +2365,7 @@ mod tests {
             );
         }
         let sid = create_or_reuse_appcontainer_sid("LpmDeniedDaclTest").unwrap();
-        let strict = grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true);
+        let strict = grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, true);
         assert!(
             matches!(
                 strict,
@@ -2272,7 +2373,7 @@ mod tests {
             ),
             "{strict:?}"
         );
-        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, false).unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, false).unwrap();
     }
 
     /// Reparse-point roots must honor `strict_root` too: a junction
@@ -2311,6 +2412,7 @@ mod tests {
         // Strict: refuse with named error.
         let strict_result = grant_dacl_ace_to_tree(
             &junction,
+            None,
             sid.0,
             FILE_GENERIC_READ,
             /* strict_root */ true,
@@ -2329,6 +2431,7 @@ mod tests {
         // hard-aborted the entire spawn.
         let best_effort_result = grant_dacl_ace_to_tree(
             &junction,
+            None,
             sid.0,
             FILE_GENERIC_READ,
             /* strict_root */ false,

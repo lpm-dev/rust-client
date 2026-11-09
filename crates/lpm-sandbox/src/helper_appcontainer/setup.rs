@@ -665,6 +665,29 @@ impl GrantTree {
         })
     }
 
+    /// Opens `path` for a grant from `base`, a writable root above it,
+    /// refusing a reparse point anywhere between the two: a script may turn
+    /// any directory below `base` into one.
+    pub(super) fn open_below(base: &Path, path: &Path) -> Result<Self, AppContainerError> {
+        let relative = path.strip_prefix(base).map_err(|_| {
+            failure(format!(
+                "{} is outside the writable root {}",
+                path.display(),
+                base.display()
+            ))
+        })?;
+        let (handle, identity) = open_permissions(base, false)?;
+        let base = walk::Target {
+            handle,
+            identity,
+            directory: true,
+        };
+        Ok(Self {
+            root: base.below(relative, path)?,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub(super) fn is_directory(&self) -> bool {
         self.root.directory
     }
