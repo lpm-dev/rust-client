@@ -15,7 +15,7 @@ use std::time::Duration;
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm, lpm_spawnable_with_registry};
-use wiremock::matchers::{body_partial_json, header, method, path};
+use wiremock::matchers::{any, body_partial_json, header, method, path};
 use wiremock::{Mock, Request, ResponseTemplate};
 
 #[test]
@@ -481,10 +481,41 @@ struct McpServer {
     stdin: Option<std::process::ChildStdin>,
     lines: mpsc::Receiver<String>,
     next_id: u64,
+    /// Whether each request carries the 2026-07-28 `_meta` in place of an
+    /// `initialize` handshake.
+    stateless: bool,
+    /// Notifications read while waiting for a response.
+    notifications: Vec<Value>,
 }
+
+const STATELESS_META: &str = r#"{
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {},
+    "io.modelcontextprotocol/clientInfo": { "name": "workflow-test", "version": "1.0.0" }
+}"#;
 
 impl McpServer {
     fn start(project: &TempProject, registry_url: &str) -> Self {
+        let mut server = Self::spawn(project, registry_url, false);
+        let initialized = server.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "workflow-test", "version": "1.0.0" },
+            }),
+        );
+        assert_eq!(initialized["result"]["serverInfo"]["name"], "lpm");
+        server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        server
+    }
+
+    /// A server driven as a 2026-07-28 client drives it, without `initialize`.
+    fn start_stateless(project: &TempProject, registry_url: &str) -> Self {
+        Self::spawn(project, registry_url, true)
+    }
+
+    fn spawn(project: &TempProject, registry_url: &str, stateless: bool) -> Self {
         let mut command = lpm_spawnable_with_registry(project, registry_url);
         command
             .args(["mcp", "serve"])
@@ -501,23 +532,14 @@ impl McpServer {
                 }
             }
         });
-        let mut server = Self {
+        Self {
             child,
             stdin,
             lines,
             next_id: 1,
-        };
-        let initialized = server.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": { "name": "workflow-test", "version": "1.0.0" },
-            }),
-        );
-        assert_eq!(initialized["result"]["serverInfo"]["name"], "lpm");
-        server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-        server
+            stateless,
+            notifications: Vec::new(),
+        }
     }
 
     fn send(&mut self, message: &Value) {
@@ -526,18 +548,51 @@ impl McpServer {
         stdin.flush().expect("flush to the server");
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Value {
+    fn request(&mut self, method: &str, mut params: Value) -> Value {
+        let id = self.send_request(method, &mut params);
+        loop {
+            let message = self.next_message(method);
+            if message["id"] == json!(id) && message.get("method").is_none() {
+                return message;
+            }
+            if message.get("id").is_none() {
+                self.notifications.push(message);
+            }
+        }
+    }
+
+    fn send_request(&mut self, method: &str, params: &mut Value) -> u64 {
+        if self.stateless {
+            params["_meta"] = serde_json::from_str(STATELESS_META).unwrap();
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        id
+    }
+
+    fn next_message(&mut self, waiting_for: &str) -> Value {
+        let line = self
+            .lines
+            .recv_timeout(ANSWER_TIMEOUT)
+            .unwrap_or_else(|_| panic!("nothing arrived while waiting for {waiting_for}"));
+        serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("stdout must carry only JSON-RPC: {error}: {line}"))
+    }
+
+    /// The next notification with `method`, including one already read
+    /// while waiting for a response.
+    fn notification(&mut self, method: &str) -> Value {
+        if let Some(index) = self
+            .notifications
+            .iter()
+            .position(|message| message["method"] == method)
+        {
+            return self.notifications.remove(index);
+        }
         loop {
-            let line = self
-                .lines
-                .recv_timeout(ANSWER_TIMEOUT)
-                .unwrap_or_else(|_| panic!("no answer to {method}"));
-            let message: Value = serde_json::from_str(&line)
-                .unwrap_or_else(|error| panic!("stdout must carry only JSON-RPC: {error}: {line}"));
-            if message["id"] == json!(id) {
+            let message = self.next_message(method);
+            if message["method"] == method {
                 return message;
             }
         }
@@ -941,4 +996,163 @@ async fn mcp_serve_keeps_the_retired_runtime_while_an_older_lpm_runs_it() {
         runtime.join("runtime/package.json").is_file(),
         "a runtime an older lpm still runs must stay"
     );
+}
+
+/// A tool listing that answers only after `delay`, the first time.
+async fn mount_slow_then_prompt_listing(registry: &MockRegistry, delay: Duration) {
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("mcp-method", "tools/list"))
+        .respond_with(move |request: &Request| {
+            rpc_result(json!({ "tools": [registry_tool("lpm_search")] }))(request).set_delay(delay)
+        })
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(registry.server())
+        .await;
+    mount_tool_listing(registry, json!([registry_tool("lpm_search")])).await;
+}
+
+#[tokio::test]
+async fn mcp_serve_lists_its_own_tools_while_the_registry_is_slow_and_announces_the_rest() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_slow_then_prompt_listing(&registry, Duration::from_secs(60)).await;
+    let mut server = McpServer::start(&project, &registry.url());
+
+    let started = std::time::Instant::now();
+    let first = server.tool_names();
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "a slow registry must not hold the listing: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(first, ["lpm_install", "lpm_add", "lpm_audit"]);
+
+    server.notification("notifications/tools/list_changed");
+    let second = server.tool_names();
+
+    assert_eq!(
+        second,
+        ["lpm_search", "lpm_install", "lpm_add", "lpm_audit"]
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_announces_late_registry_tools_on_a_listen_stream() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_slow_then_prompt_listing(&registry, Duration::from_secs(60)).await;
+    let mut server = McpServer::start_stateless(&project, &registry.url());
+    let listen = server.send_request(
+        "subscriptions/listen",
+        &mut json!({ "notifications": { "toolsListChanged": true } }),
+    );
+    let acknowledged = server.notification("notifications/subscriptions/acknowledged");
+    assert_eq!(
+        acknowledged["params"]["notifications"]["toolsListChanged"],
+        true
+    );
+
+    let first = server.tool_names();
+    let changed = server.notification("notifications/tools/list_changed");
+    let second = server.tool_names();
+
+    assert_eq!(first, ["lpm_install", "lpm_add", "lpm_audit"]);
+    assert_eq!(
+        changed["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(listen),
+        "the notice belongs to the listen stream: {changed}"
+    );
+    assert_eq!(
+        second,
+        ["lpm_search", "lpm_install", "lpm_add", "lpm_audit"]
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_reads_public_data_again_after_lpm_logout() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("authorization", "Bearer stored-access"))
+        .respond_with(rpc_result(json!({
+            "content": [{ "type": "text", "text": "Results for alice." }],
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("authorization", "Bearer stored-access"))
+        .respond_with(rpc_refusal(401, "This token was revoked."))
+        .with_priority(2)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(rpc_result(json!({
+            "content": [{ "type": "text", "text": "Public results." }],
+        })))
+        .mount(registry.server())
+        .await;
+    seed_login(&project, &registry, "stored-access");
+    let mut server = McpServer::start(&project, &registry.url());
+    let (_, signed_in) = server.call("lpm_search", json!({ "query": "forms" }));
+    assert_eq!(signed_in, "Results for alice.");
+
+    support::auth_state::write_credentials_store(project.home(), &json!({}));
+    let (result, text) = server.call("lpm_search", json!({ "query": "forms" }));
+
+    assert_eq!(text, "Public results.");
+    assert!(result.get("isError").is_none_or(|error| error == false));
+}
+
+#[tokio::test]
+async fn mcp_serve_stops_a_running_command_when_the_editor_disconnects() {
+    let editor = TempProject::empty(r#"{"name":"editor-workspace","version":"1.0.0"}"#);
+    let project = TempProject::empty(r#"{"name":"mcp-install","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(registry.server())
+        .await;
+    let mut server = McpServer::start(&editor, &registry.url());
+    server.send_request(
+        "tools/call",
+        &mut json!({
+            "name": "lpm_install",
+            "arguments": {
+                "projectPath": project.path().to_str().unwrap(),
+                "name": "acme.forms",
+            },
+        }),
+    );
+    let deadline = std::time::Instant::now() + ANSWER_TIMEOUT;
+    while registry
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the install never reached the registry"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let disconnected = std::time::Instant::now();
+    let (status, stderr) = server.stop();
+
+    assert!(
+        disconnected.elapsed() < Duration::from_secs(60),
+        "the server must stop the install instead of waiting for it: {:?}\n{stderr}",
+        disconnected.elapsed()
+    );
+    assert!(status.success(), "{stderr}");
 }
