@@ -90,9 +90,7 @@ impl ProfileMark {
             for &pid in &pids {
                 if pid > 1 && self.is_on(pid) {
                     remaining += 1;
-                    // SAFETY: SIGKILL to one process this spawn started; ESRCH
-                    // after it exits on its own is harmless.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    self.end(pid);
                 }
             }
             if remaining == 0 {
@@ -100,6 +98,22 @@ impl ProfileMark {
             }
         }
         remaining
+    }
+
+    /// Sends SIGKILL to `pid` while it carries this mark. The PID version is
+    /// read before the check that decides the kill, and the kill is bound
+    /// to it, so a PID that passes to another process in between is never
+    /// signalled: the kill lands only on the process that was checked.
+    fn end(&self, pid: libc::pid_t) {
+        if SIGNAL_ONE_PROCESS.is_none() {
+            // SAFETY: SIGKILL to one process this spawn started; ESRCH after
+            // it exits on its own is harmless.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        } else if let Some(process) = ProcessIdentity::read(pid)
+            && self.is_on(pid)
+        {
+            process.kill();
+        }
     }
 }
 
@@ -129,29 +143,132 @@ fn lookup_denied(pid: libc::pid_t, name: &CStr) -> Option<bool> {
 /// processes this one may signal, which includes every process a spawn
 /// started, even one running a set-user-ID program.
 fn list_processes_of_real_user(uid: libc::uid_t, pids: &mut Vec<libc::pid_t>) {
-    pids.clear();
-    loop {
-        // SAFETY: a null buffer asks only for the size needed.
-        let needed = unsafe { libc::proc_listpids(PROC_RUID_ONLY, uid, std::ptr::null_mut(), 0) };
-        let Ok(needed) = usize::try_from(needed) else {
+    fill_pid_list(pids, |buffer, bytes| {
+        // SAFETY: a null buffer asks only for the size needed; otherwise the
+        // buffer holds `bytes` bytes of writable pid_t storage.
+        unsafe { libc::proc_listpids(PROC_RUID_ONLY, uid, buffer.cast(), bytes) }
+    });
+}
+
+/// Fills `pids` through `list`, which behaves like `proc_listpids`: given a
+/// null buffer it reports the bytes needed, otherwise it fills the buffer
+/// and reports the bytes written.
+fn fill_pid_list(
+    pids: &mut Vec<libc::pid_t>,
+    mut list: impl FnMut(*mut libc::pid_t, c_int) -> c_int,
+) {
+    let entry = size_of::<libc::pid_t>();
+    for _ in 0..LIST_ATTEMPTS {
+        pids.clear();
+        let Ok(needed) = usize::try_from(list(std::ptr::null_mut(), 0)) else {
             return;
         };
-        let capacity = needed / size_of::<libc::pid_t>() + 64;
-        pids.reserve(capacity.saturating_sub(pids.capacity()));
-        let bytes =
-            c_int::try_from(pids.capacity() * size_of::<libc::pid_t>()).unwrap_or(c_int::MAX);
-        // SAFETY: the buffer holds `bytes` bytes of writable pid_t storage.
-        let written =
-            unsafe { libc::proc_listpids(PROC_RUID_ONLY, uid, pids.as_mut_ptr().cast(), bytes) };
-        let Ok(written) = usize::try_from(written) else {
+        pids.reserve(needed / entry + LIST_HEADROOM);
+        let bytes = c_int::try_from(pids.capacity() * entry).unwrap_or(c_int::MAX);
+        let Ok(written) = usize::try_from(list(pids.as_mut_ptr(), bytes)) else {
             return;
         };
+        // SAFETY: `list` initialized `written` bytes of whole pid_t values,
+        // at most `bytes`, which the capacity covers.
+        unsafe { pids.set_len(written / entry) };
         if written < usize::try_from(bytes).unwrap_or(usize::MAX) {
-            // SAFETY: the kernel initialized `written` bytes of whole pid_t values.
-            unsafe { pids.set_len(written / size_of::<libc::pid_t>()) };
             return;
         }
     }
+}
+
+/// Room for processes that start between sizing a listing and filling it.
+const LIST_HEADROOM: usize = 64;
+/// A full buffer may have cut the listing short, so it is retried with a
+/// larger one; past this many tries the sweep works from the partial list
+/// and the next sweep picks up the rest.
+const LIST_ATTEMPTS: usize = 8;
+
+/// One process, as opposed to whichever process holds its PID.
+#[derive(Clone, Copy, Debug)]
+struct ProcessIdentity {
+    pid: libc::pid_t,
+    version: i32,
+}
+
+impl ProcessIdentity {
+    /// `None` when the process is gone, or when this macOS can't signal one
+    /// process rather than a PID.
+    fn read(pid: libc::pid_t) -> Option<Self> {
+        SIGNAL_ONE_PROCESS.as_ref()?;
+        pid_version(pid).map(|version| Self { pid, version })
+    }
+
+    /// Sends SIGKILL to this process; once its PID belongs to another
+    /// process, the kernel refuses with ESRCH.
+    fn kill(self) {
+        let Some(signal) = *SIGNAL_ONE_PROCESS else {
+            return;
+        };
+        let mut token = AuditToken([0; 8]);
+        token.0[AUDIT_TOKEN_PID] = self.pid as u32;
+        token.0[AUDIT_TOKEN_PID_VERSION] = self.version as u32;
+        // SAFETY: the token outlives the call, which only reads it.
+        unsafe { signal(&mut token, libc::SIGKILL) };
+    }
+}
+
+/// `audit_token_t`. The kernel resolves a token to a process by the PID and
+/// PID version slots alone.
+#[repr(C)]
+struct AuditToken([u32; 8]);
+const AUDIT_TOKEN_PID: usize = 5;
+const AUDIT_TOKEN_PID_VERSION: usize = 7;
+
+type SignalWithAuditToken = unsafe extern "C" fn(*mut AuditToken, c_int) -> c_int;
+
+/// `proc_signal_with_audittoken`, looked up at run time so the binary still
+/// loads on a macOS release without it. `None` there, and wherever the
+/// kernel doesn't report PID versions.
+static SIGNAL_ONE_PROCESS: LazyLock<Option<SignalWithAuditToken>> = LazyLock::new(|| {
+    // SAFETY: RTLD_DEFAULT and a NUL-terminated name are all dlsym needs.
+    let symbol =
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"proc_signal_with_audittoken".as_ptr()) };
+    // SAFETY: getpid has no preconditions and cannot fail.
+    if symbol.is_null() || pid_version(unsafe { libc::getpid() }).is_none() {
+        return None;
+    }
+    // SAFETY: libproc declares it `int proc_signal_with_audittoken(audit_token_t *, int)`.
+    Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, SignalWithAuditToken>(symbol) })
+});
+
+/// `PROC_PIDUNIQIDENTIFIERINFO` from XNU's `<sys/proc_info.h>`; the public
+/// SDK header leaves it out.
+const PROC_PIDUNIQIDENTIFIERINFO: c_int = 17;
+
+/// `struct proc_uniqidentifierinfo` from XNU's `<sys/proc_info.h>`.
+#[repr(C)]
+#[derive(Default)]
+struct UniqueIdentifierInfo {
+    executable_uuid: [u8; 16],
+    unique_id: u64,
+    parent_unique_id: u64,
+    pid_version: i32,
+    reserved: [u32; 5],
+}
+
+const _: () = assert!(size_of::<UniqueIdentifierInfo>() == 56);
+
+/// The version the kernel gave `pid` when its current process took it.
+fn pid_version(pid: libc::pid_t) -> Option<i32> {
+    let mut info = UniqueIdentifierInfo::default();
+    let size = size_of::<UniqueIdentifierInfo>() as c_int;
+    // SAFETY: the buffer holds `size` writable bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (written == size && info.pid_version != 0).then_some(info.pid_version)
 }
 
 /// Spawned profiles' marks by the root process's PID.
@@ -318,6 +435,86 @@ mod tests {
             unsandboxed_alive,
             "ending a spawn killed an unsandboxed process"
         );
+    }
+
+    /// Answers like `proc_listpids` for a user running `running`.
+    fn list_from(running: &[libc::pid_t], buffer: *mut libc::pid_t, bytes: c_int) -> c_int {
+        let entry = size_of::<libc::pid_t>();
+        if buffer.is_null() {
+            return c_int::try_from(size_of_val(running)).unwrap();
+        }
+        let written = running.len().min(usize::try_from(bytes).unwrap() / entry);
+        // SAFETY: the caller's buffer holds `bytes` bytes, room for `written` pids.
+        unsafe { std::ptr::copy_nonoverlapping(running.as_ptr(), buffer, written) };
+        c_int::try_from(written * entry).unwrap()
+    }
+
+    #[test]
+    fn a_listing_that_outgrows_a_reused_buffer_grows_it_and_returns_every_process() {
+        let running: Vec<libc::pid_t> = (1000..1300).collect();
+        let mut pids = Vec::with_capacity(256);
+        let mut calls = 0;
+
+        fill_pid_list(&mut pids, |buffer, bytes| {
+            calls += 1;
+            assert!(
+                calls < 32,
+                "the listing kept retrying without growing its buffer"
+            );
+            list_from(&running, buffer, bytes)
+        });
+
+        assert_eq!(pids, running);
+    }
+
+    #[test]
+    fn a_listing_that_fills_every_buffer_stops_retrying_and_keeps_what_it_read() {
+        let mut pids = Vec::new();
+        let mut calls = 0;
+
+        fill_pid_list(&mut pids, |buffer, bytes| {
+            calls += 1;
+            assert!(calls < 64, "the listing never stopped retrying");
+            // Processes start faster than the buffer grows, so every
+            // listing comes back full.
+            let fits = if buffer.is_null() {
+                calls * 1000
+            } else {
+                usize::try_from(bytes).unwrap() / size_of::<libc::pid_t>() + 1
+            };
+            let running: Vec<libc::pid_t> = (2..).take(fits).collect();
+            list_from(&running, buffer, bytes)
+        });
+
+        assert!(!pids.is_empty(), "a full listing was thrown away");
+    }
+
+    #[test]
+    fn a_kill_meant_for_a_pids_earlier_process_spares_the_process_holding_it_now() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let current = ProcessIdentity::read(pid).expect("a running child has an identity");
+        let earlier = ProcessIdentity {
+            version: current.version.wrapping_sub(1),
+            ..current
+        };
+
+        earlier.kill();
+        std::thread::sleep(Duration::from_millis(100));
+        let spared = child.try_wait().unwrap().is_none();
+        current.kill();
+        let status = child.wait().unwrap();
+
+        assert!(
+            spared,
+            "a kill meant for the PID's earlier process reached the current one"
+        );
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
     #[test]
