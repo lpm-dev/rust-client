@@ -160,9 +160,11 @@ pub(super) fn wait_with_timeout(
     let stdout_reader = match stdout_reader {
         Ok(reader) => reader,
         Err(error) => {
-            crate::commands::rebuild::process_tree::kill_process_tree(&mut child);
+            let cleanup = crate::commands::rebuild::process_tree::kill_process_tree(&mut child);
             let _ = child.wait();
-            return Err(ChildWaitError::Wait(error.to_string()));
+            return Err(ChildWaitError::Wait(
+                crate::commands::rebuild::process_tree::with_survivors(error.to_string(), cleanup),
+            ));
         }
     };
     let stderr_reader = child
@@ -173,11 +175,13 @@ pub(super) fn wait_with_timeout(
     let stderr_reader = match stderr_reader {
         Ok(reader) => reader,
         Err(error) => {
-            crate::commands::rebuild::process_tree::kill_process_tree(&mut child);
+            let cleanup = crate::commands::rebuild::process_tree::kill_process_tree(&mut child);
             let _ = child.wait();
             finished.store(true, Ordering::Release);
             join_tail_reader(stdout_reader);
-            return Err(ChildWaitError::Wait(error.to_string()));
+            return Err(ChildWaitError::Wait(
+                crate::commands::rebuild::process_tree::with_survivors(error.to_string(), cleanup),
+            ));
         }
     };
     let status = crate::commands::rebuild::process_tree::wait_with_timeout(child, &timeout);

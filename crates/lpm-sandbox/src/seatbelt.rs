@@ -286,10 +286,9 @@ pub(crate) fn render_profile_with_toolchain(
     //
     // NB: SBPL does not expose `process-set-pgid` as an operation
     // name (it is not in the Seatbelt grammar; sandbox-exec rejects
-    // it with "unbound variable: process-set-pgid"). The matching
-    // kill-tree-escape concern is closed in
-    // `lpm_sandbox::terminate_sandbox_tree` via descendant-PID
-    // enumeration; the SBPL profile only narrows process-exec here.
+    // it with "unbound variable: process-set-pgid"). A descendant that
+    // leaves its process group is still found through the per-spawn
+    // mark `seatbelt_tree` appends to this profile.
     out.push_str("(allow process*)\n");
     // Block process-exec to the macOS automation / privilege-escalation
     // surfaces. `osascript` reaches every AppleScript-controllable app
@@ -320,7 +319,9 @@ pub(crate) fn render_profile_with_toolchain(
             quoted_path(&compilers, "Apple compiler directory")?
         ));
     }
-    out.push_str("(allow signal)\n");
+    // Signals stay within this spawn's processes. Otherwise a script could
+    // kill the LPM process that would end its tree, or the user's others.
+    out.push_str("(allow signal (target same-sandbox))\n");
     // Mach lookups + sysctl reads the dynamic linker + libSystem
     // need. IOKit usage comes from libsystem (device enumeration
     // during locale init and similar); without it even /usr/bin/true
@@ -846,7 +847,11 @@ mod tests {
             p.contains("(allow process*)"),
             "need process fork+exec+info: {p}"
         );
-        assert!(p.contains("(allow signal)"));
+        assert!(p.contains("(allow signal (target same-sandbox))"));
+        assert!(
+            !p.contains("(allow signal)"),
+            "signals must not reach other processes: {p}"
+        );
         assert!(p.contains("(allow mach-lookup)"));
         assert!(p.contains("(allow sysctl-read)"));
         assert!(p.contains("(allow iokit-open)"));

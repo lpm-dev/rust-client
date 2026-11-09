@@ -296,19 +296,11 @@ fn detached_probe(reparent: bool) {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS native compatibility permits detached descendants; see sandbox limitations"
-)]
 fn successful_lifecycle_terminates_detached_children() {
     detached_probe(false);
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS native compatibility permits reparented descendants; see sandbox limitations"
-)]
 fn timed_out_lifecycle_terminates_reparented_grandchildren() {
     detached_probe(true);
 }
