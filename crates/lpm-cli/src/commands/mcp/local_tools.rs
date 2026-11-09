@@ -590,6 +590,7 @@ fn result_of(tool: LocalTool, command: &str, output: &std::process::Output) -> C
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
 
     fn arguments(value: serde_json::Value) -> JsonObject {
@@ -865,9 +866,12 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     static STARTS_WHILE_QUEUED: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(unix)]
     static STARTS_AFTER_CANCEL: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(unix)]
     fn spawn_counting_queued(
         command: &mut std::process::Command,
     ) -> std::io::Result<std::process::Child> {
@@ -875,6 +879,7 @@ mod tests {
         command.spawn()
     }
 
+    #[cfg(unix)]
     fn spawn_counting_cancelled(
         command: &mut std::process::Command,
     ) -> std::io::Result<std::process::Child> {
