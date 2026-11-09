@@ -76,6 +76,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
+#[cfg(target_os = "macos")]
+mod seatbelt_tree;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -953,10 +956,14 @@ fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
 
 /// Tear down the entire process tree for a sandboxed child by PID.
 ///
-/// On Unix this is a no-op: the install pipeline already kills the
-/// child's process group directly via `kill(-pid, SIGKILL)` because
-/// the [`Sandbox::spawn`] path puts the lifecycle child in its own
-/// group via `process_group(0)`.
+/// On Linux this is a no-op: the install pipeline kills the child's
+/// process group directly via `kill(-pid, SIGKILL)`, and the seccomp
+/// filter keeps every descendant from leaving that group.
+///
+/// On macOS a descendant can leave the group with `setsid`, so this ends
+/// every process still running under the Seatbelt profile of the
+/// [`Sandbox::spawn`] that started `pid`, wherever it sits in the
+/// process tree.
 ///
 /// On Windows a [`spawn_tracked_command`] child is attached to a Job
 /// Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` whose handle the
@@ -966,18 +973,22 @@ fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
 /// AppContainer helper, which holds its script's Job Object itself:
 /// killing the helper closes that Job and ends the tree.
 ///
-/// Idempotent: PIDs without a tracked entry (Unix; Windows children
-/// that exited normally; sandboxed lifecycle children) are silent
-/// no-ops. Always pair with `Child::kill()`.
+/// Idempotent: PIDs without a tracked entry (Linux; Windows children
+/// that exited normally; sandboxed Windows lifecycle children) are
+/// silent no-ops. Always pair with `Child::kill()`.
 pub fn terminate_sandbox_tree(_pid: u32) {
     #[cfg(target_os = "windows")]
     windows::terminate_sandbox_tree(_pid);
+    #[cfg(target_os = "macos")]
+    seatbelt_tree::terminate_sandbox_tree(_pid);
 }
 
-/// Release the tracker entry for a [`spawn_tracked_command`] child that
-/// exited normally (no timeout, no panic). On Unix this is a no-op. On
-/// Windows it closes the cached Job Object handle, which also ends any
-/// descendant the child left running; without it the tracker keeps one
+/// Release the tracker entry for a child that exited normally (no
+/// timeout, no panic), ending any descendant it left running. On Linux
+/// this is a no-op. On macOS it ends every process still running under
+/// the child's Seatbelt profile, as [`terminate_sandbox_tree`] does. On
+/// Windows it closes the cached Job Object handle of a
+/// [`spawn_tracked_command`] child; without it the tracker keeps one
 /// open HANDLE per tracked command for the parent's lifetime. The
 /// timeout-kill path uses [`terminate_sandbox_tree`] instead, which also
 /// releases the entry.
@@ -986,6 +997,8 @@ pub fn terminate_sandbox_tree(_pid: u32) {
 pub fn release_sandbox_tracker(_pid: u32) {
     #[cfg(target_os = "windows")]
     windows::release_sandbox_tracker_entry(_pid);
+    #[cfg(target_os = "macos")]
+    seatbelt_tree::terminate_sandbox_tree(_pid);
 }
 
 /// Spawn a command in an OS process-tree container without applying

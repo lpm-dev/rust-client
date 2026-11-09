@@ -94,8 +94,12 @@ impl Sandbox for SeatbeltSandbox {
         // inline, so no temp-file handoff is needed. Env, cwd, and
         // stdio apply to the sandbox-exec process — it inherits them
         // to the ultimate child.
+        let mark = crate::seatbelt_tree::ProfileMark::new();
+        let mut profile = String::with_capacity(self.profile.len() + 256);
+        profile.push_str(&self.profile);
+        mark.append_rules(&mut profile);
         let mut command = std::process::Command::new(SANDBOX_EXEC);
-        command.arg("-p").arg(&self.profile);
+        command.arg("-p").arg(&profile);
         command.arg(&cmd.program);
         for a in &cmd.args {
             command.arg(a);
@@ -132,9 +136,11 @@ impl Sandbox for SeatbeltSandbox {
             }
         }
 
-        command.spawn().map_err(|e| SandboxError::SpawnFailed {
+        let child = command.spawn().map_err(|e| SandboxError::SpawnFailed {
             reason: format!("sandbox-exec spawn failed: {e}"),
-        })
+        })?;
+        crate::seatbelt_tree::track(child.id(), mark);
+        Ok(child)
     }
 
     fn backend_name(&self) -> &'static str {
@@ -350,6 +356,39 @@ mod tests {
         assert!(
             !status.success(),
             "Seatbelt must deny reading a path outside the allow list — got status {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_script_signals_its_own_processes_but_nothing_outside_its_sandbox() {
+        let rs = realistic_spec();
+        let mut outsider = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let script = format!(
+            "/bin/sleep 30 & own=$!\n\
+             /bin/kill $own || exit 3\n\
+             /bin/kill -0 {outsider} 2>/dev/null && exit 4\n\
+             /bin/kill -0 $PPID 2>/dev/null && exit 5\n\
+             exit 0",
+            outsider = outsider.id()
+        );
+        let mut cmd = SandboxedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        cmd.stderr = SandboxStdio::Null;
+        let status = sb.spawn(cmd).expect("spawn").wait().expect("wait");
+        let _ = outsider.kill();
+        let _ = outsider.wait();
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "3: the script could not signal its own child; 4: it signalled an \
+             unrelated process; 5: it signalled the process that started it"
         );
     }
 

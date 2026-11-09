@@ -31,6 +31,9 @@ pub(in crate::commands) fn kill_process_tree(child: &mut std::process::Child) {
                 libc::kill(d as i32, libc::SIGKILL);
             }
         }
+        // A descendant that left the group and lost its parent before the
+        // snapshot is only reachable through the sandbox that started it.
+        lpm_sandbox::terminate_sandbox_tree(pid);
     }
     #[cfg(not(unix))]
     {
