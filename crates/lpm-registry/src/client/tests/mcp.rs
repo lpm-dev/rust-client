@@ -104,6 +104,11 @@ async fn hosted_mcp_listing_never_sends_a_stored_session() {
         !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
         "a public listing must not carry the session's bearer"
     );
+    assert_eq!(
+        client.session().unwrap().current_source_peek(),
+        None,
+        "a public listing must not read the credential store"
+    );
 }
 
 #[tokio::test]

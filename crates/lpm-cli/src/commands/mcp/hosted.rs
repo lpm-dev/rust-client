@@ -134,6 +134,7 @@ impl HostedRegistry {
         if let Some(arguments) = arguments {
             params.insert("arguments".to_owned(), Value::Object(arguments));
         }
+        self.read_login_off_thread().await;
         let mut outcome = self
             .send(
                 "tools/call",
@@ -142,41 +143,48 @@ impl HostedRegistry {
                 AuthPosture::AuthRequired,
             )
             .await;
-        if matches!(outcome, Err(HostedFailure::SignIn(_))) && self.found_new_login() {
+        // The user may have run `lpm login`, or `lpm logout`, since the
+        // login this server holds was read.
+        if matches!(
+            outcome,
+            Err(HostedFailure::SignIn(_)
+                | HostedFailure::Request(LpmError::AuthRequired | LpmError::SessionExpired))
+        ) && self.login_changed().await
+        {
             outcome = self
                 .send("tools/call", Some(name), params, AuthPosture::AuthRequired)
                 .await;
         }
-        let failure = match outcome {
-            Ok(result) => return Ok(forwarded_result(name, result)),
-            Err(HostedFailure::Rpc(error)) => return Err(error),
-            Err(failure) => failure,
-        };
-        if matches!(
-            failure,
-            HostedFailure::Request(LpmError::AuthRequired | LpmError::SessionExpired)
-        ) && let Some(session) = self.client.session()
-            && let Err(error) = session.reread_stored_credentials()
-        {
-            tracing::debug!(
-                target: "lpm_cli::mcp",
-                "stored credentials could not be read again: {error}"
-            );
+        match outcome {
+            Ok(result) => Ok(forwarded_result(name, result)),
+            Err(HostedFailure::Rpc(error)) => Err(error),
+            Err(failure) => Ok(tool_error(&self.explain(&failure))),
         }
-        Ok(tool_error(&self.explain(&failure)))
     }
 
-    /// Whether a login appeared since the session was first read: the user
-    /// may have run `lpm login` after the server started.
-    fn found_new_login(&self) -> bool {
-        let Some(session) = self.client.session() else {
+    /// Read the stored login before a request needs it, on a blocking
+    /// thread: reading the credential store can wait on a macOS Keychain
+    /// prompt, which must not hold an async worker of a long-running server.
+    async fn read_login_off_thread(&self) {
+        let Some(session) = self.client.session().map(Arc::clone) else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || session.current_source()).await;
+    }
+
+    /// Read the stored login again, on a blocking thread, and say whether it
+    /// differs from the one the failed request used.
+    async fn login_changed(&self) -> bool {
+        let Some(session) = self.client.session().map(Arc::clone) else {
             return false;
         };
-        session.reread_stored_credentials().unwrap_or(false)
-            && self
-                .client
-                .has_bearer_for_posture(AuthPosture::AuthRequired)
-                .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            let before = session.current_bearer_lazy().ok().flatten();
+            session.reread_stored_credentials().unwrap_or(false)
+                && session.current_bearer_lazy().ok().flatten() != before
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn send(
@@ -225,10 +233,15 @@ impl HostedRegistry {
             } => message.clone(),
             HostedFailure::Busy {
                 message: None,
-                retry_after_secs,
+                retry_after_secs: Some(seconds),
             } => format!(
-                "The registry's MCP server at {server} is limiting requests. Retry in {} seconds.",
-                retry_after_secs.unwrap_or(60)
+                "The registry's MCP server at {server} is limiting requests. Retry in {seconds} seconds."
+            ),
+            HostedFailure::Busy {
+                message: None,
+                retry_after_secs: None,
+            } => format!(
+                "The registry's MCP server at {server} is limiting requests. Retry later."
             ),
             HostedFailure::Missing => format!(
                 "The registry has no MCP server at {server}, so its registry tools are unavailable."
@@ -355,10 +368,13 @@ fn response_in(body: &[u8], id: u64) -> Option<Result<Value, ErrorData>> {
 
 /// The data of each event in a `text/event-stream` body.
 fn event_data(body: &[u8]) -> impl Iterator<Item = String> + '_ {
-    let text = String::from_utf8_lossy(body);
+    // An event stream may end its lines with CRLF, LF, or a lone CR.
+    let text = String::from_utf8_lossy(body)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let mut events = Vec::new();
     let mut data = String::new();
-    for line in text.lines() {
+    for line in text.split('\n') {
         if line.is_empty() {
             if !data.is_empty() {
                 events.push(std::mem::take(&mut data));
@@ -429,6 +445,17 @@ mod tests {
         );
 
         assert_eq!(read_answer(&stream, 3).unwrap(), json!({"content": []}));
+    }
+
+    #[test]
+    fn read_answer_reads_an_event_stream_with_lone_carriage_returns() {
+        let stream = answer(
+            200,
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\rdata: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"content\":[]}}\r\r",
+        );
+
+        assert_eq!(read_answer(&stream, 5).unwrap(), json!({"content": []}));
     }
 
     #[test]
