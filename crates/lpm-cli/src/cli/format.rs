@@ -1193,7 +1193,10 @@ fn registry_http_lines(answer: &lpm_common::RegistryHttpError) -> Vec<SlimErrorL
     if let Some(notice) = &answer.notice {
         push_untrusted_detail(&mut lines, "notice", notice);
     }
-    if let Some(wait) = answer.retry_after_secs.filter(|_| answer.status == 503) {
+    if let Some(wait) = answer
+        .retry_after_secs
+        .filter(|_| matches!(answer.status, 429 | 503))
+    {
         push_detail(
             &mut lines,
             "retry after",

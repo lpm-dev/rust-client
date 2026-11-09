@@ -892,6 +892,20 @@ impl LpmError {
         ) || matches!(self, LpmError::RegistryHttp(answer) if answer.status == 401)
     }
 
+    /// Whether the LPM credential itself was refused: the session, the
+    /// environment token, or an lpm.dev 401. Every other lpm.dev request made
+    /// with it fails the same way, unlike a 401 from another registry, which
+    /// holds its own credential.
+    pub fn is_lpm_credential_failure(&self) -> bool {
+        match self {
+            LpmError::AuthRequired | LpmError::SessionExpired | LpmError::EnvTokenRejected => true,
+            LpmError::RegistryHttp(answer) => {
+                answer.status == 401 && answer.registry_kind == crate::RegistryKind::Lpm
+            }
+            _ => false,
+        }
+    }
+
     /// Whether the registry asked the client to slow down.
     pub fn is_rate_limited(&self) -> bool {
         match self {
@@ -1232,6 +1246,26 @@ mod tests {
             notice: None,
             subject: None,
         }
+    }
+
+    #[test]
+    fn only_an_lpm_credential_refusal_stops_every_lpm_lookup() {
+        assert!(LpmError::AuthRequired.is_lpm_credential_failure());
+        assert!(LpmError::SessionExpired.is_lpm_credential_failure());
+        assert!(LpmError::EnvTokenRejected.is_lpm_credential_failure());
+        assert!(
+            LpmError::RegistryHttp(Box::new(registry_http_error(401))).is_lpm_credential_failure()
+        );
+
+        let mut other_registry = registry_http_error(401);
+        other_registry.registry = "https://npm.corp.example".into();
+        other_registry.registry_kind = crate::RegistryKind::Custom;
+        let other_registry = LpmError::RegistryHttp(Box::new(other_registry));
+        assert!(other_registry.is_credential_failure());
+        assert!(!other_registry.is_lpm_credential_failure());
+        assert!(
+            !LpmError::RegistryHttp(Box::new(registry_http_error(403))).is_lpm_credential_failure()
+        );
     }
 
     #[test]

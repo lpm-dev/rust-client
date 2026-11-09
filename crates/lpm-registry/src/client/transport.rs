@@ -1,9 +1,11 @@
-use super::error_body::{AnswerFacts, RegistryOrigin, registry_refusal};
+use super::error_body::{AnswerFacts, RegistryOrigin, registry_refusal, unauthorized};
 use super::*;
 use lpm_common::RegistryKind;
 
 mod error_redaction;
-use error_redaction::{read_error_text_redacting, read_request_error_text};
+use error_redaction::{
+    answer_facts, read_error_text_redacting, read_request_error_text, redact_credentials,
+};
 
 pub(super) enum PublishSafeResponse {
     Response(reqwest::Response),
@@ -29,6 +31,10 @@ pub(super) const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Maximum backoff delay (10 seconds).
 pub(super) const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
+
+/// The longest rate-limit wait a request sits out, once. A registry that asks
+/// for longer is told to the user with its wait instead of stalling them.
+pub(super) const RATE_LIMIT_LONGEST_WAIT: Duration = Duration::from_secs(60);
 
 const RETRY_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -82,32 +88,21 @@ impl RegistryClient {
                 let (header, value) = proof.header();
                 request = request.header(header, value);
             }
-            let response = self.send_once_preserving_status(request).await?;
+            let request = build_request(request)?;
+            let sent = request.headers().clone();
+            let response = self.send_built_once_preserving_status(request).await?;
             let status = response.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(LpmError::RateLimited {
-                    retry_after_secs: retry_after_seconds(&response),
-                });
-            }
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                let parsed = parse_capped_api_json::<serde_json::Value>(
-                    response,
-                    &format!("{operation} response"),
-                )
-                .await;
-                return Err(match &parsed {
-                    Ok(body) => super::second_factor::second_factor_unauthorized_error(
-                        body, command, operation,
-                    ),
-                    Err(_) => LpmError::AuthRequired,
-                });
-            }
             // A refusal keeps its status and code, and a proxy's HTML page
             // reads as what it is rather than as unparseable JSON.
             if !status.is_success() {
                 let origin = self.registry_origin(response.url());
-                let facts = AnswerFacts::from_headers(response.headers());
-                let body = read_capped_error_text(response).await;
+                let facts = answer_facts(response.headers(), &sent);
+                let body = read_error_text_redacting(response, &sent).await;
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    return Err(second_factor_or_unauthorized(
+                        &facts, &body, &origin, command, operation,
+                    ));
+                }
                 return Err(registry_refusal(status.as_u16(), &facts, &body, &origin));
             }
             let parsed = parse_capped_api_json::<serde_json::Value>(
@@ -131,21 +126,36 @@ impl RegistryClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
+        let request = self.post_json_request(url, body).await?;
+        self.send_built_once_preserving_status(request).await
+    }
+
+    /// A POST of `body` as JSON to `url`, with the bearer.
+    async fn post_json_request(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Request, LpmError> {
         let mut request = self.http.for_url(url).await?.post(url).json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             request = request.bearer_auth(bearer);
         }
-        self.send_once_preserving_status(request).await
+        build_request(request)
     }
 
     pub(super) async fn send_once_preserving_status(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
+        self.send_built_once_preserving_status(build_request(request)?)
+            .await
+    }
+
+    pub(super) async fn send_built_once_preserving_status(
+        &self,
+        mut request: reqwest::Request,
+    ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
-        let mut request = request
-            .build()
-            .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
         self.route_to_npm_transport(&mut request);
         self.http
             .for_url(request.url().as_str())
@@ -186,9 +196,14 @@ impl RegistryClient {
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
-            let response = self.post_json_raw_status(url, body).await?;
+            let request = self.post_json_request(url, body).await?;
+            let sent = request.headers().clone();
+            let response = self.send_built_once_preserving_status(request).await?;
             if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(LpmError::AuthRequired);
+                let origin = self.registry_origin(response.url());
+                let facts = answer_facts(response.headers(), &sent);
+                let body = read_error_text_redacting(response, &sent).await;
+                return Err(unauthorized(&facts, &body, &origin));
             }
             Ok(response)
         })
@@ -482,35 +497,42 @@ impl RegistryClient {
         self.validate_base_url()?;
 
         let mut last_error = None;
+        let mut waited_long = false;
 
         for attempt in 0..=MAX_RETRIES {
             let req = request_factory()?
                 .build()
                 .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
             let headers = req.headers().clone();
-            let origin = self.registry_origin(req.url());
 
             let transfer = super::http::TransferClientProvider(self.http.as_ref());
             match lpm_http::send_with_replayable_redirects(&transfer, req, Some(payload)).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    let facts = AnswerFacts::from_headers(response.headers());
+                    if matches!(status, 200..=299 | 304) {
+                        return Ok(PublishSafeResponse::Response(response));
+                    }
+                    let facts = AnswerFacts::from_headers(response.headers(), |text| {
+                        redact_credentials(text, &headers);
+                        if let Some(secret) = bearer
+                            && let std::borrow::Cow::Owned(redacted) =
+                                lpm_common::redact_exact_secret(text, secret)
+                        {
+                            *text = redacted;
+                        }
+                    });
+                    let origin = self.registry_origin(response.url());
 
                     match status {
-                        200..=299 | 304 => return Ok(PublishSafeResponse::Response(response)),
-
                         // Non-retryable client errors — fail immediately
                         401 => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
-                            return Err(serde_json::from_str::<serde_json::Value>(&body).map_or(
-                                LpmError::AuthRequired,
-                                |body| {
-                                    super::second_factor::second_factor_unauthorized_error(
-                                        &body,
-                                        "lpm publish",
-                                        "publish",
-                                    )
-                                },
+                            return Err(second_factor_or_unauthorized(
+                                &facts,
+                                &body,
+                                &origin,
+                                "lpm publish",
+                                "publish",
                             ));
                         }
                         403 => {
@@ -556,17 +578,17 @@ impl RegistryClient {
 
                         // Rate limit — respect Retry-After
                         429 => {
-                            let wanted = facts.retry_after_secs.unwrap_or(1);
-                            last_error = Some(registry_refusal(status, &facts, "", &origin));
-                            if attempt < MAX_RETRIES && wanted <= RETRY_MAX_DELAY.as_secs() {
+                            if attempt < MAX_RETRIES
+                                && let Some(wait) = rate_limit_wait(&facts, &mut waited_long)
+                            {
                                 // Honor the test-only backoff override so
                                 // 429-flood retry-exhaustion tests don't
                                 // hang on the server-supplied Retry-After.
-                                let delay = backoff_override()
-                                    .unwrap_or_else(|| Duration::from_secs(wanted));
-                                tokio::time::sleep(delay).await;
+                                tokio::time::sleep(backoff_override().unwrap_or(wait)).await;
                                 continue;
                             }
+                            let body = read_publish_error_text(response, &headers, bearer).await;
+                            last_error = Some(registry_refusal(status, &facts, &body, &origin));
                             break;
                         }
 
@@ -779,12 +801,12 @@ impl RegistryClient {
         P: lpm_http::ReplayableHttpClientProvider<Error = LpmError> + Sync,
     {
         let mut request = request;
-        let origin = self.registry_origin(request.url());
-        self.route_to_npm_transport(&mut request);
+        let routed_to_npm_transport = self.route_to_npm_transport(&mut request);
         self.validate_base_url()?;
         self.validate_request_url(request.url())?;
 
         let mut last_error = None;
+        let mut waited_long = false;
         let can_reselect_redirect_clients = request.try_clone().is_some();
 
         for attempt in 0..=MAX_RETRIES {
@@ -832,16 +854,17 @@ impl RegistryClient {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     tracing::event!(name: "headers_observed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64, status = u64::from(status));
+                    if matches!(status, 200..=299 | 304) {
+                        return Ok(Answered::Success(response));
+                    }
                     let retried = matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
                         && attempt < MAX_RETRIES;
-                    let facts = AnswerFacts::from_headers(response.headers());
-                    if failed == FailedAnswer::Response
-                        && !matches!(status, 200..=299 | 304)
-                        && !retried
-                    {
+                    let facts = answer_facts(response.headers(), request.headers());
+                    let origin =
+                        self.answer_origin(&request, response.url(), routed_to_npm_transport);
+                    if failed == FailedAnswer::Response && !retried {
                         return Ok(Answered::Failed(FailedResponse {
                             status,
-                            retry_after_secs: parse_retry_after(&response),
                             body: read_request_error_text(response, &request).await,
                             facts,
                             origin,
@@ -849,29 +872,32 @@ impl RegistryClient {
                     }
 
                     match status {
-                        200..=299 | 304 => return Ok(Answered::Success(response)),
-
                         // Non-retryable errors — fail immediately
-                        401 if origin.kind == RegistryKind::Lpm => {
-                            return Err(LpmError::AuthRequired);
+                        401 => {
+                            let body = read_request_error_text(response, &request).await;
+                            return Err(unauthorized(&facts, &body, &origin));
                         }
                         // Retryable: rate limit
                         429 => {
-                            let wanted = facts.retry_after_secs.unwrap_or(1);
-                            last_error = Some(registry_refusal(status, &facts, "", &origin));
-                            // A wait longer than the backoff cap is the
-                            // registry's to choose; retrying sooner only
-                            // spends the attempts against the same limit.
-                            if attempt < MAX_RETRIES && wanted <= RETRY_MAX_DELAY.as_secs() {
+                            if attempt < MAX_RETRIES
+                                && let Some(wait) = rate_limit_wait(&facts, &mut waited_long)
+                            {
                                 // Honor the test-only backoff override here
                                 // too — see the sibling site in publish-path.
-                                let delay = backoff_override()
-                                    .unwrap_or_else(|| Duration::from_secs(wanted));
+                                let delay = backoff_override().unwrap_or(wait);
                                 tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 tokio::time::sleep(delay).await;
                                 tracing::event!(name: "backoff_end", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 continue;
                             }
+                            // Read only once the limit stands, for what it says.
+                            let body = tokio::time::timeout(
+                                RETRY_ERROR_BODY_TIMEOUT,
+                                read_request_error_text(response, &request),
+                            )
+                            .await
+                            .unwrap_or_default();
+                            last_error = Some(registry_refusal(status, &facts, &body, &origin));
                             break;
                         }
 
@@ -918,10 +944,35 @@ impl RegistryClient {
         Err(last_error.unwrap_or_else(|| LpmError::Network("request failed after retries".into())))
     }
 
-    fn route_to_npm_transport(&self, request: &mut reqwest::Request) {
-        if let Some(url) = self.npm_transport_url_for(request.url()) {
-            *request.url_mut() = url;
+    /// Points a request for npm's registry at the configured npm transport,
+    /// and says whether it did.
+    fn route_to_npm_transport(&self, request: &mut reqwest::Request) -> bool {
+        let Some(url) = self.npm_transport_url_for(request.url()) else {
+            return false;
+        };
+        *request.url_mut() = url;
+        true
+    }
+
+    /// Which registry answered `request`: the host a redirect ended at, or,
+    /// for a request routed to the npm transport, npm's registry, which the
+    /// transport stands in for.
+    fn answer_origin(
+        &self,
+        request: &reqwest::Request,
+        answered: &reqwest::Url,
+        routed_to_npm_transport: bool,
+    ) -> RegistryOrigin {
+        if routed_to_npm_transport && answered.origin() == request.url().origin() {
+            return RegistryOrigin {
+                origin: reqwest::Url::parse(&self.npm_registry_url).map_or_else(
+                    |_| self.npm_registry_url.trim_end_matches('/').to_owned(),
+                    |url| url.origin().ascii_serialization(),
+                ),
+                kind: RegistryKind::Npm,
+            };
         }
+        self.registry_origin(answered)
     }
 
     fn npm_transport_url_for(&self, url: &reqwest::Url) -> Option<reqwest::Url> {
@@ -939,7 +990,7 @@ impl RegistryClient {
 /// Whether a publish's 403 says the Registry has the version: by its
 /// `VERSION_EXISTS` code, or by the exact message registries that predate the
 /// code send.
-fn publish_refusal_is_version_exists(body: &str, version: &str) -> bool {
+pub(super) fn publish_refusal_is_version_exists(body: &str, version: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
     };
@@ -950,6 +1001,69 @@ fn publish_refusal_is_version_exists(body: &str, version: &str) -> bool {
                 format!("Version {version} already exists. You cannot overwrite versions.")
                     .as_str(),
             )
+}
+
+/// The error a registry's failed answer to a request that sent `sent` is:
+/// a 401 as [`unauthorized`] reads it, any other as [`registry_refusal`]
+/// does, with the request's credentials redacted from what it says.
+pub(super) async fn answer_refusal(
+    origin: &RegistryOrigin,
+    response: reqwest::Response,
+    sent: &reqwest::header::HeaderMap,
+) -> LpmError {
+    let status = response.status().as_u16();
+    let facts = answer_facts(response.headers(), sent);
+    let body = read_error_text_redacting(response, sent).await;
+    if status == 401 {
+        return unauthorized(&facts, &body, origin);
+    }
+    registry_refusal(status, &facts, &body, origin)
+}
+
+pub(super) fn build_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Request, LpmError> {
+    request
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))
+}
+
+/// How long to sit out a 429 before retrying, or None when the wait it asks
+/// for is the user's to hear about. Waits up to the backoff cap are retried
+/// as often as any failure; one longer wait, up to a minute, once, so a
+/// registry pacing a burst doesn't fail an install it would have served.
+fn rate_limit_wait(facts: &AnswerFacts, waited_long: &mut bool) -> Option<Duration> {
+    let wanted = Duration::from_secs(facts.retry_after_secs.unwrap_or(1));
+    if wanted <= RETRY_MAX_DELAY {
+        return Some(wanted);
+    }
+    if *waited_long || wanted > RATE_LIMIT_LONGEST_WAIT {
+        return None;
+    }
+    *waited_long = true;
+    tracing::info!(
+        "the registry rate-limited this request; waiting {}s as it asked",
+        wanted.as_secs()
+    );
+    Some(wanted)
+}
+
+/// What a 401 that may be a second-factor challenge is: the challenge or
+/// refused proof it names, or else what any 401 from that registry is.
+fn second_factor_or_unauthorized(
+    facts: &AnswerFacts,
+    body: &str,
+    origin: &RegistryOrigin,
+    command: &'static str,
+    operation: &str,
+) -> LpmError {
+    let challenge = serde_json::from_str::<serde_json::Value>(body).map(|json| {
+        super::second_factor::second_factor_unauthorized_error(&json, command, operation)
+    });
+    match challenge {
+        Ok(LpmError::AuthRequired) | Err(_) => unauthorized(facts, body, origin),
+        Ok(error) => error,
+    }
 }
 
 /// A publish refused because the Registry has the version.
@@ -983,12 +1097,20 @@ impl RegistryClient {
     }
 }
 
-/// The error the LPM registry's refusal is, from its status, body and the
-/// wait a 429 asked for, for an answer read outside the retry loop.
+/// The headers of a refusal the LPM registry gave, kept beside it outside
+/// the retry loop.
+pub(super) struct LpmRefusalHeaders<'a> {
+    pub(super) retry_after_secs: Option<u64>,
+    pub(super) request_id: Option<&'a str>,
+    pub(super) notice: Option<&'a str>,
+}
+
+/// The error the LPM registry's refusal is, from its status, body and
+/// headers, for an answer read outside the retry loop.
 pub(super) fn lpm_refusal(
     status: u16,
     body: &str,
-    retry_after_secs: u64,
+    headers: LpmRefusalHeaders<'_>,
     registry: &str,
 ) -> LpmError {
     let origin = RegistryOrigin {
@@ -999,9 +1121,14 @@ pub(super) fn lpm_refusal(
         kind: RegistryKind::Lpm,
     };
     let facts = AnswerFacts {
-        retry_after_secs: Some(retry_after_secs),
-        ..AnswerFacts::default()
+        content_type: None,
+        retry_after_secs: headers.retry_after_secs,
+        request_id: headers.request_id.map(str::to_owned),
+        notice: headers.notice.map(str::to_owned),
     };
+    if status == 401 {
+        return unauthorized(&facts, body, &origin);
+    }
     registry_refusal(status, &facts, body, &origin)
 }
 
@@ -1030,65 +1157,42 @@ impl Answered {
     pub(super) fn into_response(self) -> Result<reqwest::Response, LpmError> {
         match self {
             Self::Success(response) => Ok(response),
-            Self::Failed(FailedResponse {
-                status: 401,
-                origin:
-                    RegistryOrigin {
-                        kind: RegistryKind::Lpm,
-                        ..
-                    },
-                ..
-            }) => Err(LpmError::AuthRequired),
-            Self::Failed(FailedResponse {
-                status,
-                body,
-                facts,
-                origin,
-                ..
-            }) => Err(registry_refusal(status, &facts, &body, &origin)),
+            Self::Failed(failed) => Err(failed.into_error()),
         }
     }
 }
 
-/// An answer that isn't a success, read: its status, the wait its
-/// `Retry-After` asks, and its body, capped, with the request's credentials
-/// redacted, as a server can echo them.
+/// An answer that isn't a success, read: its status, what its headers say,
+/// which registry gave it, and its body, capped, with the request's
+/// credentials redacted, as a server can echo them.
 #[derive(Debug)]
 pub(super) struct FailedResponse {
     pub(super) status: u16,
-    pub(super) retry_after_secs: u64,
     pub(super) body: String,
     pub(super) facts: AnswerFacts,
     pub(super) origin: RegistryOrigin,
 }
 
-/// Parse `Retry-After` header from a 429 response.
-/// Returns seconds to wait. Falls back to 1 second if header is missing/unparseable.
-/// The seconds a 429's `Retry-After` asks to wait, as the registry says
-/// them, for a change that isn't retried and reports the wait instead.
+impl FailedResponse {
+    /// The error this answer is: a 401 as [`unauthorized`] reads it, any
+    /// other as [`registry_refusal`] does.
+    pub(super) fn into_error(self) -> LpmError {
+        if self.status == 401 {
+            return unauthorized(&self.facts, &self.body, &self.origin);
+        }
+        registry_refusal(self.status, &self.facts, &self.body, &self.origin)
+    }
+}
+
+/// The seconds a 429's `Retry-After` asks to wait, in seconds or as an HTTP
+/// date, for a change that isn't retried and reports the wait instead.
 pub(super) fn retry_after_seconds(response: &reqwest::Response) -> u64 {
     response
         .headers()
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|value| super::error_body::retry_after_secs(value, std::time::SystemTime::now()))
         .unwrap_or(1)
-}
-
-pub(super) fn parse_retry_after(response: &reqwest::Response) -> u64 {
-    parse_retry_after_header(
-        response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok()),
-    )
-}
-
-fn parse_retry_after_header(value: Option<&str>) -> u64 {
-    value
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1)
-        .min(RETRY_MAX_DELAY.as_secs())
 }
 
 /// Exponential backoff with capped delay.
@@ -1201,10 +1305,95 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_seconds_are_capped_to_the_transport_backoff_limit() {
+    fn a_rate_limit_is_sat_out_up_to_a_minute_once() {
+        let facts = |secs| AnswerFacts {
+            retry_after_secs: Some(secs),
+            ..AnswerFacts::default()
+        };
+        let mut waited_long = false;
         assert_eq!(
-            parse_retry_after_header(Some("315360000")),
-            RETRY_MAX_DELAY.as_secs()
+            rate_limit_wait(&facts(5), &mut waited_long),
+            Some(Duration::from_secs(5))
         );
+        assert!(!waited_long);
+        assert_eq!(
+            rate_limit_wait(&facts(45), &mut waited_long),
+            Some(Duration::from_secs(45))
+        );
+        assert!(waited_long);
+        assert_eq!(rate_limit_wait(&facts(45), &mut waited_long), None);
+        assert_eq!(
+            rate_limit_wait(&facts(10), &mut waited_long),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(rate_limit_wait(&facts(61), &mut false), None);
+        assert_eq!(
+            rate_limit_wait(&AnswerFacts::default(), &mut false),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn one_long_rate_limit_wait_is_sat_out_and_a_second_is_reported() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _lock = env_lock();
+        let _env = ScopedEnv::set(&[("LPM_RETRY_BACKOFF_MS_OVERRIDE", "1")]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/paced-once"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/paced-once"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/paced-twice"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let client = RegistryClient::new().with_base_url(server.uri());
+
+            let once = client
+                .send_with_retry(
+                    client
+                        .build_get(&format!("{}/paced-once", server.uri()))
+                        .await
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(once.status(), reqwest::StatusCode::OK);
+
+            let twice = client
+                .send_with_retry(
+                    client
+                        .build_get(&format!("{}/paced-twice", server.uri()))
+                        .await
+                        .unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    twice,
+                    LpmError::RateLimited {
+                        retry_after_secs: 30
+                    }
+                ),
+                "{twice:?}"
+            );
+            server.verify().await;
+        });
     }
 }

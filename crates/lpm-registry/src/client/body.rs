@@ -278,46 +278,42 @@ pub(super) async fn read_capped_error_text(mut response: reqwest::Response) -> S
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// The firewall or entitlement refusal an lpm.dev Worker's 403 names, with
+/// every field it sends cleaned for one terminal row, as any registry text is.
 pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let error = json_string_field(&value, "error")?;
+    let text = |key: &str, max_chars: usize| {
+        json_string_field(&value, key)
+            .map(|text| lpm_common::sanitize_server_text(text, max_chars))
+            .filter(|text| !text.is_empty())
+    };
+    let message = || {
+        text("message", 600)
+            .unwrap_or_else(|| "A Pro account or active org membership is required.".to_owned())
+    };
 
     match error {
-        "blocked_by_lpm_firewall" => {
-            let package = json_string_field(&value, "package").unwrap_or("requested package");
-            let verdict = json_string_field(&value, "verdict").unwrap_or("unknown");
-            let reason = json_string_field(&value, "reason")
-                .unwrap_or("the registry policy refused this download");
-            Some(LpmError::NpmFirewallBlocked(Box::new(
-                lpm_common::NpmFirewallBlockedErrorContext {
-                    package: package.to_owned(),
-                    verdict: verdict.to_owned(),
-                    reason: reason.to_owned(),
-                    decision_id: json_string_field(&value, "decisionId").map(str::to_owned),
-                    match_source: json_string_field(&value, "matchSource").map(str::to_owned),
-                },
-            )))
-        }
-        "upstream_proxy_entitlement_required" => {
-            let message = json_string_field(&value, "message")
-                .unwrap_or("A Pro account or active org membership is required.");
-            Some(LpmError::UpstreamProxyEntitlementRequired {
-                message: message.to_owned(),
-                reason: json_string_field(&value, "reason").map(str::to_owned),
-                entitlement_source: json_string_field(&value, "entitlementSource")
-                    .map(str::to_owned),
-            })
-        }
-        "npm_firewall_entitlement_required" => {
-            let message = json_string_field(&value, "message")
-                .unwrap_or("A Pro account or active org membership is required.");
-            Some(LpmError::NpmFirewallEntitlementRequired {
-                message: message.to_owned(),
-                reason: json_string_field(&value, "reason").map(str::to_owned),
-                entitlement_source: json_string_field(&value, "entitlementSource")
-                    .map(str::to_owned),
-            })
-        }
+        "blocked_by_lpm_firewall" => Some(LpmError::NpmFirewallBlocked(Box::new(
+            lpm_common::NpmFirewallBlockedErrorContext {
+                package: text("package", 214).unwrap_or_else(|| "requested package".to_owned()),
+                verdict: text("verdict", 64).unwrap_or_else(|| "unknown".to_owned()),
+                reason: text("reason", 600)
+                    .unwrap_or_else(|| "the registry policy refused this download".to_owned()),
+                decision_id: text("decisionId", 120),
+                match_source: text("matchSource", 120),
+            },
+        ))),
+        "upstream_proxy_entitlement_required" => Some(LpmError::UpstreamProxyEntitlementRequired {
+            message: message(),
+            reason: text("reason", 600),
+            entitlement_source: text("entitlementSource", 120),
+        }),
+        "npm_firewall_entitlement_required" => Some(LpmError::NpmFirewallEntitlementRequired {
+            message: message(),
+            reason: text("reason", 600),
+            entitlement_source: text("entitlementSource", 120),
+        }),
         _ => None,
     }
 }

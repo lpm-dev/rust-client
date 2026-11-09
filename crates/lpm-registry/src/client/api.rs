@@ -1,5 +1,6 @@
 use super::transport::{
-    Answered, FailedResponse, MAX_RETRIES, backoff_delay, retry_after_seconds, version_exists_error,
+    Answered, FailedResponse, MAX_RETRIES, backoff_delay, publish_refusal_is_version_exists,
+    retry_after_seconds, version_exists_error,
 };
 use super::*;
 
@@ -134,29 +135,13 @@ fn is_coded_refusal(body: &str) -> bool {
 }
 
 /// The error a refusal of a publish's upload is, as the publish's own would
-/// read: `VERSION_EXISTS` as the version existing, anything else with its
-/// status, message and code.
-fn publish_upload_refusal(status: u16, body: &str, version: &str) -> LpmError {
-    let json = serde_json::from_str::<serde_json::Value>(body).ok();
-    let text = |field: &str| {
-        json.as_ref()
-            .and_then(|json| json.get(field))
-            .and_then(serde_json::Value::as_str)
-    };
-    let code = text("code");
-    if code == Some("VERSION_EXISTS") {
+/// read: `VERSION_EXISTS` as the version existing, anything else as the
+/// registry's refusal, with its status, message, code and request id.
+fn publish_upload_refusal(failed: FailedResponse, version: &str) -> LpmError {
+    if failed.status == 403 && publish_refusal_is_version_exists(&failed.body, version) {
         return version_exists_error(version);
     }
-    let status_text = reqwest::StatusCode::from_u16(status)
-        .map_or_else(|_| status.to_string(), |status| status.to_string());
-    let error = text("error").map_or_else(
-        || format!("HTTP {status_text}"),
-        |error| lpm_common::sanitize_terminal_inline(error).into_owned(),
-    );
-    LpmError::Registry(match code {
-        Some(code) => format!("publish failed ({status_text}): {error} [{code}]"),
-        None => format!("publish failed ({status_text}): {error}"),
-    })
+    failed.into_error()
 }
 
 /// The error a tarball upload that got no answer is, without its URL: a
@@ -280,14 +265,18 @@ impl RegistryClient {
             .get(destination.as_url().clone())
             .header("Accept", "application/json");
         let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
-        let response = self.send_with_retry_with_npmrc_auth(req, auth).await.map_err(|error| {
-            match error {
+        // A search sends the .npmrc credential for its registry, never the
+        // LPM session, so even when that registry is the LPM host a missing
+        // credential is .npmrc's to supply.
+        let response = self
+            .send_with_retry_with_npmrc_auth(req, auth)
+            .await
+            .map_err(|error| match error {
                 LpmError::AuthRequired => LpmError::Registry(
                     "search authentication failed. Configure credentials in .npmrc for the selected npm-compatible registry.".into(),
                 ),
                 error => error,
-            }
-        })?;
+            })?;
         let envelope: NpmSearchEnvelope =
             parse_capped_api_json(response, &format!("response from {}", destination.as_str()))
                 .await?;
@@ -456,9 +445,7 @@ impl RegistryClient {
                     .send_with_retry_keeping_status(self.build_get(&url).await?)
                     .await?
                 {
-                    Answered::Failed(FailedResponse { status: 401, .. }) => {
-                        Err(LpmError::AuthRequired)
-                    }
+                    Answered::Failed(failed) if failed.status == 401 => Err(failed.into_error()),
                     answer => Ok(answer),
                 }
             })
@@ -467,8 +454,8 @@ impl RegistryClient {
             Answered::Success(response) => response,
             Answered::Failed(FailedResponse {
                 status,
-                retry_after_secs,
                 body,
+                facts,
                 ..
             }) => {
                 let json = serde_json::from_str::<serde_json::Value>(&body).ok();
@@ -488,7 +475,9 @@ impl RegistryClient {
                     code: text("code"),
                     error,
                     body,
-                    retry_after_secs,
+                    retry_after_secs: facts.retry_after_secs,
+                    request_id: facts.request_id,
+                    notice: facts.notice,
                     registry: self.base_url.clone(),
                 });
             }
@@ -540,9 +529,7 @@ impl RegistryClient {
                     request = request.bearer_auth(bearer);
                 }
                 match self.send_with_retry_keeping_status(request).await? {
-                    Answered::Failed(FailedResponse { status: 401, .. }) => {
-                        Err(LpmError::AuthRequired)
-                    }
+                    Answered::Failed(failed) if failed.status == 401 => Err(failed.into_error()),
                     answer => Ok(answer),
                 }
             })
@@ -554,9 +541,7 @@ impl RegistryClient {
                 body,
                 ..
             }) if !is_coded_refusal(&body) => return Ok(None),
-            Answered::Failed(FailedResponse { status, body, .. }) => {
-                return Err(publish_upload_refusal(status, &body, version));
-            }
+            Answered::Failed(failed) => return Err(publish_upload_refusal(failed, version)),
         };
         let upload: PublishUpload =
             parse_capped_api_json(response, "publish upload response").await?;
@@ -1120,16 +1105,15 @@ impl RegistryClient {
             self.base_url,
             urlencoding::encode(domain)
         );
-        let request = self
-            .build_get_with_posture(&url, AuthPosture::SessionRequired)
-            .await?;
-        let response = self.send_once_preserving_status(request).await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(LpmError::Http {
-                status: status.as_u16(),
-                message: "tunnel diagnostic lookup failed".into(),
-            });
+        let request = super::transport::build_request(
+            self.build_get_with_posture(&url, AuthPosture::SessionRequired)
+                .await?,
+        )?;
+        let sent = request.headers().clone();
+        let response = self.send_built_once_preserving_status(request).await?;
+        if !response.status().is_success() {
+            let origin = self.registry_origin(response.url());
+            return Err(super::transport::answer_refusal(&origin, response, &sent).await);
         }
         parse_capped_api_json(response, "tunnel diagnostic lookup response").await
     }
@@ -1156,12 +1140,18 @@ impl PublishPreflightVerdict {
                 status,
                 body,
                 retry_after_secs,
+                request_id,
+                notice,
                 registry,
                 ..
             } => Err(super::transport::lpm_refusal(
                 status,
                 &body,
-                retry_after_secs,
+                super::transport::LpmRefusalHeaders {
+                    retry_after_secs,
+                    request_id: request_id.as_deref(),
+                    notice: notice.as_deref(),
+                },
                 &registry,
             )),
         }

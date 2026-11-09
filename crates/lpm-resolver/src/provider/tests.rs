@@ -2499,3 +2499,44 @@ fn metadata_parsers_keep_merged_selection_separate_from_latest_hints() {
         }
     }
 }
+
+#[test]
+fn an_unpublished_workspace_member_falls_back_to_its_workspace_copy_on_a_404() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let npm_server = rt.block_on(async {
+        let npm_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws-unpublished"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({ "error": "Not found" })),
+            )
+            .mount(&npm_server)
+            .await;
+        npm_server
+    });
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(None),
+    );
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+        .with_route_mode(RouteMode::Direct);
+    let pkg = ResolverPackage::npm("ws-unpublished");
+    let key = CanonicalKey::from(&pkg);
+    let mut workspace = make_info(&["2.0.0"], vec![], vec![], vec![]);
+    workspace.versions_complete = false;
+    workspace
+        .workspace_versions
+        .insert(NpmVersion::parse("2.0.0").unwrap());
+    provider.cache.insert(key.clone(), Arc::new(workspace));
+
+    provider
+        .direct_fetch_and_cache(&pkg)
+        .expect("a 404 for a workspace member must fall back to the workspace copy");
+
+    assert!(provider.cache.get(&key).unwrap().versions_complete);
+}

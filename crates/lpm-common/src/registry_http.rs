@@ -31,6 +31,8 @@ impl RegistryKind {
 pub enum RegistryBodyKind {
     Json,
     Html,
+    /// An XML error, as object storage (S3, R2, GCS) answers.
+    Xml,
     Text,
     Empty,
 }
@@ -112,6 +114,7 @@ impl RegistryHttpError {
         let host = self.registry_host();
         let npmrc_token = format!("//{host}/:_authToken");
         match (self.status, self.registry_kind) {
+            (401, RegistryKind::Lpm) if self.code.is_some() && self.message_from_registry => None,
             (401, RegistryKind::Lpm) => {
                 Some("Run `lpm login`, or set LPM_TOKEN to a valid token.".into())
             }
@@ -192,9 +195,15 @@ impl fmt::Display for RegistryHttpError {
                 self.registry_host(),
                 self.status_line(),
                 self.message
-            )
+            )?;
         } else {
-            f.write_str(&self.message)
+            f.write_str(&self.message)?;
+        }
+        match self.retry_after_secs {
+            Some(wait) if matches!(self.status, 429 | 503) => {
+                write!(f, " (retry after {wait}s)")
+            }
+            _ => Ok(()),
         }
     }
 }

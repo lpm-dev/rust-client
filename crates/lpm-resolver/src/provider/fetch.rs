@@ -189,8 +189,9 @@ impl LpmDependencyProvider {
                 };
                 let metadata = match metadata_result {
                     Ok(metadata) => metadata,
-                    Err(lpm_common::LpmError::NotFound(_))
-                        if activate_workspace_fallback(&self.cache, &key).is_some() =>
+                    Err(error)
+                        if error.is_not_found()
+                            && activate_workspace_fallback(&self.cache, &key).is_some() =>
                     {
                         self.available_versions_cache
                             .lock()

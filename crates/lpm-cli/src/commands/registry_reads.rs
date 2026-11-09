@@ -211,6 +211,9 @@ pub async fn revalidate_routed_package_metadata(
                 .await
         }
     };
+    // These reads send the .npmrc credential for their registry, never the
+    // LPM session, so even when that registry is the LPM host a missing
+    // credential is .npmrc's to supply.
     let metadata = result.map_err(|error| match error {
         LpmError::AuthRequired => LpmError::Registry(
             "info authentication failed. Configure credentials in .npmrc for the selected npm-compatible registry.".into(),

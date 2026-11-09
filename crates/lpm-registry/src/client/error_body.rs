@@ -2,8 +2,9 @@
 //!
 //! Registries put their message in different fields: npm's convention is a
 //! JSON `error` string, others use `message`, `detail` (RFC 7807) or
-//! `reason`. lpm.dev adds a machine-readable `code`, and its older Worker
-//! answers put a snake_case code in `error` with the message in `message`.
+//! `reason`, and object storage answers XML with `<Code>` and `<Message>`.
+//! lpm.dev adds a machine-readable `code`, and its older Worker answers put
+//! a snake_case code in `error` with the message in `message`.
 //! Everything a registry sends is untrusted, so the message is sanitized
 //! for one terminal row and bounded before it goes anywhere.
 
@@ -20,6 +21,16 @@ const MAX_MESSAGE_CHARS: usize = 600;
 const MAX_TOKEN_CHARS: usize = 120;
 /// The most of an error body read; the rest is dropped, not the message.
 pub(super) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// lpm.dev's 401 codes for a kind of token no session refresh changes: an
+/// organization token, a token limited to one purpose, a vault CI credential.
+/// Its other 401s (missing, expired, revoked) may be a stale session, which
+/// `AuthRequired` refreshes.
+const LPM_UNAUTHORIZED_BEYOND_REFRESH: [&str; 4] = [
+    "ORG_TOKEN_UNAVAILABLE",
+    "ORG_TOKEN_CREATOR_UNAUTHORIZED",
+    "TOKEN_SCOPE_RESTRICTED",
+    "VAULT_CREDENTIAL_INVALID",
+];
 
 /// What an error answer's headers say, read before its body is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,13 +42,21 @@ pub(super) struct AnswerFacts {
 }
 
 impl AnswerFacts {
-    pub(super) fn from_headers(headers: &HeaderMap) -> Self {
+    /// What an error answer's `headers` say. `redact` takes the request's
+    /// credentials out of the text a server controls, as an echoed bearer in
+    /// a notice, before it's cleaned and cut, so no part of one survives.
+    pub(super) fn from_headers(headers: &HeaderMap, redact: impl Fn(&mut String)) -> Self {
         let text = |name: &str| {
             headers
                 .get(name)
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+        };
+        let shown = |value: &str, max_chars: usize| {
+            let mut value = value.to_owned();
+            redact(&mut value);
+            sanitize_server_text(&value, max_chars)
         };
         Self {
             content_type: text("content-type").map(|value| value.to_ascii_lowercase()),
@@ -49,8 +68,8 @@ impl AnswerFacts {
             ]
             .into_iter()
             .find_map(text)
-            .map(|id| sanitize_server_text(id, MAX_TOKEN_CHARS)),
-            notice: text("npm-notice").map(|notice| sanitize_server_text(notice, 300)),
+            .map(|id| shown(id, MAX_TOKEN_CHARS)),
+            notice: text("npm-notice").map(|notice| shown(notice, 300)),
             retry_after_secs: text("retry-after")
                 .and_then(|value| retry_after_secs(value, SystemTime::now())),
         }
@@ -127,20 +146,43 @@ fn string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> 
 
 fn body_kind(facts: &AnswerFacts, body: &str) -> RegistryBodyKind {
     let trimmed = body.trim_start();
+    let content_type = facts.content_type.as_deref().unwrap_or_default();
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_end();
     if trimmed.is_empty() {
         RegistryBodyKind::Empty
-    } else if facts
-        .content_type
-        .as_deref()
-        .is_some_and(|kind| kind.starts_with("text/html"))
-        || trimmed.starts_with('<')
-    {
+    } else if media_type.ends_with("/xml") || media_type.ends_with("+xml") {
+        RegistryBodyKind::Xml
+    } else if media_type == "text/html" {
+        RegistryBodyKind::Html
+    } else if trimmed.starts_with("<?xml") || trimmed.starts_with("<Error>") {
+        RegistryBodyKind::Xml
+    } else if trimmed.starts_with('<') {
         RegistryBodyKind::Html
     } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
         RegistryBodyKind::Json
     } else {
         RegistryBodyKind::Text
     }
+}
+
+/// The text of the first `<name>` element in an XML error, unescaped. Object
+/// storage errors are flat, so no parser is needed to find it.
+fn xml_element(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&format!("</{name}>"))? + start;
+    let text = body[start..end].trim();
+    (!text.is_empty()).then(|| {
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    })
 }
 
 fn status_phrase(status: u16) -> &'static str {
@@ -190,6 +232,15 @@ pub(super) fn decode_registry_error(
             Err(_) => kind = RegistryBodyKind::Text,
         }
     }
+    if kind == RegistryBodyKind::Xml {
+        code = xml_element(body, "Code").and_then(|text| clean_code(&text));
+        message = xml_element(body, "Message")
+            .map(|text| sanitize_server_text(&text, MAX_MESSAGE_CHARS))
+            .filter(|text| !text.is_empty());
+        if let Some(id) = xml_element(body, "RequestId") {
+            request_id = request_id.or_else(|| Some(sanitize_server_text(&id, MAX_TOKEN_CHARS)));
+        }
+    }
     if kind == RegistryBodyKind::Text {
         message = body
             .lines()
@@ -209,6 +260,16 @@ pub(super) fn decode_registry_error(
             "{host} answered HTTP {status} {} with an HTML page instead of a registry response, which usually means a proxy, firewall or CDN answered.",
             status_phrase(status)
         ),
+        RegistryBodyKind::Xml => match &code {
+            Some(code) => format!(
+                "{host} answered HTTP {status} {} with the storage error {code}.",
+                status_phrase(status)
+            ),
+            None => format!(
+                "{host} answered HTTP {status} {} with an XML error instead of a registry response.",
+                status_phrase(status)
+            ),
+        },
         _ => format!(
             "{host} answered HTTP {status} {} without saying why.",
             status_phrase(status)
@@ -224,7 +285,10 @@ pub(super) fn decode_registry_error(
         message_from_registry,
         body_kind: kind,
         request_id: request_id.filter(|id| !id.is_empty()),
-        retry_after_secs: facts.retry_after_secs,
+        // Only a rate limit or an unavailable server says when to come back.
+        retry_after_secs: facts
+            .retry_after_secs
+            .filter(|_| matches!(status, 429 | 503)),
         notice: facts.notice.clone(),
         subject: None,
     }
@@ -233,7 +297,7 @@ pub(super) fn decode_registry_error(
 /// The error a registry's non-success answer is. A 403 from lpm.dev that
 /// names one of its firewall or entitlement codes keeps its typed error;
 /// no other registry can produce those, so a third party can't pose as
-/// LPM's firewall. A 429 is a rate limit with the full wait it asked for.
+/// LPM's firewall. A 429 keeps the full wait it asked for.
 pub(super) fn registry_refusal(
     status: u16,
     facts: &AnswerFacts,
@@ -246,12 +310,36 @@ pub(super) fn registry_refusal(
     {
         return error;
     }
-    if status == 429 {
+    let answer = decode_registry_error(status, facts, body, origin);
+    // A rate limit the registry explains keeps its explanation, such as a
+    // quota and whom to ask; `is_rate_limited` and its `rate_limited` code
+    // hold either way.
+    if status == 429 && !answer.message_from_registry && answer.code.is_none() {
         return LpmError::RateLimited {
             retry_after_secs: facts.retry_after_secs.unwrap_or(1),
         };
     }
-    LpmError::RegistryHttp(Box::new(decode_registry_error(status, facts, body, origin)))
+    LpmError::RegistryHttp(Box::new(answer))
+}
+
+/// The error a 401 is. From lpm.dev it's `AuthRequired`, which refreshes the
+/// session and retries, unless its code names a kind of token no refresh
+/// changes; then the registry's reason is what the user needs to read. From
+/// another registry it's that registry's refusal.
+pub(super) fn unauthorized(facts: &AnswerFacts, body: &str, origin: &RegistryOrigin) -> LpmError {
+    if origin.kind != RegistryKind::Lpm {
+        return registry_refusal(401, facts, body, origin);
+    }
+    let answer = decode_registry_error(401, facts, body, origin);
+    if answer
+        .code
+        .as_deref()
+        .is_some_and(|code| LPM_UNAUTHORIZED_BEYOND_REFRESH.contains(&code))
+    {
+        LpmError::RegistryHttp(Box::new(answer))
+    } else {
+        LpmError::AuthRequired
+    }
 }
 
 #[cfg(test)]
@@ -391,7 +479,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("cf-ray", "8f00-IAD".parse().unwrap());
         headers.insert("npm-notice", "Maintenance at 02:00 UTC".parse().unwrap());
-        let facts = AnswerFacts::from_headers(&headers);
+        let facts = AnswerFacts::from_headers(&headers, |_| {});
         assert_eq!(facts.request_id.as_deref(), Some("8f00-IAD"));
         assert_eq!(facts.notice.as_deref(), Some("Maintenance at 02:00 UTC"));
     }
@@ -420,6 +508,43 @@ mod tests {
     }
 
     #[test]
+    fn keeps_a_rate_limits_explanation_and_its_wait() {
+        let facts = AnswerFacts {
+            retry_after_secs: Some(3600),
+            ..json()
+        };
+        let error = registry_refusal(
+            429,
+            &facts,
+            r#"{"error":"Your organization used its monthly download quota. Ask its administrator to raise it.","code":"QUOTA_EXHAUSTED"}"#,
+            &custom(),
+        );
+        assert!(error.is_rate_limited());
+        assert_eq!(error.error_code(), "rate_limited");
+        let LpmError::RegistryHttp(answer) = error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(answer.code.as_deref(), Some("QUOTA_EXHAUSTED"));
+        assert!(answer.message.starts_with("Your organization used"));
+        assert_eq!(answer.retry_after_secs, Some(3600));
+    }
+
+    #[test]
+    fn takes_the_requests_credentials_out_of_header_text() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "npm-notice",
+            "rejected token lpm_secret123".parse().unwrap(),
+        );
+        headers.insert("x-request-id", "lpm_secret123-7f".parse().unwrap());
+        let facts = AnswerFacts::from_headers(&headers, |text| {
+            *text = text.replace("lpm_secret123", "<redacted>");
+        });
+        assert_eq!(facts.notice.as_deref(), Some("rejected token <redacted>"));
+        assert_eq!(facts.request_id.as_deref(), Some("<redacted>-7f"));
+    }
+
+    #[test]
     fn reports_the_full_wait_a_rate_limit_asked_for() {
         let facts = AnswerFacts {
             retry_after_secs: Some(3600),
@@ -430,6 +555,89 @@ mod tests {
             LpmError::RateLimited {
                 retry_after_secs: 3600
             }
+        ));
+    }
+
+    #[test]
+    fn reads_an_object_storage_xml_error_instead_of_calling_it_html() {
+        let facts = AnswerFacts {
+            content_type: Some("application/xml".into()),
+            ..AnswerFacts::default()
+        };
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>Request has expired &amp; can&apos;t be used</Message><RequestId>R2-7f</RequestId></Error>";
+        let answer = decode_registry_error(403, &facts, body, &custom());
+        assert_eq!(answer.body_kind, RegistryBodyKind::Xml);
+        assert_eq!(answer.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(answer.message, "Request has expired & can't be used");
+        assert_eq!(answer.request_id.as_deref(), Some("R2-7f"));
+
+        let sniffed = decode_registry_error(
+            404,
+            &AnswerFacts::default(),
+            "<Error><Code>NoSuchKey</Code></Error>",
+            &custom(),
+        );
+        assert_eq!(sniffed.body_kind, RegistryBodyKind::Xml);
+        assert!(!sniffed.message_from_registry);
+        assert_eq!(
+            sniffed.message,
+            "npm.example.com answered HTTP 404 Not Found with the storage error NoSuchKey."
+        );
+    }
+
+    #[test]
+    fn keeps_a_wait_only_where_a_status_means_come_back_later() {
+        let facts = AnswerFacts {
+            retry_after_secs: Some(30),
+            ..AnswerFacts::default()
+        };
+        assert_eq!(
+            decode_registry_error(503, &facts, "", &lpm()).retry_after_secs,
+            Some(30)
+        );
+        assert_eq!(
+            decode_registry_error(403, &facts, "", &lpm()).retry_after_secs,
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_lpm_401s_a_refresh_cannot_fix_as_the_registrys_reason() {
+        for code in LPM_UNAUTHORIZED_BEYOND_REFRESH {
+            let body = serde_json::json!({
+                "error": "Whoever created this organization token no longer has the role it needs.",
+                "code": code,
+            })
+            .to_string();
+            let error = unauthorized(&json(), &body, &lpm());
+            assert!(
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 401 && answer.code.as_deref() == Some(code)),
+                "{code}: {error:?}"
+            );
+            assert!(error.is_lpm_credential_failure());
+            let LpmError::RegistryHttp(answer) = error else {
+                unreachable!()
+            };
+            assert_eq!(
+                answer.hint(),
+                None,
+                "the registry's message carries the advice"
+            );
+        }
+        for body in [
+            r#"{"error":"The lpm.dev token sent has expired.","code":"TOKEN_EXPIRED"}"#,
+            r#"{"error":"needs a token","code":"AUTH_REQUIRED"}"#,
+            "",
+            "<html>401</html>",
+        ] {
+            assert!(
+                matches!(unauthorized(&json(), body, &lpm()), LpmError::AuthRequired),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            unauthorized(&json(), r#"{"error":"bad token","code":"ORG_TOKEN_UNAVAILABLE"}"#, &custom()),
+            LpmError::RegistryHttp(answer) if answer.registry_kind == RegistryKind::Custom
         ));
     }
 

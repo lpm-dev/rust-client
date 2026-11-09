@@ -235,7 +235,9 @@ fn push_neutralized_control(
 
 /// C0/C1 controls and DEL, and the Unicode format characters that reorder or
 /// hide what a terminal shows (bidi embeddings, overrides, isolates and marks,
-/// zero-width space, word joiner, BOM) or break the row (line and paragraph
+/// zero-width space, word joiner, invisible operators, the Mongolian vowel
+/// separator, interlinear annotations, BOM, and the tag characters, which can
+/// carry a whole hidden ASCII message) or break the row (line and paragraph
 /// separators). Joiners U+200C/U+200D stay: scripts and emoji need them, and
 /// they can't reorder text.
 #[inline]
@@ -245,13 +247,16 @@ fn is_terminal_control(ch: char) -> bool {
         0x00..=0x1f
             | 0x7f..=0x9f
             | 0x061c
+            | 0x180e
             | 0x200b
             | 0x200e
             | 0x200f
             | 0x2028..=0x202e
-            | 0x2060
+            | 0x2060..=0x2064
             | 0x2066..=0x2069
             | 0xfeff
+            | 0xfff9..=0xfffb
+            | 0xe0000..=0xe007f
     )
 }
 
@@ -262,12 +267,39 @@ mod server_text_tests {
     #[test]
     fn neutralizes_reordering_and_invisible_format_characters() {
         for ch in [
-            '\u{202e}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}', '\u{200b}',
-            '\u{2060}', '\u{feff}', '\u{2028}', '\u{2029}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{061c}',
+            '\u{200b}',
+            '\u{2060}',
+            '\u{feff}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{180e}',
+            '\u{2061}',
+            '\u{2064}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e007f}',
         ] {
             let text = format!("evil{ch}gpj.exe");
             assert_eq!(sanitize_terminal_inline(&text), "evil?gpj.exe", "{ch:?}");
         }
+    }
+
+    #[test]
+    fn neutralizes_a_message_hidden_in_tag_characters() {
+        let hidden: String = "run evil"
+            .chars()
+            .map(|ch| char::from_u32(0xe0000 + ch as u32).unwrap())
+            .collect();
+        let shown = sanitize_server_text(&format!("denied{hidden}"), 100);
+        assert_eq!(shown, "denied????????");
     }
 
     #[test]

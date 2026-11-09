@@ -125,3 +125,31 @@ async fn a_registrys_message_cannot_drive_the_terminal() {
         "a registry's text must stay on its own row: {stderr}"
     );
 }
+
+#[tokio::test]
+async fn install_keeps_a_rate_limits_explanation_and_its_wait() {
+    let registry = MockRegistry::start().await;
+    refuse_metadata(
+        &registry,
+        "quota-widget",
+        ResponseTemplate::new(429)
+            .insert_header("retry-after", "3600")
+            .set_body_json(serde_json::json!({
+                "error": "Your organization used its monthly download quota. Ask its administrator to raise it.",
+                "code": "QUOTA_EXHAUSTED",
+            })),
+    )
+    .await;
+    let project = project_with("quota-widget");
+
+    let output = install(&project, &registry, true);
+
+    assert!(!output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], "rate_limited", "{json}");
+    assert_eq!(json["http_status"], 429);
+    assert_eq!(json["server_code"], "QUOTA_EXHAUSTED");
+    assert_eq!(json["retry_after_secs"], 3600);
+    let message = json["error"].as_str().unwrap();
+    assert!(message.contains("monthly download quota"), "{message}");
+}

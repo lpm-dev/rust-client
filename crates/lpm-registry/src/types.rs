@@ -1056,14 +1056,16 @@ pub enum PublishPreflightVerdict {
     Accepted(PublishPreflightResponse),
     /// The Registry refuses it: its HTTP status, its `code` where it gives
     /// one, its message, or `HTTP <status>` where its body has none, the
-    /// body as sent, which a request's failure reports, and a 429's
-    /// `Retry-After` in seconds.
+    /// body as sent, which a request's failure reports, the wait a 429 or
+    /// 503's `Retry-After` asks in seconds, its request id and `npm-notice`.
     Refused {
         status: u16,
         code: Option<String>,
         error: String,
         body: String,
-        retry_after_secs: u64,
+        retry_after_secs: Option<u64>,
+        request_id: Option<String>,
+        notice: Option<String>,
         /// The registry that refused it.
         registry: String,
     },
