@@ -20,6 +20,18 @@ pub const TLS_MATERIAL_FILE_SIZE_CAP_BYTES: u64 = 1024 * 1024;
 /// Maximum aggregate TLS material retained by one registry client bundle.
 pub const TLS_MATERIAL_AGGREGATE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The first `limit` bytes of the file at `path`, or all of it if it is
+/// shorter. A file of any size costs at most `limit` bytes.
+pub fn read_file_prefix(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let capacity = usize::try_from(limit.min(INITIAL_BUFFER_CAPACITY_BYTES))
+        .map_err(|_| io::Error::other("file prefix capacity is unsupported"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    std::fs::File::open(path)?
+        .take(limit)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Read at most `limit + 1` bytes from an arbitrary stream.
 ///
 /// This is intended for pipes and other readers that do not have meaningful
@@ -503,6 +515,18 @@ fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn a_file_prefix_is_the_first_bytes_of_a_file_of_any_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.js");
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_file_prefix(&path, 4).unwrap(), b"0123");
+        assert_eq!(read_file_prefix(&path, 10).unwrap(), b"0123456789");
+        assert_eq!(read_file_prefix(&path, 64).unwrap(), b"0123456789");
+        assert_eq!(read_file_prefix(&path, 0).unwrap(), b"");
+        assert!(read_file_prefix(&dir.path().join("missing.js"), 4).is_err());
+    }
 
     #[test]
     fn empty_and_ordinary_files_are_read() {

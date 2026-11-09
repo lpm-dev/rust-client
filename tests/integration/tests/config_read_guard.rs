@@ -190,10 +190,6 @@ impl RawReadAudit {
         matches!(
             (self.relative, function, operation),
             (
-                "crates/lpm-cli/src/build_state.rs",
-                "read_referenced_file",
-                "std::fs::read"
-            ) | (
                 "crates/lpm-cli/src/commands/audit/discovery.rs",
                 "detect_npm_lockfile_version",
                 "std::fs::read_to_string"
@@ -299,7 +295,7 @@ impl RawReadAudit {
                 ".read_to_end"
             ) | (
                 "crates/lpm-security/src/script_hash.rs",
-                "hash_delegate_graph",
+                "hash_delegate_file",
                 "std::fs::read"
             )
         )

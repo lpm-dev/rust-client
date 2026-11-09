@@ -1359,6 +1359,10 @@ pub fn read_manifest_repository(pkg_dir: &Path) -> Option<String> {
 /// marker so the model knows the slice is partial.
 pub const REFERENCED_SCRIPT_MAX_BYTES: usize = 32 * 1024;
 
+/// Bytes read past [`REFERENCED_SCRIPT_MAX_BYTES`]: enough to decode the
+/// character that straddles the cap and to know the file goes on.
+const REFERENCED_SCRIPT_READ_AHEAD: usize = 8;
+
 /// Embeddable file content for the advisor prompt. The runbook caps
 /// depth at 1 (no recursive require
 /// following) and scope to explicit safe-relative paths.
@@ -1432,7 +1436,14 @@ fn read_referenced_file(pkg_dir: &Path, rel_path: &str) -> Option<String> {
         return None;
     }
 
-    let bytes = std::fs::read(&canonical_target).ok()?;
+    // Decoding looks at most four bytes past a character's start, so the
+    // cap and a few more bytes decode the embedded prefix exactly, and any
+    // bytes beyond them mean the file is longer than the cap.
+    let bytes = lpm_common::read_file_prefix(
+        &canonical_target,
+        (REFERENCED_SCRIPT_MAX_BYTES + REFERENCED_SCRIPT_READ_AHEAD) as u64,
+    )
+    .ok()?;
 
     // Binary detection: any NUL byte in the first 4 KB pushes the
     // file out of the embed path. Most JavaScript / shell scripts
@@ -3604,6 +3615,58 @@ mod tests {
             content.contains("[truncated for prompt context]"),
             "truncation marker missing"
         );
+    }
+
+    #[test]
+    fn a_referenced_file_is_embedded_as_reading_it_whole_would_embed_it() {
+        // Only the cap and a few bytes are read; the embed must be what
+        // decoding and truncating the whole file gives, whatever bytes
+        // straddle the cap.
+        let whole = |bytes: &[u8]| {
+            let mut content = String::from_utf8_lossy(bytes).into_owned();
+            if content.len() > REFERENCED_SCRIPT_MAX_BYTES {
+                let mut cut = REFERENCED_SCRIPT_MAX_BYTES;
+                while cut > 0 && !content.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                content.truncate(cut);
+                content.push_str("\n... [truncated for prompt context]\n");
+            }
+            content
+        };
+        let cap = REFERENCED_SCRIPT_MAX_BYTES;
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for length in [cap - 1, cap, cap + 1, cap + 3, cap + 4, cap + 9, cap * 3] {
+            cases.push(vec![b'a'; length]);
+        }
+        for offset in 0..8 {
+            for tail in [
+                "é".as_bytes(),
+                "€".as_bytes(),
+                "😀".as_bytes(),
+                &[0xF0, 0x9F][..],
+                &[0xC3][..],
+                &[0xFF, 0xFE, 0xFD][..],
+                &[0xE2, 0x82, 0x28][..],
+            ] {
+                let mut bytes = vec![b'a'; cap - 4 + offset];
+                for _ in 0..4 {
+                    bytes.extend_from_slice(tail);
+                }
+                bytes.extend_from_slice(&[b'b'; 64]);
+                cases.push(bytes);
+            }
+        }
+        for bytes in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("install.js"), &bytes).unwrap();
+            assert_eq!(
+                read_referenced_file(dir.path(), "install.js").as_deref(),
+                Some(whole(&bytes).as_str()),
+                "length {}",
+                bytes.len()
+            );
+        }
     }
 
     #[test]
