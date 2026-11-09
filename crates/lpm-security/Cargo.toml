@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Security auditing, provenance verification, and trust policies for LPM"
 
 [dependencies]
+aho-corasick = "1"
 lpm-common = { workspace = true }
 lpm-extractor = { workspace = true }
 lpm-lockfile = { workspace = true }
