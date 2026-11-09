@@ -177,6 +177,12 @@ const SHADOWED_BINARIES: &[&str] = &[
     "python3", "ruby", "perl", "env", "cat", "ls", "rm", "cp", "mv", "mkdir", "chmod",
 ];
 
+/// Programs that start the lifecycle-script sandbox. `node_modules/.bin` sits
+/// ahead of the system directories on a lifecycle child's PATH, so a package
+/// bin with one of these names would stand in for the sandbox anywhere it is
+/// looked up by name. Compared case-insensitively for APFS and NTFS.
+const SANDBOX_LAUNCHERS: &[&str] = &["sandbox-exec"];
+
 /// Validate a bin entry name. Returns `Ok(())` if the name is acceptable,
 /// `Err(reason)` if it must be rejected entirely.
 /// Logs a warning (but does not reject) for names that shadow common system binaries.
@@ -188,6 +194,15 @@ const SHADOWED_BINARIES: &[&str] = &[
 pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
     validate_portable_command_name(name)
         .map_err(|error| format!("bin name \"{name}\" {}", error.reason()))?;
+
+    if SANDBOX_LAUNCHERS
+        .iter()
+        .any(|launcher| launcher.eq_ignore_ascii_case(name))
+    {
+        return Err(format!(
+            "bin name \"{name}\" is reserved for the lifecycle-script sandbox launcher"
+        ));
+    }
 
     // Warn (don't reject) for shadowing common system binaries
     if SHADOWED_BINARIES.contains(&name) {
