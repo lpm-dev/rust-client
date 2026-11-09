@@ -169,9 +169,9 @@ pub(super) fn probe_sandbox_backend_with_global(
                     // - macOS Seatbelt's `(deny default)` covers every
                     //   socket family unconditionally.
                     // - Windows AppContainer denies
-                    //   every socket family via the WFP layer once the
-                    //   capability list is empty — same coverage shape
-                    //   as macOS Seatbelt.
+                    //   every socket family via the WFP layer when no
+                    //   network capability is granted — same coverage
+                    //   shape as macOS Seatbelt.
                     // - Linux landlock V4 + seccomp-bpf
                     //   layered together: landlock denies BindTcp +
                     //   ConnectTcp, seccomp denies direct

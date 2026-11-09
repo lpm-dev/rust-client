@@ -242,7 +242,7 @@ pub(crate) enum BackendPosture {
     /// `deny_outbound_network = false`. Capability list contains
     /// `InternetClient`. Public posture: [`SandboxPosture::Default`].
     Default,
-    /// `deny_outbound_network = true`. Empty capability list.
+    /// `deny_outbound_network = true`. No network capability.
     /// Public posture: [`SandboxPosture::Strict`].
     Strict,
 }
@@ -462,8 +462,8 @@ impl Sandbox for AppContainerSandbox {
             .arg("--stdio-stderr")
             .arg(stdio_for_argv(cmd.stderr).as_str());
 
-        // Default posture grants InternetClient; Strict omits the
-        // flag for an empty capability list.
+        // Default posture grants InternetClient; Strict omits it, leaving
+        // no network capability.
         if matches!(self.posture, BackendPosture::Default) {
             helper_cmd.arg("--grant-internet-client");
         }
