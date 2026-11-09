@@ -807,6 +807,28 @@ impl SessionManager {
         Ok(secret)
     }
 
+    /// Read stored credentials again on the next request, in place of what
+    /// this manager found when it first looked.
+    ///
+    /// A long-running process, such as `lpm mcp serve`, calls this when a
+    /// request needed a login it didn't have, since the user may have run
+    /// `lpm login` or `lpm logout` after the process started. A `--token`
+    /// flag, `LPM_TOKEN`, or CI token stays in force. Returns whether stored
+    /// credentials will be read again.
+    pub fn reread_stored_credentials(&self) -> bool {
+        let _guard = self.classify_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());
+        if cached
+            .as_ref()
+            .is_some_and(|cached| !cached.source.is_locally_managed())
+        {
+            return false;
+        }
+        *cached = None;
+        self.classified.store(false, Ordering::Release);
+        true
+    }
+
     /// Clear the local stored session state (access + refresh + expiry
     /// metadata) and drop the in-memory cache. Used when the server
     /// authoritatively rejects the session.
@@ -1715,6 +1737,69 @@ mod tests {
         assert_eq!(crate::get_stored_access_token(registry), None);
         assert_eq!(crate::get_refresh_token(registry), None);
         assert_eq!(manager.current_bearer_lazy().unwrap(), None);
+    }
+
+    #[test]
+    fn rereading_stored_credentials_finds_a_login_made_after_the_first_lookup() {
+        let _env = token_classify_isolate();
+        let registry = "https://later-login.invalid";
+        let manager = SessionManager::new(registry, None);
+        assert_eq!(manager.current_bearer_lazy().unwrap(), None);
+
+        crate::set_token(registry, "later-access").expect("access token should store");
+        crate::set_refresh_token(registry, "later-refresh").expect("refresh token should store");
+        assert_eq!(
+            manager.current_bearer_lazy().unwrap(),
+            None,
+            "a manager reads stored credentials once until asked to read them again"
+        );
+
+        assert!(manager.reread_stored_credentials());
+        assert_eq!(
+            manager.current_bearer_lazy().unwrap().as_deref(),
+            Some("later-access")
+        );
+        assert_eq!(
+            manager.current_source().unwrap(),
+            Some(TokenSource::StoredSession)
+        );
+    }
+
+    #[test]
+    fn rereading_stored_credentials_forgets_a_login_removed_after_the_first_lookup() {
+        let _env = token_classify_isolate();
+        let registry = "https://later-logout.invalid";
+        crate::set_token(registry, "removed-access").expect("access token should store");
+        crate::set_refresh_token(registry, "removed-refresh").expect("refresh token should store");
+        let manager = SessionManager::new(registry, None);
+        assert_eq!(
+            manager.current_bearer_lazy().unwrap().as_deref(),
+            Some("removed-access")
+        );
+
+        crate::clear_login_state(registry).expect("logout should clear stored state");
+        assert!(manager.reread_stored_credentials());
+
+        assert_eq!(manager.current_bearer_lazy().unwrap(), None);
+    }
+
+    #[test]
+    fn rereading_stored_credentials_keeps_an_explicit_token() {
+        let _env = token_classify_isolate();
+        let registry = "https://explicit-token.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+        let manager = SessionManager::new(registry, Some("flag-token".into()));
+
+        assert!(!manager.reread_stored_credentials());
+
+        assert_eq!(
+            manager.current_bearer_lazy().unwrap().as_deref(),
+            Some("flag-token")
+        );
+        assert_eq!(
+            manager.current_source().unwrap(),
+            Some(TokenSource::ExplicitFlag)
+        );
     }
 
     #[test]

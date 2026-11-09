@@ -1,16 +1,22 @@
-//! Workflow tests for `lpm mcp setup / remove / status`.
+//! Workflow tests for `lpm mcp setup / remove / status / serve`.
 //!
 //! MCP setup writes server entries into existing well-known editor config
 //! files (Claude Code: `~/.claude.json`, Cursor: `~/.cursor/mcp.json`,
 //! etc.). Tests run under an isolated HOME so they don't touch the
-//! developer's real editor config.
+//! developer's real editor config. `lpm mcp serve` is driven over its stdio
+//! as an editor drives it, with the mock registry as the hosted MCP server.
 
 mod support;
 
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_with_registry};
-
-const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::sync::mpsc;
+use std::time::Duration;
+use support::auth_state::{SessionSeed, seed_sessions};
+use support::mock_registry::{MockRegistry, make_tarball};
+use support::{TempProject, lpm, lpm_spawnable_with_registry};
+use wiremock::matchers::{body_partial_json, header, method, path};
+use wiremock::{Mock, Request, ResponseTemplate};
 
 #[test]
 fn mcp_invalid_syntax_reports_usage_errors() {
@@ -71,7 +77,7 @@ fn mcp_setup_pins_the_launcher_before_project_path_lookup() {
     );
     assert!(result.status.success(), "{result:?}");
     assert!(std::path::Path::new(server["command"].as_str().unwrap()).is_absolute());
-    assert_eq!(server["env"]["LPM_CLI_PATH"], server["command"]);
+    assert!(server.get("env").is_none(), "{server}");
 }
 
 #[cfg(unix)]
@@ -123,195 +129,6 @@ fn mcp_rejects_relative_home_without_editing_project_configs() {
 }
 const HOSTILE_SERVER_NAME: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
-
-fn mcp_server_tarball(version: &str) -> Vec<u8> {
-    let script = format!(
-        "#!/usr/bin/env node\nconsole.log(`mcp-version:{version};cwd:${{process.cwd()}};auth:${{process.env.LPM_TOKEN ? \"present\" : \"missing\"}}`);\n"
-    );
-    make_tarball_from_pkg_json(
-        serde_json::json!({
-            "name": "@lpm-registry/mcp-server",
-            "version": version,
-            "bin": {
-                "lpm-mcp-server": "bin/mcp-server.js"
-            }
-        }),
-        &[("bin/mcp-server.js", script.as_bytes())],
-    )
-}
-
-fn mcp_server_tarball_with_blocked_lifecycle(version: &str) -> Vec<u8> {
-    let script = format!(
-        "#!/usr/bin/env node\nconsole.log(`mcp-version:{version};cwd:${{process.cwd()}};auth:${{process.env.LPM_TOKEN ? \"present\" : \"missing\"}}`);\n"
-    );
-    make_tarball_from_pkg_json(
-        serde_json::json!({
-            "name": "@lpm-registry/mcp-server",
-            "version": version,
-            "bin": {
-                "lpm-mcp-server": "bin/mcp-server.js"
-            },
-            "scripts": {
-                "install": "node -e \"process.exit(0)\""
-            }
-        }),
-        &[("bin/mcp-server.js", script.as_bytes())],
-    )
-}
-
-fn published_at(seconds_ago: i64) -> String {
-    use chrono::SecondsFormat;
-
-    (chrono::Utc::now() - chrono::Duration::seconds(seconds_ago))
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-fn mcp_runtime_root(project: &TempProject) -> std::path::PathBuf {
-    project.cache_dir().join("mcp/runtime")
-}
-
-fn expire_mcp_runtime(project: &TempProject) {
-    let marker = mcp_runtime_root(project).join("package.json");
-    let marker_file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&marker)
-        .expect("open MCP runtime freshness marker");
-    marker_file
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60))
-        .expect("expire MCP runtime freshness marker");
-    let metadata_cache = project.cache_dir().join("metadata");
-    if metadata_cache.exists() {
-        std::fs::remove_dir_all(metadata_cache)
-            .expect("clear registry metadata cache before refreshing MCP runtime");
-    }
-}
-
-async fn mount_mcp_server_versions(
-    registry: &MockRegistry,
-    versions: &[(&str, i64)],
-    latest: &str,
-) {
-    let mut version_metadata = serde_json::Map::new();
-    let mut publication_times = serde_json::Map::new();
-    let mut tarballs = Vec::with_capacity(versions.len());
-
-    for (version, seconds_ago) in versions {
-        let tarball = mcp_server_tarball(version);
-        version_metadata.insert(
-            (*version).to_string(),
-            serde_json::json!({
-                "name": "@lpm-registry/mcp-server",
-                "version": version,
-                "bin": {
-                    "lpm-mcp-server": "bin/mcp-server.js"
-                },
-                "dependencies": {},
-                "dist": {
-                    "tarball": registry.tarball_url("@lpm-registry/mcp-server", version),
-                    "integrity": compute_integrity(&tarball),
-                }
-            }),
-        );
-        publication_times.insert(
-            (*version).to_string(),
-            serde_json::Value::String(published_at(*seconds_ago)),
-        );
-        tarballs.push((*version, tarball));
-    }
-
-    registry
-        .with_package_metadata_and_tarballs(
-            "@lpm-registry/mcp-server",
-            serde_json::json!({
-                "name": "@lpm-registry/mcp-server",
-                "dist-tags": { "latest": latest },
-                "versions": version_metadata,
-                "time": publication_times,
-            }),
-            &tarballs,
-        )
-        .await;
-}
-
-async fn mount_mcp_server_without_integrity(
-    registry: &MockRegistry,
-    version: &str,
-    seconds_ago: i64,
-) {
-    let tarball = mcp_server_tarball(version);
-    let mut versions = serde_json::Map::new();
-    versions.insert(
-        version.to_string(),
-        serde_json::json!({
-            "name": "@lpm-registry/mcp-server",
-            "version": version,
-            "bin": {
-                "lpm-mcp-server": "bin/mcp-server.js"
-            },
-            "dependencies": {},
-            "dist": {
-                "tarball": registry.tarball_url(
-                    "@lpm-registry/mcp-server",
-                    version
-                ),
-            }
-        }),
-    );
-    let mut publication_times = serde_json::Map::new();
-    publication_times.insert(
-        version.to_string(),
-        serde_json::Value::String(published_at(seconds_ago)),
-    );
-    registry
-        .with_package_metadata_and_tarballs(
-            "@lpm-registry/mcp-server",
-            serde_json::json!({
-                "name": "@lpm-registry/mcp-server",
-                "dist-tags": { "latest": version },
-                "versions": versions,
-                "time": publication_times,
-            }),
-            &[(version, tarball)],
-        )
-        .await;
-}
-
-async fn mount_mcp_server_with_blocked_lifecycle(registry: &MockRegistry, version: &str) {
-    let tarball = mcp_server_tarball_with_blocked_lifecycle(version);
-    registry
-        .with_package_metadata_and_tarballs(
-            "@lpm-registry/mcp-server",
-            serde_json::json!({
-                "name": "@lpm-registry/mcp-server",
-                "dist-tags": { "latest": version },
-                "versions": {
-                    version: {
-                        "name": "@lpm-registry/mcp-server",
-                        "version": version,
-                        "bin": {
-                            "lpm-mcp-server": "bin/mcp-server.js"
-                        },
-                        "scripts": {
-                            "install": "node -e \"process.exit(0)\""
-                        },
-                        "dependencies": {},
-                        "dist": {
-                            "tarball": registry.tarball_url(
-                                "@lpm-registry/mcp-server",
-                                version
-                            ),
-                            "integrity": compute_integrity(&tarball),
-                        }
-                    }
-                },
-                "time": {
-                    version: published_at(48 * 60 * 60)
-                },
-            }),
-            &[(version, tarball)],
-        )
-        .await;
-}
 
 fn assert_hostile_server_name_is_inline_safe(context: &str, rendered: &str) {
     assert!(
@@ -491,8 +308,8 @@ fn mcp_setup_and_remove_use_slim_human_status() {
         "mcp setup must not use cliclack gutter output, got:\n{setup_stderr}",
     );
     assert!(
-        setup_stderr.contains(MCP_PACKAGE_SPEC),
-        "mcp setup must report the published package policy, got:\n{setup_stderr}"
+        setup_stderr.contains("Registry tools come from https://lpm.dev/mcp"),
+        "mcp setup must say where registry tools come from, got:\n{setup_stderr}"
     );
 
     let remove = lpm(&project)
@@ -522,7 +339,7 @@ fn mcp_setup_and_remove_use_slim_human_status() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently() {
+fn mcp_setup_writes_the_lpm_launcher_to_both_container_shapes_idempotently() {
     let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
     let claude_path = project.home().join(".claude.json");
     #[cfg(target_os = "macos")]
@@ -576,10 +393,7 @@ fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently(
             executable
         );
         assert_eq!(server["args"], serde_json::json!(["mcp", "serve"]));
-        assert_eq!(
-            server["env"],
-            serde_json::json!({ "LPM_CLI_PATH": command })
-        );
+        assert!(server.get("env").is_none(), "{server}");
     }
     assert_eq!(claude["mcpServers"].as_object().unwrap().len(), 2);
     assert_eq!(vscode["servers"].as_object().unwrap().len(), 2);
@@ -588,7 +402,7 @@ fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently(
 }
 
 #[test]
-fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_config() {
+fn mcp_setup_json_reports_the_launcher_it_wrote_and_the_registry_server() {
     let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
     let claude_path = project.home().join(".claude.json");
     std::fs::write(&claude_path, "{}").unwrap();
@@ -609,7 +423,6 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
         .unwrap_or_else(|error| panic!("stdout must be one JSON document: {error}\n{stdout}"));
     insta::assert_json_snapshot!(envelope, {
         ".command" => "[LPM_PATH]",
-        ".env.LPM_CLI_PATH" => "[LPM_PATH]",
     }, @r###"
     {
       "success": true,
@@ -617,17 +430,12 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
       "configured": [
         "Claude Code"
       ],
-      "package": "@lpm-registry/mcp-server",
-      "package_spec": "@lpm-registry/mcp-server@latest",
-      "version_policy": "latest-security-eligible",
       "command": "[LPM_PATH]",
       "args": [
         "mcp",
         "serve"
       ],
-      "env": {
-        "LPM_CLI_PATH": "[LPM_PATH]"
-      }
+      "registry_server": "https://lpm.dev/mcp"
     }
     "###);
 
@@ -637,281 +445,6 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
         config["mcpServers"]["lpm-registry"]["args"],
         envelope["args"]
     );
-}
-
-#[tokio::test]
-async fn mcp_serve_ignores_workspace_lockfile_and_security_overrides() {
-    let project = TempProject::empty(
-        r#"{
-            "name":"mcp",
-            "version":"1.0.0",
-            "lpm":{"minimumReleaseAge":0}
-        }"#,
-    );
-    let mut lockfile = lpm_lockfile::Lockfile::new();
-    lockfile.add_package(lpm_lockfile::LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "@lpm-registry/mcp-server".to_string(),
-        version: "0.1.0".to_string(),
-        integrity: Some(support::VALID_TEST_INTEGRITY.to_string()),
-        ..Default::default()
-    });
-    support::finalize_exact_lockfile_fixture(
-        &mut lockfile,
-        &[(
-            "@lpm-registry/mcp-server",
-            "@lpm-registry/mcp-server",
-            "0.1.0",
-        )],
-    );
-    lockfile
-        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
-        .expect("seed workspace lockfile");
-
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_versions(&registry, &[("1.0.0", 48 * 60 * 60)], "1.0.0").await;
-
-    let output = lpm_with_registry(&project, &registry.url())
-        .env("LPM_TOKEN", "workflow-mcp-token")
-        .args(["mcp", "serve"])
-        .output()
-        .expect("run isolated MCP launcher");
-
-    assert!(
-        output.status.success(),
-        "MCP launcher must ignore workspace install policy and lockfile:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("mcp-version:1.0.0"),
-        "MCP launcher must resolve independently of the workspace pin: {stdout}"
-    );
-    assert!(
-        stdout.contains(&format!(
-            "cwd:{}",
-            project
-                .path()
-                .canonicalize()
-                .expect("canonicalize project path")
-                .display()
-        )),
-        "the launched MCP server must still execute in the editor workspace: {stdout}"
-    );
-    assert!(
-        stdout.contains("auth:present"),
-        "the verified MCP server must receive the documented LPM_TOKEN environment: {stdout}"
-    );
-    assert!(
-        mcp_runtime_root(&project).join("lpm.lock").is_file(),
-        "the MCP launcher must use its dedicated verified runtime cache"
-    );
-    assert!(
-        !project.cache_dir().join("dlx").exists(),
-        "the managed MCP runtime must not be swept with ordinary dlx entries"
-    );
-}
-
-#[tokio::test]
-async fn mcp_serve_runs_the_newest_release_allowed_by_the_cooldown() {
-    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
-    lpm(&project)
-        .args(["config", "release-age", "--set", "1d"])
-        .assert()
-        .success();
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_versions(
-        &registry,
-        &[("1.0.0", 48 * 60 * 60), ("2.0.0", 60)],
-        "2.0.0",
-    )
-    .await;
-
-    let output = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .expect("run MCP launcher against a fresh latest release");
-
-    assert!(
-        output.status.success(),
-        "MCP launcher must fall back to a mature release:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("mcp-version:1.0.0"),
-        "MCP launcher must not bypass the release-age cooldown"
-    );
-}
-
-#[tokio::test]
-async fn mcp_serve_cold_install_reserves_stdout_when_lifecycle_scripts_are_blocked() {
-    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_with_blocked_lifecycle(&registry, "1.0.0").await;
-
-    let output = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .expect("run MCP launcher with a blocked lifecycle script");
-
-    assert!(
-        output.status.success(),
-        "MCP launcher must start after safely blocking lifecycle scripts:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let expected = format!(
-        "mcp-version:1.0.0;cwd:{};auth:missing\n",
-        project
-            .path()
-            .canonicalize()
-            .expect("canonicalize project path")
-            .display()
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        expected,
-        "the cold install must not write lifecycle reporting into MCP JSON-RPC stdout"
-    );
-}
-
-#[tokio::test]
-async fn mcp_serve_refuses_registry_metadata_without_integrity() {
-    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_without_integrity(&registry, "1.0.0", 48 * 60 * 60).await;
-
-    let output = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .expect("run MCP launcher against metadata without integrity");
-
-    assert!(
-        !output.status.success(),
-        "the managed MCP runtime must not trust an unhashed registry tarball:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Refusing to install an unverified registry tarball"),
-        "the failure must explain the integrity requirement, got:\n{stderr}"
-    );
-    assert!(
-        !mcp_runtime_root(&project).exists(),
-        "a rejected MCP runtime must never become active"
-    );
-}
-
-#[tokio::test]
-async fn mcp_serve_does_not_fallback_after_an_authentication_failure() {
-    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
-    let initial_registry = MockRegistry::start().await;
-    mount_mcp_server_versions(&initial_registry, &[("1.0.0", 48 * 60 * 60)], "1.0.0").await;
-    let initial = lpm_with_registry(&project, &initial_registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .expect("install the initial verified MCP runtime");
-    assert!(
-        initial.status.success(),
-        "initial MCP launch must succeed: {}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
-    expire_mcp_runtime(&project);
-
-    let auth_registry = MockRegistry::start().await;
-    auth_registry
-        .with_npm_package_error(
-            "@lpm-registry/mcp-server",
-            403,
-            serde_json::json!({ "error": "forbidden" }),
-        )
-        .await;
-    std::fs::write(
-        project.home().join(".npmrc"),
-        format!("@lpm-registry:registry={}/\n", auth_registry.url()),
-    )
-    .expect("write isolated user npmrc");
-    let rejected = lpm_with_registry(&project, &auth_registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .expect("refresh MCP runtime against an authentication failure");
-
-    assert!(
-        !rejected.status.success(),
-        "an authentication failure must fail closed instead of running stale code:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&rejected.stdout),
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    assert!(
-        !String::from_utf8_lossy(&rejected.stdout).contains("mcp-version:"),
-        "the cached MCP server must not execute after an authentication failure"
-    );
-    assert!(
-        !String::from_utf8_lossy(&rejected.stderr).contains("last verified version"),
-        "authentication failures must not be described as an outage fallback"
-    );
-}
-
-#[tokio::test]
-async fn mcp_serve_uses_the_last_verified_runtime_during_a_registry_outage() {
-    let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_versions(&registry, &[("1.0.0", 48 * 60 * 60)], "1.0.0").await;
-
-    let initial = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .expect("install the initial verified MCP runtime");
-    assert!(
-        initial.status.success(),
-        "initial MCP launch must succeed: {}",
-        String::from_utf8_lossy(&initial.stderr)
-    );
-    let initial_stderr = String::from_utf8_lossy(&initial.stderr);
-    assert!(
-        !initial_stderr.contains("Checking stored LPM"),
-        "the unattended MCP launcher must not inspect stored credentials:\n{initial_stderr}"
-    );
-
-    expire_mcp_runtime(&project);
-
-    let fallback = lpm_with_registry(&project, "http://127.0.0.1:9")
-        .args(["mcp", "serve"])
-        .output()
-        .expect("run MCP launcher during registry outage");
-
-    assert!(
-        fallback.status.success(),
-        "a transport outage must not prevent a verified cached launch:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&fallback.stdout),
-        String::from_utf8_lossy(&fallback.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&fallback.stdout).contains("mcp-version:1.0.0"),
-        "the last verified MCP server must execute during the outage"
-    );
-    let fallback_stderr = String::from_utf8_lossy(&fallback.stderr);
-    assert!(
-        fallback_stderr.contains("last verified version"),
-        "the launcher must report its stale-cache fallback on stderr, got:\n{fallback_stderr}"
-    );
-    assert!(
-        !fallback_stderr.contains("Checking stored LPM"),
-        "the unattended MCP launcher must never inspect stored credentials:\n{fallback_stderr}"
-    );
-    let installed: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            mcp_runtime_root(&project).join("node_modules/@lpm-registry/mcp-server/package.json"),
-        )
-        .expect("read retained MCP package manifest"),
-    )
-    .expect("parse retained MCP package manifest");
-    assert_eq!(installed["version"], "1.0.0");
 }
 
 // ─── unknown action ───────────────────────────────────────────────────
@@ -937,251 +470,475 @@ fn mcp_unknown_action_reports_usage_and_points_to_help() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn mcp_cached_runtime_does_not_use_caller_controlled_node() {
-    use std::os::unix::fs::PermissionsExt;
-    let project = TempProject::empty(r#"{"name":"mcp-runtime-boundary","version":"1.0.0"}"#);
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_versions(&registry, &[("1.0.0", 72 * 3600)], "1.0.0").await;
-    let first = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    project.write_file(
-        "node_modules/.bin/node",
-        "#!/bin/sh\nif [ -n \"$LPM_TOKEN\" ]; then printf intercepted > intercepted; fi\nexit 92\n",
-    );
-    let node = project.path().join("node_modules/.bin/node");
-    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let output = lpm_with_registry(&project, &registry.url())
-        .env("LPM_TOKEN", "dummy-mcp-token")
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(
-        !project.path().join("intercepted").exists(),
-        "caller Node received the managed runtime token"
-    );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("mcp-version:1.0.0"));
-    assert!(stdout.contains("auth:present"));
+// ─── serve ────────────────────────────────────────────────────────────
+
+/// How long a test waits for one answer from the server.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A running `lpm mcp serve`, driven over its stdio as an editor drives it.
+struct McpServer {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: mpsc::Receiver<String>,
+    next_id: u64,
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn mcp_ignores_inherited_project_paths_and_symlinks() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    let project = TempProject::empty(r#"{"name":"mcp-path-boundary","version":"1.0.0"}"#);
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_versions(&registry, &[("1.0.0", 72 * 3600)], "1.0.0").await;
-    let first = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    project.write_file(
-        "tools/node",
-        "#!/bin/sh\nprintf intercepted > intercepted\nexit 92\n",
-    );
-    std::fs::set_permissions(
-        project.path().join("tools/node"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    let external = tempfile::tempdir().unwrap();
-    symlink(project.path().join("tools"), external.path().join("alias")).unwrap();
-    for untrusted in [
-        std::path::PathBuf::from("tools"),
-        project.path().join("tools"),
-        external.path().join("alias"),
-    ] {
-        let path = std::env::join_paths(
-            std::iter::once(untrusted)
-                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-        )
-        .unwrap();
-        let output = lpm_with_registry(&project, &registry.url())
-            .env("PATH", path)
-            .env("LPM_TOKEN", "dummy-mcp-token")
+impl McpServer {
+    fn start(project: &TempProject, registry_url: &str) -> Self {
+        let mut command = lpm_spawnable_with_registry(project, registry_url);
+        command
             .args(["mcp", "serve"])
-            .output()
-            .unwrap();
-        assert!(
-            !project.path().join("intercepted").exists(),
-            "caller path reached managed execution"
+            .stdin(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("start lpm mcp serve");
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("server stdout");
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut server = Self {
+            child,
+            stdin,
+            lines,
+            next_id: 1,
+        };
+        let initialized = server.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "workflow-test", "version": "1.0.0" },
+            }),
         );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("auth:present"));
+        assert_eq!(initialized["result"]["serverInfo"]["name"], "lpm");
+        server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        server
     }
-}
 
-#[cfg(windows)]
-#[tokio::test]
-async fn mcp_ignores_node_commands_in_the_caller_directory() {
-    let project = TempProject::empty(r#"{"name":"mcp-cwd-boundary","version":"1.0.0"}"#);
-    let registry = MockRegistry::start().await;
-    mount_mcp_server_versions(&registry, &[("1.0.0", 72 * 3600)], "1.0.0").await;
-    let first = lpm_with_registry(&project, &registry.url())
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    project.write_file(
-        "node.cmd",
-        "@echo off\r\necho intercepted>intercepted\r\nexit /b 92\r\n",
-    );
-    let output = lpm_with_registry(&project, &registry.url())
-        .env("LPM_TOKEN", "dummy-mcp-token")
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(!project.path().join("intercepted").exists());
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("auth:present"));
-}
+    fn send(&mut self, message: &Value) {
+        let stdin = self.stdin.as_mut().expect("server stdin is open");
+        writeln!(stdin, "{message}").expect("write to the server");
+        stdin.flush().expect("flush to the server");
+    }
 
-#[tokio::test]
-async fn mcp_promoted_runtime_remains_reachable_during_store_pruning() {
-    let project = TempProject::empty(r#"{"name":"mcp-prune","version":"1.0.0"}"#);
-    let mock = MockRegistry::start().await;
-    mount_mcp_server_versions(&mock, &[("1.0.0", 72 * 3600)], "1.0.0").await;
-    let first = lpm_with_registry(&project, &mock.url())
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    lpm(&project)
-        .args(["cache", "prune", "--apply"])
-        .assert()
-        .success();
-    mock.server().reset().await;
-    let warm = lpm_with_registry(&project, &mock.url())
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(
-        warm.status.success(),
-        "prune removed the active runtime: {}",
-        String::from_utf8_lossy(&warm.stderr)
-    );
-    assert!(String::from_utf8_lossy(&warm.stdout).contains("mcp-version:1.0.0"));
-}
-
-#[tokio::test]
-async fn mcp_store_pruning_waits_until_the_active_server_finishes() {
-    let project = TempProject::empty(r#"{"name":"mcp-active-prune","version":"1.0.0"}"#);
-    let mock = MockRegistry::start().await;
-    let script = b"#!/usr/bin/env node\nconst fs=require('fs');fs.writeFileSync('ready','ready');const start=Date.now();const timer=setInterval(()=>{if(fs.existsSync('release')||Date.now()-start>10000){clearInterval(timer);try{fs.readFileSync(__filename);console.log('MCP_ALIVE')}catch(e){console.error(e.message);process.exitCode=31;}}},20);";
-    mock.with_manifest_package(serde_json::json!({"name":"@lpm-registry/mcp-server","version":"1.0.0","bin":{"lpm-mcp-server":"server.js"}}), &[("server.js", script)]).await;
-    let mut server = support::lpm_spawnable_with_registry(&project, &mock.url())
-        .args(["mcp", "serve"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !project.file_exists("ready") {
-        if server.try_wait().unwrap().is_some() || std::time::Instant::now() >= deadline {
-            let _ = server.kill();
-            let output = server.wait_with_output().unwrap();
-            panic!(
-                "server did not reach readiness: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(ANSWER_TIMEOUT)
+                .unwrap_or_else(|_| panic!("no answer to {method}"));
+            let message: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|error| panic!("stdout must carry only JSON-RPC: {error}: {line}"));
+            if message["id"] == json!(id) {
+                return message;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let mut prune = support::lpm_spawnable(&project)
-        .args(["cache", "prune", "--apply"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let waited = prune.try_wait().unwrap().is_none();
-    project.write_file("release", "done");
-    let output = server.wait_with_output().unwrap();
-    let pruned = prune.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+
+    fn tool_names(&mut self) -> Vec<String> {
+        self.request("tools/list", json!({}))["result"]["tools"]
+            .as_array()
+            .expect("a tool list")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The result of a tool call, and its text.
+    fn call(&mut self, name: &str, arguments: Value) -> (Value, String) {
+        let answer = self.request(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        );
+        let result = answer["result"].clone();
+        assert!(
+            !result.is_null(),
+            "{name} must answer with a result: {answer}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        (result, text)
+    }
+
+    /// Close stdin, as an editor does when it stops the server, and return
+    /// how it exited and what it wrote to stderr.
+    fn stop(mut self) -> (std::process::ExitStatus, String) {
+        drop(self.stdin.take());
+        let deadline = std::time::Instant::now() + ANSWER_TIMEOUT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the server") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server must exit when its stdin closes"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            std::io::Read::read_to_string(&mut pipe, &mut stderr).expect("read stderr");
+        }
+        (status, stderr)
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Answers a JSON-RPC request to the hosted MCP server with `result`, under
+/// the request's own id.
+fn rpc_result(result: Value) -> impl Fn(&Request) -> ResponseTemplate {
+    move |request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).expect("a JSON-RPC request");
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "result": result,
+        }))
+    }
+}
+
+/// Refuses a JSON-RPC request to the hosted MCP server with `status` and a
+/// JSON-RPC error saying `message`.
+fn rpc_refusal(status: u16, message: &'static str) -> impl Fn(&Request) -> ResponseTemplate {
+    move |request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).expect("a JSON-RPC request");
+        ResponseTemplate::new(status)
+            .insert_header("www-authenticate", "Bearer scope=\"read\"")
+            .set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "error": { "code": -32000, "message": message },
+            }))
+    }
+}
+
+fn registry_tool(name: &str) -> Value {
+    json!({
+        "name": name,
+        "description": format!("The registry's {name}."),
+        "inputSchema": { "type": "object", "properties": {} },
+    })
+}
+
+async fn mount_tool_listing(registry: &MockRegistry, tools: Value) {
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("mcp-method", "tools/list"))
+        .and(header("mcp-protocol-version", "2026-07-28"))
+        .respond_with(rpc_result(json!({ "tools": tools, "ttlMs": 3_600_000 })))
+        .mount(registry.server())
+        .await;
+}
+
+fn seed_login(project: &TempProject, registry: &MockRegistry, access: &str) {
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some(access),
+            refresh_token: Some("stored-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
     );
-    assert!(
-        pruned.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pruned.stderr)
-    );
-    assert!(
-        waited,
-        "pruning ran while the server still used store files"
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("MCP_ALIVE"));
 }
 
 #[tokio::test]
-async fn mcp_refresh_keeps_the_previous_runtime_when_its_default_executable_is_missing() {
-    let project = TempProject::empty(r#"{"name":"mcp-unusable-refresh","version":"1.0.0"}"#);
-    let mock = MockRegistry::start().await;
-    mount_mcp_server_versions(&mock, &[("1.0.0", 72 * 3600)], "1.0.0").await;
-    lpm_with_registry(&project, &mock.url())
-        .args(["mcp", "serve"])
-        .assert()
-        .success();
-    expire_mcp_runtime(&project);
-    let marker = mcp_runtime_root(&project).join("package.json");
-    let modified = std::fs::metadata(&marker).unwrap().modified().unwrap();
-    mock.server().reset().await;
-    mock.with_manifest_package(serde_json::json!({"name":"@lpm-registry/mcp-server","version":"2.0.0","bin":{"mcp-server":"missing.js","helper":"helper.js"}}), &[("helper.js", b"#!/usr/bin/env node\nconsole.log('HELPER');")]).await;
-    let output = lpm_with_registry(&project, &mock.url())
-        .args(["mcp", "serve"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success(), "unusable MCP refresh succeeded");
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            mcp_runtime_root(&project).join("node_modules/@lpm-registry/mcp-server/package.json"),
-        )
-        .unwrap(),
+async fn mcp_serve_lists_the_registry_tools_and_its_own_without_reading_a_login() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_tool_listing(
+        &registry,
+        json!([registry_tool("lpm_search"), registry_tool("lpm_install")]),
     )
-    .unwrap();
+    .await;
+    seed_login(&project, &registry, "stored-access");
+    let mut server = McpServer::start(&project, &registry.url());
+
+    let tools = server.tool_names();
+    let listed_again = server.tool_names();
+
     assert_eq!(
-        manifest["version"], "1.0.0",
-        "unusable refresh discarded the previous runtime"
+        tools,
+        ["lpm_search", "lpm_install", "lpm_add", "lpm_audit"],
+        "registry tools come first, and a local tool keeps its name"
     );
+    assert_eq!(listed_again, tools);
+    let listings: Vec<_> = registry
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/mcp")
+        .collect();
+    assert_eq!(listings.len(), 1, "a fresh listing is reused");
+    assert!(
+        listings[0].headers.get("authorization").is_none(),
+        "a listing is the same for everyone and must not carry the login"
+    );
+    let (status, stderr) = server.stop();
+    assert!(status.success(), "{stderr}");
+}
+
+#[tokio::test]
+async fn mcp_serve_calls_a_registry_tool_with_the_stored_login() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("mcp-method", "tools/call"))
+        .and(header("mcp-name", "lpm_account"))
+        .and(header("authorization", "Bearer stored-access"))
+        .and(body_partial_json(json!({
+            "params": { "name": "lpm_account", "arguments": { "pool": true } }
+        })))
+        .respond_with(rpc_result(json!({
+            "content": [{ "type": "text", "text": "Signed in as alice." }],
+        })))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    seed_login(&project, &registry, "stored-access");
+    let mut server = McpServer::start(&project, &registry.url());
+
+    let (result, text) = server.call("lpm_account", json!({ "pool": true }));
+
+    assert_eq!(text, "Signed in as alice.");
+    assert!(result.get("isError").is_none_or(|error| error == false));
+}
+
+#[tokio::test]
+async fn mcp_serve_refreshes_a_rejected_login_once_and_retries_the_call() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("authorization", "Bearer stale-access"))
+        .respond_with(rpc_refusal(401, "This token has expired."))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    registry
+        .with_refresh_expected(
+            "stored-refresh",
+            "rotated-access",
+            "rotated-refresh",
+            "2099-01-01T00:00:00Z",
+            1,
+        )
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("authorization", "Bearer rotated-access"))
+        .respond_with(rpc_result(json!({
+            "content": [{ "type": "text", "text": "Signed in as alice." }],
+        })))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    seed_login(&project, &registry, "stale-access");
+    let mut server = McpServer::start(&project, &registry.url());
+
+    let (_, text) = server.call("lpm_account", json!({}));
+
+    assert_eq!(text, "Signed in as alice.");
+}
+
+#[tokio::test]
+async fn mcp_serve_asks_for_lpm_login_when_the_registry_wants_an_account() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(rpc_refusal(
+            401,
+            "Reading an account needs you to sign in to LPM.dev.",
+        ))
+        .mount(registry.server())
+        .await;
+    let mut server = McpServer::start(&project, &registry.url());
+
+    let (result, text) = server.call("lpm_account", json!({}));
+
+    assert_eq!(result["isError"], true);
     assert_eq!(
-        std::fs::metadata(marker).unwrap().modified().unwrap(),
-        modified
+        text,
+        "Reading an account needs you to sign in to LPM.dev. Run `lpm login` in a terminal to sign in to LPM.dev, then call the tool again."
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_uses_a_login_made_after_it_started() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(header("authorization", "Bearer later-access"))
+        .respond_with(rpc_result(json!({
+            "content": [{ "type": "text", "text": "Signed in as alice." }],
+        })))
+        .with_priority(1)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(rpc_refusal(401, "Reading an account needs you to sign in."))
+        .mount(registry.server())
+        .await;
+    let mut server = McpServer::start(&project, &registry.url());
+    let (signed_out, _) = server.call("lpm_account", json!({}));
+    assert_eq!(signed_out["isError"], true);
+
+    seed_login(&project, &registry, "later-access");
+    let (_, text) = server.call("lpm_account", json!({}));
+
+    assert_eq!(text, "Signed in as alice.");
+}
+
+#[tokio::test]
+async fn mcp_serve_keeps_its_own_tools_when_the_registry_is_unreachable() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let mut server = McpServer::start(&project, "http://127.0.0.1:9");
+
+    let tools = server.tool_names();
+    let (result, text) = server.call("lpm_search", json!({ "query": "forms" }));
+
+    assert_eq!(tools, ["lpm_install", "lpm_add", "lpm_audit"]);
+    assert_eq!(result["isError"], true);
+    assert!(
+        text.starts_with("lpm couldn't reach the registry's MCP server at http://127.0.0.1:9/mcp"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_installs_an_lpm_dev_package_into_the_named_project() {
+    let editor = TempProject::empty(r#"{"name":"editor-workspace","version":"1.0.0"}"#);
+    let project = TempProject::empty(r#"{"name":"mcp-install","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package(
+            "@lpm.dev/acme.forms",
+            "1.0.0",
+            &make_tarball("@lpm.dev/acme.forms", "1.0.0"),
+        )
+        .await;
+    let mut server = McpServer::start(&editor, &registry.url());
+
+    let (result, text) = server.call(
+        "lpm_install",
+        json!({
+            "projectPath": project.path().to_str().unwrap(),
+            "name": "acme.forms",
+            "version": "1.0.0",
+        }),
+    );
+
+    assert!(
+        result.get("isError").is_none_or(|error| error == false),
+        "{text}"
+    );
+    let report: Value = serde_json::from_str(&text).expect("the tool returns the JSON result");
+    assert_eq!(report["success"], true, "{report}");
+    assert!(
+        project
+            .path()
+            .join("node_modules/@lpm.dev/acme.forms/package.json")
+            .is_file(),
+        "the package must be installed in the named project"
+    );
+    assert!(
+        !editor.path().join("node_modules").exists(),
+        "nothing may be installed in the editor's own directory"
+    );
+}
+
+#[tokio::test]
+async fn mcp_serve_refuses_a_relative_project_without_running_anything() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let mut server = McpServer::start(&project, "http://127.0.0.1:9");
+
+    let (result, text) = server.call(
+        "lpm_install",
+        json!({ "projectPath": ".", "name": "acme.forms" }),
+    );
+
+    assert_eq!(result["isError"], true);
+    assert_eq!(
+        text,
+        "projectPath must be an absolute path to the project's directory, not .."
+    );
+    assert!(!project.path().join("node_modules").exists());
+}
+
+#[tokio::test]
+async fn mcp_serve_and_setup_remove_the_retired_npm_runtime() {
+    for action in ["serve", "setup"] {
+        let project = TempProject::empty(r#"{"name":"mcp-retired","version":"1.0.0"}"#);
+        let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+        let runtime = root.retired_mcp_runtime();
+        std::fs::create_dir_all(runtime.join("runtime")).unwrap();
+        std::fs::write(runtime.join("runtime/package.json"), "{}").unwrap();
+
+        if action == "serve" {
+            let server = McpServer::start(&project, "http://127.0.0.1:9");
+            let (status, stderr) = server.stop();
+            assert!(status.success(), "{stderr}");
+        } else {
+            let output = lpm(&project).args(["mcp", "setup"]).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+
+        assert!(
+            !runtime.exists(),
+            "`lpm mcp {action}` must remove the retired runtime"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_serve_keeps_the_retired_runtime_while_an_older_lpm_runs_it() {
+    let project = TempProject::empty(r#"{"name":"mcp-retired","version":"1.0.0"}"#);
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    let runtime = root.retired_mcp_runtime();
+    std::fs::create_dir_all(runtime.join("runtime")).unwrap();
+    std::fs::write(runtime.join("runtime/package.json"), "{}").unwrap();
+    let lock_path = root.retired_mcp_runtime_lock();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        lpm_common::with_shared_lock(lock_path, || {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, lpm_common::LpmError>(())
+        })
+    });
+    held_rx.recv().unwrap();
+
+    let server = McpServer::start(&project, "http://127.0.0.1:9");
+    let (status, stderr) = server.stop();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+
+    assert!(status.success(), "{stderr}");
+    assert!(
+        runtime.join("runtime/package.json").is_file(),
+        "a runtime an older lpm still runs must stay"
     );
 }

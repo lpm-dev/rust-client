@@ -58,6 +58,7 @@ mod firewall;
 mod history_reuse;
 mod http_tls;
 mod install_accounting;
+mod mcp;
 mod metadata;
 mod policy_transport;
 mod projection;

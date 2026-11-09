@@ -1195,9 +1195,6 @@ mod tests {
         assert!(command_needs_global_state(&parse(&[
             "lpm", "cache", "clean", "tasks"
         ])));
-        assert!(command_needs_global_state(&parse(&[
-            "lpm", "cache", "clean", "mcp"
-        ])));
         // Read-only `cache path` does not.
         assert!(!command_needs_global_state(&parse(&[
             "lpm", "cache", "path"
