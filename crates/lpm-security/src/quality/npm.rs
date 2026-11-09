@@ -210,6 +210,10 @@ fn percent_decoded(raw: &str) -> Option<String> {
             continue;
         }
         let hex = bytes.get(index + 1..index + 3)?;
+        // `from_str_radix` alone would take `%+1` as a sign and a digit.
+        if !hex.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
         let byte = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
         if byte == b'/' || byte == b'\\' {
             return None;
@@ -428,6 +432,8 @@ pub(crate) fn pattern_matches<'f>(
 struct TargetPattern {
     prefix: String,
     middles: Vec<String>,
+    /// The middles' total length, summed once rather than for every file.
+    middles_len: usize,
     suffix: String,
 }
 
@@ -439,6 +445,7 @@ impl TargetPattern {
         let suffix = rest.pop()?;
         Some(Self {
             prefix,
+            middles_len: rest.iter().map(String::len).sum(),
             middles: rest,
             suffix,
         })
@@ -452,8 +459,7 @@ impl TargetPattern {
             return (!middle.is_empty()).then_some(middle);
         }
         let stars = self.middles.len() + 1;
-        let literal: usize = self.middles.iter().map(String::len).sum();
-        let spare = middle.len().checked_sub(literal)?;
+        let spare = middle.len().checked_sub(self.middles_len)?;
         if spare == 0 || spare % stars != 0 {
             return None;
         }
@@ -769,6 +775,8 @@ mod tests {
             "./a%2Fb.js",
             "./a%5Cb.js",
             "./a%zz.js",
+            "./a%+1.js",
+            "./a%-1.js",
             "./%ff.js",
         ] {
             assert!(!valid_target(refused), "{refused}");

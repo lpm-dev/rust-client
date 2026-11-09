@@ -76,6 +76,8 @@ struct ExportSet {
     /// A re-export from another package or an unread file left names out,
     /// or the package re-exports more names than the checks keep.
     incomplete: bool,
+    /// The files of the package it re-exports from.
+    reexported_from: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,8 +250,8 @@ impl<'a> Package<'a> {
         }
         if depth > MAX_REEXPORT_DEPTH || !visiting.insert(path.to_string()) {
             return Rc::new(ExportSet {
-                names: BTreeMap::new(),
                 incomplete: depth > MAX_REEXPORT_DEPTH,
+                ..ExportSet::default()
             });
         }
         let mut set = ExportSet::default();
@@ -274,6 +276,7 @@ impl<'a> Package<'a> {
                     let symbol = match self.resolve_specifier(path, specifier) {
                         Some(target) => {
                             let target_set = self.export_set_within(&target, visiting, depth + 1);
+                            set.reexported_from.insert(target);
                             match target_set.names.get(imported.as_str()) {
                                 Some(symbol) => symbol.clone(),
                                 None => {
@@ -304,6 +307,7 @@ impl<'a> Package<'a> {
                         continue;
                     };
                     let target_set = self.export_set_within(&target, visiting, depth + 1);
+                    set.reexported_from.insert(target);
                     set.incomplete |= target_set.incomplete;
                     for (name, symbol) in &target_set.names {
                         if &**name == "default"
@@ -338,6 +342,28 @@ impl<'a> Package<'a> {
         set
     }
 
+    /// How many files the export walks from `roots` reached but couldn't
+    /// read, being over a size limit.
+    fn unread_by_export_walks(&self, roots: &[String]) -> usize {
+        let archive = self.archive();
+        let sets = self.export_sets.borrow();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut pending: Vec<&str> = roots.iter().map(String::as_str).collect();
+        let mut unread = 0;
+        while let Some(path) = pending.pop() {
+            if !seen.insert(path) {
+                continue;
+            }
+            if archive.over_read_limit(path) {
+                unread += 1;
+            }
+            if let Some(set) = sets.get(path) {
+                pending.extend(set.reexported_from.iter().map(String::as_str));
+            }
+        }
+        unread
+    }
+
     /// The subpaths `exports` maps, with each a pattern maps expanded over
     /// the files it matches (at most `MAX_PATTERN_SUBPATHS`), or `.` alone
     /// for a package without `exports`.
@@ -366,22 +392,41 @@ impl<'a> Package<'a> {
             else {
                 continue;
             };
-            let Some(files) = npm::pattern_matches(self.archive(), pattern) else {
-                continue;
-            };
-            for (file, matched) in files {
-                if expanded == MAX_PATTERN_SUBPATHS {
+            // A `types` pattern also matches the declarations TypeScript
+            // substitutes for its JavaScript extension: `./types/*.js` finds
+            // `types/a.d.ts`.
+            let mut patterns = vec![pattern.to_string()];
+            if conditions == npm::TYPES_IMPORT_CONDITIONS {
+                patterns.extend(npm::declaration_candidates(pattern));
+            }
+            let mut seen = HashSet::new();
+            for pattern in &patterns {
+                let Some(files) = npm::pattern_matches(self.archive(), pattern) else {
                     break;
-                }
-                let subpath = format!("{key_prefix}{matched}{key_suffix}");
-                // A more specific subpath, such as a null pattern, may keep it
-                // from consumers.
-                if exports
-                    .resolve_subpath(&subpath, conditions)
-                    .is_some_and(|(resolved, _)| resolved == file)
-                {
-                    subpaths.push(subpath);
-                    expanded += 1;
+                };
+                for (file, matched) in files {
+                    if expanded == MAX_PATTERN_SUBPATHS {
+                        break;
+                    }
+                    let subpath = format!("{key_prefix}{matched}{key_suffix}");
+                    if seen.contains(&subpath) {
+                        continue;
+                    }
+                    // A more specific subpath, such as a null pattern, may
+                    // keep it from consumers.
+                    if exports
+                        .resolve_subpath(&subpath, conditions)
+                        .is_some_and(|(resolved, _)| {
+                            resolved == file
+                                || npm::declaration_candidates(&resolved)
+                                    .iter()
+                                    .any(|candidate| candidate == file)
+                        })
+                    {
+                        seen.insert(subpath.clone());
+                        subpaths.push(subpath);
+                        expanded += 1;
+                    }
                 }
             }
         }
@@ -677,7 +722,7 @@ fn api_docs(package: &Package<'_>, results: &mut Results) {
         return;
     }
     let documented = symbols.values().filter(|documented| **documented).count();
-    let unread = package.archive().unretained();
+    let unread = package.unread_by_export_walks(&files);
     let unread_note = if unread > 0 {
         format!(
             "; {unread} file{} over the read limit unchecked",

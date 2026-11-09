@@ -95,12 +95,6 @@ pub(crate) fn doc_text(raw: &str) -> String {
     text
 }
 
-/// Whether doc comment text documents `name`: long enough and more than
-/// the name itself.
-pub(crate) fn documents(text: &str, name: &str) -> bool {
-    DocSummary::of(text).documents(name)
-}
-
 fn normalized(value: &str) -> String {
     value
         .chars()
@@ -109,8 +103,8 @@ fn normalized(value: &str) -> String {
         .collect()
 }
 
-/// A doc comment's text as `documents` compares it, worked out once for
-/// every name the comment may document.
+/// A doc comment's text, worked out once for every name the comment may
+/// document.
 pub(crate) struct DocSummary {
     long_enough: bool,
     normalized: String,
@@ -519,10 +513,10 @@ mod tests {
             documented(&facts),
             [("createMarkdownRendererInstance", false)]
         );
-        assert!(!documents(
-            "Create markdown-renderer instance",
-            "createMarkdownRendererInstance"
-        ));
+        assert!(
+            !DocSummary::of("Create markdown-renderer instance")
+                .documents("createMarkdownRendererInstance")
+        );
     }
 
     #[test]

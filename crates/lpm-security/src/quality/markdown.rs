@@ -61,11 +61,12 @@ impl<'a> Readme<'a> {
                 continue;
             }
             // `[label]:` with its destination on the next line, as CommonMark
-            // allows: both lines are the definition.
+            // allows: both lines are the definition. A next line that isn't
+            // a destination makes both a paragraph.
             if !in_paragraph
                 && let Some(label) = reference_label(line)
                 && let Some((next_start, next_end)) = lines.peek()
-                && !text[next_start..next_end].trim().is_empty()
+                && is_destination_line(&text[next_start..next_end])
             {
                 lines.next();
                 definitions.insert(label);
@@ -172,6 +173,29 @@ fn reference_definition(line: &str) -> Option<String> {
         return None;
     }
     normalize_label(label)
+}
+
+/// Whether `line` is a link destination, as the line after a bare
+/// `[label]:` must be: `<...>` or one run without whitespace, then nothing
+/// or a title in quotes or parentheses.
+fn is_destination_line(line: &str) -> bool {
+    let line = line.trim();
+    let rest = if let Some(bracketed) = line.strip_prefix('<') {
+        match bracketed.find('>') {
+            Some(end) => &bracketed[end + 1..],
+            None => return false,
+        }
+    } else {
+        match line.find(char::is_whitespace) {
+            Some(end) => &line[end..],
+            None => "",
+        }
+    };
+    if line.is_empty() {
+        return false;
+    }
+    let title = rest.trim_start();
+    title.is_empty() || title.starts_with(['"', '\'', '('])
 }
 
 /// The normalized label of a line holding only `[label]:`, a definition
@@ -585,6 +609,35 @@ mod tests {
             readme.prose_chars(),
             "[note]: Keep this line.".chars().count()
         );
+    }
+
+    #[test]
+    fn a_label_line_followed_by_prose_stays_text() {
+        let readme =
+            Readme::parse("[note]:\nThis is ordinary text with several words, not a link.\n");
+        assert_eq!(
+            readme.prose_chars(),
+            "[note]: This is ordinary text with several words, not a link."
+                .chars()
+                .count()
+        );
+    }
+
+    #[test]
+    fn a_label_line_followed_by_a_destination_and_title_is_a_definition() {
+        for destination in [
+            "  https://example.com",
+            "  https://example.com \"Home\"",
+            "  <https://example.com/a b> 'Home'",
+        ] {
+            let text = format!("# Kit\n\n[site]:\n{destination}\n");
+            let readme = Readme::parse(&text);
+            assert_eq!(
+                readme.prose_chars(),
+                "# Kit".chars().count(),
+                "{destination}"
+            );
+        }
     }
 
     #[test]

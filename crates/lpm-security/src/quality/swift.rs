@@ -1,7 +1,7 @@
 //! Swift sources and the evaluated manifest (`swift package dump-package`)
 //! as the quality checks read them.
 
-use super::js_api::{doc_text, documents};
+use super::js_api::{DocSummary, doc_text};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -14,6 +14,20 @@ pub(crate) struct SwiftFileFacts {
     pub public_names: Vec<String>,
     /// It declares an `XCTestCase` subclass or a `@Test` function.
     pub declares_tests: bool,
+    /// Types it declares that code outside the module can't reach.
+    pub internal_types: Vec<String>,
+    /// The public members of its extensions, which it counts. Code outside
+    /// the module can't reach one whose extended type the module declares
+    /// internal; that takes every file of the module to decide.
+    pub extension_members: Vec<ExtensionMember>,
+}
+
+/// A public member of an extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtensionMember {
+    pub extended: String,
+    pub name: String,
+    pub documented: bool,
 }
 
 /// At most this many public names are kept per file.
@@ -364,7 +378,7 @@ const MAX_INHERITANCE_TOKENS: usize = 64;
 
 /// A type's body the walk is inside.
 #[derive(Clone, Copy)]
-struct Scope {
+struct Scope<'s> {
     /// The depth of its members.
     depth: usize,
     /// Code outside the module can reach its members: every type around it
@@ -375,6 +389,8 @@ struct Scope {
     members_public: bool,
     /// A public enum, whose cases are public declarations.
     enum_cases: bool,
+    /// The type an extension extends.
+    extended: Option<&'s str>,
 }
 
 /// How far a `case` declaration's list of names is read.
@@ -383,14 +399,18 @@ const MAX_CASE_TOKENS: usize = 4096;
 /// Reads a Swift source file.
 pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
     let Scan { tokens, docs } = scan(source);
-    // Each doc comment by the token after it; of several, the nearest wins.
-    let docs: HashMap<usize, &DocComment> = docs.iter().map(|doc| (doc.next_token, doc)).collect();
+    // Each doc comment by the token after it, summarized once however many
+    // declarations it leads; of several, the nearest wins.
+    let docs: HashMap<usize, (usize, DocSummary)> = docs
+        .iter()
+        .map(|doc| (doc.next_token, (doc.last_line, DocSummary::of(&doc.text))))
+        .collect();
     let mut facts = SwiftFileFacts::default();
     let mut depth = 0usize;
-    let mut scopes: Vec<Scope> = Vec::new();
+    let mut scopes: Vec<Scope<'_>> = Vec::new();
     // A type declaration whose `{` hasn't been reached: its body, and the
     // token past which its header has run too long to be one.
-    let mut pending: Option<(Scope, usize)> = None;
+    let mut pending: Option<(Scope<'_>, usize)> = None;
     for (index, token) in tokens.iter().enumerate() {
         match token.text {
             "{" => {
@@ -428,8 +448,16 @@ pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
             container.is_some_and(|scope| scope.visible)
         };
         if let Some(scope) = type_body(&tokens, index, depth, reachable, container) {
+            if !scope.visible
+                && scope.extended.is_none()
+                && facts.internal_types.len() < MAX_NAMES_PER_FILE
+                && let Some(name) = tokens.get(index + 1)
+            {
+                facts.internal_types.push(name.text.to_string());
+            }
             pending = Some((scope, index + MAX_ATTRIBUTE_TOKENS));
         }
+        let extended = container.and_then(|scope| scope.extended);
         if !reachable {
             continue;
         }
@@ -443,15 +471,15 @@ pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
             {
                 continue;
             }
-            record_public(&mut facts, &tokens, &docs, index, name);
+            record_public(&mut facts, &tokens, &docs, index, name, extended);
         } else if token.text == "case" && container.is_some_and(|scope| scope.enum_cases) {
             for name in case_names(&tokens, index) {
-                record_public(&mut facts, &tokens, &docs, index, name);
+                record_public(&mut facts, &tokens, &docs, index, name, extended);
             }
         } else if container.is_some_and(|scope| scope.members_public)
             && let Some(name) = implicitly_public_member(&tokens, index)
         {
-            record_public(&mut facts, &tokens, &docs, index, name);
+            record_public(&mut facts, &tokens, &docs, index, name, extended);
         }
     }
     facts
@@ -463,13 +491,13 @@ pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
 /// extension`; its members are reachable when it is public and code can
 /// reach it. An extension's explicitly public members are, unless it is
 /// private.
-fn type_body(
-    tokens: &[Token<'_>],
+fn type_body<'s>(
+    tokens: &[Token<'s>],
     index: usize,
     depth: usize,
     reachable: bool,
-    container: Option<&Scope>,
-) -> Option<Scope> {
+    container: Option<&Scope<'s>>,
+) -> Option<Scope<'s>> {
     let keyword = tokens[index].text;
     if !matches!(
         keyword,
@@ -477,12 +505,13 @@ fn type_body(
     ) {
         return None;
     }
-    // `class func`: a modifier, not a type.
+    // `class func`: a modifier, not a type; `protocol P: class`: a
+    // constraint.
     if keyword == "class"
-        && tokens.get(index + 1).is_some_and(|next| {
+        && (tokens.get(index + 1).is_some_and(|next| {
             matches!(next.text, "func" | "var" | "let" | "subscript")
                 || MODIFIERS.contains(&next.text)
-        })
+        }) || index > 0 && tokens[index - 1].text == ":")
     {
         return None;
     }
@@ -508,6 +537,9 @@ fn type_body(
             && access == Some("public")
             && matches!(keyword, "extension" | "protocol"),
         enum_cases: visible && keyword == "enum",
+        extended: (keyword == "extension")
+            .then(|| tokens.get(index + 1).map(|name| name.text))
+            .flatten(),
     })
 }
 
@@ -521,7 +553,10 @@ fn case_names(tokens: &[Token<'_>], index: usize) -> Vec<String> {
             "(" => parentheses += 1,
             ")" => parentheses = parentheses.saturating_sub(1),
             "," if parentheses == 0 => expects_name = true,
-            "{" | "}" | ";" | "@" | "#" | "case" if parentheses == 0 => break,
+            // No `case` declares inside another's parentheses, so an
+            // unclosed one can't make every later case rescan the file.
+            "case" => break,
+            "{" | "}" | ";" | "@" | "#" if parentheses == 0 => break,
             text if parentheses == 0
                 && (DECLARATION_KEYWORDS.contains(&text) || MODIFIERS.contains(&text)) =>
             {
@@ -540,17 +575,27 @@ fn case_names(tokens: &[Token<'_>], index: usize) -> Vec<String> {
 fn record_public(
     facts: &mut SwiftFileFacts,
     tokens: &[Token<'_>],
-    docs: &HashMap<usize, &DocComment>,
+    docs: &HashMap<usize, (usize, DocSummary)>,
     at: usize,
     name: String,
+    extended: Option<&str>,
 ) {
     let start = declaration_start(tokens, at);
     let start_line = tokens[start].line;
     // A doc comment documents the declaration it leads, ending on the line
     // above it or on its own line.
-    let documented = docs.get(&start).is_some_and(|doc| {
-        start_line.saturating_sub(doc.last_line) <= 1 && documents(&doc.text, &name)
+    let documented = docs.get(&start).is_some_and(|(last_line, summary)| {
+        start_line.saturating_sub(*last_line) <= 1 && summary.documents(&name)
     });
+    if let Some(extended) = extended
+        && facts.extension_members.len() < MAX_NAMES_PER_FILE
+    {
+        facts.extension_members.push(ExtensionMember {
+            extended: extended.to_string(),
+            name: name.clone(),
+            documented,
+        });
+    }
     facts.public_declarations += 1;
     if documented {
         facts.documented_declarations += 1;
@@ -1008,6 +1053,7 @@ impl<'m> Manifest<'m> {
     /// Modules of the targets library products contain.
     pub fn library_modules(&self) -> Vec<String> {
         let mut modules = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for product in self
             .json
             .get("products")
@@ -1030,7 +1076,7 @@ impl<'m> Manifest<'m> {
                 .filter_map(Value::as_str)
             {
                 let module = module_name(target);
-                if !modules.contains(&module) {
+                if seen.insert(module.clone()) {
                     modules.push(module);
                 }
             }
@@ -1186,6 +1232,36 @@ mod tests {
             let facts = file_facts(&source);
             assert!(facts.public_declarations <= 50_000);
         }
+    }
+
+    #[test]
+    fn a_case_left_inside_parentheses_ends_at_the_next_case() {
+        let facts = file_facts(&format!(
+            "public enum E {{\n{}}}",
+            "case a(x ".repeat(200_000)
+        ));
+        assert_eq!(facts.public_declarations, 200_001);
+    }
+
+    #[test]
+    fn a_class_constraint_keeps_the_protocol_body() {
+        let facts = file_facts("public protocol P: class {\n    func a()\n    func b()\n}\n");
+        assert_eq!(facts.public_declarations, 3);
+    }
+
+    #[test]
+    fn an_extension_records_the_type_it_extends_for_each_public_member() {
+        let facts =
+            file_facts("struct Cache {}\nextension Cache {\n    public func clear() {}\n}\n");
+        assert_eq!(facts.internal_types, ["Cache"]);
+        assert_eq!(
+            facts.extension_members,
+            [ExtensionMember {
+                extended: "Cache".to_string(),
+                name: "clear".to_string(),
+                documented: false,
+            }]
+        );
     }
 
     #[test]

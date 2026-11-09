@@ -702,6 +702,21 @@ fn a_well_made_swift_package_earns_every_archive_point() {
 }
 
 #[test]
+fn a_public_member_of_an_extension_of_an_internal_type_is_no_public_api() {
+    let mut files = swift_files();
+    files.push((
+        "Sources/Lib/Internal.swift",
+        "struct Cache {}\nextension Cache {\n    /// Clears every entry the cache holds right now.\n    public func clear() {}\n}\nextension String {\n    /// Joins this string and another with a space between.\n    public func joined(_ other: String) -> String { self + other }\n}\n"
+            .to_string(),
+    ));
+    let report = swift_report(&files, Some(&swift_manifest()));
+    assert_eq!(
+        check(&report, "api-docs").detail,
+        "4 of 4 public declarations have doc comments (100%)"
+    );
+}
+
+#[test]
 fn swift_manifest_checks_wait_for_the_evaluated_manifest() {
     let report = swift_report(&swift_files(), None);
     for id in [
@@ -937,6 +952,108 @@ fn a_types_condition_naming_javascript_reads_the_declaration_beside_it() {
         10,
         "{}",
         check(&report, "types").detail
+    );
+}
+
+/// A TypeScript source of `size` bytes that declares nothing.
+fn filler_typescript(size: usize) -> String {
+    "// filler\n".repeat(size / 10)
+}
+
+#[test]
+fn typescript_sources_no_export_reaches_leave_api_docs_whole() {
+    let mut files: Vec<(String, String)> = ["src/a.ts", "src/b.ts", "src/c.ts"]
+        .into_iter()
+        .map(|path| (path.to_string(), filler_typescript(1_900_000)))
+        .collect();
+    files.extend(
+        good_package(&good_manifest())
+            .into_iter()
+            .map(|(path, text)| (path.to_string(), text)),
+    );
+    let report = owned_report(&files);
+    assert_eq!(
+        check(&report, "api-docs").detail,
+        "3 of 3 exports in the type declarations have doc comments (100%)"
+    );
+}
+
+#[test]
+fn a_types_source_that_re_exports_an_unread_file_says_so() {
+    let mut manifest = good_manifest();
+    manifest["types"] = json!("./src/index.ts");
+    manifest["exports"]["."]["types"] = json!("./src/index.ts");
+    let mut files: Vec<(String, String)> = ["src/a.ts", "src/b.ts", "src/c.ts"]
+        .into_iter()
+        .map(|path| (path.to_string(), filler_typescript(1_500_000)))
+        .collect();
+    files.extend(with_manifest(
+        &manifest,
+        &[(
+            "src/index.ts",
+            "/** Parses Markdown source into a syntax tree. */\nexport function parse(source: string): string { return source }\nexport * from './c'\n",
+        )],
+    ));
+    let report = owned_report(&files);
+    assert_eq!(
+        check(&report, "api-docs").detail,
+        "1 of 1 exports in the type declarations have doc comments (100%); 1 file over the read limit unchecked"
+    );
+}
+
+#[test]
+fn a_wildcard_types_target_finds_the_declarations_typescript_substitutes() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["main"] = Value::Null;
+    manifest["exports"] = json!({
+        "./*": { "types": "./types/*.js", "import": "./dist/*.js" }
+    });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("dist/a.js", "export function parse(s) { return s }\n"),
+            (
+                "types/a.d.ts",
+                "/** Parses Markdown source into a syntax tree. */\nexport declare function parse(source: string): string;\n",
+            ),
+        ],
+    ));
+    assert_eq!(
+        points(&report, "api-docs"),
+        10,
+        "{}",
+        check(&report, "api-docs").detail
+    );
+}
+
+#[test]
+fn a_null_subpath_keeps_its_files_out_of_api_docs() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["main"] = Value::Null;
+    manifest["exports"] = json!({
+        "./*": { "types": "./dist/*.d.ts", "import": "./dist/*.mjs" },
+        "./internal/*": null
+    });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("dist/a.mjs", "export function parse(s) { return s }\n"),
+            (
+                "dist/a.d.ts",
+                "/** Parses Markdown source into a syntax tree. */\nexport declare function parse(source: string): string;\n",
+            ),
+            ("dist/internal/b.mjs", "export function hidden() {}\n"),
+            (
+                "dist/internal/b.d.ts",
+                "export declare function hidden(): void;\n",
+            ),
+        ],
+    ));
+    assert_eq!(
+        check(&report, "api-docs").detail,
+        "4 of 4 exports in the type declarations have doc comments (100%)"
     );
 }
 

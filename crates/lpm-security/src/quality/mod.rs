@@ -18,7 +18,7 @@ pub use spec::{Category, CheckSpec, Decider, QualityEcosystem};
 use serde::Serialize;
 use serde_json::Value;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 
 /// Version of the [`QualityReport`] document. Bump it when a field changes
@@ -149,8 +149,9 @@ pub(crate) struct Archive {
     retained: HashMap<String, String>,
     retained_bytes: u64,
     retained_typescript_bytes: u64,
-    /// Declaration or JavaScript files left unread past the size limits.
-    unretained: usize,
+    /// Declaration, JavaScript and TypeScript files left unread past the
+    /// size limits.
+    unretained: HashSet<String>,
     /// The `type` each nested package.json sets, by its directory.
     scopes: HashMap<String, Option<String>>,
 }
@@ -192,8 +193,9 @@ impl Archive {
         self.retained.get(path).map(String::as_str)
     }
 
-    pub fn unretained(&self) -> usize {
-        self.unretained
+    /// The checks would have read `path` but it was over a size limit.
+    pub fn over_read_limit(&self, path: &str) -> bool {
+        self.unretained.contains(path)
     }
 
     /// The `type` the package.json in `directory` sets, when the archive
@@ -337,7 +339,7 @@ impl QualityCollector {
                     (&mut self.archive.retained_bytes, MAX_RETAINED_BYTES)
                 };
                 if size > MAX_RETAINED_FILE_BYTES || retained.saturating_add(size) > limit {
-                    self.archive.unretained += 1;
+                    self.archive.unretained.insert(path.to_string());
                     return None;
                 }
                 *retained += size;
@@ -980,15 +982,12 @@ fn run_swift(
                 .any(|target| target.kind == "test" && target.contains(path))
     };
 
-    let (declarations, documented) = files.iter().filter(|(path, _)| !in_tests(path)).fold(
-        (0usize, 0usize),
-        |(declarations, documented), (_, facts)| {
-            (
-                declarations + facts.public_declarations,
-                documented + facts.documented_declarations,
-            )
-        },
-    );
+    let sources: Vec<&swift::SwiftFileFacts> = files
+        .iter()
+        .filter(|(path, _)| !in_tests(path))
+        .map(|(_, facts)| facts)
+        .collect();
+    let (declarations, documented) = swift_reachable_api(&sources);
     let unread_note = if unread > 0 {
         format!(
             " ({unread} source file{} over 2 MiB unread)",
@@ -1237,6 +1236,39 @@ fn swift_readme_install(context: &Context<'_>, results: &mut Results) {
     }
 }
 
+/// The public declarations of a module's source files and how many are
+/// documented, leaving out each public member of an extension of a type the
+/// module declares only internally, which code outside it can't reach.
+fn swift_reachable_api(sources: &[&swift::SwiftFileFacts]) -> (usize, usize) {
+    let public_types: HashSet<&str> = sources
+        .iter()
+        .flat_map(|facts| facts.public_names.iter().map(String::as_str))
+        .collect();
+    let internal_types: HashSet<&str> = sources
+        .iter()
+        .flat_map(|facts| facts.internal_types.iter().map(String::as_str))
+        .filter(|name| !public_types.contains(name))
+        .collect();
+    sources
+        .iter()
+        .fold((0, 0), |(declarations, documented), facts| {
+            let (hidden, hidden_documented) = facts
+                .extension_members
+                .iter()
+                .filter(|member| internal_types.contains(member.extended.as_str()))
+                .fold((0, 0), |(hidden, documented), member| {
+                    (hidden + 1, documented + usize::from(member.documented))
+                });
+            (
+                declarations + facts.public_declarations.saturating_sub(hidden),
+                documented
+                    + facts
+                        .documented_declarations
+                        .saturating_sub(hidden_documented),
+            )
+        })
+}
+
 fn swift_readme_example(
     context: &Context<'_>,
     results: &mut Results,
@@ -1249,13 +1281,19 @@ fn swift_readme_example(
         return;
     };
     let modules = manifest.library_modules();
+    let module_set: HashSet<&str> = modules.iter().map(String::as_str).collect();
     let readme = markdown::Readme::parse(text);
     let samples: Vec<swift::SampleUse> = readme
         .blocks
         .iter()
         .filter(|block| block.language == "swift")
         .map(|block| swift::sample_use(block.body))
-        .filter(|sample| sample.imports.iter().any(|module| modules.contains(module)))
+        .filter(|sample| {
+            sample
+                .imports
+                .iter()
+                .any(|module| module_set.contains(module.as_str()))
+        })
         .collect();
     if samples.is_empty() {
         results.fail(
@@ -1292,7 +1330,7 @@ fn swift_readme_example(
         for module in sample
             .imports
             .iter()
-            .filter(|module| modules.contains(module))
+            .filter(|module| module_set.contains(module.as_str()))
         {
             if !seen.insert(module.as_str()) {
                 continue;
