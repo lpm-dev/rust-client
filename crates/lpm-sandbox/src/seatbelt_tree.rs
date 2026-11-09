@@ -206,7 +206,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// `Some(true)` when `pid`'s profile denies looking up the Mach service
 /// `name`, `Some(false)` when it allows it, `None` when the check failed.
-fn lookup_denied(pid: libc::pid_t, name: &CStr) -> Option<bool> {
+pub(crate) fn lookup_denied(pid: libc::pid_t, name: &CStr) -> Option<bool> {
     // SAFETY: both strings are NUL-terminated and outlive the call; the
     // global-name filter takes exactly one `const char *` variadic argument.
     let result = unsafe {

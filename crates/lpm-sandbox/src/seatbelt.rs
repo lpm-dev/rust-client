@@ -331,6 +331,12 @@ pub(crate) fn render_profile_with_toolchain(
     // during locale init and similar); without it even /usr/bin/true
     // fails to load on recent macOS releases.
     out.push_str("(allow mach-lookup)\n");
+    // App launches and Apple Events have their own Seatbelt checks
+    // (`lsopen`, `appleevent-send`), which `(deny default)` refuses, but
+    // the pasteboard is only a Mach service. Without this a script could
+    // read a password just copied, or swap the command the user is about
+    // to paste into a shell.
+    out.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow iokit-open)\n");
 
@@ -871,6 +877,21 @@ mod tests {
         assert!(!write_section.contains(".husky"));
         assert!(!write_section.contains(".node-gyp"));
         assert!(!write_section.contains("node_modules"));
+    }
+
+    #[test]
+    fn scripts_cannot_reach_the_pasteboard() {
+        let p = render_profile(&spec(), false).unwrap();
+        let allow = p
+            .find("(allow mach-lookup)\n")
+            .expect("Mach lookups are allowed");
+        let deny = p
+            .find("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))")
+            .expect("the pasteboard server is denied");
+        assert!(
+            deny > allow,
+            "Seatbelt applies the last matching rule, so the deny must follow the allow"
+        );
     }
 
     #[test]
