@@ -7,6 +7,8 @@ expression: json
   "name": "@lpm.dev/owner.widget",
   "available": true,
   "message": null,
+  "status": null,
+  "rulesVersion": null,
   "score": 0,
   "maxScore": 100,
   "tier": "needs-work",
@@ -24,6 +26,7 @@ expression: json
       "category": null,
       "label": "README",
       "passed": false,
+      "status": null,
       "points": 0,
       "maxPoints": 10,
       "detail": "Add a README."

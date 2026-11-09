@@ -7,31 +7,62 @@ expression: envelope
   "name": "owner.widget",
   "available": true,
   "message": null,
+  "status": "complete",
+  "rulesVersion": 3,
   "score": 73,
   "maxScore": 100,
-  "tier": "silver",
-  "ecosystem": "node",
-  "categories": null,
+  "tier": "good",
+  "ecosystem": "js",
+  "categories": {
+    "documentation": {
+      "score": 26,
+      "max": 32
+    },
+    "api": {
+      "score": 21,
+      "max": 26
+    },
+    "provenance": {
+      "score": 0,
+      "max": 12
+    },
+    "health": {
+      "score": 26,
+      "max": 30
+    }
+  },
   "published_at": null,
   "checks": [
     {
       "id": "readme",
-      "category": "docs",
+      "category": "documentation",
       "label": "README present",
       "passed": true,
-      "points": 10,
-      "maxPoints": 10,
+      "status": "passed",
+      "points": 6,
+      "maxPoints": 6,
       "detail": "this detail must stay hidden"
     },
     {
-      "id": "provenance",
-      "category": "security",
+      "id": "api-docs",
+      "category": "documentation",
+      "label": "API docs",
+      "passed": false,
+      "status": "partial",
+      "points": 6,
+      "maxPoints": 10,
+      "detail": "12 of 20 exports have doc comments"
+    },
+    {
+      "id": "trusted-publishing",
+      "category": "provenance",
       "label": "Provenance attestations",
       "passed": false,
+      "status": "failed",
       "points": 0,
-      "maxPoints": 20,
+      "maxPoints": 5,
       "detail": "missing provenance attestations"
     }
   ],
-  "count": 2
+  "count": 3
 }

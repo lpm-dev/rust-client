@@ -2219,6 +2219,120 @@ fn publish_check_mode_shows_quality() {
     );
 }
 
+fn quality_check_fixture() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.quality-kit",
+        "version": "1.2.0",
+        "description": "Formats byte counts for people to read",
+        "license": "MIT",
+        "type": "module",
+        "keywords": ["bytes"],
+        "sideEffects": false,
+        "exports": {
+            ".": { "types": "./index.d.ts", "default": "./index.js" }
+        }
+    }"#,
+    );
+    project.write_file(
+        "index.js",
+        "export function formatBytes(n) { return `${n} B` }\n",
+    );
+    project.write_file(
+        "index.d.ts",
+        "/** Formats a byte count for people to read. */\nexport declare function formatBytes(n: number): string;\n",
+    );
+    project.write_file("README.md", "# Quality kit\n\nShort.\n");
+    project
+}
+
+#[test]
+fn publish_check_lists_registry_checks_as_checked_after_publish() {
+    let project = quality_check_fixture();
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--lpm"])
+        .output()
+        .expect("failed to run lpm publish --check");
+
+    assert!(output.status.success(), "{output:?}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("Quality score:") && combined.contains("archive points"),
+        "--check must give the archive score, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("checked by LPM.dev Registry after publish"),
+        "registry checks must say when they run, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Publish from CI with trusted publishing"),
+        "registry checks must say what earns them, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Add a CHANGELOG.md"),
+        "a failed archive check must say how to earn its points, got:\n{combined}"
+    );
+}
+
+#[test]
+fn publish_check_json_reports_every_quality_check() {
+    let project = quality_check_fixture();
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--lpm"])
+        .output()
+        .expect("failed to run lpm publish --check --json");
+
+    assert!(output.status.success(), "{output:?}");
+    let envelope = parse_json_output(&output.stdout);
+    let quality = &envelope["quality"];
+    assert_eq!(quality["ecosystem"], "js");
+    assert_eq!(quality["registryMaxPoints"], 17);
+    let checks = quality["checks"].as_array().expect("checks");
+    assert_eq!(
+        checks.len(),
+        24,
+        "every JavaScript check, archive and registry"
+    );
+    let status = |id: &str| {
+        checks
+            .iter()
+            .find(|check| check["id"] == id)
+            .map(|check| check["status"].clone())
+            .unwrap()
+    };
+    assert_eq!(status("agent-skills"), "after_publish");
+    assert_eq!(status("api-docs"), "passed");
+    assert_eq!(status("changelog"), "failed");
+    insta::assert_json_snapshot!("publish_check_quality_report", quality);
+}
+
+#[tokio::test]
+async fn publish_sends_no_quality_report_in_version_metadata() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = quality_check_fixture();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("failed to run lpm publish");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = lpm_publish_request(&requests);
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    let version = &payload["versions"]["1.2.0"];
+    assert!(version.get("_qualityChecks").is_none(), "{version:#}");
+    assert!(version.get("_qualityMeta").is_none(), "{version:#}");
+}
+
 #[test]
 fn publish_check_npm_json_emits_success_object_without_lpm_quality() {
     let project = TempProject::empty(
@@ -2832,7 +2946,7 @@ async fn publish_preserves_authored_executable_bits_in_the_uploaded_tarball() {
 
 #[cfg(feature = "swift-tests")]
 #[tokio::test]
-async fn publish_quality_metadata_uses_the_detected_ecosystem() {
+async fn publish_sends_the_detected_ecosystem_and_no_quality_report() {
     let mock = MockRegistry::start().await;
     mock.with_publish_endpoint().await;
     mock.with_whoami("testuser", "test@example.com").await;
@@ -2863,9 +2977,11 @@ async fn publish_quality_metadata_uses_the_detected_ecosystem() {
     let requests = mock.server().received_requests().await.unwrap();
     let upload = lpm_publish_request(&requests);
     let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
-    assert_eq!(
-        payload["versions"]["1.0.0"]["_qualityMeta"]["ecosystem"],
-        serde_json::json!("swift"),
+    let version = &payload["versions"]["1.0.0"];
+    assert_eq!(version["_ecosystem"], serde_json::json!("swift"));
+    assert!(
+        version.get("_qualityChecks").is_none() && version.get("_qualityMeta").is_none(),
+        "LPM.dev Registry runs the quality checks itself; the publish sends no report: {version:#}"
     );
 }
 

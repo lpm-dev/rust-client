@@ -1,7 +1,7 @@
 use super::swift::extract_swift_metadata;
 use crate::commands::publish_common::{self, TarballFile};
+use crate::install_ui;
 use crate::prompt::PromptResultExt as _;
-use crate::{install_ui, quality};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use serde::ser::{SerializeMap as _, SerializeSeq as _};
@@ -282,7 +282,6 @@ pub(super) struct LpmPublishBody<'a> {
     pub(super) version_data: &'a serde_json::Value,
     pub(super) tarball_files: &'a [TarballFile],
     pub(super) package_json_size_override: Option<u64>,
-    pub(super) quality_result: Option<&'a quality::QualityResult>,
     pub(super) lpm_config: Option<&'a serde_json::Value>,
     pub(super) detected_ecosystem: &'a str,
     pub(super) swift_manifest: Option<&'a serde_json::Value>,
@@ -325,7 +324,6 @@ impl LpmPublishBody<'_> {
             LpmPackMetadata::new(self.tarball_files, self.package_json_size_override);
         let lpm_version = LpmVersionPayload {
             base: version_object,
-            quality_result: self.quality_result,
             pack_metadata: &pack_metadata,
             lpm_config: self.lpm_config,
             detected_ecosystem: self.detected_ecosystem,
@@ -425,7 +423,6 @@ fn packed_file_size(file: &TarballFile, package_json_size_override: Option<u64>)
 
 struct LpmVersionPayload<'a> {
     base: &'a serde_json::Map<String, serde_json::Value>,
-    quality_result: Option<&'a quality::QualityResult>,
     pack_metadata: &'a LpmPackMetadata<'a>,
     lpm_config: Option<&'a serde_json::Value>,
     detected_ecosystem: &'a str,
@@ -434,8 +431,9 @@ struct LpmVersionPayload<'a> {
 
 impl LpmVersionPayload<'_> {
     fn replaces(&self, key: &str) -> bool {
-        key == "_npmPackMeta"
-            || self.quality_result.is_some() && matches!(key, "_qualityChecks" | "_qualityMeta")
+        // LPM.dev Registry runs the quality checks itself; a quality report
+        // in version metadata is never sent.
+        matches!(key, "_npmPackMeta" | "_qualityChecks" | "_qualityMeta")
             || self.lpm_config.is_some() && key == "_lpmConfig"
             || self.detected_ecosystem != "js" && key == "_ecosystem"
             || self.swift_metadata.is_some() && key == "_swiftManifest"
@@ -449,7 +447,6 @@ impl serde::Serialize for LpmVersionPayload<'_> {
     {
         let replaced = self.base.keys().filter(|key| self.replaces(key)).count();
         let additions = 1
-            + usize::from(self.quality_result.is_some()) * 2
             + usize::from(self.lpm_config.is_some())
             + usize::from(self.detected_ecosystem != "js")
             + usize::from(self.swift_metadata.is_some());
@@ -464,17 +461,6 @@ impl serde::Serialize for LpmVersionPayload<'_> {
                 map.serialize_entry(key, value)?;
             }
         }
-        if let Some(result) = self.quality_result {
-            map.serialize_entry("_qualityChecks", &result.checks)?;
-            map.serialize_entry(
-                "_qualityMeta",
-                &LpmQualityMetadata {
-                    score: result.score,
-                    max_score: result.max_score,
-                    ecosystem: self.detected_ecosystem,
-                },
-            )?;
-        }
         map.serialize_entry("_npmPackMeta", self.pack_metadata)?;
         if let Some(config) = self.lpm_config {
             map.serialize_entry("_lpmConfig", config)?;
@@ -487,14 +473,6 @@ impl serde::Serialize for LpmVersionPayload<'_> {
         }
         map.end()
     }
-}
-
-#[derive(serde::Serialize)]
-struct LpmQualityMetadata<'a> {
-    score: u32,
-    #[serde(rename = "maxScore")]
-    max_score: u32,
-    ecosystem: &'a str,
 }
 
 struct LpmPublishPayload<'a> {
@@ -662,7 +640,6 @@ mod tests {
             version_data: &version_data,
             tarball_files: &files,
             package_json_size_override: None,
-            quality_result: None,
             lpm_config: None,
             detected_ecosystem: "js",
             swift_manifest: None,
@@ -708,7 +685,6 @@ mod tests {
         let pack_metadata = LpmPackMetadata::new(&files, Some(12));
         let version = LpmVersionPayload {
             base: base.as_object().unwrap(),
-            quality_result: None,
             pack_metadata: &pack_metadata,
             lpm_config: None,
             detected_ecosystem: "js",
@@ -913,7 +889,6 @@ mod tests {
             version_data: &version_data,
             tarball_files: &[],
             package_json_size_override: None,
-            quality_result: None,
             lpm_config: None,
             detected_ecosystem: "js",
             swift_manifest: None,

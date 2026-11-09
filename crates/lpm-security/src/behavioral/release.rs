@@ -11,6 +11,7 @@
 use super::{
     PackageAnalysis, PackageAnalyzer, ScanLimits, SourceEvidence, TagFiles, path_to_slash, roles,
 };
+use crate::quality::{QualityCollector, QualityEcosystem, QualityReport};
 use flate2::bufread::GzDecoder;
 use lpm_common::LpmError;
 use serde::Serialize;
@@ -56,6 +57,16 @@ pub enum Ecosystem {
 }
 
 impl Ecosystem {
+    /// The quality checks' ecosystem, for the ecosystems the quality score
+    /// covers.
+    pub fn quality(self) -> Option<QualityEcosystem> {
+        match self {
+            Self::Js => Some(QualityEcosystem::Js),
+            Self::Swift => Some(QualityEcosystem::Swift),
+            Self::Rust | Self::Python => None,
+        }
+    }
+
     fn reads(self, path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
         let Some((_, extension)) = name.rsplit_once('.') else {
@@ -98,6 +109,10 @@ pub struct ReleaseSignals {
     pub eval_calls: usize,
     pub url_domains: Vec<String>,
     pub coverage: ReleaseCoverage,
+    /// The quality checks the archive decides, for an ecosystem the quality
+    /// score covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<QualityReport>,
 }
 
 /// How much of a release the analysis read.
@@ -122,7 +137,10 @@ pub struct ReleaseCoverage {
     pub complete: bool,
 }
 
-/// Analyze a release from its gzipped tarball.
+/// Analyze a release from its gzipped tarball, and run the quality checks
+/// its archive decides when its ecosystem has them. `swift_manifest` is a
+/// Swift release's evaluated manifest (`swift package dump-package`); the
+/// checks that read it are pending without it.
 ///
 /// The input is read to its end, every file an npm client unpacks included:
 /// each gzip member and every tar entry, past zero blocks that end the
@@ -138,7 +156,99 @@ pub struct ReleaseCoverage {
 pub fn analyze_release_tarball<R: Read>(
     gzipped: R,
     ecosystem: Ecosystem,
+    swift_manifest: Option<&serde_json::Value>,
 ) -> Result<ReleaseSignals, LpmError> {
+    let mut analyzer = PackageAnalyzer::with_limits(ScanLimits::REGISTRY);
+    let mut quality = ecosystem.quality().map(QualityCollector::new);
+    let mut manifest = None;
+    let mut buffer = Vec::new();
+
+    visit_release_files(gzipped, |path, relative, size, mut entry| {
+        if roles::is_native_artifact_path(path) {
+            analyzer.note_native_artifact(path.to_string());
+        }
+        let quality_bytes = quality
+            .as_mut()
+            .and_then(|quality| quality.note_file(path, size));
+        if path == "package.json" {
+            manifest = (size <= lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                .then(|| read_whole(&mut entry, size))
+                .transpose()
+                .map_err(LpmError::Io)?;
+        } else if size > 0 && ecosystem.reads(path) {
+            let limits = ScanLimits::REGISTRY;
+            if size > limits.full_file_bytes {
+                let sample =
+                    read_ends(&mut entry, size, limits.sample_bytes).map_err(LpmError::Io)?;
+                analyzer.feed_sample(relative, size, &sample);
+            } else {
+                buffer.clear();
+                entry.read_to_end(&mut buffer).map_err(LpmError::Io)?;
+                analyzer.feed(relative, &buffer);
+                if let (Some(quality), Some(bytes)) = (quality.as_mut(), quality_bytes) {
+                    let end = usize::try_from(bytes)
+                        .map_or(buffer.len(), |bytes| bytes.min(buffer.len()));
+                    quality.add_content(path, &buffer[..end]);
+                }
+            }
+        } else if let (Some(quality), Some(bytes)) = (quality.as_mut(), quality_bytes) {
+            buffer.clear();
+            entry
+                .take(bytes)
+                .read_to_end(&mut buffer)
+                .map_err(LpmError::Io)?;
+            quality.add_content(path, &buffer);
+        }
+        Ok(())
+    })?;
+
+    let quality = quality.map(|quality| quality.finish(manifest.as_deref(), swift_manifest));
+    Ok(release_signals(
+        analyzer.finish(manifest.as_deref()),
+        quality,
+    ))
+}
+
+/// Runs only the quality checks a release's archive decides, reading its
+/// gzipped tarball as [`analyze_release_tarball`] does, for `lpm publish`.
+///
+/// # Errors
+///
+/// As [`analyze_release_tarball`]'s.
+pub fn analyze_release_quality<R: Read>(
+    gzipped: R,
+    ecosystem: QualityEcosystem,
+    swift_manifest: Option<&serde_json::Value>,
+) -> Result<QualityReport, LpmError> {
+    let mut quality = QualityCollector::new(ecosystem);
+    let mut manifest = None;
+    let mut buffer = Vec::new();
+    visit_release_files(gzipped, |path, _, size, mut entry| {
+        let wanted = quality.note_file(path, size);
+        if path == "package.json" {
+            manifest = (size <= lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                .then(|| read_whole(&mut entry, size))
+                .transpose()
+                .map_err(LpmError::Io)?;
+        } else if let Some(bytes) = wanted {
+            buffer.clear();
+            entry
+                .take(bytes)
+                .read_to_end(&mut buffer)
+                .map_err(LpmError::Io)?;
+            quality.add_content(path, &buffer);
+        }
+        Ok(())
+    })?;
+    Ok(quality.finish(manifest.as_deref(), swift_manifest))
+}
+
+/// Calls `visit` with each regular file of a release's gzipped tarball: its
+/// package-relative path, as a string and a path, its size and its content.
+fn visit_release_files<R: Read>(
+    gzipped: R,
+    mut visit: impl FnMut(&str, &std::path::Path, u64, &mut dyn Read) -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
     let compressed = BufReader::with_capacity(
         READ_BUFFER_BYTES,
         LimitedReader::new(gzipped, MAX_COMPRESSED_BYTES, "compressed"),
@@ -151,10 +261,6 @@ pub fn analyze_release_tarball<R: Read>(
             "decompressed",
         ),
     );
-    let mut analyzer = PackageAnalyzer::with_limits(ScanLimits::REGISTRY);
-    let mut manifest = None;
-    let mut buffer = Vec::new();
-
     lpm_extractor::visit_tar_archive_to_end(tar, ARCHIVE_LIMITS, |mut entry| {
         let entry_type = entry.header().entry_type();
         if !entry_type.is_file() && entry_type != tar::EntryType::Continuous {
@@ -165,30 +271,10 @@ pub fn analyze_release_tarball<R: Read>(
         };
         let path = path_to_slash(&relative);
         let size = entry.size();
-        if roles::is_native_artifact_path(&path) {
-            analyzer.note_native_artifact(path.clone());
-        }
-        if path == "package.json" {
-            manifest = (size <= lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-                .then(|| read_whole(&mut entry, size))
-                .transpose()
-                .map_err(LpmError::Io)?;
-        } else if size > 0 && ecosystem.reads(&path) {
-            let limits = ScanLimits::REGISTRY;
-            if size > limits.full_file_bytes {
-                let sample =
-                    read_ends(&mut entry, size, limits.sample_bytes).map_err(LpmError::Io)?;
-                analyzer.feed_sample(&relative, size, &sample);
-            } else {
-                buffer.clear();
-                entry.read_to_end(&mut buffer).map_err(LpmError::Io)?;
-                analyzer.feed(&relative, &buffer);
-            }
-        }
+        visit(&path, &relative, size, &mut entry)?;
         Ok(ControlFlow::<()>::Continue(()))
     })?;
-
-    Ok(release_signals(analyzer.finish(manifest.as_deref())))
+    Ok(())
 }
 
 fn read_whole(reader: &mut impl Read, size: u64) -> io::Result<Vec<u8>> {
@@ -217,7 +303,7 @@ fn read_ends(reader: &mut impl Read, size: u64, sample_bytes: usize) -> io::Resu
     Ok(sample)
 }
 
-fn release_signals(analysis: PackageAnalysis) -> ReleaseSignals {
+fn release_signals(analysis: PackageAnalysis, quality: Option<QualityReport>) -> ReleaseSignals {
     let meta = analysis.meta;
     let source = analysis.source;
     let supply = analysis.supply_chain;
@@ -279,6 +365,7 @@ fn release_signals(analysis: PackageAnalysis) -> ReleaseSignals {
         eval_calls: meta.eval_calls,
         url_domains: meta.url_domains,
         coverage,
+        quality,
     }
 }
 
@@ -421,7 +508,7 @@ mod tests {
     }
 
     fn analyze(entries: &[(&str, &[u8])]) -> ReleaseSignals {
-        analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Js).unwrap()
+        analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Js, None).unwrap()
     }
 
     #[test]
@@ -526,7 +613,7 @@ mod tests {
             ("scripts/build.js", b"eval(code)"),
         ];
         let signals =
-            analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Swift).unwrap();
+            analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Swift, None).unwrap();
 
         assert!(!signals.tags["eval"]);
         assert_eq!(signals.coverage.source_files, 2);
@@ -540,7 +627,7 @@ mod tests {
             ("pkg/kit.py", b"def run():\n    return 1\n"),
         ];
         let signals =
-            analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Python).unwrap();
+            analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Python, None).unwrap();
 
         assert!(signals.tags["eval"]);
         assert_eq!(signals.coverage.source_files, 2);
@@ -563,10 +650,10 @@ mod tests {
 
     #[test]
     fn refuses_input_that_is_not_a_gzipped_tarball() {
-        assert!(analyze_release_tarball(b"not a tarball".as_slice(), Ecosystem::Js).is_err());
+        assert!(analyze_release_tarball(b"not a tarball".as_slice(), Ecosystem::Js, None).is_err());
         let mut truncated = tarball(&[("index.js", b"module.exports = 1")]);
         truncated.truncate(truncated.len() / 2);
-        assert!(analyze_release_tarball(truncated.as_slice(), Ecosystem::Js).is_err());
+        assert!(analyze_release_tarball(truncated.as_slice(), Ecosystem::Js, None).is_err());
     }
 
     #[test]
@@ -583,8 +670,9 @@ mod tests {
         let mut gzipped = GzEncoder::new(Vec::new(), Compression::fast());
         io::Write::write_all(&mut gzipped, &raw.into_inner().unwrap()).unwrap();
 
-        let error = analyze_release_tarball(gzipped.finish().unwrap().as_slice(), Ecosystem::Js)
-            .unwrap_err();
+        let error =
+            analyze_release_tarball(gzipped.finish().unwrap().as_slice(), Ecosystem::Js, None)
+                .unwrap_err();
         assert!(error.to_string().contains("path traversal"), "{error}");
     }
 
@@ -597,7 +685,7 @@ mod tests {
         )));
         input.extend_from_slice(&[0; 64]);
 
-        let signals = analyze_release_tarball(input.as_slice(), Ecosystem::Js).unwrap();
+        let signals = analyze_release_tarball(input.as_slice(), Ecosystem::Js, None).unwrap();
 
         assert!(signals.tags["childProcess"]);
         assert_eq!(signals.tag_files["childProcess"].files, ["lib/run.js"]);
@@ -612,7 +700,8 @@ mod tests {
             tar::EntryType::Regular,
         ));
 
-        let signals = analyze_release_tarball(gzip(&archive).as_slice(), Ecosystem::Js).unwrap();
+        let signals =
+            analyze_release_tarball(gzip(&archive).as_slice(), Ecosystem::Js, None).unwrap();
 
         assert!(signals.tags["childProcess"]);
     }
@@ -622,13 +711,13 @@ mod tests {
         for trailing in [b"trailing bytes".as_slice(), b"\x00\x00trailing bytes"] {
             let mut input = tarball(&[("index.js", b"module.exports = 1")]);
             input.extend_from_slice(trailing);
-            assert!(analyze_release_tarball(input.as_slice(), Ecosystem::Js).is_err());
+            assert!(analyze_release_tarball(input.as_slice(), Ecosystem::Js, None).is_err());
         }
 
         let mut corrupt = tarball(&[("index.js", b"module.exports = 1")]);
         let crc = corrupt.len() - 8;
         corrupt[crc] ^= 0xff;
-        assert!(analyze_release_tarball(corrupt.as_slice(), Ecosystem::Js).is_err());
+        assert!(analyze_release_tarball(corrupt.as_slice(), Ecosystem::Js, None).is_err());
     }
 
     #[test]
@@ -640,10 +729,92 @@ mod tests {
         ] {
             let archive = tar_archive(&[(path, PAYLOAD)], entry_type);
             let signals =
-                analyze_release_tarball(gzip(&archive).as_slice(), Ecosystem::Js).unwrap();
+                analyze_release_tarball(gzip(&archive).as_slice(), Ecosystem::Js, None).unwrap();
             assert!(signals.tags["childProcess"], "{path}");
             assert_eq!(signals.coverage.source_files, 1, "{path}");
         }
+    }
+
+    #[test]
+    fn reports_the_archive_quality_checks_of_a_scored_ecosystem() {
+        let entries: &[(&str, &[u8])] = &[
+            (
+                "package.json",
+                br#"{"name":"@lpm.dev/acme.kit","version":"1.0.0","license":"MIT","sideEffects":false}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+            ("LICENSE", b"MIT"),
+        ];
+        let signals = analyze(entries);
+        let quality = signals.quality.expect("JavaScript is scored");
+        assert_eq!(quality.ecosystem, QualityEcosystem::Js);
+        let check = |id: &str| quality.checks.iter().find(|check| check.id == id).unwrap();
+        assert_eq!(check("license").points, 5);
+        assert_eq!(check("license-file").points, 2);
+        assert_eq!(check("side-effects").points, 2);
+        assert_eq!(check("readme").points, 0);
+
+        let alone =
+            analyze_release_quality(tarball(entries).as_slice(), QualityEcosystem::Js, None)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&alone).unwrap(),
+            serde_json::to_value(&quality).unwrap(),
+            "lpm publish scores the archive as the registry does"
+        );
+    }
+
+    #[test]
+    fn reports_no_quality_checks_for_an_unscored_ecosystem() {
+        let signals = analyze_release_tarball(
+            tarball(&[("main.py", b"print(1)")]).as_slice(),
+            Ecosystem::Python,
+            None,
+        )
+        .unwrap();
+        assert!(signals.quality.is_none());
+        assert!(
+            serde_json::to_value(&signals)
+                .unwrap()
+                .get("quality")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn passes_the_evaluated_manifest_to_the_swift_checks() {
+        let entries: &[(&str, &[u8])] = &[
+            ("Package.swift", b"// swift-tools-version: 6.0"),
+            ("Sources/Kit/Kit.swift", b"public struct Kit {}"),
+        ];
+        let pending = analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Swift, None)
+            .unwrap()
+            .quality
+            .unwrap();
+        let platforms = |report: &QualityReport| {
+            report
+                .checks
+                .iter()
+                .find(|check| check.id == "platforms")
+                .map(|check| check.status)
+                .unwrap()
+        };
+        assert_eq!(platforms(&pending), crate::quality::CheckStatus::Pending);
+
+        let manifest = serde_json::json!({
+            "toolsVersion": { "_version": "6.0.0" },
+            "platforms": [{ "platformName": "macos", "version": "14.0" }],
+            "products": [], "targets": [], "dependencies": []
+        });
+        let scored = analyze_release_tarball(
+            tarball(entries).as_slice(),
+            Ecosystem::Swift,
+            Some(&manifest),
+        )
+        .unwrap()
+        .quality
+        .unwrap();
+        assert_eq!(platforms(&scored), crate::quality::CheckStatus::Passed);
     }
 
     #[test]

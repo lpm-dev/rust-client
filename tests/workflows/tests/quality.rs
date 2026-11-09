@@ -6,27 +6,47 @@ use support::{TempProject, lpm_with_registry};
 fn sample_quality_report() -> serde_json::Value {
     serde_json::json!({
         "name": "owner.widget",
+        "status": "complete",
+        "rulesVersion": 3,
         "score": 73,
         "maxScore": 100,
-        "tier": "silver",
-        "ecosystem": "node",
+        "tier": "good",
+        "ecosystem": "js",
+        "categories": {
+            "documentation": { "score": 26, "max": 32 },
+            "api": { "score": 21, "max": 26 },
+            "provenance": { "score": 0, "max": 12 },
+            "health": { "score": 26, "max": 30 }
+        },
         "checks": [
             {
                 "id": "readme",
-                "category": "docs",
+                "category": "documentation",
                 "label": "README present",
+                "status": "passed",
                 "passed": true,
-                "points": 10,
-                "maxPoints": 10,
+                "points": 6,
+                "maxPoints": 6,
                 "detail": "this detail must stay hidden"
             },
             {
-                "id": "provenance",
-                "category": "security",
+                "id": "api-docs",
+                "category": "documentation",
+                "label": "API docs",
+                "status": "partial",
+                "passed": false,
+                "points": 6,
+                "maxPoints": 10,
+                "detail": "12 of 20 exports have doc comments"
+            },
+            {
+                "id": "trusted-publishing",
+                "category": "provenance",
                 "label": "Provenance attestations",
+                "status": "failed",
                 "passed": false,
                 "points": 0,
-                "maxPoints": 20,
+                "maxPoints": 5,
                 "detail": "missing provenance attestations"
             }
         ]
@@ -57,7 +77,17 @@ async fn quality_human_output_uses_slim_completion_and_shows_failed_detail_only(
     assert!(stdout.contains("score"), "score field missing");
     assert!(stdout.contains("tier"), "tier field missing");
     assert!(stdout.contains("ecosystem"), "ecosystem field missing");
-    assert!(stdout.contains("checks"), "checks section missing");
+    assert!(stdout.contains("rules"), "rules version missing");
+    assert!(stdout.contains("docs"), "docs category missing");
+    assert!(stdout.contains("provenance"), "provenance category missing");
+    assert!(
+        stdout.contains("◐ API docs"),
+        "a partial check must show as partial"
+    );
+    assert!(
+        stdout.contains("12 of 20 exports have doc comments"),
+        "a partial check's detail must be shown"
+    );
     assert!(
         stdout.contains("✓ README present"),
         "passed check label missing"
@@ -114,6 +144,63 @@ async fn quality_json_envelope_matches_snapshot() {
     assert_eq!(envelope["score"], serde_json::json!(73));
 
     insta::assert_json_snapshot!("quality_json_envelope_owner_widget", envelope);
+}
+
+#[tokio::test]
+async fn quality_shows_scoring_while_the_report_is_pending() {
+    let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let mut report = sample_quality_report();
+    report["status"] = serde_json::json!("pending");
+    report["score"] = serde_json::Value::Null;
+    report["checks"][2]["status"] = serde_json::json!("pending");
+    mock.with_quality_report("owner.widget", report).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["quality", "owner.widget"])
+        .output()
+        .expect("failed to run lpm quality");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Scoring…"),
+        "pending report must say Scoring…:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("73/100"),
+        "a pending report shows no score:\n{stdout}"
+    );
+    assert!(stdout.contains("◦ Provenance attestations"), "{stdout}");
+}
+
+#[tokio::test]
+async fn quality_reads_a_report_from_a_registry_without_categories_or_status() {
+    let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_quality_report(
+        "owner.widget",
+        serde_json::json!({
+            "name": "owner.widget", "score": 40, "maxScore": 100, "tier": "needs-work",
+            "checks": [
+                {"id": "has-readme", "label": "Has README", "passed": true, "points": 8, "maxPoints": 8},
+                {"id": "has-types", "label": "Has types", "passed": false, "points": 0, "maxPoints": 8, "detail": "No types"}
+            ]
+        }),
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["quality", "owner.widget"])
+        .output()
+        .expect("failed to run lpm quality");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("40/100"), "{stdout}");
+    assert!(stdout.contains("✓ Has README"), "{stdout}");
+    assert!(stdout.contains("✗ Has types"), "{stdout}");
+    assert!(stdout.contains("No types"), "{stdout}");
 }
 
 #[path = "quality_contract/mod.rs"]

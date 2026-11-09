@@ -135,15 +135,19 @@ async fn publish_current_project_locked(
         options.json_output,
         options.allow_secrets,
     )?;
+    let staged_tarball = match &rewritten_tarball {
+        Some(tarball) => std::sync::Arc::new(tarball.read_data()?),
+        None => std::sync::Arc::clone(&prepared.tarball_data),
+    };
     let quality = publish::run_publish_quality_gate(publish::PublishQualityGateInput {
-        pkg_json: &prepared.pkg_json,
-        readme: prepared.readme.as_deref(),
-        tarball_files: &prepared.tarball_files,
+        tarball: staged_tarball.as_slice(),
         detected_ecosystem: &prepared.detected_ecosystem,
         swift_manifest: prepared.swift_manifest.as_ref(),
         min_score: options.min_score,
         json_output: options.json_output,
+        check_only: false,
     })?;
+    drop(staged_tarball);
 
     if options.dry_run {
         let json = serde_json::json!({
@@ -157,7 +161,7 @@ async fn publish_current_project_locked(
             "access": access,
             "files": prepared.tarball_files.len(),
             "tarball_size": rewritten_tarball.as_ref().map_or(prepared.tarball_size, |tarball| tarball.len()),
-            "quality": quality,
+            "quality": publish::quality_json(&quality),
         });
         if options.json_output {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());

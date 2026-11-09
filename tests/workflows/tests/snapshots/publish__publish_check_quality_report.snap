@@ -1,0 +1,238 @@
+---
+source: tests/workflows/tests/publish.rs
+expression: quality
+---
+{
+  "schemaVersion": 1,
+  "rulesVersion": 1,
+  "ecosystem": "js",
+  "preflightScore": 72,
+  "archivePoints": 60,
+  "archiveMaxPoints": 83,
+  "registryMaxPoints": 17,
+  "checks": [
+    {
+      "id": "readme",
+      "category": "documentation",
+      "label": "README",
+      "points": 0,
+      "maxPoints": 6,
+      "status": "failed",
+      "detail": "README.md has 20 characters of prose; 300 earn the points",
+      "tip": "Add a README.md at the package root with at least 300 characters of prose, not counting code blocks, badges and HTML."
+    },
+    {
+      "id": "readme-install",
+      "category": "documentation",
+      "label": "Install command",
+      "points": 0,
+      "maxPoints": 3,
+      "status": "failed",
+      "detail": "No README code block installs @lpm.dev/testuser.quality-kit with lpm, npm, pnpm, yarn or bun",
+      "tip": "Add a code block to the README with the command that installs this exact package, such as `lpm install @lpm.dev/owner.name` or `npm install @lpm.dev/owner.name`."
+    },
+    {
+      "id": "readme-example",
+      "category": "documentation",
+      "label": "Usage example",
+      "points": 0,
+      "maxPoints": 5,
+      "status": "failed",
+      "detail": "No js or ts code block in the README imports @lpm.dev/testuser.quality-kit",
+      "tip": "Add a ```js or ```ts code block to the README that imports the package by its name (2 points). Import only names the package exports for all 5."
+    },
+    {
+      "id": "api-docs",
+      "category": "documentation",
+      "label": "API docs",
+      "points": 10,
+      "maxPoints": 10,
+      "status": "passed",
+      "detail": "1 of 1 exports in the type declarations have doc comments (100%)"
+    },
+    {
+      "id": "changelog",
+      "category": "documentation",
+      "label": "Changelog",
+      "points": 0,
+      "maxPoints": 3,
+      "status": "failed",
+      "detail": "No CHANGELOG, CHANGES or HISTORY file at the package root",
+      "tip": "Add a CHANGELOG.md (or CHANGES or HISTORY) at the package root with an entry that names this version."
+    },
+    {
+      "id": "agent-skills",
+      "category": "documentation",
+      "label": "Agent Skills",
+      "points": null,
+      "maxPoints": 5,
+      "status": "after_publish",
+      "tip": "Publish at least one Agent Skill with the package. LPM.dev Registry counts it once its security scan approves it."
+    },
+    {
+      "id": "entry-points",
+      "category": "api",
+      "label": "Entry points exist",
+      "points": 5,
+      "maxPoints": 5,
+      "status": "passed",
+      "detail": "All 2 declared entry paths exist"
+    },
+    {
+      "id": "types",
+      "category": "api",
+      "label": "Type declarations",
+      "points": 10,
+      "maxPoints": 10,
+      "status": "passed",
+      "detail": "Every entry has type declarations (2 entries)"
+    },
+    {
+      "id": "esm",
+      "category": "api",
+      "label": "ESM entry",
+      "points": 4,
+      "maxPoints": 4,
+      "status": "passed",
+      "detail": "index.js is an ES module"
+    },
+    {
+      "id": "exports-map",
+      "category": "api",
+      "label": "Exports map",
+      "points": 4,
+      "maxPoints": 4,
+      "status": "passed",
+      "detail": "\"exports\" maps 1 subpath"
+    },
+    {
+      "id": "side-effects",
+      "category": "api",
+      "label": "Side effects declared",
+      "points": 2,
+      "maxPoints": 2,
+      "status": "passed",
+      "detail": "\"sideEffects\": false"
+    },
+    {
+      "id": "engines",
+      "category": "api",
+      "label": "Node.js engines",
+      "points": 0,
+      "maxPoints": 1,
+      "status": "failed",
+      "detail": "package.json has no engines.node",
+      "tip": "Add a valid range to \"engines\": { \"node\": \">=20\" } in package.json."
+    },
+    {
+      "id": "trusted-publishing",
+      "category": "provenance",
+      "label": "Trusted publishing",
+      "points": null,
+      "maxPoints": 5,
+      "status": "after_publish",
+      "tip": "Publish from CI with trusted publishing (OIDC), such as `lpm publish` in a GitHub Actions job with `id-token: write`."
+    },
+    {
+      "id": "signed-provenance",
+      "category": "provenance",
+      "label": "Signed provenance",
+      "points": null,
+      "maxPoints": 2,
+      "status": "after_publish",
+      "tip": "Publish from CI with a Sigstore provenance bundle (`lpm publish --provenance`)."
+    },
+    {
+      "id": "repository-verified",
+      "category": "provenance",
+      "label": "Repository matches provenance",
+      "points": null,
+      "maxPoints": 2,
+      "status": "after_publish",
+      "tip": "Publish with trusted publishing from the repository that package.json \"repository\" names."
+    },
+    {
+      "id": "verified-domain",
+      "category": "provenance",
+      "label": "Owner's verified domain",
+      "points": null,
+      "maxPoints": 3,
+      "status": "after_publish",
+      "tip": "Verify a domain for the package's owner (the organization, for an organization package) with a DNS TXT record in its LPM.dev settings."
+    },
+    {
+      "id": "license",
+      "category": "health",
+      "label": "License",
+      "points": 5,
+      "maxPoints": 5,
+      "status": "passed",
+      "detail": "SPDX expression \"MIT\""
+    },
+    {
+      "id": "license-file",
+      "category": "health",
+      "label": "License file",
+      "points": 0,
+      "maxPoints": 2,
+      "status": "failed",
+      "detail": "No LICENSE, LICENCE or COPYING file at the package root",
+      "tip": "Add a LICENSE, LICENCE or COPYING file at the package root."
+    },
+    {
+      "id": "description",
+      "category": "health",
+      "label": "Description",
+      "points": 2,
+      "maxPoints": 2,
+      "status": "passed",
+      "detail": "38 characters"
+    },
+    {
+      "id": "keywords",
+      "category": "health",
+      "label": "Keywords",
+      "points": 1,
+      "maxPoints": 1,
+      "status": "passed",
+      "detail": "1 keyword"
+    },
+    {
+      "id": "repository",
+      "category": "health",
+      "label": "Repository",
+      "points": 0,
+      "maxPoints": 3,
+      "status": "failed",
+      "detail": "package.json has no \"repository\" URL",
+      "tip": "Set \"repository\" in package.json to the source repository's URL, such as \"github:owner/repo\" or { \"type\": \"git\", \"url\": \"https://github.com/owner/repo\" }."
+    },
+    {
+      "id": "lean-install",
+      "category": "health",
+      "label": "Lean install",
+      "points": 6,
+      "maxPoints": 6,
+      "status": "passed",
+      "detail": "0 direct dependencies"
+    },
+    {
+      "id": "no-install-scripts",
+      "category": "health",
+      "label": "No install scripts",
+      "points": 5,
+      "maxPoints": 5,
+      "status": "passed",
+      "detail": "Nothing runs at install"
+    },
+    {
+      "id": "clean-archive",
+      "category": "health",
+      "label": "Clean archive",
+      "points": 6,
+      "maxPoints": 6,
+      "status": "passed",
+      "detail": "No stray files; 540 B unpacked"
+    }
+  ]
+}

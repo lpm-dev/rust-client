@@ -20,7 +20,7 @@ pub mod roles;
 pub mod secrets;
 pub mod source;
 pub mod supply_chain;
-mod syntax;
+pub(crate) mod syntax;
 mod threats;
 
 pub use evidence::SourceEvidence;

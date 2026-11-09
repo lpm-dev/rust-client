@@ -110,5 +110,167 @@ expression: document
     "skippedFiles": 0,
     "manifest": true,
     "complete": true
+  },
+  "quality": {
+    "schemaVersion": 1,
+    "rulesVersion": 1,
+    "ecosystem": "js",
+    "checks": [
+      {
+        "id": "readme",
+        "category": "documentation",
+        "points": 0,
+        "maxPoints": 6,
+        "status": "failed",
+        "detail": "No README at the package root"
+      },
+      {
+        "id": "readme-install",
+        "category": "documentation",
+        "points": 0,
+        "maxPoints": 3,
+        "status": "failed",
+        "detail": "No README"
+      },
+      {
+        "id": "readme-example",
+        "category": "documentation",
+        "points": 0,
+        "maxPoints": 5,
+        "status": "failed",
+        "detail": "No README"
+      },
+      {
+        "id": "api-docs",
+        "category": "documentation",
+        "points": 0,
+        "maxPoints": 10,
+        "status": "failed",
+        "detail": "No type declarations or ESM entry to read the exports from"
+      },
+      {
+        "id": "changelog",
+        "category": "documentation",
+        "points": 0,
+        "maxPoints": 3,
+        "status": "failed",
+        "detail": "No CHANGELOG, CHANGES or HISTORY file at the package root"
+      },
+      {
+        "id": "entry-points",
+        "category": "api",
+        "points": 5,
+        "maxPoints": 5,
+        "status": "passed",
+        "detail": "All 1 declared entry path exist"
+      },
+      {
+        "id": "types",
+        "category": "api",
+        "points": 0,
+        "maxPoints": 10,
+        "status": "failed",
+        "detail": "No entry has type declarations"
+      },
+      {
+        "id": "esm",
+        "category": "api",
+        "points": 0,
+        "maxPoints": 4,
+        "status": "failed",
+        "detail": "No \"module\" field, and \"main\" isn't an ES module"
+      },
+      {
+        "id": "exports-map",
+        "category": "api",
+        "points": 0,
+        "maxPoints": 4,
+        "status": "failed",
+        "detail": "package.json has no \"exports\""
+      },
+      {
+        "id": "side-effects",
+        "category": "api",
+        "points": 0,
+        "maxPoints": 2,
+        "status": "failed",
+        "detail": "package.json doesn't declare \"sideEffects\""
+      },
+      {
+        "id": "engines",
+        "category": "api",
+        "points": 0,
+        "maxPoints": 1,
+        "status": "failed",
+        "detail": "package.json has no engines.node"
+      },
+      {
+        "id": "license",
+        "category": "health",
+        "points": 5,
+        "maxPoints": 5,
+        "status": "passed",
+        "detail": "SPDX expression \"MIT\""
+      },
+      {
+        "id": "license-file",
+        "category": "health",
+        "points": 0,
+        "maxPoints": 2,
+        "status": "failed",
+        "detail": "No LICENSE, LICENCE or COPYING file at the package root"
+      },
+      {
+        "id": "description",
+        "category": "health",
+        "points": 0,
+        "maxPoints": 2,
+        "status": "failed",
+        "detail": "package.json has no \"description\""
+      },
+      {
+        "id": "keywords",
+        "category": "health",
+        "points": 0,
+        "maxPoints": 1,
+        "status": "failed",
+        "detail": "package.json has no keywords"
+      },
+      {
+        "id": "repository",
+        "category": "health",
+        "points": 0,
+        "maxPoints": 3,
+        "status": "failed",
+        "detail": "package.json has no \"repository\" URL"
+      },
+      {
+        "id": "lean-install",
+        "category": "health",
+        "points": 5,
+        "maxPoints": 6,
+        "status": "partial",
+        "detail": "1 direct dependency"
+      },
+      {
+        "id": "no-install-scripts",
+        "category": "health",
+        "points": 0,
+        "maxPoints": 5,
+        "status": "failed",
+        "detail": "binding.gyp at the package root makes npm run node-gyp rebuild at install"
+      },
+      {
+        "id": "clean-archive",
+        "category": "health",
+        "points": 6,
+        "maxPoints": 6,
+        "status": "passed",
+        "detail": "No stray files; 229 B unpacked"
+      }
+    ],
+    "facts": {
+      "repository": null
+    }
   }
 }

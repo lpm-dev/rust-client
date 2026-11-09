@@ -32,7 +32,7 @@ pub(crate) use provenance::{
     ProvenanceRequest, materialize_provenance_request,
     resolve_provenance_request_from_project_source,
 };
-pub(crate) use quality_gate::run_publish_quality_gate;
+pub(crate) use quality_gate::{quality_json, run_publish_quality_gate};
 pub(crate) use secret_scan::run_publish_secret_scan;
 #[allow(unused_imports)]
 pub use target::resolve_targets;

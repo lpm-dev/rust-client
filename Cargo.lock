@@ -4255,6 +4255,7 @@ dependencies = [
  "lpm-common",
  "lpm-extractor",
  "lpm-lockfile",
+ "lpm-semver",
  "lpm-workspace",
  "memchr",
  "oxc_allocator",
@@ -4271,12 +4272,14 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "shlex",
+ "spdx",
  "stacker",
  "strsim",
  "tar",
  "tempfile",
  "time",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -1350,6 +1350,14 @@ pub struct QualityResponse {
     #[serde(default)]
     pub ecosystem: Option<String>,
 
+    /// `complete`, or `pending` while a check's evidence is still being
+    /// gathered. Registries before the four-bar score send none.
+    #[serde(default)]
+    pub status: Option<String>,
+
+    #[serde(default, rename = "rulesVersion")]
+    pub rules_version: Option<u32>,
+
     #[serde(default)]
     pub checks: Vec<QualityCheck>,
 }
@@ -1366,6 +1374,10 @@ pub struct QualityCheck {
 
     #[serde(default)]
     pub passed: Option<bool>,
+
+    /// `passed`, `partial`, `failed` or `pending`.
+    #[serde(default)]
+    pub status: Option<String>,
 
     #[serde(default)]
     pub points: Option<u32>,
