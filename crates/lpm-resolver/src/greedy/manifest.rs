@@ -1436,16 +1436,25 @@ async fn fetch_metadata_raw(
 }
 
 fn metadata_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -> ResolveError {
-    match error {
-        lpm_common::LpmError::NotFound(detail) => ResolveError::PackageNotFound {
+    if error.is_not_found() {
+        return ResolveError::PackageNotFound {
             package: canonical.to_string(),
-            detail,
-        },
-        other => ResolveError::DependencyFetch {
+            detail: match error {
+                lpm_common::LpmError::NotFound(detail) => detail,
+                other => other.to_string(),
+            },
+        };
+    }
+    if let Some(failure) = crate::RegistryFetchFailure::from_lpm_error(&error) {
+        return ResolveError::Registry {
             package: canonical.to_string(),
-            version: "*".to_string(),
-            detail: other.to_string(),
-        },
+            failure,
+        };
+    }
+    ResolveError::DependencyFetch {
+        package: canonical.to_string(),
+        version: "*".to_string(),
+        detail: error.to_string(),
     }
 }
 
@@ -1567,6 +1576,11 @@ pub(super) fn propagate_fetch_error(
             edge.canonical,
         );
         return Ok(());
+    }
+    // A registry's refusal isn't about the dependency's range: it keeps its
+    // kind, so the user is told to sign in, wait, or what the registry said.
+    if let ResolveError::Registry { .. } = err {
+        return Err(err.clone());
     }
     let detail = match err {
         ResolveError::DependencyFetch { detail, .. }

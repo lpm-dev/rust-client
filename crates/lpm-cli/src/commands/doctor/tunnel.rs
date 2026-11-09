@@ -153,10 +153,10 @@ pub(super) async fn check_tunnel_domain_from_config(
 async fn check_authenticated_tunnel(client: &RegistryClient, domain: &str) -> Check {
     let result = match client.diagnostic_tunnel_domain_lookup_once(domain).await {
         Ok(result) => result,
-        Err(_) => {
+        Err(error) => {
             return Check::warn(
                 &doctor_catalog::TUNNEL_UNVERIFIED,
-                &format!("{domain} (configured, could not verify ownership)"),
+                &format!("{domain} (configured, could not verify ownership: {error})"),
             );
         }
     };

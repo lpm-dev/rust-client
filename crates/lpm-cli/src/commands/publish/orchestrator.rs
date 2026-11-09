@@ -355,7 +355,7 @@ impl PublishIntent {
                             }
                             metadata.versions.contains_key(&self.package_version)
                         }
-                        Err(LpmError::NotFound(_)) => false,
+                        Err(error) if error.is_not_found() => false,
                         Err(error) => return Err(error),
                     }
                 }
@@ -1466,7 +1466,7 @@ async fn execute_prepared_inner(
             .unwrap_or(resolved_lpm_name);
         let prev = match client.get_skills(name_short, None).await {
             Ok(prev) => Some(prev),
-            Err(LpmError::NotFound(_)) => None,
+            Err(error) if error.is_not_found() => None,
             Err(error) => {
                 return Err(LpmError::Registry(format!(
                     "could not check previously published skills for {resolved_lpm_name}: {error}"

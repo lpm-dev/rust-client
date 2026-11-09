@@ -716,6 +716,7 @@ fn refresh_can_use_verified_fallback(error: &LpmError) -> bool {
     match error {
         LpmError::Network(_) | LpmError::RateLimited { .. } => true,
         LpmError::Http { status, .. } => retryable_http_status(*status),
+        LpmError::RegistryHttp(answer) => retryable_http_status(answer.status),
         LpmError::Resolution(context) => resolution_fetch_failure_is_transient(context),
         _ => false,
     }

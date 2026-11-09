@@ -51,9 +51,15 @@ pub(super) async fn run_scan(
         let client = client.clone_with_config();
         Some(tokio::spawn(async move {
             client.batch_metadata(&names).await.map_err(|error| {
-                LpmError::Registry(format!(
-                    "LPM registry metadata lookup failed during audit: {error}"
-                ))
+                // A refused credential or a registry's own refusal keeps its
+                // kind, so `--json` and the hint say what to do.
+                if error.is_credential_failure() || error.http_status().is_some() {
+                    error
+                } else {
+                    LpmError::Registry(format!(
+                        "LPM registry metadata lookup failed during audit: {error}"
+                    ))
+                }
             })
         }))
     };

@@ -462,6 +462,40 @@ pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Valu
                 "root_session_guidance": "To manage root's own LPM state, use a root session with SUDO_USER unset.",
             }
         }),
+        lpm_common::LpmError::RegistryHttp(answer) => {
+            let mut json = serde_json::json!({
+                "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+                "success": false,
+                "error": format!("{error}"),
+                "error_code": error.error_code(),
+                "http_status": answer.status,
+                "registry": answer.registry,
+                "registry_kind": answer.registry_kind.as_str(),
+                "registry_message": answer.message_from_registry,
+            });
+            for (key, value) in [
+                ("server_code", answer.code.as_deref()),
+                ("request_id", answer.request_id.as_deref()),
+                ("notice", answer.notice.as_deref()),
+                ("package", answer.subject.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    json[key] = serde_json::json!(value);
+                }
+            }
+            if let Some(wait) = answer.retry_after_secs {
+                json["retry_after_secs"] = serde_json::json!(wait);
+            }
+            json
+        }
+        lpm_common::LpmError::RateLimited { retry_after_secs } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error": format!("{error}"),
+            "error_code": error.error_code(),
+            "http_status": 429,
+            "retry_after_secs": retry_after_secs,
+        }),
         _ => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -488,6 +522,9 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
             "Re-authenticate with LPM",
             "lpm login",
         )),
+        lpm_common::LpmError::RegistryHttp(answer) => answer
+            .hint()
+            .map(|hint| serde_json::json!([{ "description": hint }])),
         lpm_common::LpmError::ArtifactUnavailable(context) => {
             context.suggested_command.as_deref().map(|command| {
                 crate::json_contract::command_next_steps(
@@ -707,6 +744,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             push_untrusted_detail(&mut lines, "message", message);
             lines
         }
+        lpm_common::LpmError::RegistryHttp(answer) => registry_http_lines(answer),
         lpm_common::LpmError::AuthRequired => {
             diagnostic_lines("Authentication required", None, error)
         }
@@ -1134,6 +1172,44 @@ fn resolution_available_detail(
         )),
         None => Some(install_ui::terminal_line!("{} {}", count, noun)),
     }
+}
+
+/// A registry's refusal: which registry, its status, what it said, and the
+/// advice that fits that registry. The registry's words were sanitized to
+/// one bounded row when they were read; they still go through `field`.
+fn registry_http_lines(answer: &lpm_common::RegistryHttpError) -> Vec<SlimErrorLine> {
+    let mut lines = vec![SlimErrorLine::Failed(install_ui::terminal_line!(
+        "{} answered {}",
+        install_ui::field(answer.registry_host()),
+        install_ui::red(&answer.status_line()),
+    ))];
+    if let Some(subject) = &answer.subject {
+        push_detail(&mut lines, "package", install_ui::yellow(subject));
+    }
+    push_untrusted_detail(&mut lines, "reason", &answer.message);
+    if let Some(code) = &answer.code {
+        push_detail(&mut lines, "code", install_ui::field(code));
+    }
+    if let Some(notice) = &answer.notice {
+        push_untrusted_detail(&mut lines, "notice", notice);
+    }
+    if let Some(wait) = answer
+        .retry_after_secs
+        .filter(|_| matches!(answer.status, 429 | 503))
+    {
+        push_detail(
+            &mut lines,
+            "retry after",
+            install_ui::status_ok(&format!("{wait}s")),
+        );
+    }
+    if let Some(request_id) = &answer.request_id {
+        push_detail(&mut lines, "request id", install_ui::field(request_id));
+    }
+    if let Some(hint) = answer.hint() {
+        push_dimmed_multiline_detail(&mut lines, "hint", &hint);
+    }
+    lines
 }
 
 fn diagnostic_lines(

@@ -146,7 +146,7 @@ async fn report_managed_pool_install_stops_after_the_bounded_retry_budget() {
         .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await;
 
-    assert!(matches!(result, Err(LpmError::Http { status: 503, .. })));
+    assert_eq!(result.unwrap_err().http_status(), Some(503));
 }
 
 #[tokio::test]

@@ -2450,9 +2450,9 @@ async fn npm_etag_revalidation_exhausts_503_and_returns_http_error() {
 
     let result = client.get_npm_package_metadata(npm_name).await;
     match result {
-        Err(LpmError::Http { status, message }) => {
-            assert_eq!(status, 503);
-            assert!(message.contains("temporary proxy metadata outage"));
+        Err(LpmError::RegistryHttp(answer)) => {
+            assert_eq!(answer.status, 503);
+            assert!(answer.message.contains("temporary proxy metadata outage"));
         }
         other => panic!("expected final http error, got {other:?}"),
     }
@@ -2603,9 +2603,9 @@ async fn etag_revalidation_exhausts_503_and_returns_http_error() {
 
     let result = client.get_package_metadata(&name).await;
     match result {
-        Err(LpmError::Http { status, message }) => {
-            assert_eq!(status, 503);
-            assert!(message.contains("temporary metadata outage"));
+        Err(LpmError::RegistryHttp(answer)) => {
+            assert_eq!(answer.status, 503);
+            assert!(answer.message.contains("temporary metadata outage"));
         }
         other => panic!("expected final http error, got {other:?}"),
     }

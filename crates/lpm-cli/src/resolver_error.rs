@@ -3,6 +3,9 @@ use lpm_common::{LpmError, ResolutionErrorContext, ResolutionFailureKind};
 pub(crate) fn resolver_error_to_lpm(error: lpm_resolver::ResolveError) -> LpmError {
     match error {
         lpm_resolver::ResolveError::Resolution(context) => LpmError::Resolution(context),
+        lpm_resolver::ResolveError::Registry { package, failure } => {
+            failure.into_lpm_error(&package)
+        }
         lpm_resolver::ResolveError::PeerConflict {
             canonical,
             requirements,

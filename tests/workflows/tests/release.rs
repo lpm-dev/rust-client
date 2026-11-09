@@ -342,6 +342,22 @@ fn redact_release_paths(json: &mut serde_json::Value) {
     }
 }
 
+/// `text` with the mock registry's `127.0.0.1:<port>` host, which changes
+/// every run, as `[registry]`.
+fn redact_mock_host(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("127.0.0.1:") {
+        redacted.push_str(&rest[..start]);
+        redacted.push_str("[registry]");
+        let after = &rest[start + "127.0.0.1:".len()..];
+        let port_len = after.bytes().take_while(u8::is_ascii_digit).count();
+        rest = &after[port_len..];
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
 fn redact_publish_paths(json: &mut serde_json::Value) {
     if let Some(results) = json["results"].as_array_mut() {
         for result in results {
@@ -354,6 +370,9 @@ fn redact_publish_paths(json: &mut serde_json::Value) {
                 for target in targets {
                     if target.get("duration_ms").is_some() {
                         target["duration_ms"] = serde_json::json!("[duration]");
+                    }
+                    if let Some(error) = target["error"].as_str() {
+                        target["error"] = serde_json::json!(redact_mock_host(error));
                     }
                 }
             }
@@ -3681,7 +3700,7 @@ async fn release_publish_reports_completed_and_unattempted_packages_after_failur
             {
               "registry": "lpm",
               "success": false,
-              "error": "HTTP 500: {\"error\":\"simulated registry failure\"}",
+              "error": "[registry] answered 500 Internal Server Error: simulated registry failure",
               "duration_ms": "[duration]"
             }
           ]

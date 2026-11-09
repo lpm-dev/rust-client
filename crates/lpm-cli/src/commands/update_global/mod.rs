@@ -71,8 +71,10 @@ where
 }
 
 fn update_failure_reason(error: &LpmError) -> String {
-    let LpmError::NotFound(detail) = error else {
-        return error.to_string();
+    let detail = match error {
+        LpmError::NotFound(detail) => detail.as_str(),
+        LpmError::RegistryHttp(answer) if answer.status == 404 => answer.message.as_str(),
+        error => return error.to_string(),
     };
     let detail = detail.trim();
     if detail.is_empty() {
@@ -1164,6 +1166,31 @@ fn execute_saved_spec_rewrite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registrys_404_reads_as_not_found_with_its_message() {
+        let answer = lpm_common::RegistryHttpError {
+            status: 404,
+            registry: "https://registry.npmjs.org".into(),
+            registry_kind: lpm_common::RegistryKind::Npm,
+            code: None,
+            message: "package 'gone' was not found in the npm registry".into(),
+            message_from_registry: false,
+            body_kind: lpm_common::RegistryBodyKind::Empty,
+            request_id: None,
+            retry_after_secs: None,
+            notice: None,
+            subject: None,
+        };
+        assert_eq!(
+            update_failure_reason(&LpmError::RegistryHttp(Box::new(answer))),
+            "Not found: package 'gone' was not found in the npm registry"
+        );
+        assert_eq!(
+            update_failure_reason(&LpmError::NotFound("not found: gone".into())),
+            "Not found: gone"
+        );
+    }
 
     fn scoped_update_env(
         path: &std::path::Path,

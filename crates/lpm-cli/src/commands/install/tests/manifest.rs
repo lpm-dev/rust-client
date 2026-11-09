@@ -928,7 +928,7 @@ async fn registry_signing_keys_for_route_preserves_custom_error_when_npm_keys_do
     .expect_err("non-matching npm keys must not hide the custom registry error");
 
     assert!(
-        matches!(error, LpmError::Http { status: 400, .. }),
+        matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 400),
         "expected original custom-registry HTTP 400, got {error:?}"
     );
 }

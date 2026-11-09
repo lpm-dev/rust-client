@@ -1,6 +1,14 @@
 use base64::Engine as _;
 use reqwest::header::{AUTHORIZATION, HeaderMap, PROXY_AUTHORIZATION};
 
+use super::AnswerFacts;
+
+/// What an error answer's headers say, with the credentials the request
+/// sent (`sent`) redacted from the text a server controls.
+pub(super) fn answer_facts(answer: &HeaderMap, sent: &HeaderMap) -> AnswerFacts {
+    AnswerFacts::from_headers(answer, |text| redact_credentials(text, sent))
+}
+
 pub(super) async fn read_request_error_text(
     response: reqwest::Response,
     request: &reqwest::Request,
@@ -18,7 +26,7 @@ pub(super) async fn read_error_text_redacting(
     text
 }
 
-fn redact_credentials(text: &mut String, headers: &HeaderMap) {
+pub(super) fn redact_credentials(text: &mut String, headers: &HeaderMap) {
     for name in [AUTHORIZATION, PROXY_AUTHORIZATION] {
         let Some(header) = headers.get(name).and_then(|value| value.to_str().ok()) else {
             continue;

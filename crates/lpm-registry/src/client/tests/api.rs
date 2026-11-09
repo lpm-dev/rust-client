@@ -277,24 +277,20 @@ async fn a_publish_preflight_refusal_is_the_error_any_request_s_failure_is() {
         let error = verdict.into_result().unwrap_err();
         match status {
             403 => assert!(
-                matches!(&error, LpmError::Forbidden(message) if message == body),
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 403 && answer.message == body),
                 "{error:?}"
             ),
             404 => assert!(
-                matches!(&error, LpmError::NotFound(message) if message == body),
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 404 && answer.message == body),
                 "{error:?}"
             ),
             429 => assert!(
-                matches!(
-                    error,
-                    LpmError::RateLimited {
-                        retry_after_secs: 7
-                    }
-                ),
+                error.is_rate_limited()
+                    && matches!(&error, LpmError::RegistryHttp(answer) if answer.message == body && answer.retry_after_secs == Some(7)),
                 "{error:?}"
             ),
             _ => assert!(
-                matches!(&error, LpmError::Http { status: 409, message } if message == body),
+                matches!(&error, LpmError::RegistryHttp(answer) if answer.status == 409 && answer.message == body),
                 "{error:?}"
             ),
         }
@@ -742,7 +738,9 @@ async fn whoami_maps_403_to_forbidden_with_body() {
         .await;
 
     let result = client.whoami().await;
-    assert!(matches!(result, Err(LpmError::Forbidden(body)) if body == "forbidden-body"));
+    assert!(
+        matches!(result, Err(LpmError::RegistryHttp(answer)) if answer.status == 403 && answer.message == "forbidden-body")
+    );
 }
 
 #[tokio::test]
@@ -800,7 +798,9 @@ async fn whoami_maps_404_to_not_found_with_body() {
         .await;
 
     let result = client.whoami().await;
-    assert!(matches!(result, Err(LpmError::NotFound(body)) if body == "missing-user"));
+    assert!(
+        matches!(result, Err(LpmError::RegistryHttp(answer)) if answer.status == 404 && answer.message == "missing-user")
+    );
 }
 
 #[tokio::test]
@@ -1064,7 +1064,7 @@ async fn publish_package_does_not_treat_a_different_existing_version_as_success(
 
     assert!(matches!(
         result,
-        Err(LpmError::Http { status: 500, message }) if message == "publish boom"
+        Err(LpmError::RegistryHttp(answer)) if answer.status == 500 && answer.message == "publish boom"
     ));
 }
 
@@ -1556,7 +1556,7 @@ async fn publish_package_returns_http_500_when_version_missing_after_500() {
 
     assert!(matches!(
         result,
-        Err(LpmError::Http { status: 500, message }) if message == "publish boom"
+        Err(LpmError::RegistryHttp(answer)) if answer.status == 500 && answer.message == "publish boom"
     ));
 }
 
@@ -1622,16 +1622,39 @@ async fn create_publish_upload_states_a_refusal_as_the_publish_would() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .respond_with(
+            ResponseTemplate::new(413)
+                .insert_header("x-request-id", "req_00ab")
+                .set_body_json(serde_json::json!({
+                    "error": "Tarball too large (100.01 MiB). Maximum single package size is 100 MiB.",
+                    "code": "TARBALL_TOO_LARGE",
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .create_publish_upload("@lpm.dev/owner.pkg", "1.2.3", 1, "sha512-abc")
+        .await
+        .unwrap_err();
+    let LpmError::RegistryHttp(answer) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(answer.status, 413);
+    assert_eq!(answer.code.as_deref(), Some("TARBALL_TOO_LARGE"));
+    assert_eq!(answer.request_id.as_deref(), Some("req_00ab"));
+    assert_eq!(answer.registry_kind, lpm_common::RegistryKind::Lpm);
+    assert_eq!(
+        answer.message,
+        "Tarball too large (100.01 MiB). Maximum single package size is 100 MiB."
+    );
+
     for (status, body, expected) in [
-        (
-            413,
-            serde_json::json!({
-                "error": "Tarball too large (100.01 MiB). Maximum single package size is 100 MiB.",
-                "code": "TARBALL_TOO_LARGE",
-            })
-            .to_string(),
-            "publish failed (413 Payload Too Large): Tarball too large (100.01 MiB). Maximum single package size is 100 MiB. [TARBALL_TOO_LARGE]",
-        ),
         (
             403,
             serde_json::json!({
@@ -1639,12 +1662,12 @@ async fn create_publish_upload_states_a_refusal_as_the_publish_would() {
                 "code": "VERSION_EXISTS",
             })
             .to_string(),
-            "Version 1.2.3 already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version.",
+            "registry error: Version 1.2.3 already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version.",
         ),
         (
             409,
             "upstream unavailable".to_string(),
-            "publish failed (409 Conflict): HTTP 409 Conflict",
+            "answered 409 Conflict: upstream unavailable",
         ),
     ] {
         let server = MockServer::start().await;
@@ -1662,11 +1685,7 @@ async fn create_publish_upload_states_a_refusal_as_the_publish_would() {
             .await
             .unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            format!("registry error: {expected}"),
-            "{status}"
-        );
+        assert!(error.to_string().ends_with(expected), "{status}: {error}");
     }
 }
 
@@ -1720,10 +1739,12 @@ async fn create_publish_upload_states_a_coded_404_as_a_refusal() {
         .await
         .unwrap_err();
 
-    assert_eq!(
-        error.to_string(),
-        "registry error: publish failed (404 Not Found): Organization not found [ORG_NOT_FOUND]"
-    );
+    assert!(error.is_not_found(), "{error:?}");
+    let LpmError::RegistryHttp(answer) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(answer.code.as_deref(), Some("ORG_NOT_FOUND"));
+    assert_eq!(answer.message, "Organization not found");
 }
 
 #[tokio::test]

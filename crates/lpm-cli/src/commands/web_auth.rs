@@ -265,10 +265,22 @@ async fn poll_for_token(
                 {
                     // Pending approval answers 202; any other refusal stays a
                     // refusal, so waiting out the timeout would only hide it.
-                    return Err(LpmError::Registry(format!(
-                        "{label} failed: the registry answered HTTP {}",
-                        status.as_u16()
-                    )));
+                    let reason = lpm_http::read_body_capped(response, 64 * 1024)
+                        .await
+                        .ok()
+                        .and_then(|body| {
+                            lpm_common::registry_error_body_message(&String::from_utf8_lossy(&body))
+                        });
+                    return Err(LpmError::Registry(match reason {
+                        Some(reason) => format!(
+                            "{label} failed: the registry answered HTTP {}: {reason}",
+                            status.as_u16()
+                        ),
+                        None => format!(
+                            "{label} failed: the registry answered HTTP {}",
+                            status.as_u16()
+                        ),
+                    }));
                 } else if status.is_success() {
                     let remaining = timeout.saturating_sub(started_at.elapsed());
                     let body = tokio::time::timeout(

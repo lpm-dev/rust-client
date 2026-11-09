@@ -340,7 +340,9 @@ async fn unpublish_reports_what_the_registry_refuses() {
 
     assert!(!output.status.success());
     let envelope = json_output(&output);
-    assert_eq!(envelope["error_code"], "registry");
+    // The registry's refusal keeps its status, not the generic `registry`.
+    assert_eq!(envelope["error_code"], "forbidden", "{envelope}");
+    assert_eq!(envelope["http_status"], 403);
     assert!(
         envelope.to_string().contains("older than 72 hours"),
         "{envelope}"
@@ -481,7 +483,8 @@ async fn undeprecate_every_version_reports_the_registrys_refusal() {
 
     assert!(!output.status.success());
     let envelope = json_output(&output);
-    assert_eq!(envelope["error_code"], "registry", "{envelope}");
+    assert_eq!(envelope["error_code"], "http", "{envelope}");
+    assert_eq!(envelope["http_status"], 409);
     assert!(
         envelope["error"]
             .as_str()

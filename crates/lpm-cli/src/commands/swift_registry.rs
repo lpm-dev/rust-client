@@ -701,9 +701,20 @@ async fn fetch_signing_certificate(cert_url: &str) -> Result<Vec<u8>, LpmError> 
     })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(LpmError::Registry(format!(
-            "signing certificate not available (HTTP {status} from {cert_url})"
-        )));
+        let reason = lpm_http::read_body_capped(response, 64 * 1024)
+            .await
+            .ok()
+            .and_then(|body| {
+                lpm_common::registry_error_body_message(&String::from_utf8_lossy(&body))
+            });
+        return Err(LpmError::Registry(match reason {
+            Some(reason) => {
+                format!(
+                    "signing certificate not available (HTTP {status} from {cert_url}): {reason}"
+                )
+            }
+            None => format!("signing certificate not available (HTTP {status} from {cert_url})"),
+        }));
     }
     if response
         .content_length()

@@ -891,9 +891,18 @@ impl SessionManager {
                 self.clear_rejected_session_if_current(rejected_access, refresh_token)?;
                 return Err(LpmError::SessionExpired);
             }
+            let reason = lpm_http::read_body_capped(resp, 64 * 1024)
+                .await
+                .ok()
+                .and_then(|body| {
+                    lpm_common::registry_error_body_message(&String::from_utf8_lossy(&body))
+                });
             return Err(LpmError::Http {
                 status: status.as_u16(),
-                message: "silent refresh failed".to_string(),
+                message: match reason {
+                    Some(reason) => format!("the registry couldn't refresh the session: {reason}"),
+                    None => "the registry couldn't refresh the session".to_string(),
+                },
             });
         }
 

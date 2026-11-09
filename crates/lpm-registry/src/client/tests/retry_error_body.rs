@@ -136,9 +136,10 @@ async fn stalled_retry_bodies_preserve_attempt_budget_and_final_status_without_p
     let error = server.request(headers).await.unwrap_err();
     assert_eq!(server.attempts.load(Ordering::SeqCst), 4);
     match error {
-        LpmError::Http { status, message } => {
-            assert_eq!(status, 504);
-            assert!(message.is_empty(), "{message}");
+        LpmError::RegistryHttp(answer) => {
+            assert_eq!(answer.status, 504);
+            assert!(!answer.message_from_registry, "{}", answer.message);
+            assert!(!answer.message.contains("reflected-secret"));
         }
         error => panic!("expected final HTTP status, got {error}"),
     }
@@ -189,10 +190,10 @@ async fn complete_retry_bodies_preserve_context_and_redact_credentials() {
         headers.insert(name, value.parse().unwrap());
     }
     match server.request(headers).await.unwrap_err() {
-        LpmError::Http { status, message } => {
-            assert_eq!(status, 503);
+        LpmError::RegistryHttp(answer) => {
+            assert_eq!(answer.status, 503);
             assert_eq!(
-                message,
+                answer.message,
                 "denied <redacted> <redacted> <redacted> <redacted>"
             );
         }
@@ -202,7 +203,7 @@ async fn complete_retry_bodies_preserve_context_and_redact_credentials() {
 }
 
 #[tokio::test]
-async fn nonretryable_bodies_keep_their_existing_status_and_body_contract() {
+async fn nonretryable_answers_keep_their_status_and_the_registrys_words() {
     for status in [403, 404, 422] {
         let server = Server::start(vec![ResponsePlan {
             status,
@@ -211,20 +212,13 @@ async fn nonretryable_bodies_keep_their_existing_status_and_body_contract() {
         }])
         .await;
         let error = server.request(Default::default()).await.unwrap_err();
-        match (status, error) {
-            (403, LpmError::Forbidden(body)) | (404, LpmError::NotFound(body)) => {
-                assert_eq!(body, "complete diagnostic");
+        assert_eq!(error.http_status(), Some(status));
+        match error {
+            LpmError::RegistryHttp(answer) => {
+                assert_eq!(answer.message, "complete diagnostic");
+                assert!(answer.message_from_registry);
             }
-            (
-                422,
-                LpmError::Http {
-                    status: 422,
-                    message,
-                },
-            ) => {
-                assert_eq!(message, "complete diagnostic");
-            }
-            (_, error) => panic!("changed nonretryable contract for {status}: {error}"),
+            error => panic!("changed nonretryable contract for {status}: {error}"),
         }
         assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
     }

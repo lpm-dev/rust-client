@@ -4306,6 +4306,13 @@ fn upgrade_command_for_root_links(
     Some(command)
 }
 
+/// A tarball fetch's failure, naming the package and version it was for:
+/// in an install of hundreds of packages, the registry's refusal alone
+/// doesn't say which one.
+fn tarball_fetch_error(error: LpmError, package: &InstallPackage) -> LpmError {
+    error.with_registry_subject(format!("{}@{}", package.name, package.version))
+}
+
 pub(super) fn artifact_unavailable_error(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -4436,7 +4443,7 @@ impl RegistryTarballRequest<'_> {
             )
             .await
         {
-            Err(LpmError::NotFound(_)) => Err(artifact_unavailable_error(
+            Err(error) if error.is_not_found() => Err(artifact_unavailable_error(
                 self.client,
                 self.route_table,
                 self.package,
@@ -4575,7 +4582,7 @@ pub(super) async fn fetch_and_store_legacy(
     .await
     {
         Ok(u) => u,
-        Err(LpmError::NotFound(_)) => {
+        Err(error) if error.is_not_found() => {
             return Err(artifact_unavailable_error(
                 client,
                 route_table,
@@ -4583,7 +4590,7 @@ pub(super) async fn fetch_and_store_legacy(
                 artifact_selection,
             ));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(tarball_fetch_error(e, p)),
     };
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let initial_url = initial_resolution.url.clone();
@@ -4595,7 +4602,7 @@ pub(super) async fn fetch_and_store_legacy(
         .await
     {
         Ok(r) => r,
-        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() && p.integrity.is_some() => {
+        Err(error) if error.is_not_found() && p.tarball_url.is_some() && p.integrity.is_some() => {
             // Stored URL went stale — package was republished, or
             // upstream migrated paths. Invalidate metadata + retry
             // ONCE with a freshly-resolved URL.
@@ -4613,7 +4620,7 @@ pub(super) async fn fetch_and_store_legacy(
             .await
             {
                 Ok(u) => u,
-                Err(LpmError::NotFound(_)) => {
+                Err(error) if error.is_not_found() => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                     return Err(artifact_unavailable_error(
                         client,
@@ -4622,7 +4629,7 @@ pub(super) async fn fetch_and_store_legacy(
                         artifact_selection,
                     ));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(tarball_fetch_error(e, p)),
             };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             let fresh_url = fresh_resolution.url.clone();
@@ -4651,7 +4658,7 @@ pub(super) async fn fetch_and_store_legacy(
                     final_url = fresh_url;
                     r
                 }
-                Err(LpmError::NotFound(_)) => {
+                Err(error) if error.is_not_found() => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                     return Err(artifact_unavailable_error(
                         client,
@@ -4660,10 +4667,10 @@ pub(super) async fn fetch_and_store_legacy(
                         artifact_selection,
                     ));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(tarball_fetch_error(e, p)),
             }
         }
-        Err(LpmError::NotFound(_)) => {
+        Err(error) if error.is_not_found() => {
             return Err(artifact_unavailable_error(
                 client,
                 route_table,
@@ -4671,7 +4678,7 @@ pub(super) async fn fetch_and_store_legacy(
                 artifact_selection,
             ));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(tarball_fetch_error(e, p)),
     };
     // — `download_ms` measures just the GET + temp-file
     // write. URL-lookup costs (initial + optional retry) are
@@ -5107,7 +5114,7 @@ pub(super) async fn fetch_and_store_streaming(
     .await
     {
         Ok(u) => u,
-        Err(LpmError::NotFound(_)) => {
+        Err(error) if error.is_not_found() => {
             return Err(artifact_unavailable_error(
                 client,
                 route_table,
@@ -5115,7 +5122,7 @@ pub(super) async fn fetch_and_store_streaming(
                 artifact_selection,
             ));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(tarball_fetch_error(e, p)),
     };
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let initial_url = initial_resolution.url.clone();
@@ -5134,7 +5141,7 @@ pub(super) async fn fetch_and_store_streaming(
     download_headers_ms += initial_headers_start.elapsed().as_millis();
     let response = match initial_response {
         Ok(r) => r,
-        Err(LpmError::NotFound(_)) if p.tarball_url.is_some() && p.integrity.is_some() => {
+        Err(error) if error.is_not_found() && p.tarball_url.is_some() && p.integrity.is_some() => {
             // Stored URL stale — retry ONCE with fresh metadata.
             // See `fetch_and_store_legacy` for the full semantics;
             // this branch mirrors that retry logic byte-for-byte
@@ -5153,7 +5160,7 @@ pub(super) async fn fetch_and_store_streaming(
             .await
             {
                 Ok(u) => u,
-                Err(LpmError::NotFound(_)) => {
+                Err(error) if error.is_not_found() => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                     return Err(artifact_unavailable_error(
                         client,
@@ -5162,7 +5169,7 @@ pub(super) async fn fetch_and_store_streaming(
                         artifact_selection,
                     ));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(tarball_fetch_error(e, p)),
             };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             let fresh_url = fresh_resolution.url.clone();
@@ -5191,7 +5198,7 @@ pub(super) async fn fetch_and_store_streaming(
                     final_url = fresh_url;
                     r
                 }
-                Err(LpmError::NotFound(_)) => {
+                Err(error) if error.is_not_found() => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                     return Err(artifact_unavailable_error(
                         client,
@@ -5200,10 +5207,10 @@ pub(super) async fn fetch_and_store_streaming(
                         artifact_selection,
                     ));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(tarball_fetch_error(e, p)),
             }
         }
-        Err(LpmError::NotFound(_)) => {
+        Err(error) if error.is_not_found() => {
             return Err(artifact_unavailable_error(
                 client,
                 route_table,
@@ -5211,7 +5218,7 @@ pub(super) async fn fetch_and_store_streaming(
                 artifact_selection,
             ));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(tarball_fetch_error(e, p)),
     };
 
     let request = RegistryTarballRequest {

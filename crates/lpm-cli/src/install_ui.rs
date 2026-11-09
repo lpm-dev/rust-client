@@ -867,7 +867,11 @@ pub fn hyperlink(text: &str) -> TerminalFragment {
 fn format_hyperlink(text: &str, enabled: bool) -> TerminalFragment {
     let safe = lpm_common::sanitize_terminal_inline(text);
     let fallback = || TerminalFragment(safe.blue());
-    if !enabled || safe != text {
+    // A raw control character rules a link out. A Unicode format character
+    // (a bidi override, a zero-width space) doesn't: the URL parser
+    // percent-encodes it, and the encoded URL is both the link and the text
+    // shown, so it can't reorder or hide anything.
+    if !enabled || text.chars().any(char::is_control) {
         return fallback();
     }
     let Ok(target) = reqwest::Url::parse(text) else {

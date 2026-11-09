@@ -527,7 +527,8 @@ async fn download_tarball_maps_firewall_block_error() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let client = RegistryClient::new();
+    // The firewall answers from the LPM registry; no other host can.
+    let client = RegistryClient::new().with_base_url(server.uri());
 
     Mock::given(method("GET"))
         .and(path("/is-number/-/is-number-7.0.0.tgz"))
@@ -808,7 +809,9 @@ async fn download_to_file_maps_404_to_not_found_with_body() {
     let url = format!("{}/tarball/missing.tgz", server.uri());
     let result = client.download_tarball_to_file(&url).await;
 
-    assert!(matches!(result, Err(LpmError::NotFound(body)) if body == "missing tarball"));
+    assert!(
+        matches!(result, Err(LpmError::RegistryHttp(answer)) if answer.status == 404 && answer.message == "missing tarball")
+    );
 }
 
 #[tokio::test]
@@ -1917,7 +1920,7 @@ async fn third_party_tarball_not_found_does_not_refresh_lpm_session() {
         client
             .download_tarball(&format!("{}/package.tgz", third_party.uri()))
             .await,
-        Err(LpmError::NotFound(_))
+        Err(error) if error.is_not_found()
     ));
     let requests = third_party.received_requests().await.unwrap();
     assert!(!requests[0].headers.contains_key("authorization"));

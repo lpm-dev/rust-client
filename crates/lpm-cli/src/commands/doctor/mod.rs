@@ -1210,10 +1210,12 @@ async fn probe_auth(
             source,
             recovery: "replace LPM_TOKEN with a valid token, or unset LPM_TOKEN to use your saved login",
         },
-        Ok(Err(LpmError::AuthRequired | LpmError::Forbidden(_))) => AuthProbe::Invalid {
-            source,
-            recovery: "run: lpm login",
-        },
+        Ok(Err(error)) if error.is_forbidden() || matches!(error, LpmError::AuthRequired) => {
+            AuthProbe::Invalid {
+                source,
+                recovery: "run: lpm login",
+            }
+        }
         Ok(Err(error)) => AuthProbe::Unverified(format!(
             "token from {source} could not be verified: {error}"
         )),

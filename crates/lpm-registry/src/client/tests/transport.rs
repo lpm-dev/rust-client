@@ -484,3 +484,147 @@ async fn npm_transport_serves_npm_registry_requests_without_renaming_the_registr
     assert!(!client.is_configured_origin(&transport.uri()));
     transport.verify().await;
 }
+
+#[tokio::test]
+async fn an_lpm_401_no_refresh_can_fix_keeps_the_registrys_reason() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Whoever created this organization token no longer has the organization role it needs. Ask an organization owner or admin for a new token.",
+            "code": "ORG_TOKEN_CREATOR_UNAUTHORIZED",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("lpm_org_token")
+        .whoami()
+        .await
+        .unwrap_err();
+
+    let LpmError::RegistryHttp(answer) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(answer.status, 401);
+    assert_eq!(
+        answer.code.as_deref(),
+        Some("ORG_TOKEN_CREATOR_UNAUTHORIZED")
+    );
+    assert!(
+        answer
+            .message
+            .starts_with("Whoever created this organization token")
+    );
+    assert_eq!(error.error_code(), "auth_required");
+    assert!(error.is_lpm_credential_failure());
+}
+
+#[tokio::test]
+async fn a_redirect_off_lpm_is_answered_by_the_host_it_ended_at() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let lpm = MockServer::start().await;
+    let storage = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/bucket/object", storage.uri())),
+        )
+        .mount(&lpm)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/bucket/object"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "application/xml")
+                .set_body_string(
+                    "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>",
+                ),
+        )
+        .mount(&storage)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/firewall"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "blocked_by_lpm_firewall",
+            "package": "evil",
+            "verdict": "malicious",
+        })))
+        .mount(&storage)
+        .await;
+    let client = RegistryClient::new().with_base_url(lpm.uri());
+
+    let error = client.whoami().await.unwrap_err();
+    let LpmError::RegistryHttp(answer) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(answer.registry, storage.uri());
+    assert_eq!(answer.registry_kind, lpm_common::RegistryKind::Custom);
+    assert_eq!(answer.code.as_deref(), Some("AccessDenied"));
+    assert_eq!(answer.message, "Request has expired");
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/firewall-probe"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/firewall", storage.uri())),
+        )
+        .mount(&lpm)
+        .await;
+    let spoof = client
+        .send_with_retry(
+            client
+                .build_get(&format!("{}/api/registry/firewall-probe", lpm.uri()))
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&spoof, LpmError::RegistryHttp(answer) if answer.status == 403),
+        "a host lpm.dev redirected to can't answer as LPM's firewall: {spoof:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_a_registry_echoes_in_its_headers_is_redacted() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("npm-notice", "rejected token lpm_echoed_secret_value")
+                .insert_header("x-request-id", "lpm_echoed_secret_value")
+                .set_body_json(serde_json::json!({
+                    "error": "token lpm_echoed_secret_value can't read this",
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("lpm_echoed_secret_value")
+        .whoami()
+        .await
+        .unwrap_err();
+
+    let LpmError::RegistryHttp(answer) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(answer.notice.as_deref(), Some("rejected token <redacted>"));
+    assert_eq!(answer.request_id.as_deref(), Some("<redacted>"));
+    assert_eq!(answer.message, "token <redacted> can't read this");
+    assert!(!format!("{error:?}").contains("lpm_echoed_secret_value"));
+}

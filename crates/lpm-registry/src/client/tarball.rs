@@ -446,8 +446,9 @@ impl RegistryClient {
     ///
     /// Validation performed before returning:
     /// - URL scheme (HTTPS or localhost)
-    /// - HTTP status (404 → `LpmError::NotFound`; other non-2xx →
-    ///   `LpmError::Registry`)
+    /// - HTTP status: a non-2xx answer is the registry's refusal
+    ///   (`LpmError::RegistryHttp`, whose `is_not_found()` a 404 meets), a
+    ///   rate limit, or an lpm.dev firewall or credential error
     /// - `Content-Length` against `MAX_COMPRESSED_TARBALL_SIZE` when the
     ///   server declares one (streaming size enforcement is the caller's
     ///   responsibility — we can't check it here without consuming the
