@@ -17,7 +17,9 @@ pub use spec::{Category, CheckSpec, Decider, QualityEcosystem};
 
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 
 /// Version of the [`QualityReport`] document. Bump it when a field changes
 /// meaning or goes away.
@@ -43,6 +45,10 @@ const MAX_SWIFT_NAMES: usize = 65_536;
 const MAX_RETAINED_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RETAINED_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SWIFT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Nested package.json files kept for the `type` each sets for the files
+/// under it, and the size of each.
+const MAX_SCOPES: usize = 2_000;
+const MAX_SCOPE_MANIFEST_BYTES: u64 = 64 * 1024;
 /// An archive this large unpacked fails clean-archive: 10 MB.
 const CLEAN_ARCHIVE_MAX_BYTES: u64 = 10_000_000;
 
@@ -123,15 +129,25 @@ pub fn readme_rank(path: &str) -> Option<u8> {
     }
 }
 
+/// Paths the pattern lookups of one report may visit in all. A package.json
+/// can hold up to a million `exports` patterns; this keeps them from making
+/// the checks scan every file once each.
+const MAX_PATTERN_VISITS: usize = 1_000_000;
+
 /// The archive's files and the contents the checks keep.
 #[derive(Default)]
 pub(crate) struct Archive {
-    files: HashMap<String, u64>,
+    /// Every file and its size, in path order.
+    files: BTreeMap<String, u64>,
+    /// Paths the pattern lookups have visited, against `MAX_PATTERN_VISITS`.
+    pattern_visits: Cell<usize>,
     total_bytes: u64,
     retained: HashMap<String, String>,
     retained_bytes: u64,
     /// Declaration or JavaScript files left unread past the size limits.
     unretained: usize,
+    /// The `type` each nested package.json sets, by its directory.
+    scopes: HashMap<String, Option<String>>,
 }
 
 impl Archive {
@@ -143,12 +159,42 @@ impl Archive {
         self.files.keys().map(String::as_str)
     }
 
+    /// The files under `prefix` that end with `suffix` and are longer than
+    /// both, in path order: what an `exports` pattern matches. `None` once
+    /// the lookups together have visited `MAX_PATTERN_VISITS` paths.
+    pub fn pattern_files(&self, prefix: &str, suffix: &str) -> Option<Vec<&str>> {
+        let mut visits = self.pattern_visits.get().saturating_add(1);
+        let mut found = Vec::new();
+        for path in self
+            .files
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .map(|(path, _)| path.as_str())
+            .take_while(|path| path.starts_with(prefix))
+        {
+            visits += 1;
+            if visits > MAX_PATTERN_VISITS {
+                break;
+            }
+            if path.len() > prefix.len() + suffix.len() && path.ends_with(suffix) {
+                found.push(path);
+            }
+        }
+        self.pattern_visits.set(visits.min(MAX_PATTERN_VISITS + 1));
+        (visits <= MAX_PATTERN_VISITS).then_some(found)
+    }
+
     pub fn retained(&self, path: &str) -> Option<&str> {
         self.retained.get(path).map(String::as_str)
     }
 
     pub fn unretained(&self) -> usize {
         self.unretained
+    }
+
+    /// The `type` the package.json in `directory` sets, when the archive
+    /// has one there: `Some(None)` for one that sets none.
+    pub fn scope(&self, directory: &str) -> Option<Option<&str>> {
+        self.scopes.get(directory).map(Option::as_deref)
     }
 }
 
@@ -167,6 +213,9 @@ pub struct QualityCollector {
     swift_files: Vec<(String, swift::SwiftFileFacts)>,
     swift_names: usize,
     swift_unread: usize,
+    /// The READMEs [`Self::note_file`] asked for, with the bytes the source
+    /// checks read of one that is a module too (`README.js`).
+    readme_reads: HashMap<String, Option<u64>>,
 }
 
 const RETAINED_EXTENSIONS: &[&str] = &[".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs", ".jsx"];
@@ -192,6 +241,12 @@ fn is_changelog(path: &str) -> bool {
         })
 }
 
+/// A package.json below the package root, outside `node_modules`, which
+/// sets the module type of the files under it.
+fn is_nested_manifest(path: &str) -> bool {
+    path.ends_with("/package.json") && !in_node_modules(path)
+}
+
 fn in_node_modules(path: &str) -> bool {
     path.split('/').any(|segment| segment == "node_modules")
 }
@@ -212,6 +267,7 @@ impl QualityCollector {
             swift_files: Vec::new(),
             swift_names: 0,
             swift_unread: 0,
+            readme_reads: HashMap::new(),
         }
     }
 
@@ -235,12 +291,26 @@ impl QualityCollector {
         if let Some(rank) = readme_rank(path)
             && self.wants_readme(rank, path)
         {
-            return Some(size.min(MAX_README_BYTES as u64));
+            let readme = size.min(MAX_README_BYTES as u64);
+            // A README that is also a module (`README.js`) is read as both.
+            let source = self.source_bytes(path, size);
+            self.readme_reads.insert(path.to_string(), source);
+            return Some(source.map_or(readme, |source| readme.max(source)));
         }
         if is_changelog(path) {
             let remaining = MAX_CHANGELOGS_BYTES.saturating_sub(self.changelog_bytes);
             return (remaining > 0).then(|| size.min(MAX_CHANGELOG_BYTES).min(remaining));
         }
+        if self.ecosystem == QualityEcosystem::Js && is_nested_manifest(path) {
+            return (size <= MAX_SCOPE_MANIFEST_BYTES && self.archive.scopes.len() < MAX_SCOPES)
+                .then_some(size);
+        }
+        self.source_bytes(path, size)
+    }
+
+    /// How many bytes of a source file the checks read, counted against
+    /// their limits, or `None` for a file they don't read.
+    fn source_bytes(&mut self, path: &str, size: u64) -> Option<u64> {
         match self.ecosystem {
             QualityEcosystem::Js => {
                 if !RETAINED_EXTENSIONS
@@ -281,20 +351,28 @@ impl QualityCollector {
     /// The bytes of a file [`Self::note_file`] asked for, cut at the length
     /// it asked for.
     pub fn add_content(&mut self, path: &str, content: &[u8]) {
-        if let Some(rank) = readme_rank(path) {
+        if let Some(source) = self.readme_reads.remove(path)
+            && let Some(rank) = readme_rank(path)
+        {
             if self.wants_readme(rank, path) {
                 let cut = self
                     .archive
                     .files
                     .get(path)
                     .is_some_and(|&size| size > MAX_README_BYTES as u64);
-                match decode_readme(content, cut) {
+                let readme = &content[..content.len().min(MAX_README_BYTES)];
+                match decode_readme(readme, cut) {
                     Some(text) => self.readme = Some((rank, path.to_string(), Readme::Text(text))),
                     None if self.readme.is_none() => {
                         self.readme = Some((rank, path.to_string(), Readme::NotUtf8));
                     }
                     None => {}
                 }
+            }
+            if let Some(source) = source {
+                let end =
+                    usize::try_from(source).map_or(content.len(), |end| end.min(content.len()));
+                self.add_source(path, &content[..end]);
             }
             return;
         }
@@ -311,6 +389,20 @@ impl QualityCollector {
             }
             return;
         }
+        if self.ecosystem == QualityEcosystem::Js && is_nested_manifest(path) {
+            let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+            let module_type = serde_json::from_slice::<Value>(content)
+                .ok()
+                .and_then(|json| json.get("type").and_then(Value::as_str).map(str::to_string));
+            self.archive
+                .scopes
+                .insert(directory.to_string(), module_type);
+            return;
+        }
+        self.add_source(path, content);
+    }
+
+    fn add_source(&mut self, path: &str, content: &[u8]) {
         match self.ecosystem {
             QualityEcosystem::Js => {
                 self.archive.retained.insert(
@@ -373,14 +465,21 @@ impl QualityCollector {
 
 /// A README's text, or `None` when it isn't UTF-8. A README cut at the size
 /// limit drops the character the cut split.
+/// A README's text, without a byte order mark, as LPM.dev Registry shows
+/// it; `None` when it isn't UTF-8. A README cut at the limit drops only a
+/// character the cut split.
 fn decode_readme(content: &[u8], cut: bool) -> Option<String> {
-    match std::str::from_utf8(content) {
-        Ok(text) => Some(text.to_string()),
+    let text = match std::str::from_utf8(content) {
+        Ok(text) => text.to_string(),
         Err(error) if cut && error.error_len().is_none() => {
-            Some(String::from_utf8_lossy(&content[..error.valid_up_to()]).into_owned())
+            String::from_utf8_lossy(&content[..error.valid_up_to()]).into_owned()
         }
-        Err(_) => None,
-    }
+        Err(_) => return None,
+    };
+    Some(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => text,
+    })
 }
 
 /// What every check reads.
@@ -398,6 +497,18 @@ impl Context<'_> {
 
     pub fn version(&self) -> Option<&str> {
         self.manifest.and_then(|json| npm::string(json, "version"))
+    }
+
+    /// A source package, which `lpm add` copies into a project: its archive
+    /// has a root `lpm.config.json`, or its package.json the legacy
+    /// `lpm.source`.
+    pub fn is_source_package(&self) -> bool {
+        self.archive.files.contains_key("lpm.config.json")
+            || self
+                .manifest
+                .and_then(|json| json.get("lpm"))
+                .and_then(|lpm| lpm.get("source"))
+                .is_some_and(Value::is_string)
     }
 
     pub fn readme_text(&self) -> Option<&str> {
@@ -624,8 +735,8 @@ pub(crate) fn license_file_check(context: &Context<'_>, results: &mut Results) {
         .filter(|path| {
             !path.contains('/')
                 && ["LICENSE", "LICENCE", "COPYING"].iter().any(|name| {
-                    path.len() >= name.len()
-                        && path[..name.len()].eq_ignore_ascii_case(name)
+                    path.get(..name.len())
+                        .is_some_and(|start| start.eq_ignore_ascii_case(name))
                         && path[name.len()..]
                             .chars()
                             .next()
@@ -750,6 +861,14 @@ fn parse_repository(value: &str) -> bool {
 /// Longest repository identity LPM.dev Registry stores.
 const MAX_REPOSITORY_IDENTITY_LEN: usize = 300;
 
+/// An owner or repository name as git hosts allow them: ASCII letters,
+/// digits, `.`, `_`, `-` and `~`, not only dots.
+fn is_repository_part(part: &str) -> bool {
+    part.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~'))
+        && part.bytes().any(|byte| byte != b'.')
+}
+
 /// package.json's repository as `host/owner/name`, lowercase: shorthands
 /// expanded as npm expands them (`owner/name` is GitHub), `.git` and the
 /// scheme dropped.
@@ -775,9 +894,7 @@ fn repository_identity(json: &Value) -> Option<String> {
             && host
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
-            && [owner, name]
-                .iter()
-                .all(|part| !part.chars().any(char::is_whitespace))
+            && [owner, name].iter().all(|part| is_repository_part(part))
             && identity.len() <= MAX_REPOSITORY_IDENTITY_LEN;
         valid.then_some(identity)
     };
@@ -845,13 +962,11 @@ fn run_swift(
         .as_ref()
         .map(swift::Manifest::targets)
         .unwrap_or_default();
-    let test_dirs: Vec<String> = targets
-        .iter()
-        .filter(|target| target.kind == "test")
-        .map(|target| format!("{}/", target.path))
-        .collect();
     let in_tests = |path: &str| {
-        path.starts_with("Tests/") || test_dirs.iter().any(|dir| path.starts_with(dir.as_str()))
+        path.starts_with("Tests/")
+            || targets
+                .iter()
+                .any(|target| target.kind == "test" && target.contains(path))
     };
 
     let (declarations, documented) = files.iter().filter(|(path, _)| !in_tests(path)).fold(
@@ -1011,10 +1126,9 @@ fn run_swift(
         .iter()
         .filter(|target| target.kind == "test")
         .filter(|target| {
-            let dir = format!("{}/", target.path);
             files
                 .iter()
-                .any(|(path, facts)| facts.declares_tests && path.starts_with(dir.as_str()))
+                .any(|(path, facts)| facts.declares_tests && target.contains(path))
         })
         .map(|target| target.name.as_str())
         .collect();
@@ -1089,7 +1203,16 @@ fn swift_readme_install(context: &Context<'_>, results: &mut Results) {
     let readme = markdown::Readme::parse(text);
     if let Some(line) = swift_identity(name)
         .and_then(|identity| markdown::find_swift_package_declaration(&readme.blocks, &identity))
-        .or_else(|| markdown::find_install_command(&readme.blocks, name))
+        .or_else(|| {
+            markdown::find_install_command(
+                &readme.blocks,
+                name,
+                markdown::Installers {
+                    javascript: false,
+                    source_delivery: context.is_source_package(),
+                },
+            )
+        })
     {
         results.pass("readme-install", format!("README shows `{}`", line.trim()));
     } else {
@@ -1141,10 +1264,9 @@ fn swift_readme_example(
         else {
             return Default::default();
         };
-        let dir = format!("{}/", target.path);
         files
             .iter()
-            .filter(|(path, _)| path.starts_with(dir.as_str()))
+            .filter(|(path, _)| target.contains(path))
             .flat_map(|(_, facts)| facts.public_names.iter().map(String::as_str))
             .collect()
     };

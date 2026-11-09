@@ -37,14 +37,15 @@ fn quality_ecosystem(detected: &str) -> QualityEcosystem {
 }
 
 /// The archive points as a share of the points the archive checks are
-/// worth, out of 100: what the publish knows before the registry scores the
-/// rest.
+/// worth, out of 100 and rounded down: what the publish knows before the
+/// registry scores the rest. Rounding down keeps a release from showing, or
+/// passing `--min-score` with, a share it didn't reach.
 pub(crate) fn preflight_score(report: &QualityReport) -> u32 {
     let (earned, max) = report.archive_points();
     if max == 0 {
         return 0;
     }
-    earned.saturating_mul(100).saturating_add(max / 2) / max
+    earned.saturating_mul(100) / max
 }
 
 fn registry_points(ecosystem: QualityEcosystem) -> u32 {
@@ -231,6 +232,10 @@ mod tests {
     use super::*;
 
     fn report(points: u32) -> QualityReport {
+        report_of(points, 100)
+    }
+
+    fn report_of(points: u32, max_points: u32) -> QualityReport {
         QualityReport {
             schema_version: 1,
             rules_version: 1,
@@ -240,7 +245,7 @@ mod tests {
                 id: "readme",
                 category: Category::Documentation,
                 points,
-                max_points: 100,
+                max_points,
                 status: CheckStatus::Partial,
                 detail: String::new(),
             }],
@@ -260,6 +265,14 @@ mod tests {
     #[test]
     fn score_immediately_above_80_passes_an_explicit_threshold_of_80() {
         enforce_minimum_score(&report(81), 80).unwrap();
+    }
+
+    #[test]
+    fn a_share_just_below_the_threshold_doesnt_round_up_to_pass() {
+        let report = report_of(66, 83);
+        assert_eq!(preflight_score(&report), 79);
+        assert!(enforce_minimum_score(&report, 80).is_err());
+        enforce_minimum_score(&report_of(67, 83), 80).unwrap();
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 use super::Archive;
 use serde_json::{Map, Value};
+use std::cell::Cell;
+use std::collections::HashMap;
 
 /// A package-relative path as `package.json` writes it (`./lib/x.js`,
 /// `lib/x.js`), normalized, or `None` when it leaves the package or isn't
@@ -31,16 +33,21 @@ pub(crate) enum Target<'a> {
     Null,
     Conditions(Vec<(&'a str, Target<'a>)>),
     Fallbacks(Vec<Target<'a>>),
-    /// A value no resolver accepts, such as a number.
+    /// A target Node.js refuses (`ERR_INVALID_PACKAGE_TARGET`), such as a
+    /// number or a path with a `..` segment. A fallback array skips it.
     Invalid,
+    /// A condition object with a numeric key, which Node.js refuses as a
+    /// broken package.json (`ERR_INVALID_PACKAGE_CONFIG`). Nothing skips it.
+    InvalidConfig,
 }
 
 impl<'a> Target<'a> {
     fn parse(value: &'a Value) -> Self {
         match value {
-            Value::String(path) => Self::Path(path),
+            Value::String(path) if valid_target(path) => Self::Path(path),
             Value::Null => Self::Null,
             Value::Array(items) => Self::Fallbacks(items.iter().map(Self::parse).collect()),
+            Value::Object(map) if map.keys().any(|key| is_array_index(key)) => Self::InvalidConfig,
             Value::Object(map) => Self::Conditions(
                 map.iter()
                     .map(|(key, value)| (key.as_str(), Self::parse(value)))
@@ -64,7 +71,7 @@ impl<'a> Target<'a> {
                     target.paths(out);
                 }
             }
-            Self::Null | Self::Invalid => {}
+            Self::Null | Self::Invalid | Self::InvalidConfig => {}
         }
     }
 
@@ -74,18 +81,23 @@ impl<'a> Target<'a> {
     pub fn resolve(&self, conditions: &[&str]) -> Option<Resolution<'a>> {
         match self.resolve_with(conditions, false) {
             Outcome::Found(resolution) => Some(resolution),
-            Outcome::Excluded | Outcome::NoMatch => None,
+            Outcome::Excluded | Outcome::NoMatch | Outcome::Invalid | Outcome::InvalidConfig => {
+                None
+            }
         }
     }
 
     /// Node.js's PACKAGE_TARGET_RESOLVE: a matched condition whose target
     /// is null excludes the subpath instead of falling through to the next
-    /// condition.
+    /// condition, and an invalid target fails it. A fallback array skips
+    /// both and ends as its last skipped item did, as Node.js's resolver
+    /// does.
     fn resolve_with(&self, conditions: &[&str], via_types: bool) -> Outcome<'a> {
         match self {
             Self::Path(path) => Outcome::Found(Resolution { path, via_types }),
             Self::Null => Outcome::Excluded,
-            Self::Invalid => Outcome::NoMatch,
+            Self::Invalid => Outcome::Invalid,
+            Self::InvalidConfig => Outcome::InvalidConfig,
             Self::Conditions(entries) => {
                 for (key, target) in entries {
                     if *key != "default" && !conditions.contains(key) {
@@ -99,13 +111,16 @@ impl<'a> Target<'a> {
                 Outcome::NoMatch
             }
             Self::Fallbacks(targets) => {
+                let mut last = Outcome::NoMatch;
                 for target in targets {
                     match target.resolve_with(conditions, via_types) {
+                        Outcome::Found(resolution) => return Outcome::Found(resolution),
+                        Outcome::InvalidConfig => return Outcome::InvalidConfig,
                         Outcome::NoMatch => {}
-                        outcome => return outcome,
+                        skipped => last = skipped,
                     }
                 }
-                Outcome::NoMatch
+                last
             }
         }
     }
@@ -130,7 +145,7 @@ impl<'a> Target<'a> {
 
     fn has_invalid(&self) -> bool {
         match self {
-            Self::Invalid => true,
+            Self::Invalid | Self::InvalidConfig => true,
             Self::Conditions(entries) => entries.iter().any(|(_, target)| target.has_invalid()),
             Self::Fallbacks(targets) => targets.iter().any(Target::has_invalid),
             _ => false,
@@ -142,6 +157,65 @@ enum Outcome<'a> {
     Found(Resolution<'a>),
     Excluded,
     NoMatch,
+    Invalid,
+    InvalidConfig,
+}
+
+/// A key Node.js reads as an array index, which no condition object may
+/// have.
+fn is_array_index(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|byte| byte.is_ascii_digit())
+        && (key == "0" || !key.starts_with('0'))
+        && key.parse::<u32>().is_ok_and(|index| index < u32::MAX)
+}
+
+/// Node.js's rule for an `exports` target: `./`, then no segment Node.js
+/// refuses.
+fn valid_target(raw: &str) -> bool {
+    raw.strip_prefix("./")
+        .is_some_and(|rest| !has_refused_segment(rest))
+}
+
+/// Whether a target, or the part of a subpath a pattern's `*` matches, has a
+/// `.`, `..` or `node_modules` segment, percent-encoded or not and in any
+/// case, as Node.js's resolver refuses. An empty segment only draws its
+/// deprecation warning.
+fn has_refused_segment(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|code| match [code[0], code[1].to_ascii_lowercase()] {
+                [b'2', b'e'] => Some(b'.'),
+                [b'5', b'f'] => Some(b'_'),
+                [b'6' | b'4', b'e'] => Some(b'n'),
+                [b'6' | b'4', b'f'] => Some(b'o'),
+                [b'6' | b'4', b'4'] => Some(b'd'),
+                [b'6' | b'4', b'5'] => Some(b'e'),
+                [b'6' | b'4', b'd'] => Some(b'm'),
+                [b'6' | b'4', b'c'] => Some(b'l'),
+                [b'7' | b'5', b'5'] => Some(b'u'),
+                [b'7' | b'5', b'3'] => Some(b's'),
+                _ => None,
+            });
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index].to_ascii_lowercase());
+                index += 1;
+            }
+        }
+    }
+    decoded
+        .split(|&byte| byte == b'/' || byte == b'\\')
+        .any(|segment| matches!(segment, b"." | b".." | b"node_modules"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,7 +227,20 @@ pub(crate) struct Resolution<'a> {
 /// `exports`, as subpaths and their targets.
 pub(crate) struct Exports<'a> {
     pub entries: Vec<(&'a str, Target<'a>)>,
+    /// The index in `entries` of each subpath without a `*`.
+    exact: HashMap<&'a str, usize>,
+    /// Each pattern subpath (one `*`) as its prefix and suffix, with its
+    /// index in `entries`.
+    patterns: Vec<(&'a str, &'a str, usize)>,
+    /// Pattern keys the lookups have compared, against
+    /// `MAX_PATTERN_COMPARISONS`.
+    pattern_comparisons: Cell<usize>,
 }
+
+/// Pattern keys the subpath lookups of one report may compare in all. Node.js
+/// compares a subpath with every pattern key; a package.json with a million
+/// of them would make each lookup scan them all.
+const MAX_PATTERN_COMPARISONS: usize = 2_000_000;
 
 impl<'a> Exports<'a> {
     /// `Err` with the reason when Node.js would refuse the map.
@@ -177,14 +264,60 @@ impl<'a> Exports<'a> {
             Value::String(_) | Value::Array(_) => vec![(".", Target::parse(value))],
             _ => return Err("\"exports\" is not a path, an array or an object".to_string()),
         };
-        Ok(Self { entries })
+        let mut exact = HashMap::new();
+        let mut patterns = Vec::new();
+        for (index, (key, _)) in entries.iter().enumerate() {
+            match key.split_once('*') {
+                None => {
+                    exact.insert(*key, index);
+                }
+                Some((prefix, suffix)) if !suffix.contains('*') => {
+                    patterns.push((prefix, suffix, index));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(Self {
+            entries,
+            exact,
+            patterns,
+            pattern_comparisons: Cell::new(0),
+        })
     }
 
-    pub fn target(&self, subpath: &str) -> Option<&Target<'a>> {
-        self.entries
+    /// The file `subpath` resolves to under `conditions`, through an exact
+    /// subpath or else the pattern Node.js picks (the longest prefix before
+    /// its `*`), with whether a `types` condition chose it.
+    pub fn resolve_subpath(&self, subpath: &str, conditions: &[&str]) -> Option<(String, bool)> {
+        if let Some(&index) = self.exact.get(subpath) {
+            let resolution = self.entries[index].1.resolve(conditions)?;
+            return normalize(resolution.path).map(|path| (path, resolution.via_types));
+        }
+        let compared = self
+            .pattern_comparisons
+            .get()
+            .saturating_add(self.patterns.len());
+        self.pattern_comparisons.set(compared);
+        if compared > MAX_PATTERN_COMPARISONS {
+            return None;
+        }
+        let (index, matched) = self
+            .patterns
             .iter()
-            .find(|(key, _)| *key == subpath)
-            .map(|(_, target)| target)
+            .filter(|(prefix, suffix, _)| {
+                subpath.len() > prefix.len() + suffix.len()
+                    && subpath.starts_with(prefix)
+                    && subpath.ends_with(suffix)
+            })
+            .max_by_key(|(prefix, suffix, _)| (prefix.len(), suffix.len()))
+            .map(|(prefix, suffix, index)| {
+                (*index, &subpath[prefix.len()..subpath.len() - suffix.len()])
+            })?;
+        if has_refused_segment(matched) {
+            return None;
+        }
+        let resolution = self.entries[index].1.resolve(conditions)?;
+        normalize(&resolution.path.replace('*', matched)).map(|path| (path, resolution.via_types))
     }
 }
 
@@ -215,22 +348,16 @@ pub(crate) fn sibling_declaration(path: &str) -> Option<String> {
     None
 }
 
-/// The files a target with one `*` matches, by Node.js pattern rules.
-pub(crate) fn pattern_matches<'f>(archive: &'f Archive, target: &str) -> Vec<&'f str> {
+/// The files an `exports` pattern target (`./dist/*.js`) matches, in path
+/// order, or `None` once the archive's pattern lookups have run out.
+pub(crate) fn pattern_matches<'f>(archive: &'f Archive, target: &str) -> Option<Vec<&'f str>> {
     let Some((prefix, suffix)) = target.split_once('*') else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    let (Some(prefix), suffix) = (normalize_prefix(prefix), suffix) else {
-        return Vec::new();
+    let Some(prefix) = normalize_prefix(prefix) else {
+        return Some(Vec::new());
     };
-    archive
-        .paths()
-        .filter(|path| {
-            path.len() > prefix.len() + suffix.len()
-                && path.starts_with(prefix.as_str())
-                && path.ends_with(suffix)
-        })
-        .collect()
+    archive.pattern_files(&prefix, suffix)
 }
 
 fn normalize_prefix(prefix: &str) -> Option<String> {
@@ -263,9 +390,9 @@ pub(crate) fn resolve_main(archive: &Archive, raw: &str) -> Option<String> {
         .find(|candidate| archive.has(candidate))
 }
 
-/// Where TypeScript finds `types` or `typings`: the path, with `.d.ts`, or
-/// `index.d.ts` inside it.
-pub(crate) fn resolve_types_field(archive: &Archive, raw: &str) -> Option<String> {
+/// The file a `types` or `typings` field names, as TypeScript looks for it:
+/// the path, with `.d.ts`, or `index.d.ts` inside it.
+pub(crate) fn types_field_file(archive: &Archive, raw: &str) -> Option<String> {
     let path = normalize(raw)?;
     [
         path.clone(),
@@ -274,6 +401,23 @@ pub(crate) fn resolve_types_field(archive: &Archive, raw: &str) -> Option<String
     ]
     .into_iter()
     .find(|candidate| archive.has(candidate))
+}
+
+/// The declarations TypeScript reads where a `types` field or condition
+/// points: a declaration file or TypeScript source, or for a JavaScript
+/// file the declaration beside it. A README or JSON file declares nothing.
+pub(crate) fn declaration_at(archive: &Archive, path: &str) -> Option<String> {
+    if is_declaration(path) || is_typescript_source(path) {
+        return archive.has(path).then(|| path.to_string());
+    }
+    sibling_declaration(path).filter(|declaration| archive.has(declaration))
+}
+
+fn is_typescript_source(path: &str) -> bool {
+    [".ts", ".mts", ".cts", ".tsx"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+        && !is_declaration(path)
 }
 
 fn join(directory: &str, name: &str) -> String {
@@ -291,7 +435,7 @@ pub(crate) fn target_exists(archive: &Archive, raw: &str) -> bool {
         return false;
     }
     if raw.contains('*') {
-        return !pattern_matches(archive, raw).is_empty();
+        return pattern_matches(archive, raw).is_some_and(|matched| !matched.is_empty());
     }
     normalize(raw).is_some_and(|path| archive.has(&path))
 }
@@ -350,6 +494,64 @@ pub(crate) fn string<'v>(json: &'v Value, key: &str) -> Option<&'v str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_follow_node_segment_rules() {
+        for valid in [
+            "./index.js",
+            "./dist//index.js",
+            "./a.b/c",
+            "./node_modules_x/a",
+        ] {
+            assert!(valid_target(valid), "{valid}");
+        }
+        for refused in [
+            "index.js",
+            "../index.js",
+            "./dist/../index.js",
+            "./dist/./index.js",
+            "./node_modules/x/index.js",
+            "./%2e%2E/index.js",
+            "./%4E%4fde_modules/x.js",
+            "./NODE_MODULES/x.js",
+            "./dist\\..\\index.js",
+        ] {
+            assert!(!valid_target(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_resolves_by_its_longest_prefix_and_refuses_traversal() {
+        let value = serde_json::json!({
+            "./*": "./dist/*.js",
+            "./icons/*": "./dist/icons/*.svg.js",
+            "./internal/*": null
+        });
+        let exports = Exports::parse(&value).unwrap();
+        let resolve = |subpath: &str| {
+            exports
+                .resolve_subpath(subpath, &["import"])
+                .map(|(path, _)| path)
+        };
+        assert_eq!(resolve("./a").as_deref(), Some("dist/a.js"));
+        assert_eq!(resolve("./icons/x").as_deref(), Some("dist/icons/x.svg.js"));
+        assert_eq!(resolve("./internal/x"), None);
+        assert_eq!(resolve("./../../etc/passwd"), None);
+        assert_eq!(resolve("./a/%2e%2e/b"), None);
+    }
+
+    #[test]
+    fn a_numeric_condition_key_fails_even_inside_a_fallback_array() {
+        let exports = serde_json::json!([{ "0": "./a.js" }, "./b.js"]);
+        assert!(Target::parse(&exports).resolve(&["import"]).is_none());
+        let exports = serde_json::json!(["../a.js", "./b.js"]);
+        assert_eq!(
+            Target::parse(&exports)
+                .resolve(&["import"])
+                .map(|found| found.path),
+            Some("./b.js")
+        );
+    }
     use serde_json::json;
 
     #[test]

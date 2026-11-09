@@ -8,6 +8,7 @@ expression: json
   "available": false,
   "message": "No quality data available.",
   "status": null,
+  "unavailableReason": null,
   "rulesVersion": null,
   "score": null,
   "maxScore": null,

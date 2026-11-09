@@ -178,8 +178,16 @@ pub fn analyze_release_tarball<R: Read>(
         } else if size > 0 && ecosystem.reads(path) {
             let limits = ScanLimits::REGISTRY;
             if size > limits.full_file_bytes {
-                let sample =
-                    read_ends(&mut entry, size, limits.sample_bytes).map_err(LpmError::Io)?;
+                let sample = match (quality.as_mut(), quality_bytes) {
+                    (Some(quality), Some(bytes)) => {
+                        let (head, sample) =
+                            read_head_and_ends(&mut entry, size, bytes, limits.sample_bytes)
+                                .map_err(LpmError::Io)?;
+                        quality.add_content(path, &head);
+                        sample
+                    }
+                    _ => read_ends(&mut entry, size, limits.sample_bytes).map_err(LpmError::Io)?,
+                };
                 analyzer.feed_sample(relative, size, &sample);
             } else {
                 buffer.clear();
@@ -281,6 +289,50 @@ fn read_whole(reader: &mut impl Read, size: u64) -> io::Result<Vec<u8>> {
     let mut content = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
     reader.read_to_end(&mut content)?;
     Ok(content)
+}
+
+/// The first `head_bytes` of an entry of `size` bytes, which the quality
+/// checks read, and the sample [`read_ends`] takes, from one pass.
+fn read_head_and_ends(
+    reader: &mut impl Read,
+    size: u64,
+    head_bytes: u64,
+    sample_bytes: usize,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let chunk = (sample_bytes as u64).min(size);
+    let tail_start = size.saturating_sub(chunk);
+    if tail_start <= chunk {
+        let whole = read_whole(reader, size)?;
+        let head_end = usize::try_from(head_bytes).map_or(whole.len(), |end| end.min(whole.len()));
+        return Ok((whole[..head_end].to_vec(), whole));
+    }
+    let read = head_bytes.max(chunk).min(size);
+    let mut head = Vec::with_capacity(usize::try_from(read).unwrap_or_default());
+    reader.by_ref().take(read).read_to_end(&mut head)?;
+    let chunk_len = usize::try_from(chunk).unwrap_or(head.len()).min(head.len());
+    let mut sample = Vec::with_capacity(chunk_len.saturating_mul(2).saturating_add(1));
+    sample.extend_from_slice(&head[..chunk_len]);
+    sample.push(b'\n');
+    let read_so_far = head.len() as u64;
+    if tail_start >= read_so_far {
+        io::copy(
+            &mut reader.by_ref().take(tail_start - read_so_far),
+            &mut io::sink(),
+        )?;
+        reader.by_ref().take(chunk).read_to_end(&mut sample)?;
+    } else {
+        let overlap = usize::try_from(tail_start)
+            .unwrap_or(head.len())
+            .min(head.len());
+        sample.extend_from_slice(&head[overlap..]);
+        reader
+            .by_ref()
+            .take(size - read_so_far)
+            .read_to_end(&mut sample)?;
+    }
+    let head_end = usize::try_from(head_bytes).map_or(head.len(), |end| end.min(head.len()));
+    head.truncate(head_end);
+    Ok((head, sample))
 }
 
 /// The first and last `sample_bytes` of an entry of `size` bytes, joined by
@@ -762,6 +814,94 @@ mod tests {
             serde_json::to_value(&quality).unwrap(),
             "lpm publish scores the archive as the registry does"
         );
+    }
+
+    #[test]
+    fn a_sampled_file_feeds_the_quality_checks_what_lpm_publish_reads() {
+        let mut readme = b"/*\n# Kit\n\nParses and renders Markdown for the web.\n*/\n".to_vec();
+        readme.resize(9 * 1024 * 1024, b' ');
+        readme.extend_from_slice(b"\nmodule.exports = 1\n");
+        let entries: &[(&str, &[u8])] = &[
+            (
+                "package.json",
+                br#"{"name":"@lpm.dev/acme.kit","version":"1.0.0","license":"MIT"}"#,
+            ),
+            ("README.js", &readme),
+        ];
+        let signals = analyze(entries);
+        assert_eq!(signals.coverage.sampled_files, 1);
+        let quality = signals.quality.expect("JavaScript is scored");
+        let readme_check = quality
+            .checks
+            .iter()
+            .find(|check| check.id == "readme")
+            .unwrap();
+        assert_ne!(readme_check.detail, "No README", "{}", readme_check.detail);
+
+        let alone =
+            analyze_release_quality(tarball(entries).as_slice(), QualityEcosystem::Js, None)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&alone).unwrap(),
+            serde_json::to_value(&quality).unwrap()
+        );
+    }
+
+    #[test]
+    fn multibyte_root_file_names_get_a_normal_report_in_both_ecosystems() {
+        let entries: &[(&str, &[u8])] = &[
+            (
+                "package.json",
+                br#"{"name":"@lpm.dev/acme.kit","version":"1.0.0","license":"MIT"}"#,
+            ),
+            ("abcdef\u{e9}.txt", b""),
+            ("\u{65e5}\u{672c}\u{8a9e}.txt", b""),
+            ("LICENSE", b"MIT"),
+        ];
+        for (ecosystem, quality) in [
+            (Ecosystem::Js, QualityEcosystem::Js),
+            (Ecosystem::Swift, QualityEcosystem::Swift),
+        ] {
+            let signals =
+                analyze_release_tarball(tarball(entries).as_slice(), ecosystem, None).unwrap();
+            let report = signals.quality.expect("scored");
+            let license_file = |report: &QualityReport| {
+                report
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "license-file")
+                    .map(|check| check.points)
+            };
+            assert_eq!(license_file(&report), Some(2));
+            let alone =
+                analyze_release_quality(tarball(entries).as_slice(), quality, None).unwrap();
+            assert_eq!(license_file(&alone), Some(2));
+        }
+    }
+
+    #[test]
+    fn reads_an_entry_head_and_its_sample_in_one_pass() {
+        let content: Vec<u8> = (0..100u8).collect();
+        for (head_bytes, sample_bytes) in [(10, 20), (30, 20), (90, 20), (200, 20), (5, 60)] {
+            let (head, sample) = read_head_and_ends(
+                &mut content.as_slice(),
+                content.len() as u64,
+                head_bytes,
+                sample_bytes,
+            )
+            .unwrap();
+            let expected_head = &content[..content.len().min(head_bytes as usize)];
+            assert_eq!(
+                head, expected_head,
+                "head {head_bytes}, sample {sample_bytes}"
+            );
+            let expected_sample =
+                read_ends(&mut content.as_slice(), content.len() as u64, sample_bytes).unwrap();
+            assert_eq!(
+                sample, expected_sample,
+                "head {head_bytes}, sample {sample_bytes}"
+            );
+        }
     }
 
     #[test]

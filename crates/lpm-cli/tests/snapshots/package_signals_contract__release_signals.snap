@@ -178,7 +178,7 @@ expression: document
         "points": 0,
         "maxPoints": 4,
         "status": "failed",
-        "detail": "No \"module\" field, and \"main\" isn't an ES module"
+        "detail": "lib/index.js has no import or export declarations"
       },
       {
         "id": "exports-map",

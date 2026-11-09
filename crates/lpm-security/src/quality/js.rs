@@ -9,7 +9,7 @@ use super::{
     readme_check, repository_check,
 };
 use serde_json::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -64,25 +64,46 @@ struct Package<'a> {
     exports: Option<Result<Exports<'a>, String>>,
     facts: RefCell<HashMap<String, Option<Rc<ModuleFacts>>>>,
     export_sets: RefCell<HashMap<String, Rc<ExportSet>>>,
+    /// Names every export set together has kept, against
+    /// `MAX_EXPORT_ENTRIES`.
+    export_entries: Cell<usize>,
 }
 
 /// What a module exports by name, re-exports followed.
 #[derive(Debug, Default)]
 struct ExportSet {
-    names: BTreeMap<String, Symbol>,
-    /// A re-export from another package or an unread file left names out.
+    names: BTreeMap<Rc<str>, Symbol>,
+    /// A re-export from another package or an unread file left names out,
+    /// or the package re-exports more names than the checks keep.
     incomplete: bool,
 }
 
 #[derive(Debug, Clone)]
 struct Symbol {
     /// The declaring file and local name, or `None` for a name another
-    /// package declares.
-    key: Option<(String, String)>,
+    /// package declares. Shared by every module that re-exports it.
+    key: Option<Rc<(String, String)>>,
     documented: bool,
 }
 
+impl Symbol {
+    /// Whether two star re-exports reach the same binding, which Node.js
+    /// requires of a name more than one of them provides.
+    fn same_binding(&self, other: &Symbol) -> bool {
+        match (&self.key, &other.key) {
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right) || left == right,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
 const MAX_REEXPORT_DEPTH: usize = 64;
+/// Names every module's export set may keep in all: barrels re-exporting
+/// one another would otherwise copy each name into every barrel.
+const MAX_EXPORT_ENTRIES: usize = 200_000;
+/// Subpaths a pattern in `exports` may add to the API docs check.
+const MAX_PATTERN_SUBPATHS: usize = 256;
 
 impl<'a> Package<'a> {
     fn new(context: &'a Context<'a>, json: &'a Value) -> Self {
@@ -92,6 +113,7 @@ impl<'a> Package<'a> {
             exports: json.get("exports").map(Exports::parse),
             facts: RefCell::new(HashMap::new()),
             export_sets: RefCell::new(HashMap::new()),
+            export_entries: Cell::new(0),
         }
     }
 
@@ -105,8 +127,34 @@ impl<'a> Package<'a> {
             .and_then(|exports| exports.as_ref().ok())
     }
 
-    fn is_module_type(&self) -> bool {
-        npm::string(self.json, "type") == Some("module")
+    /// The `type` of the package.json nearest to `path`, which Node.js
+    /// reads for a `.js` file: `None` when that package.json has none.
+    fn module_type_for(&self, path: &str) -> Option<&str> {
+        let mut directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+        loop {
+            if directory.is_empty() {
+                return npm::string(self.json, "type");
+            }
+            if let Some(scope) = self.archive().scope(directory) {
+                return scope;
+            }
+            directory = directory.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+    }
+
+    /// Takes room for `count` more names, or `false` once the export sets
+    /// together would keep more than `MAX_EXPORT_ENTRIES`.
+    fn take_export_entries(&self, count: usize) -> bool {
+        let used = self.export_entries.get().saturating_add(count);
+        if used > MAX_EXPORT_ENTRIES {
+            return false;
+        }
+        self.export_entries.set(used);
+        true
+    }
+
+    fn export_budget_spent(&self) -> bool {
+        self.export_entries.get() >= MAX_EXPORT_ENTRIES
     }
 
     fn facts(&self, path: &str) -> Option<Rc<ModuleFacts>> {
@@ -196,11 +244,16 @@ impl<'a> Package<'a> {
         match self.facts(path) {
             None => set.incomplete = true,
             Some(facts) => {
+                if !self.take_export_entries(facts.local.len() + facts.named_reexports.len()) {
+                    set.incomplete = true;
+                    visiting.remove(path);
+                    return Rc::new(set);
+                }
                 for export in &facts.local {
                     set.names.insert(
-                        export.name.clone(),
+                        Rc::from(export.name.as_str()),
                         Symbol {
-                            key: Some((path.to_string(), export.local.clone())),
+                            key: Some(Rc::new((path.to_string(), export.local.clone()))),
                             documented: export.documented,
                         },
                     );
@@ -209,7 +262,7 @@ impl<'a> Package<'a> {
                     let symbol = match self.resolve_specifier(path, specifier) {
                         Some(target) => {
                             let target_set = self.export_set_within(&target, visiting, depth + 1);
-                            match target_set.names.get(imported) {
+                            match target_set.names.get(imported.as_str()) {
                                 Some(symbol) => symbol.clone(),
                                 None => {
                                     set.incomplete |= target_set.incomplete;
@@ -225,9 +278,15 @@ impl<'a> Package<'a> {
                             documented: false,
                         },
                     };
-                    set.names.insert(exported.clone(), symbol);
+                    set.names.insert(Rc::from(exported.as_str()), symbol);
                 }
-                for specifier in &facts.star_reexports {
+                // Names a module declares or re-exports by name shadow its
+                // star re-exports. A name two star re-exports bind to
+                // different declarations is ambiguous, and Node.js leaves it
+                // out.
+                let explicit: HashSet<Rc<str>> = set.names.keys().cloned().collect();
+                let mut ambiguous: HashSet<Rc<str>> = HashSet::new();
+                'stars: for specifier in &facts.star_reexports {
                     let Some(target) = self.resolve_specifier(path, specifier) else {
                         set.incomplete = true;
                         continue;
@@ -235,10 +294,25 @@ impl<'a> Package<'a> {
                     let target_set = self.export_set_within(&target, visiting, depth + 1);
                     set.incomplete |= target_set.incomplete;
                     for (name, symbol) in &target_set.names {
-                        if name != "default" {
-                            set.names
-                                .entry(name.clone())
-                                .or_insert_with(|| symbol.clone());
+                        if &**name == "default"
+                            || explicit.contains(name)
+                            || ambiguous.contains(name)
+                        {
+                            continue;
+                        }
+                        match set.names.get(name) {
+                            Some(existing) if existing.same_binding(symbol) => {}
+                            Some(_) => {
+                                set.names.remove(name);
+                                ambiguous.insert(Rc::clone(name));
+                            }
+                            None => {
+                                if !self.take_export_entries(1) {
+                                    set.incomplete = true;
+                                    break 'stars;
+                                }
+                                set.names.insert(Rc::clone(name), symbol.clone());
+                            }
                         }
                     }
                 }
@@ -252,18 +326,46 @@ impl<'a> Package<'a> {
         set
     }
 
-    /// The subpaths `exports` maps without patterns, or `.` alone for a
-    /// package without `exports`.
-    fn subpaths(&self) -> Vec<&'a str> {
-        match self.exports() {
-            Some(exports) => exports
-                .entries
+    /// The subpaths `exports` maps, with each a pattern maps expanded over
+    /// the files it matches (at most `MAX_PATTERN_SUBPATHS`), or `.` alone
+    /// for a package without `exports`.
+    fn subpaths(&self) -> Vec<String> {
+        let Some(exports) = self.exports() else {
+            return vec![".".to_string()];
+        };
+        let mut subpaths = Vec::new();
+        let mut expanded = 0usize;
+        for (subpath, target) in &exports.entries {
+            let Some((key_prefix, key_suffix)) = subpath.split_once('*') else {
+                subpaths.push((*subpath).to_string());
+                continue;
+            };
+            if expanded == MAX_PATTERN_SUBPATHS {
+                continue;
+            }
+            let Some(pattern) = [npm::TYPES_IMPORT_CONDITIONS, npm::IMPORT_CONDITIONS]
                 .iter()
-                .map(|(subpath, _)| *subpath)
-                .filter(|subpath| !subpath.contains('*'))
-                .collect(),
-            None => vec!["."],
+                .find_map(|conditions| target.resolve(conditions))
+                .and_then(|resolution| npm::normalize(resolution.path))
+            else {
+                continue;
+            };
+            let Some((prefix, suffix)) = pattern.split_once('*') else {
+                continue;
+            };
+            let Some(files) = npm::pattern_matches(self.archive(), &pattern) else {
+                continue;
+            };
+            for file in files {
+                if expanded == MAX_PATTERN_SUBPATHS {
+                    break;
+                }
+                let star = &file[prefix.len()..file.len() - suffix.len()];
+                subpaths.push(format!("{key_prefix}{star}{key_suffix}"));
+                expanded += 1;
+            }
         }
+        subpaths
     }
 
     /// The declaration file TypeScript reads for `subpath` under
@@ -277,22 +379,19 @@ impl<'a> Package<'a> {
         let archive = self.archive();
         match self.exports() {
             Some(exports) => {
-                let target = exports.target(subpath)?;
-                let resolution = target.resolve(types_conditions)?;
-                let path = npm::normalize(resolution.path)?;
-                if resolution.via_types || npm::is_declaration(&path) {
-                    return archive.has(&path).then_some(path);
+                let (path, via_types) = exports.resolve_subpath(subpath, types_conditions)?;
+                if via_types || npm::is_declaration(&path) {
+                    return npm::declaration_at(archive, &path);
                 }
-                let runtime_path = target
-                    .resolve(runtime)
-                    .and_then(|resolution| npm::normalize(resolution.path))?;
+                let (runtime_path, _) = exports.resolve_subpath(subpath, runtime)?;
                 npm::sibling_declaration(&runtime_path)
                     .filter(|declaration| archive.has(declaration))
             }
             None if subpath == "." => {
                 for field in ["types", "typings"] {
                     if let Some(raw) = npm::string(self.json, field) {
-                        return npm::resolve_types_field(archive, raw);
+                        return npm::types_field_file(archive, raw)
+                            .and_then(|file| npm::declaration_at(archive, &file));
                     }
                 }
                 self.main()
@@ -308,9 +407,8 @@ impl<'a> Package<'a> {
     fn runtime_entry(&self, subpath: &str, conditions: &[&str]) -> Option<String> {
         match self.exports() {
             Some(exports) => exports
-                .target(subpath)?
-                .resolve(conditions)
-                .and_then(|resolution| npm::normalize(resolution.path)),
+                .resolve_subpath(subpath, conditions)
+                .map(|(path, _)| path),
             None if subpath == "." => self.main(),
             None => None,
         }
@@ -342,21 +440,27 @@ impl<'a> Package<'a> {
             }
         }
         self.main().filter(|main| {
-            main.ends_with(".mjs") || (self.is_module_type() && main.ends_with(".js"))
+            main.ends_with(".mjs")
+                || (main.ends_with(".js")
+                    && matches!(self.module_type_for(main), Some("module") | None))
         })
     }
 
-    /// Whether Node.js loads `path` as an ES module: `.mjs`, `.js` in a
-    /// `"type": "module"` package, or `.js` without a `type` whose syntax is
-    /// ESM, which Node.js detects.
+    /// Whether Node.js loads `path` as an ES module: `.mjs`, `.js` whose
+    /// nearest package.json sets `"type": "module"`, or `.js` whose nearest
+    /// package.json sets no `type` and whose syntax is ESM, which Node.js
+    /// detects. JSX, which Node.js can't run, never is.
     fn loads_as_esm(&self, path: &str, facts: &ModuleFacts) -> bool {
+        if facts.jsx {
+            return false;
+        }
         if path.ends_with(".mjs") {
             return facts.esm_syntax;
         }
         if !path.ends_with(".js") {
             return false;
         }
-        match npm::string(self.json, "type") {
+        match self.module_type_for(path) {
             Some("module") | None => facts.esm_syntax,
             _ => false,
         }
@@ -402,7 +506,11 @@ fn readme_install(context: &Context<'_>, results: &mut Results) {
         return;
     };
     let readme = markdown::Readme::parse(text);
-    match markdown::find_install_command(&readme.blocks, name) {
+    let installers = markdown::Installers {
+        javascript: true,
+        source_delivery: context.is_source_package(),
+    };
+    match markdown::find_install_command(&readme.blocks, name, installers) {
         Some(line) => results.pass("readme-install", format!("README shows `{}`", line.trim())),
         None => results.fail(
             "readme-install",
@@ -488,25 +596,27 @@ fn readme_example(context: &Context<'_>, package: &Package<'_>, results: &mut Re
 
 fn api_docs(package: &Package<'_>, results: &mut Results) {
     let mut files: Vec<String> = Vec::new();
-    for subpath in package.subpaths() {
+    let subpaths = package.subpaths();
+    let mut seen = HashSet::new();
+    for subpath in &subpaths {
         for (types, runtime) in [
             (npm::TYPES_IMPORT_CONDITIONS, npm::IMPORT_CONDITIONS),
             (npm::TYPES_REQUIRE_CONDITIONS, npm::REQUIRE_CONDITIONS),
         ] {
             if let Some(file) = package.declaration_for(subpath, types, runtime)
-                && !files.contains(&file)
+                && seen.insert(file.clone())
             {
                 files.push(file);
             }
         }
     }
     let source = if files.is_empty() {
-        for subpath in package.subpaths() {
+        for subpath in &subpaths {
             if let Some(entry) = package.esm_entry(subpath)
                 && package
                     .facts(&entry)
                     .is_some_and(|facts| package.loads_as_esm(&entry, &facts))
-                && !files.contains(&entry)
+                && seen.insert(entry.clone())
             {
                 files.push(entry);
             }
@@ -522,14 +632,23 @@ fn api_docs(package: &Package<'_>, results: &mut Results) {
         );
         return;
     }
-    let mut symbols: HashMap<(String, String), bool> = HashMap::new();
+    let mut symbols: HashMap<Rc<(String, String)>, bool> = HashMap::new();
     for file in &files {
         for symbol in package.export_set(file).names.values() {
             if let Some(key) = &symbol.key {
-                let documented = symbols.entry(key.clone()).or_insert(false);
+                let documented = symbols.entry(Rc::clone(key)).or_insert(false);
                 *documented |= symbol.documented;
             }
         }
+    }
+    if package.export_budget_spent() {
+        results.fail(
+            "api-docs",
+            format!(
+                "The package re-exports more than {MAX_EXPORT_ENTRIES} names across its modules, more than the check reads"
+            ),
+        );
+        return;
     }
     let total = symbols.len();
     if total == 0 {
@@ -580,7 +699,7 @@ fn entry_points(package: &Package<'_>, results: &mut Results) {
     }
     for field in ["types", "typings"] {
         if let Some(raw) = npm::string(json, field) {
-            check(field, raw, npm::resolve_types_field(archive, raw).is_some());
+            check(field, raw, npm::types_field_file(archive, raw).is_some());
         }
     }
     match json.get("bin") {
@@ -699,7 +818,14 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
             let runtime_raw = runtime_resolution.path;
             let label = format!("{subpath} ({mode})");
             if subpath.contains('*') {
-                let matched = npm::pattern_matches(archive, runtime_raw);
+                // Patterns past the lookups' limit can't be confirmed typed.
+                let Some(matched) = npm::pattern_matches(archive, runtime_raw) else {
+                    entries.push(TypedEntry {
+                        label,
+                        typed: false,
+                    });
+                    continue;
+                };
                 let javascript: Vec<&str> = matched
                     .iter()
                     .copied()
@@ -752,7 +878,7 @@ fn typed_pattern(
     matched.iter().all(|path| {
         let star = &path[prefix.len()..path.len() - suffix.len()];
         match types_pattern.and_then(|resolution| npm::normalize(resolution.path)) {
-            Some(pattern) => archive.has(&pattern.replacen('*', star, 1)),
+            Some(pattern) => npm::declaration_at(archive, &pattern.replace('*', star)).is_some(),
             None => {
                 npm::sibling_declaration(path).is_some_and(|declaration| archive.has(&declaration))
             }
@@ -831,6 +957,11 @@ fn esm(package: &Package<'_>, results: &mut Results) {
     };
     if package.loads_as_esm(&entry, &facts) && facts.parsed {
         results.pass("esm", format!("{entry} is an ES module"));
+    } else if facts.jsx {
+        results.fail(
+            "esm",
+            format!("{entry} has JSX, which Node.js can't run: ship it compiled"),
+        );
     } else if !facts.esm_syntax {
         results.fail(
             "esm",

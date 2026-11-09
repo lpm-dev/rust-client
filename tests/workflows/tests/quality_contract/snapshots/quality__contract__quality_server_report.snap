@@ -8,6 +8,7 @@ expression: json
   "available": true,
   "message": null,
   "status": null,
+  "unavailableReason": null,
   "rulesVersion": null,
   "score": 0,
   "maxScore": 100,

@@ -1,6 +1,7 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_registry::{QualityCheck, RegistryClient};
+use lpm_security::quality::Category;
 
 pub async fn run(
     client: &RegistryClient,
@@ -8,10 +9,17 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let report = client.get_quality(package).await?;
-    let pending = report.status.as_deref() == Some("pending");
+    let state = ReportState::of(&report);
     let available = report
         .available
-        .unwrap_or(report.score.is_some() || pending);
+        .unwrap_or(report.score.is_some() || state != ReportState::Complete);
+    // Only a complete report adds its checks up; a registry's totals for any
+    // other would add points that checks still waiting have.
+    let categories = if state == ReportState::Complete {
+        report.categories.as_ref()
+    } else {
+        None
+    };
 
     if json_output {
         let json = serde_json::json!({
@@ -20,12 +28,13 @@ pub async fn run(
             "available": available,
             "message": report.message,
             "status": report.status,
+            "unavailableReason": report.unavailable_reason,
             "rulesVersion": report.rules_version,
-            "score": report.score,
+            "score": report.score.filter(|_| state == ReportState::Complete),
             "maxScore": report.max_score,
-            "tier": report.tier,
+            "tier": report.tier.as_ref().filter(|_| state == ReportState::Complete),
             "ecosystem": report.ecosystem,
-            "categories": report.categories,
+            "categories": categories,
             "published_at": report.published_at,
             "checks": report.checks,
             "count": report.checks.len(),
@@ -49,15 +58,26 @@ pub async fn run(
         return Ok(());
     }
 
-    match report.score {
-        Some(score) if !pending => {
-            let max = report.max_score.unwrap_or(100);
-            let tier = report.tier.as_deref().unwrap_or_else(|| tier_for(score));
-            print_field("score", tier_colored(&format!("{score}/{max}"), score));
-            print_field("tier", tier_colored(tier_label(tier), score));
+    match state {
+        ReportState::Complete => {
+            if let Some(score) = report.score {
+                let max = report.max_score.unwrap_or(100);
+                let tier = report.tier.as_deref().unwrap_or_else(|| tier_for(score));
+                print_field("score", tier_colored(&format!("{score}/{max}"), score));
+                print_field("tier", tier_colored(tier_label(tier), score));
+            }
         }
-        _ if pending => print_field("score", install_ui::dim("Scoring…")),
-        _ => {}
+        ReportState::Pending => print_field("score", install_ui::dim("Scoring…")),
+        ReportState::Unavailable => {
+            print_field("score", install_ui::yellow("Score unavailable"));
+            if let Some(reason) = report
+                .unavailable_reason
+                .as_deref()
+                .filter(|r| !r.is_empty())
+            {
+                print_field("reason", install_ui::field(reason));
+            }
+        }
     }
     if let Some(status) = &report.status {
         print_field("status", install_ui::field(status));
@@ -86,20 +106,20 @@ pub async fn run(
         } else {
             for (category, checks) in groups {
                 println!();
-                let name = category.as_deref().unwrap_or("other");
+                let label = category.as_deref().map_or("Other", category_label);
                 let totals = category
                     .as_deref()
-                    .and_then(|category| category_totals(&report, category));
+                    .and_then(|category| category_totals(categories, category));
                 match totals {
                     Some((score, max)) => println!(
                         "{}",
                         crate::install_ui::terminal_line!(
                             "{} {}",
-                            install_ui::section(category_label(name)),
+                            install_ui::section(label),
                             install_ui::dim(&format!("{score}/{max}"))
                         )
                     ),
-                    None => println!("{}", install_ui::section(category_label(name))),
+                    None => println!("{}", install_ui::section(label)),
                 }
                 for check in checks {
                     print_check(check, label_width);
@@ -113,12 +133,35 @@ pub async fn run(
     Ok(())
 }
 
+/// Where a report stands. A registry from before the four-bar score sends
+/// no status, and its reports are complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportState {
+    Complete,
+    Pending,
+    Unavailable,
+}
+
+impl ReportState {
+    fn of(report: &lpm_registry::QualityResponse) -> Self {
+        match report.status.as_deref() {
+            Some("pending") => Self::Pending,
+            Some("unavailable") => Self::Unavailable,
+            _ => Self::Complete,
+        }
+    }
+}
+
 const CATEGORY_ORDER: &[&str] = &["documentation", "api", "provenance", "health"];
 
+/// A category's name as `lpm publish --check` and the package page show it.
 fn category_label(category: &str) -> &str {
-    match category {
-        "documentation" => "docs",
-        other => other,
+    match Category::ALL
+        .into_iter()
+        .find(|known| known.as_str() == category)
+    {
+        Some(known) => known.label(),
+        None => category,
     }
 }
 
@@ -147,8 +190,8 @@ fn category_groups(
     groups
 }
 
-fn category_totals(report: &lpm_registry::QualityResponse, category: &str) -> Option<(u64, u64)> {
-    let entry = report.categories.as_ref()?.get(category)?;
+fn category_totals(categories: Option<&serde_json::Value>, category: &str) -> Option<(u64, u64)> {
+    let entry = categories?.get(category)?;
     Some((entry.get("score")?.as_u64()?, entry.get("max")?.as_u64()?))
 }
 
@@ -175,13 +218,14 @@ fn print_check(check: &QualityCheck, label_width: usize) {
         "passed" => (install_ui::green("✓"), install_ui::green(&points)),
         "partial" => (install_ui::yellow("◐"), install_ui::yellow(&points)),
         "pending" => (install_ui::dim("◦"), install_ui::dim("…")),
+        "unavailable" => (install_ui::dim("–"), install_ui::dim("not checked")),
         _ => (install_ui::red("✗"), install_ui::dim(&points)),
     };
     println!(
         "{}",
         crate::install_ui::terminal_line!("  {} {}  {}", icon, label, points)
     );
-    if status != "passed"
+    if !matches!(status, "passed" | "unavailable")
         && let Some(detail) = &check.detail
         && !detail.is_empty()
     {
@@ -241,6 +285,14 @@ mod tests {
         assert_eq!(tier_for(69), "fair");
         assert_eq!(tier_for(50), "fair");
         assert_eq!(tier_for(49), "needs-work");
+    }
+
+    #[test]
+    fn categories_read_as_publish_check_shows_them() {
+        assert_eq!(category_label("documentation"), "Docs");
+        assert_eq!(category_label("api"), "API");
+        assert_eq!(category_label("health"), "Health");
+        assert_eq!(category_label("legacy"), "legacy");
     }
 
     #[test]

@@ -17,7 +17,7 @@ expression: envelope
     "schemaVersion": 1,
     "rulesVersion": 1,
     "ecosystem": "js",
-    "preflightScore": 35,
+    "preflightScore": 34,
     "archivePoints": 29,
     "archiveMaxPoints": 83,
     "registryMaxPoints": 17,
@@ -107,7 +107,7 @@ expression: envelope
         "points": 0,
         "maxPoints": 4,
         "status": "failed",
-        "detail": "No \"module\" field, and \"main\" isn't an ES module",
+        "detail": "index.js has no import or export declarations",
         "tip": "Point the \"import\" condition of \"exports\" (or \"module\") at a file with ESM import/export syntax: .mjs, or .js in a package with \"type\": \"module\"."
       },
       {

@@ -852,6 +852,14 @@ fn the_repository_fact_names_host_owner_and_repository() {
         (json!("not a url"), None),
         (json!("git@git_host:acme/md.git"), None),
         (json!("git@github.com:acme corp/md.git"), None),
+        (json!("git@github.com:acme/\u{feff}md"), None),
+        (json!("github:acme/m\u{e9}"), None),
+        (json!("https://github.com/acme/m%20d"), None),
+        (json!("github:acme/.."), None),
+        (
+            json!("github:acme/my_lib.js-2"),
+            Some("github.com/acme/my_lib.js-2"),
+        ),
         (json!(format!("github:acme/{}", "m".repeat(300))), None),
     ] {
         let mut manifest = good_manifest();
@@ -859,4 +867,426 @@ fn the_repository_fact_names_host_owner_and_repository() {
         let report = report_of(&good_package(&manifest));
         assert_eq!(report.facts.repository.as_deref(), expected, "{repository}");
     }
+}
+
+#[test]
+fn a_root_file_with_a_multibyte_name_is_not_a_license_and_does_not_panic() {
+    let mut files = good_package(&good_manifest());
+    files.push(("abcdefé.txt", String::new()));
+    files.push(("日本語.txt", String::new()));
+    let report = report_of(&files);
+    assert_eq!(points(&report, "license-file"), 2);
+}
+
+fn owned_report(files: &[(String, String)]) -> QualityReport {
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_bytes()))
+        .collect();
+    report_with(QualityEcosystem::Js, &borrowed, None)
+}
+
+fn with_manifest(manifest: &Value, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = good_package(manifest)
+        .into_iter()
+        .map(|(path, text)| (path.to_string(), text))
+        .collect();
+    for (path, text) in extra {
+        files.retain(|(existing, _)| existing != path);
+        files.push(((*path).to_string(), (*text).to_string()));
+    }
+    files
+}
+
+#[test]
+fn a_types_target_that_declares_nothing_earns_no_type_points() {
+    let mut manifest = good_manifest();
+    manifest["types"] = json!("README.md");
+    manifest["exports"] = json!({
+        ".": { "types": "./README.md", "import": "./dist/index.mjs", "require": "./dist/index.cjs" }
+    });
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    assert_eq!(
+        points(&report, "types"),
+        0,
+        "{}",
+        check(&report, "types").detail
+    );
+
+    manifest["exports"] = json!({
+        ".": { "types": "./dist/index.mjs", "import": "./dist/index.mjs" }
+    });
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    assert_eq!(
+        points(&report, "types"),
+        0,
+        "{}",
+        check(&report, "types").detail
+    );
+}
+
+#[test]
+fn a_types_condition_naming_javascript_reads_the_declaration_beside_it() {
+    let mut manifest = good_manifest();
+    manifest["exports"] = json!({
+        ".": { "types": "./dist/index.js", "import": "./dist/index.mjs", "require": "./dist/index.cjs" }
+    });
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    assert_eq!(
+        points(&report, "types"),
+        10,
+        "{}",
+        check(&report, "types").detail
+    );
+}
+
+#[test]
+fn wildcard_exports_count_toward_api_docs_and_readme_imports() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["main"] = Value::Null;
+    manifest["exports"] = json!({
+        "./*": { "types": "./dist/*.d.ts", "import": "./dist/*.mjs" }
+    });
+    let readme = format!(
+        "# Markdown\n\n{PROSE}\n\n```sh\nlpm install @lpm.dev/acme.md\n```\n\n```ts\nimport {{ parse }} from '@lpm.dev/acme.md/a'\n```\n"
+    );
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("README.md", &readme),
+            ("dist/a.mjs", "export function parse(s) { return s }\n"),
+            (
+                "dist/a.d.ts",
+                "/** Parses Markdown source into a syntax tree. */\nexport declare function parse(source: string): string;\n",
+            ),
+        ],
+    ));
+    assert_eq!(
+        points(&report, "api-docs"),
+        10,
+        "{}",
+        check(&report, "api-docs").detail
+    );
+    assert_eq!(
+        points(&report, "readme-example"),
+        5,
+        "{}",
+        check(&report, "readme-example").detail
+    );
+}
+
+#[test]
+fn a_name_two_star_exports_bind_differently_is_ambiguous() {
+    let readme =
+        format!("# Markdown\n\n{PROSE}\n\n```ts\nimport {{ x }} from '@lpm.dev/acme.md'\n```\n");
+    let ambiguous = "export * from './a'\nexport * from './b'\n";
+    let report = owned_report(&with_manifest(
+        &good_manifest(),
+        &[
+            ("README.md", &readme),
+            ("dist/index.d.ts", ambiguous),
+            (
+                "dist/a.d.ts",
+                "/** The first x of the package here. */\nexport declare const x: number;\n",
+            ),
+            (
+                "dist/b.d.ts",
+                "/** The second x of the package here. */\nexport declare const x: string;\n",
+            ),
+        ],
+    ));
+    assert_eq!(points(&report, "readme-example"), 2);
+    assert!(
+        check(&report, "readme-example")
+            .detail
+            .contains("imports x"),
+        "{}",
+        check(&report, "readme-example").detail
+    );
+
+    let resolved = "export * from './a'\nexport * from './b'\nexport { x } from './a'\n";
+    let report = owned_report(&with_manifest(
+        &good_manifest(),
+        &[
+            ("README.md", &readme),
+            ("dist/index.d.ts", resolved),
+            (
+                "dist/a.d.ts",
+                "/** The first x of the package here. */\nexport declare const x: number;\n",
+            ),
+            (
+                "dist/b.d.ts",
+                "/** The second x of the package here. */\nexport declare const x: string;\n",
+            ),
+        ],
+    ));
+    assert_eq!(points(&report, "readme-example"), 5);
+}
+
+#[test]
+fn barrels_re_exporting_each_other_stay_within_the_export_budget() {
+    let names: String = (0..1_000)
+        .map(|index| format!("export declare const n{index}: number;\n"))
+        .collect();
+    let mut index = String::new();
+    let mut extra: Vec<(String, String)> = vec![("dist/base.d.ts".to_string(), names)];
+    for barrel in 0..300 {
+        index.push_str(&format!("export * from './barrel{barrel}'\n"));
+        extra.push((
+            format!("dist/barrel{barrel}.d.ts"),
+            "export * from './base'\n".to_string(),
+        ));
+    }
+    extra.push(("dist/index.d.ts".to_string(), index));
+    let mut files = with_manifest(&good_manifest(), &[]);
+    files.retain(|(path, _)| path != "dist/index.d.ts");
+    files.extend(extra);
+    let report = owned_report(&files);
+    assert_eq!(points(&report, "api-docs"), 0);
+    assert!(
+        check(&report, "api-docs")
+            .detail
+            .contains("re-exports more than")
+    );
+}
+
+#[test]
+fn exports_follow_node_rules_for_invalid_targets_numeric_keys_and_null_fallbacks() {
+    let mut manifest = good_manifest();
+    manifest["exports"] = json!("./dist/../dist/index.mjs");
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    assert_eq!(points(&report, "exports-map"), 0);
+    assert_eq!(points(&report, "esm"), 0);
+
+    manifest["exports"] =
+        json!({ ".": { "0": "./dist/index.mjs", "default": "./dist/index.mjs" } });
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    assert_eq!(points(&report, "exports-map"), 0);
+
+    manifest["exports"] = json!({ ".": [null, "./dist/index.mjs"] });
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    assert_eq!(
+        points(&report, "esm"),
+        4,
+        "{}",
+        check(&report, "esm").detail
+    );
+}
+
+#[test]
+fn the_nearest_package_json_decides_whether_a_js_file_is_esm() {
+    let mut manifest = good_manifest();
+    manifest["type"] = json!("commonjs");
+    manifest["exports"] = json!({ ".": { "import": "./dist/index.js" } });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("dist/package.json", "{\"type\": \"module\"}"),
+            ("dist/index.js", "export function parse(s) { return s }\n"),
+        ],
+    ));
+    assert_eq!(
+        points(&report, "esm"),
+        4,
+        "{}",
+        check(&report, "esm").detail
+    );
+
+    manifest["type"] = json!("module");
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("dist/package.json", "{\"type\": \"commonjs\"}"),
+            ("dist/index.js", "export function parse(s) { return s }\n"),
+        ],
+    ));
+    assert_eq!(points(&report, "esm"), 0);
+}
+
+#[test]
+fn a_typeless_main_with_esm_syntax_is_an_es_module() {
+    let manifest = json!({
+        "name": "@lpm.dev/acme.md",
+        "version": "1.2.3",
+        "main": "index.js"
+    });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[("index.js", "export const x = 1\n")],
+    ));
+    assert_eq!(
+        points(&report, "esm"),
+        4,
+        "{}",
+        check(&report, "esm").detail
+    );
+}
+
+#[test]
+fn jsx_in_a_js_entry_is_not_an_es_module_node_can_run() {
+    let mut manifest = good_manifest();
+    manifest["exports"] = json!({ ".": { "import": "./dist/index.js" } });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[("dist/index.js", "export const x = <div />\n")],
+    ));
+    assert_eq!(points(&report, "esm"), 0);
+    assert!(check(&report, "esm").detail.contains("JSX"));
+}
+
+#[test]
+fn a_readme_that_is_also_a_module_is_read_as_both() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["exports"] = json!("./README.js");
+    let files = with_manifest(
+        &manifest,
+        &[(
+            "README.js",
+            "/** Parses Markdown source into a syntax tree. */\nexport function parse(s) { return s }\n",
+        )],
+    )
+    .into_iter()
+    .filter(|(path, _)| path != "README.md")
+    .collect::<Vec<_>>();
+    let report = owned_report(&files);
+    assert_eq!(
+        points(&report, "esm"),
+        4,
+        "{}",
+        check(&report, "esm").detail
+    );
+    assert_eq!(
+        points(&report, "api-docs"),
+        10,
+        "{}",
+        check(&report, "api-docs").detail
+    );
+}
+
+#[test]
+fn a_byte_order_mark_doesnt_hide_the_first_install_command() {
+    let readme =
+        format!("\u{feff}```sh\nlpm install @lpm.dev/acme.md\n```\n\n# Markdown\n\n{PROSE}\n");
+    let report = owned_report(&with_manifest(&good_manifest(), &[("README.md", &readme)]));
+    assert_eq!(points(&report, "readme-install"), 3);
+}
+
+#[test]
+fn swift_targets_at_the_package_root_count_their_listed_sources() {
+    let manifest = json!({
+        "toolsVersion": { "_version": "6.0.0" },
+        "platforms": [{ "platformName": "macos", "version": "13.0", "options": [] }],
+        "products": [{ "name": "Lib", "type": { "library": ["automatic"] }, "targets": ["Lib"] }],
+        "targets": [
+            { "name": "Lib", "type": "regular", "path": ".", "sources": ["Renderer.swift"], "exclude": [], "settings": [] },
+            { "name": "LibTests", "type": "test", "path": ".", "sources": ["RendererTests.swift"], "exclude": [], "settings": [] }
+        ],
+        "dependencies": []
+    });
+    let mut files = swift_files();
+    for (from, to) in [
+        ("Sources/Lib/Renderer.swift", "Renderer.swift"),
+        ("Tests/LibTests/RendererTests.swift", "RendererTests.swift"),
+    ] {
+        let index = files.iter().position(|(path, _)| *path == from).unwrap();
+        files[index].0 = to;
+    }
+    let report = swift_report(&files, Some(&manifest));
+    assert_eq!(
+        points(&report, "has-tests"),
+        6,
+        "{}",
+        check(&report, "has-tests").detail
+    );
+    assert_eq!(
+        points(&report, "readme-example"),
+        5,
+        "{}",
+        check(&report, "readme-example").detail
+    );
+    assert_eq!(
+        check(&report, "api-docs").detail,
+        "3 of 3 public declarations have doc comments (100%)"
+    );
+}
+
+#[test]
+fn a_javascript_package_manager_doesnt_install_a_swift_package() {
+    let mut files = swift_files();
+    replace(
+        &mut files,
+        "README.md",
+        format!("# Lib\n\n{PROSE}\n\n```sh\nnpm install @lpm.dev/acme.lib\n```\n"),
+    );
+    let report = swift_report(&files, Some(&swift_manifest()));
+    assert_eq!(points(&report, "readme-install"), 0);
+
+    replace(
+        &mut files,
+        "README.md",
+        format!("# Lib\n\n{PROSE}\n\n```sh\nlpm install @lpm.dev/acme.lib\n```\n"),
+    );
+    let report = swift_report(&files, Some(&swift_manifest()));
+    assert_eq!(points(&report, "readme-install"), 3);
+}
+
+#[test]
+fn lpm_add_installs_a_source_package_but_not_another() {
+    let readme = format!("# Markdown\n\n{PROSE}\n\n```sh\nlpm add @lpm.dev/acme.md\n```\n");
+    let report = owned_report(&with_manifest(&good_manifest(), &[("README.md", &readme)]));
+    assert_eq!(points(&report, "readme-install"), 0);
+
+    let report = owned_report(&with_manifest(
+        &good_manifest(),
+        &[("README.md", &readme), ("lpm.config.json", "{}")],
+    ));
+    assert_eq!(points(&report, "readme-install"), 3);
+
+    let mut manifest = good_manifest();
+    manifest["lpm"] = json!({ "source": "src" });
+    let report = owned_report(&with_manifest(&manifest, &[("README.md", &readme)]));
+    assert_eq!(points(&report, "readme-install"), 3);
+}
+
+#[test]
+fn many_exports_patterns_stay_within_the_lookup_budget() {
+    let mut exports = serde_json::Map::new();
+    exports.insert(
+        ".".to_string(),
+        json!({ "types": "./dist/index.d.ts", "import": "./dist/index.mjs" }),
+    );
+    for index in 0..100_000 {
+        exports.insert(format!("./k{index}/*"), json!("./dist/*.mjs"));
+    }
+    let mut manifest = good_manifest();
+    manifest["exports"] = Value::Object(exports);
+    let mut files = with_manifest(&manifest, &[]);
+    for index in 0..2_000 {
+        files.push((
+            format!("dist/m{index}.mjs"),
+            "export const x = 1\n".to_string(),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let report = owned_report(&files);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        points(&report, "types"),
+        5,
+        "{}",
+        check(&report, "types").detail
+    );
+    assert!(
+        check(&report, "types")
+            .detail
+            .starts_with("1 of 200001 entries have type declarations"),
+        "{}",
+        check(&report, "types").detail
+    );
 }

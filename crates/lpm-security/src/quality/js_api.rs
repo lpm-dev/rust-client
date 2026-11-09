@@ -9,6 +9,7 @@ use oxc_ast::ast::{
 };
 use oxc_span::SourceType;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// A doc comment counts when its text is at least this long.
 pub(crate) const MIN_DOC_CHARS: usize = 20;
@@ -20,11 +21,14 @@ pub(crate) struct ModuleFacts {
     pub parsed: bool,
     /// It has an `import` or `export` declaration.
     pub esm_syntax: bool,
+    /// A `.js` file that parses only with JSX, which Node.js can't run.
+    pub jsx: bool,
     /// Names it exports from its own declarations, with whether each has a
     /// doc comment.
     pub local: Vec<LocalExport>,
-    /// `export { a as b } from "x"`: (exported, imported, specifier).
-    pub named_reexports: Vec<(String, String, String)>,
+    /// `export { a as b } from "x"`: (exported, imported, specifier), the
+    /// specifier shared by the names of one declaration.
+    pub named_reexports: Vec<(String, String, Rc<str>)>,
     /// `export * from "x"`.
     pub star_reexports: Vec<String>,
 }
@@ -37,14 +41,27 @@ pub(crate) struct LocalExport {
     pub documented: bool,
 }
 
-/// Reads a module's exports. `None` when it doesn't parse at all.
+/// Reads a module's exports. `None` when it doesn't parse at all. A `.js`
+/// file is read as JavaScript, and only one that parses solely as JSX is
+/// read with JSX.
 pub(crate) fn module_facts(path: &str, source: &str) -> Option<ModuleFacts> {
     let source_type = source_type_for(path)?;
-    inspect_program(source, source_type, |program, complete| {
-        let mut facts = collect(program, source);
-        facts.parsed = complete;
-        facts
-    })
+    let read = |source_type| {
+        inspect_program(source, source_type, |program, complete| {
+            let mut facts = collect(program, source);
+            facts.parsed = complete;
+            facts
+        })
+    };
+    let facts = read(source_type);
+    if path.ends_with(".js")
+        && facts.as_ref().is_none_or(|facts| !facts.parsed)
+        && let Some(mut with_jsx) = read(source_type.with_jsx(true)).filter(|facts| facts.parsed)
+    {
+        with_jsx.jsx = true;
+        return Some(with_jsx);
+    }
+    facts
 }
 
 fn source_type_for(path: &str) -> Option<SourceType> {
@@ -52,7 +69,7 @@ fn source_type_for(path: &str) -> Option<SourceType> {
         if path.ends_with(".d.ts") || path.ends_with(".d.mts") || path.ends_with(".d.cts") {
             SourceType::d_ts()
         } else if path.ends_with(".mjs") || path.ends_with(".js") || path.ends_with(".cjs") {
-            SourceType::mjs().with_jsx(path.ends_with(".js"))
+            SourceType::mjs()
         } else if path.ends_with(".jsx") {
             SourceType::jsx()
         } else {
@@ -81,26 +98,44 @@ pub(crate) fn doc_text(raw: &str) -> String {
 /// Whether doc comment text documents `name`: long enough and more than
 /// the name itself.
 pub(crate) fn documents(text: &str, name: &str) -> bool {
-    if text.chars().count() < MIN_DOC_CHARS {
-        return false;
+    DocSummary::of(text).documents(name)
+}
+
+fn normalized(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A doc comment's text as `documents` compares it, worked out once for
+/// every name the comment may document.
+pub(crate) struct DocSummary {
+    long_enough: bool,
+    normalized: String,
+}
+
+impl DocSummary {
+    pub(crate) fn of(text: &str) -> Self {
+        Self {
+            long_enough: text.chars().count() >= MIN_DOC_CHARS,
+            normalized: normalized(text),
+        }
     }
-    let normalized = |value: &str| {
-        value
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    normalized(text) != normalized(name)
+
+    pub(crate) fn documents(&self, name: &str) -> bool {
+        self.long_enough && self.normalized != normalized(name)
+    }
 }
 
-struct DocIndex<'s> {
+struct DocIndex {
     /// JSDoc comments by the start of the token they lead.
-    by_token: HashMap<u32, &'s str>,
+    by_token: HashMap<u32, DocSummary>,
 }
 
-impl<'s> DocIndex<'s> {
-    fn new(comments: &[Comment], source: &'s str) -> Self {
+impl DocIndex {
+    fn new(comments: &[Comment], source: &str) -> Self {
         let by_token = comments
             .iter()
             .filter(|comment| comment.is_leading() && comment.is_jsdoc())
@@ -108,7 +143,7 @@ impl<'s> DocIndex<'s> {
                 let span = comment.content_span();
                 source
                     .get(span.start as usize..span.end as usize)
-                    .map(|text| (comment.attached_to, text))
+                    .map(|text| (comment.attached_to, DocSummary::of(&doc_text(text))))
             })
             .collect();
         Self { by_token }
@@ -118,7 +153,7 @@ impl<'s> DocIndex<'s> {
         starts.iter().any(|start| {
             self.by_token
                 .get(start)
-                .is_some_and(|raw| documents(&doc_text(raw), name))
+                .is_some_and(|summary| summary.documents(name))
         })
     }
 }
@@ -227,7 +262,7 @@ fn collect(program: &Program<'_>, source: &str) -> ModuleFacts {
             }
             Statement::ExportFromDeclaration(export) => {
                 esm_syntax = true;
-                let Some(specifier_source) = export.source.value.as_str().map(str::to_string)
+                let Some(specifier_source) = export.source.value.as_str().map(Rc::<str>::from)
                 else {
                     continue;
                 };
@@ -235,7 +270,7 @@ fn collect(program: &Program<'_>, source: &str) -> ModuleFacts {
                     named_reexports.push((
                         export_name(&specifier.exported),
                         export_name(&specifier.local),
-                        specifier_source.clone(),
+                        Rc::clone(&specifier_source),
                     ));
                 }
             }
@@ -460,6 +495,21 @@ mod tests {
     }
 
     #[test]
+    fn one_long_doc_comment_over_many_bindings_is_read_once() {
+        let names: Vec<String> = (0..20_000)
+            .map(|index| format!("n{index}: number"))
+            .collect();
+        let source = format!(
+            "/** {} */\nexport declare const {};\n",
+            "Describes the value. ".repeat(5_000),
+            names.join(", ")
+        );
+        let facts = parse("index.d.ts", &source);
+        assert_eq!(facts.local.len(), 20_000);
+        assert!(facts.local.iter().all(|export| export.documented));
+    }
+
+    #[test]
     fn a_doc_comment_that_only_repeats_the_name_does_not_count() {
         let facts = parse(
             "index.d.ts",
@@ -501,13 +551,12 @@ mod tests {
             "export * from './a.js';\nexport { b as c, type T } from './b';\nexport * as ns from './n';\n",
         );
         assert_eq!(facts.star_reexports, ["./a.js"]);
-        assert_eq!(
-            facts.named_reexports,
-            [
-                ("c".to_string(), "b".to_string(), "./b".to_string()),
-                ("T".to_string(), "T".to_string(), "./b".to_string()),
-            ]
-        );
+        let named: Vec<(&str, &str, &str)> = facts
+            .named_reexports
+            .iter()
+            .map(|(exported, local, specifier)| (exported.as_str(), local.as_str(), &**specifier))
+            .collect();
+        assert_eq!(named, [("c", "b", "./b"), ("T", "T", "./b")]);
         assert_eq!(documented(&facts), [("ns", false)]);
     }
 

@@ -3,6 +3,7 @@
 
 use super::js_api::{doc_text, documents};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// What one Swift source file declares.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -11,7 +12,7 @@ pub(crate) struct SwiftFileFacts {
     pub documented_declarations: usize,
     /// Names of its public and open declarations.
     pub public_names: Vec<String>,
-    /// It subclasses `XCTestCase` or has a `@Test` function.
+    /// It declares an `XCTestCase` subclass or a `@Test` function.
     pub declares_tests: bool,
 }
 
@@ -33,6 +34,8 @@ struct Token<'s> {
 
 struct DocComment {
     last_line: usize,
+    /// The index of the token that follows it.
+    next_token: usize,
     text: String,
     /// A run of `///` lines, which the next `///` line continues.
     line_doc: bool,
@@ -85,9 +88,11 @@ fn scan(source: &str) -> Scan<'_> {
                                 doc.text.push_str(text);
                             }
                             doc.last_line = line;
+                            doc.next_token = tokens.len();
                         }
                         _ => docs.push(DocComment {
                             last_line: line,
+                            next_token: tokens.len(),
                             text: text.to_string(),
                             line_doc: true,
                         }),
@@ -120,19 +125,30 @@ fn scan(source: &str) -> Scan<'_> {
                     let inner = comment.trim_start_matches("/**").trim_end_matches("*/");
                     docs.push(DocComment {
                         last_line: line,
+                        next_token: tokens.len(),
                         text: doc_text(inner),
                         line_doc: false,
                     });
                 }
             }
-            b'"' | b'#' if starts_string(bytes, index).is_some() => {
-                let (kind, opened) = starts_string(bytes, index).unwrap_or((
-                    StringKind {
-                        hashes: 0,
-                        multiline: false,
-                    },
-                    1,
-                ));
+            b'"' | b'#' => {
+                let Some((kind, opened)) = starts_string(bytes, index) else {
+                    // A run of `#` that opens no raw string is one token;
+                    // stepping through it a byte at a time would count the
+                    // rest of the run again at each `#`.
+                    let end = index
+                        + bytes[index..]
+                            .iter()
+                            .take_while(|&&byte| byte == b'#')
+                            .count()
+                            .max(1);
+                    tokens.push(Token {
+                        text: &source[index..end],
+                        line,
+                    });
+                    index = end;
+                    continue;
+                };
                 index += opened;
                 match skip_string(bytes, index, kind, &mut line) {
                     StringEnd::Closed(next) => index = next,
@@ -333,56 +349,234 @@ const MODIFIERS: &[&str] = &[
     "open",
 ];
 
+const ACCESS_MODIFIERS: &[&str] = &[
+    "private",
+    "fileprivate",
+    "internal",
+    "package",
+    "public",
+    "open",
+];
+
+/// How far a test check looks past `class Name` for `XCTestCase` in the
+/// inheritance clause.
+const MAX_INHERITANCE_TOKENS: usize = 64;
+
 /// Reads a Swift source file.
 pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
     let Scan { tokens, docs } = scan(source);
-    let mut docs_ending: std::collections::HashMap<usize, Vec<&DocComment>> =
-        std::collections::HashMap::with_capacity(docs.len());
-    for doc in &docs {
-        docs_ending.entry(doc.last_line).or_default().push(doc);
-    }
+    // Each doc comment by the token after it; of several, the nearest wins.
+    let docs: HashMap<usize, &DocComment> = docs.iter().map(|doc| (doc.next_token, doc)).collect();
     let mut facts = SwiftFileFacts::default();
+    let mut depth = 0usize;
+    // The body depths of the `public extension`s and `public protocol`s the
+    // walk is inside: their members without an access modifier of their own
+    // are public.
+    let mut public_bodies: Vec<usize> = Vec::new();
+    // One of those whose `{` hasn't been reached: its depth, and the token
+    // past which its header has run too long to be one.
+    let mut pending_body: Option<(usize, usize)> = None;
     for (index, token) in tokens.iter().enumerate() {
-        if token.text == "XCTestCase"
-            || (token.text == "Test" && index > 0 && tokens[index - 1].text == "@")
-        {
-            facts.declares_tests = true;
+        match token.text {
+            "{" => {
+                if pending_body.take_if(|(at, _)| *at == depth).is_some() {
+                    public_bodies.push(depth + 1);
+                }
+                depth += 1;
+                continue;
+            }
+            "}" => {
+                if public_bodies.last() == Some(&depth) {
+                    public_bodies.pop();
+                }
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            _ => {}
         }
-        if token.text != "public" && token.text != "open" {
-            continue;
+        if pending_body.is_some_and(|(_, limit)| index > limit) {
+            pending_body = None;
+        }
+        if !facts.declares_tests && declares_test(&tokens, index) {
+            facts.declares_tests = true;
         }
         if index > 0 && matches!(tokens[index - 1].text, "." | "(" | ",") {
             continue;
         }
-        let Some((keyword_index, name)) = declaration_after(&tokens, index + 1) else {
-            continue;
-        };
-        if tokens[index + 1..keyword_index]
-            .iter()
-            .any(|token| token.text == "public" || token.text == "open")
+        if token.text == "public" || token.text == "open" {
+            if token.text == "public"
+                && tokens
+                    .get(index + 1)
+                    .is_some_and(|next| next.text == "extension")
+            {
+                pending_body = Some((depth, index + MAX_ATTRIBUTE_TOKENS));
+                continue;
+            }
+            let Some((keyword_index, name)) = declaration_after(&tokens, index + 1) else {
+                continue;
+            };
+            if tokens[index + 1..keyword_index]
+                .iter()
+                .any(|token| token.text == "public" || token.text == "open")
+            {
+                continue;
+            }
+            if token.text == "public" && tokens[keyword_index].text == "protocol" {
+                pending_body = Some((depth, keyword_index + MAX_ATTRIBUTE_TOKENS));
+            }
+            record_public(&mut facts, &tokens, &docs, index, name);
+        } else if public_bodies.last() == Some(&depth)
+            && let Some(name) = implicitly_public_member(&tokens, index)
         {
-            continue;
-        }
-        let start = declaration_start(&tokens, index);
-        let start_line = tokens[start].line;
-        let above = start_line
-            .checked_sub(1)
-            .and_then(|line| docs_ending.get(&line))
-            .into_iter()
-            .flatten();
-        let same_line = docs_ending.get(&start_line).into_iter().flatten();
-        let documented = above
-            .chain(same_line)
-            .any(|doc| documents(&doc.text, &name));
-        facts.public_declarations += 1;
-        if documented {
-            facts.documented_declarations += 1;
-        }
-        if facts.public_names.len() < MAX_NAMES_PER_FILE {
-            facts.public_names.push(name);
+            record_public(&mut facts, &tokens, &docs, index, name);
         }
     }
     facts
+}
+
+fn record_public(
+    facts: &mut SwiftFileFacts,
+    tokens: &[Token<'_>],
+    docs: &HashMap<usize, &DocComment>,
+    at: usize,
+    name: String,
+) {
+    let start = declaration_start(tokens, at);
+    let start_line = tokens[start].line;
+    // A doc comment documents the declaration it leads, ending on the line
+    // above it or on its own line.
+    let documented = docs.get(&start).is_some_and(|doc| {
+        start_line.saturating_sub(doc.last_line) <= 1 && documents(&doc.text, &name)
+    });
+    facts.public_declarations += 1;
+    if documented {
+        facts.documented_declarations += 1;
+    }
+    if facts.public_names.len() < MAX_NAMES_PER_FILE {
+        facts.public_names.push(name);
+    }
+}
+
+/// The name a declaration keyword at `index` declares, directly inside a
+/// `public extension` or `public protocol`, when no access modifier of its
+/// own sets its access.
+fn implicitly_public_member(tokens: &[Token<'_>], index: usize) -> Option<String> {
+    let text = tokens[index].text;
+    if !DECLARATION_KEYWORDS.contains(&text) {
+        return None;
+    }
+    // `class func`: `func` is the declaration.
+    if text == "class"
+        && tokens.get(index + 1).is_some_and(|next| {
+            matches!(next.text, "func" | "var" | "let" | "subscript")
+                || MODIFIERS.contains(&next.text)
+        })
+    {
+        return None;
+    }
+    let start = declaration_start(tokens, index);
+    if tokens[start..index]
+        .iter()
+        .any(|token| ACCESS_MODIFIERS.contains(&token.text))
+    {
+        return None;
+    }
+    match text {
+        "init" | "subscript" => Some(text.to_string()),
+        _ => Some(tokens.get(index + 1)?.text.to_string()),
+    }
+}
+
+/// The token at `index` starts a test declaration: a class whose
+/// inheritance clause names `XCTestCase`, or a `@Test` function.
+fn declares_test(tokens: &[Token<'_>], index: usize) -> bool {
+    match tokens[index].text {
+        "class" => {
+            let Some(name) = tokens.get(index + 1) else {
+                return false;
+            };
+            if !name.text.starts_with(is_identifier_start)
+                || matches!(name.text, "func" | "var" | "let" | "subscript")
+                || MODIFIERS.contains(&name.text)
+            {
+                return false;
+            }
+            let mut position = index + 2;
+            if tokens.get(position).is_some_and(|token| token.text == "<") {
+                let mut depth = 0usize;
+                while let Some(token) = tokens.get(position)
+                    && position < index + MAX_INHERITANCE_TOKENS
+                {
+                    position += 1;
+                    match token.text {
+                        "<" => depth += 1,
+                        ">" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if tokens.get(position).is_none_or(|token| token.text != ":") {
+                return false;
+            }
+            tokens
+                .iter()
+                .skip(position + 1)
+                .take(MAX_INHERITANCE_TOKENS)
+                .take_while(|token| token.text != "{" && token.text != "where")
+                .any(|token| token.text == "XCTestCase")
+        }
+        "Test" if index > 0 && tokens[index - 1].text == "@" => {
+            let mut position = index + 1;
+            let limit = index + MAX_ATTRIBUTE_TOKENS;
+            let skip_arguments = |position: &mut usize| {
+                if tokens.get(*position).is_none_or(|token| token.text != "(") {
+                    return true;
+                }
+                let mut depth = 0usize;
+                while let Some(token) = tokens.get(*position)
+                    && *position < limit
+                {
+                    *position += 1;
+                    match token.text {
+                        "(" => depth += 1,
+                        ")" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            };
+            if !skip_arguments(&mut position) {
+                return false;
+            }
+            while let Some(token) = tokens.get(position)
+                && position < limit
+            {
+                match token.text {
+                    "func" => return true,
+                    "@" => {
+                        position += 2;
+                        if !skip_arguments(&mut position) {
+                            return false;
+                        }
+                    }
+                    text if MODIFIERS.contains(&text) => position += 1,
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// After an access modifier: the declaration keyword it applies to and the
@@ -533,11 +727,34 @@ pub(crate) struct Manifest<'m> {
 pub(crate) struct TargetInfo {
     pub name: String,
     pub kind: String,
-    /// The directory its sources are in, package-relative.
+    /// The directory its sources are in, package-relative; empty for the
+    /// package root.
     pub path: String,
+    /// Its `sources`, package-relative, when it lists them.
+    sources: Option<Vec<String>>,
+    /// Its `exclude`, package-relative.
+    exclude: Vec<String>,
     /// The Swift language mode its settings set, when they set one.
     pub language_mode: Option<String>,
     pub unsafe_flags: bool,
+}
+
+impl TargetInfo {
+    /// Whether the package-relative `file` is one of its sources.
+    pub fn contains(&self, file: &str) -> bool {
+        let within = |dir: &str| {
+            dir.is_empty()
+                || file
+                    .strip_prefix(dir)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        };
+        within(&self.path)
+            && self
+                .sources
+                .as_ref()
+                .is_none_or(|sources| sources.iter().any(|source| within(source)))
+            && !self.exclude.iter().any(|excluded| within(excluded))
+    }
 }
 
 impl<'m> Manifest<'m> {
@@ -622,6 +839,23 @@ impl<'m> Manifest<'m> {
                         };
                         format!("{root}/{name}")
                     });
+                let relative = |key: &str| {
+                    target.get(key).and_then(Value::as_array).map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter_map(|entry| {
+                                super::npm::normalize(&if path.is_empty() {
+                                    entry.to_string()
+                                } else {
+                                    format!("{path}/{entry}")
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let sources = relative("sources");
+                let exclude = relative("exclude").unwrap_or_default();
                 let mut language_mode = None;
                 let mut unsafe_flags = false;
                 for setting in target
@@ -649,6 +883,8 @@ impl<'m> Manifest<'m> {
                     name,
                     kind,
                     path,
+                    sources,
+                    exclude,
                     language_mode,
                     unsafe_flags,
                 })
@@ -801,6 +1037,7 @@ mod tests {
             format!("{} public func a() {{}}", ")".repeat(200_000)),
             format!("{}func a() {{}}", "public ( ".repeat(100_000)),
             "/// A documented declaration here.\npublic func a() {}\n".repeat(50_000),
+            format!("{}\npublic func a() {{}}", "#".repeat(1_000_000)),
         ] {
             let facts = file_facts(&source);
             assert!(facts.public_declarations <= 50_000);
@@ -812,6 +1049,70 @@ mod tests {
         assert!(file_facts("import XCTest\nfinal class T: XCTestCase {}\n").declares_tests);
         assert!(file_facts("import Testing\n@Test func adds() {}\n").declares_tests);
         assert!(!file_facts("import XCTest\n// XCTestCase\n@testable import Lib\n").declares_tests);
+    }
+
+    #[test]
+    fn a_comment_documents_only_the_declaration_it_leads() {
+        let facts = file_facts(
+            "/** Renders the Markdown text into HTML. */ public func a() {} public func b() {} public func c() {}\n",
+        );
+        assert_eq!(facts.public_declarations, 3);
+        assert_eq!(facts.documented_declarations, 1);
+    }
+
+    #[test]
+    fn many_declarations_on_one_line_stay_linear() {
+        let line = "/** Renders the Markdown text into HTML. */ public func a() {} ".repeat(40_000);
+        let facts = file_facts(&line);
+        assert_eq!(facts.public_declarations, 40_000);
+        assert_eq!(facts.documented_declarations, 40_000);
+    }
+
+    #[test]
+    fn a_mention_of_xctestcase_declares_no_test() {
+        assert!(!file_facts("import XCTest\nlet unused: XCTestCase? = nil\n").declares_tests);
+        assert!(!file_facts("func make() -> XCTestCase { fatalError() }\n").declares_tests);
+        assert!(!file_facts("@Test let notAFunction = 1\n").declares_tests);
+        assert!(
+            file_facts("final class T<Value>: XCTestCase, @unchecked Sendable {}\n").declares_tests
+        );
+        assert!(
+            file_facts("@Test(\"adds\", .tags(.math)) @MainActor func adds() {}\n").declares_tests
+        );
+    }
+
+    #[test]
+    fn members_of_a_public_extension_or_protocol_are_public() {
+        let facts = file_facts(
+            "public extension String {\n    /// Renders the string as Markdown into HTML.\n    func markdown() -> String { let inner = 1; return self }\n    private func hidden() {}\n    internal var count2: Int { 0 }\n    struct Nested { func notPublic() {} }\n    public func explicit() {}\n}\nextension Int {\n    func internalOnly() {}\n}\npublic protocol Renderer {\n    func render() -> String\n    var name: String { get }\n}\n",
+        );
+        assert_eq!(
+            facts.public_names,
+            [
+                "markdown", "Nested", "explicit", "Renderer", "render", "name"
+            ]
+        );
+        assert_eq!(facts.documented_declarations, 1);
+    }
+
+    #[test]
+    fn a_target_at_the_package_root_holds_its_listed_sources() {
+        let json = json!({
+            "targets": [
+                { "name": "Kit", "type": "regular", "path": ".", "sources": ["Kit.swift", "Sources"], "exclude": ["Sources/Old"] },
+                { "name": "KitTests", "type": "test", "path": ".", "sources": ["KitTests.swift"] }
+            ]
+        });
+        let manifest = Manifest::new(&json);
+        let targets = manifest.targets();
+        assert_eq!(targets[0].path, "");
+        assert!(targets[0].contains("Kit.swift"));
+        assert!(targets[0].contains("Sources/A.swift"));
+        assert!(!targets[0].contains("Sources/Old/B.swift"));
+        assert!(!targets[0].contains("KitTests.swift"));
+        assert!(!targets[0].contains("Kit.swiftx"));
+        assert!(targets[1].contains("KitTests.swift"));
+        assert!(!targets[1].contains("Kit.swift"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ fn sample_quality_report() -> serde_json::Value {
     serde_json::json!({
         "name": "owner.widget",
         "status": "complete",
-        "rulesVersion": 3,
+        "rulesVersion": 1,
         "score": 73,
         "maxScore": 100,
         "tier": "good",
@@ -78,8 +78,12 @@ async fn quality_human_output_uses_slim_completion_and_shows_failed_detail_only(
     assert!(stdout.contains("tier"), "tier field missing");
     assert!(stdout.contains("ecosystem"), "ecosystem field missing");
     assert!(stdout.contains("rules"), "rules version missing");
-    assert!(stdout.contains("docs"), "docs category missing");
-    assert!(stdout.contains("provenance"), "provenance category missing");
+    assert!(stdout.contains("Docs"), "docs category missing");
+    assert!(stdout.contains("API"), "API category missing");
+    assert!(
+        stdout.contains("26/32"),
+        "a complete report's totals missing"
+    );
     assert!(
         stdout.contains("◐ API docs"),
         "a partial check must show as partial"
@@ -172,6 +176,54 @@ async fn quality_shows_scoring_while_the_report_is_pending() {
         "a pending report shows no score:\n{stdout}"
     );
     assert!(stdout.contains("◦ Provenance attestations"), "{stdout}");
+    assert!(
+        !stdout.contains("26/32"),
+        "a pending report shows no category totals:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn quality_says_when_the_registry_couldnt_score_a_release() {
+    let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let mut report = sample_quality_report();
+    report["status"] = serde_json::json!("unavailable");
+    report["unavailableReason"] = serde_json::json!("The archive couldn't be analyzed");
+    report["score"] = serde_json::Value::Null;
+    report["tier"] = serde_json::Value::Null;
+    for index in [0, 1] {
+        report["checks"][index]["status"] = serde_json::json!("unavailable");
+        report["checks"][index]["points"] = serde_json::json!(0);
+    }
+    mock.with_quality_report("owner.widget", report).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["quality", "owner.widget"])
+        .output()
+        .expect("failed to run lpm quality");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Score unavailable"), "{stdout}");
+    assert!(
+        stdout.contains("The archive couldn't be analyzed"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("– README present"), "{stdout}");
+    assert!(stdout.contains("not checked"), "{stdout}");
+    assert!(!stdout.contains("✗ README present"), "{stdout}");
+    assert!(!stdout.contains("26/32"), "{stdout}");
+    assert!(!stdout.contains("73/100"), "{stdout}");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["quality", "owner.widget", "--json"])
+        .output()
+        .expect("failed to run lpm quality --json");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["status"], "unavailable");
+    assert_eq!(envelope["available"], true);
+    assert!(envelope["categories"].is_null());
+    assert!(envelope["score"].is_null());
 }
 
 #[tokio::test]
