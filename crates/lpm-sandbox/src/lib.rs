@@ -201,8 +201,9 @@ pub struct SandboxSpec {
     pub package_dir: PathBuf,
     /// Absolute path to the project root (the directory containing
     /// `package.json`). Readable broadly; writable under narrow subpaths
-    /// (`node_modules`, `.husky`, and in `.lpm` only the running package's
-    /// own layout directory, [`package_layout_write_dir`]).
+    /// (`.husky`, `node_modules` only when the package lives inside it
+    /// ([`project_node_modules_write_dir`]), and in `.lpm` only the running
+    /// package's own layout directory, [`package_layout_write_dir`]).
     pub project_dir: PathBuf,
     /// Package identity for profile interpolation + denial messages.
     /// e.g. `"prisma"` or `"@napi-rs/canvas"`.
@@ -880,6 +881,21 @@ pub(crate) fn package_layout_write_dir(project_dir: &Path, package_dir: &Path) -
     Some(entry)
 }
 
+/// The project's `node_modules`, when the running package itself lives
+/// inside it, as in the v1 hoisted layout, where a script's output (such as
+/// prisma's `.prisma/client`) goes beside it. A package anywhere else (the
+/// store, `.lpm/wrappers`, a workspace member) gets no write access there:
+/// unsandboxed LPM runs `node_modules/.bin` commands and follows the root
+/// package links, so a script that could change them would run code
+/// outside its sandbox.
+pub(crate) fn project_node_modules_write_dir(
+    project_dir: &Path,
+    package_dir: &Path,
+) -> Option<PathBuf> {
+    let node_modules = project_dir.join("node_modules");
+    (package_dir != node_modules && package_dir.starts_with(&node_modules)).then_some(node_modules)
+}
+
 /// Ensure the "standard" writable subpaths referenced by the sandbox
 /// profile actually exist on disk, creating any that don't.
 ///
@@ -913,7 +929,6 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
     // profile / ruleset / DACL grants.
     let builtin = [
         spec.project_dir.join(".husky"),
-        spec.project_dir.join("node_modules"),
         spec.home_dir.join(".cache"),
         spec.home_dir.join(".node-gyp"),
         spec.home_dir.join(".npm"),
@@ -1614,8 +1629,8 @@ mod tests {
             "the package dirs in .lpm are granted only where an install made them"
         );
         assert!(
-            project.join("node_modules").exists(),
-            "missing node_modules"
+            !project.join("node_modules").exists(),
+            "a package outside node_modules has no write access there to prepare"
         );
         assert!(home.join(".cache").exists(), "missing .cache");
         assert!(home.join(".node-gyp").exists(), "missing .node-gyp");

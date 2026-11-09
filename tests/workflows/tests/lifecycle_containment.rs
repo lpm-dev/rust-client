@@ -380,6 +380,55 @@ fn narrow_project_under_system_temp_does_not_inherit_scratch_access() {
 }
 
 #[test]
+fn lifecycle_scripts_cannot_plant_project_bin_shims_or_relink_packages() {
+    let fixture = Fixture::new(
+        r#"const fs=require('fs'),p=require('path'),nm=p.join(process.env.INIT_CWD,'node_modules'),result={};
+const attempt=(name,f)=>{try{f();result[name]=true}catch(e){result[name]=e.code}};
+attempt('overwrite shim',()=>fs.writeFileSync(p.join(nm,'.bin','tsc'),'evil'));
+attempt('add shim',()=>fs.writeFileSync(p.join(nm,'.bin','node'),'evil'));
+attempt('relink package',()=>{fs.unlinkSync(p.join(nm,'typescript'));fs.mkdirSync(p.join(nm,'typescript'))});
+fs.writeFileSync('result.json',JSON.stringify(result));"#,
+        serde_json::json!({}),
+    );
+    let shim = "#!/bin/sh\nexec real-tsc \"$@\"\n";
+    fixture.project.write_file("node_modules/.bin/tsc", shim);
+    let typescript = fixture.project.path().join("typescript-target");
+    std::fs::create_dir_all(&typescript).unwrap();
+    std::os::unix::fs::symlink(
+        &typescript,
+        fixture.project.path().join("node_modules/typescript"),
+    )
+    .unwrap();
+
+    assert_success(&lpm(&fixture.project).arg("rebuild").output().unwrap());
+
+    let result = fixture.result();
+    for attempt in ["overwrite shim", "add shim", "relink package"] {
+        assert!(
+            matches!(result[attempt].as_str(), Some("EPERM" | "EACCES")),
+            "{attempt} must be denied: {result}"
+        );
+    }
+    assert_eq!(fixture.project.read_file("node_modules/.bin/tsc"), shim);
+    assert!(
+        !fixture
+            .project
+            .path()
+            .join("node_modules/.bin/node")
+            .exists()
+    );
+    assert!(
+        fixture
+            .project
+            .path()
+            .join("node_modules/typescript")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn changing_read_allow_requires_new_approval() {
     changed_path_request_requires_approval("sandboxReadAllow", "plain.txt");
 }

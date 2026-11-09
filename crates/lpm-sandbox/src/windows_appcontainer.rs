@@ -540,7 +540,8 @@ pub(crate) fn readable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
 }
 
 /// The directories the lifecycle child may write, in a fixed order: the
-/// package's own directory first, then the project's `node_modules` and
+/// package's own directory first, then the project's `node_modules` when
+/// the package lives inside it ([`crate::project_node_modules_write_dir`]),
 /// `.husky`, the package's layout directory in `.lpm` when it has one
 /// ([`crate::package_layout_write_dir`]), the per-user caches, the scratch
 /// directory, and `sandboxWriteDirs` last. Matches the macOS Seatbelt
@@ -548,7 +549,10 @@ pub(crate) fn readable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
 pub(crate) fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(8 + spec.extra_write_dirs.len());
     out.push(spec.package_dir.clone());
-    out.push(spec.project_dir.join("node_modules"));
+    out.extend(crate::project_node_modules_write_dir(
+        &spec.project_dir,
+        &spec.package_dir,
+    ));
     out.push(spec.project_dir.join(".husky"));
     out.extend(crate::package_layout_write_dir(
         &spec.project_dir,
@@ -1023,13 +1027,24 @@ mod tests {
             set,
             vec![
                 spec.package_dir.clone(),
-                spec.project_dir.join("node_modules"),
                 spec.project_dir.join(".husky"),
                 spec.home_dir.join(".cache"),
                 spec.home_dir.join(".node-gyp"),
                 spec.home_dir.join(".npm"),
                 spec.tmpdir.clone(),
             ]
+        );
+    }
+
+    #[test]
+    fn writable_set_grants_the_project_node_modules_only_to_a_package_inside_it() {
+        let mut spec = make_spec();
+        assert!(!writable_allow_set(&spec).contains(&spec.project_dir.join("node_modules")));
+
+        spec.package_dir = spec.project_dir.join("node_modules").join("pkg");
+        assert_eq!(
+            writable_allow_set(&spec)[1],
+            spec.project_dir.join("node_modules")
         );
     }
 
@@ -1051,7 +1066,7 @@ mod tests {
             .join(".lpm")
             .join("wrappers")
             .join("pkg@1.0.0");
-        assert_eq!(set[3], wrapper);
+        assert_eq!(set[2], wrapper);
         assert!(!set.contains(&spec.project_dir.join(".lpm")));
         assert!(!set.contains(&spec.project_dir.join(".lpm").join("wrappers")));
         assert_eq!(

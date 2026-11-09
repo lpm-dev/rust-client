@@ -1,8 +1,8 @@
 //! Seatbelt profile synthesis for the macOS `sandbox-exec` backend.
 //!
 //! Project reads follow approved capabilities; writes stay narrow (package store
-//! dir + `node_modules` + `.husky` + the package's own layout dir in `.lpm` +
-//! known caches + temp),
+//! dir + `.husky` + the package's own layout dir in `.lpm` + `node_modules`
+//! for a package hoisted into it + known caches + temp),
 //! network allowed by default, process-fork + exec allowed so
 //! `node-gyp` children work.
 //!
@@ -93,10 +93,10 @@ pub(crate) fn render_profile_with_toolchain(
 
     // node_modules / .husky / the package dirs in .lpm are subpaths of
     // the canonical project_dir.
-    let project_node_modules = quoted_path(
-        &canon_project_dir.join("node_modules"),
-        "project_dir/node_modules",
-    )?;
+    let project_node_modules =
+        crate::project_node_modules_write_dir(&canon_project_dir, &canon_package_dir)
+            .map(|path| quoted_path(&path, "project_dir/node_modules"))
+            .transpose()?;
     let project_husky = quoted_path(&canon_project_dir.join(".husky"), "project_dir/.husky")?;
     let package_layout_dir =
         crate::package_layout_write_dir(&canon_project_dir, &canon_package_dir)
@@ -234,15 +234,18 @@ pub(crate) fn render_profile_with_toolchain(
 
     // file-write*: narrow but covers the greens. Must contain the
     // package's own store dir (the compat corpus tests write markers
-    // here), project `node_modules` (prisma generate),
-    // `.husky` (husky install), the running package's own layout directory
-    // in `.lpm` (the rest of `.lpm` is LPM's state or other packages),
-    // `~/.cache` + `~/.node-gyp` + `~/.npm` (tooling caches), and
-    // per-script scratch directory. `/dev/null` permits shell redirection.
+    // here), project `node_modules` only for a package hoisted into it
+    // (prisma generate beside it), `.husky` (husky install), the running
+    // package's own layout directory in `.lpm` (the rest of `.lpm` is
+    // LPM's state or other packages), `~/.cache` + `~/.node-gyp` +
+    // `~/.npm` (tooling caches), and per-script scratch directory.
+    // `/dev/null` permits shell redirection.
     out.push_str("(allow file-write*\n");
     out.push_str(&format!("  (subpath {package_dir})\n"));
     if !build_cache_isolation {
-        out.push_str(&format!("  (subpath {project_node_modules})\n"));
+        if let Some(path) = &project_node_modules {
+            out.push_str(&format!("  (subpath {path})\n"));
+        }
         out.push_str(&format!("  (subpath {project_husky})\n"));
         if let Some(path) = &package_layout_dir {
             out.push_str(&format!("  (subpath {path})\n"));
