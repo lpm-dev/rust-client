@@ -13,6 +13,7 @@ fn listing(posture: AuthPosture) -> HostedMcpRequest<'static> {
         name: None,
         body: LISTING,
         posture,
+        max_response_bytes: MAX_HOSTED_MCP_RESPONSE_BYTES,
     }
 }
 
@@ -23,6 +24,7 @@ fn call(posture: AuthPosture) -> HostedMcpRequest<'static> {
         name: Some("lpm_account"),
         body: CALL,
         posture,
+        max_response_bytes: MAX_HOSTED_MCP_RESPONSE_BYTES,
     }
 }
 

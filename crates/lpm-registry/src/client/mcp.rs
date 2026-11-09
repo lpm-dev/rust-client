@@ -3,7 +3,7 @@ use super::*;
 use base64::Engine as _;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 
-/// The largest answer read from the hosted MCP server. Tool results are
+/// The largest tool result read from the hosted MCP server. Results are
 /// bounded there; reading package source is the largest, at a few megabytes.
 pub const MAX_HOSTED_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -32,6 +32,9 @@ pub struct HostedMcpRequest<'a> {
     /// credentials. [`AuthPosture::AuthRequired`] sends the session's bearer
     /// when there is one, and goes anonymous otherwise.
     pub posture: AuthPosture,
+    /// The most of the answer to read, such as
+    /// [`MAX_HOSTED_MCP_RESPONSE_BYTES`]; a longer answer is an error.
+    pub max_response_bytes: usize,
 }
 
 /// What the hosted MCP server answered, with its status kept: an anonymous
@@ -100,7 +103,7 @@ impl RegistryClient {
             });
             let body = read_capped_body(
                 response,
-                MAX_HOSTED_MCP_RESPONSE_BYTES,
+                request.max_response_bytes,
                 "the hosted MCP server's answer",
             )
             .await?;

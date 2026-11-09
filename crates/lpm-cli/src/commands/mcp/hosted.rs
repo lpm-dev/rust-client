@@ -1,9 +1,12 @@
 //! Registry tools, served by the registry's hosted MCP server and forwarded
 //! one request at a time.
 
+use lpm_auth::TokenSource;
 use lpm_common::LpmError;
 use lpm_registry::client::AuthPosture;
-use lpm_registry::{HostedMcpAnswer, HostedMcpRequest, RegistryClient};
+use lpm_registry::{
+    HostedMcpAnswer, HostedMcpRequest, MAX_HOSTED_MCP_RESPONSE_BYTES, RegistryClient,
+};
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, JsonObject, ListToolsResult, Tool};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -17,6 +20,10 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 /// Pages read for one tool listing, so a server that keeps paging can't keep
 /// a listing going forever.
 const MAX_LISTING_PAGES: usize = 8;
+
+/// The most a tool listing's pages may hold together. A listing is tens of
+/// kilobytes; it stays in memory for as long as it is fresh.
+const MAX_LISTING_BYTES: usize = 4 * 1024 * 1024;
 
 /// How long a listing stays fresh when the server doesn't say.
 const DEFAULT_LISTING_TTL: Duration = Duration::from_secs(5 * 60);
@@ -95,14 +102,22 @@ impl HostedRegistry {
         let mut tools = Vec::new();
         let mut ttl = MAX_LISTING_TTL;
         let mut cursor = None;
+        let mut budget = MAX_LISTING_BYTES;
         for _ in 0..MAX_LISTING_PAGES {
             let mut params = Map::new();
             if let Some(cursor) = cursor.take() {
                 params.insert("cursor".to_owned(), Value::String(cursor));
             }
-            let result = self
-                .send("tools/list", None, params, AuthPosture::AnonymousOnly)
+            let (result, read) = self
+                .send(
+                    "tools/list",
+                    None,
+                    params,
+                    AuthPosture::AnonymousOnly,
+                    budget,
+                )
                 .await?;
+            budget = budget.saturating_sub(read);
             let page: ListToolsResult = serde_json::from_value(result)
                 .map_err(|error| HostedFailure::Protocol(format!("the tool listing: {error}")))?;
             ttl = ttl.min(
@@ -141,8 +156,10 @@ impl HostedRegistry {
                 Some(name),
                 params.clone(),
                 AuthPosture::AuthRequired,
+                MAX_HOSTED_MCP_RESPONSE_BYTES,
             )
-            .await;
+            .await
+            .map(|(result, _)| result);
         // The user may have run `lpm login`, or `lpm logout`, since the
         // login this server holds was read.
         if matches!(
@@ -152,8 +169,15 @@ impl HostedRegistry {
         ) && self.login_changed().await
         {
             outcome = self
-                .send("tools/call", Some(name), params, AuthPosture::AuthRequired)
-                .await;
+                .send(
+                    "tools/call",
+                    Some(name),
+                    params,
+                    AuthPosture::AuthRequired,
+                    MAX_HOSTED_MCP_RESPONSE_BYTES,
+                )
+                .await
+                .map(|(result, _)| result);
         }
         match outcome {
             Ok(result) => Ok(forwarded_result(name, result)),
@@ -193,7 +217,8 @@ impl HostedRegistry {
         name: Option<&str>,
         mut params: Map<String, Value>,
         posture: AuthPosture,
-    ) -> Result<Value, HostedFailure> {
+        max_response_bytes: usize,
+    ) -> Result<(Value, usize), HostedFailure> {
         params.insert("_meta".to_owned(), request_meta());
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = serde_json::to_vec(&json!({
@@ -211,10 +236,11 @@ impl HostedRegistry {
                 name,
                 body: &body,
                 posture,
+                max_response_bytes,
             })
             .await
             .map_err(HostedFailure::Request)?;
-        read_answer(&answer, id)
+        Ok((read_answer(&answer, id)?, answer.body.len()))
     }
 
     /// What to tell the agent about a failure.
@@ -256,6 +282,15 @@ impl HostedRegistry {
             HostedFailure::Protocol(reason) => format!(
                 "The registry's MCP server at {server} sent an answer lpm couldn't read: {reason}"
             ),
+            HostedFailure::Request(LpmError::AuthRequired | LpmError::SessionExpired)
+                if self
+                    .client
+                    .session()
+                    .and_then(|session| session.current_source_peek())
+                    == Some(TokenSource::ExplicitFlag) =>
+            {
+                "LPM.dev rejected the token given with --token, which may be expired, revoked, or invalid. Replace it, or remove --token from the server's entry to use the login from `lpm login`.".to_owned()
+            }
             HostedFailure::Request(LpmError::AuthRequired | LpmError::SessionExpired) => {
                 "LPM.dev didn't accept your login, which may have expired or been signed out. Run `lpm login` in a terminal, then call the tool again.".to_owned()
             }
@@ -534,6 +569,61 @@ mod tests {
         let result = forwarded_result("lpm_docs", json!({ "resultType": "task" }));
 
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_tool_listing_larger_than_its_budget_across_pages_is_refused() {
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        let padding = "x".repeat(1_500_000);
+        Mock::given(method("POST"))
+            .respond_with(move |request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let page = body["params"]["cursor"]
+                    .as_str()
+                    .map_or(1, |cursor| cursor.parse::<u32>().unwrap());
+                let mut result = json!({
+                    "tools": [{
+                        "name": format!("lpm_page_{page}"),
+                        "description": padding,
+                        "inputSchema": { "type": "object" },
+                    }],
+                });
+                if page < 4 {
+                    result["nextCursor"] = json!((page + 1).to_string());
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
+            })
+            .mount(&server)
+            .await;
+        let hosted = HostedRegistry::new(RegistryClient::new().with_base_url(server.uri()));
+
+        let listing = hosted.tools().await;
+
+        assert!(
+            listing.is_err(),
+            "four 1.5 MB pages must exceed the listing budget"
+        );
+    }
+
+    #[test]
+    fn a_refused_explicit_token_is_named_instead_of_lpm_login() {
+        let session = Arc::new(lpm_auth::SessionManager::new(
+            "https://registry.example",
+            Some("flag-token".to_owned()),
+        ));
+        let hosted = HostedRegistry::new(
+            RegistryClient::new()
+                .with_base_url("https://registry.example")
+                .with_session(session),
+        );
+
+        for error in [LpmError::AuthRequired, LpmError::SessionExpired] {
+            let text = hosted.explain(&HostedFailure::Request(error));
+            assert!(text.contains("--token"), "{text}");
+            assert!(!text.contains("lpm login`, then"), "{text}");
+        }
     }
 
     #[test]
