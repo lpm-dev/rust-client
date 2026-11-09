@@ -51,7 +51,7 @@ const AUDITED_CONFIGURATION_LOADERS: &[&str] = &[
     "crates/lpm-cli/src/commands/install/state.rs",
     "crates/lpm-cli/src/commands/install/workspace.rs",
     "crates/lpm-cli/src/commands/manifest_metadata.rs",
-    "crates/lpm-cli/src/commands/mcp.rs",
+    "crates/lpm-cli/src/commands/mcp/mod.rs",
     "crates/lpm-cli/src/commands/migrate.rs",
     "crates/lpm-cli/src/commands/npmrc.rs",
     "crates/lpm-cli/src/commands/patch.rs",

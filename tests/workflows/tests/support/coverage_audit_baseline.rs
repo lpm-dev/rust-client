@@ -1614,14 +1614,15 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 130,
-        name: "`lpm mcp setup / remove / status`",
+        name: "`lpm mcp setup / serve / remove / status`",
         unit: true,
         integration: false,
         workflow: true,
         cli_binary: false,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/mcp.rs",
+            "crates/lpm-cli/src/commands/mcp/mod.rs",
+            "crates/lpm-cli/src/commands/mcp/serve.rs",
             "tests/workflows/tests/mcp.rs",
         ],
     },

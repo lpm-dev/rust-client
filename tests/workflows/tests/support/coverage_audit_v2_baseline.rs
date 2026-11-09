@@ -2875,25 +2875,33 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/swift.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 130: lpm mcp setup / remove / status ──
+    // ── id 130: lpm mcp setup / serve / remove / status ──
     SurfaceV2 {
         id: 130,
-        scenarios: 4,
+        scenarios: 23,
         failure_modes_tested: &[
             "status on fresh home succeeds",
             "status JSON envelope is valid JSON",
             "remove without name fails with helpful message",
             "unknown action lists valid subcommands",
+            "serve lists registry tools without reading the login",
+            "serve refreshes a rejected login once and retries",
+            "serve asks for lpm login when the registry wants an account",
+            "serve finds a login made after it started",
+            "serve keeps its own tools when the registry is unreachable",
+            "serve refuses a relative project path",
+            "serve keeps a retired runtime an older lpm still runs",
         ],
         failure_modes_known: &[
             "editor config permission denied",
             "malformed MCP config",
             "concurrent setup + status",
             "setup against an editor that doesn't ship MCP support",
+            "serve cancellation reaching a Windows process tree",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/mcp.rs", 4)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/mcp.rs", 23)],
+        last_audited_at: "2026-11-09",
     },
     // ── id 131: lpm use node@<v> ──
     SurfaceV2 {
