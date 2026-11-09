@@ -22,7 +22,9 @@
 //!   seccomp layer** so legitimate install-time IPC (node-ipc,
 //!   husky's hook protocol, npm daemon communication) keeps
 //!   working — that's the honest carve-out from full macOS
-//!   parity. Resolver-mediated DNS remains host-dependent: glibc
+//!   parity. It also reaches local daemons that start processes on
+//!   request, such as the systemd user manager or a Docker socket the
+//!   user may use, and those processes run outside the sandbox. Resolver-mediated DNS remains host-dependent: glibc
 //!   NSS may route through AF_UNIX (allowed) or fall through to
 //!   TCP port 53 (caught by landlock, not seccomp).
 //!
@@ -47,7 +49,7 @@
 //! | Platform | [`SandboxMode::Enforce`] | [`SandboxMode::LogOnly`] | [`SandboxMode::Disabled`] |
 //! |----------|--------------------------|---------------------------|----------------------------|
 //! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied**, no loopback exemption — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
-//! | Linux    | landlock V4 (kernel 6.7+) + seccomp-bpf layered together — filesystem + **outbound TCP** (landlock: BindTcp + ConnectTcp) + **direct UDP / raw / AF_PACKET / AF_NETLINK** (seccomp: `socket(2)` deny matrix). AF_UNIX intentionally allowed for legitimate IPC; resolver-mediated DNS remains host-dependent (NSS via AF_UNIX or TCP fallback). Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only (no seccomp layer either) with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
+//! | Linux    | landlock V4 (kernel 6.7+) + seccomp-bpf layered together — filesystem + **outbound TCP** (landlock: BindTcp + ConnectTcp) + **direct UDP / raw / AF_PACKET / AF_NETLINK** (seccomp: `socket(2)` deny matrix). AF_UNIX intentionally allowed for legitimate IPC; resolver-mediated DNS remains host-dependent (NSS via AF_UNIX or TCP fallback). Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only (no socket deny matrix either) with a one-line stderr warning per install. Every posture also installs the seccomp filters that keep descendants in their process group, deny `io_uring` and refuse terminal input injection. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
 //! | Windows  | AppContainer, set up by the `lpm-sandbox-helper.exe` companion binary, + Job Object for kill-tree. Filesystem-write containment with per-invocation DACL grants; strict mode also denies outbound network (empty capability list). Without the helper, construction refuses with [`SandboxError::HelperMissing`]. | [`SandboxError::ModeNotSupportedOnPlatform`] — AppContainer has no native observe-only | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
