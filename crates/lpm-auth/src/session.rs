@@ -807,26 +807,35 @@ impl SessionManager {
         Ok(secret)
     }
 
-    /// Read stored credentials again on the next request, in place of what
-    /// this manager found when it first looked.
+    /// Read stored credentials again, in place of what this manager found
+    /// when it first looked.
     ///
     /// A long-running process, such as `lpm mcp serve`, calls this when a
     /// request needed a login it didn't have, since the user may have run
     /// `lpm login` or `lpm logout` after the process started. A `--token`
     /// flag, `LPM_TOKEN`, or CI token stays in force. Returns whether stored
-    /// credentials will be read again.
-    pub fn reread_stored_credentials(&self) -> bool {
+    /// credentials were read again.
+    ///
+    /// The new login replaces the old one in one step: a concurrent request
+    /// that classified before the re-read reads the cache without
+    /// classifying again, so the cache must never be empty in between.
+    pub fn reread_stored_credentials(&self) -> Result<bool, LpmError> {
         let _guard = self.classify_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());
-        if cached
+        if self
+            .cached
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|cached| !cached.source.is_locally_managed())
         {
-            return false;
+            return Ok(false);
         }
-        *cached = None;
-        self.classified.store(false, Ordering::Release);
-        true
+        let resolved = classify_keychain_sources(&self.registry_url, |kind| {
+            self.emit_auth_storage_notice(kind);
+        })?;
+        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = resolved;
+        self.classified.store(true, Ordering::Release);
+        Ok(true)
     }
 
     /// Clear the local stored session state (access + refresh + expiry
@@ -1754,7 +1763,7 @@ mod tests {
             "a manager reads stored credentials once until asked to read them again"
         );
 
-        assert!(manager.reread_stored_credentials());
+        assert!(manager.reread_stored_credentials().unwrap());
         assert_eq!(
             manager.current_bearer_lazy().unwrap().as_deref(),
             Some("later-access")
@@ -1778,9 +1787,33 @@ mod tests {
         );
 
         crate::clear_login_state(registry).expect("logout should clear stored state");
-        assert!(manager.reread_stored_credentials());
+        assert!(manager.reread_stored_credentials().unwrap());
 
         assert_eq!(manager.current_bearer_lazy().unwrap(), None);
+    }
+
+    #[test]
+    fn rereading_stored_credentials_leaves_no_moment_without_a_login() {
+        let _env = token_classify_isolate();
+        let registry = "https://concurrent-reread.invalid";
+        crate::set_token(registry, "first-access").expect("access token should store");
+        crate::set_refresh_token(registry, "first-refresh").expect("refresh token should store");
+        let manager = SessionManager::new(registry, None);
+        assert_eq!(
+            manager.current_bearer_lazy().unwrap().as_deref(),
+            Some("first-access")
+        );
+        crate::set_token(registry, "second-access").expect("access token should store");
+
+        manager.reread_stored_credentials().unwrap();
+
+        // A request that classified before the re-read reads the cache
+        // without classifying again, so the cache must already hold a login.
+        assert_eq!(
+            manager.current_bearer_for_bridge().as_deref(),
+            Some("second-access")
+        );
+        assert!(manager.classified.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1790,7 +1823,7 @@ mod tests {
         crate::set_token(registry, "stored-access").expect("access token should store");
         let manager = SessionManager::new(registry, Some("flag-token".into()));
 
-        assert!(!manager.reread_stored_credentials());
+        assert!(!manager.reread_stored_credentials().unwrap());
 
         assert_eq!(
             manager.current_bearer_lazy().unwrap().as_deref(),

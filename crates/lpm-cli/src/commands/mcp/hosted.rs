@@ -156,8 +156,12 @@ impl HostedRegistry {
             failure,
             HostedFailure::Request(LpmError::AuthRequired | LpmError::SessionExpired)
         ) && let Some(session) = self.client.session()
+            && let Err(error) = session.reread_stored_credentials()
         {
-            session.reread_stored_credentials();
+            tracing::debug!(
+                target: "lpm_cli::mcp",
+                "stored credentials could not be read again: {error}"
+            );
         }
         Ok(tool_error(&self.explain(&failure)))
     }
@@ -168,7 +172,7 @@ impl HostedRegistry {
         let Some(session) = self.client.session() else {
             return false;
         };
-        session.reread_stored_credentials()
+        session.reread_stored_credentials().unwrap_or(false)
             && self
                 .client
                 .has_bearer_for_posture(AuthPosture::AuthRequired)
