@@ -196,7 +196,8 @@ struct AuditArguments {
     project_path: String,
 }
 
-/// A local tool call, checked and ready to run.
+/// A local tool call, checked and ready to run once its project, as given,
+/// is resolved.
 #[derive(Debug, PartialEq, Eq)]
 struct Invocation {
     project: PathBuf,
@@ -253,6 +254,20 @@ impl LocalTools {
             .args
             .splice(0..0, self.global_args.iter().cloned());
         let command = format!("lpm {}", tool.command());
+        // Resolving the project can stall on an unresponsive network mount,
+        // so it runs on a blocking thread, and before the call takes a command
+        // slot, so a stalled path never holds one.
+        let requested = std::mem::take(&mut invocation.project);
+        let resolving = tokio::task::spawn_blocking(move || project_directory(&requested));
+        invocation.project = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return tool_error(format!("`{command}` was cancelled.")),
+            resolved = resolving => match resolved {
+                Ok(Ok(project)) => project,
+                Ok(Err(reason)) => return tool_error(reason),
+                Err(error) => return tool_error(format!("`{command}` couldn't run: {error}")),
+            },
+        };
         let permit = tokio::select! {
             biased;
             () = cancel.cancelled() => return tool_error(format!("`{command}` was cancelled.")),
@@ -295,7 +310,7 @@ fn invocation(tool: LocalTool, arguments: JsonObject) -> Result<Invocation, Stri
         LocalTool::Install => {
             let arguments: InstallArguments = serde_json::from_value(arguments).map_err(invalid)?;
             Ok(Invocation {
-                project: project_directory(&arguments.project_path)?,
+                project: PathBuf::from(arguments.project_path),
                 args: vec![
                     "install".to_owned(),
                     package_spec(&arguments.name, arguments.version.as_deref(), None)?,
@@ -331,14 +346,14 @@ fn invocation(tool: LocalTool, arguments: JsonObject) -> Result<Invocation, Stri
                 args.push("--no-install-deps".to_owned());
             }
             Ok(Invocation {
-                project: project_directory(&arguments.project_path)?,
+                project: PathBuf::from(arguments.project_path),
                 args,
             })
         }
         LocalTool::Audit => {
             let arguments: AuditArguments = serde_json::from_value(arguments).map_err(invalid)?;
             Ok(Invocation {
-                project: project_directory(&arguments.project_path)?,
+                project: PathBuf::from(arguments.project_path),
                 args: vec!["audit".to_owned(), "--json".to_owned()],
             })
         }
@@ -348,8 +363,7 @@ fn invocation(tool: LocalTool, arguments: JsonObject) -> Result<Invocation, Stri
 /// The project directory a call names, resolved through any links. An
 /// agent's own working directory may not be the user's project, so the path
 /// is required and must be absolute.
-fn project_directory(path: &str) -> Result<PathBuf, String> {
-    let path = Path::new(path);
+fn project_directory(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!(
             "projectPath must be an absolute path to the project's directory, not {}.",
@@ -577,7 +591,8 @@ fn result_of(tool: LocalTool, command: &str, output: &std::process::Output) -> C
         });
     };
     let reported_failure = report.get("success") == Some(&serde_json::Value::Bool(false));
-    let failed = reported_failure || (tool != LocalTool::Audit && !output.status.success());
+    let reported_findings = tool == LocalTool::Audit && output.status.code() == Some(1);
+    let failed = reported_failure || !(output.status.success() || reported_findings);
     let text = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string());
     if failed {
         CallToolResult::error(vec![ContentBlock::text(text)])
@@ -632,7 +647,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(invocation.project, project.path().canonicalize().unwrap());
+        assert_eq!(
+            project_directory(&invocation.project).unwrap(),
+            project.path().canonicalize().unwrap()
+        );
         assert_eq!(
             invocation.args,
             ["install", "@lpm.dev/acme.forms@^2.1.0", "--json"]
@@ -694,19 +712,49 @@ mod tests {
         std::fs::write(&file, "{}").unwrap();
 
         for (path, expected) in [
-            ("relative/project", "must be an absolute path"),
-            (
-                project.path().join("missing").to_str().unwrap(),
-                "can't be used",
-            ),
-            (file.to_str().unwrap(), "is not a directory"),
+            (Path::new("relative/project"), "must be an absolute path"),
+            (&project.path().join("missing"), "can't be used"),
+            (file.as_path(), "is not a directory"),
         ] {
-            let error = invocation(LocalTool::Audit, arguments(json!({ "projectPath": path })))
-                .unwrap_err();
-            assert!(error.contains(expected), "{path}: {error}");
+            let error = project_directory(path).unwrap_err();
+            assert!(error.contains(expected), "{}: {error}", path.display());
         }
         let missing = invocation(LocalTool::Audit, JsonObject::new()).unwrap_err();
         assert!(missing.contains("projectPath"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_project_is_reported_at_once_while_every_command_slot_is_busy() {
+        let project = tempfile::tempdir().unwrap();
+        let tools = LocalTools::new(
+            PathBuf::from("/nonexistent/lpm"),
+            &RegistryClient::new(),
+            None,
+        );
+        let _busy = Arc::clone(&tools.permits)
+            .acquire_many_owned(CONCURRENT_COMMANDS as u32)
+            .await
+            .unwrap();
+        let arguments = serde_json::json!({
+            "projectPath": project.path().join("missing").to_str().unwrap(),
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tools.call(
+                LocalTool::Audit,
+                arguments.as_object().cloned(),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("a missing project must not wait for a command slot");
+
+        let text = serde_json::to_value(&result.content[0]).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(text.contains("can't be used"), "{text}");
     }
 
     #[test]
@@ -794,6 +842,23 @@ mod tests {
         assert_eq!(audit.is_error, Some(false));
         assert_eq!(install.is_error, Some(true));
         assert_eq!(refused.is_error, Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_audit_that_exits_otherwise_than_with_findings_is_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let report = r#"{"vulnerabilities":[]}"#;
+        let killed = std::process::Output {
+            status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+            stdout: report.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+
+        for output in [output(2, report, ""), output(101, report, ""), killed] {
+            let result = result_of(LocalTool::Audit, "lpm audit", &output);
+            assert_eq!(result.is_error, Some(true), "{:?}", output.status);
+        }
     }
 
     #[cfg(unix)]
