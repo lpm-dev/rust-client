@@ -44,6 +44,10 @@ const MAX_SWIFT_NAMES: usize = 65_536;
 /// [`MAX_RETAINED_BYTES`].
 const MAX_RETAINED_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RETAINED_BYTES: u64 = 16 * 1024 * 1024;
+/// TypeScript sources a package ships, kept apart from
+/// [`MAX_RETAINED_BYTES`] so they never crowd out its JavaScript and
+/// declarations. A `types` field naming one makes its exports the API.
+const MAX_RETAINED_TYPESCRIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SWIFT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// Nested package.json files kept for the `type` each sets for the files
 /// under it, and the size of each.
@@ -144,6 +148,7 @@ pub(crate) struct Archive {
     total_bytes: u64,
     retained: HashMap<String, String>,
     retained_bytes: u64,
+    retained_typescript_bytes: u64,
     /// Declaration or JavaScript files left unread past the size limits.
     unretained: usize,
     /// The `type` each nested package.json sets, by its directory.
@@ -218,7 +223,9 @@ pub struct QualityCollector {
     readme_reads: HashMap<String, Option<u64>>,
 }
 
-const RETAINED_EXTENSIONS: &[&str] = &[".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs", ".jsx"];
+const RETAINED_EXTENSIONS: &[&str] = &[
+    ".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx",
+];
 const SWIFT_SKIPPED_SEGMENTS: &[&str] =
     &[".build", "DerivedData", "Pods", ".swiftpm", "xcuserdata"];
 
@@ -321,13 +328,19 @@ impl QualityCollector {
                 {
                     return None;
                 }
-                if size > MAX_RETAINED_FILE_BYTES
-                    || self.archive.retained_bytes.saturating_add(size) > MAX_RETAINED_BYTES
-                {
+                let (retained, limit) = if npm::is_typescript_source(path) {
+                    (
+                        &mut self.archive.retained_typescript_bytes,
+                        MAX_RETAINED_TYPESCRIPT_BYTES,
+                    )
+                } else {
+                    (&mut self.archive.retained_bytes, MAX_RETAINED_BYTES)
+                };
+                if size > MAX_RETAINED_FILE_BYTES || retained.saturating_add(size) > limit {
                     self.archive.unretained += 1;
                     return None;
                 }
-                self.archive.retained_bytes += size;
+                *retained += size;
                 Some(size)
             }
             QualityEcosystem::Swift => {
@@ -1270,13 +1283,23 @@ fn swift_readme_example(
     };
     let mut used = false;
     let mut missing = None;
+    // Each module's names once, and each sample's imports once: a sample
+    // repeating `import Kit` would otherwise rescan its identifiers for every
+    // repetition.
+    let mut names_by_module: HashMap<&str, std::collections::HashSet<&str>> = HashMap::new();
     for sample in &samples {
+        let mut seen = std::collections::HashSet::new();
         for module in sample
             .imports
             .iter()
             .filter(|module| modules.contains(module))
         {
-            let names = public_names(module);
+            if !seen.insert(module.as_str()) {
+                continue;
+            }
+            let names = names_by_module
+                .entry(module.as_str())
+                .or_insert_with(|| public_names(module));
             used |= sample
                 .identifiers
                 .iter()

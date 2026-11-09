@@ -1290,3 +1290,127 @@ fn many_exports_patterns_stay_within_the_lookup_budget() {
         check(&report, "types").detail
     );
 }
+
+fn full(report: &QualityReport, id: &str) -> bool {
+    let check = check(report, id);
+    check.points == check.max_points
+}
+
+#[test]
+fn a_typescript_source_named_by_types_earns_api_docs_for_its_documented_exports() {
+    let mut manifest = good_manifest();
+    manifest["types"] = json!("./src/index.ts");
+    manifest["exports"] = json!({
+        ".": {
+            "types": "./src/index.ts",
+            "import": "./dist/index.mjs",
+            "require": "./dist/index.cjs"
+        }
+    });
+    let mut files = with_manifest(
+        &manifest,
+        &[
+            (
+                "src/index.ts",
+                "import { identity } from './identity.js'\n/** Parses Markdown source into a syntax tree. */\nexport function parse(source: string): string { return identity(source) }\n/** Renders a syntax tree into sanitized HTML. */\nexport function render(tree: string): string { return tree }\n",
+            ),
+            (
+                "src/identity.ts",
+                "export function identity(value: string): string { return value }\n",
+            ),
+        ],
+    );
+    files.retain(|(path, _)| path != "dist/index.d.ts");
+    let report = owned_report(&files);
+    for id in ["types", "api-docs", "readme-example"] {
+        assert!(full(&report, id), "{id}: {}", check(&report, id).detail);
+    }
+}
+
+#[test]
+fn a_types_path_naming_javascript_finds_the_declaration_typescript_reads() {
+    let mut manifest = good_manifest();
+    manifest["types"] = json!("./types/index.js");
+    manifest["exports"] = json!({
+        ".": {
+            "types": "./types/index.js",
+            "import": "./dist/index.mjs",
+            "require": "./dist/index.cjs"
+        },
+        "./package.json": "./package.json"
+    });
+    let mut files = with_manifest(&manifest, &[("types/index.d.ts", DOCUMENTED_DTS)]);
+    files.retain(|(path, _)| path != "dist/index.d.ts");
+    let report = owned_report(&files);
+    for id in ["entry-points", "types", "exports-map", "api-docs"] {
+        assert!(full(&report, id), "{id}: {}", check(&report, id).detail);
+    }
+}
+
+#[test]
+fn every_star_of_an_exports_target_takes_the_same_match() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["main"] = Value::Null;
+    manifest["exports"] = json!({
+        "./*": { "types": "./dist/*-*.d.ts", "import": "./dist/*-*.mjs" }
+    });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("dist/a-a.mjs", "export function parse(s) { return s }\n"),
+            (
+                "dist/a-a.d.ts",
+                "/** Parses Markdown source into a syntax tree. */\nexport declare function parse(source: string): string;\n",
+            ),
+        ],
+    ));
+    for id in ["exports-map", "types", "entry-points"] {
+        assert!(full(&report, id), "{id}: {}", check(&report, id).detail);
+    }
+}
+
+#[test]
+fn a_null_pattern_keeps_its_files_out_of_type_coverage() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["main"] = Value::Null;
+    manifest["exports"] = json!({
+        "./*": { "types": "./dist/*.d.ts", "import": "./dist/*.mjs" },
+        "./private/*": null
+    });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[
+            ("dist/a.mjs", "export function parse(s) { return s }\n"),
+            (
+                "dist/a.d.ts",
+                "/** Parses Markdown source into a syntax tree. */\nexport declare function parse(source: string): string;\n",
+            ),
+            ("dist/private/b.mjs", "export const hidden = 1\n"),
+        ],
+    ));
+    assert!(full(&report, "types"), "{}", check(&report, "types").detail);
+}
+
+#[test]
+fn exports_null_reads_as_no_exports() {
+    let mut without = good_manifest();
+    without.as_object_mut().unwrap().remove("exports");
+    let mut null = good_manifest();
+    null["exports"] = Value::Null;
+    let without = owned_report(&with_manifest(&without, &[]));
+    let null = owned_report(&with_manifest(&null, &[]));
+    for id in ["entry-points", "types", "esm", "exports-map", "api-docs"] {
+        assert_eq!(
+            (check(&null, id).points, &check(&null, id).detail),
+            (check(&without, id).points, &check(&without, id).detail),
+            "{id}"
+        );
+    }
+    assert!(
+        full(&null, "entry-points"),
+        "{}",
+        check(&null, "entry-points").detail
+    );
+}

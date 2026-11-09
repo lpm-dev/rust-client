@@ -110,7 +110,11 @@ impl<'a> Package<'a> {
         Self {
             context,
             json,
-            exports: json.get("exports").map(Exports::parse),
+            // Node.js reads `"exports": null` as no `exports`.
+            exports: json
+                .get("exports")
+                .filter(|exports| !exports.is_null())
+                .map(Exports::parse),
             facts: RefCell::new(HashMap::new()),
             export_sets: RefCell::new(HashMap::new()),
             export_entries: Cell::new(0),
@@ -186,7 +190,15 @@ impl<'a> Package<'a> {
         };
         let path = npm::normalize(&joined)?;
         let archive = self.archive();
-        let candidates: Vec<String> = if npm::is_declaration(from) {
+        let candidates: Vec<String> = if npm::is_typescript_source(from) {
+            // TypeScript source imports `./x`, `./x.js` or `./x.ts` for `x.ts`.
+            let mut candidates = npm::declaration_candidates(&path);
+            candidates.extend(["ts", "tsx", "d.ts"].map(|extension| format!("{path}.{extension}")));
+            candidates.extend(
+                ["index.ts", "index.tsx", "index.d.ts"].map(|index| format!("{path}/{index}")),
+            );
+            candidates
+        } else if npm::is_declaration(from) {
             let mut candidates = Vec::with_capacity(6);
             if npm::is_declaration(&path) {
                 candidates.push(path.clone());
@@ -343,26 +355,34 @@ impl<'a> Package<'a> {
             if expanded == MAX_PATTERN_SUBPATHS {
                 continue;
             }
-            let Some(pattern) = [npm::TYPES_IMPORT_CONDITIONS, npm::IMPORT_CONDITIONS]
-                .iter()
-                .find_map(|conditions| target.resolve(conditions))
-                .and_then(|resolution| npm::normalize(resolution.path))
+            let Some((conditions, pattern)) =
+                [npm::TYPES_IMPORT_CONDITIONS, npm::IMPORT_CONDITIONS]
+                    .iter()
+                    .find_map(|conditions| {
+                        target
+                            .resolve(conditions)
+                            .map(|resolution| (*conditions, resolution.path))
+                    })
             else {
                 continue;
             };
-            let Some((prefix, suffix)) = pattern.split_once('*') else {
+            let Some(files) = npm::pattern_matches(self.archive(), pattern) else {
                 continue;
             };
-            let Some(files) = npm::pattern_matches(self.archive(), &pattern) else {
-                continue;
-            };
-            for file in files {
+            for (file, matched) in files {
                 if expanded == MAX_PATTERN_SUBPATHS {
                     break;
                 }
-                let star = &file[prefix.len()..file.len() - suffix.len()];
-                subpaths.push(format!("{key_prefix}{star}{key_suffix}"));
-                expanded += 1;
+                let subpath = format!("{key_prefix}{matched}{key_suffix}");
+                // A more specific subpath, such as a null pattern, may keep it
+                // from consumers.
+                if exports
+                    .resolve_subpath(&subpath, conditions)
+                    .is_some_and(|(resolved, _)| resolved == file)
+                {
+                    subpaths.push(subpath);
+                    expanded += 1;
+                }
             }
         }
         subpaths
@@ -384,8 +404,7 @@ impl<'a> Package<'a> {
                     return npm::declaration_at(archive, &path);
                 }
                 let (runtime_path, _) = exports.resolve_subpath(subpath, runtime)?;
-                npm::sibling_declaration(&runtime_path)
-                    .filter(|declaration| archive.has(declaration))
+                npm::declaration_at(archive, &runtime_path)
             }
             None if subpath == "." => {
                 for field in ["types", "typings"] {
@@ -395,8 +414,7 @@ impl<'a> Package<'a> {
                     }
                 }
                 self.main()
-                    .and_then(|main| npm::sibling_declaration(&main))
-                    .filter(|declaration| archive.has(declaration))
+                    .and_then(|main| npm::declaration_at(archive, &main))
                     .or_else(|| archive.has("index.d.ts").then(|| "index.d.ts".to_string()))
             }
             None => None,
@@ -725,8 +743,12 @@ fn entry_points(package: &Package<'_>, results: &mut Results) {
         for (_, target) in &exports.entries {
             let mut paths = Vec::new();
             target.paths(&mut paths);
-            for raw in paths {
-                check("exports", raw, npm::target_exists(archive, raw));
+            for (raw, via_types) in paths {
+                check(
+                    "exports",
+                    raw,
+                    npm::condition_target_exists(archive, raw, via_types),
+                );
             }
         }
     }
@@ -817,7 +839,7 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
             };
             let runtime_raw = runtime_resolution.path;
             let label = format!("{subpath} ({mode})");
-            if subpath.contains('*') {
+            if let Some((key_prefix, key_suffix)) = subpath.split_once('*') {
                 // Patterns past the lookups' limit can't be confirmed typed.
                 let Some(matched) = npm::pattern_matches(archive, runtime_raw) else {
                     entries.push(TypedEntry {
@@ -826,19 +848,28 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
                     });
                     continue;
                 };
-                let javascript: Vec<&str> = matched
-                    .iter()
-                    .copied()
-                    .filter(|path| is_javascript(path))
+                // Only the files a consumer can reach: a more specific
+                // subpath, such as a null pattern, may keep others away.
+                let javascript: Vec<(&str, &str)> = matched
+                    .into_iter()
+                    .filter(|(path, star)| {
+                        is_javascript(path)
+                            && exports
+                                .resolve_subpath(
+                                    &format!("{key_prefix}{star}{key_suffix}"),
+                                    runtime,
+                                )
+                                .is_some_and(|(resolved, _)| resolved == *path)
+                    })
                     .collect();
                 if javascript.is_empty() {
                     continue;
                 }
-                let typed = typed_pattern(archive, target, types, runtime_raw, &javascript);
+                let typed = typed_pattern(archive, target, types, &javascript);
                 entries.push(TypedEntry { label, typed });
                 continue;
             }
-            let Some(runtime_path) = npm::normalize(runtime_raw) else {
+            let Some(runtime_path) = npm::target_path(runtime_raw) else {
                 continue;
             };
             if npm::is_declaration(&runtime_path) {
@@ -857,32 +888,23 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
     entries
 }
 
-/// Whether every file a pattern entry matches has declarations: through a
-/// `types` pattern, or beside each file.
+/// Whether every file a pattern entry matches, each with what its `*`
+/// matched, has declarations: through a `types` pattern, or beside each
+/// file.
 fn typed_pattern(
     archive: &super::Archive,
     target: &Target<'_>,
     types: &[&str],
-    runtime_pattern: &str,
-    matched: &[&str],
+    matched: &[(&str, &str)],
 ) -> bool {
     let types_pattern = target
         .resolve(types)
         .filter(|resolution| resolution.via_types);
-    let Some(runtime_pattern) = npm::normalize(runtime_pattern) else {
-        return false;
-    };
-    let Some((prefix, suffix)) = runtime_pattern.split_once('*') else {
-        return false;
-    };
-    matched.iter().all(|path| {
-        let star = &path[prefix.len()..path.len() - suffix.len()];
-        match types_pattern.and_then(|resolution| npm::normalize(resolution.path)) {
-            Some(pattern) => npm::declaration_at(archive, &pattern.replace('*', star)).is_some(),
-            None => {
-                npm::sibling_declaration(path).is_some_and(|declaration| archive.has(&declaration))
-            }
-        }
+    matched.iter().all(|(path, star)| match types_pattern {
+        Some(resolution) => npm::substitute(resolution.path, star)
+            .and_then(|declared| npm::target_path(&declared))
+            .is_some_and(|declared| npm::declaration_at(archive, &declared).is_some()),
+        None => npm::declaration_at(archive, path).is_some(),
     })
 }
 
@@ -986,7 +1008,7 @@ fn exports_map(package: &Package<'_>, results: &mut Results) {
             if problems.invalid {
                 results.fail(
                     "exports-map",
-                    "\"exports\" has a target that isn't a path, null, array or object",
+                    "\"exports\" has a target Node.js refuses: not a ./ path, null, array or object, or a path it can't decode",
                 );
             } else if let Some(missing) = problems.missing.first() {
                 results.fail(

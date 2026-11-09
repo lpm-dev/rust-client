@@ -57,18 +57,23 @@ impl<'a> Target<'a> {
         }
     }
 
-    /// Every path the tree can resolve to.
-    pub fn paths(&self, out: &mut Vec<&'a str>) {
+    /// Every path the tree can resolve to, each with whether a `types`
+    /// condition leads to it.
+    pub fn paths(&self, out: &mut Vec<(&'a str, bool)>) {
+        self.paths_within(out, false);
+    }
+
+    fn paths_within(&self, out: &mut Vec<(&'a str, bool)>, via_types: bool) {
         match self {
-            Self::Path(path) => out.push(path),
+            Self::Path(path) => out.push((path, via_types)),
             Self::Conditions(conditions) => {
-                for (_, target) in conditions {
-                    target.paths(out);
+                for (key, target) in conditions {
+                    target.paths_within(out, via_types || *key == "types");
                 }
             }
             Self::Fallbacks(targets) => {
                 for target in targets {
-                    target.paths(out);
+                    target.paths_within(out, via_types);
                 }
             }
             Self::Null | Self::Invalid | Self::InvalidConfig => {}
@@ -171,10 +176,59 @@ fn is_array_index(key: &str) -> bool {
 }
 
 /// Node.js's rule for an `exports` target: `./`, then no segment Node.js
-/// refuses.
+/// refuses, and no percent-encoding it can't turn into a file path.
 fn valid_target(raw: &str) -> bool {
     raw.strip_prefix("./")
         .is_some_and(|rest| !has_refused_segment(rest))
+        && percent_decoded(raw).is_some()
+}
+
+/// The longest path a target can name. A pattern whose substitution would
+/// be longer names no file, so it's never built: a target of thousands of
+/// `*` would otherwise multiply a long subpath into megabytes.
+const MAX_TARGET_BYTES: usize = 4096;
+
+/// A target's file as Node.js loads it, which decodes the target's URL
+/// percent-encoding, normalized. `None` when it leaves the package, or
+/// Node.js can't decode it: an encoded `/` or `\`, a malformed escape, or
+/// bytes that aren't UTF-8.
+pub(crate) fn target_path(raw: &str) -> Option<String> {
+    normalize(&percent_decoded(raw)?)
+}
+
+fn percent_decoded(raw: &str) -> Option<String> {
+    if !raw.contains('%') {
+        return Some(raw.to_string());
+    }
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let hex = bytes.get(index + 1..index + 3)?;
+        let byte = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+        if byte == b'/' || byte == b'\\' {
+            return None;
+        }
+        decoded.push(byte);
+        index += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// `target` with each `*` replaced by `matched`, as Node.js substitutes a
+/// pattern's match, or `None` when the result would be longer than
+/// [`MAX_TARGET_BYTES`].
+pub(crate) fn substitute(target: &str, matched: &str) -> Option<String> {
+    let stars = target.bytes().filter(|&byte| byte == b'*').count();
+    let length = stars
+        .checked_mul(matched.len())?
+        .checked_add(target.len() - stars)?;
+    (length <= MAX_TARGET_BYTES).then(|| target.replace('*', matched))
 }
 
 /// Whether a target, or the part of a subpath a pattern's `*` matches, has a
@@ -291,7 +345,7 @@ impl<'a> Exports<'a> {
     pub fn resolve_subpath(&self, subpath: &str, conditions: &[&str]) -> Option<(String, bool)> {
         if let Some(&index) = self.exact.get(subpath) {
             let resolution = self.entries[index].1.resolve(conditions)?;
-            return normalize(resolution.path).map(|path| (path, resolution.via_types));
+            return target_path(resolution.path).map(|path| (path, resolution.via_types));
         }
         let compared = self
             .pattern_comparisons
@@ -317,7 +371,7 @@ impl<'a> Exports<'a> {
             return None;
         }
         let resolution = self.entries[index].1.resolve(conditions)?;
-        normalize(&resolution.path.replace('*', matched)).map(|path| (path, resolution.via_types))
+        target_path(&substitute(resolution.path, matched)?).map(|path| (path, resolution.via_types))
     }
 }
 
@@ -348,16 +402,68 @@ pub(crate) fn sibling_declaration(path: &str) -> Option<String> {
     None
 }
 
-/// The files an `exports` pattern target (`./dist/*.js`) matches, in path
-/// order, or `None` once the archive's pattern lookups have run out.
-pub(crate) fn pattern_matches<'f>(archive: &'f Archive, target: &str) -> Option<Vec<&'f str>> {
-    let Some((prefix, suffix)) = target.split_once('*') else {
+/// The files an `exports` pattern target (`./dist/*.js`) matches, each with
+/// what its `*` matched, in path order, or `None` once the archive's
+/// pattern lookups have run out. A target with several `*` matches a file
+/// only where each takes the same text, as Node.js substitutes one match
+/// into all of them.
+pub(crate) fn pattern_matches<'f>(
+    archive: &'f Archive,
+    target: &str,
+) -> Option<Vec<(&'f str, &'f str)>> {
+    let Some(pattern) = TargetPattern::parse(target) else {
         return Some(Vec::new());
     };
-    let Some(prefix) = normalize_prefix(prefix) else {
-        return Some(Vec::new());
-    };
-    archive.pattern_files(&prefix, suffix)
+    let files = archive.pattern_files(&pattern.prefix, &pattern.suffix)?;
+    Some(
+        files
+            .into_iter()
+            .filter_map(|file| pattern.capture(file).map(|matched| (file, matched)))
+            .collect(),
+    )
+}
+
+/// A pattern target split at its `*`s, each piece decoded as Node.js
+/// decodes the target.
+struct TargetPattern {
+    prefix: String,
+    middles: Vec<String>,
+    suffix: String,
+}
+
+impl TargetPattern {
+    fn parse(target: &str) -> Option<Self> {
+        let mut pieces = target.split('*');
+        let prefix = normalize_prefix(&percent_decoded(pieces.next()?)?)?;
+        let mut rest: Vec<String> = pieces.map(percent_decoded).collect::<Option<_>>()?;
+        let suffix = rest.pop()?;
+        Some(Self {
+            prefix,
+            middles: rest,
+            suffix,
+        })
+    }
+
+    /// What each `*` matches in `file`, which `pattern_files` found under
+    /// the prefix and ending with the suffix.
+    fn capture<'f>(&self, file: &'f str) -> Option<&'f str> {
+        let middle = file.get(self.prefix.len()..file.len().checked_sub(self.suffix.len())?)?;
+        if self.middles.is_empty() {
+            return (!middle.is_empty()).then_some(middle);
+        }
+        let stars = self.middles.len() + 1;
+        let literal: usize = self.middles.iter().map(String::len).sum();
+        let spare = middle.len().checked_sub(literal)?;
+        if spare == 0 || spare % stars != 0 {
+            return None;
+        }
+        let matched = middle.get(..spare / stars)?;
+        let mut rest = &middle[matched.len()..];
+        for piece in &self.middles {
+            rest = rest.strip_prefix(piece.as_str())?.strip_prefix(matched)?;
+        }
+        rest.is_empty().then_some(matched)
+    }
 }
 
 fn normalize_prefix(prefix: &str) -> Option<String> {
@@ -391,29 +497,66 @@ pub(crate) fn resolve_main(archive: &Archive, raw: &str) -> Option<String> {
 }
 
 /// The file a `types` or `typings` field names, as TypeScript looks for it:
-/// the path, with `.d.ts`, or `index.d.ts` inside it.
+/// the declarations it finds there, the path itself, the path with
+/// `.d.ts`, or `index.d.ts` inside it.
 pub(crate) fn types_field_file(archive: &Archive, raw: &str) -> Option<String> {
     let path = normalize(raw)?;
-    [
-        path.clone(),
-        format!("{path}.d.ts"),
-        join(&path, "index.d.ts"),
-    ]
-    .into_iter()
-    .find(|candidate| archive.has(candidate))
+    declaration_at(archive, &path).or_else(|| {
+        [
+            path.clone(),
+            format!("{path}.d.ts"),
+            join(&path, "index.d.ts"),
+        ]
+        .into_iter()
+        .find(|candidate| archive.has(candidate))
+    })
 }
 
 /// The declarations TypeScript reads where a `types` field or condition
 /// points: a declaration file or TypeScript source, or for a JavaScript
-/// file the declaration beside it. A README or JSON file declares nothing.
+/// path the source or declaration TypeScript puts in its place, whether or
+/// not the JavaScript file is there. A README or JSON file declares nothing.
 pub(crate) fn declaration_at(archive: &Archive, path: &str) -> Option<String> {
-    if is_declaration(path) || is_typescript_source(path) {
-        return archive.has(path).then(|| path.to_string());
-    }
-    sibling_declaration(path).filter(|declaration| archive.has(declaration))
+    declaration_candidates(path)
+        .into_iter()
+        .find(|candidate| archive.has(candidate))
 }
 
-fn is_typescript_source(path: &str) -> bool {
+/// Where TypeScript looks for the declarations of `path`, in its order: a
+/// declaration or TypeScript source as it is, or for a JavaScript
+/// extension the TypeScript extensions it substitutes.
+pub(crate) fn declaration_candidates(path: &str) -> Vec<String> {
+    if is_declaration(path) || is_typescript_source(path) {
+        return vec![path.to_string()];
+    }
+    for (javascript, substitutes) in [
+        (".mjs", &[".mts", ".d.mts"][..]),
+        (".cjs", &[".cts", ".d.cts"][..]),
+        (".jsx", &[".tsx", ".ts", ".d.ts"][..]),
+        (".js", &[".ts", ".tsx", ".d.ts"][..]),
+    ] {
+        if let Some(stem) = path.strip_suffix(javascript) {
+            return substitutes
+                .iter()
+                .map(|extension| format!("{stem}{extension}"))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Whether TypeScript finds declarations where a `types` condition's
+/// target points: an exact path, or a pattern that matches one.
+fn types_target_exists(archive: &Archive, raw: &str) -> bool {
+    if raw.contains('*') {
+        return declaration_candidates(raw)
+            .iter()
+            .any(|pattern| target_exists(archive, pattern));
+    }
+    target_path(raw).is_some_and(|path| declaration_at(archive, &path).is_some())
+}
+
+pub(crate) fn is_typescript_source(path: &str) -> bool {
     [".ts", ".mts", ".cts", ".tsx"]
         .iter()
         .any(|extension| path.ends_with(extension))
@@ -437,7 +580,13 @@ pub(crate) fn target_exists(archive: &Archive, raw: &str) -> bool {
     if raw.contains('*') {
         return pattern_matches(archive, raw).is_some_and(|matched| !matched.is_empty());
     }
-    normalize(raw).is_some_and(|path| archive.has(&path))
+    target_path(raw).is_some_and(|path| archive.has(&path))
+}
+
+/// Whether a target an `exports` condition leads to is there: under a
+/// `types` condition, the declarations TypeScript reads for it will do.
+pub(crate) fn condition_target_exists(archive: &Archive, raw: &str, via_types: bool) -> bool {
+    target_exists(archive, raw) || (via_types && types_target_exists(archive, raw))
 }
 
 /// The paths `exports` names that are missing, and the condition objects
@@ -457,8 +606,8 @@ pub(crate) fn exports_problems(archive: &Archive, exports: &Exports<'_>) -> Expo
     for (subpath, target) in &exports.entries {
         let mut paths = Vec::new();
         target.paths(&mut paths);
-        for path in paths {
-            if !target_exists(archive, path) {
+        for (path, via_types) in paths {
+            if !condition_target_exists(archive, path, via_types) {
                 problems.missing.push(path.to_string());
             }
         }
@@ -598,6 +747,86 @@ mod tests {
     fn exports_mixing_subpaths_and_conditions_is_refused() {
         let value = json!({ ".": "./a.js", "import": "./b.mjs" });
         assert!(Exports::parse(&value).is_err());
+    }
+
+    fn archive_of(paths: &[&str]) -> Archive {
+        let mut archive = Archive::default();
+        for path in paths {
+            archive.files.insert((*path).to_string(), 1);
+        }
+        archive
+    }
+
+    #[test]
+    fn a_target_is_decoded_as_node_loads_its_file() {
+        assert_eq!(target_path("./%61.js").as_deref(), Some("a.js"));
+        assert_eq!(
+            target_path("./dist/caf%C3%A9.js").as_deref(),
+            Some("dist/café.js")
+        );
+        for refused in [
+            "./a%2fb.js",
+            "./a%2Fb.js",
+            "./a%5Cb.js",
+            "./a%zz.js",
+            "./%ff.js",
+        ] {
+            assert!(!valid_target(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn every_star_of_a_target_takes_the_same_match() {
+        let value = json!({ "./*": "./dist/*-*.js" });
+        let exports = Exports::parse(&value).unwrap();
+        assert_eq!(
+            exports
+                .resolve_subpath("./a", IMPORT_CONDITIONS)
+                .map(|(path, _)| path)
+                .as_deref(),
+            Some("dist/a-a.js")
+        );
+        let archive = archive_of(&["dist/a-a.js", "dist/a-b.js", "dist/ab-ab.js"]);
+        assert_eq!(
+            pattern_matches(&archive, "./dist/*-*.js"),
+            Some(vec![("dist/a-a.js", "a"), ("dist/ab-ab.js", "ab")])
+        );
+    }
+
+    #[test]
+    fn a_substitution_longer_than_any_path_names_no_file() {
+        let value = json!({ "./*": format!("./{}.js", "*".repeat(50_000)) });
+        let exports = Exports::parse(&value).unwrap();
+        let subpath = format!("./{}", "a".repeat(1_000));
+        assert_eq!(exports.resolve_subpath(&subpath, IMPORT_CONDITIONS), None);
+        assert_eq!(substitute("./*.js", &"a".repeat(MAX_TARGET_BYTES)), None);
+    }
+
+    #[test]
+    fn typescript_reads_the_declaration_in_place_of_a_javascript_path() {
+        let archive = archive_of(&["types/index.d.ts", "esm/a.d.mts", "src/b.ts"]);
+        assert_eq!(
+            declaration_at(&archive, "types/index.js").as_deref(),
+            Some("types/index.d.ts")
+        );
+        assert_eq!(
+            declaration_at(&archive, "esm/a.mjs").as_deref(),
+            Some("esm/a.d.mts")
+        );
+        assert_eq!(
+            declaration_at(&archive, "src/b.js").as_deref(),
+            Some("src/b.ts")
+        );
+        assert_eq!(
+            types_field_file(&archive, "./types/index.js").as_deref(),
+            Some("types/index.d.ts")
+        );
+        assert!(condition_target_exists(&archive, "./types/index.js", true));
+        assert!(!condition_target_exists(
+            &archive,
+            "./types/index.js",
+            false
+        ));
     }
 
     #[test]

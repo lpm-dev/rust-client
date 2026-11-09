@@ -60,6 +60,18 @@ impl<'a> Readme<'a> {
                 end_block(&mut prose);
                 continue;
             }
+            // `[label]:` with its destination on the next line, as CommonMark
+            // allows: both lines are the definition.
+            if !in_paragraph
+                && let Some(label) = reference_label(line)
+                && let Some((next_start, next_end)) = lines.peek()
+                && !text[next_start..next_end].trim().is_empty()
+            {
+                lines.next();
+                definitions.insert(label);
+                end_block(&mut prose);
+                continue;
+            }
             let Some(fence) = opening_fence(line) else {
                 prose.push_str(line);
                 prose.push('\n');
@@ -155,6 +167,25 @@ fn is_atx_heading(line: &str) -> bool {
 /// The normalized label of a line that is a one-line link reference
 /// definition (`[label]: destination`), which renders nothing.
 fn reference_definition(line: &str) -> Option<String> {
+    let (label, destination) = reference_parts(line)?;
+    if destination.is_empty() {
+        return None;
+    }
+    normalize_label(label)
+}
+
+/// The normalized label of a line holding only `[label]:`, a definition
+/// whose destination follows on the next line.
+fn reference_label(line: &str) -> Option<String> {
+    let (label, destination) = reference_parts(line)?;
+    if !destination.is_empty() {
+        return None;
+    }
+    normalize_label(label)
+}
+
+/// A reference definition's label and what follows its `:`, trimmed.
+fn reference_parts(line: &str) -> Option<(&str, &str)> {
     if leading_spaces(line) > 3 {
         return None;
     }
@@ -165,10 +196,7 @@ fn reference_definition(line: &str) -> Option<String> {
         return None;
     }
     let destination = rest[close + 1..].strip_prefix(':')?.trim();
-    if destination.is_empty() {
-        return None;
-    }
-    normalize_label(label)
+    Some((label, destination))
 }
 
 /// A link label as CommonMark matches it: case-folded, its whitespace runs
@@ -214,6 +242,7 @@ fn closes(line: &str, fence: &Fence) -> bool {
 }
 
 /// Line spans of a text, without their line breaks.
+#[derive(Clone)]
 struct LineSpans<'a> {
     text: &'a str,
     position: usize,
@@ -226,6 +255,11 @@ impl<'a> LineSpans<'a> {
 
     fn position(&self) -> usize {
         self.position
+    }
+
+    /// The next line's span, without moving past it.
+    fn peek(&self) -> Option<(usize, usize)> {
+        self.clone().next()
     }
 
     fn next(&mut self) -> Option<(usize, usize)> {
@@ -529,6 +563,27 @@ mod tests {
         assert_eq!(
             readme.prose_chars(),
             "# Kit Read the guide, the Docs and FAQ.".chars().count()
+        );
+    }
+
+    #[test]
+    fn a_definition_with_its_url_on_the_next_line_is_no_prose_either() {
+        let mut text = String::from("# Kit\n\n");
+        for index in 0..100 {
+            text.push_str(&format!("[![badge {index}][shield]][site] "));
+        }
+        text.push_str("\n\n[shield]:\n  https://img.shields.io/badge/very/long/path.svg\n");
+        text.push_str("[site]:\n  https://example.com\n");
+        let readme = Readme::parse(&text);
+        assert_eq!(readme.prose_chars(), "# Kit".chars().count());
+    }
+
+    #[test]
+    fn a_label_line_followed_by_a_blank_line_stays_text() {
+        let readme = Readme::parse("[note]:\n\nKeep this line.\n");
+        assert_eq!(
+            readme.prose_chars(),
+            "[note]: Keep this line.".chars().count()
         );
     }
 

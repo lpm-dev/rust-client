@@ -362,6 +362,24 @@ const ACCESS_MODIFIERS: &[&str] = &[
 /// inheritance clause.
 const MAX_INHERITANCE_TOKENS: usize = 64;
 
+/// A type's body the walk is inside.
+#[derive(Clone, Copy)]
+struct Scope {
+    /// The depth of its members.
+    depth: usize,
+    /// Code outside the module can reach its members: every type around it
+    /// is public or open.
+    visible: bool,
+    /// Its members without an access modifier of their own are public: a
+    /// `public extension` or `public protocol`.
+    members_public: bool,
+    /// A public enum, whose cases are public declarations.
+    enum_cases: bool,
+}
+
+/// How far a `case` declaration's list of names is read.
+const MAX_CASE_TOKENS: usize = 4096;
+
 /// Reads a Swift source file.
 pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
     let Scan { tokens, docs } = scan(source);
@@ -369,33 +387,30 @@ pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
     let docs: HashMap<usize, &DocComment> = docs.iter().map(|doc| (doc.next_token, doc)).collect();
     let mut facts = SwiftFileFacts::default();
     let mut depth = 0usize;
-    // The body depths of the `public extension`s and `public protocol`s the
-    // walk is inside: their members without an access modifier of their own
-    // are public.
-    let mut public_bodies: Vec<usize> = Vec::new();
-    // One of those whose `{` hasn't been reached: its depth, and the token
-    // past which its header has run too long to be one.
-    let mut pending_body: Option<(usize, usize)> = None;
+    let mut scopes: Vec<Scope> = Vec::new();
+    // A type declaration whose `{` hasn't been reached: its body, and the
+    // token past which its header has run too long to be one.
+    let mut pending: Option<(Scope, usize)> = None;
     for (index, token) in tokens.iter().enumerate() {
         match token.text {
             "{" => {
-                if pending_body.take_if(|(at, _)| *at == depth).is_some() {
-                    public_bodies.push(depth + 1);
+                if let Some((scope, _)) = pending.take_if(|(scope, _)| scope.depth == depth + 1) {
+                    scopes.push(scope);
                 }
                 depth += 1;
                 continue;
             }
             "}" => {
-                if public_bodies.last() == Some(&depth) {
-                    public_bodies.pop();
+                if scopes.last().is_some_and(|scope| scope.depth == depth) {
+                    scopes.pop();
                 }
                 depth = depth.saturating_sub(1);
                 continue;
             }
             _ => {}
         }
-        if pending_body.is_some_and(|(_, limit)| index > limit) {
-            pending_body = None;
+        if pending.is_some_and(|(_, limit)| index > limit) {
+            pending = None;
         }
         if !facts.declares_tests && declares_test(&tokens, index) {
             facts.declares_tests = true;
@@ -403,15 +418,22 @@ pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
         if index > 0 && matches!(tokens[index - 1].text, "." | "(" | ",") {
             continue;
         }
+        // The type body this token is a direct member of, if any; `None` at
+        // the top level, and in a function or accessor body, which declares
+        // nothing outside the module can reach.
+        let container = scopes.last().filter(|scope| scope.depth == depth);
+        let reachable = if depth == 0 {
+            true
+        } else {
+            container.is_some_and(|scope| scope.visible)
+        };
+        if let Some(scope) = type_body(&tokens, index, depth, reachable, container) {
+            pending = Some((scope, index + MAX_ATTRIBUTE_TOKENS));
+        }
+        if !reachable {
+            continue;
+        }
         if token.text == "public" || token.text == "open" {
-            if token.text == "public"
-                && tokens
-                    .get(index + 1)
-                    .is_some_and(|next| next.text == "extension")
-            {
-                pending_body = Some((depth, index + MAX_ATTRIBUTE_TOKENS));
-                continue;
-            }
             let Some((keyword_index, name)) = declaration_after(&tokens, index + 1) else {
                 continue;
             };
@@ -421,17 +443,98 @@ pub(crate) fn file_facts(source: &str) -> SwiftFileFacts {
             {
                 continue;
             }
-            if token.text == "public" && tokens[keyword_index].text == "protocol" {
-                pending_body = Some((depth, keyword_index + MAX_ATTRIBUTE_TOKENS));
-            }
             record_public(&mut facts, &tokens, &docs, index, name);
-        } else if public_bodies.last() == Some(&depth)
+        } else if token.text == "case" && container.is_some_and(|scope| scope.enum_cases) {
+            for name in case_names(&tokens, index) {
+                record_public(&mut facts, &tokens, &docs, index, name);
+            }
+        } else if container.is_some_and(|scope| scope.members_public)
             && let Some(name) = implicitly_public_member(&tokens, index)
         {
             record_public(&mut facts, &tokens, &docs, index, name);
         }
     }
     facts
+}
+
+/// The body a type declaration at `index` opens, when it is one: `class`,
+/// `struct`, `enum`, `actor`, `protocol` or `extension`. A type is public
+/// with a `public` or `open` modifier, or without one inside a `public
+/// extension`; its members are reachable when it is public and code can
+/// reach it. An extension's explicitly public members are, unless it is
+/// private.
+fn type_body(
+    tokens: &[Token<'_>],
+    index: usize,
+    depth: usize,
+    reachable: bool,
+    container: Option<&Scope>,
+) -> Option<Scope> {
+    let keyword = tokens[index].text;
+    if !matches!(
+        keyword,
+        "class" | "struct" | "enum" | "actor" | "protocol" | "extension"
+    ) {
+        return None;
+    }
+    // `class func`: a modifier, not a type.
+    if keyword == "class"
+        && tokens.get(index + 1).is_some_and(|next| {
+            matches!(next.text, "func" | "var" | "let" | "subscript")
+                || MODIFIERS.contains(&next.text)
+        })
+    {
+        return None;
+    }
+    let start = declaration_start(tokens, index);
+    let access = tokens[start..index]
+        .iter()
+        .rev()
+        .find(|token| ACCESS_MODIFIERS.contains(&token.text))
+        .map(|token| token.text);
+    let public = match access {
+        Some(access) => access == "public" || access == "open",
+        None => container.is_some_and(|scope| scope.members_public),
+    };
+    let visible = reachable
+        && match keyword {
+            "extension" => !matches!(access, Some("private" | "fileprivate")),
+            _ => public,
+        };
+    Some(Scope {
+        depth: depth + 1,
+        visible,
+        members_public: visible
+            && access == Some("public")
+            && matches!(keyword, "extension" | "protocol"),
+        enum_cases: visible && keyword == "enum",
+    })
+}
+
+/// The names a `case` declaration at `index` declares: `case a, b(Int)`.
+fn case_names(tokens: &[Token<'_>], index: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut expects_name = true;
+    let mut parentheses = 0usize;
+    for token in tokens.iter().skip(index + 1).take(MAX_CASE_TOKENS) {
+        match token.text {
+            "(" => parentheses += 1,
+            ")" => parentheses = parentheses.saturating_sub(1),
+            "," if parentheses == 0 => expects_name = true,
+            "{" | "}" | ";" | "@" | "#" | "case" if parentheses == 0 => break,
+            text if parentheses == 0
+                && (DECLARATION_KEYWORDS.contains(&text) || MODIFIERS.contains(&text)) =>
+            {
+                break;
+            }
+            text if parentheses == 0 && expects_name && text.starts_with(is_identifier_start) => {
+                names.push(text.to_string());
+                expects_name = false;
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 fn record_public(
@@ -632,6 +735,16 @@ fn declaration_start(tokens: &[Token<'_>], modifier: usize) -> usize {
         let previous = &tokens[start - 1];
         if MODIFIERS.contains(&previous.text) {
             start -= 1;
+            continue;
+        }
+        // `private(set)` before the declaration's other modifiers.
+        if previous.text == ")"
+            && start >= 4
+            && tokens[start - 2].text == "set"
+            && tokens[start - 3].text == "("
+            && ACCESS_MODIFIERS.contains(&tokens[start - 4].text)
+        {
+            start -= 4;
             continue;
         }
         // `@Attr` or `@Attr(...)`
@@ -1004,6 +1117,37 @@ mod tests {
             ["Renderer", "make", "count", "init", "parse"]
         );
         assert!(!facts.declares_tests);
+    }
+
+    #[test]
+    fn a_setter_access_before_public_still_lets_the_doc_comment_lead() {
+        let facts = file_facts(
+            "/// The number of items the cache holds right now.\nprivate(set) public var count: Int = 0\n",
+        );
+        assert_eq!(facts.public_declarations, 1);
+        assert_eq!(facts.documented_declarations, 1);
+    }
+
+    #[test]
+    fn only_declarations_code_outside_the_module_reaches_count() {
+        let facts = file_facts(
+            "struct Internal {\n    /// A method nobody outside the module can call.\n    public func hidden() {}\n}\nprivate extension Internal {\n    public func alsoHidden() {}\n}\n/// Renders Markdown text into sanitized HTML output.\npublic func render() {}\n",
+        );
+        assert_eq!(facts.public_names, ["render"]);
+        assert_eq!(facts.documented_declarations, 1);
+    }
+
+    #[test]
+    fn a_public_enum_counts_each_case_as_a_declaration() {
+        let facts = file_facts(
+            "/// How a document renders its headings and links.\npublic enum Style {\n    /// Plain text without any markup at all.\n    case plain\n    case rich(level: Int), compact\n    indirect case nested(Style)\n    func describe() -> String {\n        switch self { case .plain: return \"\" default: return \"\" }\n    }\n}\nenum Hidden { case a, b }\n",
+        );
+        assert_eq!(
+            facts.public_names,
+            ["Style", "plain", "rich", "compact", "nested"]
+        );
+        assert_eq!(facts.public_declarations, 5);
+        assert_eq!(facts.documented_declarations, 2);
     }
 
     #[test]
