@@ -131,10 +131,11 @@ pub(crate) async fn post_install_security_summary(
                 .iter()
                 .map(|package| package.destination.as_path()),
         );
+        let materializations = Materializations::new(materialized);
         let analyses: Vec<_> = packages
             .par_iter()
             .filter_map(|package| {
-                analyze_live_package(package, materialized, &nested)
+                analyze_live_package(package, &materializations, &nested)
                     .map(|analysis| (package, analysis))
             })
             .collect();
@@ -205,9 +206,58 @@ pub(crate) async fn post_install_security_summary(
     emit_human_security_summary(packages.len(), &issues, verbose);
 }
 
+/// The materialization each summary package's live source is read from:
+/// the first with its instance id, or else, among those without an id, the
+/// one with its name and version at the lowest destination. Searching the
+/// list for every package was quadratic in installed packages.
+struct Materializations<'m> {
+    by_instance: HashMap<lpm_common::PackageInstanceId, &'m MaterializedPackage>,
+    by_name_and_version: HashMap<(&'m str, &'m str), &'m MaterializedPackage>,
+}
+
+impl<'m> Materializations<'m> {
+    fn new(materialized: &'m [MaterializedPackage]) -> Self {
+        let mut by_instance = HashMap::new();
+        let mut by_name_and_version: HashMap<(&str, &str), &MaterializedPackage> = HashMap::new();
+        for candidate in materialized {
+            match candidate.instance_id {
+                Some(instance_id) => {
+                    by_instance.entry(instance_id).or_insert(candidate);
+                }
+                None => {
+                    let key = (candidate.name.as_str(), candidate.version.as_str());
+                    by_name_and_version
+                        .entry(key)
+                        .and_modify(|selected| {
+                            if candidate.destination < selected.destination {
+                                *selected = candidate;
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+        }
+        Self {
+            by_instance,
+            by_name_and_version,
+        }
+    }
+
+    fn select(&self, package: &SecuritySummaryPackage) -> Option<&'m MaterializedPackage> {
+        package
+            .instance_id
+            .and_then(|instance_id| self.by_instance.get(&instance_id).copied())
+            .or_else(|| {
+                self.by_name_and_version
+                    .get(&(package.name.as_str(), package.version.as_str()))
+                    .copied()
+            })
+    }
+}
+
 fn analyze_live_package(
     package: &SecuritySummaryPackage,
-    materialized: &[MaterializedPackage],
+    materializations: &Materializations<'_>,
     nested: &HashMap<&Path, Vec<PathBuf>>,
 ) -> Option<PackageAnalysis> {
     tracing::trace!(
@@ -215,27 +265,7 @@ fn analyze_live_package(
         version = %package.version,
         "Scanning live package source for install security summary"
     );
-    let exact = package.instance_id.and_then(|instance_id| {
-        materialized
-            .iter()
-            .find(|candidate| candidate.instance_id == Some(instance_id))
-    });
-    let selected = exact.or_else(|| {
-        let mut candidates = materialized.iter().filter(|candidate| {
-            candidate.instance_id.is_none()
-                && candidate.name == package.name
-                && candidate.version == package.version
-        });
-        candidates.next().map(|first| {
-            candidates.fold(first, |selected, candidate| {
-                if candidate.destination < selected.destination {
-                    candidate
-                } else {
-                    selected
-                }
-            })
-        })
-    })?;
+    let selected = materializations.select(package)?;
     let (source, contents) = match selected.analysis_source.as_deref() {
         Some(source) => (source, PackageDirectory::LocalSource),
         None => (
@@ -718,6 +748,46 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_package_reads_the_materialization_the_list_search_chose() {
+        let materialized = |instance_id, name: &str, destination: &str| MaterializedPackage {
+            instance_id,
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            analysis_source: None,
+            destination: PathBuf::from(destination),
+        };
+        let id = lpm_common::PackageInstanceId::derive("a", "1.0.0", "registry+npm", "root/a");
+        let missing =
+            lpm_common::PackageInstanceId::derive("a", "1.0.0", "registry+npm", "root/missing");
+        let list = vec![
+            materialized(Some(id), "a", "/first-by-id"),
+            materialized(Some(id), "a", "/second-by-id"),
+            materialized(None, "a", "/b"),
+            materialized(None, "a", "/a"),
+            materialized(None, "a", "/a"),
+            materialized(None, "other", "/0"),
+        ];
+        let materializations = Materializations::new(&list);
+        let package = |instance_id| SecuritySummaryPackage {
+            instance_id,
+            ..summary_package("a", false)
+        };
+        let selected = |instance_id| {
+            materializations
+                .select(&package(instance_id))
+                .map(std::ptr::from_ref)
+        };
+        assert_eq!(selected(Some(id)), Some(std::ptr::from_ref(&list[0])));
+        assert_eq!(selected(Some(missing)), Some(std::ptr::from_ref(&list[3])));
+        assert_eq!(selected(None), Some(std::ptr::from_ref(&list[3])));
+        assert!(
+            Materializations::new(&list[..2])
+                .select(&package(None))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn disabled_lpm_security_insights_schedules_no_registry_enrichment() {
         let packages = [
             summary_package("@lpm.dev/secure", true),
@@ -787,8 +857,12 @@ mod tests {
             is_lpm: false,
         };
 
-        let analysis =
-            analyze_live_package(&package, &materialized, &nested_packages(&materialized)).unwrap();
+        let analysis = analyze_live_package(
+            &package,
+            &Materializations::new(&materialized),
+            &nested_packages(&materialized),
+        )
+        .unwrap();
 
         assert!(!analysis.source.eval);
         assert!(analysis.source.child_process);
@@ -822,8 +896,12 @@ mod tests {
         }];
         let package = summary_package("local", false);
 
-        let analysis =
-            analyze_live_package(&package, &materialized, &nested_packages(&materialized)).unwrap();
+        let analysis = analyze_live_package(
+            &package,
+            &Materializations::new(&materialized),
+            &nested_packages(&materialized),
+        )
+        .unwrap();
 
         assert!(analysis.source.eval);
     }
@@ -873,13 +951,18 @@ mod tests {
         ];
         let nested = nested_packages(&materialized);
 
-        let analysis =
-            analyze_live_package(&summary_package("kit", false), &materialized, &nested).unwrap();
+        let analysis = analyze_live_package(
+            &summary_package("kit", false),
+            &Materializations::new(&materialized),
+            &nested,
+        )
+        .unwrap();
         let runner = SecuritySummaryPackage {
             version: "2.0.0".to_string(),
             ..summary_package("@scope/runner", false)
         };
-        let runner_analysis = analyze_live_package(&runner, &materialized, &nested).unwrap();
+        let runner_analysis =
+            analyze_live_package(&runner, &Materializations::new(&materialized), &nested).unwrap();
 
         assert!(analysis.source.eval);
         assert!(!analysis.source.child_process);
@@ -914,8 +997,12 @@ mod tests {
         }];
         let nested = nested_packages(&materialized);
 
-        let analysis =
-            analyze_live_package(&summary_package("local", false), &materialized, &nested).unwrap();
+        let analysis = analyze_live_package(
+            &summary_package("local", false),
+            &Materializations::new(&materialized),
+            &nested,
+        )
+        .unwrap();
 
         assert!(!analysis.source.eval);
         assert_eq!(analysis.meta.files_scanned, 1);
