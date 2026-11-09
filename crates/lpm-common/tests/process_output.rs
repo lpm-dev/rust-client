@@ -125,3 +125,33 @@ fn probe_deadline_still_kills_an_owned_root_that_changes_its_group() {
         "probe root outlived the deadline"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_stopped_command_finishes_its_cleanup_within_the_grace_it_is_given() {
+    use lpm_common::process_output::CaptureSession;
+    use std::os::unix::process::ExitStatusExt;
+
+    let cleanup = "trap 'sleep 1; exit 7' TERM; while :; do sleep 0.05; done";
+    for (grace, finished) in [
+        (Duration::from_secs(5), true),
+        (Duration::from_millis(200), false),
+    ] {
+        let started = Instant::now();
+        let output = CaptureSession::default()
+            .capture_output_with_spawn_and_grace(
+                &mut shell(cleanup, ""),
+                1024,
+                |_| (started.elapsed() > Duration::from_millis(300)).then_some(libc::SIGTERM),
+                Command::spawn,
+                grace,
+            )
+            .unwrap();
+
+        if finished {
+            assert_eq!(output.status.code(), Some(7), "{grace:?}");
+        } else {
+            assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{grace:?}");
+        }
+    }
+}

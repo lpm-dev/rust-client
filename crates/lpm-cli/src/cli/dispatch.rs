@@ -364,7 +364,6 @@ async fn async_main(cli: Cli) -> Result<()> {
         lpm_auth::SessionManager::new(session_registry_url.to_string(), explicit_flag_token);
     let session_manager = auth_storage_notice::attach(session_manager, cli.json);
     let session = std::sync::Arc::new(session_manager);
-    let unattended_mcp_serve = matches!(&command, Commands::Mcp(args) if matches!(args.action, commands::mcp::McpAction::Serve));
 
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(session_registry_url.to_string())
@@ -376,16 +375,14 @@ async fn async_main(cli: Cli) -> Result<()> {
     {
         client = client.with_npm_transport_url(npm_transport_url);
     }
-    if !unattended_mcp_serve {
-        client = client.with_session(session.clone());
-    }
+    client = client.with_session(session.clone());
 
     // Step 3 transition bridge: until Step 4 wires posture-aware
     // dispatch through SessionManager, also seed the legacy
     // `with_token` path so existing request methods keep their bearer.
     // SessionManager is the source of truth — this branch goes away
     // once Step 4 lands.
-    if !unattended_mcp_serve && let Some(bearer) = session.current_bearer_for_bridge() {
+    if let Some(bearer) = session.current_bearer_for_bridge() {
         client = client.with_token(bearer);
     }
 
@@ -2105,7 +2102,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             commands::swift_registry::run(&session, registry_url, cli.json, force).await
         },
         Commands::Mcp(args) => {
-            commands::mcp::run(&client, args.action, cli.json).await
+            commands::mcp::run(&client, args.action, cli.json, cli.token.as_deref()).await
         },
         Commands::Use(args) => {
             let lifecycle_args::UseArgs {
@@ -2294,7 +2291,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                     strict_integrity: false,
                     min_release_age_override,
                     min_release_age_exclude: &min_release_age_exclude,
-                    inherit_caller_context: true,
                     reserve_stdout: cli.json,
                 },
             )
@@ -2326,7 +2322,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                     strict_integrity: false,
                     min_release_age_override,
                     min_release_age_exclude: &min_release_age_exclude,
-                    inherit_caller_context: true,
                     reserve_stdout: cli.json,
                 },
             )

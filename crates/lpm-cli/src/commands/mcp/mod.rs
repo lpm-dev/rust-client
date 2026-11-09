@@ -1,19 +1,21 @@
+//! `lpm mcp`: the LPM MCP server, and its entries in editors' configurations.
+
+mod hosted;
+mod local_tools;
+mod serve;
+
 use crate::install_ui;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use lpm_registry::RegistryClient;
 use serde_json::{Map, Value};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-const MCP_PACKAGE: &str = "@lpm-registry/mcp-server";
-const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
-const MCP_VERSION_POLICY: &str = "latest-security-eligible";
-
 #[derive(clap::Subcommand)]
 pub(crate) enum McpAction {
-    /// Configure the Registry server in existing editor configurations.
+    /// Configure the LPM server in existing editor configurations.
     Setup { name: Option<String> },
-    /// Run the managed stdio server for an MCP client.
+    /// Run the stdio server for an MCP client.
     Serve,
     /// Remove a named server from existing editor configurations.
     Remove { name: String },
@@ -21,14 +23,20 @@ pub(crate) enum McpAction {
     Status,
 }
 
+/// `explicit_token` is the `--token` the command runs with, which the
+/// commands `lpm mcp serve` runs for its local tools need too.
 pub async fn run(
     client: &RegistryClient,
     action: McpAction,
     json_output: bool,
+    explicit_token: Option<&str>,
 ) -> Result<(), LpmError> {
     match action {
-        McpAction::Setup { name } => setup(name.as_deref(), json_output).await,
-        McpAction::Serve => serve(client, json_output).await,
+        McpAction::Setup { name } => setup(client, name.as_deref(), json_output).await,
+        McpAction::Serve => {
+            require_stdio_transport(std::io::stdin().is_terminal(), json_output)?;
+            serve::serve(client, explicit_token).await
+        }
         McpAction::Remove { name } => remove(&name, json_output).await,
         McpAction::Status => status(json_output).await,
     }
@@ -141,11 +149,10 @@ fn default_server_config() -> Result<Value, LpmError> {
     let command = executable
         .to_str()
         .ok_or_else(|| LpmError::Registry("MCP launcher path must contain valid UTF-8".into()))?;
-    // Editors and delegated tools must not resolve a project-controlled PATH entry.
+    // Editors must not resolve a project-controlled PATH entry.
     Ok(serde_json::json!({
         "command": command,
         "args": ["mcp", "serve"],
-        "env": { "LPM_CLI_PATH": command },
     }))
 }
 
@@ -165,11 +172,34 @@ fn require_stdio_transport(stdin_is_terminal: bool, json_output: bool) -> Result
     Ok(())
 }
 
-async fn serve(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
-    require_stdio_transport(std::io::stdin().is_terminal(), json_output)?;
-    let workspace = std::env::current_dir().map_err(LpmError::Io)?;
-    let anonymous_client = client.clone_anonymous();
-    crate::commands::run::managed_dlx(&anonymous_client, &workspace, MCP_PACKAGE_SPEC).await
+/// Remove the npm MCP server runtime that `lpm mcp serve` installed before
+/// it served natively. An older `lpm` holds the runtime's lock shared while
+/// it runs that server, so a held lock leaves the runtime for a later run.
+fn remove_retired_runtime() {
+    let Ok(root) = LpmRoot::from_env() else {
+        return;
+    };
+    let runtime = root.retired_mcp_runtime();
+    let Ok(metadata) = std::fs::symlink_metadata(&runtime) else {
+        return;
+    };
+    let lock_path = root.retired_mcp_runtime_lock();
+    let Ok(Some(lock)) = lpm_common::try_acquire_exclusive_lock(&lock_path) else {
+        return;
+    };
+    let removed = if metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata) {
+        std::fs::remove_dir_all(&runtime)
+    } else {
+        std::fs::remove_file(&runtime)
+    };
+    if let Err(error) = removed {
+        tracing::debug!(
+            target: "lpm_cli::mcp",
+            "the retired MCP runtime at {} could not be removed: {error}",
+            runtime.display()
+        );
+    }
+    drop(lock);
 }
 
 fn load_config(path: &Path) -> Result<Value, LpmError> {
@@ -356,7 +386,11 @@ fn status_for_editors(editors: &[EditorConfig]) -> Result<Vec<Value>, LpmError> 
     Ok(results)
 }
 
-async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {
+async fn setup(
+    client: &RegistryClient,
+    server_name: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let name = server_name.unwrap_or("lpm-registry");
     let editors = get_editors()?;
     if !json_output {
@@ -368,13 +402,8 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
         .iter()
         .filter_map(|result| result.configured_name())
         .collect();
-
-    tracing::warn!(
-        target: "lpm_cli::mcp",
-        "MCP setup writes an `lpm mcp serve` autostart. The launcher resolves \
-         {MCP_PACKAGE_SPEC} independently of the editor workspace and applies \
-         LPM's security policy."
-    );
+    remove_retired_runtime();
+    let registry_server = client.hosted_mcp_url();
 
     if json_output {
         println!(
@@ -383,12 +412,9 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
                 "success": true,
                 "server": name,
                 "configured": configured,
-                "package": MCP_PACKAGE,
-                "package_spec": MCP_PACKAGE_SPEC,
-                "version_policy": MCP_VERSION_POLICY,
                 "command": server_config["command"],
                 "args": server_config["args"],
-                "env": server_config["env"],
+                "registry_server": registry_server,
             }))
             .unwrap()
         );
@@ -422,9 +448,10 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
         }
 
         install_ui::done_line(install_ui::TerminalLine::new("Server name: ").yellow(name));
-        install_ui::done_line(install_ui::TerminalLine::new("Package: ").yellow(MCP_PACKAGE_SPEC));
-        install_ui::detail(
-            "  lpm mcp serve runs the newest release allowed by LPM security policy",
+        install_ui::detail_line(
+            install_ui::TerminalLine::new("  Registry tools come from ")
+                .field(&registry_server)
+                .text(", and install, add, and audit run here"),
         );
         install_ui::done("Done · restart your editor to pick up the new MCP server");
     }
@@ -920,16 +947,16 @@ mod tests {
     }
 
     #[test]
-    fn default_server_config_uses_the_isolated_lpm_launcher() {
+    fn default_server_config_runs_this_lpm_binary() {
         let cfg = default_server_config().unwrap();
         let executable = std::env::current_exe().unwrap();
         assert_eq!(cfg["command"], executable.to_str().unwrap());
-        assert_eq!(cfg["env"]["LPM_CLI_PATH"], cfg["command"]);
         assert_eq!(cfg["args"], serde_json::json!(["mcp", "serve"]));
+        assert!(cfg.get("env").is_none());
     }
 
     #[test]
-    fn mcp_serve_refuses_an_interactive_terminal_before_package_resolution() {
+    fn mcp_serve_refuses_an_interactive_terminal() {
         let error = require_stdio_transport(true, false).unwrap_err();
 
         assert!(error.to_string().contains("stdio transport"));
@@ -949,8 +976,8 @@ mod tests {
         let config = serde_json::json!({
             "mcpServers": {
                 "lpm-registry": {
-                    "command": "npx",
-                    "args": ["-y", MCP_PACKAGE_SPEC]
+                    "command": "/usr/local/bin/lpm",
+                    "args": ["mcp", "serve"]
                 }
             }
         });

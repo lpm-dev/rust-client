@@ -132,8 +132,28 @@ impl CaptureSession {
         &mut self,
         command: &mut Command,
         stream_limit: usize,
+        cancellation_signal: impl FnMut(u32) -> Option<i32>,
+        spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+    ) -> io::Result<Output> {
+        self.capture_output_with_spawn_and_grace(
+            command,
+            stream_limit,
+            cancellation_signal,
+            spawn,
+            Duration::from_millis(500),
+        )
+    }
+
+    /// [`Self::capture_output_with_spawn`], giving the process `grace`
+    /// between the cancellation signal and the kill, for a command that
+    /// stops processes of its own when it is signalled.
+    pub fn capture_output_with_spawn_and_grace(
+        &mut self,
+        command: &mut Command,
+        stream_limit: usize,
         mut cancellation_signal: impl FnMut(u32) -> Option<i32>,
         spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+        grace: Duration,
     ) -> io::Result<Output> {
         command
             .stdin(Stdio::null())
@@ -171,7 +191,7 @@ impl CaptureSession {
                 }
                 cancelled_at = Some(Instant::now());
             }
-            if cancelled_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500)) {
+            if cancelled_at.is_some_and(|at| at.elapsed() >= grace) {
                 process.terminate_tree();
                 for previous in &mut self.processes {
                     previous.terminate_tree();
@@ -244,7 +264,7 @@ impl CaptureSession {
             if let Some((status, at)) = exited
                 && ((stdout_eof && stderr_eof && !progressed)
                     || at.elapsed() >= Duration::from_millis(250))
-                && cancelled_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(500))
+                && cancelled_at.is_none_or(|at| at.elapsed() >= grace)
             {
                 process.child.stdout = Some(stdout_pipe);
                 process.child.stderr = Some(stderr_pipe);

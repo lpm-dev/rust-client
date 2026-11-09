@@ -3,8 +3,6 @@
 //! Cache management, package name parsing, and binary execution.
 //! The install step is handled in the CLI layer (self-hosted via LPM's resolver/store/linker).
 
-mod managed;
-
 use crate::bin_path;
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
 use lpm_workspace::read_package_json;
@@ -520,34 +518,6 @@ pub fn exec_dlx_binary(
     extra_args: &[String],
 ) -> Result<(), LpmError> {
     let command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args)?;
-    exec_built_dlx_command(command, package_spec)
-}
-
-/// Validate the managed runtime's selected entrypoint before promoting an installation.
-pub fn validate_managed_runtime_entrypoint(
-    cache_dir: &Path,
-    package_spec: &str,
-) -> Result<(), LpmError> {
-    managed::entrypoint(cache_dir, package_spec).map(|_| ())
-}
-
-/// Execute a verified LPM-owned runtime while preserving the environment
-/// variables that runtime documents as part of its public contract.
-///
-/// This is intentionally narrower than a general allow-list API. Ordinary
-/// `lpm dlx` packages remain fully credential-scrubbed.
-pub fn exec_verified_lpm_runtime(
-    project_dir: &Path,
-    cache_dir: &Path,
-    package_spec: &str,
-    extra_args: &[String],
-) -> Result<(), LpmError> {
-    let mut command = managed::build_command(project_dir, cache_dir, package_spec, extra_args)?;
-    for variable in ["LPM_TOKEN", "LPM_REGISTRY_URL", "LPM_CLI_PATH"] {
-        if let Some(value) = std::env::var_os(variable) {
-            command.env(variable, value);
-        }
-    }
     exec_built_dlx_command(command, package_spec)
 }
 

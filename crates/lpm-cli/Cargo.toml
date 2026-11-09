@@ -64,6 +64,7 @@ httpdate = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+rmcp = { workspace = true }
 serde_yaml = { workspace = true }
 shlex = { workspace = true }
 miette = { workspace = true }

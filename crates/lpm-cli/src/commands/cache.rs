@@ -7,11 +7,10 @@
 //! store` is the single entry point for store maintenance.
 //!
 //! Surface:
-//!   lpm cache clean                 cleans metadata + tasks + dlx + mcp
+//!   lpm cache clean                 cleans metadata + tasks + dlx
 //!   lpm cache clean metadata        cleans one subcategory
 //!   lpm cache clean tasks
 //!   lpm cache clean dlx
-//!   lpm cache clean mcp
 //!   lpm cache path                  prints the cache root
 //!   lpm cache path metadata         prints one subcategory path
 //!   lpm cache status                reports local task cache usage + remote status
@@ -75,7 +74,6 @@ pub(crate) enum CacheCategory {
     Metadata,
     Tasks,
     Dlx,
-    Mcp,
 }
 
 impl CacheCategory {
@@ -84,7 +82,6 @@ impl CacheCategory {
             Self::Metadata => "metadata",
             Self::Tasks => "tasks",
             Self::Dlx => "dlx",
-            Self::Mcp => "mcp",
         }
     }
 
@@ -93,7 +90,6 @@ impl CacheCategory {
             Self::Metadata => root.cache_metadata(),
             Self::Tasks => root.cache_tasks(),
             Self::Dlx => root.cache_dlx(),
-            Self::Mcp => root.cache_mcp(),
         }
     }
 }
@@ -394,11 +390,13 @@ fn resolve_targets(
     category: Option<CacheCategory>,
 ) -> Vec<(&'static str, PathBuf)> {
     match category {
+        // A cleanup of everything also removes the npm MCP runtime an older
+        // `lpm mcp serve` left behind, unless an older `lpm` still runs it.
         None => vec![
             ("metadata", root.cache_metadata()),
             ("tasks", root.cache_tasks()),
             ("dlx", root.cache_dlx()),
-            ("mcp", root.cache_mcp()),
+            ("mcp", root.retired_mcp_runtime()),
         ],
         Some(category) => vec![(category.name(), category.path(root))],
     }
@@ -591,7 +589,7 @@ fn emit_semantic_change_notice() {
 fn semantic_change_notice_details() -> Vec<install_ui::TerminalLine> {
     vec![
         crate::install_ui::terminal_line!(
-            "  {} `lpm cache clean` now cleans metadata, task, dlx, and MCP caches only.",
+            "  {} `lpm cache clean` now cleans metadata, task, and dlx caches only.",
             install_ui::dim("note")
         ),
         crate::install_ui::terminal_line!(
@@ -663,7 +661,6 @@ mod tests {
             (CacheCategory::Metadata, "metadata"),
             (CacheCategory::Tasks, "tasks"),
             (CacheCategory::Dlx, "dlx"),
-            (CacheCategory::Mcp, "mcp"),
         ] {
             let targets = resolve_targets(&root, Some(category));
             assert_eq!(targets.len(), 1);
@@ -682,9 +679,8 @@ mod tests {
         let joined = console::strip_ansi_codes(&joined).into_owned();
 
         assert!(
-            joined.contains(
-                "note `lpm cache clean` now cleans metadata, task, dlx, and MCP caches only."
-            ),
+            joined
+                .contains("note `lpm cache clean` now cleans metadata, task, and dlx caches only."),
             "notice should explain the new cache-clean scope: {joined}"
         );
         assert!(
@@ -702,7 +698,10 @@ mod tests {
         populate(&root.cache_metadata(), &["a.json"]);
         populate(&root.cache_tasks(), &["b.json"]);
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
-        populate(&root.cache_mcp().join("runtime"), &["package.json"]);
+        populate(
+            &root.retired_mcp_runtime().join("runtime"),
+            &["package.json"],
+        );
 
         // Plant store state to prove we DON'T touch it.
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
@@ -712,7 +711,10 @@ mod tests {
         assert!(!root.cache_metadata().exists(), "metadata should be gone");
         assert!(!root.cache_tasks().exists(), "tasks should be gone");
         assert!(!root.cache_dlx().exists(), "dlx should be gone");
-        assert!(!root.cache_mcp().exists(), "mcp should be gone");
+        assert!(
+            !root.retired_mcp_runtime().exists(),
+            "the retired MCP runtime should be gone"
+        );
         assert!(
             root.store_v1().join("react@19.0.0").exists(),
             "store must be untouched"
@@ -727,22 +729,32 @@ mod tests {
         populate(&root.cache_metadata(), &["a.json"]);
         populate(&root.cache_tasks(), &["b.json"]);
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
-        populate(&root.cache_mcp().join("runtime"), &["package.json"]);
+        populate(
+            &root.retired_mcp_runtime().join("runtime"),
+            &["package.json"],
+        );
 
         run_clean(&root, Some(CacheCategory::Metadata), true).unwrap();
 
         assert!(!root.cache_metadata().exists());
         assert!(root.cache_tasks().join("b.json").exists());
         assert!(root.cache_dlx().join("hash1").join("package.json").exists());
-        assert!(root.cache_mcp().join("runtime/package.json").exists());
+        assert!(
+            root.retired_mcp_runtime()
+                .join("runtime/package.json")
+                .exists()
+        );
     }
 
     #[test]
-    fn clean_mcp_refuses_to_delete_an_in_use_runtime() {
+    fn clean_keeps_a_retired_mcp_runtime_an_older_lpm_still_runs() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
-        populate(&root.cache_mcp().join("runtime"), &["package.json"]);
-        let lock_path = root.cache_mcp_lock();
+        populate(
+            &root.retired_mcp_runtime().join("runtime"),
+            &["package.json"],
+        );
+        let lock_path = root.retired_mcp_runtime_lock();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
@@ -754,9 +766,12 @@ mod tests {
         });
         held_rx.recv().unwrap();
 
-        let error = run_clean(&root, Some(CacheCategory::Mcp), true).unwrap_err();
-        assert!(error.to_string().contains("in use"));
-        assert!(root.cache_mcp().join("runtime/package.json").exists());
+        run_clean(&root, None, true).unwrap();
+        assert!(
+            root.retired_mcp_runtime()
+                .join("runtime/package.json")
+                .exists()
+        );
 
         release_tx.send(()).unwrap();
         holder.join().unwrap().unwrap();
@@ -873,15 +888,6 @@ mod tests {
         run(
             CacheCmd::Path {
                 category: Some(CacheCategory::Dlx),
-            },
-            true,
-            None,
-        )
-        .await
-        .unwrap();
-        run(
-            CacheCmd::Path {
-                category: Some(CacheCategory::Mcp),
             },
             true,
             None,

@@ -292,11 +292,16 @@ impl LpmRoot {
         self.cache_root().join("dlx")
     }
 
-    pub fn cache_mcp(&self) -> PathBuf {
+    /// The npm MCP server runtime `lpm mcp serve` installed before it
+    /// served natively. Used only to remove it; do not read or write
+    /// through this path in new code.
+    pub fn retired_mcp_runtime(&self) -> PathBuf {
         self.cache_root().join("mcp")
     }
 
-    pub fn cache_mcp_lock(&self) -> PathBuf {
+    /// The lock an older `lpm` holds shared while it runs
+    /// [`Self::retired_mcp_runtime`].
+    pub fn retired_mcp_runtime_lock(&self) -> PathBuf {
         self.cache_root().join(".mcp.lock")
     }
 
@@ -2085,8 +2090,8 @@ mod tests {
             root.cache_metadata(),
             root.cache_tasks(),
             root.cache_dlx(),
-            root.cache_mcp(),
-            root.cache_mcp_lock(),
+            root.retired_mcp_runtime(),
+            root.retired_mcp_runtime_lock(),
             root.cache_clean_lock(),
             root.legacy_dlx_cache(),
             root.bin_dir(),

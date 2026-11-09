@@ -1,7 +1,8 @@
 //! Workflow tests for `lpm cache clean [subcat]` and `lpm cache path [subcat]`.
 //!
-//! These cover the subcategory dispatch (`metadata` / `tasks` / `dlx` / `mcp`) and
-//! the all-subcategory blanket form. No registry, no network.
+//! These cover the subcategory dispatch (`metadata` / `tasks` / `dlx`) and
+//! the all-subcategory blanket form, which also removes the npm MCP runtime an
+//! older `lpm mcp serve` left behind. No registry, no network.
 
 mod support;
 
@@ -919,18 +920,22 @@ fn cache_path_metadata_subcategory_prints_metadata_dir() {
 }
 
 #[test]
-fn cache_path_mcp_subcategory_prints_managed_runtime_cache_dir() {
+fn cache_path_and_clean_no_longer_take_the_retired_mcp_category() {
     let project = TempProject::empty(r#"{"name":"cache-path","version":"1.0.0"}"#);
+    seed_subcat(&project, "mcp", "runtime.json", &[0xdd; 64]);
 
-    let output = lpm(&project)
-        .args(["cache", "path", "mcp"])
-        .output()
-        .expect("failed to run lpm cache path mcp");
+    for action in ["path", "clean"] {
+        let output = lpm(&project)
+            .args(["cache", action, "mcp"])
+            .output()
+            .expect("failed to run lpm cache with the mcp category");
 
-    assert!(output.status.success(), "lpm cache path mcp failed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = cache_root(&project).join("mcp").display().to_string();
-    assert_eq!(stdout.trim(), expected);
+        assert_eq!(output.status.code(), Some(2), "lpm cache {action} mcp");
+    }
+    assert!(
+        cache_root(&project).join("mcp/runtime.json").exists(),
+        "a refused category must not remove anything"
+    );
 }
 
 #[test]
@@ -949,7 +954,9 @@ fn cache_path_unknown_subcategory_fails_with_helpful_message() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("invalid value") && stderr.contains("values metadata, tasks, dlx, mcp"),
+        stderr.contains("invalid value")
+            && stderr.contains("values metadata, tasks, dlx")
+            && !stderr.contains(", mcp"),
         "stderr must list valid subcategories, got:\n{stderr}"
     );
 }
@@ -986,7 +993,7 @@ fn cache_path_json_envelope_shape_is_stable() {
 // ─── clean subcommand ─────────────────────────────────────────────────
 
 #[test]
-fn cache_clean_blanket_removes_all_four_subcategories() {
+fn cache_clean_blanket_removes_every_category_and_the_retired_mcp_runtime() {
     let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
 
     seed_subcat(&project, "metadata", "pkg-meta.json", b"{\"a\":1}");
@@ -1195,7 +1202,9 @@ fn cache_clean_unknown_subcategory_fails_with_helpful_message() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("invalid value") && stderr.contains("values metadata, tasks, dlx, mcp"),
+        stderr.contains("invalid value")
+            && stderr.contains("values metadata, tasks, dlx")
+            && !stderr.contains(", mcp"),
         "stderr must list valid subcategories, got:\n{stderr}"
     );
 }
@@ -1228,7 +1237,7 @@ fn cache_clean_json_envelope_reports_per_subcategory_freed_bytes() {
     assert_eq!(
         cleaned.len(),
         4,
-        "blanket cache clean must report metadata + tasks + dlx + mcp, got {} entries: {envelope}",
+        "blanket cache clean must report metadata + tasks + dlx + the retired mcp runtime, got {} entries: {envelope}",
         cleaned.len(),
     );
 
@@ -1251,12 +1260,12 @@ fn cache_clean_json_envelope_reports_per_subcategory_freed_bytes() {
 }
 
 #[test]
-fn cache_clean_json_reports_an_in_use_mcp_runtime_as_skipped() {
+fn cache_clean_json_reports_a_retired_mcp_runtime_an_older_lpm_runs_as_skipped() {
     let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
     seed_subcat(&project, "metadata", "a.json", &[0xaa; 100]);
     seed_subcat(&project, "mcp/runtime", "package.json", &[0xdd; 400]);
     let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
-    let lock_path = root.cache_mcp_lock();
+    let lock_path = root.retired_mcp_runtime_lock();
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder = std::thread::spawn(move || {

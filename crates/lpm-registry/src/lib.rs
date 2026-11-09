@@ -12,8 +12,9 @@ pub mod types;
 
 pub use client::{
     BatchMetadataEntryStream, CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats,
-    GateDecision, MANAGED_INSTALL_ACCOUNTING_HEADER, MANAGED_INSTALL_ACCOUNTING_VERSION,
-    MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
+    GateDecision, HostedMcpAnswer, HostedMcpRequest, MANAGED_INSTALL_ACCOUNTING_HEADER,
+    MANAGED_INSTALL_ACCOUNTING_VERSION, MAX_COMPRESSED_TARBALL_SIZE,
+    MAX_COMPRESSED_TARBALL_SPOOL_BYTES, MAX_HOSTED_MCP_RESPONSE_BYTES,
     MAX_MANAGED_POOL_INSTALL_EDGES, MAX_MANAGED_POOL_INSTALL_LPM_NODES,
     MAX_MANAGED_POOL_INSTALL_NODES, ManagedInstallAccounting, ManagedInstallGraph,
     ManagedInstallNode, ManagedInstallRoot, MetadataProjection, NoProjection,

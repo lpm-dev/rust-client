@@ -32,6 +32,7 @@ mod history_cache;
 mod http;
 mod install_accounting;
 mod manifest;
+mod mcp;
 mod metadata;
 mod projection;
 mod public_npm;
@@ -59,6 +60,7 @@ pub use self::install_accounting::{
     ManagedInstallNode, ManagedInstallRoot,
 };
 pub use self::manifest::ManifestVersionMetadata;
+pub use self::mcp::{HostedMcpAnswer, HostedMcpRequest, MAX_HOSTED_MCP_RESPONSE_BYTES};
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::projection::{MetadataProjection, NoProjection, ProjectionSlot, ResolutionMetadata};
 pub use self::public_npm::PublicNpmAccess;
