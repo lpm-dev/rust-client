@@ -83,17 +83,17 @@
 //!
 //!   **Accepted-posture trade-off (H14):** the AF_UNIX carve-out is
 //!   asymmetric with macOS strict (Seatbelt denies every socket
-//!   family). systemd-resolved over the UNIX socket continues to
-//!   resolve from inside the sandbox, and `$SSH_AUTH_SOCK` —
-//!   typically under `/tmp` which is in the read+write allow-list —
-//!   remains reachable. Narrowing to "AF_UNIX only for fd-passing
-//!   inherited from parent" would need a per-syscall socketpair gate
-//!   that landlock+seccomp don't currently offer; the runtime defense
-//!   is the network-containment + project-output-containment posture
-//!   limiting what an in-sandbox AF_UNIX consumer can exfiltrate. A
-//!   later mitigation handle is `[sandbox] unix-socket-denylist`
-//!   listing well-known agent sockets, but it requires per-distro
-//!   path inventory and isn't shipped today.
+//!   family). Any pathname socket the user can connect to stays
+//!   reachable: systemd-resolved, `$SSH_AUTH_SOCK` (typically under
+//!   `/tmp`, which is writable), and daemons that start processes on
+//!   request. The systemd user manager (`/run/user/<uid>/bus`) and a
+//!   Docker socket the user may use can start a process that has
+//!   neither the landlock domain nor the seccomp filters, sits outside
+//!   the process group, and has the network even under strict. Before
+//!   landlock ABI 9 (Linux 7.1, `AccessFs::ResolveUnix`) neither
+//!   landlock nor seccomp can gate `connect(2)` by socket path, so no
+//!   Linux posture closes that today; `lpm doctor` and the rebuild
+//!   docs state it.
 //! - **Degraded** (kernel < 6.7 AND `allow_degraded = true`): probe
 //!   landlock at ABI V1 (filesystem-only). The construction-side
 //!   succeeds when V1 is reachable; the install pipeline emits the
@@ -219,11 +219,12 @@ impl BackendPosture {
     /// the families landlock V4 doesn't reach.
     ///
     /// Only `Strict` returns `true`. `Default` and `Degraded`
-    /// explicitly skip the seccomp layer: `Default` is the
-    /// relaxed posture by design, and `Degraded` only reaches
-    /// V1 (filesystem-only) — adding seccomp without landlock
-    /// V4 would create a Linux strict-posture variant the
-    /// upstream contract doesn't promise.
+    /// skip the socket matrix: `Default` allows network by
+    /// design, and `Degraded` only reaches V1 (filesystem-only) —
+    /// denying UDP without landlock V4's TCP deny would create a
+    /// Linux strict-posture variant the upstream contract doesn't
+    /// promise. Every posture still installs
+    /// [`build_containment_filters`].
     ///
     /// The pre_exec closure consults this predicate to decide
     /// whether to call [`seccompiler::apply_filter`] before
@@ -489,12 +490,11 @@ impl Sandbox for LandlockSandbox {
         // invokes pre_exec once per spawn; the `take().ok_or(...)`
         // path below catches the hypothetical double-invocation.
         let mut ruleset_opt = Some(ruleset);
-        let process_group_filter =
-            crate::seccomp::build_process_group_filters(self.virtualize_self_process_group)
-                .map_err(|error| SandboxError::ProfileRenderFailed {
-                    reason: format!("process containment filter failed: {error}"),
-                })?;
-        let mut process_filters = Some(process_group_filter);
+        let containment_filters = build_containment_filters(self.virtualize_self_process_group)
+            .map_err(|error| SandboxError::ProfileRenderFailed {
+                reason: format!("process containment filter failed: {error}"),
+            })?;
+        let mut process_filters = Some(containment_filters);
         let mut seccomp_opt = seccomp_program;
         let mut overlay_opt = overlay_spec;
         // Strict posture promises TCP-egress denial, so the child must
@@ -825,6 +825,18 @@ fn build_parent_side_ruleset(
     Ok(ruleset)
 }
 
+/// The seccomp filters every enforce posture installs, whatever its network
+/// policy: the process-group lock, the `io_uring` deny and the terminal
+/// input-injection deny.
+fn build_containment_filters(
+    virtualize_self_process_group: bool,
+) -> Result<Vec<seccompiler::BpfProgram>, seccompiler::Error> {
+    let mut filters = crate::seccomp::build_process_group_filters(virtualize_self_process_group)?;
+    filters.push(crate::seccomp::build_io_uring_deny_filter()?);
+    filters.push(crate::seccomp::build_terminal_injection_deny_filter()?);
+    Ok(filters)
+}
+
 fn rule_access_bits(access: RuleAccess, abi: ABI, is_file: bool) -> BitFlags<AccessFs> {
     let valid = if is_file {
         AccessFs::from_file(abi)
@@ -1138,6 +1150,46 @@ mod tests {
         let mut child = sb.spawn(cmd).expect("spawn under enforce");
         let status = child.wait().expect("wait");
         assert!(status.success(), "/usr/bin/true under landlock must exit 0");
+    }
+
+    #[test]
+    fn default_posture_scripts_get_no_io_uring_and_cannot_inject_terminal_input() {
+        // seccomp matches syscall arguments, not the descriptor's type, so
+        // TIOCSTI on fd 0 (here /dev/null) fails with EPERM only when the
+        // filter is installed; without it the kernel answers ENOTTY.
+        let project = tempfile::tempdir().expect("project tempdir");
+        let mut spec = realistic_spec();
+        spec.project_dir = project.path().to_path_buf();
+        let sb = match new_for_platform(spec, SandboxMode::Enforce) {
+            Ok(sb) => sb,
+            Err(SandboxError::KernelTooOld { .. }) => return,
+            Err(e) => panic!("factory failed: {e:?}"),
+        };
+        let probe = format!(
+            "import ctypes, ctypes.util, errno, sys\n\
+             libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)\n\
+             params = ctypes.create_string_buffer(120)\n\
+             if libc.syscall({io_uring_setup}, 4, params) >= 0: sys.exit(1)\n\
+             if ctypes.get_errno() != errno.ENOSYS: sys.exit(2)\n\
+             byte = ctypes.c_char(b'x')\n\
+             if libc.ioctl(0, {tiocsti}, ctypes.byref(byte)) != -1: sys.exit(3)\n\
+             sys.exit(0 if ctypes.get_errno() == errno.EPERM else 4)\n",
+            io_uring_setup = libc::SYS_io_uring_setup,
+            tiocsti = libc::TIOCSTI,
+        );
+        let mut cmd = SandboxedCommand::new("/usr/bin/python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(probe)
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        cmd.stdin = SandboxStdio::Null;
+        let status = sb.spawn(cmd).expect("spawn").wait().expect("wait");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "1: io_uring_setup created a ring; 2: it failed with an errno other than \
+             ENOSYS; 3: TIOCSTI succeeded; 4: TIOCSTI was not refused by the filter"
+        );
     }
 
     #[test]

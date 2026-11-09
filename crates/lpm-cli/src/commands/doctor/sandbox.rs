@@ -187,7 +187,9 @@ pub(super) fn probe_sandbox_backend_with_global(
                     } else {
                         "outbound TCP denial (landlock V4: BindTcp + ConnectTcp) + \
                          direct UDP / raw / AF_PACKET / AF_NETLINK denial \
-                         (seccomp-bpf, 1); AF_UNIX allowed for IPC"
+                         (seccomp-bpf, 1); AF_UNIX sockets stay reachable, including \
+                         local daemons such as the systemd user manager or Docker that \
+                         can start processes outside the sandbox"
                     };
                     Check::pass(
                         &doctor_catalog::SANDBOX_AVAILABLE,

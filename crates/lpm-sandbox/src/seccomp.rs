@@ -63,9 +63,6 @@
 //! - `keyctl(2)` / `add_key(2)` — could manipulate the per-user
 //!   keyring.
 //! - `bpf(2)` (`BPF_PROG_LOAD`) combined with user-ns.
-//! - `io_uring_setup(2)` — landlock awareness was only added in
-//!   kernel ≥ 6.10; older kernels with `io_uring` give the script
-//!   a filesystem I/O channel outside this filter's view.
 //!
 //! `PR_SET_NO_NEW_PRIVS` (issued by `seccompiler::apply_filter`)
 //! blocks setuid escalation but NOT any of the above. The runtime
@@ -82,6 +79,23 @@
 //! syscalls), but the deny-everything default would need a per-
 //! Node-major-version syscall inventory to avoid breaking legitimate
 //! lifecycle scripts.
+//!
+//! # Filters every enforce posture installs
+//!
+//! The socket matrix above is strict-only. These are installed in the
+//! default and degraded postures too, because they keep the filesystem
+//! and process containment honest rather than deny network:
+//!
+//! - [`build_process_group_filters`] keeps every descendant in the
+//!   process group the kill-on-exit path signals.
+//! - [`build_io_uring_deny_filter`] answers the three `io_uring`
+//!   syscalls with `ENOSYS`. A ring's socket, connect, open and send
+//!   operations skip the `socket(2)` the matrix sees, and before kernel
+//!   6.10 the file operations skip landlock too. Runtimes that probe
+//!   for `io_uring` fall back to epoll and their threadpool.
+//! - [`build_terminal_injection_deny_filter`] refuses `TIOCSTI` and
+//!   `TIOCLINUX`, which would let a script type into the user's
+//!   terminal through an inherited descriptor.
 //!
 //! # Async-signal safety
 //!
@@ -361,6 +375,186 @@ mod tests {
         // mirror without breaking compilation.
         #[cfg(target_arch = "x86_64")]
         assert_eq!(X32_SYSCALL_BIT, 0x4000_0000);
+    }
+}
+
+/// Deny the `io_uring` syscalls with `ENOSYS`, as on a kernel built
+/// without it, so callers that probe for it fall back to plain syscalls.
+/// Installed in every enforce posture: a ring's socket, connect, open and
+/// send operations skip the syscalls the socket matrix and pre-6.10
+/// landlock see.
+pub(crate) fn build_io_uring_deny_filter() -> Result<BpfProgram, seccompiler::Error> {
+    let mut rules = BTreeMap::new();
+    for syscall in IO_URING_SYSCALLS {
+        rules.insert(syscall, Vec::new());
+        #[cfg(target_arch = "x86_64")]
+        rules.insert(X32_SYSCALL_BIT | syscall, Vec::new());
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        TARGET_ARCH,
+    )?;
+    Ok(filter.try_into()?)
+}
+
+const IO_URING_SYSCALLS: [i64; 3] = [
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+];
+
+/// Terminal ioctls that push bytes into a terminal's input queue. A script
+/// with the user's terminal on an inherited descriptor could otherwise type
+/// a command the user's shell runs after LPM exits (`TIOCSTI`, which kernels
+/// before 6.2 allow by default), or do the same through the virtual-console
+/// selection paste (`TIOCLINUX`). Matched on the low 32 bits, as the kernel
+/// reads the request as `unsigned int`.
+pub(crate) fn build_terminal_injection_deny_filter() -> Result<BpfProgram, seccompiler::Error> {
+    let rules = TERMINAL_INJECTION_IOCTLS
+        .into_iter()
+        .map(|request| {
+            SeccompRule::new(vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                request,
+            )?])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut by_syscall = BTreeMap::new();
+    by_syscall.insert(libc::SYS_ioctl, rules.clone());
+    #[cfg(target_arch = "x86_64")]
+    by_syscall.insert(X32_SYSCALL_BIT | libc::SYS_ioctl, rules);
+    let filter = SeccompFilter::new(
+        by_syscall,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        TARGET_ARCH,
+    )?;
+    Ok(filter.try_into()?)
+}
+
+// `libc::Ioctl` is `c_ulong` on glibc and `c_int` on musl.
+#[allow(clippy::unnecessary_cast)]
+const TERMINAL_INJECTION_IOCTLS: [u64; 2] = [libc::TIOCSTI as u64, libc::TIOCLINUX as u64];
+
+#[cfg(test)]
+mod containment_filter_tests {
+    use super::*;
+
+    /// Forks a child that installs `program` and returns `probe`'s result as
+    /// its exit status, so the filter never touches the test process.
+    /// `probe` must make only syscalls: it runs after a fork of a
+    /// multithreaded process.
+    fn in_filtered_child(program: &BpfProgram, probe: impl Fn() -> i32) -> i32 {
+        // SAFETY: the child calls only syscalls and `_exit`, and the parent
+        // waits for exactly the child it created.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                if seccompiler::apply_filter(program).is_err() {
+                    libc::_exit(100);
+                }
+                libc::_exit(probe());
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status), "status={status}");
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    fn errno() -> i32 {
+        // SAFETY: errno is thread-local and always readable.
+        unsafe { *libc::__errno_location() }
+    }
+
+    #[test]
+    fn io_uring_setup_reports_enosys_inside_the_filter() {
+        let program = build_io_uring_deny_filter().unwrap();
+        let status = in_filtered_child(&program, || {
+            let mut params = [0_u8; 120];
+            // SAFETY: io_uring_setup reads and writes a 120-byte params struct.
+            let result = unsafe { libc::syscall(libc::SYS_io_uring_setup, 4, params.as_mut_ptr()) };
+            match (result, errno()) {
+                (0.., _) => 1,
+                (_, libc::ENOSYS) => 0,
+                _ => 2,
+            }
+        });
+        assert_eq!(status, 0, "1: a ring was created; 2: the wrong errno");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn x32_io_uring_syscalls_cannot_bypass_the_filter() {
+        let program = build_io_uring_deny_filter().unwrap();
+        let status = in_filtered_child(&program, || {
+            let mut params = [0_u8; 120];
+            // SAFETY: io_uring_setup reads and writes a 120-byte params struct.
+            let result = unsafe {
+                libc::syscall(
+                    X32_SYSCALL_BIT | libc::SYS_io_uring_setup,
+                    4,
+                    params.as_mut_ptr(),
+                )
+            };
+            i32::from(result != -1 || errno() != libc::ENOSYS)
+        });
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn terminal_input_injection_is_denied_but_other_terminal_ioctls_work() {
+        let mut controller = 0;
+        let mut device = 0;
+        // SAFETY: openpty writes two descriptors; the name, termios and
+        // window size inputs are optional and left null.
+        let opened = unsafe {
+            libc::openpty(
+                &mut controller,
+                &mut device,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+        let program = build_terminal_injection_deny_filter().unwrap();
+
+        let status = in_filtered_child(&program, || {
+            let byte = b'x';
+            // SAFETY: TIOCSTI reads one byte through the pointer.
+            if unsafe { libc::ioctl(device, libc::TIOCSTI, &byte) } != -1 {
+                return 1;
+            }
+            if errno() != libc::EPERM {
+                return 2;
+            }
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: TIOCGWINSZ writes one winsize through the pointer.
+            if unsafe { libc::ioctl(device, libc::TIOCGWINSZ, &mut size) } != 0 {
+                return 3;
+            }
+            0
+        });
+        // SAFETY: both descriptors came from openpty above.
+        unsafe {
+            libc::close(device);
+            libc::close(controller);
+        }
+        assert_eq!(
+            status, 0,
+            "1: TIOCSTI injected input; 2: the wrong errno; 3: an ordinary terminal ioctl failed"
+        );
     }
 }
 
