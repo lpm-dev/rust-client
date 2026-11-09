@@ -30,6 +30,11 @@
 use crate::seatbelt;
 use crate::{Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxSpec, SandboxedCommand};
 
+/// `Command` resolves a bare program name against the child's own `PATH`,
+/// which for lifecycle scripts starts with package-writable directories.
+/// Naming the wrapper by bare name would let a package supply the "sandbox".
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
 pub(crate) struct SeatbeltSandbox {
     profile: String,
     mode: SandboxMode,
@@ -89,7 +94,7 @@ impl Sandbox for SeatbeltSandbox {
         // inline, so no temp-file handoff is needed. Env, cwd, and
         // stdio apply to the sandbox-exec process — it inherits them
         // to the ultimate child.
-        let mut command = std::process::Command::new("sandbox-exec");
+        let mut command = std::process::Command::new(SANDBOX_EXEC);
         command.arg("-p").arg(&self.profile);
         command.arg(&cmd.program);
         for a in &cmd.args {
@@ -274,6 +279,39 @@ mod tests {
         let mut child = sb.spawn(cmd).expect("spawn under enforce");
         let status = child.wait().expect("wait");
         assert!(status.success(), "/usr/bin/true under sandbox must exit 0");
+    }
+
+    #[test]
+    fn a_sandbox_exec_on_the_child_path_does_not_replace_the_system_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Lifecycle children get `node_modules/.bin` ahead of the system
+        // directories on PATH, and a dependency controls what lands there.
+        let rs = realistic_spec();
+        let decoy_dir = tempfile::tempdir().unwrap();
+        let marker = decoy_dir.path().join("decoy-ran");
+        let decoy = decoy_dir.path().join("sandbox-exec");
+        std::fs::write(
+            &decoy,
+            format!(
+                "#!/bin/sh\n: > '{}'\nshift 2\nexec \"$@\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let path = format!("{}:/usr/bin:/bin", decoy_dir.path().display());
+        let cmd = SandboxedCommand::new("/usr/bin/true").envs_cleared([("PATH", path)]);
+        let status = sb.spawn(cmd).expect("spawn").wait().expect("wait");
+
+        assert!(status.success());
+        assert!(
+            !marker.exists(),
+            "the sandbox ran a `sandbox-exec` found on the child's PATH instead of \
+             /usr/bin/sandbox-exec, so no profile was applied"
+        );
     }
 
     #[test]

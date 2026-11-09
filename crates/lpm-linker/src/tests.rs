@@ -1080,6 +1080,14 @@ fn bin_name_normal_allowed() {
 }
 
 #[test]
+fn bin_name_naming_the_macos_sandbox_wrapper_is_rejected_in_any_case() {
+    for name in ["sandbox-exec", "Sandbox-Exec", "SANDBOX-EXEC"] {
+        let error = validate_bin_name(name, "pkg").expect_err(name);
+        assert!(error.contains("sandbox"), "{error}");
+    }
+}
+
+#[test]
 fn bin_name_node_warns_but_allowed() {
     // "node" should be allowed (Ok) but logs a warning
     assert!(validate_bin_name("node", "pkg").is_ok());
