@@ -18,14 +18,7 @@ pub(super) fn validate_registry_version(
         .security_findings
         .iter()
         .flatten()
-        .filter_map(|finding| finding.severity.as_deref())
-        .chain(
-            metadata
-                .vulnerabilities
-                .iter()
-                .flatten()
-                .filter_map(|vulnerability| vulnerability.severity.as_deref()),
-        );
+        .filter_map(|finding| finding.severity.as_deref());
     for severity in severities {
         if super::policy::severity_level(severity.trim()) == 0 {
             return Err(lpm_common::LpmError::Registry(format!(
@@ -169,28 +162,5 @@ pub(super) fn collect_registry_issues(
             source: "registry".to_string(),
             ..AuditIssue::default()
         });
-    }
-
-    // Registry-provided vulnerabilities
-    if let Some(vulns) = &ver_meta.vulnerabilities {
-        for vuln in vulns {
-            let id = vuln.id.as_deref().unwrap_or("unknown");
-            let summary = vuln.summary.as_deref().unwrap_or("");
-            let severity = vuln.severity.as_deref().unwrap_or("moderate");
-            issues.push(AuditIssue {
-                severity: severity.trim().to_ascii_lowercase(),
-                message: format!(
-                    "{id}{}",
-                    if summary.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" — {summary}")
-                    }
-                ),
-                category: "vulnerability".to_string(),
-                source: "registry".to_string(),
-                ..AuditIssue::default()
-            });
-        }
     }
 }

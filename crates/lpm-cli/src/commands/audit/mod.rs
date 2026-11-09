@@ -5,6 +5,7 @@ pub mod inventory;
 mod behavior;
 mod fix;
 mod install_summary;
+mod lpm_dependencies;
 mod osv;
 mod policy;
 mod registry;
@@ -34,6 +35,7 @@ use report::{
 
 pub use fix::run_fix;
 pub use install_summary::{print_install_summary, run_install_summary, summarize_registry_install};
+pub(crate) use lpm_dependencies::lpm_versions_with_vulnerable_dependencies;
 pub(crate) use osv::query_vulnerable_versions;
 pub(crate) use policy::AuditLevel;
 pub use secrets::run_secrets;
@@ -266,25 +268,18 @@ pub async fn run(
 
     // ── Exit code: non-zero based on --fail-on policy ──
     let has_vulns = !osv_vulns.is_empty();
-    let has_registry_vulns = results
-        .iter()
-        .any(|r| r.issues.iter().any(|i| i.category == "vulnerability"));
     // Critical behaviors: obfuscation, protestware (always a failure signal)
-    let has_critical_behavior = results.iter().any(|r| {
-        r.issues
-            .iter()
-            .any(|i| i.severity == "critical" && i.category != "vulnerability")
-    });
+    let has_critical_behavior = results
+        .iter()
+        .any(|r| r.issues.iter().any(|i| i.severity == "critical"));
     // High behaviors: eval, child_process, shell, dynamic_require
     // Only triggers failure when --fail-on behavior or --fail-on all is explicit
-    let has_high_behavior = results.iter().any(|r| {
-        r.issues
-            .iter()
-            .any(|i| i.severity == "high" && i.category != "vulnerability")
-    });
+    let has_high_behavior = results
+        .iter()
+        .any(|r| r.issues.iter().any(|i| i.severity == "high"));
 
     let should_fail = match fail_policy {
-        FailPolicy::Vuln => has_vulns || has_registry_vulns,
+        FailPolicy::Vuln => has_vulns,
         FailPolicy::Behavior => has_critical_behavior || has_high_behavior,
         FailPolicy::Secrets => false,
         // Default (All): critical behaviors + vulns. High behaviors only
@@ -293,10 +288,10 @@ pub async fn run(
         FailPolicy::All => {
             if fail_on.is_some() {
                 // Explicit --fail-on all: include high behaviors
-                has_vulns || has_critical_behavior || has_high_behavior || has_registry_vulns
+                has_vulns || has_critical_behavior || has_high_behavior
             } else {
                 // Implicit default: backward-compatible (critical + vulns only)
-                has_vulns || has_critical_behavior || has_registry_vulns
+                has_vulns || has_critical_behavior
             }
         }
     };

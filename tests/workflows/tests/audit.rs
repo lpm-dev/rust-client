@@ -9,6 +9,11 @@ mod support;
 
 mod audit_contract;
 
+use support::lpm_dependency_advisory::{
+    ADVISORY, DEPENDENCY, STALE_REGISTRY_ADVISORY, WRAPPER, WrapperRelease,
+    answer_osv_for_dependency, dependency_advisory, install_wrapper_with_npm_dependency,
+    wrapper_project,
+};
 use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json, make_tarball_with_files,
@@ -335,7 +340,7 @@ async fn install_one_with_pkg_json(
         .success();
 }
 
-async fn mount_registry_advisory(mock: &MockRegistry, package: &str, summary: &str) {
+async fn mount_registry_finding(mock: &MockRegistry, package: &str, description: &str) {
     let ndjson = format!(
         "{}\n",
         serde_json::json!({
@@ -348,10 +353,9 @@ async fn mount_registry_advisory(mock: &MockRegistry, package: &str, summary: &s
                         "name": package,
                         "version": "1.0.0",
                         "dependencies": {},
-                        "_vulnerabilities": [{
-                            "id": "REGISTRY-ESCAPE",
-                            "summary": summary,
-                            "severity": "high"
+                        "_securityFindings": [{
+                            "severity": "critical",
+                            "description": description
                         }]
                     }
                 }
@@ -1058,7 +1062,7 @@ async fn audit_fails_on_the_same_registry_tag_outside_tests() {
 }
 
 #[tokio::test]
-async fn audit_registry_advisory_sanitizes_human_output_and_preserves_json_value() {
+async fn audit_registry_finding_sanitizes_human_output_and_preserves_json_value() {
     let package = "@lpm.dev/test.audit-terminal-boundary";
     let summary = "safe advisory\nFORGED-LINE\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
     let project = TempProject::empty(&format!(
@@ -1066,7 +1070,7 @@ async fn audit_registry_advisory_sanitizes_human_output_and_preserves_json_value
     ));
     let mock = MockRegistry::start().await;
     install_one(&project, &mock, package).await;
-    mount_registry_advisory(&mock, package, summary).await;
+    mount_registry_finding(&mock, package, summary).await;
     mock.with_osv_querybatch(vec![vec![]]).await;
 
     let osv_url = format!("{}/v1/querybatch", mock.url());
@@ -1079,7 +1083,10 @@ async fn audit_registry_advisory_sanitizes_human_output_and_preserves_json_value
     let human = human_command
         .output()
         .expect("failed to spawn colored lpm audit");
-    assert!(!human.status.success(), "high advisory must fail audit");
+    assert!(
+        !human.status.success(),
+        "a critical registry finding must fail audit"
+    );
     let rendered = format!(
         "{}{}",
         String::from_utf8_lossy(&human.stdout),
@@ -1110,14 +1117,14 @@ async fn audit_registry_advisory_sanitizes_human_output_and_preserves_json_value
     }
 
     let json = run_audit_json(&project, &mock, &[]);
-    assert!(!json.status.success(), "high advisory must fail JSON audit");
+    assert!(
+        !json.status.success(),
+        "a critical registry finding must fail JSON audit"
+    );
     assert!(json.stderr.is_empty(), "JSON audit must not write stderr");
     let envelope: serde_json::Value = serde_json::from_slice(&json.stdout)
         .unwrap_or_else(|error| panic!("audit JSON must parse: {error}"));
-    assert_eq!(
-        envelope["packages"][0]["issues"][0]["message"],
-        format!("REGISTRY-ESCAPE — {summary}")
-    );
+    assert_eq!(envelope["packages"][0]["issues"][0]["message"], summary);
 }
 
 #[tokio::test]
@@ -2317,54 +2324,192 @@ async fn audit_fix_fails_when_vulnerable_direct_dependency_has_ambiguous_source(
 }
 
 #[tokio::test]
-async fn audit_fix_plans_lpm_registry_advisory_remediation() {
-    let package = "@lpm.dev/test.audit-fix";
-    let project = TempProject::empty(&format!(
-        r#"{{"name":"audit-fix-lpm","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
-    ));
+async fn audit_reports_an_lpm_dependency_advisory_once_and_ignores_stale_registry_advisories() {
+    let project = wrapper_project("1.0.0");
     let mock = MockRegistry::start().await;
-    let vulnerable = make_tarball(package, "1.0.0");
-    let fixed = make_tarball(package, "1.0.1");
-    let metadata = serde_json::json!({
-        "name": package,
-        "dist-tags": {"latest": "1.0.1"},
-        "versions": {
-            "1.0.0": {
-                "name": package,
-                "version": "1.0.0",
-                "dist": {
-                    "tarball": format!("{}{}", mock.url(), MockRegistry::tarball_path(package, "1.0.0")),
-                    "integrity": support::mock_registry::compute_integrity(&vulnerable)
-                },
-                "_vulnerabilities": [{"id": "LPM-ADV-1", "summary": "test", "severity": "high"}]
-            },
-            "1.0.1": {
-                "name": package,
-                "version": "1.0.1",
-                "dist": {
-                    "tarball": format!("{}{}", mock.url(), MockRegistry::tarball_path(package, "1.0.1")),
-                    "integrity": support::mock_registry::compute_integrity(&fixed)
-                }
-            }
-        }
-    });
-    mock.with_package_metadata_and_tarballs(
-        package,
-        metadata,
-        &[("1.0.0", vulnerable), ("1.0.1", fixed)],
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+        }],
+        true,
     )
     .await;
-    lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills"])
-        .assert()
-        .success();
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let out = run_audit_json(&project, &mock, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|error| panic!("audit JSON must parse ({error}):\n{stdout}"));
+
+    assert!(!out.status.success(), "a critical advisory must fail audit");
+    assert_eq!(envelope["osv_vulnerabilities"], 1, "{envelope:#}");
+    assert_eq!(envelope["counts"]["critical"], 1, "{envelope:#}");
+    assert_eq!(
+        envelope["vulnerabilities"][0]["package"], DEPENDENCY,
+        "{envelope:#}"
+    );
+    assert!(
+        !stdout.contains(STALE_REGISTRY_ADVISORY),
+        "a registry advisory the registry no longer serves must not be reported:\n{stdout}"
+    );
+    assert!(
+        envelope["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|package| {
+                package["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|issue| issue["category"] != "vulnerability")
+            }),
+        "an advisory is reported under the npm package it affects, not again under the LPM package: {envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_ignores_registry_advisories_for_lpm_packages() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.1",
+            },
+        ],
+        true,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![]).await;
 
     let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
-    assert!(out.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(envelope["planned"], 1);
-    assert_eq!(envelope["packages"][0]["to"], "1.0.1");
-    assert_eq!(envelope["packages"][0]["vulnerabilities"][0], "LPM-ADV-1");
+
+    assert!(out.status.success(), "{envelope:#}");
+    assert_eq!(envelope["planned"], 0, "{envelope:#}");
+}
+
+#[tokio::test]
+async fn audit_fix_upgrades_an_lpm_package_past_the_advisory_on_its_npm_dependency() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.1",
+            },
+        ],
+        false,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert!(out.status.success(), "{envelope:#}");
+    assert_eq!(envelope["planned"], 1, "{envelope:#}");
+    assert_eq!(envelope["packages"][0]["name"], WRAPPER, "{envelope:#}");
+    assert_eq!(envelope["packages"][0]["to"], "1.0.1", "{envelope:#}");
+    assert_eq!(
+        envelope["packages"][0]["vulnerabilities"],
+        serde_json::json!([ADVISORY]),
+        "{envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_skips_an_lpm_package_whose_newer_releases_still_install_the_advisory() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "~1.0.0 <1.0.1",
+            },
+        ],
+        false,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert!(!out.status.success(), "{envelope:#}");
+    assert_eq!(envelope["planned"], 0, "{envelope:#}");
+    assert_eq!(envelope["skipped"][0]["name"], WRAPPER, "{envelope:#}");
+    assert!(
+        envelope["skipped"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no verified non-vulnerable version")),
+        "{envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_installs_the_lpm_upgrade_and_verifies_its_npm_dependency() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.1",
+            },
+        ],
+        false,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+    answer_osv_for_dependency(&mock, "1.0.1", vec![]).await;
+
+    let out = run_audit_json(&project, &mock, &["fix"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["dependencies"][WRAPPER], "1.0.1", "{manifest:#}");
 }
 
 #[tokio::test]

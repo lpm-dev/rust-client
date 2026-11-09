@@ -153,7 +153,7 @@ fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetada
                 has_install_script: None,
                 security_findings: None,
                 quality_score: None,
-                vulnerabilities: None,
+                legacy_vulnerabilities: None,
                 publication_status: None,
             },
         );

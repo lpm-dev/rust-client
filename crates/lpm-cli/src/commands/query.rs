@@ -281,13 +281,8 @@ pub async fn run(
     };
 
     let external_state = if requirements.vulnerabilities || requirements.deprecations {
-        let package_pairs = inv
-            .discovery
-            .packages
-            .iter()
-            .map(|package| (package.name.clone(), package.version.clone()))
-            .collect::<Vec<_>>();
-        load_external_package_state(client, project_root, &package_pairs, requirements).await?
+        load_external_package_state(client, project_root, &inv.discovery.packages, requirements)
+            .await?
     } else {
         ExternalPackageState::default()
     };
@@ -839,10 +834,13 @@ struct ExternalPackageState {
     deprecated_versions: HashMap<String, HashSet<String>>,
 }
 
+/// Which installed versions are vulnerable or deprecated. OSV answers for npm
+/// packages; an `@lpm.dev` package is vulnerable when OSV flags an npm
+/// package it depends on directly, at the installed version.
 async fn load_external_package_state(
     client: &RegistryClient,
     project_dir: &Path,
-    packages: &[(String, String)],
+    packages: &[crate::commands::audit::discovery::DiscoveredPackage],
     requirements: QueryDataRequirements,
 ) -> Result<ExternalPackageState, LpmError> {
     if !requirements.vulnerabilities && !requirements.deprecations {
@@ -853,11 +851,10 @@ async fn load_external_package_state(
     let mut registry_pairs = Vec::with_capacity(packages.len());
     let mut osv_seen = HashSet::with_capacity(packages.len());
     let mut osv_pairs = Vec::with_capacity(packages.len());
-    for (name, version) in packages {
+    for package in packages {
+        let (name, version) = (&package.name, &package.version);
         let is_lpm_package = name.starts_with("@lpm.dev/");
-        if (requirements.deprecations || requirements.vulnerabilities && is_lpm_package)
-            && registry_seen.insert((name.as_str(), version.as_str()))
-        {
+        if requirements.deprecations && registry_seen.insert((name.as_str(), version.as_str())) {
             registry_pairs.push((name.clone(), version.clone()));
         }
         if requirements.vulnerabilities
@@ -878,6 +875,16 @@ async fn load_external_package_state(
         }
     };
     let (mut state, osv_vulnerable_versions) = tokio::try_join!(registry_future, osv_future)?;
+    for (name, version) in crate::commands::audit::lpm_versions_with_vulnerable_dependencies(
+        packages,
+        &osv_vulnerable_versions,
+    ) {
+        state
+            .vulnerable_versions
+            .entry(name)
+            .or_default()
+            .insert(version);
+    }
     for (name, versions) in osv_vulnerable_versions {
         state
             .vulnerable_versions
@@ -971,19 +978,6 @@ async fn load_registry_package_state(
                 "registry metadata for {name} does not include installed version {version}; query results would be incomplete"
             ))
         })?;
-        if requirements.vulnerabilities
-            && name.starts_with("@lpm.dev/")
-            && version_metadata
-                .vulnerabilities
-                .as_ref()
-                .is_some_and(|vulnerabilities| !vulnerabilities.is_empty())
-        {
-            state
-                .vulnerable_versions
-                .entry(name.clone())
-                .or_default()
-                .insert(version.clone());
-        }
         if requirements.deprecations
             && registry_deprecation_is_active(version_metadata.deprecated.as_ref())
         {

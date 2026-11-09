@@ -1528,9 +1528,9 @@ mod tests {
     // ── collect_registry_warnings tests ──────────────────────────────
 
     #[test]
-    fn ordinary_install_registry_warnings_ignore_vulnerability_advisories() {
+    fn ordinary_install_registry_warnings_ignore_a_cached_registry_advisory() {
         let ver_meta = lpm_registry::VersionMetadata {
-            vulnerabilities: Some(vec![
+            legacy_vulnerabilities: Some(vec![
                 lpm_registry::Vulnerability {
                     id: Some("CVE-2021-1234".into()),
                     summary: Some("test vuln".into()),
@@ -1551,7 +1551,7 @@ mod tests {
 
         assert!(
             counts.lifecycle_scripts.is_empty(),
-            "ordinary install must leave vulnerability advisories to audit-after-install"
+            "ordinary install must leave vulnerabilities to audit-after-install's OSV scan"
         );
     }
 

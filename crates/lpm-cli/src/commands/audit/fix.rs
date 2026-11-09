@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::{PackageMetadata, RegistryClient};
-use lpm_semver::Version;
+use lpm_registry::{PackageMetadata, RegistryClient, VersionMetadata};
+use lpm_semver::{Version, VersionReq};
 
 use crate::install_ui;
 use crate::npm_public_source::{
@@ -11,6 +11,7 @@ use crate::npm_public_source::{
 };
 
 use super::discovery::{self, ManagerKind};
+use super::lpm_dependencies::{DependencyAdvisory, LpmDependencyAdvisories};
 use super::osv::{OsvVulnerability, run_osv_scan};
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,9 @@ async fn run_fix_inner(
             .push(vuln);
     }
 
+    let lpm_advisories = LpmDependencyAdvisories::new(&discovery.packages, &osv_outcome.vulns);
+    let mut dependency_metadata = HashMap::new();
+
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
     let root_index = LockfileRootIndex::new(Some(lockfile));
@@ -140,6 +144,15 @@ async fn run_fix_inner(
         };
         let installed_version = &locked_package.version;
         let is_lpm_package = target_name.starts_with("@lpm.dev/");
+        let lpm_dependency_advisories = if is_lpm_package {
+            let advisories = lpm_advisories.of(target_name, installed_version);
+            if advisories.is_empty() {
+                continue;
+            }
+            advisories
+        } else {
+            &[]
+        };
         let npm_vulns = if is_lpm_package {
             None
         } else {
@@ -191,17 +204,13 @@ async fn run_fix_inner(
         }
 
         let (target, vulnerability_ids) = if is_lpm_package {
-            let Some(version_metadata) = metadata.version(installed_version) else {
+            if metadata.version(installed_version).is_none() {
                 skipped.push(AuditFixSkipped {
                     name: dep.local_name,
                     reason: format!(
                         "registry metadata omitted installed version {target_name}@{installed_version}"
                     ),
                 });
-                continue;
-            };
-            let vulnerability_ids = lpm_vulnerability_ids(version_metadata);
-            if vulnerability_ids.is_empty() {
                 continue;
             }
             if let Some(reason) = dep.unsupported_reason.clone() {
@@ -211,8 +220,18 @@ async fn run_fix_inner(
                 });
                 continue;
             }
-            match choose_lpm_audit_fix_target(target_name, installed_version, &metadata) {
-                Ok(target) => (target, vulnerability_ids),
+            match choose_lpm_audit_fix_target(
+                client,
+                lockfile,
+                target_name,
+                installed_version,
+                &metadata,
+                lpm_dependency_advisories,
+                &mut dependency_metadata,
+            )
+            .await
+            {
+                Ok(target) => (target, advisory_ids(lpm_dependency_advisories)),
                 Err(reason) => {
                     skipped.push(AuditFixSkipped {
                         name: dep.local_name,
@@ -621,10 +640,20 @@ fn choose_audit_fix_target(
     ))
 }
 
-fn choose_lpm_audit_fix_target(
+/// The first release of an LPM package newer than the installed one that
+/// leaves every advisory on the installed release's npm dependencies: it no
+/// longer depends on the affected package, or the version a fresh install
+/// picks for its range is outside each advisory. `lpm audit fix` installs
+/// without the lockfile, so the fresh pick is what lands; verification then
+/// asks OSV about the installed tree again.
+async fn choose_lpm_audit_fix_target(
+    client: &RegistryClient,
+    lockfile: &lpm_lockfile::Lockfile,
     package: &str,
     installed_version: &str,
     metadata: &PackageMetadata,
+    advisories: &[DependencyAdvisory<'_>],
+    dependency_metadata: &mut HashMap<String, PackageMetadata>,
 ) -> Result<String, String> {
     let installed = Version::parse(installed_version)
         .map_err(|error| format!("installed version '{installed_version}' is invalid: {error}"))?;
@@ -635,35 +664,163 @@ fn choose_lpm_audit_fix_target(
         .filter(|version| !version.is_prerelease() && version > &installed)
         .collect();
     candidates.sort();
-    for candidate in candidates {
+
+    let mut by_dependency: BTreeMap<&str, Vec<&DependencyAdvisory<'_>>> = BTreeMap::new();
+    for advisory in advisories {
+        by_dependency
+            .entry(advisory.dependency)
+            .or_default()
+            .push(advisory);
+    }
+
+    'candidates: for candidate in candidates {
         let candidate = candidate.to_string();
-        let Some(version) = metadata.version(&candidate) else {
+        let Some(release) = metadata.version(&candidate) else {
             continue;
         };
-        super::registry::validate_registry_version(package, &candidate, version)
+        super::registry::validate_registry_version(package, &candidate, release)
             .map_err(|error| error.to_string())?;
-        if lpm_vulnerability_ids(version).is_empty() {
-            return Ok(candidate);
+        for (dependency, dependency_advisories) in &by_dependency {
+            let Some(range) = declared_range(release, dependency) else {
+                continue;
+            };
+            let installed_dependency = dependency_advisories[0].version;
+            let dependency_metadata = locked_dependency_metadata(
+                client,
+                lockfile,
+                dependency,
+                installed_dependency,
+                dependency_metadata,
+            )
+            .await?;
+            let Some(picked) = version_a_fresh_install_picks(dependency_metadata, range) else {
+                continue 'candidates;
+            };
+            for advisory in dependency_advisories {
+                if advisory.vulnerability.affects_version(&picked)? {
+                    continue 'candidates;
+                }
+            }
         }
+        return Ok(candidate);
     }
     Err(format!(
         "registry has no verified non-vulnerable version of '{package}' newer than {installed_version}"
     ))
 }
 
-fn lpm_vulnerability_ids(metadata: &lpm_registry::VersionMetadata) -> Vec<String> {
-    metadata
-        .vulnerabilities
-        .as_deref()
-        .unwrap_or_default()
+/// The range `release` gives `dependency`, directly or through an npm alias,
+/// or `None` when it no longer depends on it.
+fn declared_range<'a>(release: &'a VersionMetadata, dependency: &str) -> Option<&'a str> {
+    for specs in [
+        &release.dependencies,
+        &release.optional_dependencies,
+        &release.peer_dependencies,
+    ] {
+        if let Some(spec) = specs.get(dependency) {
+            match npm_alias(spec) {
+                Some((target, range)) if target == dependency => return Some(range),
+                Some(_) => {}
+                None => return Some(spec),
+            }
+        }
+        if let Some(range) = specs
+            .values()
+            .filter_map(|spec| npm_alias(spec))
+            .find_map(|(target, range)| (target == dependency).then_some(range))
+        {
+            return Some(range);
+        }
+    }
+    None
+}
+
+/// The package and range of an `npm:<package>@<range>` alias.
+fn npm_alias(spec: &str) -> Option<(&str, &str)> {
+    let aliased = spec
+        .strip_prefix("npm:")
+        .filter(|aliased| !aliased.is_empty())?;
+    match aliased[1..].find('@') {
+        Some(at) => Some((&aliased[..=at], &aliased[at + 2..])),
+        None => Some((aliased, "")),
+    }
+}
+
+/// The version an install without a lockfile picks for `range`: the one
+/// `range` names as a dist-tag, the `latest` tag when it satisfies the range,
+/// as npm and LPM prefer, or else the newest satisfying version.
+fn version_a_fresh_install_picks(metadata: &PackageMetadata, range: &str) -> Option<String> {
+    let range = range.trim();
+    if let Some(tagged) = metadata.dist_tags.get(range) {
+        return Some(tagged.clone());
+    }
+    let requirement = VersionReq::parse(if range.is_empty() { "*" } else { range }).ok()?;
+    if let Some(latest) = metadata
+        .dist_tags
+        .get("latest")
+        .filter(|latest| metadata.versions.contains_key(latest.as_str()))
+        .and_then(|latest| Version::parse(latest).ok())
+        .filter(|latest| requirement.matches(latest))
+    {
+        return Some(latest.to_string());
+    }
+    let versions: Vec<Version> = metadata
+        .versions
+        .keys()
+        .filter_map(|version| Version::parse(version).ok())
+        .collect();
+    let versions: Vec<&Version> = versions.iter().collect();
+    lpm_semver::max_satisfying(&versions, &requirement).map(ToString::to_string)
+}
+
+/// The npm metadata of an installed dependency, read once per name, from the
+/// source its lockfile entries name. A source that is neither public npm nor
+/// the configured registry is refused, so the name isn't disclosed elsewhere.
+async fn locked_dependency_metadata<'cache>(
+    client: &RegistryClient,
+    lockfile: &lpm_lockfile::Lockfile,
+    dependency: &str,
+    version: &str,
+    cache: &'cache mut HashMap<String, PackageMetadata>,
+) -> Result<&'cache PackageMetadata, String> {
+    if !cache.contains_key(dependency) {
+        let start = lockfile
+            .packages
+            .partition_point(|locked| locked.name.as_str() < dependency);
+        let mut sources = lockfile.packages[start..]
+            .iter()
+            .take_while(|locked| locked.name == dependency)
+            .filter(|locked| locked.version == version)
+            .map(|locked| locked_package_npm_metadata_source(locked, client));
+        let source = match (sources.next(), sources.all(|other| other.is_some())) {
+            (Some(Some(source)), true) => source,
+            (None, _) => {
+                return Err(format!(
+                    "lpm.lock has no entry for dependency {dependency}@{version}"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "lockfile source of dependency {dependency} is not public npm or the configured LPM registry; refusing to disclose the name to npm metadata endpoints"
+                ));
+            }
+        };
+        let metadata = fetch_audit_fix_metadata(client, dependency, Some(source))
+            .await
+            .map_err(|error| {
+                format!("metadata lookup for dependency {dependency} failed: {error}")
+            })?;
+        cache.insert(dependency.to_string(), metadata);
+    }
+    Ok(&cache[dependency])
+}
+
+fn advisory_ids(advisories: &[DependencyAdvisory<'_>]) -> Vec<String> {
+    advisories
         .iter()
-        .enumerate()
-        .map(|(index, vulnerability)| {
-            vulnerability
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("unknown-{}", index + 1))
-        })
+        .map(|advisory| advisory.vulnerability.id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -787,6 +944,7 @@ async fn verify_audit_fixes(
             )
         })
         .collect();
+    let lpm_advisories = LpmDependencyAdvisories::new(&discovery.packages, &osv_outcome.vulns);
 
     for fix in fixes {
         if fix.target_name.starts_with("@lpm.dev/") {
@@ -799,13 +957,22 @@ async fn verify_audit_fixes(
                 ))
             })?;
             super::registry::validate_registry_version(&fix.target_name, &fix.to, version)?;
-            let remaining = lpm_vulnerability_ids(version);
+            let remaining = lpm_advisories.of(&fix.target_name, &fix.to);
             if !remaining.is_empty() {
+                let found = remaining
+                    .iter()
+                    .map(|advisory| {
+                        format!(
+                            "{} in {}@{}",
+                            advisory.vulnerability.id, advisory.dependency, advisory.version
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 return Err(LpmError::Script(format!(
-                    "audit fix verification found {}@{} still vulnerable: {}",
+                    "audit fix verification found {}@{} still installs a vulnerable dependency: {}",
                     fix.target_name,
                     fix.to,
-                    remaining.join(", ")
+                    found.join(", ")
                 )));
             }
         } else if remaining_osv.contains(&(fix.target_name.as_str(), fix.to.as_str())) {
@@ -918,6 +1085,108 @@ fn audit_fix_remove_optional_file(path: &Path) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release(dependencies: &[(&str, &str)], peers: &[(&str, &str)]) -> VersionMetadata {
+        let specs = |entries: &[(&str, &str)]| {
+            entries
+                .iter()
+                .map(|(name, spec)| (name.to_string(), spec.to_string()))
+                .collect()
+        };
+        VersionMetadata {
+            dependencies: specs(dependencies),
+            peer_dependencies: specs(peers),
+            ..Default::default()
+        }
+    }
+
+    fn packument(latest: &str, versions: &[&str], tags: &[(&str, &str)]) -> PackageMetadata {
+        let mut dist_tags = serde_json::Map::new();
+        dist_tags.insert("latest".into(), latest.into());
+        for (tag, version) in tags {
+            dist_tags.insert((*tag).into(), (*version).into());
+        }
+        let versions: serde_json::Map<String, serde_json::Value> = versions
+            .iter()
+            .map(|version| {
+                (
+                    version.to_string(),
+                    serde_json::json!({ "name": "dep", "version": version }),
+                )
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "name": "dep",
+            "dist-tags": dist_tags,
+            "versions": versions
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn npm_alias_reads_plain_and_scoped_targets() {
+        assert_eq!(npm_alias("npm:lodash@^4.17.0"), Some(("lodash", "^4.17.0")));
+        assert_eq!(npm_alias("npm:@types/node@20"), Some(("@types/node", "20")));
+        assert_eq!(npm_alias("npm:lodash"), Some(("lodash", "")));
+        assert_eq!(npm_alias("npm:"), None);
+        assert_eq!(npm_alias("^4.17.0"), None);
+    }
+
+    #[test]
+    fn declared_range_follows_aliases_and_peers_and_reports_a_dropped_dependency() {
+        let direct = release(&[("lodash", "^4.17.21")], &[]);
+        assert_eq!(declared_range(&direct, "lodash"), Some("^4.17.21"));
+
+        let aliased = release(&[("lo", "npm:lodash@~4.17.21")], &[]);
+        assert_eq!(declared_range(&aliased, "lodash"), Some("~4.17.21"));
+
+        let renamed = release(&[("lodash", "npm:lodash-es@4")], &[]);
+        assert_eq!(declared_range(&renamed, "lodash"), None);
+
+        let peer = release(&[], &[("react", ">=18")]);
+        assert_eq!(declared_range(&peer, "react"), Some(">=18"));
+
+        assert_eq!(declared_range(&release(&[], &[]), "lodash"), None);
+    }
+
+    #[test]
+    fn a_fresh_install_prefers_latest_then_the_newest_satisfying_version() {
+        let metadata = packument("1.2.0", &["1.0.0", "1.1.0", "1.2.0", "2.0.0"], &[]);
+        assert_eq!(
+            version_a_fresh_install_picks(&metadata, "^1.0.0").as_deref(),
+            Some("1.2.0")
+        );
+        assert_eq!(
+            version_a_fresh_install_picks(&metadata, "^2.0.0").as_deref(),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            version_a_fresh_install_picks(&metadata, "~1.1.0").as_deref(),
+            Some("1.1.0")
+        );
+        assert_eq!(
+            version_a_fresh_install_picks(&metadata, "").as_deref(),
+            Some("1.2.0")
+        );
+        assert_eq!(version_a_fresh_install_picks(&metadata, "^3.0.0"), None);
+        assert_eq!(
+            version_a_fresh_install_picks(&metadata, "git+https://x"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_resolves_a_dist_tag_range() {
+        let metadata = packument(
+            "1.2.0",
+            &["1.2.0", "2.0.0-beta.1"],
+            &[("next", "2.0.0-beta.1")],
+        );
+        assert_eq!(
+            version_a_fresh_install_picks(&metadata, "next").as_deref(),
+            Some("2.0.0-beta.1")
+        );
+    }
 
     #[test]
     fn audit_fix_range_pins_npm_alias_to_planned_target() {

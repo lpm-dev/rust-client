@@ -4,10 +4,10 @@ expression: "&envelope[\"audit_summary\"]"
 ---
 {
   "packages_audited": 1,
-  "vulnerabilities": 2,
+  "vulnerabilities": 0,
   "suspicious": 0,
   "severity_counts": {
-    "critical": 3,
+    "critical": 2,
     "high": 0,
     "moderate": 0,
     "low": 0,
@@ -24,15 +24,8 @@ expression: "&envelope[\"audit_summary\"]"
     {
       "package": "@lpm.dev/test.audit-critical-parity",
       "version": "1.0.0",
-      "message": "LPM-ADV-CRITICAL-A — first critical advisory",
-      "category": "vulnerability",
-      "source": "registry"
-    },
-    {
-      "package": "@lpm.dev/test.audit-critical-parity",
-      "version": "1.0.0",
-      "message": "LPM-ADV-CRITICAL-B — second critical advisory",
-      "category": "vulnerability",
+      "message": "second critical registry analysis finding",
+      "category": "security",
       "source": "registry"
     }
   ],

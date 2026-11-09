@@ -7,6 +7,10 @@ mod install_save_policy;
 mod support;
 
 use support::assertions;
+use support::lpm_dependency_advisory::{
+    STALE_REGISTRY_ADVISORY, WrapperRelease, answer_osv_for_dependency, dependency_advisory,
+    mount_wrapper_with_npm_dependency, wrapper_project,
+};
 use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json, make_tarball_with_files,
@@ -1854,40 +1858,22 @@ async fn install_osv_outage_suppresses_audit_after_install_summary() {
 }
 
 #[tokio::test]
-async fn install_audit_after_install_counts_lpm_registry_advisories() {
+async fn install_audit_after_install_counts_an_lpm_dependency_advisory_once() {
     let mock = MockRegistry::start().await;
-    let package = "@lpm.dev/test.audit-after-install";
-    let tarball = make_tarball(package, "1.0.0");
-    let metadata = serde_json::json!({
-        "name": package,
-        "dist-tags": {"latest": "1.0.0"},
-        "versions": {
-            "1.0.0": {
-                "name": package,
-                "version": "1.0.0",
-                "dist": {
-                    "tarball": format!(
-                        "{}{}",
-                        mock.url(),
-                        MockRegistry::tarball_path(package, "1.0.0")
-                    ),
-                    "integrity": compute_integrity(&tarball)
-                },
-                "_vulnerabilities": [{
-                    "id": "LPM-ADV-INSTALL",
-                    "summary": "test advisory",
-                    "severity": "high"
-                }]
-            }
-        }
-    });
-    mock.with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
-        .await;
+    mount_wrapper_with_npm_dependency(
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+        }],
+        true,
+    )
+    .await;
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+    let project = wrapper_project("1.0.0");
 
-    let project = TempProject::empty(&format!(
-        r#"{{"name":"audit-lpm-advisory","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
-    ));
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "install",
             "--audit-after-install",
@@ -1900,8 +1886,12 @@ async fn install_audit_after_install_counts_lpm_registry_advisories() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "install must succeed: {stderr}");
     assert!(
-        stderr.contains("1 vulnerability"),
-        "LPM registry advisory must be included in the install audit count: {stderr}"
+        stderr.contains("1 vulnerability") && stderr.contains("1 critical"),
+        "the advisory on the LPM package's npm dependency counts once: {stderr}"
+    );
+    assert!(
+        !stderr.contains(STALE_REGISTRY_ADVISORY),
+        "a registry advisory the registry no longer serves must not be shown: {stderr}"
     );
 }
 
@@ -1992,22 +1982,21 @@ async fn install_audit_after_install_preserves_individual_critical_findings() {
                     ),
                     "integrity": compute_integrity(&tarball)
                 },
-                "_vulnerabilities": [
+                "_vulnerabilities": [{
+                    "id": "LPM-ADV-CRITICAL-CACHED",
+                    "summary": "a registry advisory no longer served",
+                    "severity": "critical"
+                }],
+                "_securityFindings": [
                     {
-                        "id": "LPM-ADV-CRITICAL-A",
-                        "summary": "first critical advisory",
-                        "severity": "critical"
+                        "severity": "critical",
+                        "description": "critical registry analysis finding"
                     },
                     {
-                        "id": "LPM-ADV-CRITICAL-B",
-                        "summary": "second critical advisory",
-                        "severity": "critical"
+                        "severity": "critical",
+                        "description": "second critical registry analysis finding"
                     }
-                ],
-                "_securityFindings": [{
-                    "severity": "critical",
-                    "description": "critical registry analysis finding"
-                }]
+                ]
             }
         }
     });
@@ -2030,17 +2019,19 @@ async fn install_audit_after_install_preserves_individual_critical_findings() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "install must succeed: {stderr}");
     for expected in [
-        "2 vulnerabilities",
-        "3 critical",
-        "LPM-ADV-CRITICAL-A",
-        "LPM-ADV-CRITICAL-B",
+        "2 critical",
         "critical registry analysis finding",
+        "second critical registry analysis finding",
     ] {
         assert!(
             stderr.contains(expected),
             "audit-after-install must preserve {expected:?}: {stderr}"
         );
     }
+    assert!(
+        !stderr.contains("LPM-ADV-CRITICAL-CACHED"),
+        "a registry advisory the registry no longer serves must not be shown: {stderr}"
+    );
 
     let json_project = TempProject::empty(&format!(
         r#"{{"name":"audit-critical-parity-json","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#

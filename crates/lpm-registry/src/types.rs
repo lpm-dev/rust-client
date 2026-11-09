@@ -210,11 +210,15 @@ pub struct VersionMetadata {
     #[serde(default, rename = "_qualityScore")]
     pub quality_score: Option<u32>,
 
+    /// Per-release OSV results, which the registry no longer serves and the
+    /// CLI never reads: OSV results go stale, so `lpm audit` and `lpm query`
+    /// ask OSV about the installed tree instead. Kept, in place, so metadata
+    /// cached by earlier CLIs keeps its positional MessagePack layout.
     #[serde(default, rename = "_vulnerabilities")]
-    pub vulnerabilities: Option<Vec<Vulnerability>>,
+    pub legacy_vulnerabilities: Option<Vec<Vulnerability>>,
 }
 
-/// Known vulnerability from OSV database (stored server-side on publish).
+/// An entry of the `_vulnerabilities` list the registry once served.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vulnerability {
     #[serde(default)]
@@ -708,8 +712,7 @@ impl VersionMetadata {
             .lifecycle_scripts
             .as_ref()
             .is_some_and(|s| !s.is_empty());
-        let has_vulns = self.vulnerabilities.as_ref().is_some_and(|v| !v.is_empty());
-        has_findings || has_dangerous_tags || has_lifecycle || has_vulns
+        has_findings || has_dangerous_tags || has_lifecycle
     }
 
     /// Returns the ecosystem, checking both _ecosystem and lpmConfig.ecosystem.
@@ -2050,6 +2053,17 @@ mod tests {
         )
         .unwrap();
         assert!(ran.has_security_issues());
+    }
+
+    #[test]
+    fn a_cached_registry_advisory_is_not_a_security_issue() {
+        let cached: VersionMetadata = serde_json::from_str(
+            r#"{"name":"kit","version":"1.0.0","_vulnerabilities":[{"id":"GHSA-old","severity":"critical"}]}"#,
+        )
+        .unwrap();
+
+        assert!(cached.legacy_vulnerabilities.is_some());
+        assert!(!cached.has_security_issues());
     }
 
     #[test]

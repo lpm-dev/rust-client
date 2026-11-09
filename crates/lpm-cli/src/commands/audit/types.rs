@@ -5,7 +5,8 @@ use super::osv::OsvVulnerability;
 pub struct AuditCounts {
     /// Total packages discovered + checked in this run.
     pub packages_audited: usize,
-    /// OSV and LPM registry vulnerabilities across the discovered tree.
+    /// OSV advisories across the discovered tree. One affecting an `@lpm.dev`
+    /// package's dependency counts once, under the npm package it affects.
     pub vulnerabilities: usize,
     /// Packages with actionable behavioral findings, excluding source capabilities.
     pub suspicious: usize,

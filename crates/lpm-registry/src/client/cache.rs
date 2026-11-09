@@ -1870,7 +1870,7 @@ mod metadata_cache_schema_tests {
             has_install_script: _,
             security_findings: _,
             quality_score: _,
-            vulnerabilities: _,
+            legacy_vulnerabilities: _,
             publication_status: _,
         } = metadata;
     }

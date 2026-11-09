@@ -104,7 +104,7 @@ pub(super) struct VersionMetadataWire<const OMIT_DEV: bool = false> {
     quality_score: Option<u32>,
 
     #[serde(default, rename = "_vulnerabilities")]
-    vulnerabilities: Option<Vec<Vulnerability>>,
+    legacy_vulnerabilities: Option<Vec<Vulnerability>>,
     #[serde(
         default,
         rename = "bundledDependencies",
@@ -161,7 +161,7 @@ impl<const OMIT_DEV: bool> TryFrom<VersionMetadataWire<OMIT_DEV>> for VersionMet
             has_install_script: wire.has_install_script,
             security_findings: wire.security_findings,
             quality_score: wire.quality_score,
-            vulnerabilities: wire.vulnerabilities,
+            legacy_vulnerabilities: wire.legacy_vulnerabilities,
         })
     }
 }
