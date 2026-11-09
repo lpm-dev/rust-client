@@ -42,7 +42,7 @@ pub(super) async fn serve(
             client,
             explicit_token.map(str::to_owned),
         ),
-        tools_changed: Arc::new(tokio::sync::watch::Sender::new(())),
+        tools_changed: Arc::new(tokio::sync::watch::Sender::new(0)),
         recovering: Arc::new(AtomicBool::new(false)),
     };
     let running = server
@@ -60,9 +60,9 @@ pub(super) async fn serve(
 struct LpmServer {
     hosted: Arc<HostedRegistry>,
     local: LocalTools,
-    /// Signalled when the registry's tools arrive after a listing went
+    /// How many times the registry's tools arrived after a listing went
     /// without them, for `subscriptions/listen` streams.
-    tools_changed: Arc<tokio::sync::watch::Sender<()>>,
+    tools_changed: Arc<tokio::sync::watch::Sender<u64>>,
     /// Whether the registry's tools are being asked for again.
     recovering: Arc<AtomicBool>,
 }
@@ -88,7 +88,7 @@ impl LpmServer {
                 wait = (wait * 2).min(RECOVERY_LONGEST_WAIT);
             }
             recovering.store(false, Ordering::Release);
-            tools_changed.send_replace(());
+            tools_changed.send_modify(|arrivals| *arrivals += 1);
             // A 2026-07-28 client hears of the change on its listen stream;
             // an earlier one takes the notification unscoped.
             let earlier_revision = peer.peer_info().is_some_and(|info| {
@@ -169,6 +169,13 @@ impl ServerHandler for LpmServer {
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         let mut changes = self.tools_changed.subscribe();
+        // A stream opened after the registry's tools arrived hears of them at
+        // once: its client may hold a listing from before they did.
+        if *changes.borrow_and_update() > 0
+            && context.sink().notify_tool_list_changed().await.is_err()
+        {
+            return Ok(());
+        }
         loop {
             tokio::select! {
                 () = context.cancelled() => return Ok(()),

@@ -583,6 +583,10 @@ impl McpServer {
     /// The next notification with `method`, including one already read
     /// while waiting for a response.
     fn notification(&mut self, method: &str) -> Value {
+        self.notification_within(method, ANSWER_TIMEOUT)
+    }
+
+    fn notification_within(&mut self, method: &str, timeout: Duration) -> Value {
         if let Some(index) = self
             .notifications
             .iter()
@@ -590,8 +594,14 @@ impl McpServer {
         {
             return self.notifications.remove(index);
         }
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            let message = self.next_message(method);
+            let line = self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|_| panic!("no {method} arrived within {timeout:?}"));
+            let message: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|error| panic!("stdout must carry only JSON-RPC: {error}: {line}"));
             if message["method"] == method {
                 return message;
             }
@@ -1155,4 +1165,37 @@ async fn mcp_serve_stops_a_running_command_when_the_editor_disconnects() {
         disconnected.elapsed()
     );
     assert!(status.success(), "{stderr}");
+}
+
+#[tokio::test]
+async fn mcp_serve_tells_a_listen_stream_opened_after_the_registry_tools_arrived() {
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    mount_slow_then_prompt_listing(&registry, Duration::from_secs(60)).await;
+    let mut server = McpServer::start_stateless(&project, &registry.url());
+    assert_eq!(server.tool_names(), ["lpm_install", "lpm_add", "lpm_audit"]);
+    let deadline = std::time::Instant::now() + ANSWER_TIMEOUT;
+    while server.tool_names().len() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the registry tools never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Past the server's first retry, so the tools have been announced before
+    // the stream opens.
+    std::thread::sleep(Duration::from_secs(4));
+
+    let listen = server.send_request(
+        "subscriptions/listen",
+        &mut json!({ "notifications": { "toolsListChanged": true } }),
+    );
+    server.notification("notifications/subscriptions/acknowledged");
+    let changed =
+        server.notification_within("notifications/tools/list_changed", Duration::from_secs(10));
+
+    assert_eq!(
+        changed["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(listen)
+    );
 }

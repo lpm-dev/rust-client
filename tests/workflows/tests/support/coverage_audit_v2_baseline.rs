@@ -2878,7 +2878,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 130: lpm mcp setup / serve / remove / status ──
     SurfaceV2 {
         id: 130,
-        scenarios: 27,
+        scenarios: 28,
         failure_modes_tested: &[
             "status on fresh home succeeds",
             "status JSON envelope is valid JSON",
@@ -2895,6 +2895,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "serve announces late registry tools, unscoped and on a listen stream",
             "serve reads public data again after lpm logout",
             "serve stops a running command when the editor disconnects",
+            "serve tells a listen stream opened after the registry tools arrived",
         ],
         failure_modes_known: &[
             "editor config permission denied",
@@ -2904,7 +2905,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "serve cancellation reaching a Windows process tree",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/mcp.rs", 27)],
+        scenarios_by_file: &[("tests/workflows/tests/mcp.rs", 28)],
         last_audited_at: "2026-11-09",
     },
     // ── id 131: lpm use node@<v> ──
