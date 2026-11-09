@@ -343,6 +343,47 @@ impl RegistryClient {
             .await
     }
 
+    // ─── npm Account Endpoints ──────────────────────────────────────
+
+    /// Get a token to publish to npm in `@<npm user>/lpm-verify`, which
+    /// proves the account owns that npm account.
+    ///
+    /// Posture: `SessionRequired`: only an `lpm login` session can prove an
+    /// npm account, never a project or CI token.
+    ///
+    /// Calls: POST /api/registry/-/npm-verification/token
+    pub async fn npm_verification_token(&self) -> Result<NpmVerificationToken, LpmError> {
+        let url = format!("{}/api/registry/-/npm-verification/token", self.base_url);
+        let value = self
+            .post_session_json(&url, &serde_json::json!({}), "npm verification token")
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| LpmError::Registry(format!("unexpected npm verification token: {e}")))
+    }
+
+    /// Ask the Registry to check the proof package `npm_username` published.
+    /// A refusal keeps its code, such as `PACKAGE_NOT_FOUND` while npm
+    /// hasn't served the package yet.
+    ///
+    /// Posture: `SessionRequired`.
+    ///
+    /// Calls: POST /api/registry/-/npm-verification/verify
+    pub async fn npm_verification_verify(
+        &self,
+        npm_username: &str,
+    ) -> Result<NpmVerificationResult, LpmError> {
+        let url = format!("{}/api/registry/-/npm-verification/verify", self.base_url);
+        let value = self
+            .post_session_json(
+                &url,
+                &serde_json::json!({ "npmUsername": npm_username }),
+                "npm verification",
+            )
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| LpmError::Registry(format!("unexpected npm verification result: {e}")))
+    }
+
     // ─── Auth Endpoints ─────────────────────────────────────────────
 
     /// Get current user info.

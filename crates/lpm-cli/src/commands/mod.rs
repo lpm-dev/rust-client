@@ -94,6 +94,7 @@ pub mod upgrade;
 pub mod r#use;
 pub mod use_ui;
 pub mod vault;
+pub mod verify_npm;
 pub mod version;
 pub mod web_auth;
 pub mod whoami;

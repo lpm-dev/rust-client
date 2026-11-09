@@ -1123,7 +1123,7 @@ fn can_handle_interactive_challenge(
 }
 
 /// Prompt the user for an npm OTP code.
-fn prompt_npm_otp() -> Result<String, LpmError> {
+pub(crate) fn prompt_npm_otp() -> Result<String, LpmError> {
     let code: String = cliclack::input("npm one-time password")
         .validate(|input: &String| {
             if input.len() == 6 && input.chars().all(|c| c.is_ascii_digit()) {
@@ -1138,7 +1138,10 @@ fn prompt_npm_otp() -> Result<String, LpmError> {
 }
 
 /// Detect if an HTTP response indicates OTP is required.
-fn is_otp_required(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
+pub(crate) fn is_otp_required(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED
         && headers
             .get("www-authenticate")

@@ -2349,3 +2349,88 @@ async fn publish_approved_package_reports_a_refused_approval_instead_of_a_sign_i
 
     assert!(matches!(result, Err(LpmError::Registry(text)) if text == message));
 }
+
+#[tokio::test]
+async fn npm_verification_token_reads_the_token_and_the_name_the_account_waits_for() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-verification/token"))
+        .and(header("authorization", "Bearer session-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "a".repeat(32),
+            "expiresAt": "2026-11-10T12:00:00.000Z",
+            "packageName": "lpm-verify",
+            "field": "lpmVerification",
+            "username": null,
+            "npmUsername": null,
+            "pendingUsername": "blake-regalia",
+            "pendingUsernameNpmAccounts": ["blake.regalia"],
+            "weeklyDownloadThreshold": 10000,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let issued = client.npm_verification_token().await.unwrap();
+
+    assert_eq!(issued.token, "a".repeat(32));
+    assert_eq!(issued.field, "lpmVerification");
+    assert_eq!(issued.pending_username.as_deref(), Some("blake-regalia"));
+    assert_eq!(issued.pending_username_npm_accounts, ["blake.regalia"]);
+}
+
+#[tokio::test]
+async fn npm_verification_verify_sends_the_npm_username_and_keeps_a_refusal_s_code() {
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-verification/verify"))
+        .and(body_json(
+            serde_json::json!({ "npmUsername": "blake.regalia" }),
+        ))
+        .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+            "code": "PACKAGE_NOT_FOUND",
+            "error": "npm doesn't have the package yet.",
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-verification/verify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "npmUsername": "blake.regalia",
+            "username": "blake-regalia",
+            "claimed": "blake-regalia",
+            "taken": null,
+            "unclaimable": null,
+        })))
+        .mount(&server)
+        .await;
+
+    let refusal = client
+        .npm_verification_verify("blake.regalia")
+        .await
+        .unwrap_err();
+    let LpmError::RegistryHttp(answer) = refusal else {
+        panic!("expected the Registry's refusal, got {refusal:?}");
+    };
+    assert_eq!(
+        (answer.status, answer.code.as_deref()),
+        (422, Some("PACKAGE_NOT_FOUND"))
+    );
+
+    let proved = client
+        .npm_verification_verify("blake.regalia")
+        .await
+        .unwrap();
+    assert_eq!(proved.claimed.as_deref(), Some("blake-regalia"));
+}
