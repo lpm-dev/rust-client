@@ -617,6 +617,57 @@ fn cleanup_advice(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Tone {
+    Done,
+    Warn,
+    Detail,
+}
+
+/// What the proof did to the account's username, and how the account can
+/// still get the name held for the npm account, one line each.
+fn username_lines(proof: &NpmVerificationResult) -> Vec<(Tone, String)> {
+    let held = proof.held_name.as_ref().filter(|_| proof.claimed.is_none());
+    let mut lines = Vec::new();
+    if let Some(name) = &proof.claimed {
+        lines.push((Tone::Done, format!("Your username is now {name}")));
+    } else if let Some(name) = &proof.locked
+        && held.is_none_or(|held| &held.name != name)
+    {
+        lines.push((
+            Tone::Warn,
+            format!(
+                "You published under your current username, so it can't change to {name} any more."
+            ),
+        ));
+    } else if let Some(name) = &proof.taken {
+        lines.push((
+            Tone::Warn,
+            format!("{name} was taken before you finished. Choose another username in your LPM.dev settings."),
+        ));
+    } else if let Some(name) = &proof.unclaimable {
+        lines.push((
+            Tone::Warn,
+            format!("{name} isn't held for this npm account, so you're still waiting for it."),
+        ));
+    }
+    if let Some(held) = held {
+        let name = &held.name;
+        lines.push(if held.username_locked {
+            (
+                Tone::Warn,
+                format!("{name} is held for this npm account, but your username can't change because you've published under it. To use {name}, unlink this npm account in your LPM.dev settings and prove it from another LPM.dev account."),
+            )
+        } else {
+            (
+                Tone::Detail,
+                format!("{name} is held for this npm account. To use it, change your username in your LPM.dev settings."),
+            )
+        });
+    }
+    lines
+}
+
 fn report(
     proof: &NpmVerificationResult,
     package_name: &str,
@@ -637,6 +688,7 @@ fn report(
             "taken": proof.taken,
             "unclaimable": proof.unclaimable,
             "locked": proof.locked,
+            "heldName": proof.held_name,
             "package": package_name,
             "version": version,
             "unpublished": matches!(cleanup, Cleanup::Removed),
@@ -653,20 +705,12 @@ fn report(
         "Proved the npm account {}",
         lpm_common::sanitize_terminal_inline(&proof.npm_username)
     ));
-    if let Some(name) = &proof.claimed {
-        install_ui::done_untrusted(&format!("Your username is now {name}"));
-    } else if let Some(name) = &proof.locked {
-        install_ui::warn_untrusted(&format!(
-            "You published under your current username, so it can't change to {name} any more."
-        ));
-    } else if let Some(name) = &proof.taken {
-        install_ui::warn_untrusted(&format!(
-            "{name} was taken before you finished. Choose another username in your LPM.dev settings."
-        ));
-    } else if let Some(name) = &proof.unclaimable {
-        install_ui::warn_untrusted(&format!(
-            "{name} isn't held for this npm account, so you're still waiting for it."
-        ));
+    for (tone, line) in username_lines(proof) {
+        match tone {
+            Tone::Done => install_ui::done_untrusted(&line),
+            Tone::Warn => install_ui::warn_untrusted(&line),
+            Tone::Detail => install_ui::detail_untrusted(&line),
+        }
     }
     match unpublish_error {
         None => install_ui::done_untrusted(&format!("Removed {package_name}@{version} from npm")),
@@ -683,6 +727,88 @@ mod tests {
     use std::io::Read as _;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn proved(username: &str) -> NpmVerificationResult {
+        NpmVerificationResult {
+            npm_username: "sindresorhus".into(),
+            username: Some(username.into()),
+            claimed: None,
+            taken: None,
+            unclaimable: None,
+            locked: None,
+            held_name: None,
+        }
+    }
+
+    fn held(username_locked: bool) -> lpm_registry::NpmHeldName {
+        lpm_registry::NpmHeldName {
+            name: "sindresorhus".into(),
+            username_locked,
+        }
+    }
+
+    #[test]
+    fn tells_a_locked_account_how_another_account_can_take_the_held_name() {
+        let proof = NpmVerificationResult {
+            held_name: Some(held(true)),
+            ..proved("tolga")
+        };
+
+        assert_eq!(
+            username_lines(&proof),
+            vec![(
+                Tone::Warn,
+                "sindresorhus is held for this npm account, but your username can't change because you've published under it. To use sindresorhus, unlink this npm account in your LPM.dev settings and prove it from another LPM.dev account.".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn tells_an_account_that_can_rename_which_name_its_npm_account_holds() {
+        let proof = NpmVerificationResult {
+            held_name: Some(held(false)),
+            ..proved("tolga")
+        };
+
+        assert_eq!(
+            username_lines(&proof),
+            vec![(
+                Tone::Detail,
+                "sindresorhus is held for this npm account. To use it, change your username in your LPM.dev settings.".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn says_once_that_a_locked_username_can_t_take_the_name_it_waited_for() {
+        let proof = NpmVerificationResult {
+            locked: Some("sindresorhus".into()),
+            held_name: Some(held(true)),
+            ..proved("tolga")
+        };
+
+        let lines = username_lines(&proof);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].1.contains("prove it from another LPM.dev account"));
+    }
+
+    #[test]
+    fn reports_the_claimed_name_alone() {
+        let proof = NpmVerificationResult {
+            claimed: Some("sindresorhus".into()),
+            ..proved("sindresorhus")
+        };
+
+        assert_eq!(
+            username_lines(&proof),
+            vec![(Tone::Done, "Your username is now sindresorhus".to_string())]
+        );
+    }
+
+    #[test]
+    fn says_nothing_about_the_username_when_the_proof_changed_nothing() {
+        assert!(username_lines(&proved("tolga")).is_empty());
+    }
 
     fn issued() -> NpmVerificationToken {
         NpmVerificationToken {

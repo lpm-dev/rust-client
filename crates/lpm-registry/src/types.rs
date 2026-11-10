@@ -1015,6 +1015,21 @@ pub struct NpmVerificationResult {
     /// because it published under its current one.
     #[serde(default)]
     pub locked: Option<String>,
+    /// The name held for the proved npm account, when the account doesn't
+    /// have it and no other account, organization or tunnel does.
+    #[serde(default)]
+    pub held_name: Option<NpmHeldName>,
+}
+
+/// A name LPM.dev holds for an npm account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmHeldName {
+    pub name: String,
+    /// The account published under its username, so only another account
+    /// that proves the npm account can take the name.
+    #[serde(default)]
+    pub username_locked: bool,
 }
 
 // ─── Auth ──────────────────────────────────────────────────────────
