@@ -1297,6 +1297,61 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn instance(n: u8) -> lpm_common::PackageInstanceId {
+        lpm_common::PackageInstanceId::parse(&format!("{n:064x}")).unwrap()
+    }
+
+    fn locked_at(id: u8, name: &str, version: &str) -> lpm_lockfile::LockedPackage {
+        lpm_lockfile::LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            instance_id: Some(instance(id)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn installed_dependencies_name_the_rows_an_edge_installs_peers_included() {
+        let dep = locked_at(2, "dep-pkg", "1.0.0");
+        let react = locked_at(3, "react", "18.0.0");
+        let mut wrapper = locked_at(1, "@lpm.dev/acme.ui", "1.0.0");
+        wrapper.dependencies = vec!["legacy@1.0.0".into()];
+        wrapper.dependency_targets = BTreeMap::from([("legacy".to_string(), instance(2))]);
+        wrapper.peer_edges = vec![lpm_common::PeerEdge::registry("react", "react", "18.0.0")];
+        wrapper.peer_targets = BTreeMap::from([("react".to_string(), instance(3))]);
+        let by_instance = HashMap::from([(instance(2), &dep), (instance(3), &react)]);
+
+        assert_eq!(
+            installed_dependencies(&wrapper, &by_instance),
+            [
+                ("dep-pkg".to_string(), "1.0.0".to_string()),
+                ("react".to_string(), "18.0.0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_dependencies_fall_back_to_the_edges_of_a_lockfile_without_targets() {
+        let mut wrapper = locked_at(1, "@lpm.dev/acme.ui", "1.0.0");
+        wrapper.instance_id = None;
+        wrapper.dependencies = vec![
+            "legacy@1.0.0".into(),
+            "@scope/name@2.0.0".into(),
+            "@1.0.0".into(),
+        ];
+        wrapper.alias_dependencies = vec![["legacy".into(), "dep-pkg".into()]];
+        wrapper.peer_edges = vec![lpm_common::PeerEdge::registry("r", "react", "18.0.0")];
+
+        assert_eq!(
+            installed_dependencies(&wrapper, &HashMap::new()),
+            [
+                ("@scope/name".to_string(), "2.0.0".to_string()),
+                ("dep-pkg".to_string(), "1.0.0".to_string()),
+                ("react".to_string(), "18.0.0".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn npm_lockfile_preserves_dependency_edges() {
         let dir = tempfile::tempdir().unwrap();

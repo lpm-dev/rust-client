@@ -205,6 +205,22 @@ impl OsvVulnerability {
         }
     }
 
+    /// The advisory affecting every version of its package before `fixed`.
+    #[cfg(test)]
+    pub(super) fn fixed_in(mut self, fixed: &str) -> Self {
+        self.affected = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": { "name": self.package, "ecosystem": "npm" },
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": fixed }]
+                }]
+            }))
+            .expect("an OSV affected entry"),
+        ];
+        self
+    }
+
     pub(super) fn affects_version(&self, version: &str) -> Result<bool, String> {
         evaluate_affected_ranges(&self.affected, &self.package, version)?.ok_or_else(|| {
             format!(

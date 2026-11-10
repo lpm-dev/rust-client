@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{PackageMetadata, RegistryClient, VersionMetadata};
-use lpm_semver::{Version, VersionReq};
+use lpm_resolver::{NpmRange, NpmVersion};
+use lpm_semver::Version;
 
 use crate::install_ui;
 use crate::npm_public_source::{
@@ -148,7 +149,7 @@ async fn run_fix_inner(
         let installed_version = &locked_package.version;
         let is_lpm_package = target_name.starts_with("@lpm.dev/");
         let lpm_dependency_advisories = if is_lpm_package {
-            let advisories = lpm_advisories.of(target_name, installed_version);
+            let advisories = lpm_advisories.of(locked_package);
             if advisories.is_empty() {
                 continue;
             }
@@ -639,11 +640,68 @@ fn choose_audit_fix_target(
     ))
 }
 
-/// A dependency's npm metadata, with its versions parsed once.
+/// A dependency's npm metadata, with its versions parsed once as the
+/// resolver parses them.
 struct DependencyVersions {
     metadata: PackageMetadata,
     /// Every version that parses, newest first.
-    versions: Vec<Version>,
+    versions: Vec<NpmVersion>,
+    /// The `latest` tag, when it names a published version.
+    latest: Option<NpmVersion>,
+}
+
+impl DependencyVersions {
+    fn new(metadata: PackageMetadata) -> Self {
+        let mut versions: Vec<NpmVersion> = metadata
+            .versions
+            .keys()
+            .filter_map(|version| NpmVersion::parse(version).ok())
+            .collect();
+        versions.sort_unstable_by(|left, right| right.cmp(left));
+        let latest = metadata
+            .dist_tags
+            .get("latest")
+            .filter(|latest| metadata.versions.contains_key(latest.as_str()))
+            .and_then(|latest| NpmVersion::parse(latest).ok());
+        Self {
+            metadata,
+            versions,
+            latest,
+        }
+    }
+}
+
+/// A range as the resolver reads it against one dependency's dist-tags: a
+/// dist-tag range allows only its tagged version, and `latest` the stable
+/// versions up to the tag.
+struct InstallRange {
+    range: NpmRange,
+    tagged: Option<NpmVersion>,
+}
+
+impl InstallRange {
+    fn new(dependency: &DependencyVersions, raw: &str) -> Option<Self> {
+        let range = NpmRange::parse_registry_spec(raw).ok()?;
+        let tagged = match range.dist_tag() {
+            Some("latest") => dependency.latest.clone(),
+            Some(tag) => dependency
+                .metadata
+                .dist_tags
+                .get(tag)
+                .and_then(|version| NpmVersion::parse(version).ok()),
+            None => None,
+        };
+        Some(Self { range, tagged })
+    }
+
+    fn allows(&self, version: &NpmVersion) -> bool {
+        self.range
+            .satisfies_with_dist_tag(version, self.tagged.as_ref())
+    }
+
+    fn prefers_latest(&self) -> bool {
+        self.range.dist_tag().is_none_or(|tag| tag == "latest")
+    }
 }
 
 /// The dependencies' metadata read so far, by name and by the source their
@@ -708,20 +766,19 @@ async fn choose_lpm_audit_fix_target(
                 cache,
             )
             .await?;
-            let kept: &[&str] = if keeps_lockfile {
-                &installed_versions.iter().copied().collect::<Vec<_>>()
+            let kept: Vec<&str> = if keeps_lockfile {
+                installed_versions.iter().copied().collect()
             } else {
-                &[]
+                Vec::new()
             };
-            for range in &ranges {
-                let Some(picked) = version_an_install_picks(versions, range, kept) else {
-                    continue 'candidates;
-                };
-                for advisory in dependency_advisories {
-                    if advisory.vulnerability.affects_version(&picked)? {
-                        continue 'candidates;
-                    }
-                }
+            if !installs_no_affected_version(
+                &ranges,
+                versions,
+                &locked_versions(lockfile, dependency),
+                &kept,
+                dependency_advisories,
+            )? {
+                continue 'candidates;
             }
         }
         return Ok(candidate);
@@ -731,67 +788,147 @@ async fn choose_lpm_audit_fix_target(
     ))
 }
 
+/// How a release depends on a package: it installs it, or it takes the
+/// version the tree provides as a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    Dependency,
+    Peer { optional: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DeclaredRange {
+    range: String,
+    slot: Slot,
+}
+
 /// Every range `release` gives `dependency`: under its own name and under
 /// each npm alias of it, in `dependencies`, `optionalDependencies`, whose
 /// entry replaces a `dependencies` entry of the same name as npm's does, and
 /// `peerDependencies`. Empty when it no longer depends on it.
-fn declared_ranges(release: &VersionMetadata, dependency: &str) -> Vec<String> {
-    let regular = release
+fn declared_ranges(release: &VersionMetadata, dependency: &str) -> Vec<DeclaredRange> {
+    let names = |key: &str, spec: &str| match lpm_resolver::ranges::parse_npm_alias(spec) {
+        Some(alias) => (alias.target == dependency).then_some(alias.range),
+        None => (key == dependency).then(|| spec.to_string()),
+    };
+    let installed = release
         .dependencies
         .iter()
         .filter(|(key, _)| !release.optional_dependencies.contains_key(*key))
-        .chain(&release.optional_dependencies);
-    let mut ranges: Vec<String> = regular
-        .chain(&release.peer_dependencies)
-        .filter_map(
-            |(key, spec)| match lpm_resolver::ranges::parse_npm_alias(spec) {
-                Some(alias) => (alias.target == dependency).then_some(alias.range),
-                None => (key == dependency).then(|| spec.clone()),
+        .chain(&release.optional_dependencies)
+        .filter_map(|(key, spec)| names(key, spec))
+        .map(|range| DeclaredRange {
+            range,
+            slot: Slot::Dependency,
+        });
+    let peers = release.peer_dependencies.iter().filter_map(|(key, spec)| {
+        names(key, spec).map(|range| DeclaredRange {
+            range,
+            slot: Slot::Peer {
+                optional: release
+                    .peer_dependencies_meta
+                    .get(key)
+                    .is_some_and(|meta| meta.optional),
             },
-        )
-        .collect();
+        })
+    });
+    let mut ranges: Vec<DeclaredRange> = installed.chain(peers).collect();
     ranges.sort_unstable();
     ranges.dedup();
     ranges
 }
 
-/// The version an install picks for `range`: the version a dist-tag range
-/// names; a version the kept lockfile holds that the range allows, as the
-/// resolver keeps it; the `latest` tag when it satisfies the range, as npm
-/// and LPM prefer; or else the newest satisfying version.
+/// The version an install picks for `range`, as the resolver picks it: a
+/// version the kept lockfile holds that the range allows; the `latest` tag
+/// when it satisfies the range; or else the newest version it allows.
 fn version_an_install_picks(
     dependency: &DependencyVersions,
     range: &str,
     kept: &[&str],
 ) -> Option<String> {
-    let range = range.trim();
-    if let Some(tagged) = dependency.metadata.dist_tags.get(range) {
-        return Some(tagged.clone());
-    }
-    let requirement = VersionReq::parse(if range.is_empty() { "*" } else { range }).ok()?;
+    let range = InstallRange::new(dependency, range)?;
     if let Some(locked) = kept
         .iter()
-        .filter_map(|version| Version::parse(version).ok())
-        .filter(|version| requirement.matches(version))
+        .filter_map(|version| NpmVersion::parse(version).ok())
+        .filter(|version| range.allows(version))
         .max()
     {
         return Some(locked.to_string());
     }
-    if let Some(latest) = dependency
-        .metadata
-        .dist_tags
-        .get("latest")
-        .filter(|latest| dependency.metadata.versions.contains_key(latest.as_str()))
-        .and_then(|latest| Version::parse(latest).ok())
-        .filter(|latest| requirement.matches(latest))
+    if range.prefers_latest()
+        && let Some(latest) = dependency
+            .latest
+            .as_ref()
+            .filter(|latest| range.allows(latest))
     {
         return Some(latest.to_string());
     }
     dependency
         .versions
         .iter()
-        .find(|version| requirement.matches(version))
+        .find(|version| range.allows(version))
         .map(ToString::to_string)
+}
+
+/// Whether every version `ranges` can install of a dependency is outside
+/// every advisory on it. A peer takes a version the tree already holds when
+/// its range allows one, as the resolver binds it, so each of those counts;
+/// otherwise the install adds one, except for an optional peer.
+fn installs_no_affected_version(
+    ranges: &[DeclaredRange],
+    dependency: &DependencyVersions,
+    in_tree: &BTreeSet<&str>,
+    kept: &[&str],
+    advisories: &[&DependencyAdvisory<'_>],
+) -> Result<bool, String> {
+    for declared in ranges {
+        let bound: Vec<String> = match declared.slot {
+            Slot::Dependency => Vec::new(),
+            Slot::Peer { .. } => match InstallRange::new(dependency, &declared.range) {
+                Some(range) => in_tree
+                    .iter()
+                    .filter(|version| {
+                        NpmVersion::parse(version).is_ok_and(|version| range.allows(&version))
+                    })
+                    .map(|version| (*version).to_string())
+                    .collect(),
+                None => return Ok(false),
+            },
+        };
+        let installs = if !bound.is_empty() {
+            bound
+        } else if declared.slot == (Slot::Peer { optional: true }) {
+            continue;
+        } else {
+            match version_an_install_picks(dependency, &declared.range, kept) {
+                Some(picked) => vec![picked],
+                None => return Ok(false),
+            }
+        };
+        for version in &installs {
+            for advisory in advisories {
+                if advisory.vulnerability.affects_version(version)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Every version of `dependency` the lockfile installs, wherever in the tree.
+fn locked_versions<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    dependency: &str,
+) -> BTreeSet<&'a str> {
+    let start = lockfile
+        .packages
+        .partition_point(|locked| locked.name.as_str() < dependency);
+    lockfile.packages[start..]
+        .iter()
+        .take_while(|locked| locked.name == dependency)
+        .map(|locked| locked.version.as_str())
+        .collect()
 }
 
 /// The source every locked instance of `dependency` at `versions` came
@@ -849,19 +986,7 @@ async fn locked_dependency_versions<'cache>(
             .map_err(|error| {
                 format!("metadata lookup for dependency {dependency} failed: {error}")
             })?;
-        let mut parsed: Vec<Version> = metadata
-            .versions
-            .keys()
-            .filter_map(|version| Version::parse(version).ok())
-            .collect();
-        parsed.sort_unstable_by(|left, right| right.cmp(left));
-        cache.insert(
-            key.clone(),
-            DependencyVersions {
-                metadata,
-                versions: parsed,
-            },
-        );
+        cache.insert(key.clone(), DependencyVersions::new(metadata));
     }
     Ok(&cache[&key])
 }
@@ -956,6 +1081,7 @@ async fn verify_audit_fixes(
         .map_err(|error| LpmError::Script(format!("failed to verify updated lpm.lock: {error}")))?;
     let root_index = LockfileRootIndex::new(Some(&lockfile));
 
+    let mut installed_fixes = Vec::with_capacity(fixes.len());
     for fix in fixes.iter() {
         let installed = select_installed_direct_locked_package(
             project_dir,
@@ -976,6 +1102,7 @@ async fn verify_audit_fixes(
                 fix.name, fix.to, installed.version
             )));
         }
+        installed_fixes.push((fix, installed));
     }
 
     let discovery = discovery::discover_packages(project_dir)?;
@@ -997,7 +1124,7 @@ async fn verify_audit_fixes(
         .collect();
     let lpm_advisories = LpmDependencyAdvisories::new(&discovery.packages, &osv_outcome.vulns);
 
-    for fix in fixes {
+    for (fix, installed) in installed_fixes {
         if fix.target_name.starts_with("@lpm.dev/") {
             let name = PackageName::parse(&fix.target_name)?;
             let metadata = client.refetch_package_metadata(&name).await?;
@@ -1008,7 +1135,7 @@ async fn verify_audit_fixes(
                 ))
             })?;
             super::registry::validate_registry_version(&fix.target_name, &fix.to, version)?;
-            let remaining = lpm_advisories.of(&fix.target_name, &fix.to);
+            let remaining = lpm_advisories.of(installed);
             if !remaining.is_empty() {
                 let found = remaining
                     .iter()
@@ -1177,33 +1304,52 @@ mod tests {
             "versions": documents
         }))
         .unwrap();
-        let mut parsed: Vec<Version> = versions
-            .iter()
-            .filter_map(|version| Version::parse(version).ok())
-            .collect();
-        parsed.sort_unstable_by(|left, right| right.cmp(left));
-        DependencyVersions {
-            metadata,
-            versions: parsed,
-        }
+        DependencyVersions::new(metadata)
+    }
+
+    /// Each range `release` gives `dependency`, with how it takes it.
+    fn ranges_of(release: &VersionMetadata, dependency: &str) -> Vec<(String, &'static str)> {
+        declared_ranges(release, dependency)
+            .into_iter()
+            .map(|declared| {
+                let slot = match declared.slot {
+                    Slot::Dependency => "dependency",
+                    Slot::Peer { optional: false } => "peer",
+                    Slot::Peer { optional: true } => "optional peer",
+                };
+                (declared.range, slot)
+            })
+            .collect()
+    }
+
+    fn installed(range: &str) -> (String, &'static str) {
+        (range.to_string(), "dependency")
     }
 
     #[test]
     fn declared_ranges_follow_names_aliases_and_peers_and_report_a_dropped_dependency() {
         let direct = release(&[("lodash", "^4.17.21")], &[], &[]);
-        assert_eq!(declared_ranges(&direct, "lodash"), ["^4.17.21"]);
+        assert_eq!(ranges_of(&direct, "lodash"), [installed("^4.17.21")]);
 
         let aliased = release(&[("lo", "npm:lodash@~4.17.21")], &[], &[]);
-        assert_eq!(declared_ranges(&aliased, "lodash"), ["~4.17.21"]);
+        assert_eq!(ranges_of(&aliased, "lodash"), [installed("~4.17.21")]);
 
         let scoped = release(&[("node", "npm:@types/node@20")], &[], &[]);
-        assert_eq!(declared_ranges(&scoped, "@types/node"), ["20"]);
+        assert_eq!(ranges_of(&scoped, "@types/node"), [installed("20")]);
 
         let renamed = release(&[("lodash", "npm:lodash-es@4")], &[], &[]);
         assert!(declared_ranges(&renamed, "lodash").is_empty());
 
-        let peer = release(&[], &[], &[("react", ">=18")]);
-        assert_eq!(declared_ranges(&peer, "react"), [">=18"]);
+        let mut peer = release(&[], &[], &[("react", ">=18"), ("vue", "^3")]);
+        peer.peer_dependencies_meta.insert(
+            "vue".into(),
+            lpm_registry::PeerDependencyMeta { optional: true },
+        );
+        assert_eq!(ranges_of(&peer, "react"), [(">=18".to_string(), "peer")]);
+        assert_eq!(
+            ranges_of(&peer, "vue"),
+            [("^3".to_string(), "optional peer")]
+        );
 
         assert!(declared_ranges(&release(&[], &[], &[]), "lodash").is_empty());
     }
@@ -1211,20 +1357,23 @@ mod tests {
     #[test]
     fn declared_ranges_list_every_slot_that_installs_the_dependency() {
         let both = release(&[("dep", "1.0.1"), ("bad", "npm:dep@1.0.0")], &[], &[]);
-        assert_eq!(declared_ranges(&both, "dep"), ["1.0.0", "1.0.1"]);
+        assert_eq!(
+            ranges_of(&both, "dep"),
+            [installed("1.0.0"), installed("1.0.1")]
+        );
     }
 
     #[test]
     fn an_optional_entry_replaces_the_dependency_entry_of_the_same_name() {
         let overridden = release(&[("dep", "1.0.1")], &[("dep", "1.0.0")], &[]);
-        assert_eq!(declared_ranges(&overridden, "dep"), ["1.0.0"]);
+        assert_eq!(ranges_of(&overridden, "dep"), [installed("1.0.0")]);
     }
 
     #[test]
     fn a_malformed_alias_target_is_no_range_and_no_panic() {
         let malformed = release(&[("x", "npm:é@1"), ("y", "npm:")], &[], &[]);
         assert!(declared_ranges(&malformed, "dep").is_empty());
-        assert_eq!(declared_ranges(&malformed, "é"), ["1"]);
+        assert_eq!(ranges_of(&malformed, "é"), [installed("1")]);
     }
 
     #[test]
@@ -1250,6 +1399,64 @@ mod tests {
             version_an_install_picks(&dep, "next", &[]).as_deref(),
             Some("2.0.0-beta.1")
         );
+    }
+
+    #[test]
+    fn a_latest_range_installs_the_newest_stable_version_up_to_the_tag() {
+        let dep = dependency(
+            "2.0.0-beta.1",
+            &["1.0.0", "2.0.0-beta.1"],
+            &[("next", "2.0.0-beta.1")],
+        );
+        let picks = |range| version_an_install_picks(&dep, range, &[]);
+        assert_eq!(picks("latest").as_deref(), Some("1.0.0"));
+        assert_eq!(picks("*").as_deref(), Some("1.0.0"));
+        assert_eq!(picks("next").as_deref(), Some("2.0.0-beta.1"));
+        assert_eq!(
+            picks("1.x || >=2.0.0-beta.0").as_deref(),
+            Some("2.0.0-beta.1")
+        );
+    }
+
+    #[test]
+    fn a_peer_takes_a_version_the_tree_holds_before_the_install_adds_one() {
+        let dep = dependency("1.0.1", &["1.0.0", "1.0.1"], &[]);
+        let advisory_on = OsvVulnerability::for_test("dep", "1.0.0", "GHSA-dep").fixed_in("1.0.1");
+        let advisory = DependencyAdvisory {
+            dependency: "dep",
+            version: "1.0.0",
+            vulnerability: &advisory_on,
+        };
+        let check = |ranges: &[DeclaredRange], in_tree: &[&'static str]| {
+            installs_no_affected_version(
+                ranges,
+                &dep,
+                &in_tree.iter().copied().collect(),
+                &[],
+                &[&advisory],
+            )
+            .unwrap()
+        };
+        let peer = |range: &str, optional| DeclaredRange {
+            range: range.into(),
+            slot: Slot::Peer { optional },
+        };
+        let dependency_on = |range: &str| DeclaredRange {
+            range: range.into(),
+            slot: Slot::Dependency,
+        };
+
+        assert!(check(&[dependency_on("*")], &["1.0.0"]));
+        assert!(!check(&[peer("*", false)], &["1.0.0"]));
+        assert!(!check(&[peer("*", false)], &["1.0.0", "1.0.1"]));
+        assert!(check(&[peer(">=1.0.1", false)], &["1.0.0"]));
+        assert!(check(&[peer("*", false)], &[]));
+        assert!(!check(&[peer("1.0.0", false)], &[]));
+        assert!(check(&[peer("1.0.0", true)], &[]));
+        assert!(!check(
+            &[dependency_on("1.0.1"), dependency_on("1.0.0")],
+            &[]
+        ));
     }
 
     #[test]

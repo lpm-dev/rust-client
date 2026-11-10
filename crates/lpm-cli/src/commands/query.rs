@@ -286,8 +286,7 @@ pub async fn run(
     } else {
         ExternalPackageState::default()
     };
-    let vulnerable_versions = external_state.vulnerable_versions;
-    let deprecated_versions = external_state.deprecated_versions;
+    let deprecated_versions = &external_state.deprecated_versions;
 
     let workspace_project_root = inv
         .discovery
@@ -325,9 +324,7 @@ pub async fn run(
                 analysis: inv.analyses[index].as_deref(),
                 has_scripts: has_scripts.get(index).copied().unwrap_or(false),
                 is_built: is_built.get(index).copied().unwrap_or(false),
-                is_vulnerable: vulnerable_versions
-                    .get(&package.name)
-                    .is_some_and(|versions| versions.contains(&package.version)),
+                is_vulnerable: external_state.is_vulnerable(index, &package.name, &package.version),
                 is_deprecated: deprecated_versions
                     .get(&package.name)
                     .is_some_and(|versions| versions.contains(&package.version)),
@@ -388,9 +385,7 @@ pub async fn run(
             analysis: inv.analyses[index].as_deref(),
             has_scripts: has_scripts.get(index).copied().unwrap_or(false),
             is_built: is_built.get(index).copied().unwrap_or(false),
-            is_vulnerable: vulnerable_versions
-                .get(&pkg.name)
-                .is_some_and(|versions| versions.contains(&pkg.version)),
+            is_vulnerable: external_state.is_vulnerable(index, &pkg.name, &pkg.version),
             is_deprecated: deprecated_versions
                 .get(&pkg.name)
                 .is_some_and(|versions| versions.contains(&pkg.version)),
@@ -831,7 +826,23 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
 #[derive(Default)]
 struct ExternalPackageState {
     vulnerable_versions: HashMap<String, HashSet<String>>,
+    /// For each discovered package, whether it is an LPM package that OSV
+    /// flags through its own direct npm dependencies.
+    vulnerable_through_dependencies: Vec<bool>,
     deprecated_versions: HashMap<String, HashSet<String>>,
+}
+
+impl ExternalPackageState {
+    fn is_vulnerable(&self, index: usize, name: &str, version: &str) -> bool {
+        self.vulnerable_versions
+            .get(name)
+            .is_some_and(|versions| versions.contains(version))
+            || self
+                .vulnerable_through_dependencies
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+    }
 }
 
 /// Which installed versions are vulnerable or deprecated. OSV answers for npm
@@ -875,16 +886,11 @@ async fn load_external_package_state(
         }
     };
     let (mut state, osv_vulnerable_versions) = tokio::try_join!(registry_future, osv_future)?;
-    for (name, version) in crate::commands::audit::lpm_versions_with_vulnerable_dependencies(
-        packages,
-        &osv_vulnerable_versions,
-    ) {
-        state
-            .vulnerable_versions
-            .entry(name)
-            .or_default()
-            .insert(version);
-    }
+    state.vulnerable_through_dependencies =
+        crate::commands::audit::lpm_packages_with_vulnerable_dependencies(
+            packages,
+            &osv_vulnerable_versions,
+        );
     for (name, versions) in osv_vulnerable_versions {
         state
             .vulnerable_versions

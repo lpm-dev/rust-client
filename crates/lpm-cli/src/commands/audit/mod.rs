@@ -35,7 +35,7 @@ use report::{
 
 pub use fix::run_fix;
 pub use install_summary::{print_install_summary, run_install_summary, summarize_registry_install};
-pub(crate) use lpm_dependencies::lpm_versions_with_vulnerable_dependencies;
+pub(crate) use lpm_dependencies::lpm_packages_with_vulnerable_dependencies;
 pub(crate) use osv::query_vulnerable_versions;
 pub(crate) use policy::AuditLevel;
 pub use secrets::run_secrets;

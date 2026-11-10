@@ -10,9 +10,10 @@ mod support;
 mod audit_contract;
 
 use support::lpm_dependency_advisory::{
-    ADVISORY, DEPENDENCY, STALE_REGISTRY_ADVISORY, WRAPPER, WrapperRelease,
-    answer_osv_for_dependency, dependency_advisory, install_wrapper_with_npm_dependency,
-    mount_wrapper_with_npm_dependency, wrapper_project,
+    ADVISORY, ANCHOR, DEPENDENCY, STALE_REGISTRY_ADVISORY, WRAPPER, WrapperManifest,
+    WrapperRelease, answer_osv_for_dependency, answer_osv_for_tree, dependency_advisory,
+    install_wrapper_beside_an_anchor, install_wrapper_with_npm_dependency,
+    mount_wrapper_with_npm_dependency, wrapper_beside_an_anchor_project, wrapper_project,
 };
 use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
@@ -2594,6 +2595,45 @@ async fn audit_fix_asks_the_registry_nothing_about_a_local_lpm_package_it_cant_r
             .iter()
             .map(|request| request.url.path().to_string())
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_passes_over_a_release_whose_peer_takes_the_vulnerable_version_the_tree_keeps() {
+    let project = wrapper_beside_an_anchor_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_beside_an_anchor(
+        &project,
+        &mock,
+        &[
+            WrapperManifest {
+                version: "1.0.0",
+                fields: serde_json::json!({ "dependencies": { DEPENDENCY: "1.0.0" } }),
+            },
+            WrapperManifest {
+                version: "1.0.1",
+                fields: serde_json::json!({ "peerDependencies": { DEPENDENCY: "*" } }),
+            },
+            WrapperManifest {
+                version: "1.0.2",
+                fields: serde_json::json!({}),
+            },
+        ],
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    mark_lockfile_package_as_public_npm(&project, ANCHOR);
+    answer_osv_for_tree(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert!(out.status.success(), "{envelope:#}");
+    assert_eq!(envelope["planned"], 1, "{envelope:#}");
+    assert_eq!(envelope["packages"][0]["name"], WRAPPER, "{envelope:#}");
+    assert_eq!(
+        envelope["packages"][0]["to"], "1.0.2",
+        "1.0.1's peer takes the dep-pkg 1.0.0 the anchor keeps: {envelope:#}"
     );
 }
 

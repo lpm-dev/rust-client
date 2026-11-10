@@ -15,8 +15,9 @@ mod query_contract;
 mod support;
 
 use support::lpm_dependency_advisory::{
-    DEPENDENCY, WRAPPER, WrapperRelease, answer_osv_for_dependency, dependency_advisory,
-    install_wrapper_with_npm_dependency, wrapper_project,
+    ANCHOR, DEPENDENCY, WRAPPER, WrapperManifest, WrapperRelease, answer_osv_for_dependency,
+    answer_osv_for_tree, dependency_advisory, install_wrapper_beside_an_anchor,
+    install_wrapper_with_npm_dependency, wrapper_beside_an_anchor_project, wrapper_project,
 };
 use support::mock_registry::MockRegistry;
 use support::{TempProject, VALID_TEST_INTEGRITY};
@@ -1350,6 +1351,54 @@ async fn query_vulnerable_matches_an_lpm_package_through_its_vulnerable_npm_depe
             (DEPENDENCY.to_string(), "1.0.0".to_string()),
         ],
         "an LPM package is vulnerable through the npm package it installs: {matches:#}"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerable_matches_an_lpm_package_through_the_peer_it_takes() {
+    let project = wrapper_beside_an_anchor_project("1.0.1");
+    let mock = MockRegistry::start().await;
+    install_wrapper_beside_an_anchor(
+        &project,
+        &mock,
+        &[WrapperManifest {
+            version: "1.0.1",
+            fields: serde_json::json!({ "peerDependencies": { DEPENDENCY: "*" } }),
+        }],
+    )
+    .await;
+    answer_osv_for_tree(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "--json",
+            "query",
+            ":vulnerable",
+        ])
+        .output()
+        .expect("failed to run the vulnerability query");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut matched = matches
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| package["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    matched.sort();
+    assert_eq!(
+        matched,
+        [WRAPPER.to_string(), DEPENDENCY.to_string()],
+        "the wrapper takes the dep-pkg 1.0.0 that {ANCHOR} keeps: {matches:#}"
     );
 }
 
