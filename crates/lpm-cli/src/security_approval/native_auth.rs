@@ -392,11 +392,19 @@ mod windows_runtime_apartment_tests {
         RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RO_INIT_TYPE, RPC_E_CHANGED_MODE,
         RoInitialize, RoUninitialize, S_FALSE, S_OK,
     };
+    use lpm_common::LpmError;
     use windows_core::HRESULT;
 
-    /// Apartment state belongs to a thread, and libtest can run several tests
-    /// on one thread (`--test-threads=1` runs them all on the main thread).
-    fn on_fresh_thread(test: impl FnOnce() + Send + 'static) {
+    /// Runs `test` on a new thread, which starts outside any apartment, and
+    /// never alongside another of these tests. When the last apartment in the
+    /// process closes, COM tears down process-wide state, and a thread entering
+    /// a single-threaded apartment at that moment fails with
+    /// ERROR_CANNOT_FIND_WND_CLASS (0x8007057F).
+    fn alone_on_fresh_thread(test: impl FnOnce() + Send + 'static) {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _turn = TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Err(panic) = std::thread::spawn(test).join() {
             std::panic::resume_unwind(panic);
         }
@@ -419,7 +427,7 @@ mod windows_runtime_apartment_tests {
 
     #[test]
     fn first_initialization_on_a_thread_leaves_the_apartment_on_drop() {
-        on_fresh_thread(|| {
+        alone_on_fresh_thread(|| {
             let apartment = enter_apartment();
             assert!(apartment.should_uninitialize);
             drop(apartment);
@@ -432,7 +440,7 @@ mod windows_runtime_apartment_tests {
 
     #[test]
     fn initializing_inside_a_multithreaded_apartment_releases_only_its_own_reference() {
-        on_fresh_thread(|| {
+        alone_on_fresh_thread(|| {
             assert_eq!(ro_initialize(RO_INIT_MULTITHREADED), S_OK);
 
             let apartment = enter_apartment();
@@ -456,7 +464,7 @@ mod windows_runtime_apartment_tests {
 
     #[test]
     fn initializing_inside_a_single_threaded_apartment_reuses_it_without_uninitializing() {
-        on_fresh_thread(|| {
+        alone_on_fresh_thread(|| {
             assert_eq!(ro_initialize(RO_INIT_SINGLETHREADED), S_OK);
 
             let apartment = enter_apartment();
@@ -467,6 +475,35 @@ mod windows_runtime_apartment_tests {
                 ro_initialize(RO_INIT_SINGLETHREADED),
                 S_FALSE,
                 "the caller's single-threaded apartment must survive the approval"
+            );
+            ro_uninitialize();
+            ro_uninitialize();
+        });
+    }
+
+    #[test]
+    fn an_unexpected_initialization_failure_fails_closed_without_leaving_the_callers_apartment() {
+        alone_on_fresh_thread(|| {
+            assert_eq!(ro_initialize(RO_INIT_SINGLETHREADED), S_OK);
+
+            // With S_OK as the reusable code, the RPC_E_CHANGED_MODE that the
+            // single-threaded apartment produces is an unexpected failure.
+            let Err(LpmError::Registry(message)) = WindowsRuntimeApartment::initialize(S_OK) else {
+                panic!("an unexpected RoInitialize failure must fail closed");
+            };
+            assert!(
+                message.starts_with(
+                    "native Windows security approval could not initialize Windows Runtime: "
+                ),
+                "{message}"
+            );
+            // The system message before the code is localized.
+            assert!(message.ends_with("(0x80010106)"), "{message}");
+
+            assert_eq!(
+                ro_initialize(RO_INIT_SINGLETHREADED),
+                S_FALSE,
+                "the caller's single-threaded apartment must survive the failure"
             );
             ro_uninitialize();
             ro_uninitialize();

@@ -1,0 +1,3 @@
+# rustfmt's defaults, on purpose. Without this file rustfmt would look for
+# settings above the checkout and in the user's profile, and those could change
+# `cargo fmt --check` results and the generated Windows bindings.

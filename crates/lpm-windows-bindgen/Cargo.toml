@@ -9,6 +9,7 @@ description = "Regenerates the Windows API bindings that lpm-cli commits"
 publish = false
 
 [dependencies]
+toml = { workspace = true }
 windows-bindgen = "0.100"
 
 [lints]

@@ -4474,6 +4474,7 @@ dependencies = [
 name = "lpm-windows-bindgen"
 version = "0.86.0"
 dependencies = [
+ "toml",
  "windows-bindgen",
 ]
 
