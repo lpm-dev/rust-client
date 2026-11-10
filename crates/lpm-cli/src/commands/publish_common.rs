@@ -296,7 +296,6 @@ pub struct TarballHashes {
 }
 
 /// Compute SHA-1 and SHA-512 hashes for tarball data.
-#[cfg(test)]
 pub fn compute_hashes(tarball_data: &[u8]) -> TarballHashes {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use sha2::{Digest, Sha512};

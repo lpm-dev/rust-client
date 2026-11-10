@@ -10,6 +10,7 @@ pub const NPM_AUTH_TYPE_HEADER: &str = "npm-auth-type";
 pub const NPM_COMMAND_HEADER: &str = "npm-command";
 pub const NPM_AUTH_TYPE_WEB: &str = "web";
 pub const NPM_COMMAND_PUBLISH: &str = "publish";
+pub const NPM_COMMAND_UNPUBLISH: &str = "unpublish";
 
 const LOGIN_ENDPOINT: &str = "-/v1/login";
 const NPM_WEB_AUTH_RESPONSE_MAX_BYTES: usize = 64 * 1024;

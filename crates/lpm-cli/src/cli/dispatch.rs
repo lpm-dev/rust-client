@@ -549,6 +549,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             commands::quality::run(&client, &args.package, cli.json).await
         }
         Commands::Whoami => commands::whoami::run(&client, cli.json).await,
+        Commands::VerifyNpm => commands::verify_npm::run(&client, cli.json).await,
         Commands::Health => commands::health::run(&client, registry_url, cli.json).await,
         Commands::Download(args) => {
             let registry_args::DownloadArgs {

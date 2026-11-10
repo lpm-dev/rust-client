@@ -983,6 +983,57 @@ pub struct CheckNameResponse {
     pub owner_type: Option<String>,
 }
 
+// ─── npm accounts ──────────────────────────────────────────────────
+
+/// POST /api/registry/-/npm-verification/token
+///
+/// The token an account publishes to npm to prove it owns an npm account,
+/// and the username it waits for, with the npm accounts that can claim it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmVerificationToken {
+    pub token: String,
+    /// When the token was issued; the proof's version is `1.0.<its seconds>`
+    /// on the website and in the CLI alike.
+    #[serde(default)]
+    pub issued_at: Option<String>,
+    pub expires_at: String,
+    /// The proof package's name under the npm user's scope: `lpm-verify`.
+    pub package_name: String,
+    /// The `package.json` field that carries the token.
+    pub field: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub npm_username: Option<String>,
+    #[serde(default)]
+    pub pending_username: Option<String>,
+    #[serde(default)]
+    pub pending_username_npm_accounts: Vec<String>,
+}
+
+/// POST /api/registry/-/npm-verification/verify
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NpmVerificationResult {
+    pub npm_username: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The username the account waited for and now has.
+    #[serde(default)]
+    pub claimed: Option<String>,
+    /// The username the account waited for, which something else held first.
+    #[serde(default)]
+    pub taken: Option<String>,
+    /// The username the account waits for, which this npm account can't claim.
+    #[serde(default)]
+    pub unclaimable: Option<String>,
+    /// The username the account waited for, which it can no longer take
+    /// because it published under its current one.
+    #[serde(default)]
+    pub locked: Option<String>,
+}
+
 // ─── Auth ──────────────────────────────────────────────────────────
 
 /// GET /api/registry/-/whoami

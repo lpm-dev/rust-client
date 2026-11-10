@@ -121,6 +121,16 @@ fn verbose_long_form_survives() {
 }
 
 #[test]
+fn verify_npm_parses_and_leaves_verify_to_the_project_s_script() {
+    let cli = Cli::try_parse_from(["lpm", "verify-npm", "--json"]).unwrap();
+    assert!(cli.json);
+    assert!(matches!(cli.command, Some(Commands::VerifyNpm)));
+
+    let shortcut = Cli::try_parse_from(["lpm", "verify"]).unwrap();
+    assert!(matches!(shortcut.command, Some(Commands::External(_))));
+}
+
+#[test]
 fn recursive_install_flag_parses_short_or_long_forms() {
     for raw in [["lpm", "install", "-r"], ["lpm", "install", "--recursive"]] {
         let cli = Cli::try_parse_from(raw).expect("recursive install flag should parse");

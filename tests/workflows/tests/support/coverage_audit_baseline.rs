@@ -64,6 +64,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Version",
     "Release",
     "Stage",
+    "VerifyNpm",
     "Login",
     "Logout",
     "Setup",

@@ -229,6 +229,15 @@ pub(crate) enum Commands {
     /// Stage packages for npm publishing.
     Stage(registry::StageArgs),
 
+    /// Prove you own your npm account, to use your npm username on LPM.dev
+    /// and show the npm account on your profile.
+    ///
+    /// Publishes `@<npm user>/lpm-verify` with your npm login, waits for
+    /// LPM.dev to find it, then unpublishes it. Needs `lpm login` and an
+    /// npm login (`lpm login --npm`, NPM_TOKEN or .npmrc). A hyphenated name
+    /// keeps `lpm verify` free for a project's own `verify` script.
+    VerifyNpm,
+
     /// Log in to a package registry.
     #[command(visible_alias = "l")]
     Login(registry::LoginArgs),

@@ -115,6 +115,46 @@ impl RegistryClient {
         .await
     }
 
+    /// POST JSON with the `lpm login` session's bearer, once, renewing the
+    /// session on a 401 and asking again. A refusal keeps the Registry's
+    /// status and code, so the caller can tell one it can try again from
+    /// one it can't. `operation` names the answer in a parse error.
+    pub(super) async fn post_session_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        operation: &str,
+    ) -> Result<serde_json::Value, LpmError> {
+        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
+            let bearer = self
+                .current_bearer(AuthPosture::SessionRequired)?
+                .ok_or(LpmError::SessionExpired)?;
+            let request = build_request(
+                self.http
+                    .for_url(url)
+                    .await?
+                    .post(url)
+                    .json(body)
+                    .bearer_auth(&bearer),
+            )?;
+            let sent = request.headers().clone();
+            let response = self.send_built_once_preserving_status(request).await?;
+            let status = response.status();
+            if !status.is_success() {
+                let origin = self.registry_origin(response.url());
+                let facts = answer_facts(response.headers(), &sent);
+                let body = read_error_text_redacting(response, &sent).await;
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    return Err(unauthorized(&facts, &body, &origin));
+                }
+                return Err(registry_refusal(status.as_u16(), &facts, &body, &origin));
+            }
+            parse_capped_api_json::<serde_json::Value>(response, &format!("{operation} response"))
+                .await
+        })
+        .await
+    }
+
     /// POST JSON once and preserve every HTTP status for the caller.
     ///
     /// Use this for idempotent, recoverable mutations whose caller must
