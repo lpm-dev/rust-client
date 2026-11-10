@@ -175,12 +175,44 @@ fn is_array_index(key: &str) -> bool {
         && key.parse::<u32>().is_ok_and(|index| index < u32::MAX)
 }
 
-/// Node.js's rule for an `exports` target: `./`, then no segment Node.js
-/// refuses, and no percent-encoding it can't turn into a file path.
+/// Node.js's rule for an `exports` target it can select: `./`, then no
+/// segment it refuses. A fallback array skips a target that breaks it. One
+/// whose percent-encoding names no file is still selected: loading it fails,
+/// and no later fallback runs.
 fn valid_target(raw: &str) -> bool {
     raw.strip_prefix("./")
         .is_some_and(|rest| !has_refused_segment(rest))
-        && percent_decoded(raw).is_some()
+}
+
+/// The part of a target Node.js reads as a file path. A target is a URL, so
+/// an unencoded `?` or `#` starts its query or fragment.
+fn path_part(raw: &str) -> &str {
+    raw.find(['?', '#']).map_or(raw, |end| &raw[..end])
+}
+
+/// Whether a target's path has a `*` for a pattern's match. A pattern key's
+/// target without one names the same file for every subpath.
+pub(crate) fn has_pattern(raw: &str) -> bool {
+    path_part(raw).contains('*')
+}
+
+/// A file's part matched by a pattern target, as a subpath must spell it:
+/// Node.js decodes the target after substituting the match, so a literal
+/// `%` is `%25`, and `?` and `#` are encoded so they stay in the path.
+pub(crate) fn subpath_match(matched: &str) -> std::borrow::Cow<'_, str> {
+    if !matched.contains(['%', '?', '#']) {
+        return std::borrow::Cow::Borrowed(matched);
+    }
+    let mut encoded = String::with_capacity(matched.len() + 4);
+    for character in matched.chars() {
+        match character {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3F"),
+            '#' => encoded.push_str("%23"),
+            other => encoded.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(encoded)
 }
 
 /// The longest path a target can name. A pattern whose substitution would
@@ -188,12 +220,12 @@ fn valid_target(raw: &str) -> bool {
 /// `*` would otherwise multiply a long subpath into megabytes.
 const MAX_TARGET_BYTES: usize = 4096;
 
-/// A target's file as Node.js loads it, which decodes the target's URL
-/// percent-encoding, normalized. `None` when it leaves the package, or
-/// Node.js can't decode it: an encoded `/` or `\`, a malformed escape, or
-/// bytes that aren't UTF-8.
+/// A target's file as Node.js loads it: its path, without a query or
+/// fragment, percent-decoded and normalized. `None` when it leaves the
+/// package, or Node.js can't decode it: an encoded `/` or `\`, a malformed
+/// escape, or bytes that aren't UTF-8.
 pub(crate) fn target_path(raw: &str) -> Option<String> {
-    normalize(&percent_decoded(raw)?)
+    normalize(&percent_decoded(path_part(raw))?)
 }
 
 fn percent_decoded(raw: &str) -> Option<String> {
@@ -439,7 +471,7 @@ struct TargetPattern {
 
 impl TargetPattern {
     fn parse(target: &str) -> Option<Self> {
-        let mut pieces = target.split('*');
+        let mut pieces = path_part(target).split('*');
         let prefix = normalize_prefix(&percent_decoded(pieces.next()?)?)?;
         let mut rest: Vec<String> = pieces.map(percent_decoded).collect::<Option<_>>()?;
         let suffix = rest.pop()?;
@@ -554,7 +586,7 @@ pub(crate) fn declaration_candidates(path: &str) -> Vec<String> {
 /// Whether TypeScript finds declarations where a `types` condition's
 /// target points: an exact path, or a pattern that matches one.
 fn types_target_exists(archive: &Archive, raw: &str) -> bool {
-    if raw.contains('*') {
+    if has_pattern(raw) {
         return declaration_candidates(raw)
             .iter()
             .any(|pattern| target_exists(archive, pattern));
@@ -583,7 +615,7 @@ pub(crate) fn target_exists(archive: &Archive, raw: &str) -> bool {
     if !raw.starts_with("./") {
         return false;
     }
-    if raw.contains('*') {
+    if has_pattern(raw) {
         return pattern_matches(archive, raw).is_some_and(|matched| !matched.is_empty());
     }
     target_path(raw).is_some_and(|path| archive.has(&path))
@@ -770,7 +802,7 @@ mod tests {
             target_path("./dist/caf%C3%A9.js").as_deref(),
             Some("dist/café.js")
         );
-        for refused in [
+        for undecodable in [
             "./a%2fb.js",
             "./a%2Fb.js",
             "./a%5Cb.js",
@@ -779,8 +811,51 @@ mod tests {
             "./a%-1.js",
             "./%ff.js",
         ] {
-            assert!(!valid_target(refused), "{refused}");
+            assert!(valid_target(undecodable), "{undecodable}");
+            assert_eq!(target_path(undecodable), None, "{undecodable}");
         }
+    }
+
+    #[test]
+    fn a_query_or_fragment_is_no_part_of_the_file() {
+        assert_eq!(target_path("./index.js?raw").as_deref(), Some("index.js"));
+        assert_eq!(target_path("./index.js#main").as_deref(), Some("index.js"));
+        assert_eq!(target_path("./a%3Fb.js").as_deref(), Some("a?b.js"));
+        assert_eq!(target_path("./a%23b.js").as_deref(), Some("a#b.js"));
+        assert!(has_pattern("./dist/*.js?v=1"));
+        assert!(!has_pattern("./index.js?v=*"));
+    }
+
+    #[test]
+    fn a_fallback_array_skips_only_a_target_node_refuses_to_select() {
+        let resolve = |value: Value| {
+            Exports::parse(&value)
+                .unwrap()
+                .resolve_subpath(".", IMPORT_CONDITIONS)
+                .map(|(path, _)| path)
+        };
+        assert_eq!(
+            resolve(json!(["../outside.js", "./index.js"])).as_deref(),
+            Some("index.js")
+        );
+        assert_eq!(resolve(json!(["./bad%zz.js", "./index.js"])), None);
+        assert_eq!(resolve(json!(["./a%2Fb.js", "./index.js"])), None);
+    }
+
+    #[test]
+    fn a_match_is_spelled_as_a_subpath_reaches_its_file() {
+        assert_eq!(subpath_match("button"), "button");
+        assert_eq!(subpath_match("100%"), "100%25");
+        assert_eq!(subpath_match("a?b#c"), "a%3Fb%23c");
+        let value = json!({ "./*": "./dist/*.js" });
+        let exports = Exports::parse(&value).unwrap();
+        assert_eq!(
+            exports
+                .resolve_subpath(&format!("./{}", subpath_match("100%")), IMPORT_CONDITIONS)
+                .map(|(path, _)| path)
+                .as_deref(),
+            Some("dist/100%.js")
+        );
     }
 
     #[test]

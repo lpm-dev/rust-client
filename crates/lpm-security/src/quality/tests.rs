@@ -1002,6 +1002,96 @@ fn a_types_source_that_re_exports_an_unread_file_says_so() {
 }
 
 #[test]
+fn a_wildcard_key_whose_target_has_no_star_scores_as_its_one_file() {
+    let mut constant = good_manifest();
+    constant["types"] = Value::Null;
+    constant["main"] = Value::Null;
+    constant["exports"] = json!({
+        "./*": { "types": "./dist/index.d.ts", "import": "./dist/index.mjs" }
+    });
+    let mut exact = constant.clone();
+    exact["exports"] = json!({
+        "./index": { "types": "./dist/index.d.ts", "import": "./dist/index.mjs" }
+    });
+    let constant = owned_report(&with_manifest(&constant, &[]));
+    let exact = owned_report(&with_manifest(&exact, &[]));
+    for (id, expected) in [("api-docs", 10), ("types", 10)] {
+        assert_eq!(
+            points(&constant, id),
+            expected,
+            "{id}: {}",
+            check(&constant, id).detail
+        );
+        assert_eq!(
+            points(&exact, id),
+            expected,
+            "{id}: {}",
+            check(&exact, id).detail
+        );
+    }
+}
+
+#[test]
+fn a_file_whose_name_holds_a_percent_counts_toward_type_coverage() {
+    let mut manifest = good_manifest();
+    manifest["exports"] = json!({
+        ".": { "types": "./dist/index.d.ts", "import": "./dist/index.mjs" },
+        "./*": "./dist/*.js"
+    });
+    let report = owned_report(&with_manifest(
+        &manifest,
+        &[("dist/100%.js", "export const ratio = 1\n")],
+    ));
+    assert_eq!(
+        points(&report, "types"),
+        5,
+        "{}",
+        check(&report, "types").detail
+    );
+}
+
+#[test]
+fn a_target_query_or_fragment_names_the_file_before_it() {
+    for target in ["./dist/index.mjs?raw", "./dist/index.mjs#main"] {
+        let mut manifest = good_manifest();
+        manifest["exports"] = json!({
+            ".": {
+                "types": "./dist/index.d.ts",
+                "import": target,
+                "require": "./dist/index.cjs",
+                "default": target
+            }
+        });
+        let report = owned_report(&with_manifest(&manifest, &[]));
+        for (id, expected) in [("entry-points", 5), ("exports-map", 4)] {
+            assert_eq!(
+                points(&report, id),
+                expected,
+                "{target} {id}: {}",
+                check(&report, id).detail
+            );
+        }
+    }
+}
+
+#[test]
+fn a_target_node_cannot_decode_ends_its_fallbacks() {
+    let mut manifest = good_manifest();
+    manifest["types"] = Value::Null;
+    manifest["main"] = Value::Null;
+    manifest["exports"] = json!({ ".": ["./dist/bad%zz.mjs", "./dist/index.mjs"] });
+    let report = owned_report(&with_manifest(&manifest, &[]));
+    for id in ["entry-points", "types", "exports-map"] {
+        assert_eq!(
+            points(&report, id),
+            0,
+            "{id}: {}",
+            check(&report, id).detail
+        );
+    }
+}
+
+#[test]
 fn a_wildcard_types_target_finds_the_declarations_typescript_substitutes() {
     let mut manifest = good_manifest();
     manifest["types"] = Value::Null;

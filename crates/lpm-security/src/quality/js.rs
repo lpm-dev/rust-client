@@ -392,6 +392,27 @@ impl<'a> Package<'a> {
             else {
                 continue;
             };
+            // A more specific subpath, such as a null pattern, may keep a
+            // file from consumers, so each subpath must still reach it.
+            let reaches = |subpath: &str, file: &str| {
+                exports
+                    .resolve_subpath(subpath, conditions)
+                    .is_some_and(|(resolved, _)| {
+                        resolved == file
+                            || npm::declaration_candidates(&resolved)
+                                .iter()
+                                .any(|candidate| candidate == file)
+                    })
+            };
+            if !npm::has_pattern(pattern) {
+                if let Some(subpath) = self
+                    .constant_pattern_subpath(key_prefix, key_suffix, pattern, conditions, reaches)
+                {
+                    subpaths.push(subpath);
+                    expanded += 1;
+                }
+                continue;
+            }
             // A `types` pattern also matches the declarations TypeScript
             // substitutes for its JavaScript extension: `./types/*.js` finds
             // `types/a.d.ts`.
@@ -408,21 +429,12 @@ impl<'a> Package<'a> {
                     if expanded == MAX_PATTERN_SUBPATHS {
                         break;
                     }
-                    let subpath = format!("{key_prefix}{matched}{key_suffix}");
+                    let subpath =
+                        format!("{key_prefix}{}{key_suffix}", npm::subpath_match(matched));
                     if seen.contains(&subpath) {
                         continue;
                     }
-                    // A more specific subpath, such as a null pattern, may
-                    // keep it from consumers.
-                    if exports
-                        .resolve_subpath(&subpath, conditions)
-                        .is_some_and(|(resolved, _)| {
-                            resolved == file
-                                || npm::declaration_candidates(&resolved)
-                                    .iter()
-                                    .any(|candidate| candidate == file)
-                        })
-                    {
+                    if reaches(&subpath, file) {
                         seen.insert(subpath.clone());
                         subpaths.push(subpath);
                         expanded += 1;
@@ -431,6 +443,27 @@ impl<'a> Package<'a> {
             }
         }
         subpaths
+    }
+
+    /// A subpath through a pattern key whose target has no `*`, which loads
+    /// that one file for every match, when the file is there.
+    fn constant_pattern_subpath(
+        &self,
+        key_prefix: &str,
+        key_suffix: &str,
+        target: &str,
+        conditions: &[&str],
+        reaches: impl Fn(&str, &str) -> bool,
+    ) -> Option<String> {
+        let path = npm::target_path(target)?;
+        let file = if conditions == npm::TYPES_IMPORT_CONDITIONS {
+            npm::declaration_at(self.archive(), &path)?
+        } else {
+            self.archive().has(&path).then(|| path.clone())?
+        };
+        constant_pattern_subpath_reaching(key_prefix, key_suffix, &path, |subpath| {
+            reaches(subpath, &file)
+        })
     }
 
     /// The declaration file TypeScript reads for `subpath` under
@@ -843,6 +876,26 @@ struct TypedEntry {
     typed: bool,
 }
 
+/// The first of a few subpaths through a pattern key, whose target loads
+/// `path` for every match, that `reaches` accepts: one a more specific
+/// subpath doesn't take.
+fn constant_pattern_subpath_reaching(
+    key_prefix: &str,
+    key_suffix: &str,
+    path: &str,
+    reaches: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let stem = path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.split('.').next())
+        .filter(|stem| !stem.is_empty());
+    stem.into_iter()
+        .chain(["index", "x"])
+        .map(|matched| format!("{key_prefix}{}{key_suffix}", npm::subpath_match(matched)))
+        .find(|subpath| reaches(subpath))
+}
+
 fn is_javascript(path: &str) -> bool {
     [".js", ".mjs", ".cjs", ".jsx"]
         .iter()
@@ -884,7 +937,27 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
             };
             let runtime_raw = runtime_resolution.path;
             let label = format!("{subpath} ({mode})");
-            if let Some((key_prefix, key_suffix)) = subpath.split_once('*') {
+            let mut reachable = std::borrow::Cow::Borrowed(*subpath);
+            if let Some((key_prefix, key_suffix)) = subpath.split_once('*')
+                && !npm::has_pattern(runtime_raw)
+            {
+                let Some(runtime_path) = npm::target_path(runtime_raw) else {
+                    continue;
+                };
+                let Some(found) = constant_pattern_subpath_reaching(
+                    key_prefix,
+                    key_suffix,
+                    &runtime_path,
+                    |candidate| {
+                        exports
+                            .resolve_subpath(candidate, runtime)
+                            .is_some_and(|(resolved, _)| resolved == runtime_path)
+                    },
+                ) else {
+                    continue;
+                };
+                reachable = std::borrow::Cow::Owned(found);
+            } else if let Some((key_prefix, key_suffix)) = subpath.split_once('*') {
                 // Patterns past the lookups' limit can't be confirmed typed.
                 let Some(matched) = npm::pattern_matches(archive, runtime_raw) else {
                     entries.push(TypedEntry {
@@ -895,8 +968,9 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
                 };
                 // Only the files a consumer can reach: a more specific
                 // subpath, such as a null pattern, may keep others away.
-                let javascript: Vec<(&str, &str)> = matched
+                let javascript: Vec<(&str, std::borrow::Cow<'_, str>)> = matched
                     .into_iter()
+                    .map(|(path, star)| (path, npm::subpath_match(star)))
                     .filter(|(path, star)| {
                         is_javascript(path)
                             && exports
@@ -926,21 +1000,23 @@ fn typed_entries(package: &Package<'_>) -> Vec<TypedEntry> {
             }
             entries.push(TypedEntry {
                 label,
-                typed: package.declaration_for(subpath, types, runtime).is_some(),
+                typed: package
+                    .declaration_for(&reachable, types, runtime)
+                    .is_some(),
             });
         }
     }
     entries
 }
 
-/// Whether every file a pattern entry matches, each with what its `*`
-/// matched, has declarations: through a `types` pattern, or beside each
-/// file.
+/// Whether every file a pattern entry matches, each with its `*` match as
+/// a subpath spells it, has declarations: through a `types` pattern, or
+/// beside each file.
 fn typed_pattern(
     archive: &super::Archive,
     target: &Target<'_>,
     types: &[&str],
-    matched: &[(&str, &str)],
+    matched: &[(&str, std::borrow::Cow<'_, str>)],
 ) -> bool {
     let types_pattern = target
         .resolve(types)
