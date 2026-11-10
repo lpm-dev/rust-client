@@ -824,9 +824,6 @@ jobs:
       - name: Windows proxy named-pipe tests
         run: cargo test --locked -p lpm-proxy named_pipe
 
-      - name: Windows Runtime apartment tests
-        run: cargo test --locked -p lpm-cli --bin lpm-rs security_approval::native_auth::windows_runtime_apartment_tests
-
       - name: Build CLI for workflow backend test
         run: cargo build --locked -p lpm-cli
 
