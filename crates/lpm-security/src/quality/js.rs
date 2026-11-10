@@ -542,10 +542,20 @@ impl<'a> Package<'a> {
         })
     }
 
-    /// Whether Node.js loads `path` as an ES module: `.mjs`, `.js` whose
-    /// nearest package.json sets `"type": "module"`, or `.js` whose nearest
-    /// package.json sets no `type` and whose syntax is ESM, which Node.js
-    /// detects. JSX, which Node.js can't run, never is.
+    /// The file [`Self::esm_entry`] names for `subpath`, when it loads as an
+    /// ES module whose exports can be read. A `.js` `main` in a package with
+    /// no `type` is often CommonJS, whose exports aren't declared.
+    fn readable_esm_entry(&self, subpath: &str) -> Option<String> {
+        self.esm_entry(subpath).filter(|entry| {
+            self.facts(entry)
+                .is_some_and(|facts| self.loads_as_esm(entry, &facts))
+        })
+    }
+
+    /// Whether Node.js loads `path` as an ES module that uses ESM syntax:
+    /// `.mjs`, `.js` whose nearest package.json sets `"type": "module"`, or
+    /// `.js` whose nearest package.json sets no `type`, which Node.js loads
+    /// as ESM when its syntax is. JSX, which Node.js can't run, never is.
     fn loads_as_esm(&self, path: &str, facts: &ModuleFacts) -> bool {
         if facts.jsx {
             return false;
@@ -583,7 +593,7 @@ impl<'a> Package<'a> {
                     npm::REQUIRE_CONDITIONS,
                 )
             })
-            .or_else(|| self.esm_entry(&subpath))?;
+            .or_else(|| self.readable_esm_entry(&subpath))?;
         let set = self.export_set(&file);
         (!set.names.is_empty() || !set.incomplete).then_some(set)
     }
@@ -708,10 +718,7 @@ fn api_docs(package: &Package<'_>, results: &mut Results) {
     }
     let source = if files.is_empty() {
         for subpath in &subpaths {
-            if let Some(entry) = package.esm_entry(subpath)
-                && package
-                    .facts(&entry)
-                    .is_some_and(|facts| package.loads_as_esm(&entry, &facts))
+            if let Some(entry) = package.readable_esm_entry(subpath)
                 && seen.insert(entry.clone())
             {
                 files.push(entry);
