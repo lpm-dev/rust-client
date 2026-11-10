@@ -405,6 +405,61 @@ fn parse(
     .flatten()
 }
 
+/// Parses `source` as `source_type` and gives `inspect` the program and
+/// whether it parsed without a syntax error. The parse stops at a stack
+/// floor as [`parse`]'s does, and moves to a [`DEEP_PARSE_STACK`] segment
+/// when the caller's stack runs out. `None` when the source nests too deeply
+/// for that too, or fails to parse at all.
+pub(crate) fn inspect_program<T>(
+    source: &str,
+    source_type: SourceType,
+    inspect: impl FnOnce(&oxc_ast::ast::Program<'_>, bool) -> T,
+) -> Option<T> {
+    let mut inspect = Some(inspect);
+    let remaining = stacker::remaining_stack().unwrap_or(0);
+    if let Some(floor) = current_stack_floor()
+        && let Ok(result) = inspect_above(source, source_type, floor, &mut inspect)
+    {
+        return result;
+    }
+    if remaining >= DEEP_PARSE_STACK {
+        return None;
+    }
+    on_new_stack(DEEP_PARSE_STACK, || {
+        let floor = current_stack_floor()?;
+        inspect_above(source, source_type, floor, &mut inspect)
+            .ok()
+            .flatten()
+    })
+    .flatten()
+}
+
+/// `Err` when the parse ran out of stack above `stack_floor`.
+fn inspect_above<T, F: FnOnce(&oxc_ast::ast::Program<'_>, bool) -> T>(
+    source: &str,
+    source_type: SourceType,
+    stack_floor: usize,
+    inspect: &mut Option<F>,
+) -> Result<Option<T>, ()> {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type)
+        .with_options(ParseOptions {
+            stack_floor,
+            ..ParseOptions::default()
+        })
+        .parse();
+    if parsed.stack_exhausted {
+        return Err(());
+    }
+    if parsed.fatal_error {
+        return Ok(None);
+    }
+    let complete = !parsed.diagnostics.has_errors();
+    Ok(inspect
+        .take()
+        .map(|inspect| inspect(&parsed.program, complete)))
+}
+
 impl<'s> SourceContext<'s> {
     pub fn new(source: &str, filename: &str, stripped: &'s mut Vec<u8>) -> Self {
         Self::with_complete_input(source, filename, stripped, true)

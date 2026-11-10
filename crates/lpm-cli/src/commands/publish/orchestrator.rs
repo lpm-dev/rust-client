@@ -18,7 +18,7 @@ use super::provenance::{
     ProvenanceRequest, load_provenance_request_file, materialize_provenance_request,
     resolve_provenance_request_from_project_source,
 };
-use super::quality_gate::run_publish_quality_gate;
+use super::quality_gate::{quality_json, run_publish_quality_gate};
 use super::secret_scan::run_publish_secret_scan;
 use super::skills::compute_published_skills_digest;
 use super::target::resolve_targets;
@@ -172,7 +172,7 @@ pub(crate) struct PreparedPublish {
     rewritten_tarballs: HashMap<String, publish_common::RewrittenTarball>,
     version_data: serde_json::Value,
     precomputed_npm_artifacts: HashMap<String, NpmTargetArtifact>,
-    quality_result: Option<crate::quality::QualityResult>,
+    quality_report: Option<lpm_security::quality::QualityReport>,
     npm_version_preflighted: bool,
     publish_lifecycle: Option<std::sync::Arc<super::lifecycle::PublishLifecycle>>,
     publish_lifecycle_dir: PathBuf,
@@ -1237,16 +1237,26 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         &mut rewritten_tarballs,
     )?;
 
-    // Quality checks are required only for the LPM target.
-    let quality_result = if targets_lpm {
+    // The quality checks score the tarball LPM.dev Registry receives.
+    let quality_report = if targets_lpm {
+        let lpm_tarball = lpm_target_request(LpmTargetSource {
+            target_names: &target_names,
+            name: &name,
+            version: &version,
+            version_data: &version_data,
+            tarball_data: &tarball_data,
+            tarball_hashes: &tarball_hashes,
+            rewritten_tarballs: &rewritten_tarballs,
+        })?
+        .tarball
+        .read_data()?;
         Some(run_publish_quality_gate(PublishQualityGateInput {
-            pkg_json: &pkg_json,
-            readme: readme.as_deref(),
-            tarball_files: &tarball_files,
+            tarball: lpm_tarball.as_slice(),
             detected_ecosystem: &detected_ecosystem,
             swift_manifest: swift_manifest.as_ref(),
             min_score,
             json_output,
+            check_only,
         })?)
     } else {
         None
@@ -1265,7 +1275,6 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
             &LpmPublishParts {
                 readme: readme.as_deref(),
                 tarball_files: &tarball_files,
-                quality_result: quality_result.as_ref(),
                 lpm_config: lpm_config.as_ref(),
                 detected_ecosystem: &detected_ecosystem,
                 swift_manifest: swift_manifest.as_ref(),
@@ -1307,7 +1316,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         rewritten_tarballs,
         version_data,
         precomputed_npm_artifacts,
-        quality_result,
+        quality_report,
         npm_version_preflighted,
         publish_lifecycle: None,
         publish_lifecycle_dir: project_dir.to_path_buf(),
@@ -1367,7 +1376,7 @@ async fn execute_prepared_inner(
         rewritten_tarballs,
         version_data,
         mut precomputed_npm_artifacts,
-        quality_result,
+        quality_report,
         npm_version_preflighted,
         publish_lifecycle,
         publish_lifecycle_dir,
@@ -1489,7 +1498,7 @@ async fn execute_prepared_inner(
     if check_only {
         if emit_summary && json_output {
             let json = publish_check_json(
-                quality_result.as_ref(),
+                quality_report.as_ref(),
                 &targets,
                 &target_names,
                 &tarball_files,
@@ -1586,7 +1595,7 @@ async fn execute_prepared_inner(
                 "files": tarball_files.len(),
                 "tarball_files": tarball_files_json(&tarball_files),
                 "tarball_size": tarball_size,
-                "quality": quality_result,
+                "quality": quality_report.as_ref().map(quality_json),
                 "targets": targets.iter().map(|t| {
                     let key = t.key();
                     let name = target_names.get(&key);
@@ -1603,7 +1612,7 @@ async fn execute_prepared_inner(
                 target_names: &target_names,
                 file_count: tarball_files.len(),
                 tarball_size,
-                quality_result: quality_result.as_ref(),
+                quality_report: quality_report.as_ref(),
                 has_skills,
                 ecosystem: &eco,
                 targets: &targets,
@@ -1743,7 +1752,6 @@ async fn execute_prepared_inner(
                         request.body(&LpmPublishParts {
                             readme: readme.as_deref(),
                             tarball_files: &tarball_files,
-                            quality_result: quality_result.as_ref(),
                             lpm_config: lpm_config.as_ref(),
                             detected_ecosystem: &detected_ecosystem,
                             swift_manifest: swift_manifest.as_ref(),
@@ -2403,7 +2411,6 @@ struct LpmTargetSource<'a> {
 struct LpmPublishParts<'a> {
     readme: Option<&'a str>,
     tarball_files: &'a [publish_common::TarballFile],
-    quality_result: Option<&'a crate::quality::QualityResult>,
     lpm_config: Option<&'a serde_json::Value>,
     detected_ecosystem: &'a str,
     swift_manifest: Option<&'a serde_json::Value>,
@@ -2448,7 +2455,6 @@ impl LpmTargetRequest<'_> {
             version_data: &self.version_data,
             tarball_files: parts.tarball_files,
             package_json_size_override: self.tarball.package_json_size,
-            quality_result: parts.quality_result,
             lpm_config: parts.lpm_config,
             detected_ecosystem: parts.detected_ecosystem,
             swift_manifest: parts.swift_manifest,
@@ -2808,7 +2814,6 @@ mod lpm_target_limit_tests {
         LpmPublishParts {
             readme,
             tarball_files,
-            quality_result: None,
             lpm_config: None,
             detected_ecosystem: "js",
             swift_manifest: None,

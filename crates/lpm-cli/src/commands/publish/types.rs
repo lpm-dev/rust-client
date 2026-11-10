@@ -471,13 +471,15 @@ pub(crate) struct NpmTargetArtifact {
 }
 
 pub(crate) struct PublishQualityGateInput<'a> {
-    pub(crate) pkg_json: &'a serde_json::Value,
-    pub(crate) readme: Option<&'a str>,
-    pub(crate) tarball_files: &'a [TarballFile],
+    /// The gzipped tarball LPM.dev Registry receives.
+    pub(crate) tarball: &'a [u8],
     pub(crate) detected_ecosystem: &'a str,
     pub(crate) swift_manifest: Option<&'a serde_json::Value>,
     pub(crate) min_score: Option<u32>,
     pub(crate) json_output: bool,
+    /// `--check`, which lists every check instead of the ones that lost
+    /// points.
+    pub(crate) check_only: bool,
 }
 
 pub(crate) struct NpmTargetArtifactInput<'a> {

@@ -7,11 +7,10 @@
 use crate::install_ui;
 use cap_std::fs::Dir;
 use lpm_common::LpmError;
+use lpm_security::quality::MAX_README_BYTES;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-const MAX_README_BYTES: usize = 1_000_000;
 
 /// A file entry in the tarball.
 #[derive(Debug, Clone)]
@@ -377,26 +376,6 @@ fn read_readme_content(
             Ok(String::from_utf8(bytes).ok())
         }
         Err(_) => Ok(None),
-    }
-}
-
-fn readme_priority(path: &str) -> Option<usize> {
-    if path.contains(['/', '\\']) {
-        return None;
-    }
-    let (base, extension) = path
-        .split_once('.')
-        .map_or((path, None), |(base, extension)| (base, Some(extension)));
-    if !base.eq_ignore_ascii_case("readme") {
-        return None;
-    }
-    match extension {
-        None => Some(1),
-        Some(extension) if extension.eq_ignore_ascii_case("md") => Some(0),
-        Some(extension) if extension.eq_ignore_ascii_case("txt") => Some(2),
-        Some(extension) if extension.eq_ignore_ascii_case("markdown") => Some(3),
-        Some(extension) if !extension.is_empty() && !extension.ends_with(['~', '$']) => Some(4),
-        Some(_) => None,
     }
 }
 
@@ -841,7 +820,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
             }
 
             let stream_without_buffering = override_content.is_none()
-                && readme_priority(&candidate.archive_path).is_none()
+                && lpm_security::quality::readme_rank(&candidate.archive_path).is_none()
                 && secret_scan.as_ref().is_none_or(|_| {
                     candidate.secret_scan != CandidateScan::Pending
                         || !lpm_security::behavioral::secrets::file_content_requires_scan(
@@ -945,7 +924,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
                     return Err(unsafe_publish_file_error(&candidate.archive_path));
                 }
             }
-            if let Some(priority) = readme_priority(&candidate.archive_path)
+            if let Some(priority) =
+                lpm_security::quality::readme_rank(&candidate.archive_path).map(usize::from)
                 && readme
                     .as_ref()
                     .is_none_or(|(current_priority, _)| priority < *current_priority)

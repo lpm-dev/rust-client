@@ -220,7 +220,9 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     if let Commands::InternalPackageSignals(args) = &command {
-        if let Err(error) = commands::package_signals::run(args.ecosystem.into()) {
+        if let Err(error) =
+            commands::package_signals::run(args.ecosystem.into(), args.swift_manifest.as_deref())
+        {
             exit_with_lpm_error(&error, true);
         }
         return Ok(());

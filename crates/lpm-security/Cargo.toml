@@ -12,6 +12,7 @@ aho-corasick = "1"
 lpm-common = { workspace = true }
 lpm-extractor = { workspace = true }
 lpm-lockfile = { workspace = true }
+lpm-semver = { workspace = true }
 lpm-workspace = { path = "../lpm-workspace" }
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
@@ -31,8 +32,10 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 shlex = { workspace = true }
+spdx = { version = "0.13.5", default-features = false }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { workspace = true }
+url = "2"
 oxc_allocator = "=0.157.0"
 oxc_ast = "=0.157.0"
 oxc_ast_visit = "=0.157.0"

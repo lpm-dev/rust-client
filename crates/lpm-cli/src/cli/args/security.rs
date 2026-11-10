@@ -12,6 +12,10 @@ pub(crate) struct InternalPackageSignalsArgs {
     /// The language whose source files are read.
     #[arg(long, value_enum, default_value_t = SignalsEcosystem::Js)]
     pub(crate) ecosystem: SignalsEcosystem,
+    /// A Swift release's evaluated manifest (`swift package dump-package`
+    /// output), for the quality checks that read it.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) swift_manifest: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

@@ -96,6 +96,15 @@ fn prints_the_release_signals_as_one_json_document() {
     assert_eq!(document["tagFiles"]["childProcess"]["testsOnly"], true);
     assert_eq!(document["evalCalls"], 1);
     assert_eq!(document["coverage"]["complete"], true);
+    assert_eq!(document["quality"]["schemaVersion"], 1);
+    assert_eq!(document["quality"]["ecosystem"], "js");
+    let license = document["quality"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "license")
+        .unwrap();
+    assert_eq!(license["points"], 5);
     document["lpmVersion"] = serde_json::json!("[version]");
     insta::assert_json_snapshot!("release_signals", document);
 }
@@ -114,6 +123,75 @@ fn reads_the_sources_of_the_ecosystem_it_is_given() {
     assert_eq!(document["tags"]["eval"], false);
     assert_eq!(document["coverage"]["sourceFiles"], 1);
     assert_eq!(document["coverage"]["manifest"], false);
+}
+
+fn swift_check<'d>(document: &'d serde_json::Value, id: &str) -> &'d serde_json::Value {
+    document["quality"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} check in {document:#}"))
+}
+
+#[test]
+fn scores_the_swift_checks_from_the_evaluated_manifest_it_is_given() {
+    let tarball = release_tarball(&[
+        ("Package.swift", b"// swift-tools-version: 6.0"),
+        ("Sources/Kit/Kit.swift", b"public struct Kit {}"),
+    ]);
+    let without = package_signals(&["--ecosystem", "swift"], &tarball);
+    assert!(without.status.success(), "{without:?}");
+    let document: serde_json::Value = serde_json::from_slice(&without.stdout).unwrap();
+    assert_eq!(swift_check(&document, "platforms")["status"], "pending");
+
+    let manifests = TempDir::new().unwrap();
+    let manifest = manifests.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        br#"{"toolsVersion":{"_version":"6.0.0"},"platforms":[{"platformName":"macos","version":"14.0"}],"products":[],"targets":[],"dependencies":[]}"#,
+    )
+    .unwrap();
+    let with = package_signals(
+        &[
+            "--ecosystem",
+            "swift",
+            "--swift-manifest",
+            manifest.to_str().unwrap(),
+        ],
+        &tarball,
+    );
+    assert!(with.status.success(), "{with:?}");
+    let document: serde_json::Value = serde_json::from_slice(&with.stdout).unwrap();
+    assert_eq!(swift_check(&document, "platforms")["status"], "passed");
+    assert_eq!(swift_check(&document, "versioned-deps")["status"], "passed");
+}
+
+#[test]
+fn reports_a_swift_manifest_that_is_not_a_json_object_as_a_json_error() {
+    let manifests = TempDir::new().unwrap();
+    let manifest = manifests.path().join("manifest.json");
+    std::fs::write(&manifest, b"[1, 2]").unwrap();
+    let tarball = release_tarball(&[("Package.swift", b"// swift-tools-version: 6.0")]);
+
+    let output = package_signals(
+        &[
+            "--ecosystem",
+            "swift",
+            "--swift-manifest",
+            manifest.to_str().unwrap(),
+        ],
+        &tarball,
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Swift manifest")),
+        "{error:#}"
+    );
 }
 
 #[test]

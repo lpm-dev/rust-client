@@ -16,6 +16,7 @@
 
 pub mod behavioral;
 pub mod provenance;
+pub mod quality;
 pub mod query;
 pub mod reach;
 pub mod script_hash;

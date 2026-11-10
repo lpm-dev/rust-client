@@ -1,10 +1,12 @@
+use super::quality_gate::{preflight_score, quality_json};
 use super::types::{
     LpmPublicationStatus, PublishResult, PublishTarget, SWIFT_REASON_FALLBACK,
     SWIFT_RELEASE_REJECTED, SWIFT_REMEDY_FALLBACK, swift_rejection_reason, swift_rejection_remedy,
 };
 use crate::commands::publish_common::TarballFile;
-use crate::{install_ui, quality};
+use crate::install_ui;
 use lpm_registry::SwiftReleaseState;
+use lpm_security::quality::QualityReport;
 use std::collections::HashMap;
 
 pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
@@ -77,15 +79,14 @@ pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
 }
 
 pub(super) fn publish_check_json(
-    quality_result: Option<&quality::QualityResult>,
+    quality_report: Option<&QualityReport>,
     targets: &[PublishTarget],
     target_names: &HashMap<String, String>,
     files: &[TarballFile],
 ) -> serde_json::Value {
-    let mut json = quality_result
-        .and_then(|qr| serde_json::to_value(qr).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({ "quality": null }));
+    let mut json = serde_json::json!({
+        "quality": quality_report.map(quality_json),
+    });
 
     let obj = json
         .as_object_mut()
@@ -137,7 +138,7 @@ pub(super) struct DryRunSummary<'a> {
     pub(super) target_names: &'a HashMap<String, String>,
     pub(super) file_count: usize,
     pub(super) tarball_size: usize,
-    pub(super) quality_result: Option<&'a quality::QualityResult>,
+    pub(super) quality_report: Option<&'a QualityReport>,
     pub(super) has_skills: bool,
     pub(super) ecosystem: &'a str,
     pub(super) targets: &'a [PublishTarget],
@@ -163,13 +164,15 @@ pub(super) fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
         "files",
         format_dry_run_files_value(summary.file_count, summary.tarball_size),
     );
-    if let Some(qr) = summary.quality_result {
+    if let Some(report) = summary.quality_report {
+        let (earned, max) = report.archive_points();
         publish_detail(
             "quality",
             &crate::install_ui::terminal_line!(
-                "{}/{}",
-                install_ui::status_ok(&qr.score.to_string()),
-                qr.max_score
+                "{}/{} {}",
+                install_ui::status_ok(&earned.to_string()),
+                max,
+                install_ui::dim(&format!("archive points ({}%)", preflight_score(report)))
             ),
         );
     }
@@ -493,29 +496,4 @@ pub(super) fn format_publish_visibility(visibility: &str) -> install_ui::Termina
         "public" => install_ui::status_ok("public"),
         other => install_ui::yellow(other),
     }
-}
-
-pub(super) fn print_publish_quality_result(result: &quality::QualityResult) {
-    install_ui::done_untrusted(&format!(
-        "Quality score: {}/{}",
-        result.score, result.max_score
-    ));
-    for check in result
-        .checks
-        .iter()
-        .filter(|check| !check.server_only && !check.passed)
-    {
-        install_ui::warn_line(format_publish_quality_issue(check));
-    }
-}
-
-pub(super) fn format_publish_quality_issue(
-    check: &quality::QualityCheck,
-) -> install_ui::TerminalLine {
-    let detail = check.detail.as_deref().unwrap_or(if check.server_only {
-        "pending"
-    } else {
-        "missing"
-    });
-    crate::install_ui::terminal_line!("{}  {}", &check.label, install_ui::dim(detail))
 }
