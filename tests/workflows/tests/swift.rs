@@ -25,6 +25,10 @@ const SWIFT_PACKAGE: &str = "@lpm.dev/acme.swift-logger";
 const SWIFT_VERSION: &str = "1.0.0";
 const SWIFT_PRODUCT: &str = "SwiftLogger";
 const SWIFT_CRITICAL_FINDING: &str = "critical Swift registry analysis finding";
+const SWIFT_SECOND_CRITICAL_FINDING: &str = "second critical Swift registry analysis finding";
+/// A `_vulnerabilities` entry the registry no longer serves; cached metadata
+/// may still carry it, and no audit shows it.
+const SWIFT_CACHED_ADVISORY: &str = "LPM-SWIFT-CACHED-ADVISORY";
 
 #[tokio::test]
 async fn swift_registry_fresh_configuration_contains_required_registries_object() {
@@ -205,22 +209,21 @@ async fn mount_named_swift_package(
 async fn mount_swift_package_with_audit_findings(mock: &MockRegistry) -> Vec<u8> {
     mount_swift_package_with_security_metadata(
         mock,
-        Some(serde_json::json!([{
-            "severity": "critical",
-            "description": SWIFT_CRITICAL_FINDING
-        }])),
         Some(serde_json::json!([
             {
-                "id": "LPM-SWIFT-ADV-A",
-                "summary": "first Swift advisory",
-                "severity": "critical"
+                "severity": "critical",
+                "description": SWIFT_CRITICAL_FINDING
             },
             {
-                "id": "LPM-SWIFT-ADV-B",
-                "summary": "second Swift advisory",
-                "severity": "critical"
+                "severity": "critical",
+                "description": SWIFT_SECOND_CRITICAL_FINDING
             }
         ])),
+        Some(serde_json::json!([{
+            "id": SWIFT_CACHED_ADVISORY,
+            "summary": "a registry advisory no longer served",
+            "severity": "critical"
+        }])),
     )
     .await
 }
@@ -888,7 +891,11 @@ async fn ordinary_swift_install_does_not_show_registry_audit_findings() {
         output.status.success(),
         "ordinary Swift install should succeed:\n{combined}"
     );
-    for hidden in [SWIFT_CRITICAL_FINDING, "LPM-SWIFT-ADV-A", "LPM-SWIFT-ADV-B"] {
+    for hidden in [
+        SWIFT_CRITICAL_FINDING,
+        SWIFT_SECOND_CRITICAL_FINDING,
+        SWIFT_CACHED_ADVISORY,
+    ] {
         assert!(
             !combined.contains(hidden),
             "ordinary Swift install must leave {hidden:?} to audit:\n{combined}"
@@ -917,18 +924,19 @@ async fn swift_install_with_audit_after_install_preserves_critical_registry_find
     );
     for expected in [
         SWIFT_CRITICAL_FINDING,
-        "2 vulnerabilities",
-        "3 critical",
-        "LPM-SWIFT-ADV-A",
-        "LPM-SWIFT-ADV-B",
+        SWIFT_SECOND_CRITICAL_FINDING,
+        "2 critical",
         "[registry/security]",
-        "[registry/vulnerability]",
     ] {
         assert!(
             combined.contains(expected),
             "audit-enabled Swift install must show {expected:?}:\n{combined}"
         );
     }
+    assert!(
+        !combined.contains(SWIFT_CACHED_ADVISORY),
+        "a registry advisory the registry no longer serves must not be shown:\n{combined}"
+    );
     assert!(
         !combined.contains("run `lpm audit`"),
         "Swift audit summary must not recommend an audit command that lacks Swift discovery:\n{combined}"
@@ -962,7 +970,7 @@ async fn swift_install_config_enables_registry_audit_findings() {
         "config-enabled Swift audit should succeed:\n{combined}"
     );
     assert!(
-        combined.contains(SWIFT_CRITICAL_FINDING) && combined.contains("3 critical"),
+        combined.contains(SWIFT_CRITICAL_FINDING) && combined.contains("2 critical"),
         "audit-after-install config must expose Critical Swift registry findings:\n{combined}"
     );
 }

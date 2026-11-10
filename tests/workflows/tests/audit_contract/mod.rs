@@ -322,8 +322,8 @@ async fn registry_audit_fixture(
     install_one(&project, &mock, package).await;
     let mut entry = serde_json::json!({"name":package,"version":version,"dependencies":{}});
     if let Some(severity) = severity {
-        entry["_vulnerabilities"] =
-            serde_json::json!([{"id":"REGISTRY-CONTRACT","severity":severity}]);
+        entry["_securityFindings"] =
+            serde_json::json!([{"description":"REGISTRY-CONTRACT","severity":severity}]);
     }
     let metadata = serde_json::json!({"name":package,"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":entry}});
     let batch = format!(
@@ -348,10 +348,10 @@ async fn registry_audit_fixture(
 }
 
 #[tokio::test]
-async fn audit_registry_severity_cannot_hide_an_advisory_from_the_failure_policy() {
+async fn audit_registry_severity_cannot_hide_a_finding_from_the_failure_policy() {
     for severity in ["HIGH ", "unknown"] {
         let (project, mock) = registry_audit_fixture("1.0.0", Some(severity)).await;
-        let output = run_audit_json(&project, &mock, &["--level=high", "--fail-on=vuln"]);
+        let output = run_audit_json(&project, &mock, &["--level=high", "--fail-on=behavior"]);
         assert!(
             !output.status.success(),
             "{severity}: {}",
@@ -367,7 +367,7 @@ async fn audit_registry_severity_cannot_hide_an_advisory_from_the_failure_policy
                     .iter()
                     .any(|package| {
                         package["issues"].as_array().unwrap().iter().any(|issue| {
-                            issue["severity"] == "high" && issue["category"] == "vulnerability"
+                            issue["severity"] == "high" && issue["category"] == "security"
                         })
                     }),
                 "{envelope}"
@@ -384,6 +384,19 @@ async fn audit_registry_severity_cannot_hide_an_advisory_from_the_failure_policy
 }
 
 #[tokio::test]
+async fn audit_fail_on_vuln_ignores_a_critical_registry_finding() {
+    let (project, mock) = registry_audit_fixture("1.0.0", Some("critical")).await;
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=vuln"]);
+
+    assert!(
+        output.status.success(),
+        "only an OSV advisory fails --fail-on=vuln: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
 async fn audit_rejects_registry_version_identity_mismatches() {
     let (project, mock) = registry_audit_fixture("2.0.0", None).await;
     let output = run_audit_json(&project, &mock, &[]);
@@ -396,12 +409,48 @@ async fn audit_rejects_registry_version_identity_mismatches() {
 
 #[tokio::test]
 async fn audit_fix_rejects_registry_version_identity_mismatches() {
-    let (project, mock) = registry_audit_fixture("2.0.0", None).await;
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    let fixture = install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+                alias: None,
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.1",
+                alias: None,
+            },
+        ],
+        false,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+    let mut mismatched = fixture.metadata.clone();
+    mismatched["versions"]["1.0.0"]["version"] = "2.0.0".into();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{WRAPPER}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mismatched))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let _ = std::fs::remove_dir_all(project.cache_dir().join("metadata"));
+
     let output = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(!output.status.success(), "{envelope}");
+    assert_eq!(envelope["planned"], 0, "{envelope}");
     assert!(
-        !output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        envelope["skipped"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("inconsistent version metadata")),
+        "{envelope}"
     );
 }
 
@@ -530,36 +579,32 @@ async fn audit_fix_accepts_an_installed_dependency_manifest_with_a_bom() {
 
 #[tokio::test]
 async fn audit_fix_rolls_back_when_verification_metadata_changes_version_identity() {
-    let package = "@lpm.dev/test.verify-identity";
-    let project = TempProject::empty(&format!(
-        r#"{{"name":"verify-identity","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
-    ));
+    let package = WRAPPER;
+    let project = wrapper_project("1.0.0");
     let mock = MockRegistry::start().await;
-    let vulnerable = make_tarball(package, "1.0.0");
-    let fixed = make_tarball(package, "1.0.1");
-    let metadata = serde_json::json!({
-        "name": package, "dist-tags": {"latest": "1.0.1"},
-        "versions": {
-            "1.0.0": {"name": package, "version": "1.0.0", "dist": {
-                "tarball": format!("{}{}", mock.url(), MockRegistry::tarball_path(package, "1.0.0")),
-                "integrity": support::mock_registry::compute_integrity(&vulnerable)
-            }, "_vulnerabilities": [{"id": "VERIFY-ID", "severity": "high"}]},
-            "1.0.1": {"name": package, "version": "1.0.1", "dist": {
-                "tarball": format!("{}{}", mock.url(), MockRegistry::tarball_path(package, "1.0.1")),
-                "integrity": support::mock_registry::compute_integrity(&fixed)
-            }}
-        }
-    });
-    mock.with_package_metadata_and_tarballs(
-        package,
-        metadata.clone(),
-        &[("1.0.0", vulnerable), ("1.0.1", fixed.clone())],
+    let fixture = install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+                alias: None,
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.1",
+                alias: None,
+            },
+        ],
+        false,
     )
     .await;
-    lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-security-summary", "--no-skills"])
-        .assert()
-        .success();
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+    answer_osv_for_dependency(&mock, "1.0.1", vec![]).await;
+    let fixed = fixture.tarball("1.0.1");
+    let metadata = fixture.metadata.clone();
     let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_tarball = served.clone();
     Mock::given(method("GET"))

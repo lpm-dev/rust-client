@@ -14,6 +14,11 @@
 mod query_contract;
 mod support;
 
+use support::lpm_dependency_advisory::{
+    ANCHOR, DEPENDENCY, WRAPPER, WrapperManifest, WrapperRelease, answer_osv_for_dependency,
+    answer_osv_for_tree, dependency_advisory, install_wrapper_beside_an_anchor,
+    install_wrapper_with_npm_dependency, wrapper_beside_an_anchor_project, wrapper_project,
+};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, VALID_TEST_INTEGRITY};
 use wiremock::matchers::{method, path};
@@ -1259,7 +1264,7 @@ fn query_vulnerability_assertion_fails_when_osv_cannot_be_reached() {
 }
 
 #[tokio::test]
-async fn query_vulnerability_assertion_fails_when_registry_metadata_is_unavailable() {
+async fn query_deprecation_assertion_fails_when_registry_metadata_is_unavailable() {
     let project = TempProject::empty(
         r#"{"name":"q","version":"1.0.0","dependencies":{"@lpm.dev/example.pkg":"1.0.0"}}"#,
     );
@@ -1279,39 +1284,184 @@ async fn query_vulnerability_assertion_fails_when_registry_metadata_is_unavailab
             &mock.url(),
             "--insecure",
             "query",
-            ":vulnerable",
+            ":deprecated",
             "--assert-none",
         ])
         .output()
-        .expect("failed to run registry-backed vulnerability assertion");
+        .expect("failed to run registry-backed deprecation assertion");
 
     assert!(
         !output.status.success(),
-        "a vulnerability assertion must fail closed on registry errors"
+        "a deprecation assertion must fail closed on registry errors"
     );
 }
 
 #[tokio::test]
-async fn query_vulnerable_matches_registry_advisories_for_lpm_packages() {
-    let project = TempProject::empty(
-        r#"{"name":"q","version":"1.0.0","dependencies":{"@lpm.dev/example.pkg":"1.0.0"}}"#,
-    );
-    seed_pkg_with_source(&project, "@lpm.dev/example.pkg", "1.0.0", SRC_CLEAN);
+async fn query_vulnerable_matches_an_lpm_package_through_its_vulnerable_npm_dependency() {
+    let project = wrapper_project("1.0.0");
     let mock = MockRegistry::start().await;
-    mock.with_batch_metadata(vec![serde_json::json!({
-        "name": "@lpm.dev/example.pkg",
-        "dist-tags": {"latest": "1.0.0"},
-        "versions": {
-            "1.0.0": {
-                "name": "@lpm.dev/example.pkg",
-                "version": "1.0.0",
-                "_vulnerabilities": [{"id": "LPM-QUERY-POSITIVE"}]
-            }
-        }
-    })])
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+            alias: None,
+        }],
+        false,
+    )
     .await;
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
 
     let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "--json",
+            "query",
+            ":vulnerable",
+        ])
+        .output()
+        .expect("failed to run the vulnerability query");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut matched = matches
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| {
+            (
+                package["name"].as_str().unwrap().to_string(),
+                package["version"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    matched.sort();
+    assert_eq!(
+        matched,
+        [
+            (WRAPPER.to_string(), "1.0.0".to_string()),
+            (DEPENDENCY.to_string(), "1.0.0".to_string()),
+        ],
+        "an LPM package is vulnerable through the npm package it installs: {matches:#}"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerable_matches_an_lpm_package_through_the_peer_it_takes() {
+    let project = wrapper_beside_an_anchor_project("1.0.1");
+    let mock = MockRegistry::start().await;
+    install_wrapper_beside_an_anchor(
+        &project,
+        &mock,
+        &[WrapperManifest {
+            version: "1.0.1",
+            fields: serde_json::json!({ "peerDependencies": { DEPENDENCY: "*" } }),
+        }],
+    )
+    .await;
+    answer_osv_for_tree(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "--json",
+            "query",
+            ":vulnerable",
+        ])
+        .output()
+        .expect("failed to run the vulnerability query");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut matched = matches
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| package["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    matched.sort();
+    assert_eq!(
+        matched,
+        [WRAPPER.to_string(), DEPENDENCY.to_string()],
+        "the wrapper takes the dep-pkg 1.0.0 that {ANCHOR} keeps: {matches:#}"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerable_matches_an_lpm_package_through_an_npm_alias() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+            alias: Some("renamed"),
+        }],
+        false,
+    )
+    .await;
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "--json",
+            "query",
+            ":vulnerable",
+        ])
+        .output()
+        .expect("failed to run the vulnerability query");
+
+    let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        matches
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["name"] == WRAPPER),
+        "the alias names dep-pkg, which OSV flags: {matches:#}"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerable_ignores_registry_advisories_for_lpm_packages() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+            alias: None,
+        }],
+        true,
+    )
+    .await;
+    answer_osv_for_dependency(&mock, "1.0.0", vec![]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "--registry",
             &mock.url(),
@@ -1321,15 +1471,12 @@ async fn query_vulnerable_matches_registry_advisories_for_lpm_packages() {
             "--assert-none",
         ])
         .output()
-        .expect("failed to run registry-backed vulnerability query");
+        .expect("failed to run the vulnerability assertion");
 
     assert!(
-        !output.status.success(),
-        "a registry advisory affecting the installed version must match :vulnerable"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("1 package matched :vulnerable"),
-        "the failure must come from the matched vulnerability assertion"
+        output.status.success(),
+        "a registry advisory the registry no longer serves must not match :vulnerable: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -1438,7 +1585,7 @@ async fn query_rejects_registry_metadata_that_omits_the_installed_version() {
             "2.0.0": {
                 "name": "@lpm.dev/example.pkg",
                 "version": "2.0.0",
-                "_vulnerabilities": [{"id": "LATEST-ONLY"}]
+                "deprecated": "only the latest release is described"
             }
         }
     })])
@@ -1452,7 +1599,7 @@ async fn query_rejects_registry_metadata_that_omits_the_installed_version() {
             &mock.url(),
             "--insecure",
             "query",
-            ":vulnerable",
+            ":deprecated",
             "--assert-none",
         ])
         .output()

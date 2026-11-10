@@ -268,7 +268,7 @@ fn fail_on_behavior_catches_high_severity() {
 
 // ─── collect_registry_issues: behavioral-tag → AuditIssue mapping ───
 
-use lpm_registry::{BehavioralTags, SecurityFinding, VersionMetadata, Vulnerability};
+use lpm_registry::{BehavioralTags, SecurityFinding, VersionMetadata};
 
 fn meta_with_tags(setup: impl FnOnce(&mut BehavioralTags)) -> VersionMetadata {
     let mut tags = BehavioralTags::default();
@@ -662,67 +662,21 @@ fn registry_issue_empty_lifecycle_scripts_emits_no_issue() {
     assert!(issues.is_empty());
 }
 
-// vulnerabilities arm
+// A registry advisory in older metadata
 
 #[test]
-fn registry_issue_vulnerabilities_emits_one_issue_per_vuln() {
-    let meta = VersionMetadata {
-        vulnerabilities: Some(vec![
-            Vulnerability {
-                id: Some("GHSA-aaaa".into()),
-                summary: Some("rce".into()),
-                severity: Some("HIGH".into()),
-                aliases: None,
-            },
-            Vulnerability {
-                id: Some("CVE-2025-0001".into()),
-                summary: None,
-                severity: Some("Critical".into()),
-                aliases: None,
-            },
-        ]),
-        ..Default::default()
-    };
-    let issues = collect(&meta);
-    assert_eq!(issues.len(), 2);
-    // Severity is lowercased
-    let high = issues
-        .iter()
-        .find(|i| i.message.contains("GHSA-aaaa"))
-        .unwrap();
-    assert_eq!(high.severity, "high");
-    assert_eq!(high.category, "vulnerability");
-    assert!(high.message.contains("rce"));
-    let critical = issues
-        .iter()
-        .find(|i| i.message.contains("CVE-2025-0001"))
-        .unwrap();
-    assert_eq!(critical.severity, "critical");
-    // No summary → no " — " separator
-    assert!(!critical.message.contains(" — "));
-}
-
-#[test]
-fn registry_issue_vulnerability_defaults_for_missing_fields() {
-    let meta = VersionMetadata {
-        vulnerabilities: Some(vec![Vulnerability {
-            id: None,
-            summary: None,
-            severity: None,
-            aliases: None,
-        }]),
-        ..Default::default()
-    };
-    let issues = collect(&meta);
-    assert_eq!(issues.len(), 1);
-    assert_eq!(issues[0].severity, "moderate", "default severity");
-    assert_eq!(issues[0].message, "unknown", "default id");
+fn registry_issues_ignore_a_registry_advisory_from_older_metadata() {
+    let meta: VersionMetadata = serde_json::from_str(
+        r#"{"name":"kit","version":"1.0.0","_vulnerabilities":[{"id":"GHSA-aaaa","severity":"critical"}]}"#,
+    )
+    .unwrap();
+    assert!(collect(&meta).is_empty());
 }
 
 // Combined — multiple arms in one call
 
 #[test]
-fn registry_issue_combined_security_behavioral_scripts_vulns() {
+fn registry_issue_combined_security_behavioral_scripts() {
     let mut scripts = std::collections::HashMap::new();
     scripts.insert("preinstall".to_string(), "x".to_string());
     let meta = VersionMetadata {
@@ -738,18 +692,12 @@ fn registry_issue_combined_security_behavioral_scripts_vulns() {
             ..Default::default()
         }),
         lifecycle_scripts: Some(scripts),
-        vulnerabilities: Some(vec![Vulnerability {
-            id: Some("CVE-2025-9999".into()),
-            summary: Some("rce".into()),
-            severity: Some("high".into()),
-            aliases: None,
-        }]),
         ..Default::default()
     };
     let issues = collect(&meta);
     // 1 security_finding + 3 active buckets (critical/dangerous/medium)
-    // + 1 lifecycle_scripts + 1 vulnerability = 6 issues.
-    assert_eq!(issues.len(), 6, "got: {issues:?}");
+    // + 1 lifecycle_scripts = 5 issues.
+    assert_eq!(issues.len(), 5, "got: {issues:?}");
 }
 
 /// `query_osv_batch` now surfaces non-2xx responses as `Err`

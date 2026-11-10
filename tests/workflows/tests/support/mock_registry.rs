@@ -3563,10 +3563,33 @@ impl MockRegistry {
         latest_version: &str,
         versions: &[(&str, serde_json::Value, Option<Vec<u8>>)],
     ) -> serde_json::Value {
+        let manifests = versions
+            .iter()
+            .map(|(version, dependencies, bytes)| {
+                (
+                    *version,
+                    serde_json::json!({ "dependencies": dependencies }),
+                    bytes.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.mount_package_manifest_routes(name, latest_version, &manifests)
+            .await
+    }
+
+    /// As [`Self::mount_full_package_metadata_routes`], with each version's
+    /// manifest fields, such as `dependencies` and `peerDependencies`, as
+    /// given.
+    pub async fn mount_package_manifest_routes(
+        &self,
+        name: &str,
+        latest_version: &str,
+        versions: &[(&str, serde_json::Value, Option<Vec<u8>>)],
+    ) -> serde_json::Value {
         let mut versions_map = serde_json::Map::new();
         let mut times_map = serde_json::Map::new();
 
-        for (v, deps, bytes_opt) in versions {
+        for (v, fields, bytes_opt) in versions {
             let tarball_url = self.tarball_url(name, v);
             let integrity = match bytes_opt {
                 Some(bytes) => compute_integrity(bytes),
@@ -3580,18 +3603,18 @@ impl MockRegistry {
             if bytes_opt.is_some() {
                 self.register_tarball_integrity(name, v, integrity.clone());
             }
-            versions_map.insert(
-                (*v).to_string(),
-                serde_json::json!({
-                    "name": name,
-                    "version": v,
-                    "dist": {
-                        "tarball": tarball_url,
-                        "integrity": integrity,
-                    },
-                    "dependencies": deps,
-                }),
-            );
+            let mut document = serde_json::json!({
+                "name": name,
+                "version": v,
+                "dist": {
+                    "tarball": tarball_url,
+                    "integrity": integrity,
+                },
+            });
+            if let (Some(document), Some(fields)) = (document.as_object_mut(), fields.as_object()) {
+                document.extend(fields.clone());
+            }
+            versions_map.insert((*v).to_string(), document);
             times_map.insert(
                 (*v).to_string(),
                 serde_json::Value::String("2025-01-01T00:00:00.000Z".into()),

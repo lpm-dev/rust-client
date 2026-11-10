@@ -209,22 +209,6 @@ pub struct VersionMetadata {
 
     #[serde(default, rename = "_qualityScore")]
     pub quality_score: Option<u32>,
-
-    #[serde(default, rename = "_vulnerabilities")]
-    pub vulnerabilities: Option<Vec<Vulnerability>>,
-}
-
-/// Known vulnerability from OSV database (stored server-side on publish).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Vulnerability {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub severity: Option<String>,
-    #[serde(default)]
-    pub aliases: Option<Vec<String>>,
 }
 
 /// Static behavioral analysis tags — what the package code does.
@@ -708,8 +692,7 @@ impl VersionMetadata {
             .lifecycle_scripts
             .as_ref()
             .is_some_and(|s| !s.is_empty());
-        let has_vulns = self.vulnerabilities.as_ref().is_some_and(|v| !v.is_empty());
-        has_findings || has_dangerous_tags || has_lifecycle || has_vulns
+        has_findings || has_dangerous_tags || has_lifecycle
     }
 
     /// Returns the ecosystem, checking both _ecosystem and lpmConfig.ecosystem.
@@ -2050,6 +2033,21 @@ mod tests {
         )
         .unwrap();
         assert!(ran.has_security_issues());
+    }
+
+    #[test]
+    fn a_registry_advisory_from_older_metadata_is_ignored() {
+        let cached: VersionMetadata = serde_json::from_str(
+            r#"{"name":"kit","version":"1.0.0","_vulnerabilities":[{"id":"GHSA-old","severity":"critical"}]}"#,
+        )
+        .unwrap();
+
+        assert!(!cached.has_security_issues());
+        assert!(
+            !serde_json::to_string(&cached)
+                .unwrap()
+                .contains("_vulnerabilities")
+        );
     }
 
     #[test]

@@ -14,17 +14,13 @@ pub fn summarize_registry_install(
 ) -> AuditCounts {
     let started = std::time::Instant::now();
     let result = registry_audit_result(name, version, ver_meta);
-    let vulnerabilities = result
-        .issues
-        .iter()
-        .filter(|issue| issue.category == "vulnerability")
-        .count();
     let (severity_counts, critical_findings) =
         summarize_findings(std::slice::from_ref(&result), &[]);
 
     AuditCounts {
         packages_audited: 1,
-        vulnerabilities,
+        // Vulnerabilities come from OSV, which a registry-only summary doesn't ask.
+        vulnerabilities: 0,
         suspicious: 0,
         severity_counts,
         critical_findings,
@@ -98,13 +94,7 @@ pub async fn run_install_summary(
         ));
     }
 
-    let registry_vulnerabilities = scan
-        .results
-        .iter()
-        .flat_map(|result| &result.issues)
-        .filter(|issue| issue.category == "vulnerability")
-        .count();
-    let vulnerabilities = scan.osv_vulnerabilities.len() + registry_vulnerabilities;
+    let vulnerabilities = scan.osv_vulnerabilities.len();
     let (severity_counts, critical_findings) =
         summarize_findings(&scan.results, &scan.osv_vulnerabilities);
 

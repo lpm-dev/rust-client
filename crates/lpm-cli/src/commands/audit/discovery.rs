@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -337,6 +337,11 @@ fn lpm_discovered_packages(
     lockfile: &lpm_lockfile::Lockfile,
 ) -> Vec<DiscoveredPackage> {
     let project_paths = resolve_lpm_project_paths(project_root, lockfile);
+    let by_instance: HashMap<_, _> = lockfile
+        .packages
+        .iter()
+        .filter_map(|package| package.instance_id.map(|id| (id, package)))
+        .collect();
     lockfile
         .packages
         .iter()
@@ -344,17 +349,7 @@ fn lpm_discovered_packages(
             // All packages in lpm.lock (both @lpm.dev and npm) are in the
             // LPM store at ~/.lpm/store/v1/<name>@<version>/. The store-backed
             // scan uses store.package_dir(name, version), not the path field.
-
-            // Parse dependencies from "name@version" format
-            let dependencies = p
-                .dependencies
-                .iter()
-                .filter_map(|dep_ref| {
-                    dep_ref
-                        .rfind('@')
-                        .map(|at| (dep_ref[..at].to_string(), dep_ref[at + 1..].to_string()))
-                })
-                .collect();
+            let dependencies = installed_dependencies(p, &by_instance);
 
             let selector = format!("{}@{}", p.name, p.version);
             let patch_sha256 = lockfile
@@ -392,6 +387,46 @@ fn lpm_discovered_packages(
             }
         })
         .collect()
+}
+
+/// The packages `package` installs directly, peers included, each as the
+/// lockfile row it resolved to: its canonical name, so an npm alias names
+/// its target, and that row's version. A lockfile without exact targets
+/// falls back to the edge's own `<local name>@<version>`, with the alias
+/// target in place of the local name.
+fn installed_dependencies(
+    package: &lpm_lockfile::LockedPackage,
+    by_instance: &HashMap<lpm_common::PackageInstanceId, &lpm_lockfile::LockedPackage>,
+) -> Vec<(String, String)> {
+    let target_of = |local: &str, targets: &BTreeMap<String, lpm_common::PackageInstanceId>| {
+        targets
+            .get(local)
+            .and_then(|id| by_instance.get(id))
+            .map(|target| (target.name.clone(), target.version.clone()))
+    };
+    let mut installed: Vec<(String, String)> = package
+        .dependencies
+        .iter()
+        .filter_map(|dep_ref| {
+            let at = dep_ref.rfind('@').filter(|&at| at > 0)?;
+            let (local, version) = (&dep_ref[..at], &dep_ref[at + 1..]);
+            target_of(local, &package.dependency_targets).or_else(|| {
+                let name = package
+                    .alias_dependencies
+                    .iter()
+                    .find(|[alias, _]| alias == local)
+                    .map_or(local, |[_, target]| target.as_str());
+                Some((name.to_string(), version.to_string()))
+            })
+        })
+        .collect();
+    installed.extend(package.peer_edges.iter().map(|edge| {
+        target_of(&edge.local_name, &package.peer_targets)
+            .unwrap_or_else(|| (edge.target_name.clone(), edge.target_version.clone()))
+    }));
+    installed.sort_unstable();
+    installed.dedup();
+    installed
 }
 
 fn resolve_lpm_project_paths(
@@ -1261,6 +1296,61 @@ fn pnpm_manifest_matches(
 mod tests {
     use super::*;
     use std::fs;
+
+    fn instance(n: u8) -> lpm_common::PackageInstanceId {
+        lpm_common::PackageInstanceId::parse(&format!("{n:064x}")).unwrap()
+    }
+
+    fn locked_at(id: u8, name: &str, version: &str) -> lpm_lockfile::LockedPackage {
+        lpm_lockfile::LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            instance_id: Some(instance(id)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn installed_dependencies_name_the_rows_an_edge_installs_peers_included() {
+        let dep = locked_at(2, "dep-pkg", "1.0.0");
+        let react = locked_at(3, "react", "18.0.0");
+        let mut wrapper = locked_at(1, "@lpm.dev/acme.ui", "1.0.0");
+        wrapper.dependencies = vec!["legacy@1.0.0".into()];
+        wrapper.dependency_targets = BTreeMap::from([("legacy".to_string(), instance(2))]);
+        wrapper.peer_edges = vec![lpm_common::PeerEdge::registry("react", "react", "18.0.0")];
+        wrapper.peer_targets = BTreeMap::from([("react".to_string(), instance(3))]);
+        let by_instance = HashMap::from([(instance(2), &dep), (instance(3), &react)]);
+
+        assert_eq!(
+            installed_dependencies(&wrapper, &by_instance),
+            [
+                ("dep-pkg".to_string(), "1.0.0".to_string()),
+                ("react".to_string(), "18.0.0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_dependencies_fall_back_to_the_edges_of_a_lockfile_without_targets() {
+        let mut wrapper = locked_at(1, "@lpm.dev/acme.ui", "1.0.0");
+        wrapper.instance_id = None;
+        wrapper.dependencies = vec![
+            "legacy@1.0.0".into(),
+            "@scope/name@2.0.0".into(),
+            "@1.0.0".into(),
+        ];
+        wrapper.alias_dependencies = vec![["legacy".into(), "dep-pkg".into()]];
+        wrapper.peer_edges = vec![lpm_common::PeerEdge::registry("r", "react", "18.0.0")];
+
+        assert_eq!(
+            installed_dependencies(&wrapper, &HashMap::new()),
+            [
+                ("@scope/name".to_string(), "2.0.0".to_string()),
+                ("dep-pkg".to_string(), "1.0.0".to_string()),
+                ("react".to_string(), "18.0.0".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn npm_lockfile_preserves_dependency_edges() {

@@ -42,6 +42,7 @@ pub mod assertions;
 pub mod auth_state;
 pub mod build_state;
 pub mod fault_registry;
+pub mod lpm_dependency_advisory;
 pub mod mock_registry;
 pub mod source_recovery;
 pub mod verdaccio;

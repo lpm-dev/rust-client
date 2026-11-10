@@ -1870,22 +1870,12 @@ mod metadata_cache_schema_tests {
             has_install_script: _,
             security_findings: _,
             quality_score: _,
-            vulnerabilities: _,
             publication_status: _,
         } = metadata;
     }
 
     fn peer_dependency_meta_fields(metadata: PeerDependencyMeta) {
         let PeerDependencyMeta { optional: _ } = metadata;
-    }
-
-    fn vulnerability_fields(vulnerability: Vulnerability) {
-        let Vulnerability {
-            id: _,
-            summary: _,
-            severity: _,
-            aliases: _,
-        } = vulnerability;
     }
 
     fn behavioral_tags_fields(tags: BehavioralTags) {
@@ -2013,7 +2003,6 @@ mod metadata_cache_schema_tests {
         let _: fn(PackageMetadata) = package_metadata_fields;
         let _: fn(VersionMetadata) = version_metadata_fields;
         let _: fn(PeerDependencyMeta) = peer_dependency_meta_fields;
-        let _: fn(Vulnerability) = vulnerability_fields;
         let _: fn(BehavioralTags) = behavioral_tags_fields;
         let _: fn(SecurityFinding) = security_finding_fields;
         let _: fn(SwiftMeta) = swift_meta_fields;

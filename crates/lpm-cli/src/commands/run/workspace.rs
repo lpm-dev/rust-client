@@ -969,25 +969,41 @@ mod tests {
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let finished = std::sync::Mutex::new(Vec::new());
-        let member = |name: &'static str, turn: usize, millis: u64| {
-            let _slot = slots.acquire(turn);
-            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(millis));
-            running.fetch_sub(1, Ordering::SeqCst);
-            finished.lock().unwrap().push(name);
-        };
-        let member = &member;
+        let (quick_done, quick_finished) = std::sync::mpsc::channel();
 
         std::thread::scope(|scope| {
-            scope.spawn(move || member("slow", 0, 400));
+            let (slots, running, peak, finished) = (&slots, &running, &peak, &finished);
+            let enter = move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+            };
+            scope.spawn(move || {
+                let _slot = slots.acquire(0);
+                enter();
+                // It holds its slot until every quick member has run through
+                // the other one, so no timing decides the order.
+                for _ in 0..3 {
+                    quick_finished
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("a quick member runs while the slow one holds its slot");
+                }
+                finished.lock().unwrap().push("slow");
+                running.fetch_sub(1, Ordering::SeqCst);
+            });
             for (turn, name) in ["a", "b", "c"].into_iter().enumerate() {
-                scope.spawn(move || member(name, turn + 1, 20));
+                let quick_done = quick_done.clone();
+                scope.spawn(move || {
+                    let _slot = slots.acquire(turn + 1);
+                    enter();
+                    finished.lock().unwrap().push(name);
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    quick_done.send(()).unwrap();
+                });
             }
         });
 
         assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(finished.lock().unwrap().last(), Some(&"slow"));
+        assert_eq!(*finished.lock().unwrap(), ["a", "b", "c", "slow"]);
     }
 
     #[test]

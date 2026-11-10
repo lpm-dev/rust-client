@@ -191,6 +191,36 @@ pub(super) struct OsvVulnerability {
 }
 
 impl OsvVulnerability {
+    /// An advisory with no affected ranges, for tests that only need its
+    /// identity.
+    #[cfg(test)]
+    pub(super) fn for_test(package: &str, version: &str, id: &str) -> Self {
+        Self {
+            package: package.to_string(),
+            version: version.to_string(),
+            id: id.to_string(),
+            summary: String::new(),
+            severity: "high".to_string(),
+            affected: Vec::new(),
+        }
+    }
+
+    /// The advisory affecting every version of its package before `fixed`.
+    #[cfg(test)]
+    pub(super) fn fixed_in(mut self, fixed: &str) -> Self {
+        self.affected = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": { "name": self.package, "ecosystem": "npm" },
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": fixed }]
+                }]
+            }))
+            .expect("an OSV affected entry"),
+        ];
+        self
+    }
+
     pub(super) fn affects_version(&self, version: &str) -> Result<bool, String> {
         evaluate_affected_ranges(&self.affected, &self.package, version)?.ok_or_else(|| {
             format!(
