@@ -179,7 +179,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Console",
     "Win32_System_WinRT",
 ] }
-windows-future = "0.3.2"
 windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

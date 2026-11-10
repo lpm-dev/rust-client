@@ -105,6 +105,9 @@ jobs:
       - name: Test Apple signing-service retry helper
         run: bash scripts/ci/test-with-apple-service-retry.sh
 
+      - name: Test unlocked gnome-keyring helper
+        run: bash scripts/ci/test-with-unlocked-gnome-keyring.sh
+
       - name: Test immutable env engine exporter
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
@@ -345,10 +348,10 @@ jobs:
       - name: Credential store compatibility with keyring 3
         run: |
           bash scripts/ci/install-apt-packages.sh --no-install-recommends gnome-keyring dbus-daemon
-          dbus-run-session -- bash -c 'printf lpm-ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null && cargo test --locked -p lpm-keyring --test keyring3_compatibility -- --ignored'
+          bash scripts/ci/with-unlocked-gnome-keyring.sh cargo test --locked -p lpm-keyring --test keyring3_compatibility -- --ignored
 
       - name: Install nextest
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
 
@@ -444,7 +447,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install nextest
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
 
@@ -568,7 +571,7 @@ jobs:
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Install nextest
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
 
@@ -628,7 +631,7 @@ jobs:
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Install nextest
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: nextest
 
