@@ -110,11 +110,12 @@ fn run_native_auth_command(mut command: std::process::Command) -> Result<bool, L
 fn request_windows_hello_approval(
     prompt: &str,
 ) -> Result<WindowsHelloVerificationAction, LpmError> {
-    use windows::Security::Credentials::UI::UserConsentVerifier;
-    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-    use windows::Win32::System::Console::GetConsoleWindow;
-    use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
-    use windows::core::{HSTRING, factory};
+    use super::windows_hello_bindings::{
+        GetConsoleWindow, IUserConsentVerifierInterop, RPC_E_CHANGED_MODE,
+        UserConsentVerificationResult, UserConsentVerifier,
+    };
+    use windows_core::{HSTRING, factory};
+    use windows_future::IAsyncOperation;
 
     let _apartment = WindowsRuntimeApartment::initialize(RPC_E_CHANGED_MODE)?;
     let availability = UserConsentVerifier::CheckAvailabilityAsync()
@@ -149,7 +150,9 @@ fn request_windows_hello_approval(
         unsafe {
             // SAFETY: `interop` is the activation factory for UserConsentVerifier, `hwnd`
             // belongs to this process's console window, and `message` is a live HSTRING.
-            interop.RequestVerificationForWindowAsync(hwnd, &message)
+            interop.RequestVerificationForWindowAsync::<IAsyncOperation<UserConsentVerificationResult>>(
+                hwnd, &message,
+            )
         }
     }
     .map_err(|err| {
@@ -173,13 +176,17 @@ struct WindowsRuntimeApartment {
 
 #[cfg(target_os = "windows")]
 impl WindowsRuntimeApartment {
-    fn initialize(changed_mode: windows::core::HRESULT) -> Result<Self, LpmError> {
+    fn initialize(changed_mode: windows_core::HRESULT) -> Result<Self, LpmError> {
+        use super::windows_hello_bindings::{RO_INIT_MULTITHREADED, RoInitialize};
+
+        // Every success code, including S_FALSE for a thread already in the
+        // multithreaded apartment, takes a reference that needs `RoUninitialize`.
         match unsafe {
             // SAFETY: Initializes WinRT for the current thread before using WinRT APIs.
-            windows::Win32::System::WinRT::RoInitialize(
-                windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
-            )
-        } {
+            RoInitialize(RO_INIT_MULTITHREADED)
+        }
+        .ok()
+        {
             Ok(()) => Ok(Self {
                 should_uninitialize: true,
             }),
@@ -199,7 +206,7 @@ impl Drop for WindowsRuntimeApartment {
         if self.should_uninitialize {
             unsafe {
                 // SAFETY: Paired with a successful `RoInitialize` on this thread.
-                windows::Win32::System::WinRT::RoUninitialize();
+                super::windows_hello_bindings::RoUninitialize();
             }
         }
     }
@@ -375,5 +382,94 @@ mod backend_tests {
                 Some(directory.path())
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_runtime_apartment_tests {
+    use super::WindowsRuntimeApartment;
+    use crate::security_approval::windows_hello_bindings::{
+        RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RO_INIT_TYPE, RPC_E_CHANGED_MODE,
+        RoInitialize, RoUninitialize, S_FALSE, S_OK,
+    };
+    use windows_core::HRESULT;
+
+    /// Apartment state belongs to a thread, and libtest can run several tests
+    /// on one thread (`--test-threads=1` runs them all on the main thread).
+    fn on_fresh_thread(test: impl FnOnce() + Send + 'static) {
+        if let Err(panic) = std::thread::spawn(test).join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn ro_initialize(mode: RO_INIT_TYPE) -> HRESULT {
+        // SAFETY: Each successful call is paired with `ro_uninitialize` on the same thread.
+        unsafe { RoInitialize(mode) }
+    }
+
+    fn ro_uninitialize() {
+        // SAFETY: Paired with a successful `ro_initialize` on this thread.
+        unsafe { RoUninitialize() }
+    }
+
+    fn enter_apartment() -> WindowsRuntimeApartment {
+        WindowsRuntimeApartment::initialize(RPC_E_CHANGED_MODE)
+            .unwrap_or_else(|err| panic!("Windows Runtime apartment failed to initialize: {err}"))
+    }
+
+    #[test]
+    fn first_initialization_on_a_thread_leaves_the_apartment_on_drop() {
+        on_fresh_thread(|| {
+            let apartment = enter_apartment();
+            assert!(apartment.should_uninitialize);
+            drop(apartment);
+
+            // A thread still in the multithreaded apartment would get RPC_E_CHANGED_MODE.
+            assert_eq!(ro_initialize(RO_INIT_SINGLETHREADED), S_OK);
+            ro_uninitialize();
+        });
+    }
+
+    #[test]
+    fn initializing_inside_a_multithreaded_apartment_releases_only_its_own_reference() {
+        on_fresh_thread(|| {
+            assert_eq!(ro_initialize(RO_INIT_MULTITHREADED), S_OK);
+
+            let apartment = enter_apartment();
+            assert!(apartment.should_uninitialize);
+            drop(apartment);
+
+            assert_eq!(
+                ro_initialize(RO_INIT_SINGLETHREADED),
+                RPC_E_CHANGED_MODE,
+                "the caller's reference must keep the thread in the multithreaded apartment"
+            );
+            ro_uninitialize();
+            assert_eq!(
+                ro_initialize(RO_INIT_SINGLETHREADED),
+                S_OK,
+                "the approval's S_FALSE reference must have been released"
+            );
+            ro_uninitialize();
+        });
+    }
+
+    #[test]
+    fn initializing_inside_a_single_threaded_apartment_reuses_it_without_uninitializing() {
+        on_fresh_thread(|| {
+            assert_eq!(ro_initialize(RO_INIT_SINGLETHREADED), S_OK);
+
+            let apartment = enter_apartment();
+            assert!(!apartment.should_uninitialize);
+            drop(apartment);
+
+            assert_eq!(
+                ro_initialize(RO_INIT_SINGLETHREADED),
+                S_FALSE,
+                "the caller's single-threaded apartment must survive the approval"
+            );
+            ro_uninitialize();
+            ro_uninitialize();
+        });
     }
 }

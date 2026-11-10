@@ -40,6 +40,7 @@ members = [
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
     "crates/lpm-triage-advisor",
+    "crates/lpm-windows-bindgen",
     "bench/ecosystem-verifier",
     "tests/integration",
     "tests/workflows",

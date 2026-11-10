@@ -59,6 +59,17 @@ updates:
       - "dependencies"
       - "rust"
     groups:
+      # windows-rs crates release in lockstep, and the committed Windows
+      # bindings need windows-bindgen to match windows-core and windows-future.
+      # The group takes every update type, so a release like 0.3 -> 0.100 moves
+      # them together too. Dependabot puts a crate in the first group it
+      # matches, so this group must stay above the one below.
+      windows-rs:
+        applies-to: version-updates
+        patterns:
+          - "windows-*"
+        exclude-patterns:
+          - "windows-native-keyring-store"
       rust-minor-and-patch:
         applies-to: version-updates
         update-types:

@@ -1,0 +1,15 @@
+[package]
+name = "lpm-windows-bindgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Regenerates the Windows API bindings that lpm-cli commits"
+publish = false
+
+[dependencies]
+windows-bindgen = "0.100"
+
+[lints]
+workspace = true
