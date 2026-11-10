@@ -6,12 +6,11 @@
 //! - **Unix:** plain `symlink(2)` via [`std::os::unix::fs::symlink`].
 //! - **Windows:** tries [`std::os::windows::fs::symlink_dir`] first
 //!   (works under Developer Mode or with appropriate policy). On
-//!   failure, falls back to NTFS junctions via `cmd /c mklink /J`,
-//!   which does not require admin privileges. Junction targets must
-//!   be absolute, so relative targets are resolved against the link's
-//!   parent and lexically cleaned (`..` segments simplified) before
-//!   being handed to cmd. Path strings are validated against cmd.exe
-//!   metacharacters to prevent command injection.
+//!   failure, falls back to an NTFS junction, which does not require
+//!   admin privileges, set directly with `FSCTL_SET_REPARSE_POINT`.
+//!   Junction targets must be absolute, so relative targets are
+//!   resolved against the link's parent and lexically cleaned (`..`
+//!   segments simplified) first.
 //!
 //! Both lpm-linker (for the install-time wrapper layout) and
 //! lpm-store v2 (for sibling-symlinks under `links/<graph-key>/`) use
@@ -26,9 +25,9 @@ use std::path::{Component, Path};
 ///
 /// On Unix, this is a relative-or-absolute `symlink(2)`. On Windows,
 /// the call tries `CreateSymbolicLinkW` first and silently falls back
-/// to `mklink /J` (NTFS junction) if the symlink fails — junctions
-/// don't need admin privileges, so this is the practical Windows
-/// path for end-user installs.
+/// to an NTFS junction if the symlink fails — junctions don't need
+/// admin privileges, so this is the practical Windows path for
+/// end-user installs.
 ///
 /// Returns the underlying I/O error if neither the symlink nor the
 /// junction call succeeds. Callers should surface the error rather
@@ -239,43 +238,142 @@ fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::Result<()> {
-    let abs_target = absolute_windows_link_target(target, link)?;
+    let link = with_backslashes(link);
+    let abs_target = absolute_windows_link_target(&with_backslashes(target), &link)?;
 
     // Try symlink_dir first — works without admin on Windows setups
     // running with Developer Mode or with the SeCreateSymbolicLink
     // privilege granted via group policy.
-    if std::os::windows::fs::symlink_dir(&abs_target, link).is_ok() {
+    if std::os::windows::fs::symlink_dir(&abs_target, &link).is_ok() {
         return Ok(());
     }
+    create_junction(&abs_target, &link)
+}
 
-    // Validate path strings before handing them to cmd.exe.
-    let link_str = link.to_string_lossy();
-    let target_str = abs_target.to_string_lossy();
-    if let Err(reason) = validate_cmd_path(&link_str) {
-        return Err(std::io::Error::new(
+/// `path` with every `/` as `\`. A scoped package's name puts a `/` in the
+/// linker's paths. Windows reads it as a separator except after a `\\?\`
+/// prefix, where it would be part of a name, and no Windows file name may
+/// hold one, so the backslash means the same in every form.
+#[cfg(windows)]
+fn with_backslashes(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
+        })
+        .collect();
+    PathBuf::from(std::ffi::OsString::from_wide(&wide))
+}
+
+/// Creates `link` as an NTFS junction to the absolute `target`. A junction
+/// needs no privilege, and setting its reparse point directly keeps both
+/// paths away from any command interpreter.
+#[cfg(windows)]
+fn create_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+
+    let reparse_data = mount_point_reparse_data(target)?;
+    let reparse_data_len = u32::try_from(reparse_data.len())
+        .expect("mount_point_reparse_data keeps the buffer within u16 lengths");
+    std::fs::create_dir(link)?;
+    let linked = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(link)
+        .and_then(|directory| {
+            let mut returned = 0;
+            // SAFETY: `directory` is an open handle and `reparse_data` outlives
+            // this synchronous call, which writes no output.
+            let set = unsafe {
+                DeviceIoControl(
+                    directory.as_raw_handle(),
+                    FSCTL_SET_REPARSE_POINT,
+                    reparse_data.as_ptr().cast(),
+                    reparse_data_len,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if set == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    if linked.is_err() {
+        let _ = std::fs::remove_dir(link);
+    }
+    linked
+}
+
+/// The `REPARSE_DATA_BUFFER` of a junction to the absolute `target`: the NT
+/// path Windows follows, then the path tools display.
+#[cfg(windows)]
+fn mount_point_reparse_data(target: &Path) -> std::io::Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Prefix;
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+
+    let invalid = |reason: &str| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("refusing junction: link path {reason}"),
-        ));
-    }
-    if let Err(reason) = validate_cmd_path(&target_str) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing junction: target path {reason}"),
-        ));
-    }
+            format!("cannot create a junction to {}: {reason}", target.display()),
+        )
+    };
+    let wide: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let Some(Component::Prefix(prefix)) = target.components().next() else {
+        return Err(invalid("the target is not absolute"));
+    };
+    // `\\?\` is four units long.
+    let (local, print): (&[u16], &[u16]) = match prefix.kind() {
+        Prefix::Disk(_) => (&wide, &wide),
+        Prefix::VerbatimDisk(_) => (&wide[4..], &wide[4..]),
+        Prefix::Verbatim(_) => (&wide[4..], &wide),
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(_) => {
+            return Err(invalid("a junction can only point at a local volume"));
+        }
+    };
+    let substitute: Vec<u16> = r"\??\"
+        .encode_utf16()
+        .chain(local.iter().copied())
+        .collect();
 
-    let status = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J", &link_str, &target_str])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Four 16-bit offsets and lengths, then both names, each NUL-terminated.
+    let too_long = || invalid("the path is too long for a junction");
+    let substitute_length = u16::try_from(substitute.len() * 2).map_err(|_| too_long())?;
+    let print_length = u16::try_from(print.len() * 2).map_err(|_| too_long())?;
+    let data_length = 8u16
+        .checked_add(substitute_length)
+        .and_then(|length| length.checked_add(print_length))
+        .and_then(|length| length.checked_add(4))
+        .ok_or_else(too_long)?;
 
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => Err(std::io::Error::other(
-            "failed to create junction or symlink",
-        )),
+    let mut data = Vec::with_capacity(8 + usize::from(data_length));
+    data.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    data.extend_from_slice(&data_length.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    for field in [0, substitute_length, substitute_length + 2, print_length] {
+        data.extend_from_slice(&field.to_le_bytes());
     }
+    for unit in substitute.iter().chain(&[0]).chain(print).chain(&[0]) {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(data)
 }
 
 #[cfg(windows)]
@@ -303,8 +401,8 @@ fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
 }
 
 /// Lexically simplify `..` and `.` segments in a path without touching
-/// the filesystem. Used by the Windows junction path so `mklink /J`
-/// receives a canonical absolute target.
+/// the filesystem. Used by the Windows link path so a junction receives
+/// a canonical absolute target.
 ///
 /// `a/b/../c` → `a/c`, `./a` → `a`, leading `..` segments are
 /// preserved (we have no parent to pop into). Leading `RootDir` /
@@ -331,7 +429,7 @@ fn lexically_clean(p: &Path) -> PathBuf {
 }
 
 /// Reject path strings containing cmd.exe metacharacters. Used before
-/// `cmd /c mklink /J` and before emitting a `.cmd` bin shim. Covers
+/// emitting a `.cmd` bin shim. Covers
 /// the sub-expression triple `( ) ;` and the quote-bypass triple
 /// `` ` ' \t`` so a crafted `package.json > name` can't reach cmd.exe's
 /// parser through double-quoted argument shapes.
@@ -426,6 +524,106 @@ mod tests {
         remove_path_entry(&published_link).unwrap();
         assert!(published_link.symlink_metadata().is_err());
         assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"ok");
+    }
+
+    /// A scoped package's name holds a `/`, so the linker's paths do too.
+    fn assert_scoped_package_link_resolves(root: &Path) {
+        let target = root.join("store/@scope/name");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker"), b"ok").unwrap();
+        std::fs::create_dir_all(root.join("node_modules").join("@scope")).unwrap();
+        let link = root.join("node_modules").join("@scope/name");
+
+        create_dir_symlink_or_junction(&target, &link).unwrap();
+
+        assert_eq!(std::fs::read(link.join("marker")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn a_scoped_package_link_is_created_through_the_forward_slash_its_name_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_scoped_package_link_resolves(dir.path());
+    }
+
+    #[test]
+    fn a_scoped_package_link_under_a_verbatim_root_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_scoped_package_link_resolves(&dir.path().canonicalize().unwrap());
+    }
+
+    fn target_with_marker(parent: &Path) -> PathBuf {
+        let target = parent.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker"), b"ok").unwrap();
+        target
+    }
+
+    #[test]
+    fn a_junction_resolves_to_its_target_and_removes_without_touching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = target_with_marker(dir.path());
+        let link = dir.path().join("link");
+
+        create_junction(&target, &link).unwrap();
+
+        assert!(is_symlink_or_junction(&link.symlink_metadata().unwrap()));
+        assert_eq!(std::fs::read(link.join("marker")).unwrap(), b"ok");
+        remove_path_entry(&link).unwrap();
+        assert!(link.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn a_junction_path_may_hold_characters_a_command_interpreter_would_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = target_with_marker(&dir.path().join("a&b %PATH% (c)"));
+        let link = dir.path().join("x&y %TEMP%");
+
+        create_junction(&target, &link).unwrap();
+
+        assert_eq!(std::fs::read(link.join("marker")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn a_junction_is_created_past_max_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = "d".repeat(120);
+        let root = dir.path().canonicalize().unwrap().join(&deep).join(&deep);
+        let target = target_with_marker(&root);
+        let link = root.join("l".repeat(120));
+        assert!(link.as_os_str().len() > 260);
+
+        create_junction(&target, &link).unwrap();
+
+        assert_eq!(std::fs::read(link.join("marker")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn a_junction_never_replaces_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = target_with_marker(dir.path());
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("kept"), b"kept").unwrap();
+
+        let error = create_junction(&target, &existing).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!is_symlink_or_junction(
+            &existing.symlink_metadata().unwrap()
+        ));
+        assert_eq!(std::fs::read(existing.join("kept")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn a_junction_to_a_network_share_is_refused_without_leaving_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+
+        let error = create_junction(Path::new(r"\\server\share\package"), &link).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(link.symlink_metadata().is_err());
     }
 }
 

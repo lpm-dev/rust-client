@@ -158,8 +158,8 @@ impl<'a> LayoutPaths<'a> {
     /// `link_name` is the symlink's relative-from-`node_modules/`
     /// filename — used only to count `/` separators (its scoped
     /// depth). The resulting relative path is what the linker hands
-    /// to `std::os::unix::fs::symlink` or `mklink /J` (after absolute
-    /// resolution on Windows).
+    /// to `std::os::unix::fs::symlink` or a Windows junction (after
+    /// absolute resolution).
     pub fn root_symlink_target(
         &self,
         link_name: &str,

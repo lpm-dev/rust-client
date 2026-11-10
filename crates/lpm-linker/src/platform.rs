@@ -58,10 +58,9 @@ pub(crate) use lpm_common::symlink::validate_cmd_path;
 
 /// Create a symlink (Unix) or junction (Windows) from `link` pointing to `target`.
 ///
-/// On Windows, NTFS junctions don't require admin privileges (unlike symlinks).
-/// We use `cmd /c mklink /J` which handles junction creation natively.
-/// Junctions require absolute paths, so we resolve relative targets before creating.
-/// Falls back to `symlink_dir` if junction creation fails.
+/// On Windows this tries a directory symlink first and falls back to an NTFS
+/// junction, which needs no admin privileges. Junctions require absolute
+/// paths, so relative targets are resolved before creating.
 ///
 // Directory-link creation is shared with lpm-store so v1 and v2 keep
 // the same Windows symlink-then-junction fallback behavior.
