@@ -1865,6 +1865,7 @@ async fn install_audit_after_install_counts_an_lpm_dependency_advisory_once() {
         &[WrapperRelease {
             version: "1.0.0",
             dependency_range: "1.0.0",
+            alias: None,
         }],
         true,
     )

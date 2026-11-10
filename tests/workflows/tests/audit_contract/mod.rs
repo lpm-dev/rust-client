@@ -384,6 +384,19 @@ async fn audit_registry_severity_cannot_hide_a_finding_from_the_failure_policy()
 }
 
 #[tokio::test]
+async fn audit_fail_on_vuln_ignores_a_critical_registry_finding() {
+    let (project, mock) = registry_audit_fixture("1.0.0", Some("critical")).await;
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=vuln"]);
+
+    assert!(
+        output.status.success(),
+        "only an OSV advisory fails --fail-on=vuln: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
 async fn audit_rejects_registry_version_identity_mismatches() {
     let (project, mock) = registry_audit_fixture("2.0.0", None).await;
     let output = run_audit_json(&project, &mock, &[]);
@@ -405,10 +418,12 @@ async fn audit_fix_rejects_registry_version_identity_mismatches() {
             WrapperRelease {
                 version: "1.0.0",
                 dependency_range: "1.0.0",
+                alias: None,
             },
             WrapperRelease {
                 version: "1.0.1",
                 dependency_range: "^1.0.1",
+                alias: None,
             },
         ],
         false,
@@ -574,10 +589,12 @@ async fn audit_fix_rolls_back_when_verification_metadata_changes_version_identit
             WrapperRelease {
                 version: "1.0.0",
                 dependency_range: "1.0.0",
+                alias: None,
             },
             WrapperRelease {
                 version: "1.0.1",
                 dependency_range: "^1.0.1",
+                alias: None,
             },
         ],
         false,

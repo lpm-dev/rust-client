@@ -178,15 +178,15 @@ mod tests {
             issues: vec![
                 AuditIssue {
                     severity: "Critical".to_string(),
-                    message: "LPM-ADV-A".to_string(),
-                    category: "vulnerability".to_string(),
+                    message: "registry finding A".to_string(),
+                    category: "security".to_string(),
                     source: "registry".to_string(),
                     ..AuditIssue::default()
                 },
                 AuditIssue {
                     severity: "critical".to_string(),
-                    message: "LPM-ADV-B".to_string(),
-                    category: "vulnerability".to_string(),
+                    message: "registry finding B".to_string(),
+                    category: "security".to_string(),
                     source: "registry".to_string(),
                     ..AuditIssue::default()
                 },
@@ -204,8 +204,8 @@ mod tests {
 
         assert_eq!(counts.critical, 3);
         assert_eq!(critical_findings.len(), 3);
-        assert_eq!(critical_findings[0].message, "LPM-ADV-A");
-        assert_eq!(critical_findings[1].message, "LPM-ADV-B");
+        assert_eq!(critical_findings[0].message, "registry finding A");
+        assert_eq!(critical_findings[1].message, "registry finding B");
         assert_eq!(critical_findings[2].message, "registry analysis finding");
     }
 }

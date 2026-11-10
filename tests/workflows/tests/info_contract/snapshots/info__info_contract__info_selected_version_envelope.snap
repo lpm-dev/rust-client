@@ -37,7 +37,6 @@ expression: envelope
       "_qualityScore": null,
       "_securityFindings": null,
       "_swiftMeta": null,
-      "_vulnerabilities": null,
       "bundleDependencies": [],
       "cpu": [],
       "dependencies": {
@@ -67,7 +66,6 @@ expression: envelope
       "_qualityScore": null,
       "_securityFindings": null,
       "_swiftMeta": null,
-      "_vulnerabilities": null,
       "bundleDependencies": [],
       "cpu": [],
       "dependencies": {},
@@ -93,7 +91,6 @@ expression: envelope
       "_qualityScore": null,
       "_securityFindings": null,
       "_swiftMeta": null,
-      "_vulnerabilities": null,
       "bundleDependencies": [],
       "cpu": [],
       "dependencies": {},

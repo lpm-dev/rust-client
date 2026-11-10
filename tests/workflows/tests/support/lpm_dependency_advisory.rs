@@ -14,10 +14,23 @@ pub const ADVISORY: &str = "GHSA-dep-pkg-fixed-in-1-0-1";
 /// The `_vulnerabilities` entry the registry served before it stopped.
 pub const STALE_REGISTRY_ADVISORY: &str = "LPM-STALE-REGISTRY-ADVISORY";
 
-/// One release of the wrapper and the range it gives `dep-pkg`.
+/// One release of the wrapper and the range it gives `dep-pkg`, under its
+/// own name or, with `alias`, as `"<alias>": "npm:dep-pkg@<range>"`.
 pub struct WrapperRelease<'a> {
     pub version: &'a str,
     pub dependency_range: &'a str,
+    pub alias: Option<&'a str>,
+}
+
+impl WrapperRelease<'_> {
+    fn dependencies(&self) -> serde_json::Value {
+        match self.alias {
+            Some(alias) => serde_json::json!({
+                alias: format!("npm:{DEPENDENCY}@{}", self.dependency_range)
+            }),
+            None => serde_json::json!({ DEPENDENCY: self.dependency_range }),
+        }
+    }
 }
 
 /// The project manifest that depends on the wrapper's first release.
@@ -69,7 +82,7 @@ pub async fn mount_wrapper_with_npm_dependency(
     let wrapper_versions = releases
         .iter()
         .map(|release| {
-            let dependencies = serde_json::json!({ DEPENDENCY: release.dependency_range });
+            let dependencies = release.dependencies();
             let tarball = make_tarball_from_pkg_json(
                 serde_json::json!({
                     "name": WRAPPER,

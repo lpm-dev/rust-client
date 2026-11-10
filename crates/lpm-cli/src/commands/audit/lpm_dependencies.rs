@@ -2,7 +2,7 @@
 //! vulnerable through the npm packages it depends on directly, at the
 //! versions its lockfile edges installed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use lpm_common::package_name::is_lpm_package;
 
@@ -37,48 +37,51 @@ impl<'a> LpmDependencyAdvisories<'a> {
                 .or_default()
                 .push(vulnerability);
         }
+        for advisories in by_instance.values_mut() {
+            advisories.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            advisories.dedup_by(|left, right| left.id == right.id);
+        }
 
         let mut by_package: HashMap<&str, HashMap<&str, Vec<DependencyAdvisory<'a>>>> =
             HashMap::new();
         if by_instance.is_empty() {
             return Self { by_package };
         }
+        // The flagged edges of each LPM version, once each however many
+        // instances share them, before any advisory is attached.
+        let mut flagged: HashMap<(&str, &str), BTreeSet<(&str, &str)>> = HashMap::new();
         for package in packages
             .iter()
             .filter(|package| is_lpm_package(&package.name))
         {
             for (dependency, version) in &package.dependencies {
-                if is_lpm_package(dependency) {
-                    continue;
+                if !is_lpm_package(dependency)
+                    && by_instance.contains_key(&(dependency.as_str(), version.as_str()))
+                {
+                    flagged
+                        .entry((&package.name, &package.version))
+                        .or_default()
+                        .insert((dependency, version));
                 }
-                let Some(found) = by_instance.get(&(dependency.as_str(), version.as_str())) else {
-                    continue;
-                };
-                let advisories = by_package
-                    .entry(&package.name)
-                    .or_default()
-                    .entry(&package.version)
-                    .or_default();
-                advisories.extend(found.iter().map(|vulnerability| DependencyAdvisory {
-                    dependency,
-                    version,
-                    vulnerability,
-                }));
             }
         }
-        for advisories in by_package.values_mut().flat_map(HashMap::values_mut) {
-            advisories.sort_unstable_by(|left, right| {
-                (left.dependency, left.version, &left.vulnerability.id).cmp(&(
-                    right.dependency,
-                    right.version,
-                    &right.vulnerability.id,
-                ))
-            });
-            advisories.dedup_by(|left, right| {
-                left.dependency == right.dependency
-                    && left.version == right.version
-                    && left.vulnerability.id == right.vulnerability.id
-            });
+        for ((name, version), edges) in flagged {
+            let advisories = edges
+                .into_iter()
+                .flat_map(|edge| {
+                    by_instance[&edge]
+                        .iter()
+                        .map(move |vulnerability| DependencyAdvisory {
+                            dependency: edge.0,
+                            version: edge.1,
+                            vulnerability,
+                        })
+                })
+                .collect();
+            by_package
+                .entry(name)
+                .or_default()
+                .insert(version, advisories);
         }
         Self { by_package }
     }
@@ -150,6 +153,46 @@ mod tests {
                 .insert(version.to_string());
         }
         map
+    }
+
+    #[test]
+    fn the_index_lists_each_advisory_once_however_many_instances_share_it() {
+        let mut packages: Vec<DiscoveredPackage> = (0..50)
+            .map(|_| {
+                package(
+                    "@lpm.dev/acme.ui",
+                    "1.0.0",
+                    &[("lodash", "4.17.20"), ("react", "18.0.0")],
+                )
+            })
+            .collect();
+        packages.push(package("lodash", "4.17.20", &[]));
+        let vulnerabilities = [
+            OsvVulnerability::for_test("lodash", "4.17.20", "GHSA-b"),
+            OsvVulnerability::for_test("lodash", "4.17.20", "GHSA-a"),
+            OsvVulnerability::for_test("lodash", "4.17.20", "GHSA-a"),
+            OsvVulnerability::for_test("lodash", "4.17.21", "GHSA-c"),
+        ];
+
+        let index = LpmDependencyAdvisories::new(&packages, &vulnerabilities);
+        let advisories = index.of("@lpm.dev/acme.ui", "1.0.0");
+
+        assert_eq!(
+            advisories
+                .iter()
+                .map(|advisory| (
+                    advisory.dependency,
+                    advisory.version,
+                    advisory.vulnerability.id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("lodash", "4.17.20", "GHSA-a"),
+                ("lodash", "4.17.20", "GHSA-b")
+            ]
+        );
+        assert!(index.of("@lpm.dev/acme.ui", "2.0.0").is_empty());
+        assert!(index.of("lodash", "4.17.20").is_empty());
     }
 
     #[test]

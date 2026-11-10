@@ -191,6 +191,20 @@ pub(super) struct OsvVulnerability {
 }
 
 impl OsvVulnerability {
+    /// An advisory with no affected ranges, for tests that only need its
+    /// identity.
+    #[cfg(test)]
+    pub(super) fn for_test(package: &str, version: &str, id: &str) -> Self {
+        Self {
+            package: package.to_string(),
+            version: version.to_string(),
+            id: id.to_string(),
+            summary: String::new(),
+            severity: "high".to_string(),
+            affected: Vec::new(),
+        }
+    }
+
     pub(super) fn affects_version(&self, version: &str) -> Result<bool, String> {
         evaluate_affected_ranges(&self.affected, &self.package, version)?.ok_or_else(|| {
             format!(

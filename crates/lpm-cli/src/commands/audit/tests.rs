@@ -268,7 +268,7 @@ fn fail_on_behavior_catches_high_severity() {
 
 // ─── collect_registry_issues: behavioral-tag → AuditIssue mapping ───
 
-use lpm_registry::{BehavioralTags, SecurityFinding, VersionMetadata, Vulnerability};
+use lpm_registry::{BehavioralTags, SecurityFinding, VersionMetadata};
 
 fn meta_with_tags(setup: impl FnOnce(&mut BehavioralTags)) -> VersionMetadata {
     let mut tags = BehavioralTags::default();
@@ -662,19 +662,14 @@ fn registry_issue_empty_lifecycle_scripts_emits_no_issue() {
     assert!(issues.is_empty());
 }
 
-// A cached registry advisory
+// A registry advisory in older metadata
 
 #[test]
-fn registry_issues_ignore_a_cached_registry_advisory() {
-    let meta = VersionMetadata {
-        legacy_vulnerabilities: Some(vec![Vulnerability {
-            id: Some("GHSA-aaaa".into()),
-            summary: Some("rce".into()),
-            severity: Some("critical".into()),
-            aliases: None,
-        }]),
-        ..Default::default()
-    };
+fn registry_issues_ignore_a_registry_advisory_from_older_metadata() {
+    let meta: VersionMetadata = serde_json::from_str(
+        r#"{"name":"kit","version":"1.0.0","_vulnerabilities":[{"id":"GHSA-aaaa","severity":"critical"}]}"#,
+    )
+    .unwrap();
     assert!(collect(&meta).is_empty());
 }
 

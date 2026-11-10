@@ -1528,29 +1528,16 @@ mod tests {
     // ── collect_registry_warnings tests ──────────────────────────────
 
     #[test]
-    fn ordinary_install_registry_warnings_ignore_a_cached_registry_advisory() {
-        let ver_meta = lpm_registry::VersionMetadata {
-            legacy_vulnerabilities: Some(vec![
-                lpm_registry::Vulnerability {
-                    id: Some("CVE-2021-1234".into()),
-                    summary: Some("test vuln".into()),
-                    severity: Some("critical".into()),
-                    aliases: None,
-                },
-                lpm_registry::Vulnerability {
-                    id: Some("CVE-2021-5678".into()),
-                    summary: Some("another vuln".into()),
-                    severity: Some("high".into()),
-                    aliases: None,
-                },
-            ]),
-            ..Default::default()
-        };
+    fn ordinary_install_registry_warnings_ignore_a_registry_advisory_from_older_metadata() {
+        let ver_meta: lpm_registry::VersionMetadata = serde_json::from_str(
+            r#"{"name":"pkg","version":"1.0.0","_vulnerabilities":[{"id":"CVE-2021-1234","severity":"critical"}]}"#,
+        )
+        .unwrap();
         let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(
-            counts.lifecycle_scripts.is_empty(),
+            counts.behavioral.is_empty() && counts.lifecycle_scripts.is_empty(),
             "ordinary install must leave vulnerabilities to audit-after-install's OSV scan"
         );
     }

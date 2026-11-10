@@ -1305,6 +1305,7 @@ async fn query_vulnerable_matches_an_lpm_package_through_its_vulnerable_npm_depe
         &[WrapperRelease {
             version: "1.0.0",
             dependency_range: "1.0.0",
+            alias: None,
         }],
         false,
     )
@@ -1353,6 +1354,47 @@ async fn query_vulnerable_matches_an_lpm_package_through_its_vulnerable_npm_depe
 }
 
 #[tokio::test]
+async fn query_vulnerable_matches_an_lpm_package_through_an_npm_alias() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+            alias: Some("renamed"),
+        }],
+        false,
+    )
+    .await;
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "--json",
+            "query",
+            ":vulnerable",
+        ])
+        .output()
+        .expect("failed to run the vulnerability query");
+
+    let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        matches
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["name"] == WRAPPER),
+        "the alias names dep-pkg, which OSV flags: {matches:#}"
+    );
+}
+
+#[tokio::test]
 async fn query_vulnerable_ignores_registry_advisories_for_lpm_packages() {
     let project = wrapper_project("1.0.0");
     let mock = MockRegistry::start().await;
@@ -1362,6 +1404,7 @@ async fn query_vulnerable_ignores_registry_advisories_for_lpm_packages() {
         &[WrapperRelease {
             version: "1.0.0",
             dependency_range: "1.0.0",
+            alias: None,
         }],
         true,
     )

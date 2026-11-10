@@ -12,7 +12,7 @@ mod audit_contract;
 use support::lpm_dependency_advisory::{
     ADVISORY, DEPENDENCY, STALE_REGISTRY_ADVISORY, WRAPPER, WrapperRelease,
     answer_osv_for_dependency, dependency_advisory, install_wrapper_with_npm_dependency,
-    wrapper_project,
+    mount_wrapper_with_npm_dependency, wrapper_project,
 };
 use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
@@ -2333,6 +2333,7 @@ async fn audit_reports_an_lpm_dependency_advisory_once_and_ignores_stale_registr
         &[WrapperRelease {
             version: "1.0.0",
             dependency_range: "1.0.0",
+            alias: None,
         }],
         true,
     )
@@ -2382,10 +2383,12 @@ async fn audit_fix_ignores_registry_advisories_for_lpm_packages() {
             WrapperRelease {
                 version: "1.0.0",
                 dependency_range: "1.0.0",
+                alias: None,
             },
             WrapperRelease {
                 version: "1.0.1",
                 dependency_range: "^1.0.1",
+                alias: None,
             },
         ],
         true,
@@ -2412,10 +2415,12 @@ async fn audit_fix_upgrades_an_lpm_package_past_the_advisory_on_its_npm_dependen
             WrapperRelease {
                 version: "1.0.0",
                 dependency_range: "1.0.0",
+                alias: None,
             },
             WrapperRelease {
                 version: "1.0.1",
                 dependency_range: "^1.0.1",
+                alias: None,
             },
         ],
         false,
@@ -2449,10 +2454,12 @@ async fn audit_fix_skips_an_lpm_package_whose_newer_releases_still_install_the_a
             WrapperRelease {
                 version: "1.0.0",
                 dependency_range: "1.0.0",
+                alias: None,
             },
             WrapperRelease {
                 version: "1.0.1",
                 dependency_range: "~1.0.0 <1.0.1",
+                alias: None,
             },
         ],
         false,
@@ -2476,6 +2483,121 @@ async fn audit_fix_skips_an_lpm_package_whose_newer_releases_still_install_the_a
 }
 
 #[tokio::test]
+async fn audit_fix_upgrades_an_lpm_package_whose_aliased_npm_dependency_osv_flags() {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+                alias: Some("renamed"),
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.1",
+                alias: Some("renamed"),
+            },
+        ],
+        false,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert!(out.status.success(), "{envelope:#}");
+    assert_eq!(envelope["planned"], 1, "{envelope:#}");
+    assert_eq!(envelope["packages"][0]["to"], "1.0.1", "{envelope:#}");
+}
+
+#[tokio::test]
+async fn audit_fix_upgrades_to_a_release_whose_range_still_allows_the_advisory_when_latest_is_fixed()
+ {
+    let project = wrapper_project("1.0.0");
+    let mock = MockRegistry::start().await;
+    install_wrapper_with_npm_dependency(
+        &project,
+        &mock,
+        &[
+            WrapperRelease {
+                version: "1.0.0",
+                dependency_range: "1.0.0",
+                alias: None,
+            },
+            WrapperRelease {
+                version: "1.0.1",
+                dependency_range: "^1.0.0",
+                alias: None,
+            },
+        ],
+        false,
+    )
+    .await;
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert!(out.status.success(), "{envelope:#}");
+    assert_eq!(envelope["planned"], 1, "{envelope:#}");
+    assert_eq!(envelope["packages"][0]["to"], "1.0.1", "{envelope:#}");
+}
+
+#[tokio::test]
+async fn audit_fix_asks_the_registry_nothing_about_a_local_lpm_package_it_cant_rewrite() {
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"wrapper-app","version":"1.0.0","dependencies":{{"{WRAPPER}":"file:./local-wrapper"}}}}"#
+    ));
+    project.write_file(
+        "local-wrapper/package.json",
+        &format!(
+            r#"{{"name":"{WRAPPER}","version":"1.0.0","license":"MIT","dependencies":{{"{DEPENDENCY}":"1.0.0"}}}}"#
+        ),
+    );
+    let mock = MockRegistry::start().await;
+    mount_wrapper_with_npm_dependency(
+        &mock,
+        &[WrapperRelease {
+            version: "1.0.0",
+            dependency_range: "1.0.0",
+            alias: None,
+        }],
+        false,
+    )
+    .await;
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    mark_lockfile_package_as_public_npm(&project, DEPENDENCY);
+    answer_osv_for_dependency(&mock, "1.0.0", vec![dependency_advisory()]).await;
+    let requests_before = mock.server().received_requests().await.unwrap().len();
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(envelope["planned"], 0, "{envelope:#}");
+    assert_eq!(envelope["skipped"][0]["name"], WRAPPER, "{envelope:#}");
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests[requests_before..]
+            .iter()
+            .all(|request| !request.url.path().contains("test.wrapper")),
+        "a local package's name must not reach the registry: {:?}",
+        requests[requests_before..]
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn audit_fix_installs_the_lpm_upgrade_and_verifies_its_npm_dependency() {
     let project = wrapper_project("1.0.0");
     let mock = MockRegistry::start().await;
@@ -2486,10 +2608,12 @@ async fn audit_fix_installs_the_lpm_upgrade_and_verifies_its_npm_dependency() {
             WrapperRelease {
                 version: "1.0.0",
                 dependency_range: "1.0.0",
+                alias: None,
             },
             WrapperRelease {
                 version: "1.0.1",
                 dependency_range: "^1.0.1",
+                alias: None,
             },
         ],
         false,
