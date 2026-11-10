@@ -1232,6 +1232,46 @@ fn a_name_two_star_exports_bind_differently_is_ambiguous() {
 }
 
 #[test]
+fn a_commonjs_entry_leaves_the_example_s_names_unread() {
+    let manifest = |extra: Value| {
+        let mut manifest = json!({ "name": "cjs-pkg", "version": "1.0.0", "main": "index.js" });
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        manifest.to_string()
+    };
+    let source = "module.exports = function check(value) {\n  return value != null\n}\n";
+    for (example, extra, entry) in [
+        ("const check = require('cjs-pkg')", json!({}), "index.js"),
+        (
+            "const { check } = require('cjs-pkg')",
+            json!({}),
+            "index.js",
+        ),
+        (
+            "import { check } from 'cjs-pkg'",
+            json!({ "exports": { ".": { "import": "./index.cjs" } } }),
+            "index.cjs",
+        ),
+    ] {
+        let readme = format!("# cjs-pkg\n\n{PROSE}\n\n```js\n{example}\n\ncheck(1)\n```\n");
+        let manifest = manifest(extra);
+        let report = js_report(&[
+            ("package.json", &manifest),
+            ("README.md", &readme),
+            (entry, source),
+        ]);
+        let detail = &check(&report, "readme-example").detail;
+        assert_eq!(points(&report, "readme-example"), 2, "{example}: {detail}");
+        assert!(
+            detail.contains("couldn't be read"),
+            "{example} through {entry}: {detail}"
+        );
+    }
+}
+
+#[test]
 fn barrels_re_exporting_each_other_stay_within_the_export_budget() {
     let names: String = (0..1_000)
         .map(|index| format!("export declare const n{index}: number;\n"))
