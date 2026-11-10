@@ -110,12 +110,11 @@ fn run_native_auth_command(mut command: std::process::Command) -> Result<bool, L
 fn request_windows_hello_approval(
     prompt: &str,
 ) -> Result<WindowsHelloVerificationAction, LpmError> {
-    use windows::Security::Credentials::UI::{UserConsentVerificationResult, UserConsentVerifier};
+    use windows::Security::Credentials::UI::UserConsentVerifier;
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::System::Console::GetConsoleWindow;
     use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
     use windows::core::{HSTRING, factory};
-    use windows_future::IAsyncOperation;
 
     let _apartment = WindowsRuntimeApartment::initialize(RPC_E_CHANGED_MODE)?;
     let availability = UserConsentVerifier::CheckAvailabilityAsync()
@@ -138,7 +137,7 @@ fn request_windows_hello_approval(
         // console, or a null HWND when there is no console window.
         GetConsoleWindow()
     };
-    let operation: IAsyncOperation<UserConsentVerificationResult> = if hwnd.0.is_null() {
+    let operation = if hwnd.0.is_null() {
         UserConsentVerifier::RequestVerificationAsync(&message)
     } else {
         let interop =
