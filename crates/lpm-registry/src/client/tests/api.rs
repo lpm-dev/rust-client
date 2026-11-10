@@ -2434,3 +2434,49 @@ async fn npm_verification_verify_sends_the_npm_username_and_keeps_a_refusal_s_co
         .unwrap();
     assert_eq!(proved.claimed.as_deref(), Some("blake-regalia"));
 }
+
+#[tokio::test]
+async fn npm_verification_verify_reads_the_held_name_and_an_answer_without_one() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-verification/verify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "npmUsername": "sindresorhus",
+            "username": "tolga",
+            "claimed": null,
+            "heldName": { "name": "sindresorhus", "usernameLocked": true },
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-verification/verify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "npmUsername": "sindresorhus",
+            "username": "tolga",
+        })))
+        .mount(&server)
+        .await;
+
+    let held = client
+        .npm_verification_verify("sindresorhus")
+        .await
+        .unwrap()
+        .held_name
+        .expect("the held name");
+    assert_eq!(
+        (held.name.as_str(), held.username_locked),
+        ("sindresorhus", true)
+    );
+
+    let older = client
+        .npm_verification_verify("sindresorhus")
+        .await
+        .unwrap();
+    assert!(older.held_name.is_none());
+}
