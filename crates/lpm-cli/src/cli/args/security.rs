@@ -12,6 +12,21 @@ pub(crate) struct InternalSecurityPolicyArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct InternalCertStoreArgs {
+    #[arg(value_enum)]
+    pub(crate) action: commands::cert::CertStoreAction,
+    /// The certificate to add.
+    #[arg(long, value_name = "PATH", required_if_eq("action", "add"))]
+    pub(crate) file: Option<std::path::PathBuf>,
+    /// The SHA-256 fingerprint, in hex, the added certificate must have.
+    #[arg(long, required_if_eq("action", "add"))]
+    pub(crate) sha256: Option<String>,
+    /// The SHA-1 thumbprint, in hex, of the certificate to remove.
+    #[arg(long, required_if_eq("action", "remove"))]
+    pub(crate) sha1: Option<String>,
+}
+
+#[derive(Args)]
 pub(crate) struct InternalPackageSignalsArgs {
     /// The language whose source files are read.
     #[arg(long, value_enum, default_value_t = SignalsEcosystem::Js)]

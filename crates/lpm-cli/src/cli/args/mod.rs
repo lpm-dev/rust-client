@@ -616,6 +616,11 @@ pub(crate) enum Commands {
     #[command(name = "internal-security-policy", hide = true)]
     InternalSecurityPolicy(security::InternalSecurityPolicyArgs),
 
+    /// Hidden elevated helper that adds LPM's CA to, or removes it from, the
+    /// Windows Root store, so the UAC prompt names LPM rather than certutil.
+    #[command(name = "internal-cert-store", hide = true)]
+    InternalCertStore(security::InternalCertStoreArgs),
+
     /// Hidden OXC transform helper for the LPM TypeScript runtime.
     #[command(name = "internal-ts-transform", hide = true)]
     InternalTsTransform(build::InternalTsTransformArgs),

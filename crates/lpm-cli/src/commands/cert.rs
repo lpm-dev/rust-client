@@ -227,6 +227,89 @@ fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// What the elevated certificate-trust helper does to the Windows Root
+/// store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CertStoreAction {
+    Add,
+    Remove,
+}
+
+/// The elevated helper that changes the Windows Root store for `lpm cert`
+/// and the commands that set up HTTPS: adds the certificate in `file`, which
+/// must have the SHA-256 fingerprint `sha256`, or removes the one with the
+/// SHA-1 thumbprint `sha1`.
+pub(crate) fn run_internal_cert_store(
+    action: CertStoreAction,
+    file: Option<&Path>,
+    sha256: Option<&str>,
+    sha1: Option<&str>,
+) -> Result<(), LpmError> {
+    crate::privilege::require_effective_root("certificate-trust")?;
+    let missing = |flag: &str| LpmError::Cert(format!("internal-cert-store needs {flag}"));
+    #[cfg(windows)]
+    {
+        use lpm_cert::trust::WindowsRootStoreChange;
+
+        let change = match action {
+            CertStoreAction::Add => WindowsRootStoreChange::Add {
+                path: file.ok_or_else(|| missing("--file"))?.to_path_buf(),
+                sha256: sha256.ok_or_else(|| missing("--sha256"))?.to_string(),
+            },
+            CertStoreAction::Remove => WindowsRootStoreChange::Remove {
+                sha1: sha1.ok_or_else(|| missing("--sha1"))?.to_string(),
+            },
+        };
+        lpm_cert::trust::apply_windows_root_store_change(&change)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (action, file, sha256, sha1, missing);
+        Err(LpmError::Cert(
+            "the certificate-trust helper changes the Windows Root store only".into(),
+        ))
+    }
+}
+
+/// Makes a Root-store change through [`run_internal_cert_store`], elevated
+/// with UAC, whose prompt then names LPM's publisher; or directly where LPM
+/// already runs elevated.
+#[cfg(windows)]
+pub(crate) fn change_windows_root_store_through_helper(
+    change: &lpm_cert::trust::WindowsRootStoreChange,
+) -> Result<(), LpmError> {
+    use lpm_cert::trust::WindowsRootStoreChange;
+
+    if crate::privilege::is_elevated() {
+        return lpm_cert::trust::apply_windows_root_store_change(change);
+    }
+    let args = match change {
+        WindowsRootStoreChange::Add { path, sha256 } => vec![
+            "internal-cert-store".to_string(),
+            "add".to_string(),
+            "--file".to_string(),
+            path.display().to_string(),
+            "--sha256".to_string(),
+            sha256.clone(),
+        ],
+        WindowsRootStoreChange::Remove { sha1 } => vec![
+            "internal-cert-store".to_string(),
+            "remove".to_string(),
+            "--sha1".to_string(),
+            sha1.clone(),
+        ],
+    };
+    crate::elevation::run_current_exe_helper(
+        &args,
+        "Password for LPM certificate trust: ",
+        "certificate-trust",
+    )
+    .map_err(|error| match error {
+        LpmError::Registry(message) => LpmError::Cert(message),
+        other => other,
+    })
+}
+
 fn run_generate(
     project_dir: &Path,
     extra_hosts: &[String],

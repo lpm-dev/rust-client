@@ -9,7 +9,7 @@ use crate::cert;
 use lpm_common::LpmError;
 use std::path::Path;
 use std::process::Command;
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 use std::process::Stdio;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -318,6 +318,102 @@ fn certutil_executable() -> Result<std::path::PathBuf, LpmError> {
     })?;
     certutil.push("certutil.exe");
     Ok(certutil)
+}
+
+/// A change to the machine's Root store, which needs an administrator.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsRootStoreChange {
+    /// Add the certificate in `path`, whose SHA-256 fingerprint, in hex
+    /// without separators, is `sha256`.
+    Add {
+        path: std::path::PathBuf,
+        sha256: String,
+    },
+    /// Remove the certificate whose SHA-1 thumbprint, in hex without
+    /// separators, is `sha1`.
+    Remove { sha1: String },
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsRootStoreChange {
+    fn certutil_args(&self) -> Vec<String> {
+        match self {
+            Self::Add { path, .. } => vec![
+                "-addstore".into(),
+                "Root".into(),
+                path.display().to_string(),
+            ],
+            Self::Remove { sha1 } => vec!["-delstore".into(), "Root".into(), sha1.clone()],
+        }
+    }
+}
+
+/// How a Root-store change is made elevated, once the LPM CLI registers its
+/// own elevated helper (see [`set_windows_elevated_root_store`]).
+#[cfg(target_os = "windows")]
+type WindowsElevatedRootStore = fn(&WindowsRootStoreChange) -> Result<(), LpmError>;
+
+#[cfg(target_os = "windows")]
+static WINDOWS_ELEVATED_ROOT_STORE: std::sync::OnceLock<WindowsElevatedRootStore> =
+    std::sync::OnceLock::new();
+
+/// Has Root-store changes made elevated by `elevated`, the LPM CLI's own
+/// elevated helper, so the UAC prompt names LPM's publisher; without it
+/// LPM elevates certutil itself, and the prompt names Microsoft's.
+#[cfg(target_os = "windows")]
+pub fn set_windows_elevated_root_store(elevated: WindowsElevatedRootStore) {
+    let _ = WINDOWS_ELEVATED_ROOT_STORE.set(elevated);
+}
+
+#[cfg(target_os = "windows")]
+fn change_windows_root_store_elevated(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
+    match WINDOWS_ELEVATED_ROOT_STORE.get() {
+        Some(elevated) => elevated(change),
+        None => run_certutil_elevated(&change.certutil_args()),
+    }
+}
+
+/// Makes `change` from a process that is already elevated, as the LPM
+/// CLI's elevated helper is: an added certificate must be the one its
+/// fingerprint names, a removed one is named by a thumbprint alone, and
+/// then certutil does it.
+#[cfg(target_os = "windows")]
+pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
+    match change {
+        WindowsRootStoreChange::Add { path, sha256 } => {
+            let pem =
+                lpm_common::read_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+                    .map_err(|error| {
+                        LpmError::Cert(format!("failed to read {}: {error}", path.display()))
+                    })?;
+            let actual =
+                cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(&pem)?).replace(':', "");
+            if !actual.eq_ignore_ascii_case(sha256) {
+                return Err(LpmError::Cert(format!(
+                    "{} is not the certificate with SHA-256 fingerprint {sha256}",
+                    path.display()
+                )));
+            }
+        }
+        WindowsRootStoreChange::Remove { sha1 } => {
+            if sha1.len() != 40 || !sha1.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(LpmError::Cert(format!(
+                    "{sha1:?} is not a SHA-1 thumbprint"
+                )));
+            }
+        }
+    }
+    let status = Command::new(certutil_executable()?)
+        .args(change.certutil_args())
+        .stdout(Stdio::null())
+        .status()
+        .map_err(|error| LpmError::Cert(format!("failed to run certutil: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LpmError::Cert(format!("certutil exited with {status}")))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1387,7 +1483,15 @@ fn uninstall_ca_linux_bytes(expected_ca_pem: &[u8]) -> Result<(), LpmError> {
 #[cfg(target_os = "windows")]
 fn install_ca_windows(cert_path: &str) -> Result<(), LpmError> {
     tracing::debug!("installing CA to Windows Root store: {cert_path}");
-    run_certutil_elevated(&["-addstore".into(), "Root".into(), cert_path.to_string()])?;
+    let pem = lpm_common::read_file_capped(
+        Path::new(cert_path),
+        lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| LpmError::Cert(format!("failed to read {cert_path}: {error}")))?;
+    change_windows_root_store_elevated(&WindowsRootStoreChange::Add {
+        path: cert_path.into(),
+        sha256: cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(&pem)?).replace(':', ""),
+    })?;
 
     tracing::info!("CA installed to Windows Root store");
     Ok(())
@@ -1419,8 +1523,9 @@ fn uninstall_ca_windows(expected_sha1_hex: &str) -> Result<(), LpmError> {
     if !is_ca_installed_windows(expected_sha1_hex)? {
         return Ok(());
     }
-    let plain = expected_sha1_hex.replace(':', "");
-    run_certutil_elevated(&["-delstore".into(), "Root".into(), plain])?;
+    change_windows_root_store_elevated(&WindowsRootStoreChange::Remove {
+        sha1: expected_sha1_hex.replace(':', ""),
+    })?;
 
     tracing::info!("CA removed from Windows Root store");
     Ok(())
@@ -1668,6 +1773,58 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
         })
         .unwrap();
         std::fs::remove_dir(&dotted).unwrap();
+    }
+
+    /// The elevated helper refuses, before certutil runs, a certificate that
+    /// isn't the one its fingerprint names and a thumbprint that isn't one.
+    #[cfg(windows)]
+    #[test]
+    fn the_root_store_helper_checks_what_it_is_given() {
+        let ca_dir = tempfile::tempdir().unwrap();
+        let (expected, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
+        let (other, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
+        let path = ca_dir.path().join("rootCA.pem");
+        std::fs::write(&path, other.as_bytes()).unwrap();
+        let sha256 =
+            cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(expected.as_bytes()).unwrap())
+                .replace(':', "");
+
+        let added = apply_windows_root_store_change(&WindowsRootStoreChange::Add { path, sha256 });
+        assert!(
+            added
+                .unwrap_err()
+                .to_string()
+                .contains("is not the certificate with SHA-256 fingerprint")
+        );
+        for sha1 in ["", "zz", "AB & calc", &"A".repeat(41)] {
+            let removed = apply_windows_root_store_change(&WindowsRootStoreChange::Remove {
+                sha1: sha1.to_string(),
+            });
+            assert!(
+                removed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("is not a SHA-1 thumbprint"),
+                "{sha1:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_store_changes_are_certutil_store_commands() {
+        assert_eq!(
+            WindowsRootStoreChange::Add {
+                path: r"C:\LPM Home\certs\.lpm-verified-ca-1".into(),
+                sha256: "AB".into(),
+            }
+            .certutil_args(),
+            ["-addstore", "Root", r"C:\LPM Home\certs\.lpm-verified-ca-1"]
+        );
+        assert_eq!(
+            WindowsRootStoreChange::Remove { sha1: "CD".into() }.certutil_args(),
+            ["-delstore", "Root", "CD"]
+        );
     }
 
     /// certutil, like other Windows tools, can't open a file another handle

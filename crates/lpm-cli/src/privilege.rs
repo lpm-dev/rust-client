@@ -138,7 +138,9 @@ fn classifies_as_sudo_transition(effective_uid: u32, sudo_user: Option<&OsStr>) 
 fn is_privileged_helper(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::InternalHostsFile(_) | Commands::InternalSecurityPolicy(_)
+        Commands::InternalHostsFile(_)
+            | Commands::InternalSecurityPolicy(_)
+            | Commands::InternalCertStore(_)
     )
 }
 
@@ -202,6 +204,29 @@ mod tests {
                     .contains("must run elevated, as an administrator")
             );
         }
+    }
+
+    #[test]
+    fn internal_cert_store_is_a_privileged_helper() {
+        for argv in [
+            &[
+                "lpm",
+                "internal-cert-store",
+                "add",
+                "--file",
+                r"C:\x\rootCA.pem",
+                "--sha256",
+                "AB",
+            ][..],
+            &["lpm", "internal-cert-store", "remove", "--sha1", "AB"][..],
+        ] {
+            let command = Cli::try_parse_from(argv).unwrap().command.unwrap();
+            assert!(is_privileged_helper(&command), "{argv:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["lpm", "internal-cert-store", "add", "--sha256", "AB"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["lpm", "internal-cert-store", "remove"]).is_err());
     }
 
     #[test]

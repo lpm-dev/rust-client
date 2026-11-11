@@ -38,6 +38,12 @@ pub(crate) fn run() -> Result<()> {
     {
         commands::run::nested_pm::exit_with_shim(manager, std::env::args_os().skip(1).collect());
     }
+    // Root-store changes go through LPM's own elevated helper, so the UAC
+    // prompt names LPM's publisher rather than certutil's.
+    #[cfg(windows)]
+    lpm_cert::trust::set_windows_elevated_root_store(
+        commands::cert::change_windows_root_store_through_helper,
+    );
 
     // Color policy must initialize BEFORE any styled output, including
     // the `--version` fast path (which prints an `update_check` notice)
@@ -194,6 +200,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 args.run.as_deref(),
             ))
         }
+        Commands::InternalCertStore(args) => Some(commands::cert::run_internal_cert_store(
+            args.action,
+            args.file.as_deref(),
+            args.sha256.as_deref(),
+            args.sha1.as_deref(),
+        )),
         _ => None,
     };
     if let Some(result) = privileged_helper_result {
@@ -3165,7 +3177,9 @@ async fn async_main(cli: Cli) -> Result<()> {
             })
             .await
         }
-        Commands::InternalHostsFile(_) | Commands::InternalSecurityPolicy(_) => {
+        Commands::InternalHostsFile(_)
+        | Commands::InternalSecurityPolicy(_)
+        | Commands::InternalCertStore(_) => {
             unreachable!("privileged helpers return before normal command startup")
         }
         Commands::Tunnel(args) => {
