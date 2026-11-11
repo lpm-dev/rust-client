@@ -83,12 +83,33 @@ fn shell_quote_arg(
 ) -> Result<String, LpmError> {
     windows_shell_quote_arg(
         arg,
-        windows_command_uses_batch_shim(script_cmd, project_dir, path),
+        windows_argument_receiver(script_cmd, project_dir, path),
     )
 }
 
+/// What gets the arguments appended to a script run through cmd.exe: the
+/// command that starts the script's last command, such as `jest` in
+/// `tsc && jest` — not the script's first word.
 #[cfg(any(test, windows))]
-fn windows_shell_quote_arg(arg: &str, double_escape: bool) -> Result<String, LpmError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsArgumentReceiver {
+    /// A program, which gets the arguments as cmd.exe read them once.
+    Program,
+    /// A batch file, such as a `node_modules\.bin` shim, whose `%*` has
+    /// cmd.exe read them a second time.
+    BatchFile,
+    /// A command named by a variable or after a redirection, or one reached
+    /// through a pipe, `call`, `cmd`, `start`, `if` or `for`, which have
+    /// cmd.exe read the arguments again a number of times that depends on
+    /// what runs, so no escaping is right for all of them.
+    Unknown,
+}
+
+#[cfg(any(test, windows))]
+fn windows_shell_quote_arg(
+    arg: &str,
+    receiver: WindowsArgumentReceiver,
+) -> Result<String, LpmError> {
     if arg
         .bytes()
         .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
@@ -97,6 +118,27 @@ fn windows_shell_quote_arg(arg: &str, double_escape: bool) -> Result<String, Lpm
             "runtime arguments containing line breaks cannot be passed safely through cmd.exe"
                 .to_string(),
         ));
+    }
+    // Words cmd.exe gives no meaning to arrive intact however often it
+    // reads them, so they need no quoting whatever receives them.
+    if !arg.is_empty()
+        && arg.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'.' | b'/' | b':' | b'\\' | b'@' | b'+' | b'='
+                )
+        })
+    {
+        return Ok(arg.to_string());
+    }
+    if receiver == WindowsArgumentReceiver::Unknown {
+        return Err(LpmError::Script(format!(
+            "cannot pass {arg:?} to this script safely: on Windows, arguments go to the script's \
+             last command, and here cmd.exe would read them again on the way (through a pipe, \
+             `call`, `cmd`, `start`, `if`, `for`, a variable or a redirection). Only arguments \
+             made of letters, digits and -_./:\\@+= can be passed to it."
+        )));
     }
 
     let mut quoted = String::with_capacity(arg.len().saturating_mul(2).saturating_add(2));
@@ -126,7 +168,7 @@ fn windows_shell_quote_arg(arg: &str, double_escape: bool) -> Result<String, Lpm
     quoted.push('"');
 
     let escaped = windows_escape_cmd_metacharacters(&quoted);
-    if double_escape {
+    if receiver == WindowsArgumentReceiver::BatchFile {
         Ok(windows_escape_cmd_metacharacters(&escaped))
     } else {
         Ok(escaped)
@@ -165,50 +207,116 @@ fn windows_escape_cmd_metacharacters(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_command_uses_batch_shim(script_cmd: &str, project_dir: &Path, path: &str) -> bool {
-    let Some(command_name) = windows_first_command_word(script_cmd) else {
-        return false;
+fn windows_argument_receiver(
+    script_cmd: &str,
+    project_dir: &Path,
+    path: &str,
+) -> WindowsArgumentReceiver {
+    let Some(command_name) = windows_argument_command(script_cmd) else {
+        return WindowsArgumentReceiver::Unknown;
     };
     let command_path = Path::new(command_name);
-    if command_path
+    match command_path
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+        .map(str::to_ascii_lowercase)
+        .as_deref()
     {
-        return true;
-    }
-    if command_path.extension().is_some() {
-        return false;
+        Some("cmd" | "bat") => return WindowsArgumentReceiver::BatchFile,
+        Some("com" | "exe") => return WindowsArgumentReceiver::Program,
+        _ => {}
     }
 
-    let mut search_dirs = Vec::new();
-    if command_path.components().count() > 1 {
-        search_dirs.push(project_dir.to_path_buf());
-    } else {
+    // Scripts run in the project directory, which cmd.exe searches before
+    // PATH.
+    let mut search_dirs = vec![project_dir.to_path_buf()];
+    if command_path.components().count() == 1 {
         search_dirs.extend(std::env::split_paths(path));
     }
     for directory in search_dirs {
-        let candidate = directory.join(command_path);
         for extension in ["com", "exe", "bat", "cmd"] {
-            let candidate = candidate.with_extension(extension);
-            if candidate.is_file() {
-                return matches!(extension, "bat" | "cmd");
+            let mut candidate = directory.join(command_path).into_os_string();
+            candidate.push(".");
+            candidate.push(extension);
+            if Path::new(&candidate).is_file() {
+                return if matches!(extension, "bat" | "cmd") {
+                    WindowsArgumentReceiver::BatchFile
+                } else {
+                    WindowsArgumentReceiver::Program
+                };
             }
         }
     }
-    false
+    WindowsArgumentReceiver::Program
 }
 
-#[cfg(windows)]
-fn windows_first_command_word(script_cmd: &str) -> Option<&str> {
-    let trimmed = script_cmd.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('"') {
-        return rest.split_once('"').map(|(command, _)| command);
+/// The command that starts the last command of `script_cmd`, which gets
+/// the arguments appended to it, or `None` when that isn't a command name
+/// the arguments reach after a single reading by cmd.exe.
+#[cfg(any(test, windows))]
+fn windows_argument_command(script_cmd: &str) -> Option<&str> {
+    // The last command starts after the last `&`, `&&`, `|` or `||` outside
+    // quotes, not escaped with `^` and not part of a redirection like `2>&1`.
+    let mut start = 0;
+    let mut piped = false;
+    let mut grouped = false;
+    let mut quoted = false;
+    let mut previous = '\0';
+    let mut characters = script_cmd.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '\r' | '\n' => return None,
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            // A trailing `^` would escape the space before the arguments.
+            '^' => {
+                characters.next()?;
+                previous = '\0';
+                continue;
+            }
+            '(' | ')' => grouped = true,
+            '&' if matches!(previous, '<' | '>') => {}
+            '&' | '|' => {
+                let doubled = characters.next_if(|&(_, next)| next == character).is_some();
+                piped = character == '|' && !doubled;
+                grouped = false;
+                start = index + if doubled { 2 } else { 1 };
+            }
+            _ => {}
+        }
+        previous = character;
     }
-    let end = trimmed
-        .find(|character: char| character.is_whitespace() || "&|<>()".contains(character))
-        .unwrap_or(trimmed.len());
-    (end > 0).then(|| &trimmed[..end])
+    // A pipe runs its commands in another cmd.exe, which reads them again.
+    if quoted || piped || grouped {
+        return None;
+    }
+
+    let command = script_cmd[start..].trim_start_matches(|character: char| {
+        character.is_whitespace() || "@,;=".contains(character)
+    });
+    let name = match command.strip_prefix('"') {
+        Some(rest) => {
+            let (name, after) = rest.split_once('"')?;
+            if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+                return None;
+            }
+            name
+        }
+        None => command.split(char::is_whitespace).next()?,
+    };
+    // A name with these in it is a variable, a redirection, an escape or
+    // more than one word to cmd.exe.
+    if name.is_empty() || name.contains(|character: char| "%!^<>\",;=".contains(character)) {
+        return None;
+    }
+    let file_name = Path::new(name).file_name()?.to_str()?.to_ascii_lowercase();
+    if matches!(
+        file_name.as_str(),
+        "call" | "cmd" | "cmd.exe" | "start" | "if" | "for"
+    ) {
+        return None;
+    }
+    Some(name)
 }
 
 /// Build the shell command for a script invocation by quoting every runtime
@@ -2894,29 +3002,156 @@ mod tests {
             ("%PATH%", "^\"^%PATH^%^\""),
             ("!delayed!", "^\"^!delayed^!^\""),
             ("quoted\"value", "^\"quoted\\^\"value^\""),
-            ("trail\\", "^\"trail\\\\^\""),
+            ("two words\\", "^\"two^ words\\\\^\""),
             ("x^(y)", "^\"x^^^(y^)^\""),
+            ("snowman-☃", "^\"snowman-☃^\""),
+            ("*.ts", "^\"^*.ts^\""),
         ];
 
         for (input, expected) in cases {
-            assert_eq!(windows_shell_quote_arg(input, false).unwrap(), expected);
+            assert_eq!(
+                windows_shell_quote_arg(input, WindowsArgumentReceiver::Program).unwrap(),
+                expected
+            );
         }
     }
 
     #[test]
     fn windows_shell_argument_escaping_rejects_line_breaks() {
         for input in ["one\ntwo", "one\rtwo", "one\0two"] {
-            assert!(windows_shell_quote_arg(input, false).is_err());
+            assert!(windows_shell_quote_arg(input, WindowsArgumentReceiver::Program).is_err());
         }
     }
 
     #[test]
     fn windows_batch_shim_argument_escaping_adds_a_second_cmd_layer() {
-        let once = windows_shell_quote_arg("a&b", false).unwrap();
-        let twice = windows_shell_quote_arg("a&b", true).unwrap();
+        let once = windows_shell_quote_arg("a&b", WindowsArgumentReceiver::Program).unwrap();
+        let twice = windows_shell_quote_arg("a&b", WindowsArgumentReceiver::BatchFile).unwrap();
 
         assert_eq!(once, "^\"a^&b^\"");
         assert_eq!(twice, "^^^\"a^^^&b^^^\"");
+    }
+
+    #[test]
+    fn windows_plain_words_pass_unquoted_to_any_receiver() {
+        for receiver in [
+            WindowsArgumentReceiver::Program,
+            WindowsArgumentReceiver::BatchFile,
+            WindowsArgumentReceiver::Unknown,
+        ] {
+            for word in [
+                "--watch",
+                "--max-warnings=0",
+                "src/index.ts",
+                r"C:\project\out\",
+                "@scope/pkg",
+                "a+b",
+            ] {
+                assert_eq!(
+                    windows_shell_quote_arg(word, receiver).unwrap(),
+                    word,
+                    "{receiver:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_arguments_needing_escapes_are_refused_for_an_unknown_receiver() {
+        for arg in ["", "two words", "a&b", "%PATH%", "x\" & calc & \""] {
+            let error = windows_shell_quote_arg(arg, WindowsArgumentReceiver::Unknown)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot pass"), "{arg:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn windows_arguments_go_to_the_command_starting_the_scripts_last_command() {
+        let cases = [
+            ("capture", Some("capture")),
+            ("  @capture --flag", Some("capture")),
+            ("node -e 0 && capture", Some("capture")),
+            ("capture && node tools/capture.js", Some("node")),
+            ("tsc & jest", Some("jest")),
+            ("node -e 0 || capture", Some("capture")),
+            ("(node -e 0) && capture", Some("capture")),
+            ("capture > out.txt", Some("capture")),
+            ("capture 2>&1", Some("capture")),
+            ("node -e \"a && b | c\" && capture", Some("capture")),
+            ("echo a ^& b ^| c", Some("echo")),
+            (
+                "node -e 0 && \"node_modules/.bin/capture.cmd\"",
+                Some("node_modules/.bin/capture.cmd"),
+            ),
+            (
+                r"tsc && C:\tools\capture.cmd",
+                Some(r"C:\tools\capture.cmd"),
+            ),
+            // Through a pipe, a nested cmd.exe or a grouping, or named
+            // indirectly: how often cmd.exe reads the arguments depends on
+            // what runs.
+            ("node -e 0 | capture", None),
+            ("capture | node -e 0", None),
+            ("node -e 0 && (capture)", None),
+            ("(node -e 0 && capture)", None),
+            ("call capture", None),
+            ("node -e 0 && call capture", None),
+            ("cmd /c capture", None),
+            (r"C:\Windows\System32\CMD.EXE /c capture", None),
+            ("start /b /wait capture", None),
+            ("if exist x capture", None),
+            ("for %a in (x) do capture", None),
+            ("%TOOL% build", None),
+            ("!TOOL! build", None),
+            (">out.txt capture", None),
+            ("2>nul capture", None),
+            ("\"capture\"x", None),
+            // Where the arguments would land inside a quoted string, after an
+            // escape, or as a command of their own.
+            ("node -e \"console.log(1)", None),
+            ("capture ^", None),
+            ("capture &", None),
+            ("", None),
+            ("capture\r\nother", None),
+        ];
+        for (script, expected) in cases {
+            assert_eq!(windows_argument_command(script), expected, "{script:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_argument_receiver_looks_in_the_project_before_path() {
+        let project = tempfile::tempdir().unwrap();
+        let bin = project.path().join(r"node_modules\.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("shim.cmd"), "").unwrap();
+        std::fs::write(bin.join("tool.exe"), "").unwrap();
+        std::fs::write(bin.join("both.exe"), "").unwrap();
+        std::fs::write(project.path().join("both.cmd"), "").unwrap();
+        std::fs::write(project.path().join("local.bat"), "").unwrap();
+        let path = bin.to_str().unwrap();
+
+        for (script, expected) in [
+            ("tool && shim", WindowsArgumentReceiver::BatchFile),
+            ("shim && tool", WindowsArgumentReceiver::Program),
+            ("tool && local", WindowsArgumentReceiver::BatchFile),
+            ("tool && both", WindowsArgumentReceiver::BatchFile),
+            (
+                "tool && node_modules/.bin/shim",
+                WindowsArgumentReceiver::BatchFile,
+            ),
+            ("tool && SHIM.CMD", WindowsArgumentReceiver::BatchFile),
+            ("tool && missing", WindowsArgumentReceiver::Program),
+            ("tool | shim", WindowsArgumentReceiver::Unknown),
+        ] {
+            assert_eq!(
+                windows_argument_receiver(script, project.path(), path),
+                expected,
+                "{script:?}"
+            );
+        }
     }
 
     #[test]

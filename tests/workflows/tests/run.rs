@@ -708,16 +708,17 @@ fn run_without_lpm_json_rejects_a_standard_env_symlink_outside_the_project() {
     );
 }
 
+/// A project whose `capture` shim and `capture.js` record the arguments they
+/// get in `args.json`.
 #[cfg(windows)]
-#[test]
-fn run_passes_cmd_metacharacters_as_literal_arguments() {
-    let project = TempProject::empty(
-        r#"{
+fn windows_argument_capture_project(scripts: &str) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{
             "name":"windows-literal-args",
             "version":"1.0.0",
-            "scripts":{"capture":"capture"}
-        }"#,
-    );
+            "scripts":{scripts}
+        }}"#
+    ));
     project.write_file(
         "capture.js",
         "require('fs').writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));\n",
@@ -728,56 +729,105 @@ fn run_passes_cmd_metacharacters_as_literal_arguments() {
         "node_modules/.bin/capture.cmd",
         "@ECHO OFF\r\nnode \"%~dp0\\..\\..\\capture.js\" %*\r\n",
     );
+    project
+}
+
+/// Arguments reach the script's last command intact, whether that is the
+/// `capture.cmd` shim, which has cmd.exe read them twice, or `node`, which
+/// gets them after one reading — wherever the script's first word points.
+#[cfg(windows)]
+#[test]
+fn run_passes_cmd_metacharacters_as_literal_arguments() {
+    let project = windows_argument_capture_project(
+        r#"{
+            "capture":"capture",
+            "chained":"node -e 0 && capture",
+            "reverse":"capture && node capture.js"
+        }"#,
+    );
+    // The quote-escaping payload comes before `quoted"value`, whose odd
+    // number of quotes would otherwise leave it inside a quoted stretch.
+    let args = [
+        "x\" & echo PWNED>injected-marker & \"",
+        "",
+        "two words",
+        "tab\tvalue",
+        "snowman-☃",
+        "a&b",
+        "c|d",
+        "e<f",
+        "g>h",
+        "%PATH%",
+        "!delayed!",
+        "quoted\"value",
+        "trail\\",
+        "--flag=1",
+        "& echo PWNED > injected-marker",
+    ];
+
+    for script in ["capture", "chained", "reverse"] {
+        let _ = std::fs::remove_file(project.path().join("args.json"));
+        let output = lpm(&project)
+            .args(["run", script, "--"])
+            .args(args)
+            .output()
+            .expect("run script with cmd.exe metacharacters");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !project.file_exists("injected-marker"),
+            "{script}: an argument ran as a command"
+        );
+        assert!(output.status.success(), "{script} failed:\n{combined}");
+        let captured: serde_json::Value = serde_json::from_str(&project.read_file("args.json"))
+            .expect("parse captured arguments");
+        assert_eq!(captured, serde_json::json!(args), "{script}");
+    }
+}
+
+/// Through a pipe, cmd.exe reads the arguments again a number of times that
+/// depends on what runs, so only words it gives no meaning to are passed.
+#[cfg(windows)]
+#[test]
+fn run_refuses_arguments_cmd_would_reread_through_a_pipe() {
+    let project = windows_argument_capture_project(r#"{"piped":"node -e 0 | capture"}"#);
 
     let output = lpm(&project)
         .args([
             "run",
-            "capture",
+            "piped",
             "--",
-            "",
-            "two words",
-            "tab\tvalue",
-            "snowman-☃",
-            "a&b",
-            "c|d",
-            "e<f",
-            "g>h",
-            "%PATH%",
-            "!delayed!",
-            "quoted\"value",
-            "trail\\",
-            "& echo PWNED > injected-marker",
+            "--flag=1",
+            "x\" & echo PWNED>injected-marker & \"",
         ])
         .output()
-        .expect("run script with cmd.exe metacharacters");
+        .expect("run piped script with cmd.exe metacharacters");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    assert!(output.status.success(), "script failed:\n{combined}");
-    let args: serde_json::Value =
-        serde_json::from_str(&project.read_file("args.json")).expect("parse captured arguments");
-    assert_eq!(
-        args,
-        serde_json::json!([
-            "",
-            "two words",
-            "tab\tvalue",
-            "snowman-☃",
-            "a&b",
-            "c|d",
-            "e<f",
-            "g>h",
-            "%PATH%",
-            "!delayed!",
-            "quoted\"value",
-            "trail\\",
-            "& echo PWNED > injected-marker"
-        ])
-    );
+    assert!(!output.status.success(), "piped script ran:\n{combined}");
+    assert!(combined.contains("cannot pass"), "{combined}");
+    assert!(!project.file_exists("args.json"), "the script ran");
     assert!(!project.file_exists("injected-marker"));
+
+    let output = lpm(&project)
+        .args(["run", "piped", "--", "--flag=1", r"src\index.ts"])
+        .output()
+        .expect("run piped script with plain arguments");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured: serde_json::Value =
+        serde_json::from_str(&project.read_file("args.json")).expect("parse captured arguments");
+    assert_eq!(captured, serde_json::json!(["--flag=1", r"src\index.ts"]));
 }
 
 fn strip_ansi(s: &str) -> String {

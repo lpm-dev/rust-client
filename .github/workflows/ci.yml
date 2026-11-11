@@ -854,6 +854,12 @@ jobs:
           cargo test --locked -p lpm-workflows --test run_runtime workspace_does_not_reuse_shared_node_shim_version_across_member_cwds
           cargo test --locked -p lpm-workflows --test run run_keeps_a_quoted_inherited_path_entry_that_holds_a_semicolon
 
+      - name: Windows script argument quoting
+        run: |
+          cargo test --locked -p lpm-runner script::tests::windows_
+          cargo test --locked -p lpm-workflows --test run run_passes_cmd_metacharacters_as_literal_arguments
+          cargo test --locked -p lpm-workflows --test run run_refuses_arguments_cmd_would_reread_through_a_pipe
+
       - name: Windows scoped environment workflows
         run: |
           cargo test --locked -p lpm-workflows --test env_local sparse_and_bulk_inherited_lookup_match_windows_canonical_names
