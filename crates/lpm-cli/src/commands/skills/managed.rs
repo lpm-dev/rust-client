@@ -4922,7 +4922,7 @@ mod tests {
         .unwrap();
         let target = project.path().join(".agents/skills/release-notes");
         let destination = std::fs::read_link(&target).unwrap();
-        std::fs::remove_file(&target).unwrap();
+        lpm_common::remove_path_entry(&target).unwrap();
         std::fs::write(&target, portable_path(&destination)).unwrap();
 
         let state = load_state(&store).unwrap();
