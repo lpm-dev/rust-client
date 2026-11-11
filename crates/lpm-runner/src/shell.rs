@@ -839,7 +839,13 @@ fn macos_selected_shell() -> std::path::PathBuf {
 pub(crate) fn shell_process(command: &str) -> Result<Command, LpmError> {
     use std::os::windows::process::CommandExt;
 
-    let mut process = Command::new(windows_system_directory()?.join("cmd.exe"));
+    let mut cmd = lpm_common::platform::windows_system_directory().map_err(|error| {
+        LpmError::Script(format!(
+            "failed to resolve Windows system directory: {error}"
+        ))
+    })?;
+    cmd.push("cmd.exe");
+    let mut process = Command::new(cmd);
     process
         .arg("/D")
         .arg("/V:OFF")
@@ -847,35 +853,6 @@ pub(crate) fn shell_process(command: &str) -> Result<Command, LpmError> {
         .arg("/C")
         .raw_arg(format!("\"{command}\""));
     Ok(process)
-}
-
-#[cfg(windows)]
-fn windows_system_directory() -> Result<std::path::PathBuf, LpmError> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    let mut buffer = vec![0_u16; 260];
-    loop {
-        let buffer_len = u32::try_from(buffer.len())
-            .map_err(|_| LpmError::Script("Windows system directory path is too long".into()))?;
-        // SAFETY: `buffer` is writable for `buffer_len` UTF-16 units, and the
-        // pointer remains valid for the duration of this synchronous call.
-        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_len) };
-        if written == 0 {
-            return Err(LpmError::Script(format!(
-                "failed to resolve Windows system directory: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-
-        let written = written as usize;
-        if written < buffer.len() {
-            buffer.truncate(written);
-            return Ok(std::path::PathBuf::from(OsString::from_wide(&buffer)));
-        }
-        buffer.resize(written.saturating_add(1), 0);
-    }
 }
 
 #[cfg(test)]

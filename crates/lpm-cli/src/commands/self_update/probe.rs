@@ -100,17 +100,9 @@ impl ProbeEnvironment {
 
 #[cfg(windows)]
 fn probe_os_variables() -> Vec<(OsString, OsString)> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    let mut buffer = [0_u16; 32_768];
-    // SAFETY: `buffer` is writable for the supplied length. The function
-    // writes at most that many UTF-16 code units and returns their count.
-    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if length == 0 || length >= buffer.len() {
+    let Ok(mut system_directory) = lpm_common::platform::windows_system_directory() else {
         return Vec::new();
-    }
-    let mut system_directory = PathBuf::from(OsString::from_wide(&buffer[..length]));
+    };
     system_directory.push("cmd.exe");
     let windows_directory = system_directory
         .parent()

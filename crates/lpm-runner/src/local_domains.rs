@@ -277,13 +277,14 @@ pub fn system_hosts_file_path() -> PathBuf {
 
 #[cfg(windows)]
 fn windows_hosts_file_path() -> PathBuf {
-    windows_system_directory()
+    windows_directory()
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
         .join(r"System32\drivers\etc\hosts")
 }
 
+/// The Windows directory, normally `C:\Windows`.
 #[cfg(windows)]
-fn windows_system_directory() -> Option<PathBuf> {
+fn windows_directory() -> Option<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
@@ -1378,5 +1379,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "first backup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_system_hosts_file_is_the_one_under_the_system_directory() {
+        let hosts = system_hosts_file_path();
+        assert!(hosts.is_file(), "{}", hosts.display());
+        let expected = lpm_common::platform::windows_system_directory()
+            .unwrap()
+            .join(r"drivers\etc\hosts");
+        assert!(
+            hosts.as_os_str().eq_ignore_ascii_case(expected.as_os_str()),
+            "{} is not {}",
+            hosts.display(),
+            expected.display(),
+        );
     }
 }
