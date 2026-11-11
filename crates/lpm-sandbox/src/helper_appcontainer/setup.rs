@@ -1099,7 +1099,8 @@ mod tests {
     }
 
     /// Makes `path` a directory this process can read but not change, as
-    /// `C:\Program Files` is to an administrator.
+    /// `C:\Program Files` is to an administrator, while it runs without
+    /// privileges.
     fn unchangeable_directory(path: &Path) {
         std::fs::create_dir(path).unwrap();
         let user = current_user_sid().unwrap();
@@ -1112,7 +1113,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        assert!(open_permissions(path, true).is_err());
+        assert!(without_privileges(|| open_permissions(path, true).is_err()));
     }
 
     #[test]
@@ -1131,7 +1132,9 @@ mod tests {
             user_sid: user.clone(),
         };
 
-        let error = apply_plan(&plan, false).unwrap_err().to_string();
+        let error = without_privileges(|| apply_plan(&plan, false))
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("cannot update permissions for"), "{error}");
         assert!(error.contains("Nothing was changed"), "{error}");

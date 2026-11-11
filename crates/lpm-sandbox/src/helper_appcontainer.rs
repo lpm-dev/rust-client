@@ -1720,6 +1720,59 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Runs `run` on this thread with every privilege disabled. Hosted CI
+/// administrators hold backup and restore privileges that let them open
+/// any directory to change its DACL, so a test that needs one it can't
+/// change runs its check here. Other threads keep the process token.
+#[cfg(test)]
+fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    struct RevertImpersonation;
+    impl Drop for RevertImpersonation {
+        fn drop(&mut self) {
+            // SAFETY: impersonation was established on this thread only.
+            unsafe { RevertToSelf() };
+        }
+    }
+    // SAFETY: ImpersonateSelf takes no pointers.
+    assert_ne!(unsafe { ImpersonateSelf(SecurityImpersonation) }, 0);
+    let _revert = RevertImpersonation;
+    let mut token = ptr::null_mut();
+    // SAFETY: this thread is impersonating; token is an initialized output slot.
+    assert_ne!(
+        unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                1,
+                &mut token,
+            )
+        },
+        0
+    );
+    let token = HandleGuard(token);
+    // SAFETY: disable-all ignores the new-state and output buffers, which are null.
+    assert_ne!(
+        unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw(),
+                1,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        0
+    );
+    run()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
