@@ -1235,6 +1235,10 @@ mod tests {
         assert_eq!(encoded_upper, plain);
     }
 
+    // Windows refuses to rename a directory while it is open, so this
+    // replacement cannot happen there; see `publish_common`'s
+    // `an_open_tarball_source_root_keeps_its_directory_in_place`.
+    #[cfg(unix)]
     #[test]
     fn release_workspace_selection_keeps_the_opened_generation_after_same_path_replacement() {
         let temp = tempfile::tempdir().unwrap();
@@ -1279,6 +1283,8 @@ mod tests {
         assert_eq!(rediscovered.root_package.name.as_deref(), Some("original"));
     }
 
+    // Unix only, as the test above is.
+    #[cfg(unix)]
     #[test]
     fn release_workspace_identity_rejects_same_path_replacement() {
         let temp = tempfile::tempdir().unwrap();

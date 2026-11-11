@@ -2367,6 +2367,11 @@ mod tests {
         persist_release_journal(&root, br#"{"schema_version":1}"#).unwrap();
         let journal = existing_release_journal_path(&root).unwrap().unwrap();
         let state_dir = release_state_dir(&root, false).unwrap().unwrap();
+        let current_user = {
+            use std::os::windows::io::AsRawHandle as _;
+            let file = std::fs::File::open(&journal).unwrap();
+            current_user_sid_for_owned_windows_handle(file.as_raw_handle()).unwrap()
+        };
 
         for (path, directory) in [
             (root.join(".lpm"), true),
@@ -2379,7 +2384,10 @@ mod tests {
                 !sddl.contains(";;;WD)"),
                 "DACL grants Everyone access: {sddl}"
             );
-            assert!(sddl.contains(";;;OW)"), "DACL omits owner access: {sddl}");
+            assert!(
+                sddl.contains(&format!("FA;;;{current_user})")),
+                "DACL omits the current user's access: {sddl}"
+            );
             assert!(sddl.contains(";;;SY)"), "DACL omits SYSTEM access: {sddl}");
         }
     }

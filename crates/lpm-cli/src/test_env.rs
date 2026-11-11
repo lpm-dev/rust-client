@@ -64,7 +64,12 @@ impl ScopedEnv {
             .map(|(key, _)| (*key, std::env::var_os(key)))
             .collect();
 
-        for (key, value) in &vars {
+        // Windows names variables case-insensitively, so removing
+        // `npm_config_x` after setting `NPM_CONFIG_X` would undo the set.
+        // Removals go first so every listed value holds on each platform.
+        let removals = vars.iter().filter(|(_, value)| value.is_none());
+        let sets = vars.iter().filter(|(_, value)| value.is_some());
+        for (key, value) in removals.chain(sets) {
             // SAFETY: ENV_LOCK serializes test-owned process-environment mutations.
             unsafe {
                 match value {

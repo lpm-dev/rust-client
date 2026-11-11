@@ -1255,26 +1255,31 @@ mod tests {
         }
     }
 
+    /// An absolute executable path on the host. `/usr/local/bin/...` has no
+    /// drive on Windows, where lpm rightly treats it as relative.
+    const ABSOLUTE_FEED: &str = if cfg!(windows) {
+        "C:/tools/lpm-policy-feed"
+    } else {
+        "/usr/local/bin/lpm-policy-feed"
+    };
+
     #[test]
     fn load_policy_extension_configs_reads_enabled_extension() {
-        let global = global_from_toml(
+        let global = global_from_toml(&format!(
             r#"
 [policy.extensions.local_feed]
-command = ["/usr/local/bin/lpm-policy-feed", "--strict"]
+command = ["{ABSOLUTE_FEED}", "--strict"]
 mode = "enforce"
 on-error = "warn"
 timeout-ms = 750
-"#,
-        );
+"#
+        ));
 
         let configs = load_policy_extension_configs(&global).unwrap();
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "local_feed");
-        assert_eq!(
-            configs[0].command,
-            ["/usr/local/bin/lpm-policy-feed", "--strict"]
-        );
+        assert_eq!(configs[0].command, [ABSOLUTE_FEED, "--strict"]);
         assert_eq!(configs[0].mode, PolicyExtensionMode::Enforce);
         assert_eq!(configs[0].on_error, PolicyExtensionOnError::Warn);
         assert_eq!(configs[0].timeout, Duration::from_millis(750));
@@ -1282,12 +1287,12 @@ timeout-ms = 750
 
     #[test]
     fn load_policy_extension_configs_defaults_to_report_and_mode_based_on_error() {
-        let global = global_from_toml(
+        let global = global_from_toml(&format!(
             r#"
 [policy.extensions.audit]
-command = ["/bin/audit"]
-"#,
-        );
+command = ["{ABSOLUTE_FEED}"]
+"#
+        ));
 
         let configs = load_policy_extension_configs(&global).unwrap();
 

@@ -339,6 +339,10 @@ fn staging_initialization_failures_remove_empty_owned_residue() {
     }
 }
 
+// Windows refuses to rename a directory while a handle is open in it, so this
+// replacement cannot happen there; see
+// `an_open_publication_keeps_its_parent_and_transaction_in_place`.
+#[cfg(unix)]
 #[test]
 fn parent_replacement_after_quarantine_preserves_the_previous_output() {
     let project = tempfile::tempdir().unwrap();
@@ -375,6 +379,8 @@ fn parent_replacement_after_quarantine_preserves_the_previous_output() {
     .unwrap();
 }
 
+// Unix only, as `parent_replacement_after_quarantine_preserves_the_previous_output` is.
+#[cfg(unix)]
 #[test]
 fn recovery_reports_the_current_location_after_a_parent_is_renamed() {
     struct MoveParent<'a>(&'a Path, Cell<usize>);
@@ -456,6 +462,8 @@ fn a_replaced_staging_name_preserves_unadmitted_files() {
     assert!(!project.path().join(path).exists());
 }
 
+// Unix only, as `parent_replacement_after_quarantine_preserves_the_previous_output` is.
+#[cfg(unix)]
 #[test]
 fn recovery_follows_a_renamed_transaction_and_preserves_its_replacement() {
     let project = tempfile::tempdir().unwrap();
@@ -514,6 +522,44 @@ fn recovery_follows_a_renamed_transaction_and_preserves_its_replacement() {
         std::fs::read(replacement.join("user-file")).unwrap(),
         b"preserve transaction replacement"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn an_open_publication_keeps_its_parent_and_transaction_in_place() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("out")).unwrap();
+    let path = Path::new("out/env.generated");
+    write(project.path(), path, &generated("before"), false, || Ok(())).unwrap();
+    let after = generated("after");
+    let checks = Cell::new(0);
+    write(project.path(), path, &after, false, || {
+        checks.set(checks.get() + 1);
+        if checks.get() == 2 {
+            let out = project.path().join("out");
+            assert!(std::fs::rename(&out, project.path().join("displaced-out")).is_err());
+            let transaction = std::fs::read_dir(&out)
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".lpm-env-generated-")
+                })
+                .unwrap()
+                .path();
+            assert!(std::fs::rename(&transaction, out.join("moved-transaction")).is_err());
+        }
+        Ok(())
+    })
+    .unwrap();
+    for (name, bytes) in &after.files {
+        assert_eq!(
+            std::fs::read(project.path().join(path).join(name)).unwrap(),
+            *bytes
+        );
+    }
 }
 
 #[cfg(unix)]
