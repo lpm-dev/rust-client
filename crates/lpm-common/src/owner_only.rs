@@ -427,6 +427,38 @@ pub fn give_to_administrators(
     )
 }
 
+/// Whether `file` is owned by the user the process runs as, as a file an
+/// unelevated process of that user made is. The handle needs
+/// `READ_CONTROL`.
+pub fn owned_by_current_user(
+    file: &impl std::os::windows::io::AsRawHandle,
+) -> std::io::Result<bool> {
+    let mut owner: PSID = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the handle stays open; the outputs receive a LocalFree-owned
+    // descriptor and a pointer into it.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+    let user = ProcessUser::query()?;
+    // SAFETY: `owner` points into the live descriptor and the user's SID
+    // into its buffer.
+    Ok(!owner.is_null() && unsafe { EqualSid(owner, user.sid()) } != 0)
+}
+
 /// Whether `file` is owned by SYSTEM or the Administrators. The handle
 /// needs `READ_CONTROL`.
 pub fn owned_by_system_or_administrators(
@@ -727,6 +759,8 @@ mod tests {
             .unwrap();
         assert!(owned_by_system_or_administrators(&program_data).unwrap());
 
+        assert!(!owned_by_current_user(&program_data).unwrap());
+
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("user.toml");
         std::fs::write(&path, b"").unwrap();
@@ -738,6 +772,7 @@ mod tests {
         )
         .unwrap();
         assert!(!owned_by_system_or_administrators(&file).unwrap());
+        assert!(owned_by_current_user(&file).unwrap());
     }
 
     #[test]

@@ -315,9 +315,12 @@ fn take_windows_policy_set_aside() -> Vec<String> {
     )
 }
 
-/// Lists `set_aside` in the report file the unelevated caller made and named:
-/// only an existing regular file, not a link, with no other name, so the
-/// elevated helper can't be pointed at any other file to write.
+/// Lists `set_aside` in the report file the unelevated caller made and named.
+/// The elevated helper writes where its caller says, and the caller may not
+/// be the administrator who approved the prompt, so it writes only into an
+/// empty regular file of its own user's, with a single name and no link in
+/// its place, on a local drive — never through a UNC or device path, which
+/// would sign in elsewhere as that administrator — and never truncates.
 #[cfg(windows)]
 fn write_windows_policy_set_aside_report(
     report: &Path,
@@ -325,8 +328,10 @@ fn write_windows_policy_set_aside_report(
 ) -> Result<(), LpmError> {
     use std::io::Write as _;
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+        FILE_TYPE_DISK, GetFileType, READ_CONTROL, SECURITY_IDENTIFICATION,
     };
 
     let refused = |reason: String| {
@@ -335,33 +340,80 @@ fn write_windows_policy_set_aside_report(
             report.display()
         ))
     };
+    if !windows_local_drive_path(report) {
+        return Err(refused("not a path on a local drive".into()));
+    }
     let mut file = std::fs::OpenOptions::new()
-        .write(true)
+        .access_mode(FILE_GENERIC_WRITE | READ_CONTROL)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
         .open(report)
         .map_err(|error| refused(error.to_string()))?;
     let metadata = file
         .metadata()
         .map_err(|error| refused(error.to_string()))?;
-    if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || lpm_common::link_count(&file).map_err(|error| refused(error.to_string()))? != 1
-    {
-        return Err(refused("not a plain file with a single name".into()));
+    // SAFETY: the handle is open for the call.
+    let on_disk = unsafe { GetFileType(file.as_raw_handle().cast()) } == FILE_TYPE_DISK;
+    let plain = on_disk
+        && metadata.is_file()
+        && metadata.len() == 0
+        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && lpm_common::link_count(&file).map_err(|error| refused(error.to_string()))? == 1
+        && lpm_common::owner_only::owned_by_current_user(&file)
+            .map_err(|error| refused(error.to_string()))?;
+    if !plain {
+        return Err(refused(
+            "not an empty file of this user's with a single name".into(),
+        ));
     }
-    file.set_len(0)
-        .and_then(|()| file.write_all(set_aside.join("\n").as_bytes()))
+    file.write_all(set_aside.join("\n").as_bytes())
         .map_err(|error| refused(error.to_string()))
 }
 
-/// What the elevated helper listed in `report`.
+/// Whether `path` names a file by a local drive letter (`C:\…`), not a UNC
+/// or device path, nor a network or unknown drive.
 #[cfg(windows)]
-fn read_windows_policy_set_aside_report(report: &Path) -> Vec<String> {
+fn windows_local_drive_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // GetDriveTypeW's answers for a removable, a fixed and a RAM disk.
+    const LOCAL_DRIVE_TYPES: [u32; 3] = [2, 3, 6];
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let Prefix::Disk(letter) = prefix.kind() else {
+        return false;
+    };
+    let root = format!("{}:\\", char::from(letter))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `root` is NUL-terminated.
+    LOCAL_DRIVE_TYPES.contains(&unsafe { GetDriveTypeW(root.as_ptr()) })
+}
+
+/// What the elevated helper listed in `report` that names something moved
+/// aside from `policy`'s place: `<policy or its directory>.untrusted-<time>`.
+#[cfg(windows)]
+fn read_windows_policy_set_aside_report(report: &Path, policy: &Path) -> Vec<String> {
+    let prefixes = [policy.parent(), Some(policy)]
+        .into_iter()
+        .flatten()
+        .map(|entry| format!("{}.untrusted-", entry.display()))
+        .collect::<Vec<_>>();
     lpm_common::read_text_file_capped(report, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         .map(|listed| {
             listed
                 .lines()
-                .filter(|line| !line.is_empty())
+                .filter(|line| {
+                    prefixes.iter().any(|prefix| {
+                        line.strip_prefix(prefix.as_str()).is_some_and(|stamp| {
+                            !stamp.is_empty() && stamp.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                    })
+                })
                 .map(str::to_string)
                 .collect()
         })
@@ -647,7 +699,8 @@ fn apply_managed_protection_action(
 
 /// The privileged helper. On Windows, with `report`, it lists there what it
 /// moved aside, whether or not the change succeeded, for the caller to
-/// say: its own console closes when it exits.
+/// say: its own console closes when it exits. The report is a courtesy: a
+/// change made stays made, and reported as such, if it can't be written.
 pub(crate) fn run_internal_managed_protection(
     action: ManagedProtectionAction,
     report: Option<&Path>,
@@ -655,10 +708,11 @@ pub(crate) fn run_internal_managed_protection(
     crate::privilege::require_effective_root("security-policy")?;
     let applied = apply_managed_protection_action(action).map(drop);
     #[cfg(windows)]
-    if let Some(report) = report {
-        let reported =
-            write_windows_policy_set_aside_report(report, &take_windows_policy_set_aside());
-        return applied.and(reported);
+    if let Some(report) = report
+        && let Err(error) =
+            write_windows_policy_set_aside_report(report, &take_windows_policy_set_aside())
+    {
+        tracing::warn!("{error}");
     }
     #[cfg(not(windows))]
     let _ = report;
@@ -728,7 +782,7 @@ pub(crate) fn apply_managed_protection_with_privilege(
             "security-policy",
         );
         #[cfg(windows)]
-        let set_aside = read_windows_policy_set_aside_report(report.path());
+        let set_aside = read_windows_policy_set_aside_report(report.path(), &managed_policy_path());
         #[cfg(windows)]
         let helped = helped.map_err(|error| with_set_aside(error, &set_aside));
         #[cfg(not(windows))]
@@ -1379,7 +1433,7 @@ mod windows_policy_directory_tests {
         Some(RemoveOnDrop(directory))
     }
 
-    fn give_to_current_user(path: &Path) {
+    pub(super) fn give_to_current_user(path: &Path) {
         let whoami = std::process::Command::new(
             lpm_common::platform::windows_system_directory()
                 .unwrap()
@@ -1551,11 +1605,20 @@ mod windows_policy_directory_tests {
 mod windows_set_aside_report_tests {
     use super::*;
 
+    const POLICY: &str = r"C:\ProgramData\lpm\security-policy.toml";
+
+    /// A file as the caller makes it: owned by the test's user even where
+    /// the test runs elevated, whose files the Administrators own.
+    fn file_of_this_user(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        super::windows_policy_directory_tests::give_to_current_user(path);
+    }
+
     #[test]
     fn the_report_lists_what_was_moved_aside() {
         let directory = tempfile::tempdir().unwrap();
         let report = directory.path().join("report");
-        std::fs::write(&report, "left from before").unwrap();
+        file_of_this_user(&report, "");
         let set_aside = vec![
             r"C:\ProgramData\lpm.untrusted-1".to_string(),
             r"C:\ProgramData\lpm\security-policy.toml.untrusted-2".to_string(),
@@ -1563,25 +1626,70 @@ mod windows_set_aside_report_tests {
 
         write_windows_policy_set_aside_report(&report, &set_aside).unwrap();
 
-        assert_eq!(read_windows_policy_set_aside_report(&report), set_aside);
+        assert_eq!(
+            read_windows_policy_set_aside_report(&report, Path::new(POLICY)),
+            set_aside
+        );
     }
 
-    /// The elevated helper writes where an unelevated caller says, so only
-    /// to a file nothing else is reached through.
+    /// Something else of the user's could rewrite the report before it is
+    /// read back; only what names the policy's own place is said.
     #[test]
-    fn the_report_goes_only_to_a_plain_file_with_one_name() {
+    fn only_what_was_moved_aside_from_the_policy_s_place_is_read_back() {
         let directory = tempfile::tempdir().unwrap();
-        let linked = directory.path().join("linked");
-        std::fs::write(&linked, "kept").unwrap();
-        std::fs::hard_link(&linked, directory.path().join("other-name")).unwrap();
-        let missing = directory.path().join("missing");
-        let set_aside = ["x".to_string()];
+        let report = directory.path().join("report");
+        std::fs::write(
+            &report,
+            "C:\\ProgramData\\lpm.untrusted-1\n\
+             C:\\ProgramData\\lpm.untrusted-x\n\
+             C:\\ProgramData\\lpm.untrusted-\n\
+             C:\\Users\\Public\\policy.untrusted-3\n",
+        )
+        .unwrap();
 
-        assert!(write_windows_policy_set_aside_report(&linked, &set_aside).is_err());
-        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "kept");
-        assert!(write_windows_policy_set_aside_report(&missing, &set_aside).is_err());
+        assert_eq!(
+            read_windows_policy_set_aside_report(&report, Path::new(POLICY)),
+            [r"C:\ProgramData\lpm.untrusted-1"]
+        );
+    }
+
+    /// The elevated helper writes where its caller says, and the caller may
+    /// not be the administrator who approved it.
+    #[test]
+    fn the_report_goes_only_into_an_empty_local_file_of_the_user_s() {
+        let directory = tempfile::tempdir().unwrap();
+        let set_aside = ["x".to_string()];
+        let refused =
+            |path: &Path| write_windows_policy_set_aside_report(path, &set_aside).is_err();
+
+        // Never truncated.
+        let full = directory.path().join("full");
+        file_of_this_user(&full, "kept");
+        assert!(refused(&full));
+        assert_eq!(std::fs::read_to_string(&full).unwrap(), "kept");
+        // Not reached through a second name.
+        let linked = directory.path().join("linked");
+        file_of_this_user(&linked, "");
+        std::fs::hard_link(&linked, directory.path().join("other-name")).unwrap();
+        assert!(refused(&linked));
+        // Not made, and not a directory.
+        let missing = directory.path().join("missing");
+        assert!(refused(&missing));
         assert!(!missing.exists());
-        assert!(write_windows_policy_set_aside_report(directory.path(), &set_aside).is_err());
+        assert!(refused(directory.path()));
+        // Not opened by a UNC or device path at all.
+        let empty = directory.path().join("empty");
+        file_of_this_user(&empty, "");
+        assert!(refused(Path::new(r"\\localhost\C$\lpm-report")));
+        assert!(refused(&PathBuf::from(format!(r"\\?\{}", empty.display()))));
+        assert_eq!(std::fs::read_to_string(&empty).unwrap(), "");
+        // Not a file of an account other than the caller's.
+        let administrators = directory.path().join("administrators");
+        std::fs::write(&administrators, "").unwrap();
+        if crate::privilege::is_elevated() {
+            give_windows_policy_to_administrators(&administrators).unwrap();
+            assert!(refused(&administrators));
+        }
     }
 }
 
