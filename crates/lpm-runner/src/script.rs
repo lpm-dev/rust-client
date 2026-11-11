@@ -324,31 +324,59 @@ fn windows_argument_receiver_in(
 }
 
 /// The cmd.exe built-in among those that run another command, `call`,
-/// `start`, `if` and `for`, that `word` names as cmd.exe reads it: the
-/// keyword, then the end of the word or one of `.+[]\:(/`, which also end a
-/// built-in's name (`start.`, `call:label`, `if/i`) but not another's.
+/// `start`, `if` and `for`, that `word`, a first word as
+/// [`windows_first_word`] gives it, names. As measured: `call` and `start`
+/// also when one of `.+[]\:(/` follows (`start.`, `call:label`); `for` also
+/// when `(` does; `if` only as it is (`if/i` is a program named `if`).
 #[cfg(any(test, windows))]
 fn windows_command_builtin(word: &str) -> Option<&'static str> {
-    ["call", "start", "if", "for"].into_iter().find(|keyword| {
-        word.get(..keyword.len())
-            .is_some_and(|start| start.eq_ignore_ascii_case(keyword))
-            && word[keyword.len()..]
-                .chars()
+    let word = word.to_ascii_lowercase();
+    let names = |keyword: &str, endings: &str| {
+        word.strip_prefix(keyword).is_some_and(|rest| {
+            rest.chars()
                 .next()
-                .is_none_or(|next| ".+[]\\:(/".contains(next))
-    })
+                .is_none_or(|next| endings.contains(next))
+        })
+    };
+    if names("call", ".+[]\\:(/") {
+        Some("call")
+    } else if names("start", ".+[]\\:(/") {
+        Some("start")
+    } else if word == "if" {
+        Some("if")
+    } else if names("for", "(") {
+        Some("for")
+    } else {
+        None
+    }
 }
 
-/// The first word of a command, as far as cmd.exe's delimiters.
+/// The first word of a command as cmd.exe reads it to decide what runs:
+/// after any leading delimiters and `@`, up to the next delimiter, with
+/// each `^` taken out and the character after it kept (`i^f` is `if`).
 #[cfg(any(test, windows))]
-fn windows_first_word(command: &str) -> &str {
-    command
+fn windows_first_word(command: &str) -> String {
+    let mut word = String::new();
+    let mut characters = command
         .trim_start_matches(|character: char| {
             character.is_whitespace() || "@,;=".contains(character)
         })
-        .split(|character: char| character.is_whitespace() || ",;=".contains(character))
-        .next()
-        .unwrap_or_default()
+        .chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '^' => word.extend(characters.next()),
+            _ if character.is_whitespace() || ",;=".contains(character) => break,
+            _ => word.push(character),
+        }
+    }
+    word
+}
+
+/// Whether a command whose first word is `word` is, or may be once a
+/// variable in it expands, an `if` or a `for`.
+#[cfg(any(test, windows))]
+fn windows_may_be_conditional(word: &str) -> bool {
+    word.contains('%') || matches!(windows_command_builtin(word), Some("if" | "for"))
 }
 
 /// Where cmd.exe takes the arguments appended to a script.
@@ -401,12 +429,7 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
                 piped = character == '|' && !doubled;
                 grouped = false;
                 start = index + if doubled { 2 } else { 1 };
-                if piped
-                    && matches!(
-                        windows_command_builtin(windows_first_word(&script_cmd[start..])),
-                        Some("if" | "for")
-                    )
-                {
+                if piped && windows_may_be_conditional(&windows_first_word(&script_cmd[start..])) {
                     piped_body = true;
                 }
             }
@@ -433,10 +456,12 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // Whether arguments after `if <condition>` or `for … do`, with or
     // without a command or an `else`, end up a command, a condition or an
     // argument depends on what precedes them.
-    match windows_command_builtin(windows_first_word(command)) {
-        Some("if" | "for") => return WindowsScriptTail::Nothing,
-        Some(_) => return WindowsScriptTail::Unknown,
-        None => {}
+    let first_word = windows_first_word(command);
+    if windows_may_be_conditional(&first_word) {
+        return WindowsScriptTail::Nothing;
+    }
+    if windows_command_builtin(&first_word).is_some() {
+        return WindowsScriptTail::Unknown;
     }
     // A pipe runs its commands in another cmd.exe, which reads them again.
     if piped || piped_body || grouped {
@@ -3313,8 +3338,14 @@ mod tests {
             // An `if` or `for` after a pipe takes `& capture` into its body.
             ("node -e 0 | if 1==1 node -e 0 & capture", Unknown),
             ("node -e 0 | for %a in (1) do node -e 0 & capture", Unknown),
+            // cmd.exe takes the `^` out before it looks, and a variable can
+            // be either.
+            ("node -e 0 | i^f 1==1 node -e 0 & capture", Unknown),
+            ("node -e 0 | ^if 1==1 node -e 0 & capture", Unknown),
+            ("node -e 0 | f^or %a in (1) do node -e 0 & capture", Unknown),
+            ("node -e 0 | %CONDITION% node -e 0 & capture", Unknown),
             ("if 1==1 node -e 0 & capture", Command("capture")),
-            // cmd.exe also ends a built-in's name at `.+[]\:(`.
+            // cmd.exe also ends `call`'s and `start`'s names at `.+[]\:(`.
             ("start.capture", Unknown),
             ("node -e 0 && start+ /b capture", Unknown),
             ("start[x capture", Unknown),
@@ -3328,7 +3359,7 @@ mod tests {
             ),
             ("forever start", Command("forever")),
             ("caller", Command("caller")),
-            ("%TOOL% build", Unknown),
+            ("%TOOL% build", Nothing),
             ("!TOOL! build", Unknown),
             (">out.txt capture", Unknown),
             ("2>nul capture", Unknown),
@@ -3369,7 +3400,10 @@ mod tests {
             ("if exist dist", Nothing),
             ("if exist x capture", Nothing),
             ("for %a in (x) do capture", Nothing),
-            ("if/i a==a capture", Nothing),
+            // `if/i` is a program named `if`; the `/` makes it unknown anyway.
+            ("if/i a==a capture", Unknown),
+            ("node -e 0 && i^f 1==2 (node -e 0) else", Nothing),
+            ("node -e 0 && f^or %a in (1) do", Nothing),
             ("node -e 0 && if 1==1 capture", Nothing),
             ("node -e 0 | if 1==1 capture", Nothing),
         ];
