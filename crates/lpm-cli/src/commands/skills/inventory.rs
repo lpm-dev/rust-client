@@ -736,7 +736,7 @@ pub(super) fn read_and_scan_directory(directory: &Path) -> DirectoryAssessment {
                     rule_id: finding.rule_id,
                     category: finding.category,
                     severity: finding.severity,
-                    path: path.display().to_string(),
+                    path: super::managed::portable_path(&path),
                     line: finding.line_number,
                 }),
         );
