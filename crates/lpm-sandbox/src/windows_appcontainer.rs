@@ -905,15 +905,13 @@ fn try_capture_from_vcvarsall(
         );
     }
 
-    let inherited_path = std::env::var_os("PATH");
-    for name in SEARCH_PATH_ENVS {
-        let Some(key) = new_env
-            .keys()
+    fn env_key(env: &HashMap<String, String>, name: &str) -> Option<String> {
+        env.keys()
             .find(|key| key.eq_ignore_ascii_case(name))
             .cloned()
-        else {
-            continue;
-        };
+    }
+    let inherited_path = std::env::var_os("PATH");
+    if let Some(key) = env_key(&new_env, "PATH") {
         match msvc_path_over_inherited(
             &new_env[&key],
             &shell.search_path,
@@ -921,6 +919,21 @@ fn try_capture_from_vcvarsall(
         ) {
             Some(path) => {
                 new_env.insert(key, path);
+            }
+            None => {
+                new_env.remove(&key);
+            }
+        }
+    }
+    // VsDevCmd saves the PATH it started with, unless a Developer Command
+    // Prompt LPM runs in already saved the user's own; only a copy of the
+    // capture's search PATH is swapped back for the inherited one.
+    if let Some(key) = env_key(&new_env, VSCMD_PREINIT_PATH_ENV)
+        && is_search_path(&new_env[&key], &shell.search_path)
+    {
+        match inherited_path.as_deref().and_then(std::ffi::OsStr::to_str) {
+            Some(path) => {
+                new_env.insert(key, path.to_string());
             }
             None => {
                 new_env.remove(&key);
@@ -965,9 +978,8 @@ const NO_CURRENT_DIRECTORY_SEARCH_ENV: &str = "NoDefaultCurrentDirectoryInExePat
 /// lifecycle scripts.
 const CAPTURE_ONLY_ENVS: [&str; 2] = [NO_CURRENT_DIRECTORY_SEARCH_ENV, "ComSpec"];
 
-/// Variables vcvarsall builds from the search `PATH` it ran with: `PATH`
-/// itself, and the copy `VsDevCmd.bat` keeps to restore it.
-const SEARCH_PATH_ENVS: [&str; 2] = ["PATH", "__VSCMD_PREINIT_PATH"];
+/// Where `VsDevCmd.bat` keeps the `PATH` it started with, to restore it.
+const VSCMD_PREINIT_PATH_ENV: &str = "__VSCMD_PREINIT_PATH";
 
 /// The shell the capture runs vcvarsall in, outside the sandbox: the
 /// system's `cmd.exe`, and a `PATH` of only Windows' own directories and
@@ -1041,11 +1053,13 @@ impl MsvcCaptureShell {
     }
 }
 
-/// A `PATH`-style value as vcvarsall left it, with the search `PATH` the
-/// capture ran with swapped back for the `PATH` LPM inherited, so lifecycle
-/// scripts see whatever Visual Studio put before and after it around their
-/// usual `PATH`. `None` when the inherited `PATH` isn't Unicode: it has to
-/// stay inherited, since the decoded text can't stand in for it.
+/// `PATH` as vcvarsall left it, with the search `PATH` the capture ran with
+/// — found as the same directories in the same order — swapped back for the
+/// `PATH` LPM inherited, so lifecycle scripts see whatever Visual Studio put
+/// before and after it around their usual `PATH`. A `PATH` in which that
+/// sequence no longer appears is kept as vcvarsall left it. `None` when the
+/// inherited `PATH` isn't Unicode: it has to stay inherited, since the
+/// decoded text can't stand in for it.
 fn msvc_path_over_inherited(
     captured: &str,
     search_path: &str,
@@ -1055,32 +1069,44 @@ fn msvc_path_over_inherited(
         Some(path) => path.to_str()?,
         None => "",
     };
-    let is_searched = |entry: &str| {
-        let entry = entry.trim_end_matches('\\');
-        search_path
-            .split(';')
-            .any(|searched| searched.eq_ignore_ascii_case(entry))
-    };
+    let searched: Vec<&str> = search_path.split(';').collect();
     let entries: Vec<&str> = captured.split(';').filter(|e| !e.is_empty()).collect();
-    let (Some(first), Some(last)) = (
-        entries.iter().position(|e| is_searched(e)),
-        entries.iter().rposition(|e| is_searched(e)),
-    ) else {
+    let Some(start) = entries.windows(searched.len()).position(|window| {
+        window
+            .iter()
+            .zip(&searched)
+            .all(|(entry, searched)| same_directory(entry, searched))
+    }) else {
         return Some(captured.to_string());
     };
-    let mut parts: Vec<&str> = Vec::with_capacity(entries.len() + 1);
-    parts.extend_from_slice(&entries[..first]);
-    parts.extend(
-        entries[first..last]
-            .iter()
-            .copied()
-            .filter(|entry| !is_searched(entry)),
-    );
+    let mut parts: Vec<&str> = Vec::with_capacity(entries.len() + 1 - searched.len());
+    parts.extend_from_slice(&entries[..start]);
     if !inherited.is_empty() {
         parts.push(inherited);
     }
-    parts.extend_from_slice(&entries[last + 1..]);
+    parts.extend_from_slice(&entries[start + searched.len()..]);
     Some(parts.join(";"))
+}
+
+/// Whether `value` is exactly the capture's search `PATH`.
+fn is_search_path(value: &str, search_path: &str) -> bool {
+    let mut entries = value.split(';').filter(|e| !e.is_empty());
+    let mut searched = search_path.split(';');
+    loop {
+        match (entries.next(), searched.next()) {
+            (Some(entry), Some(searched)) if same_directory(entry, searched) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// `PATH` entries naming the same directory, as Windows compares them:
+/// ignoring ASCII case and a trailing backslash.
+fn same_directory(entry: &str, searched: &str) -> bool {
+    entry
+        .trim_end_matches('\\')
+        .eq_ignore_ascii_case(searched.trim_end_matches('\\'))
 }
 
 /// Best-effort host-arch token for `vcvarsall.bat`. The pattern
@@ -1378,11 +1404,19 @@ mod tests {
                 rest, inherited_path,
                 "lifecycle scripts keep the PATH lpm inherited, after what vcvarsall added",
             );
-            assert_eq!(
-                additions.get("__VSCMD_PREINIT_PATH"),
-                Some(&inherited_path),
-                "VsDevCmd's saved PATH is the one lpm inherited, not the capture's",
-            );
+            if std::env::var_os(VSCMD_PREINIT_PATH_ENV).is_some() {
+                assert_eq!(
+                    additions.get(VSCMD_PREINIT_PATH_ENV),
+                    None,
+                    "a PATH a Developer Command Prompt already saved stays as it was",
+                );
+            } else {
+                assert_eq!(
+                    additions.get(VSCMD_PREINIT_PATH_ENV),
+                    Some(&inherited_path),
+                    "VsDevCmd's saved PATH is the one lpm inherited, not the capture's",
+                );
+            }
             return;
         }
 
@@ -1414,7 +1448,7 @@ mod tests {
              reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuild >nul 2>&1 || exit /b 11\r\n\
              where cmd >nul 2>&1 || exit /b 12\r\n\
              echo vcvars| findstr vcvars >nul || exit /b 13\r\n\
-             set \"__VSCMD_PREINIT_PATH=%PATH%\"\r\n\
+             if not defined __VSCMD_PREINIT_PATH set \"__VSCMD_PREINIT_PATH=%PATH%\"\r\n\
              set \"PATH=%~dp0fakebin;%PATH%\"\r\n\
              set LPM_TEST_MSVC_CAPTURED=1\r\n\
              exit /b 0\r\n",
@@ -1424,31 +1458,44 @@ mod tests {
         path.push(";");
         path.push(std::env::var_os("PATH").unwrap_or_default());
 
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "windows_appcontainer::tests::msvc_env_capture_never_runs_commands_planted_in_the_working_directory_or_on_path",
-                "--nocapture",
-            ])
-            .current_dir(&project)
-            .env(VCVARSALL_UNDER_TEST_ENV, &vcvarsall)
-            .env("PATH", path)
-            .env_remove(NO_CURRENT_DIRECTORY_SEARCH_ENV)
-            .output()
-            .unwrap();
+        // Started from a Developer Command Prompt, VsDevCmd keeps the PATH it
+        // saved there, even one that begins with the capture's search PATH.
+        let saved_by_developer_prompt = format!(
+            r"{};C:\lpm-test-saved-path",
+            MsvcCaptureShell::locate().unwrap().search_path
+        );
+        for saved_path in [None, Some(saved_by_developer_prompt.as_str())] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "windows_appcontainer::tests::msvc_env_capture_never_runs_commands_planted_in_the_working_directory_or_on_path",
+                    "--nocapture",
+                ])
+                .current_dir(&project)
+                .env(VCVARSALL_UNDER_TEST_ENV, &vcvarsall)
+                .env("PATH", &path)
+                .env_remove(NO_CURRENT_DIRECTORY_SEARCH_ENV);
+            match saved_path {
+                Some(saved) => child.env(VSCMD_PREINIT_PATH_ENV, saved),
+                None => child.env_remove(VSCMD_PREINIT_PATH_ENV),
+            };
+            let output = child.output().unwrap();
 
-        assert!(
-            !marker.exists(),
-            "commands planted in the project ran during the MSVC env capture:\n{}",
-            std::fs::read_to_string(&marker).unwrap_or_default().trim(),
-        );
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
-            "the capture in the child test process failed or didn't run:\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+            assert!(
+                !marker.exists(),
+                "commands planted in the project ran during the MSVC env capture:\n{}",
+                std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+            );
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "the capture in the child test process failed or didn't run \
+                 (saved PATH {saved_path:?}):\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
@@ -1522,24 +1569,59 @@ mod tests {
         );
         assert_eq!(
             msvc_path_over_inherited(
-                r"C:\VS\bin;C:\Windows\system32;C:\VS\between;C:\Windows;C:\Installer",
+                r"C:\VS\pre;C:\Windows\system32;C:\Windows;C:\Installer;C:\VS\late;C:\Windows\system32",
+                searched,
+                Some(inherited),
+            )
+            .as_deref(),
+            Some(
+                r"C:\VS\pre;C:\project\node_modules\.bin;C:\Program Files\nodejs;C:\VS\late;C:\Windows\system32"
+            ),
+            "only the search PATH itself is replaced; directories vcvarsall appended keep their order",
+        );
+        assert_eq!(
+            msvc_path_over_inherited(
+                r"C:\VS\bin;C:\Windows\system32;C:\Windows;C:\Installer;C:\VS\late",
                 searched,
                 None,
             )
             .as_deref(),
-            Some(r"C:\VS\bin;C:\VS\between"),
+            Some(r"C:\VS\bin;C:\VS\late"),
             "with nothing inherited, only what vcvarsall added remains",
         );
-        assert_eq!(
-            msvc_path_over_inherited(r"C:\VS\only", searched, Some(inherited)).as_deref(),
-            Some(r"C:\VS\only"),
-            "a PATH vcvarsall replaced outright is kept as it left it",
-        );
+        for rewritten in [
+            r"C:\VS\only",
+            r"C:\Windows\system32;C:\VS\between;C:\Windows;C:\Installer",
+        ] {
+            assert_eq!(
+                msvc_path_over_inherited(rewritten, searched, Some(inherited)).as_deref(),
+                Some(rewritten),
+                "a PATH vcvarsall rewrote is kept as it left it",
+            );
+        }
         let not_unicode = std::ffi::OsString::from_wide(&[0x43, 0xD800]);
         assert_eq!(
             msvc_path_over_inherited(searched, searched, Some(&not_unicode)),
             None,
         );
+    }
+
+    #[test]
+    fn only_the_whole_search_path_counts_as_the_captures_own_saved_path() {
+        let searched = r"C:\Windows\system32;C:\Windows;C:\Installer";
+        assert!(is_search_path(searched, searched));
+        assert!(is_search_path(
+            r"C:\WINDOWS\System32\;C:\Windows;C:\Installer;",
+            searched
+        ));
+        for other in [
+            r"C:\Windows\system32;C:\Windows",
+            r"C:\Windows\system32;C:\Windows;C:\Installer;C:\saved",
+            r"C:\Windows;C:\Windows\system32;C:\Installer",
+            "",
+        ] {
+            assert!(!is_search_path(other, searched), "{other:?}");
+        }
     }
 
     #[test]
