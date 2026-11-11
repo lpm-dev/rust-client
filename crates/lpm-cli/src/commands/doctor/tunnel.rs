@@ -85,11 +85,12 @@ pub(super) async fn check_tunnel_domain_from_config(
     let subdomain = parts[0];
     let base_domain = parts[1];
 
-    // Check subdomain format
-    if subdomain.len() < 3 || subdomain.len() > 32 {
+    // An account URL, `<username>-<code>.lpm.fyi`, can be longer than the 32
+    // characters of most claims, so only the DNS label limit applies here.
+    if subdomain.len() < 3 || subdomain.len() > 63 {
         checks.push(Check::warn(
             &doctor_catalog::TUNNEL_SUBDOMAIN_LENGTH,
-            &format!("subdomain \"{subdomain}\" must be 3-32 characters"),
+            &format!("subdomain \"{subdomain}\" must be 3-63 characters"),
         ));
         return checks;
     }
@@ -312,6 +313,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tunnel_check_passes_a_long_account_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_url = format!("{}-ab3k9mzq.lpm.fyi", "a".repeat(39));
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            format!(r#"{{ "tunnel": {{ "domain": "{account_url}" }} }}"#),
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].severity, Severity::Pass),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[tokio::test]
     async fn tunnel_check_warns_short_subdomain() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -323,7 +343,7 @@ mod tests {
         let checks = check_tunnel_domain(dir.path(), &client, false).await;
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Warn));
-        assert!(checks[0].detail.contains("3-32 characters"));
+        assert!(checks[0].detail.contains("3-63 characters"));
     }
 
     #[tokio::test]
