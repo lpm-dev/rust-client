@@ -804,7 +804,19 @@ fn with_verified_certificate_file<T>(
             display_path.display()
         )));
     }
-    let result = operation(&temporary)?;
+    // certutil runs elevated, in a logon session that may lack this one's
+    // drive letters (`subst`, mapped drives), so it gets the path the system
+    // resolves the open file to.
+    #[cfg(windows)]
+    let operation_path = resolved_path(&staged_file).map_err(|error| {
+        LpmError::Cert(format!(
+            "failed to resolve the staged certificate for {}: {error}",
+            display_path.display()
+        ))
+    })?;
+    #[cfg(not(windows))]
+    let operation_path = temporary.to_path_buf();
+    let result = operation(&operation_path)?;
     // Elsewhere nothing stops another writer; the directory is LPM's own,
     // and the file is checked again.
     #[cfg(not(windows))]
@@ -831,16 +843,78 @@ fn with_verified_certificate_file<T>(
 /// Opens the staged certificate to read. On Windows it shares the file with
 /// readers only, so the open fails while any other handle can still write
 /// it, and until it is closed nobody can start writing, renaming or
-/// deleting it.
+/// deleting it; and it opens a link put in its place, not where the link
+/// leads, and refuses it.
 fn open_staged_certificate(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+    }
+    Ok(file)
+}
+
+/// The path the system resolves the open `file` to, in the plain form
+/// tools such as certutil take: `C:\…` or `\\server\share\…`, not `\\?\…`.
+#[cfg(windows)]
+fn resolved_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let mut buffer = vec![0_u16; 512];
+    let length = loop {
+        let capacity = u32::try_from(buffer.len()).map_err(std::io::Error::other)?;
+        // SAFETY: the handle is open and `buffer` holds `capacity` writable
+        // units.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle().cast(),
+                buffer.as_mut_ptr(),
+                capacity,
+                0,
+            )
+        } as usize;
+        match length {
+            0 => return Err(std::io::Error::last_os_error()),
+            written if written < buffer.len() => break written,
+            needed => buffer.resize(needed, 0),
+        }
+    };
+    let resolved = &buffer[..length];
+    let verbatim = r"\\?\".encode_utf16().collect::<Vec<_>>();
+    let verbatim_unc = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+    let plain = if let Some(share) = resolved.strip_prefix(verbatim_unc.as_slice()) {
+        r"\\".encode_utf16().chain(share.iter().copied()).collect()
+    } else if let Some(local) = resolved.strip_prefix(verbatim.as_slice()) {
+        local.to_vec()
+    } else {
+        resolved.to_vec()
+    };
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &plain,
+    )))
 }
 
 // ── macOS ──────────────────────────────────────────────────────────────
@@ -1508,9 +1582,14 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
 
         let outcome = with_verified_certificate_file(expected.as_bytes(), &display_path, |path| {
             assert_eq!(
-                path.parent(),
-                Some(ca_dir.path()),
+                std::fs::canonicalize(path.parent().unwrap()).unwrap(),
+                std::fs::canonicalize(ca_dir.path()).unwrap(),
                 "staged beside the CA, not in the temporary directory"
+            );
+            assert!(
+                !path.to_string_lossy().starts_with(r"\\?\"),
+                "certutil can't take a verbatim path: {}",
+                path.display()
             );
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
             Ok(std::fs::write(path, replacement.as_bytes()).is_ok())
