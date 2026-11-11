@@ -458,6 +458,91 @@ mod tests {
         assert_eq!(lists_profile(&profiles, sid.0), Some(false));
     }
 
+    /// Makes `path` a directory this process can read but not change, as
+    /// `C:\Program Files\nodejs` is to its user: a best-effort grant there
+    /// never lands, yet the grant record names it.
+    fn lock_directory(path: &Path) {
+        let user = setup::current_user_sid().unwrap();
+        // OWNER RIGHTS limits the owner to what it is granted.
+        let output = std::process::Command::new("icacls.exe")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("*{user}:(RX)"))
+            .args(["/grant:r", "*S-1-3-4:(RX)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    fn revoke_only_args(name: &str, record: &Path) -> HelperArgs {
+        crate::helper_protocol::parse_argv(
+            [
+                "--protocol-version",
+                &crate::helper_protocol::PROTOCOL_VERSION.to_string(),
+                "--appcontainer-name",
+                name,
+                "--grant-record",
+                record.to_str().unwrap(),
+                "--revoke-only",
+                "--delete-appcontainer-profile",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cleanup_run_passes_a_recorded_tree_it_never_granted_and_could_not_change() {
+        let name = unique_name("LpmIdentityUnchanged");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let tree = tree_with_a_file(root.path(), "granted");
+        grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        lock_directory(&locked);
+        let record = root.path().join("grants.json");
+        record_grants(&record, &[locked.clone(), tree.clone()]).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        assert_eq!(
+            run_revoke_only(&revoke_only_args(&name, &record)).unwrap(),
+            0
+        );
+
+        assert!(!grants(&tree.join("inner").join("file.txt"), sid.0));
+        assert!(!record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(false));
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_while_a_tree_it_cannot_change_holds_its_grant() {
+        let name = unique_name("LpmIdentityStuck");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        grant_dacl_ace_to_tree(&locked, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        lock_directory(&locked);
+        let record = root.path().join("grants.json");
+        record_grants(&record, std::slice::from_ref(&locked)).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot update permissions for"),
+            "{error}"
+        );
+        assert!(grants(&locked, sid.0));
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        delete_profile(&name);
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
     #[test]
     fn a_sweep_removes_grants_to_profiles_that_no_longer_exist_once() {
         let live_name = unique_name("LpmSweepLive");
