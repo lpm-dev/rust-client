@@ -423,6 +423,19 @@ pub fn create_or_take_directory(path: &std::path::Path, sddl: &str) -> std::io::
     )
 }
 
+/// Makes the Administrators the owner of `file`, as only an elevated
+/// administrator can, whoever the system made its owner. The handle needs
+/// `WRITE_OWNER`.
+pub fn give_to_administrators(
+    file: &impl std::os::windows::io::AsRawHandle,
+) -> std::io::Result<()> {
+    set_security_object(
+        file,
+        OWNER_SECURITY_INFORMATION,
+        &security_descriptor("O:BA")?,
+    )
+}
+
 /// Whether `file` is owned by SYSTEM or the Administrators. The handle
 /// needs `READ_CONTROL`.
 pub fn owned_by_system_or_administrators(
