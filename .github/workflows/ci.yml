@@ -39,6 +39,13 @@ jobs:
   windows-filesystem:
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
+  # The same gate on GitHub's ARM64 Windows runner, where the win32-arm64
+  # release builds and runs.
+  windows-filesystem-arm64:
+    uses: ./.github/workflows/windows-filesystem-gate.yml
+    with:
+      runner: windows-11-arm
+
   release-check:
     name: Release compiler warnings (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
