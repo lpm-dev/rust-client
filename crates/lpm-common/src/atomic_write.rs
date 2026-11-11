@@ -629,10 +629,12 @@ fn rename_capability_handle(
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+        FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+        FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError,
+        STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -641,9 +643,12 @@ fn rename_capability_handle(
         .len()
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| io::Error::other("atomic destination file name is too long"))?;
+    // Windows rejects a record shorter than the structure, whose one-unit
+    // `FileName` and padding outlast a one-character name.
     let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
         .checked_add(file_name_bytes)
-        .ok_or_else(|| io::Error::other("atomic rename data is too large"))?;
+        .ok_or_else(|| io::Error::other("atomic rename data is too large"))?
+        .max(size_of::<FILE_RENAME_INFORMATION>());
     let mut storage = vec![0usize; info_bytes.div_ceil(size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let info_bytes = u32::try_from(info_bytes)
@@ -662,21 +667,51 @@ fn rename_capability_handle(
             destination.len(),
         );
     }
-    for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
-        if delay_ms != 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        }
+    let rename = move |class| {
         let mut io_status = IO_STATUS_BLOCK::default();
-        let status = unsafe {
+        unsafe {
             // SAFETY: `info` describes the initialized buffer above and both handles remain valid.
             NtSetInformationFile(
                 temporary.as_raw_handle(),
                 &mut io_status,
                 info.cast(),
                 info_bytes,
-                FileRenameInformation,
+                class,
             )
-        };
+        }
+    };
+    // POSIX semantics replace a destination that is still open elsewhere, as
+    // a Unix rename does, and handles open on it keep reading the old file.
+    // The classic rename refuses such a destination with ACCESS_DENIED.
+    // Volumes and Windows releases without them reject the request, and the
+    // classic rename follows.
+    let mut class = FileRenameInformation;
+    if replace {
+        unsafe {
+            // SAFETY: `Flags` shares the union with `ReplaceIfExists` in the buffer above.
+            (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+        }
+        class = FileRenameInformationEx;
+    }
+    for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
+        if delay_ms != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let mut status = rename(class);
+        if class == FileRenameInformationEx
+            && matches!(
+                status,
+                STATUS_INVALID_PARAMETER | STATUS_INVALID_INFO_CLASS | STATUS_NOT_SUPPORTED
+            )
+        {
+            unsafe {
+                // SAFETY: as above; the classic record reads only `ReplaceIfExists`.
+                (*info).Anonymous.Flags = 0;
+                (*info).Anonymous.ReplaceIfExists = true;
+            }
+            class = FileRenameInformation;
+            status = rename(class);
+        }
         if status >= 0 {
             return Ok(());
         }
@@ -1408,6 +1443,43 @@ mod tests {
             fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o751
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_one_character_file_name_is_written_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        for contents in [b"first", b"again"] {
+            write_file_atomic_in_dir_with(&directory, "a".as_ref(), |file| {
+                file.write_all(contents)
+            })
+            .unwrap();
+            assert_eq!(fs::read(dir.path().join("a")).unwrap(), contents);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_replacement_lands_while_another_handle_holds_the_old_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join(".gitignore");
+        fs::write(&destination, b"old").unwrap();
+        let held = fs::File::open(&destination).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        write_file_atomic_in_dir_with(&directory, ".gitignore".as_ref(), |file| {
+            file.write_all(b"new")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        let mut still_open = Vec::new();
+        io::Read::read_to_end(&mut &held, &mut still_open).unwrap();
+        assert_eq!(still_open, b"old");
     }
 
     #[cfg(windows)]
