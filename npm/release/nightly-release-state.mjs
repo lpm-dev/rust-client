@@ -9,6 +9,7 @@ export const NIGHTLY_PACKAGES = Object.freeze([
   "@lpm-registry/cli-linux-arm64",
   "@lpm-registry/cli-linux-x64",
   "@lpm-registry/cli-linux-x64-musl",
+  "@lpm-registry/cli-win32-arm64",
   "@lpm-registry/cli-win32-x64",
 ]);
 

@@ -1,0 +1,22 @@
+{
+  "name": "@lpm-registry/cli-win32-arm64",
+  "version": "0.86.0",
+  "description": "LPM CLI native binary for Windows ARM64",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lpm-dev/rust-client"
+  },
+  "license": "MIT OR Apache-2.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "lpm.exe",
+    "lpx.exe",
+    "lpm-sandbox-helper.exe"
+  ],
+  "preferUnplugged": true
+}

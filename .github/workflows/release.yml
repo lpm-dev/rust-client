@@ -120,6 +120,7 @@ jobs:
                   "@lpm-registry/cli-linux-arm64"
                   "@lpm-registry/cli-linux-x64"
                   "@lpm-registry/cli-linux-x64-musl"
+                  "@lpm-registry/cli-win32-arm64"
                   "@lpm-registry/cli-win32-x64"
                 )
                 STATE_ARGS=()
@@ -1051,7 +1052,7 @@ jobs:
           file "$APP_EXECUTABLE"
 
   build-windows:
-    name: Build x86_64-pc-windows-msvc
+    name: Build ${{ matrix.target }}
     needs:
       - release-metadata
       - verify
@@ -1066,8 +1067,20 @@ jobs:
       needs.verify-windows-filesystem.result == 'success' &&
       ((needs.release-metadata.outputs.mode == 'full' && needs.verify.result == 'success') ||
       (needs.release-metadata.outputs.mode == 'candidate' && needs.verify-candidate-source.result == 'success'))
-    runs-on: windows-latest
+    # Each target builds on its own architecture, so the binary it stages
+    # also runs below.
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            platform: win32-x64
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            platform: win32-arm64
+            os: windows-11-arm
     env:
       LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
       RUSTFLAGS: "-D warnings"
@@ -1078,26 +1091,26 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Build CLI
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lpm-cli
+        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
 
       - name: Build sandbox helper
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lpm-sandbox --bin lpm-sandbox-helper
+        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
 
       - name: Stage unsigned binaries
         run: |
-          cp target/x86_64-pc-windows-msvc/release/lpm-rs.exe lpm-win32-x64.exe
-          cp target/x86_64-pc-windows-msvc/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
+          cp target/${{ matrix.target }}/release/lpm-rs.exe lpm-${{ matrix.platform }}.exe
+          cp target/${{ matrix.target }}/release/lpm-sandbox-helper.exe lpm-sandbox-helper-${{ matrix.platform }}.exe
 
       - name: Upload immutable unsigned binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: unsigned-windows-binaries
+          name: unsigned-windows-binaries-${{ matrix.platform }}
           path: |
-            lpm-win32-x64.exe
-            lpm-sandbox-helper-win32-x64.exe
+            lpm-${{ matrix.platform }}.exe
+            lpm-sandbox-helper-${{ matrix.platform }}.exe
           if-no-files-found: error
           retention-days: 1
 
@@ -1105,7 +1118,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ needs.release-metadata.outputs.version }}"
-          $actual = (& ".\lpm-win32-x64.exe" --version | Out-String).Trim()
+          $actual = (& ".\lpm-${{ matrix.platform }}.exe" --version | Out-String).Trim()
           if ($actual -ne "lpm $version") {
             Write-Error "Release binary reported '$actual', expected 'lpm $version'."
             exit 1
@@ -1131,7 +1144,8 @@ jobs:
       - name: Download unsigned binaries
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: unsigned-windows-binaries
+          pattern: unsigned-windows-binaries-*
+          merge-multiple: true
 
       - name: Validate Windows signing configuration
         shell: pwsh
@@ -1191,6 +1205,8 @@ jobs:
           files: |
             ${{ github.workspace }}\lpm-win32-x64.exe
             ${{ github.workspace }}\lpm-sandbox-helper-win32-x64.exe
+            ${{ github.workspace }}\lpm-win32-arm64.exe
+            ${{ github.workspace }}\lpm-sandbox-helper-win32-arm64.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -1200,7 +1216,12 @@ jobs:
       - name: Verify signatures
         shell: pwsh
         run: |
-          foreach ($file in @(".\lpm-win32-x64.exe", ".\lpm-sandbox-helper-win32-x64.exe")) {
+          foreach ($file in @(
+            ".\lpm-win32-x64.exe",
+            ".\lpm-sandbox-helper-win32-x64.exe",
+            ".\lpm-win32-arm64.exe",
+            ".\lpm-sandbox-helper-win32-arm64.exe"
+          )) {
             $signature = Get-AuthenticodeSignature -FilePath $file
             $signature | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
 
@@ -1227,6 +1248,20 @@ jobs:
         with:
           name: lpm-sandbox-helper-win32-x64.exe
           path: lpm-sandbox-helper-win32-x64.exe
+          retention-days: 1
+
+      - name: Upload ARM64 CLI artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lpm-win32-arm64.exe
+          path: lpm-win32-arm64.exe
+          retention-days: 1
+
+      - name: Upload ARM64 helper artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lpm-sandbox-helper-win32-arm64.exe
+          path: lpm-sandbox-helper-win32-arm64.exe
           retention-days: 1
 
   pack-npm-packages:
@@ -1349,6 +1384,9 @@ jobs:
           - platform: linux-x64-musl
             os: ubuntu-latest
             alpine: true
+          - platform: win32-arm64
+            os: windows-11-arm
+            node_arch: arm64
           - platform: win32-x64
             os: windows-latest
             node_arch: x64
@@ -1397,17 +1435,27 @@ jobs:
               --version ${{ needs.pack-npm-packages.outputs.version }}
 
   smoke-windows-recovery:
-    name: Smoke npm artifacts (win32-x64 recovery)
+    name: Smoke npm artifacts (${{ matrix.platform }} recovery)
     needs: release-metadata
     if: >-
       needs.release-metadata.outputs.should_release == 'true' &&
       github.event_name == 'workflow_dispatch' &&
       needs.release-metadata.outputs.mode == 'windows-smoke-only'
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
       actions: read
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win32-arm64
+            os: windows-11-arm
+            node_arch: arm64
+          - platform: win32-x64
+            os: windows-latest
+            node_arch: x64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1415,7 +1463,7 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
-          architecture: x64
+          architecture: ${{ matrix.node_arch }}
 
       - name: Validate source release run
         id: source
@@ -1451,7 +1499,7 @@ jobs:
         run: >-
           node npm/release/smoke-install.mjs
           --tarballs npm-release-packages
-          --platform win32-x64
+          --platform ${{ matrix.platform }}
           --version ${{ needs.release-metadata.outputs.version }}
 
   release:
@@ -1502,6 +1550,7 @@ jobs:
             lpm-darwin-arm64.zip lpm-darwin-x64.zip
             lpm-linux-x64 lpm-linux-x64-musl lpm-linux-arm64
             lpm-win32-x64.exe lpm-sandbox-helper-win32-x64.exe
+            lpm-win32-arm64.exe lpm-sandbox-helper-win32-arm64.exe
           )
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           echo "Manifest contents:"
@@ -2076,7 +2125,7 @@ jobs:
 
       - name: Preflight every platform package
         run: |
-          for platform in darwin-arm64 darwin-x64 linux-x64 linux-x64-musl linux-arm64 win32-x64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-x64-musl linux-arm64 win32-x64 win32-arm64; do
             npm view "@lpm-registry/cli-${platform}" name --json >/dev/null || {
               echo "::error::@lpm-registry/cli-${platform} is missing or has no trusted-publisher setup."
               exit 1
@@ -2114,6 +2163,7 @@ jobs:
             fi
           }
           publish_package @lpm-registry/cli-linux-x64-musl
+          publish_package @lpm-registry/cli-win32-arm64
           publish_package @lpm-registry/cli-darwin-arm64
           publish_package @lpm-registry/cli-darwin-x64
           publish_package @lpm-registry/cli-linux-x64
@@ -2564,7 +2614,7 @@ jobs:
       - name: Preflight npm platform package existence
         run: |
           set -euo pipefail
-          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
             package="@lpm-registry/cli-${platform}"
             if ! npm view "$package" name --json >/dev/null; then
               echo "::error::$package does not exist on npm. Bootstrap it and configure this release workflow as its trusted publisher before retrying. No npm packages have been published."
@@ -2612,10 +2662,12 @@ jobs:
             fi
           }
 
-          # The musl package is new and its trusted-publisher binding cannot be
-          # queried through npm's public API. Publish it first so an absent or
-          # incorrect OIDC binding fails before any established package changes.
+          # The musl and Windows ARM64 packages are new, and their trusted-
+          # publisher bindings cannot be queried through npm's public API.
+          # Publish them first so an absent or incorrect OIDC binding fails
+          # before any established package changes.
           publish_pkg @lpm-registry/cli-linux-x64-musl
+          publish_pkg @lpm-registry/cli-win32-arm64
 
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             publish_pkg "@lpm-registry/cli-${platform}"

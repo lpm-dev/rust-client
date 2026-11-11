@@ -64,6 +64,7 @@ test("published wrapper manifest stays dependency-free", () => {
     "@lpm-registry/cli-linux-arm64",
     "@lpm-registry/cli-linux-x64",
     "@lpm-registry/cli-linux-x64-musl",
+    "@lpm-registry/cli-win32-arm64",
     "@lpm-registry/cli-win32-x64",
   ]);
 });
@@ -108,6 +109,25 @@ test("resolveNativeBinary finds lpm in the matching optional dependency", () => 
   );
   assert.equal(resolved.source, "@lpm-registry/cli-linux-x64");
   assert.deepEqual(resolved.argsPrefix, []);
+});
+
+test("resolveNativeBinary finds lpm.exe in the Windows ARM64 package", () => {
+  const root = makePackageTree("win32-arm64");
+  const requireFn = createFakeRequire(root);
+
+  const resolved = resolveNativeBinary({
+    command: "lpm",
+    platform: "win32",
+    arch: "arm64",
+    requireFn,
+    env: {},
+  });
+
+  assert.equal(
+    resolved.path,
+    path.join(root, "node_modules", "@lpm-registry", "cli-win32-arm64", "lpm.exe"),
+  );
+  assert.equal(resolved.source, "@lpm-registry/cli-win32-arm64");
 });
 
 test("resolveNativeBinary uses the macOS app bundle and preserves lpx fallback behavior", () => {

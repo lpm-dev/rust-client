@@ -13,6 +13,7 @@ const RELEASE_ARTIFACT_NAME = "npm-release-packages";
 
 const BUILD_JOBS = [
   "Build aarch64-apple-darwin",
+  "Build aarch64-pc-windows-msvc",
   "Build aarch64-unknown-linux-gnu",
   "Build x86_64-apple-darwin",
   "Build x86_64-pc-windows-msvc",
@@ -26,6 +27,7 @@ const NPM_SMOKE_JOBS = [
   "Smoke npm artifacts (linux-arm64)",
   "Smoke npm artifacts (linux-x64)",
   "Smoke npm artifacts (linux-x64-musl)",
+  "Smoke npm artifacts (win32-arm64)",
   "Smoke npm artifacts (win32-x64)",
 ];
 
