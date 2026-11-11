@@ -858,7 +858,8 @@ jobs:
         run: |
           cargo test --locked -p lpm-runner script::tests::windows_
           cargo test --locked -p lpm-workflows --test run run_passes_cmd_metacharacters_as_literal_arguments
-          cargo test --locked -p lpm-workflows --test run run_refuses_arguments_cmd_would_reread_through_a_pipe
+          cargo test --locked -p lpm-workflows --test run run_refuses_arguments_cmd_would_read_again_on_the_way
+          cargo test --locked -p lpm-workflows --test run run_refuses_arguments_that_would_make_their_own_command
 
       - name: Windows scoped environment workflows
         run: |

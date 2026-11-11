@@ -103,6 +103,10 @@ enum WindowsArgumentReceiver {
     /// cmd.exe read the arguments again a number of times that depends on
     /// what runs, so no escaping is right for all of them.
     Unknown,
+    /// No command: the script ends in an operator, a redirection or an
+    /// escape, so the arguments would make a command of their own or name a
+    /// redirection's file.
+    Nothing,
 }
 
 #[cfg(any(test, windows))]
@@ -118,6 +122,12 @@ fn windows_shell_quote_arg(
             "runtime arguments containing line breaks cannot be passed safely through cmd.exe"
                 .to_string(),
         ));
+    }
+    if receiver == WindowsArgumentReceiver::Nothing {
+        return Err(LpmError::Script(format!(
+            "cannot pass {arg:?} to this script: it ends in an operator, a redirection or an \
+             escape, so on Windows its arguments would make a command of their own or name a file"
+        )));
     }
     // Words cmd.exe gives no meaning to arrive intact however often it
     // reads them, so they need no quoting whatever receives them.
@@ -136,8 +146,9 @@ fn windows_shell_quote_arg(
         return Err(LpmError::Script(format!(
             "cannot pass {arg:?} to this script safely: on Windows, arguments go to the script's \
              last command, and here cmd.exe would read them again on the way (through a pipe, \
-             `call`, `cmd`, `start`, `if`, `for`, a variable or a redirection). Only arguments \
-             made of letters, digits and -_./:\\@+= can be passed to it."
+             `call`, `cmd`, `start`, `if`, `for`, parentheses, a variable, a redirection or a `/` \
+             right after the command's name). Only arguments made of letters, digits and \
+             -_./:\\@+= can be passed to it."
         )));
     }
 
@@ -206,14 +217,42 @@ fn windows_escape_cmd_metacharacters(value: &str) -> String {
     escaped
 }
 
+/// The `PATHEXT` cmd.exe uses when none is set.
+#[cfg(windows)]
+const WINDOWS_DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
 #[cfg(windows)]
 fn windows_argument_receiver(
     script_cmd: &str,
     project_dir: &Path,
     path: &str,
 ) -> WindowsArgumentReceiver {
-    let Some(command_name) = windows_argument_command(script_cmd) else {
-        return WindowsArgumentReceiver::Unknown;
+    let pathext = std::env::var("PATHEXT")
+        .ok()
+        .filter(|pathext| !pathext.trim().is_empty());
+    windows_argument_receiver_in(
+        script_cmd,
+        project_dir,
+        path,
+        std::env::var_os("NoDefaultCurrentDirectoryInExePath").is_none(),
+        pathext.as_deref().unwrap_or(WINDOWS_DEFAULT_PATHEXT),
+    )
+}
+
+/// [`windows_argument_receiver`], given whether cmd.exe looks for commands
+/// in the current directory and the `PATHEXT` it tries.
+#[cfg(windows)]
+fn windows_argument_receiver_in(
+    script_cmd: &str,
+    project_dir: &Path,
+    path: &str,
+    search_current_directory: bool,
+    pathext: &str,
+) -> WindowsArgumentReceiver {
+    let command_name = match windows_script_tail(script_cmd) {
+        WindowsScriptTail::Command(command_name) => command_name,
+        WindowsScriptTail::Unknown => return WindowsArgumentReceiver::Unknown,
+        WindowsScriptTail::Nothing => return WindowsArgumentReceiver::Nothing,
     };
     let command_path = Path::new(command_name);
     match command_path
@@ -227,19 +266,31 @@ fn windows_argument_receiver(
         _ => {}
     }
 
-    // Scripts run in the project directory, which cmd.exe searches before
-    // PATH.
-    let mut search_dirs = vec![project_dir.to_path_buf()];
-    if command_path.components().count() == 1 {
+    // Scripts run in the project directory. cmd.exe looks there for a name
+    // with a directory in it, and first for a bare name unless
+    // NoDefaultCurrentDirectoryInExePath is set, then along PATH, trying
+    // each PATHEXT extension in turn in each directory.
+    let bare_name = command_path.components().count() == 1;
+    let mut search_dirs = Vec::new();
+    if !bare_name || search_current_directory {
+        search_dirs.push(project_dir.to_path_buf());
+    }
+    if bare_name {
         search_dirs.extend(std::env::split_paths(path));
     }
+    let extensions = pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|extension| extension.len() > 1 && extension.starts_with('.'))
+        .collect::<Vec<_>>();
     for directory in search_dirs {
-        for extension in ["com", "exe", "bat", "cmd"] {
+        for extension in &extensions {
             let mut candidate = directory.join(command_path).into_os_string();
-            candidate.push(".");
             candidate.push(extension);
             if Path::new(&candidate).is_file() {
-                return if matches!(extension, "bat" | "cmd") {
+                return if extension.eq_ignore_ascii_case(".bat")
+                    || extension.eq_ignore_ascii_case(".cmd")
+                {
                     WindowsArgumentReceiver::BatchFile
                 } else {
                     WindowsArgumentReceiver::Program
@@ -250,28 +301,44 @@ fn windows_argument_receiver(
     WindowsArgumentReceiver::Program
 }
 
-/// The command that starts the last command of `script_cmd`, which gets
-/// the arguments appended to it, or `None` when that isn't a command name
-/// the arguments reach after a single reading by cmd.exe.
+/// Where cmd.exe takes the arguments appended to a script.
 #[cfg(any(test, windows))]
-fn windows_argument_command(script_cmd: &str) -> Option<&str> {
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsScriptTail<'a> {
+    /// The command that starts the script's last command, which gets them
+    /// after a single reading.
+    Command(&'a str),
+    /// Some command, through something that has cmd.exe read them again
+    /// (see [`WindowsArgumentReceiver::Unknown`]).
+    Unknown,
+    /// No command (see [`WindowsArgumentReceiver::Nothing`]).
+    Nothing,
+}
+
+#[cfg(any(test, windows))]
+fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // The last command starts after the last `&`, `&&`, `|` or `||` outside
     // quotes, not escaped with `^` and not part of a redirection like `2>&1`.
     let mut start = 0;
     let mut piped = false;
     let mut grouped = false;
     let mut quoted = false;
+    let mut redirects_last = false;
     let mut previous = '\0';
     let mut characters = script_cmd.char_indices().peekable();
     while let Some((index, character)) = characters.next() {
         match character {
-            '\r' | '\n' => return None,
+            // cmd.exe would stop reading before the arguments.
+            '\r' | '\n' => return WindowsScriptTail::Nothing,
             '"' => quoted = !quoted,
             _ if quoted => {}
-            // A trailing `^` would escape the space before the arguments.
             '^' => {
-                characters.next()?;
+                // A trailing `^` would escape the space before the arguments.
+                if characters.next().is_none() {
+                    return WindowsScriptTail::Nothing;
+                }
                 previous = '\0';
+                redirects_last = false;
                 continue;
             }
             '(' | ')' => grouped = true,
@@ -284,39 +351,67 @@ fn windows_argument_command(script_cmd: &str) -> Option<&str> {
             }
             _ => {}
         }
+        if !character.is_whitespace() {
+            redirects_last = !quoted
+                && (matches!(character, '<' | '>')
+                    || (character == '&' && matches!(previous, '<' | '>')));
+        }
         previous = character;
     }
-    // A pipe runs its commands in another cmd.exe, which reads them again.
-    if quoted || piped || grouped {
-        return None;
+    if quoted {
+        return WindowsScriptTail::Unknown;
     }
-
     let command = script_cmd[start..].trim_start_matches(|character: char| {
         character.is_whitespace() || "@,;=".contains(character)
     });
+    // After a trailing operator the arguments would be a command; after a
+    // trailing `>` or `<`, the redirection's file.
+    if command.is_empty() || redirects_last {
+        return WindowsScriptTail::Nothing;
+    }
+    // A pipe runs its commands in another cmd.exe, which reads them again.
+    if piped || grouped {
+        return WindowsScriptTail::Unknown;
+    }
+
     let name = match command.strip_prefix('"') {
         Some(rest) => {
-            let (name, after) = rest.split_once('"')?;
+            let Some((name, after)) = rest.split_once('"') else {
+                return WindowsScriptTail::Unknown;
+            };
             if !after.is_empty() && !after.starts_with(char::is_whitespace) {
-                return None;
+                return WindowsScriptTail::Unknown;
             }
             name
         }
-        None => command.split(char::is_whitespace).next()?,
+        None => {
+            let name = command
+                .split(char::is_whitespace)
+                .next()
+                .unwrap_or_default();
+            // cmd.exe ends an unquoted name at a `/`, as in `cmd/c`, so the
+            // command is not the one this name reads as.
+            if name.contains('/') {
+                return WindowsScriptTail::Unknown;
+            }
+            name
+        }
     };
     // A name with these in it is a variable, a redirection, an escape or
     // more than one word to cmd.exe.
     if name.is_empty() || name.contains(|character: char| "%!^<>\",;=".contains(character)) {
-        return None;
+        return WindowsScriptTail::Unknown;
     }
-    let file_name = Path::new(name).file_name()?.to_str()?.to_ascii_lowercase();
-    if matches!(
-        file_name.as_str(),
-        "call" | "cmd" | "cmd.exe" | "start" | "if" | "for"
-    ) {
-        return None;
+    // Split as Windows does, on either slash, whatever platform this runs on.
+    let file_name = name.rsplit(['\\', '/']).next().unwrap_or_default();
+    if file_name.is_empty()
+        || ["call", "cmd", "cmd.exe", "start", "if", "for"]
+            .iter()
+            .any(|keyword| file_name.eq_ignore_ascii_case(keyword))
+    {
+        return WindowsScriptTail::Unknown;
     }
-    Some(name)
+    WindowsScriptTail::Command(name)
 }
 
 /// Build the shell command for a script invocation by quoting every runtime
@@ -3067,62 +3162,100 @@ mod tests {
     }
 
     #[test]
+    fn windows_scripts_ending_without_a_command_take_no_arguments() {
+        for arg in ["mkdir", "--watch", "plain-target.txt", "a&b"] {
+            let error = windows_shell_quote_arg(arg, WindowsArgumentReceiver::Nothing)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ends in an operator"), "{arg:?}: {error}");
+        }
+    }
+
+    #[test]
     fn windows_arguments_go_to_the_command_starting_the_scripts_last_command() {
+        use WindowsScriptTail::{Command, Nothing, Unknown};
         let cases = [
-            ("capture", Some("capture")),
-            ("  @capture --flag", Some("capture")),
-            ("node -e 0 && capture", Some("capture")),
-            ("capture && node tools/capture.js", Some("node")),
-            ("tsc & jest", Some("jest")),
-            ("node -e 0 || capture", Some("capture")),
-            ("(node -e 0) && capture", Some("capture")),
-            ("capture > out.txt", Some("capture")),
-            ("capture 2>&1", Some("capture")),
-            ("node -e \"a && b | c\" && capture", Some("capture")),
-            ("echo a ^& b ^| c", Some("echo")),
+            ("capture", Command("capture")),
+            ("  @capture --flag", Command("capture")),
+            ("node -e 0 && capture", Command("capture")),
+            ("capture && node tools/capture.js", Command("node")),
+            ("tsc & jest", Command("jest")),
+            ("node -e 0 || capture", Command("capture")),
+            ("(node -e 0) && capture", Command("capture")),
+            ("capture > out.txt", Command("capture")),
+            ("capture 2>&1", Command("capture")),
+            ("capture 2>& 1", Command("capture")),
+            ("node -e \"a && b | c\" && capture", Command("capture")),
+            ("echo a ^& b ^| c", Command("echo")),
             (
                 "node -e 0 && \"node_modules/.bin/capture.cmd\"",
-                Some("node_modules/.bin/capture.cmd"),
+                Command("node_modules/.bin/capture.cmd"),
             ),
             (
                 r"tsc && C:\tools\capture.cmd",
-                Some(r"C:\tools\capture.cmd"),
+                Command(r"C:\tools\capture.cmd"),
+            ),
+            (
+                r"tsc && node_modules\.bin\capture",
+                Command(r"node_modules\.bin\capture"),
             ),
             // Through a pipe, a nested cmd.exe or a grouping, or named
             // indirectly: how often cmd.exe reads the arguments depends on
             // what runs.
-            ("node -e 0 | capture", None),
-            ("capture | node -e 0", None),
-            ("node -e 0 && (capture)", None),
-            ("(node -e 0 && capture)", None),
-            ("call capture", None),
-            ("node -e 0 && call capture", None),
-            ("cmd /c capture", None),
-            (r"C:\Windows\System32\CMD.EXE /c capture", None),
-            ("start /b /wait capture", None),
-            ("if exist x capture", None),
-            ("for %a in (x) do capture", None),
-            ("%TOOL% build", None),
-            ("!TOOL! build", None),
-            (">out.txt capture", None),
-            ("2>nul capture", None),
-            ("\"capture\"x", None),
-            // Where the arguments would land inside a quoted string, after an
-            // escape, or as a command of their own.
-            ("node -e \"console.log(1)", None),
-            ("capture ^", None),
-            ("capture &", None),
-            ("", None),
-            ("capture\r\nother", None),
+            ("node -e 0 | capture", Unknown),
+            ("capture | node -e 0", Unknown),
+            ("node -e 0 && (capture)", Unknown),
+            ("(node -e 0 && capture)", Unknown),
+            ("call capture", Unknown),
+            ("node -e 0 && call capture", Unknown),
+            ("cmd /c capture", Unknown),
+            (r"C:\Windows\System32\CMD.EXE /c capture", Unknown),
+            ("start /b /wait capture", Unknown),
+            ("if exist x capture", Unknown),
+            ("for %a in (x) do capture", Unknown),
+            ("%TOOL% build", Unknown),
+            ("!TOOL! build", Unknown),
+            (">out.txt capture", Unknown),
+            ("2>nul capture", Unknown),
+            ("\"capture\"x", Unknown),
+            (r"tsc && tools\ capture", Unknown),
+            // cmd.exe ends an unquoted name at a `/`.
+            ("cmd/c capture", Unknown),
+            ("cmd.exe/c capture", Unknown),
+            ("node -e 0 && cmd/c capture", Unknown),
+            ("start/b /wait capture", Unknown),
+            ("node -e 0 && START/B/WAIT capture", Unknown),
+            ("capture/x", Unknown),
+            ("node -e 0 && capture/flag", Unknown),
+            ("tsc && C:/Windows/System32/cmd /c capture", Unknown),
+            ("tsc && node_modules/.bin/capture", Unknown),
+            // Inside an unclosed quote.
+            ("node -e \"console.log(1)", Unknown),
+            // Where the arguments would be a command or a redirection's file,
+            // or cmd.exe would stop before them.
+            ("node -e 0 &&", Nothing),
+            ("node -e 0 ||", Nothing),
+            ("node -e 0 |", Nothing),
+            ("capture &", Nothing),
+            ("capture & ", Nothing),
+            ("", Nothing),
+            ("   ", Nothing),
+            ("capture >", Nothing),
+            ("capture >>", Nothing),
+            ("capture 2>", Nothing),
+            ("capture <", Nothing),
+            ("capture 2>&", Nothing),
+            ("capture ^", Nothing),
+            ("capture\r\nother", Nothing),
         ];
         for (script, expected) in cases {
-            assert_eq!(windows_argument_command(script), expected, "{script:?}");
+            assert_eq!(windows_script_tail(script), expected, "{script:?}");
         }
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_argument_receiver_looks_in_the_project_before_path() {
+    fn windows_argument_receiver_finds_the_command_as_cmd_does() {
         let project = tempfile::tempdir().unwrap();
         let bin = project.path().join(r"node_modules\.bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -3131,26 +3264,76 @@ mod tests {
         std::fs::write(bin.join("both.exe"), "").unwrap();
         std::fs::write(project.path().join("both.cmd"), "").unwrap();
         std::fs::write(project.path().join("local.bat"), "").unwrap();
+        // A script of the shim's name in the project, which cmd.exe runs
+        // through Windows Script Host when it looks there first.
+        std::fs::write(project.path().join("shim.js"), "").unwrap();
+        std::fs::write(bin.join("ordered.vbs"), "").unwrap();
+        std::fs::write(bin.join("ordered.cmd"), "").unwrap();
         let path = bin.to_str().unwrap();
+        let receiver = |script: &str, search_current_directory: bool| {
+            windows_argument_receiver_in(
+                script,
+                project.path(),
+                path,
+                search_current_directory,
+                WINDOWS_DEFAULT_PATHEXT,
+            )
+        };
 
-        for (script, expected) in [
-            ("tool && shim", WindowsArgumentReceiver::BatchFile),
-            ("shim && tool", WindowsArgumentReceiver::Program),
-            ("tool && local", WindowsArgumentReceiver::BatchFile),
-            ("tool && both", WindowsArgumentReceiver::BatchFile),
+        for (script, in_project_first, on_path_only) in [
             (
-                "tool && node_modules/.bin/shim",
+                "tool && shim",
+                WindowsArgumentReceiver::Program,
                 WindowsArgumentReceiver::BatchFile,
             ),
-            ("tool && SHIM.CMD", WindowsArgumentReceiver::BatchFile),
-            ("tool && missing", WindowsArgumentReceiver::Program),
-            ("tool | shim", WindowsArgumentReceiver::Unknown),
+            (
+                "shim && tool",
+                WindowsArgumentReceiver::Program,
+                WindowsArgumentReceiver::Program,
+            ),
+            (
+                "tool && local",
+                WindowsArgumentReceiver::BatchFile,
+                WindowsArgumentReceiver::Program,
+            ),
+            (
+                "tool && both",
+                WindowsArgumentReceiver::BatchFile,
+                WindowsArgumentReceiver::Program,
+            ),
+            (
+                "tool && ordered",
+                WindowsArgumentReceiver::BatchFile,
+                WindowsArgumentReceiver::BatchFile,
+            ),
+            (
+                r"tool && node_modules\.bin\shim",
+                WindowsArgumentReceiver::BatchFile,
+                WindowsArgumentReceiver::BatchFile,
+            ),
+            (
+                "tool &&",
+                WindowsArgumentReceiver::Nothing,
+                WindowsArgumentReceiver::Nothing,
+            ),
+            (
+                "tool && SHIM.CMD",
+                WindowsArgumentReceiver::BatchFile,
+                WindowsArgumentReceiver::BatchFile,
+            ),
+            (
+                "tool && missing",
+                WindowsArgumentReceiver::Program,
+                WindowsArgumentReceiver::Program,
+            ),
+            (
+                "tool | shim",
+                WindowsArgumentReceiver::Unknown,
+                WindowsArgumentReceiver::Unknown,
+            ),
         ] {
-            assert_eq!(
-                windows_argument_receiver(script, project.path(), path),
-                expected,
-                "{script:?}"
-            );
+            assert_eq!(receiver(script, true), in_project_first, "{script:?}");
+            assert_eq!(receiver(script, false), on_path_only, "{script:?}");
         }
     }
 
