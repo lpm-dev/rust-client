@@ -188,9 +188,12 @@ async fn async_main(cli: Cli) -> Result<()> {
             &args.hosts,
             args.expected_blocks,
         )),
-        Commands::InternalSecurityPolicy(args) => Some(
-            crate::security_approval::run_internal_managed_protection(args.action),
-        ),
+        Commands::InternalSecurityPolicy(args) => {
+            Some(crate::security_approval::run_internal_managed_protection(
+                args.action,
+                args.report.as_deref(),
+            ))
+        }
         _ => None,
     };
     if let Some(result) = privileged_helper_result {

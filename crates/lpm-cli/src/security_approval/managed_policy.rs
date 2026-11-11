@@ -202,11 +202,16 @@ fn reclaim_windows_policy_location(path: &Path, create: bool) -> Result<(), LpmE
             "must have a managed parent directory",
         ));
     };
-    let mut attempts = 0;
-    loop {
+    let mut trusted = false;
+    for attempt in 0..=WINDOWS_POLICY_DIRECTORY_ATTEMPTS {
         match windows_policy_entry(parent, true) {
-            WindowsPolicyEntry::Trusted => break,
+            WindowsPolicyEntry::Trusted => {
+                trusted = true;
+                break;
+            }
             WindowsPolicyEntry::Missing if !create => return Ok(()),
+            // The last look only says whether the last action worked.
+            _ if attempt == WINDOWS_POLICY_DIRECTORY_ATTEMPTS => {}
             WindowsPolicyEntry::Missing => {
                 match lpm_common::owner_only::create_directory_in_place(
                     parent,
@@ -225,13 +230,12 @@ fn reclaim_windows_policy_location(path: &Path, create: bool) -> Result<(), LpmE
             }
             WindowsPolicyEntry::Untrusted => set_aside_windows_policy_entry(path, parent)?,
         }
-        attempts += 1;
-        if attempts > WINDOWS_POLICY_DIRECTORY_ATTEMPTS {
-            return Err(managed_policy_error(
-                parent,
-                "kept being replaced while LPM made it; stop whatever is creating it and try again",
-            ));
-        }
+    }
+    if !trusted {
+        return Err(managed_policy_error(
+            parent,
+            "kept being replaced while LPM made it; stop whatever is creating it and try again",
+        ));
     }
     if windows_policy_entry(path, false) == WindowsPolicyEntry::Untrusted {
         set_aside_windows_policy_entry(path, path)?;
@@ -278,8 +282,102 @@ fn set_aside_windows_policy_entry(policy: &Path, entry: &Path) -> Result<(), Lpm
         aside.display()
     );
     std::fs::rename(entry, &aside).map_err(|err| {
-        privileged_policy_io_error(policy, &format!("move {} aside for", entry.display()), err)
-    })
+        let held = matches!(err.raw_os_error(), Some(5 | 32));
+        LpmError::Registry(format!(
+            "could not move {} aside for managed security policy {}{}: {err}",
+            entry.display(),
+            policy.display(),
+            if held {
+                " (another program may have it open; close it and try again)"
+            } else {
+                ""
+            }
+        ))
+    })?;
+    WINDOWS_POLICY_SET_ASIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(aside.display().to_string());
+    Ok(())
+}
+
+/// What this process moved aside (see [`set_aside_windows_policy_entry`]),
+/// for the elevated helper to report to the caller whose console stays open.
+#[cfg(windows)]
+static WINDOWS_POLICY_SET_ASIDE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn take_windows_policy_set_aside() -> Vec<String> {
+    std::mem::take(
+        &mut *WINDOWS_POLICY_SET_ASIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Lists `set_aside` in the report file the unelevated caller made and named:
+/// only an existing regular file, not a link, with no other name, so the
+/// elevated helper can't be pointed at any other file to write.
+#[cfg(windows)]
+fn write_windows_policy_set_aside_report(
+    report: &Path,
+    set_aside: &[String],
+) -> Result<(), LpmError> {
+    use std::io::Write as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let refused = |reason: String| {
+        LpmError::Registry(format!(
+            "could not report to {}: {reason}",
+            report.display()
+        ))
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(report)
+        .map_err(|error| refused(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| refused(error.to_string()))?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || lpm_common::link_count(&file).map_err(|error| refused(error.to_string()))? != 1
+    {
+        return Err(refused("not a plain file with a single name".into()));
+    }
+    file.set_len(0)
+        .and_then(|()| file.write_all(set_aside.join("\n").as_bytes()))
+        .map_err(|error| refused(error.to_string()))
+}
+
+/// What the elevated helper listed in `report`.
+#[cfg(windows)]
+fn read_windows_policy_set_aside_report(report: &Path) -> Vec<String> {
+    lpm_common::read_text_file_capped(report, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map(|listed| {
+            listed
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Adds to `error` what was moved aside before it happened.
+#[cfg(windows)]
+fn with_set_aside(error: LpmError, set_aside: &[String]) -> LpmError {
+    if set_aside.is_empty() {
+        return error;
+    }
+    LpmError::Registry(format!(
+        "{error}; before that, LPM moved aside what it never applied: {}",
+        set_aside.join(", ")
+    ))
 }
 
 /// Makes the Administrators the owner of the policy just written, which the
@@ -316,43 +414,6 @@ fn prepare_policy_location(path: &Path) -> Result<(), LpmError> {
     #[cfg(not(all(windows, not(any(debug_assertions, test)))))]
     let _ = path;
     Ok(())
-}
-
-/// What the privileged helper moved aside since `since` (see
-/// [`reclaim_windows_policy_location`]), found by the time in their names,
-/// since a move keeps the time something was made. Its own console, where
-/// it says so, closes when it exits.
-#[cfg(windows)]
-fn windows_policy_entries_set_aside_since(
-    path: &Path,
-    since: std::time::SystemTime,
-) -> Vec<String> {
-    let since = since
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut set_aside = Vec::new();
-    for entry in [path.parent(), Some(path)].into_iter().flatten() {
-        let (Some(directory), Some(name)) = (entry.parent(), entry.file_name()) else {
-            continue;
-        };
-        let prefix = format!("{}.untrusted-", name.to_string_lossy());
-        let Ok(listing) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for item in listing.flatten() {
-            let item_name = item.file_name().to_string_lossy().into_owned();
-            if item_name
-                .strip_prefix(&prefix)
-                .and_then(|stamp| stamp.parse::<u128>().ok())
-                .is_some_and(|stamp| stamp >= since)
-            {
-                set_aside.push(item.path().display().to_string());
-            }
-        }
-    }
-    set_aside.sort();
-    set_aside
 }
 
 /// Adds how to get rid of a managed policy that fails its ownership checks
@@ -584,29 +645,27 @@ fn apply_managed_protection_action(
     }
 }
 
+/// The privileged helper. On Windows, with `report`, it lists there what it
+/// moved aside, whether or not the change succeeded, for the caller to
+/// say: its own console closes when it exits.
 pub(crate) fn run_internal_managed_protection(
     action: ManagedProtectionAction,
+    report: Option<&Path>,
 ) -> Result<(), LpmError> {
     crate::privilege::require_effective_root("security-policy")?;
-    apply_managed_protection_action(action)?;
-    Ok(())
+    let applied = apply_managed_protection_action(action).map(drop);
+    #[cfg(windows)]
+    if let Some(report) = report {
+        let reported =
+            write_windows_policy_set_aside_report(report, &take_windows_policy_set_aside());
+        return applied.and(reported);
+    }
+    #[cfg(not(windows))]
+    let _ = report;
+    applied
 }
 
 pub(crate) fn apply_managed_protection_with_privilege(
-    action: ManagedProtectionAction,
-) -> Result<ManagedProtectionReport, LpmError> {
-    #[cfg(windows)]
-    let started = std::time::SystemTime::now();
-    let report = apply_managed_protection_elevating(action)?;
-    #[cfg(windows)]
-    let report = ManagedProtectionReport {
-        set_aside: windows_policy_entries_set_aside_since(&managed_policy_path(), started),
-        ..report
-    };
-    Ok(report)
-}
-
-fn apply_managed_protection_elevating(
     action: ManagedProtectionAction,
 ) -> Result<ManagedProtectionReport, LpmError> {
     #[cfg(debug_assertions)]
@@ -622,7 +681,15 @@ fn apply_managed_protection_elevating(
         }
         #[cfg(windows)]
         if crate::privilege::is_elevated() {
-            return apply_managed_protection_action(action);
+            let applied = apply_managed_protection_action(action);
+            let set_aside = take_windows_policy_set_aside();
+            return match applied {
+                Ok(report) => Ok(ManagedProtectionReport {
+                    set_aside,
+                    ..report
+                }),
+                Err(error) => Err(with_set_aside(error, &set_aside)),
+            };
         }
 
         // On Windows, a policy that can't be loaded, such as one a
@@ -632,15 +699,41 @@ fn apply_managed_protection_elevating(
         let before = load_managed_protection_status().ok();
         #[cfg(not(windows))]
         let before = Some(load_managed_protection_status()?);
+        // Where the helper says what it moved aside: a file of this user's,
+        // not a place any user can write, such as `C:\ProgramData`.
+        #[cfg(windows)]
+        let report = tempfile::Builder::new()
+            .prefix(".lpm-policy-report-")
+            .tempfile()
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "could not make a report file for the privileged security-policy helper: {error}"
+                ))
+            })?;
+        #[cfg(windows)]
+        let args = [
+            "internal-security-policy".to_string(),
+            action.as_str().to_string(),
+            "--report".to_string(),
+            report.path().display().to_string(),
+        ];
+        #[cfg(not(windows))]
         let args = [
             "internal-security-policy".to_string(),
             action.as_str().to_string(),
         ];
-        crate::elevation::run_current_exe_helper(
+        let helped = crate::elevation::run_current_exe_helper(
             &args,
             "Password for LPM security-policy update: ",
             "security-policy",
-        )?;
+        );
+        #[cfg(windows)]
+        let set_aside = read_windows_policy_set_aside_report(report.path());
+        #[cfg(windows)]
+        let helped = helped.map_err(|error| with_set_aside(error, &set_aside));
+        #[cfg(not(windows))]
+        let set_aside = Vec::new();
+        helped?;
 
         let after = load_managed_protection_status()?;
         let change = if before.as_ref() == Some(&after) {
@@ -656,7 +749,7 @@ fn apply_managed_protection_elevating(
         Ok(ManagedProtectionReport {
             change,
             status: after,
-            set_aside: Vec::new(),
+            set_aside,
         })
     }
 
@@ -1376,7 +1469,6 @@ mod windows_policy_directory_tests {
         )
         .unwrap();
         let policy = directory.0.join("security-policy.toml");
-        let started = std::time::SystemTime::now();
 
         // A file a user owns, or an administrator's own account.
         std::fs::write(&policy, "[firewall]\nmode = \"off\"\n").unwrap();
@@ -1391,11 +1483,12 @@ mod windows_policy_directory_tests {
         reclaim_windows_policy_location(&policy, false).unwrap();
         assert!(!policy.exists(), "moved aside");
         assert_eq!(set_aside_beside(&policy).len(), 2);
-        assert_eq!(
-            windows_policy_entries_set_aside_since(&policy, started).len(),
-            2,
-            "both are reported"
-        );
+        // Other tests in this process move things aside too.
+        let reported = take_windows_policy_set_aside()
+            .into_iter()
+            .filter(|aside| aside.starts_with(&directory.0.display().to_string()))
+            .count();
+        assert_eq!(reported, 2, "both are reported");
 
         // A policy written by an administrator whose own account the system
         // made its owner goes to the Administrators, and then stays.
@@ -1451,6 +1544,44 @@ mod windows_policy_directory_tests {
         validate_windows_admin_owned_path(&directory.0, true).unwrap();
         assert_eq!(set_aside_beside(&directory.0).len(), 3);
         assert!(elsewhere.path().join("kept").exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_set_aside_report_tests {
+    use super::*;
+
+    #[test]
+    fn the_report_lists_what_was_moved_aside() {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("report");
+        std::fs::write(&report, "left from before").unwrap();
+        let set_aside = vec![
+            r"C:\ProgramData\lpm.untrusted-1".to_string(),
+            r"C:\ProgramData\lpm\security-policy.toml.untrusted-2".to_string(),
+        ];
+
+        write_windows_policy_set_aside_report(&report, &set_aside).unwrap();
+
+        assert_eq!(read_windows_policy_set_aside_report(&report), set_aside);
+    }
+
+    /// The elevated helper writes where an unelevated caller says, so only
+    /// to a file nothing else is reached through.
+    #[test]
+    fn the_report_goes_only_to_a_plain_file_with_one_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let linked = directory.path().join("linked");
+        std::fs::write(&linked, "kept").unwrap();
+        std::fs::hard_link(&linked, directory.path().join("other-name")).unwrap();
+        let missing = directory.path().join("missing");
+        let set_aside = ["x".to_string()];
+
+        assert!(write_windows_policy_set_aside_report(&linked, &set_aside).is_err());
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "kept");
+        assert!(write_windows_policy_set_aside_report(&missing, &set_aside).is_err());
+        assert!(!missing.exists());
+        assert!(write_windows_policy_set_aside_report(directory.path(), &set_aside).is_err());
     }
 }
 

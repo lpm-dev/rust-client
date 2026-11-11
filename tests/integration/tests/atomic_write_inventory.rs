@@ -159,6 +159,14 @@ fn reviewed_raw_atomic_writer(key: &str) -> bool {
 
 const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
+        "crates/lpm-cli/src/security_approval/managed_policy.rs::set_aside_windows_policy_entry",
+        "renames a Windows managed policy, or its directory, that fails the policy's own checks to a fresh `.untrusted-<time>` name beside it, keeping it for the administrator, before LPM makes or writes its own; the name's nanosecond time is one nobody can have taken beforehand",
+    ),
+    (
+        "crates/lpm-common/src/owner_only.rs::create_directory_in_place",
+        "renames a directory it just created under a fresh name, with its final security, into place with MoveFileExW without MOVEFILE_REPLACE_EXISTING, so nothing already there is replaced or taken over",
+    ),
+    (
         "crates/lpm-inspect/src/db.rs::replace_with_owner_only_copy",
         "renames SQLite's finished backup, written into an exclusively created owner-only file beside the capture database, over a database others could open, under the capture files' lock",
     ),

@@ -5,6 +5,9 @@ use clap::{Args, Subcommand};
 pub(crate) struct InternalSecurityPolicyArgs {
     #[arg(value_enum)]
     pub(crate) action: crate::security_approval::ManagedProtectionAction,
+    /// A file of the caller's to list what was moved aside in (Windows).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) report: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
