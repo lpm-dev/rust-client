@@ -840,12 +840,10 @@ fn do_capture_msvc_env() -> Result<HashMap<String, String>, String> {
     // fallback to an older install whose batch file does succeed.
     // If the first vcvarsall candidate fails at runtime, keep searching instead
     // of returning eagerly.
-    let arch = std::env::var("LPM_MSVC_TARGET")
-        .ok()
-        .unwrap_or_else(|| host_msvc_arch().to_string());
+    let target = MsvcTarget::from_env()?;
     let mut errors: Vec<String> = Vec::new();
     for vcvarsall in &candidate_vcvarsall {
-        match try_capture_from_vcvarsall(vcvarsall, &arch) {
+        match try_capture_from_vcvarsall(vcvarsall, &target) {
             Ok(additions) => return Ok(additions),
             Err(e) => {
                 errors.push(format!("{}: {e}", vcvarsall.display()));
@@ -860,17 +858,17 @@ fn do_capture_msvc_env() -> Result<HashMap<String, String>, String> {
     ))
 }
 
-/// Run `vcvarsall.bat <arch>` for one install and parse its env
+/// Run `vcvarsall.bat <target>` for one install and parse its env
 /// dump. Returns the additions/overrides on success; a
 /// human-readable failure reason on any error so the caller can
 /// aggregate per-install diagnostics.
 fn try_capture_from_vcvarsall(
     vcvarsall: &std::path::Path,
-    arch: &str,
+    target: &MsvcTarget,
 ) -> Result<HashMap<String, String>, String> {
     let shell = MsvcCaptureShell::locate()?;
     let output = shell
-        .vcvarsall_command(vcvarsall, arch)?
+        .vcvarsall_command(vcvarsall, target)?
         .output()
         .map_err(|e| format!("cmd.exe spawn for vcvarsall failed: {e}"))?;
     if !output.status.success() {
@@ -1014,7 +1012,7 @@ impl MsvcCaptureShell {
         Ok(Self { cmd, search_path })
     }
 
-    /// The `cmd.exe` invocation of `vcvarsall.bat <arch> && set`.
+    /// The `cmd.exe` invocation of `vcvarsall.bat <target> && set`.
     ///
     /// Nothing from the directory LPM was started in — usually a project
     /// root, which an untrusted repository controls — or from LPM's `PATH`
@@ -1022,25 +1020,23 @@ impl MsvcCaptureShell {
     /// name (`reg`, `where`, `findstr`, …): it starts in the Visual Studio
     /// directory holding `vcvarsall.bat`, skips the current directory and
     /// searches only the capture's `PATH` for commands, runs nested shells
-    /// (pipes, `for /f`) through the same `cmd.exe`, and ignores `AutoRun`
-    /// commands (`/D`) and delayed expansion (`/V:OFF`).
-    fn vcvarsall_command(&self, vcvarsall: &Path, arch: &str) -> Result<Command, String> {
-        if arch.is_empty() || !arch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(format!(
-                "MSVC target {arch:?} is not a vcvarsall.bat architecture such as x64, arm64 or x64_arm64"
-            ));
-        }
+    /// (pipes, `for /f`) through the same `cmd.exe`, and turns delayed
+    /// expansion off (`/V:OFF`). `/D` skips the `AutoRun` commands of this
+    /// shell, as cmd.exe does for the shells it starts for pipes; those it
+    /// starts for `for /f` still run them, but they are the machine's and
+    /// the user's own registry settings, not something a project supplies.
+    fn vcvarsall_command(&self, vcvarsall: &Path, target: &MsvcTarget) -> Result<Command, String> {
         let build_dir = vcvarsall
             .parent()
             .ok_or_else(|| format!("{} has no parent directory", vcvarsall.display()))?;
         // `raw_arg`, because `arg` would quote the whole `/C "…"` payload
         // again; `/S` makes cmd strip exactly the outermost pair of quotes.
         let mut command_line =
-            OsString::with_capacity(vcvarsall.as_os_str().len() + arch.len() + 32);
+            OsString::with_capacity(vcvarsall.as_os_str().len() + target.0.len() + 32);
         command_line.push("/D /V:OFF /S /C \"\"");
         command_line.push(vcvarsall);
         command_line.push("\" ");
-        command_line.push(arch);
+        command_line.push(&target.0);
         command_line.push(" && set\"");
         let mut command = Command::new(&self.cmd);
         command
@@ -1107,6 +1103,44 @@ fn same_directory(entry: &str, searched: &str) -> bool {
     entry
         .trim_end_matches('\\')
         .eq_ignore_ascii_case(searched.trim_end_matches('\\'))
+}
+
+/// What `vcvarsall.bat` is asked to set up: `LPM_MSVC_TARGET` when it is
+/// set to something, otherwise the host architecture. It goes onto a
+/// `cmd.exe` command line unquoted, so only words of vcvarsall's own
+/// vocabulary are accepted — an architecture, `store`/`uwp`, an SDK
+/// version, `-vcvars_ver=14.29` — made of letters, digits and `_ . = -`.
+#[derive(Debug, PartialEq)]
+struct MsvcTarget(String);
+
+impl MsvcTarget {
+    const ENV: &str = "LPM_MSVC_TARGET";
+
+    fn from_env() -> Result<Self, String> {
+        match std::env::var(Self::ENV) {
+            Ok(value) if !value.trim().is_empty() => Self::parse(&value),
+            Ok(_) | Err(std::env::VarError::NotPresent) => Self::parse(host_msvc_arch()),
+            Err(std::env::VarError::NotUnicode(value)) => {
+                Err(format!("{} {value:?} is not valid Unicode", Self::ENV))
+            }
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        let words: Vec<&str> = value.split_ascii_whitespace().collect();
+        let is_vcvarsall_word = |word: &&str| {
+            word.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'=' | b'-'))
+        };
+        if words.is_empty() || !words.iter().all(is_vcvarsall_word) {
+            return Err(format!(
+                "{} {value:?} is not vcvarsall.bat arguments such as x64, arm64 or \
+                 \"x64_arm64 10.0.22621.0 -vcvars_ver=14.29\"",
+                Self::ENV,
+            ));
+        }
+        Ok(Self(words.join(" ")))
+    }
 }
 
 /// Best-effort host-arch token for `vcvarsall.bat`. The pattern
@@ -1381,8 +1415,8 @@ mod tests {
     fn msvc_env_capture_never_runs_commands_planted_in_the_working_directory_or_on_path() {
         if let Some(vcvarsall) = std::env::var_os(VCVARSALL_UNDER_TEST_ENV) {
             let inherited_path = std::env::var("PATH").unwrap();
-            let additions =
-                try_capture_from_vcvarsall(Path::new(&vcvarsall), host_msvc_arch()).unwrap();
+            let target = MsvcTarget::parse(host_msvc_arch()).unwrap();
+            let additions = try_capture_from_vcvarsall(Path::new(&vcvarsall), &target).unwrap();
             assert_eq!(
                 additions.get("LPM_TEST_MSVC_CAPTURED").map(String::as_str),
                 Some("1"),
@@ -1458,6 +1492,30 @@ mod tests {
         path.push(";");
         path.push(std::env::var_os("PATH").unwrap_or_default());
 
+        // Left to cmd.exe's usual search, `reg` is the planted one: first from
+        // the working directory, then, with that skipped, from PATH.
+        let cmd = lpm_common::platform::windows_system_directory()
+            .unwrap()
+            .join("cmd.exe");
+        for (skip_working_directory, origin) in [(false, "working directory"), (true, "PATH")] {
+            let mut shell = Command::new(&cmd);
+            shell
+                .args(["/D", "/C", "reg"])
+                .current_dir(&project)
+                .env("PATH", &path);
+            if skip_working_directory {
+                shell.env(NO_CURRENT_DIRECTORY_SEARCH_ENV, "1");
+            } else {
+                shell.env_remove(NO_CURRENT_DIRECTORY_SEARCH_ENV);
+            }
+            assert!(shell.status().unwrap().success());
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap().trim(),
+                format!("reg.cmd from {origin}"),
+            );
+            std::fs::remove_file(&marker).unwrap();
+        }
+
         // Started from a Developer Command Prompt, VsDevCmd keeps the PATH it
         // saved there, even one that begins with the capture's search PATH.
         let saved_by_developer_prompt = format!(
@@ -1503,7 +1561,8 @@ mod tests {
         let shell = MsvcCaptureShell::locate().unwrap();
         let system = lpm_common::platform::windows_system_directory().unwrap();
         let vcvarsall = Path::new(r"C:\VS & Tools (x86)\VC\Auxiliary\Build\vcvarsall.bat");
-        let command = shell.vcvarsall_command(vcvarsall, "x64_arm64").unwrap();
+        let target = MsvcTarget::parse("x64_arm64 10.0.22621.0 -vcvars_ver=14.29").unwrap();
+        let command = shell.vcvarsall_command(vcvarsall, &target).unwrap();
 
         assert_eq!(Path::new(command.get_program()), system.join("cmd.exe"));
         assert_eq!(command.get_current_dir(), vcvarsall.parent());
@@ -1511,7 +1570,7 @@ mod tests {
         assert_eq!(
             args,
             [std::ffi::OsStr::new(
-                r#"/D /V:OFF /S /C ""C:\VS & Tools (x86)\VC\Auxiliary\Build\vcvarsall.bat" x64_arm64 && set""#
+                r#"/D /V:OFF /S /C ""C:\VS & Tools (x86)\VC\Auxiliary\Build\vcvarsall.bat" x64_arm64 10.0.22621.0 -vcvars_ver=14.29 && set""#
             )],
         );
         let env = |name: &str| {
@@ -1538,15 +1597,81 @@ mod tests {
     }
 
     #[test]
-    fn vcvarsall_command_rejects_an_architecture_that_is_not_a_plain_token() {
-        let shell = MsvcCaptureShell::locate().unwrap();
-        let vcvarsall = Path::new(r"C:\VS\VC\Auxiliary\Build\vcvarsall.bat");
-        for arch in ["", "x64 & calc", "x64\"", "arm64 && whoami"] {
+    fn msvc_target_is_only_ever_vcvarsall_arguments() {
+        assert_eq!(MsvcTarget::parse("arm64"), Ok(MsvcTarget("arm64".into())));
+        assert_eq!(
+            MsvcTarget::parse(" x64  store\t10.0.22621.0 -vcvars_ver=14.29 "),
+            Ok(MsvcTarget(
+                "x64 store 10.0.22621.0 -vcvars_ver=14.29".into()
+            )),
+        );
+        for value in [
+            "",
+            " ",
+            "x64 & calc",
+            "x64\"",
+            "arm64 && whoami",
+            "x64|more",
+            "x64 >out",
+            "x64 <in",
+            "x64^",
+            "%PATH%",
+            "!PATH!",
+            "x64 (",
+            "x64,arm64;",
+        ] {
+            assert!(MsvcTarget::parse(value).is_err(), "{value:?}");
+        }
+    }
+
+    /// Where Visual Studio with the C++ tools is installed, the capture still
+    /// sets up its compiler with only Windows' own directories to search.
+    #[test]
+    fn msvc_env_capture_sets_up_an_installed_visual_studio() {
+        let has_vcvarsall = Command::new(VSWHERE)
+            .args([
+                "-prerelease",
+                "-products",
+                "*",
+                "-property",
+                "installationPath",
+            ])
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|root| !root.is_empty())
+                    .any(|root| {
+                        Path::new(root)
+                            .join(r"VC\Auxiliary\Build\vcvarsall.bat")
+                            .exists()
+                    })
+            });
+        if !has_vcvarsall {
+            eprintln!("skipped: no Visual Studio with the C++ tools installed");
+            return;
+        }
+
+        let additions = do_capture_msvc_env().unwrap();
+        let value = |name: &str| {
+            additions
+                .iter()
+                .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then(|| value.clone()))
+                .or_else(|| std::env::var(name).ok())
+        };
+        for name in ["INCLUDE", "LIB", "VCToolsInstallDir"] {
             assert!(
-                shell.vcvarsall_command(vcvarsall, arch).is_err(),
-                "{arch:?}"
+                value(name).is_some_and(|value| !value.is_empty()),
+                "{name} is not set"
             );
         }
+        let path = value("PATH").unwrap();
+        assert!(
+            path.split(';')
+                .any(|entry| Path::new(entry).join("cl.exe").is_file()),
+            "cl.exe is not on PATH: {path}",
+        );
     }
 
     #[test]
@@ -1622,6 +1747,17 @@ mod tests {
         ] {
             assert!(!is_search_path(other, searched), "{other:?}");
         }
+
+        // What a Developer Command Prompt saves is the user's PATH, which
+        // usually starts with the same Windows directories.
+        let search_path = MsvcCaptureShell::locate().unwrap().search_path;
+        let system = lpm_common::platform::windows_system_directory().unwrap();
+        let system = system.to_str().unwrap();
+        let windows = Path::new(system).parent().unwrap().display();
+        let user_path = format!(
+            r"{system};{windows};{system}\Wbem;{system}\WindowsPowerShell\v1.0\;{system}\OpenSSH\;C:\Program Files\nodejs\"
+        );
+        assert!(!is_search_path(&user_path, &search_path), "{user_path}");
     }
 
     #[test]
