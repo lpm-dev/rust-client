@@ -816,10 +816,14 @@ fn run_passes_cmd_metacharacters_as_literal_arguments() {
 #[test]
 fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
     let project = windows_argument_capture_project(
-        r#"{"piped":"node -e 0 | capture","nested":"cmd/c capture"}"#,
+        r#"{
+            "piped":"node -e 0 | capture",
+            "nested":"cmd/c capture",
+            "piped-if":"node -e 0 | if 1==1 node -e 0 & capture"
+        }"#,
     );
 
-    for script in ["piped", "nested"] {
+    for script in ["piped", "nested", "piped-if"] {
         let _ = std::fs::remove_file(project.path().join("args.json"));
         let output = lpm(&project)
             .args([
@@ -863,12 +867,18 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
 #[cfg(windows)]
 #[test]
 fn run_refuses_arguments_that_would_make_their_own_command() {
-    let project =
-        windows_argument_capture_project(r#"{"dangling":"node -e 0 &&","redirected":"capture >"}"#);
+    let project = windows_argument_capture_project(
+        r#"{
+            "dangling":"node -e 0 &&",
+            "redirected":"capture >",
+            "conditional":"if 1==2 (node -e 0) else"
+        }"#,
+    );
 
     for (script, args) in [
         ("dangling", ["mkdir", "INJECTEDDIR"]),
         ("redirected", ["plain-target.txt", "--flag"]),
+        ("conditional", ["mkdir", "INJECTEDDIR"]),
     ] {
         let output = lpm(&project)
             .args(["run", script, "--"])

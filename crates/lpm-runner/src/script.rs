@@ -69,6 +69,7 @@ fn shell_quote_arg(
     _script_cmd: &str,
     _project_dir: &Path,
     _path: &str,
+    _envs: &HashMap<String, String>,
 ) -> Result<String, LpmError> {
     let escaped = arg.replace('\'', "'\\''");
     Ok(format!("'{escaped}'"))
@@ -80,10 +81,11 @@ fn shell_quote_arg(
     script_cmd: &str,
     project_dir: &Path,
     path: &str,
+    envs: &HashMap<String, String>,
 ) -> Result<String, LpmError> {
     windows_shell_quote_arg(
         arg,
-        windows_argument_receiver(script_cmd, project_dir, path),
+        windows_argument_receiver(script_cmd, project_dir, path, envs),
     )
 }
 
@@ -105,7 +107,8 @@ enum WindowsArgumentReceiver {
     Unknown,
     /// No command: the script ends in an operator, a redirection or an
     /// escape, so the arguments would make a command of their own or name a
-    /// redirection's file.
+    /// redirection's file; or its last command is an `if` or a `for`, where
+    /// they could be the command, the condition or the `else` branch.
     Nothing,
 }
 
@@ -126,7 +129,8 @@ fn windows_shell_quote_arg(
     if receiver == WindowsArgumentReceiver::Nothing {
         return Err(LpmError::Script(format!(
             "cannot pass {arg:?} to this script: it ends in an operator, a redirection or an \
-             escape, so on Windows its arguments would make a command of their own or name a file"
+             escape, or its last command is an `if` or a `for`, so on Windows its arguments \
+             could make a command of their own or name a file"
         )));
     }
     // Words cmd.exe gives no meaning to arrive intact however often it
@@ -221,20 +225,37 @@ fn windows_escape_cmd_metacharacters(value: &str) -> String {
 #[cfg(windows)]
 const WINDOWS_DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
 
+/// Makes cmd.exe leave the current directory out of its search for a
+/// command named without a path.
+#[cfg(windows)]
+const NO_CURRENT_DIRECTORY_SEARCH_ENV: &str = "NoDefaultCurrentDirectoryInExePath";
+
+/// The receiver as the script's cmd.exe finds it: with `envs`, the
+/// project's environment, over the one LPM inherited, as the script gets
+/// them, since a project's `.env` can set `PATHEXT` or
+/// `NoDefaultCurrentDirectoryInExePath` too.
 #[cfg(windows)]
 fn windows_argument_receiver(
     script_cmd: &str,
     project_dir: &Path,
     path: &str,
+    envs: &HashMap<String, String>,
 ) -> WindowsArgumentReceiver {
-    let pathext = std::env::var("PATHEXT")
-        .ok()
+    let project_value = |name: &str| {
+        envs.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    let search_current_directory = project_value(NO_CURRENT_DIRECTORY_SEARCH_ENV).is_none()
+        && std::env::var_os(NO_CURRENT_DIRECTORY_SEARCH_ENV).is_none();
+    let pathext = project_value("PATHEXT")
+        .or_else(|| std::env::var("PATHEXT").ok())
         .filter(|pathext| !pathext.trim().is_empty());
     windows_argument_receiver_in(
         script_cmd,
         project_dir,
         path,
-        std::env::var_os("NoDefaultCurrentDirectoryInExePath").is_none(),
+        search_current_directory,
         pathext.as_deref().unwrap_or(WINDOWS_DEFAULT_PATHEXT),
     )
 }
@@ -255,21 +276,19 @@ fn windows_argument_receiver_in(
         WindowsScriptTail::Nothing => return WindowsArgumentReceiver::Nothing,
     };
     let command_path = Path::new(command_name);
-    match command_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("cmd" | "bat") => return WindowsArgumentReceiver::BatchFile,
-        Some("com" | "exe") => return WindowsArgumentReceiver::Program,
-        _ => {}
-    }
+    let receiver_for = |extension: &str| {
+        if extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd") {
+            WindowsArgumentReceiver::BatchFile
+        } else {
+            WindowsArgumentReceiver::Program
+        }
+    };
 
     // Scripts run in the project directory. cmd.exe looks there for a name
     // with a directory in it, and first for a bare name unless
-    // NoDefaultCurrentDirectoryInExePath is set, then along PATH, trying
-    // each PATHEXT extension in turn in each directory.
+    // NoDefaultCurrentDirectoryInExePath is set, then along PATH. In each
+    // directory it tries a name with an extension as it is, then the name
+    // with each PATHEXT extension added, so `tool.exe` can be `tool.exe.cmd`.
     let bare_name = command_path.components().count() == 1;
     let mut search_dirs = Vec::new();
     if !bare_name || search_current_directory {
@@ -278,27 +297,58 @@ fn windows_argument_receiver_in(
     if bare_name {
         search_dirs.extend(std::env::split_paths(path));
     }
+    let own_extension = command_path
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned());
     let extensions = pathext
         .split(';')
         .map(str::trim)
         .filter(|extension| extension.len() > 1 && extension.starts_with('.'))
         .collect::<Vec<_>>();
     for directory in search_dirs {
+        let candidate = directory.join(command_path);
+        if let Some(own_extension) = &own_extension
+            && candidate.is_file()
+        {
+            return receiver_for(own_extension);
+        }
         for extension in &extensions {
-            let mut candidate = directory.join(command_path).into_os_string();
-            candidate.push(extension);
-            if Path::new(&candidate).is_file() {
-                return if extension.eq_ignore_ascii_case(".bat")
-                    || extension.eq_ignore_ascii_case(".cmd")
-                {
-                    WindowsArgumentReceiver::BatchFile
-                } else {
-                    WindowsArgumentReceiver::Program
-                };
+            let mut with_extension = candidate.clone().into_os_string();
+            with_extension.push(extension);
+            if Path::new(&with_extension).is_file() {
+                return receiver_for(&extension[1..]);
             }
         }
     }
     WindowsArgumentReceiver::Program
+}
+
+/// The cmd.exe built-in among those that run another command, `call`,
+/// `start`, `if` and `for`, that `word` names as cmd.exe reads it: the
+/// keyword, then the end of the word or one of `.+[]\:(/`, which also end a
+/// built-in's name (`start.`, `call:label`, `if/i`) but not another's.
+#[cfg(any(test, windows))]
+fn windows_command_builtin(word: &str) -> Option<&'static str> {
+    ["call", "start", "if", "for"].into_iter().find(|keyword| {
+        word.get(..keyword.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(keyword))
+            && word[keyword.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| ".+[]\\:(/".contains(next))
+    })
+}
+
+/// The first word of a command, as far as cmd.exe's delimiters.
+#[cfg(any(test, windows))]
+fn windows_first_word(command: &str) -> &str {
+    command
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || "@,;=".contains(character)
+        })
+        .split(|character: char| character.is_whitespace() || ",;=".contains(character))
+        .next()
+        .unwrap_or_default()
 }
 
 /// Where cmd.exe takes the arguments appended to a script.
@@ -321,6 +371,9 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // quotes, not escaped with `^` and not part of a redirection like `2>&1`.
     let mut start = 0;
     let mut piped = false;
+    // An `if` or `for` after a pipe takes the rest of the line as its body,
+    // `&` and all, into the pipe's cmd.exe.
+    let mut piped_body = false;
     let mut grouped = false;
     let mut quoted = false;
     let mut redirects_last = false;
@@ -348,6 +401,14 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
                 piped = character == '|' && !doubled;
                 grouped = false;
                 start = index + if doubled { 2 } else { 1 };
+                if piped
+                    && matches!(
+                        windows_command_builtin(windows_first_word(&script_cmd[start..])),
+                        Some("if" | "for")
+                    )
+                {
+                    piped_body = true;
+                }
             }
             _ => {}
         }
@@ -369,8 +430,16 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     if command.is_empty() || redirects_last {
         return WindowsScriptTail::Nothing;
     }
+    // Whether arguments after `if <condition>` or `for … do`, with or
+    // without a command or an `else`, end up a command, a condition or an
+    // argument depends on what precedes them.
+    match windows_command_builtin(windows_first_word(command)) {
+        Some("if" | "for") => return WindowsScriptTail::Nothing,
+        Some(_) => return WindowsScriptTail::Unknown,
+        None => {}
+    }
     // A pipe runs its commands in another cmd.exe, which reads them again.
-    if piped || grouped {
+    if piped || piped_body || grouped {
         return WindowsScriptTail::Unknown;
     }
 
@@ -421,12 +490,14 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
 /// verbatim. Extra args, however, come from the CLI tail (already
 /// split into argv by the user's shell) and must not re-introduce
 /// metacharacter semantics — otherwise `lpm run x -- "; rm -rf ~"`
-/// detonates inside `sh -c`.
+/// detonates inside `sh -c`. `envs` is what the script's environment adds
+/// to LPM's, which on Windows decides how cmd.exe finds the receiver.
 pub fn assemble_shell_command(
     script_cmd: &str,
     extra_args: &[String],
     project_dir: &Path,
     path: &str,
+    envs: &HashMap<String, String>,
 ) -> Result<String, LpmError> {
     if extra_args.is_empty() {
         return Ok(script_cmd.to_string());
@@ -437,7 +508,7 @@ pub fn assemble_shell_command(
     full_command.push_str(script_cmd);
     for arg in extra_args {
         full_command.push(' ');
-        full_command.push_str(&shell_quote_arg(arg, script_cmd, project_dir, path)?);
+        full_command.push_str(&shell_quote_arg(arg, script_cmd, project_dir, path, envs)?);
     }
     Ok(full_command)
 }
@@ -590,7 +661,8 @@ pub fn run_script_with_envs_and_config(
         &path,
         validate_schema,
     )?;
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
+    let full_cmd =
+        assemble_shell_command(&script_cmd, extra_args, project_dir, &path, env_vars.vars())?;
 
     // Run the main script
     let status = shell::spawn_shell(&ShellCommand {
@@ -762,7 +834,8 @@ pub fn run_dev_script_with_envs_and_config(
         &path,
         validate_schema,
     )?;
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
+    let full_cmd =
+        assemble_shell_command(&script_cmd, extra_args, project_dir, &path, env_vars.vars())?;
     let status = shell::spawn_shell_with_endpoint(
         &ShellCommand {
             command: &full_cmd,
@@ -1070,7 +1143,13 @@ fn run_script_with_output_at_path_and_config(
         )?;
         let full_command;
         let command = if phase == script_name {
-            full_command = assemble_shell_command(declared_command, extra_args, project_dir, path)?;
+            full_command = assemble_shell_command(
+                declared_command,
+                extra_args,
+                project_dir,
+                path,
+                environment.vars(),
+            )?;
             full_command.as_str()
         } else {
             declared_command
@@ -1240,7 +1319,8 @@ fn run_command_buffered_named_with_config(
         validate_schema,
     )?;
 
-    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
+    let full_cmd =
+        assemble_shell_command(command, extra_args, project_dir, &path, env_vars.vars())?;
 
     let captured = shell::spawn_shell_capture(&ShellCommand {
         command: &full_cmd,
@@ -1411,7 +1491,8 @@ fn run_command_prefixed_named_with_config(
         validate_schema,
     )?;
 
-    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
+    let full_cmd =
+        assemble_shell_command(command, extra_args, project_dir, &path, env_vars.vars())?;
 
     let captured = shell::spawn_shell_prefixed(
         &ShellCommand {
@@ -1577,7 +1658,8 @@ fn run_command_named_with_envs_and_config(
         validate_schema,
     )?;
 
-    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
+    let full_cmd =
+        assemble_shell_command(command, extra_args, project_dir, &path, env_vars.vars())?;
 
     let status = shell::spawn_shell(&ShellCommand {
         command: &full_cmd,
@@ -2055,7 +2137,8 @@ fn run_command_captured_named_with_config(
         validate_schema,
     )?;
 
-    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
+    let full_cmd =
+        assemble_shell_command(command, extra_args, project_dir, &path, env_vars.vars())?;
 
     let captured = shell::spawn_shell_tee_with_reserved_stdout(
         &ShellCommand {
@@ -3058,14 +3141,27 @@ mod tests {
         let path = "";
         // Each runtime arg becomes a single-quoted POSIX shell word so
         // a malicious tail like `; rm -rf ~` lands as one literal token.
-        let cmd =
-            assemble_shell_command("echo hello", &["; rm -rf ~".into()], project, path).unwrap();
+        let cmd = assemble_shell_command(
+            "echo hello",
+            &["; rm -rf ~".into()],
+            project,
+            path,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(cmd, "echo hello '; rm -rf ~'");
 
         // Embedded single quotes are escaped via the close-escape-reopen
         // dance — the resulting word reaches the script as the literal
         // string `it's fine`.
-        let cmd = assemble_shell_command("echo", &["it's fine".into()], project, path).unwrap();
+        let cmd = assemble_shell_command(
+            "echo",
+            &["it's fine".into()],
+            project,
+            path,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(cmd, r#"echo 'it'\''s fine'"#);
 
         // Shell metacharacters in extra args are inert.
@@ -3074,6 +3170,7 @@ mod tests {
             &["$HOME".into(), "`pwd`".into(), "&& whoami".into()],
             project,
             path,
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(cmd, "echo '$HOME' '`pwd`' '&& whoami'");
@@ -3081,7 +3178,9 @@ mod tests {
         // Empty extra-args list returns the script body verbatim — the
         // body itself is package.json-authored and may contain pipes,
         // redirects, env expansion that must work as written.
-        let cmd = assemble_shell_command("cat file | grep foo", &[], project, path).unwrap();
+        let cmd =
+            assemble_shell_command("cat file | grep foo", &[], project, path, &HashMap::new())
+                .unwrap();
         assert_eq!(cmd, "cat file | grep foo");
     }
 
@@ -3211,8 +3310,24 @@ mod tests {
             ("cmd /c capture", Unknown),
             (r"C:\Windows\System32\CMD.EXE /c capture", Unknown),
             ("start /b /wait capture", Unknown),
-            ("if exist x capture", Unknown),
-            ("for %a in (x) do capture", Unknown),
+            // An `if` or `for` after a pipe takes `& capture` into its body.
+            ("node -e 0 | if 1==1 node -e 0 & capture", Unknown),
+            ("node -e 0 | for %a in (1) do node -e 0 & capture", Unknown),
+            ("if 1==1 node -e 0 & capture", Command("capture")),
+            // cmd.exe also ends a built-in's name at `.+[]\:(`.
+            ("start.capture", Unknown),
+            ("node -e 0 && start+ /b capture", Unknown),
+            ("start[x capture", Unknown),
+            ("start] capture", Unknown),
+            (r"start\capture", Unknown),
+            ("call:label", Unknown),
+            ("CALL.", Unknown),
+            (
+                "start-server-and-test dev",
+                Command("start-server-and-test"),
+            ),
+            ("forever start", Command("forever")),
+            ("caller", Command("caller")),
             ("%TOOL% build", Unknown),
             ("!TOOL! build", Unknown),
             (">out.txt capture", Unknown),
@@ -3247,6 +3362,16 @@ mod tests {
             ("capture 2>&", Nothing),
             ("capture ^", Nothing),
             ("capture\r\nother", Nothing),
+            // After `if <condition>` or `for … do` the arguments can become
+            // the command, the condition or the `else` branch.
+            ("if 1==2 (node -e 0) else", Nothing),
+            ("for %a in (1) do", Nothing),
+            ("if exist dist", Nothing),
+            ("if exist x capture", Nothing),
+            ("for %a in (x) do capture", Nothing),
+            ("if/i a==a capture", Nothing),
+            ("node -e 0 && if 1==1 capture", Nothing),
+            ("node -e 0 | if 1==1 capture", Nothing),
         ];
         for (script, expected) in cases {
             assert_eq!(windows_script_tail(script), expected, "{script:?}");
@@ -3269,6 +3394,11 @@ mod tests {
         std::fs::write(project.path().join("shim.js"), "").unwrap();
         std::fs::write(bin.join("ordered.vbs"), "").unwrap();
         std::fs::write(bin.join("ordered.cmd"), "").unwrap();
+        // A bin named `named.exe` gets the shim `named.exe.cmd`; with both
+        // there, cmd.exe runs the name as written.
+        std::fs::write(bin.join("named.exe.cmd"), "").unwrap();
+        std::fs::write(bin.join("written.exe"), "").unwrap();
+        std::fs::write(bin.join("written.exe.cmd"), "").unwrap();
         let path = bin.to_str().unwrap();
         let receiver = |script: &str, search_current_directory: bool| {
             windows_argument_receiver_in(
@@ -3322,6 +3452,16 @@ mod tests {
                 WindowsArgumentReceiver::BatchFile,
             ),
             (
+                "tool && named.exe",
+                WindowsArgumentReceiver::BatchFile,
+                WindowsArgumentReceiver::BatchFile,
+            ),
+            (
+                "tool && written.exe",
+                WindowsArgumentReceiver::Program,
+                WindowsArgumentReceiver::Program,
+            ),
+            (
                 "tool && missing",
                 WindowsArgumentReceiver::Program,
                 WindowsArgumentReceiver::Program,
@@ -3335,6 +3475,55 @@ mod tests {
             assert_eq!(receiver(script, true), in_project_first, "{script:?}");
             assert_eq!(receiver(script, false), on_path_only, "{script:?}");
         }
+    }
+
+    /// A project's `.env` reaches the script's cmd.exe, so its `PATHEXT` and
+    /// `NoDefaultCurrentDirectoryInExePath` decide what runs.
+    #[cfg(windows)]
+    #[test]
+    fn windows_argument_receiver_follows_the_scripts_environment() {
+        let project = tempfile::tempdir().unwrap();
+        let bin = project.path().join(r"node_modules\.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("tool.exe"), "").unwrap();
+        std::fs::write(bin.join("tool.cmd"), "").unwrap();
+        std::fs::write(bin.join("other.exe"), "").unwrap();
+        std::fs::write(project.path().join("local.bat"), "").unwrap();
+        let path = bin.to_str().unwrap();
+        let envs = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect::<HashMap<_, _>>()
+        };
+
+        assert_eq!(
+            windows_argument_receiver(
+                "other && tool",
+                project.path(),
+                path,
+                &envs(&[("pathext", ".CMD;.EXE;.COM")])
+            ),
+            WindowsArgumentReceiver::BatchFile
+        );
+        assert_eq!(
+            windows_argument_receiver(
+                "other && tool",
+                project.path(),
+                path,
+                &envs(&[("PATHEXT", ".COM;.EXE;.BAT;.CMD")])
+            ),
+            WindowsArgumentReceiver::Program
+        );
+        assert_eq!(
+            windows_argument_receiver(
+                "other && local",
+                project.path(),
+                path,
+                &envs(&[("NoDefaultCurrentDirectoryInExePath", "1")])
+            ),
+            WindowsArgumentReceiver::Program
+        );
     }
 
     #[test]
