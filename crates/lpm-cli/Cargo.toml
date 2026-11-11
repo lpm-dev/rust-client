@@ -172,13 +172,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "block2"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Foundation",
-    "Security_Credentials_UI",
-    "Win32_Foundation",
-    "Win32_System_Console",
-    "Win32_System_WinRT",
-] }
+# The generated Windows Hello bindings need none of windows-core's proc macros.
+windows-core = { version = "0.100", default-features = false, features = ["std"] }
+windows-future = "0.100"
 windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

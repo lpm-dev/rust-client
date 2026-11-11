@@ -136,6 +136,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # The generator reads the Windows metadata bundled with windows-bindgen,
+      # so Linux can check the bindings that only Windows builds compile.
+      - name: Committed Windows bindings match their generator
+        run: |
+          cargo run --locked -p lpm-windows-bindgen
+          git diff --exit-code -- crates/lpm-cli/src/security_approval/windows_hello_bindings.rs
+
       - name: Cargo dependency policy
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:

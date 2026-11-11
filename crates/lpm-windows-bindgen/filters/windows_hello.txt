@@ -1,0 +1,22 @@
+// Windows Hello approval in crates/lpm-cli/src/security_approval/native_auth.rs.
+
+// Select UserConsentVerifier by method. Selecting the whole class generates an
+// empty class that refers to IUserConsentVerifierStatics without generating it.
+Windows.Security.Credentials.UI.UserConsentVerifier::{CheckAvailabilityAsync, RequestVerificationAsync}
+Windows.Security.Credentials.UI.UserConsentVerifierAvailability
+Windows.Security.Credentials.UI.UserConsentVerificationResult
+
+// The bundled Win32 metadata declares every Win32 API directly in the
+// Windows.Win32 namespace, without the Windows.Win32.System.* sub-namespaces.
+Windows.Win32.IUserConsentVerifierInterop
+Windows.Win32.GetConsoleWindow
+Windows.Win32.RoInitialize
+Windows.Win32.RoUninitialize
+Windows.Win32.RO_INIT_MULTITHREADED
+Windows.Win32.RPC_E_CHANGED_MODE
+
+// The Windows Runtime apartment tests also enter a single-threaded apartment
+// and check the exact success code.
+Windows.Win32.RO_INIT_SINGLETHREADED
+Windows.Win32.S_OK
+Windows.Win32.S_FALSE
