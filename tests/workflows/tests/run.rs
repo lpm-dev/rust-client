@@ -820,11 +820,18 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
             "piped":"node -e 0 | capture",
             "nested":"cmd/c capture",
             "piped-if":"node -e 0 | if 1==1 node -e 0 & capture",
-            "piped-escaped-if":"node -e 0 | i^f 1==1 node -e 0 & capture"
+            "piped-escaped-if":"node -e 0 | i^f 1==1 node -e 0 & capture",
+            "piped-if-paren":"node -e 0 | if(1)==(1) node -e 0 & capture"
         }"#,
     );
 
-    for script in ["piped", "nested", "piped-if", "piped-escaped-if"] {
+    for script in [
+        "piped",
+        "nested",
+        "piped-if",
+        "piped-escaped-if",
+        "piped-if-paren",
+    ] {
         let _ = std::fs::remove_file(project.path().join("args.json"));
         let output = lpm(&project)
             .args([

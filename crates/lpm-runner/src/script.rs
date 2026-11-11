@@ -129,8 +129,8 @@ fn windows_shell_quote_arg(
     if receiver == WindowsArgumentReceiver::Nothing {
         return Err(LpmError::Script(format!(
             "cannot pass {arg:?} to this script: it ends in an operator, a redirection or an \
-             escape, or its last command is an `if` or a `for`, so on Windows its arguments \
-             could make a command of their own or name a file"
+             escape, or its last command is an `if`, a `for` or a variable that could be one, \
+             so on Windows its arguments could make a command of their own or name a file"
         )));
     }
     // Words cmd.exe gives no meaning to arrive intact however often it
@@ -323,11 +323,19 @@ fn windows_argument_receiver_in(
     WindowsArgumentReceiver::Program
 }
 
+/// Whether cmd.exe takes `character` as space between words, as the C
+/// runtime's `iswspace` does. That differs from Rust's whitespace at U+180E
+/// (MONGOLIAN VOWEL SEPARATOR) alone, among all of the BMP.
+#[cfg(any(test, windows))]
+fn windows_is_space(character: char) -> bool {
+    character.is_whitespace() || character == '\u{180E}'
+}
+
 /// The cmd.exe built-in among those that run another command, `call`,
 /// `start`, `if` and `for`, that `word`, a first word as
 /// [`windows_first_word`] gives it, names. As measured: `call` and `start`
-/// also when one of `.+[]\:(/` follows (`start.`, `call:label`); `for` also
-/// when `(` does; `if` only as it is (`if/i` is a program named `if`).
+/// also when one of `.+[]\:(/` follows (`start.`, `call:label`); `if` and
+/// `for` also when `(` does, and no other (`if/i` is a program named `if`).
 #[cfg(any(test, windows))]
 fn windows_command_builtin(word: &str) -> Option<&'static str> {
     let word = word.to_ascii_lowercase();
@@ -342,7 +350,7 @@ fn windows_command_builtin(word: &str) -> Option<&'static str> {
         Some("call")
     } else if names("start", ".+[]\\:(/") {
         Some("start")
-    } else if word == "if" {
+    } else if names("if", "(") {
         Some("if")
     } else if names("for", "(") {
         Some("for")
@@ -359,13 +367,13 @@ fn windows_first_word(command: &str) -> String {
     let mut word = String::new();
     let mut characters = command
         .trim_start_matches(|character: char| {
-            character.is_whitespace() || "@,;=".contains(character)
+            windows_is_space(character) || "@,;=".contains(character)
         })
         .chars();
     while let Some(character) = characters.next() {
         match character {
             '^' => word.extend(characters.next()),
-            _ if character.is_whitespace() || ",;=".contains(character) => break,
+            _ if windows_is_space(character) || ",;=".contains(character) => break,
             _ => word.push(character),
         }
     }
@@ -373,10 +381,11 @@ fn windows_first_word(command: &str) -> String {
 }
 
 /// Whether a command whose first word is `word` is, or may be once a
-/// variable in it expands, an `if` or a `for`.
+/// variable in it expands, an `if` or a `for`. A quoted word is neither.
 #[cfg(any(test, windows))]
 fn windows_may_be_conditional(word: &str) -> bool {
-    word.contains('%') || matches!(windows_command_builtin(word), Some("if" | "for"))
+    (word.contains('%') && !word.starts_with('"'))
+        || matches!(windows_command_builtin(word), Some("if" | "for"))
 }
 
 /// Where cmd.exe takes the arguments appended to a script.
@@ -435,7 +444,7 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
             }
             _ => {}
         }
-        if !character.is_whitespace() {
+        if !windows_is_space(character) {
             redirects_last = !quoted
                 && (matches!(character, '<' | '>')
                     || (character == '&' && matches!(previous, '<' | '>')));
@@ -446,7 +455,7 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
         return WindowsScriptTail::Unknown;
     }
     let command = script_cmd[start..].trim_start_matches(|character: char| {
-        character.is_whitespace() || "@,;=".contains(character)
+        windows_is_space(character) || "@,;=".contains(character)
     });
     // After a trailing operator the arguments would be a command; after a
     // trailing `>` or `<`, the redirection's file.
@@ -473,16 +482,13 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
             let Some((name, after)) = rest.split_once('"') else {
                 return WindowsScriptTail::Unknown;
             };
-            if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+            if !after.is_empty() && !after.starts_with(windows_is_space) {
                 return WindowsScriptTail::Unknown;
             }
             name
         }
         None => {
-            let name = command
-                .split(char::is_whitespace)
-                .next()
-                .unwrap_or_default();
+            let name = command.split(windows_is_space).next().unwrap_or_default();
             // cmd.exe ends an unquoted name at a `/`, as in `cmd/c`, so the
             // command is not the one this name reads as.
             if name.contains('/') {
@@ -3360,6 +3366,7 @@ mod tests {
             ("forever start", Command("forever")),
             ("caller", Command("caller")),
             ("%TOOL% build", Nothing),
+            (r#""%LOCALAPPDATA%\tool.exe" build"#, Unknown),
             ("!TOOL! build", Unknown),
             (">out.txt capture", Unknown),
             ("2>nul capture", Unknown),
@@ -3404,6 +3411,13 @@ mod tests {
             ("if/i a==a capture", Unknown),
             ("node -e 0 && i^f 1==2 (node -e 0) else", Nothing),
             ("node -e 0 && f^or %a in (1) do", Nothing),
+            // `if` is also the built-in before `(`.
+            ("node -e 0 | if(1)==(1) node -e 0 & capture", Unknown),
+            ("node -e 0 | i^f(1)==(1) node -e 0 & capture", Unknown),
+            ("node -e 0 && if(1)==(2) (node -e 0) else", Nothing),
+            // cmd.exe also takes U+180E as a space, as `iswspace` does.
+            ("node -e 0 | if\u{180E}1==1 node -e 0 & capture", Unknown),
+            ("node -e 0 && capture\u{180E}--x", Command("capture")),
             ("node -e 0 && if 1==1 capture", Nothing),
             ("node -e 0 | if 1==1 capture", Nothing),
         ];
