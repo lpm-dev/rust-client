@@ -864,15 +864,7 @@ fn try_capture_from_vcvarsall(
     vcvarsall: &std::path::Path,
     arch: &str,
 ) -> Result<HashMap<String, String>, String> {
-    // Use `raw_arg` to bypass Rust's auto-arg-quoting: with regular
-    // `arg`, Rust wraps the argument in quotes because it contains
-    // spaces, and cmd ends up seeing the entire `/c "..."` payload
-    // as one over-quoted token. The documented pattern for `cmd /c
-    // <quoted-command>` is `/S /c "<command>"` so cmd strips the
-    // OUTERmost pair of quotes; see Windows command-line docs.
-    let raw_cmd_line = format!("/S /c \"\"{}\" {arch} && set\"", vcvarsall.display());
-    let output = Command::new("cmd.exe")
-        .raw_arg(&raw_cmd_line)
+    let output = vcvarsall_command(vcvarsall, arch)?
         .output()
         .map_err(|e| format!("cmd.exe spawn for vcvarsall failed: {e}"))?;
     if !output.status.success() {
@@ -917,6 +909,9 @@ fn try_capture_from_vcvarsall(
     let pre_env: HashMap<OsString, OsString> = std::env::vars_os().collect();
     let mut additions = HashMap::new();
     for (k, v) in &new_env {
+        if k.eq_ignore_ascii_case(NO_CURRENT_DIRECTORY_SEARCH_ENV) {
+            continue;
+        }
         match pre_env.get(std::ffi::OsStr::new(k)) {
             Some(prev) if prev.to_str().is_none_or(|prev| prev == v) => {}
             _ => {
@@ -925,6 +920,40 @@ fn try_capture_from_vcvarsall(
         }
     }
     Ok(additions)
+}
+
+/// Makes cmd.exe leave the current directory out of its search for
+/// commands named without a path.
+const NO_CURRENT_DIRECTORY_SEARCH_ENV: &str = "NoDefaultCurrentDirectoryInExePath";
+
+/// The `cmd.exe` invocation of `vcvarsall.bat <arch> && set`.
+///
+/// It runs outside the sandbox, so nothing from the directory LPM was
+/// started in — usually a project root, which an untrusted repository
+/// controls — may stand in for the tools the Visual Studio scripts call by
+/// bare name (`reg`, `where`, `findstr`, …): cmd.exe comes from the system
+/// directory, starts in the Visual Studio directory holding `vcvarsall.bat`,
+/// skips the current directory when searching for commands, and ignores
+/// `AutoRun` commands (`/D`). The search setting is the capture's own and is
+/// left out of the environment handed to lifecycle scripts.
+fn vcvarsall_command(vcvarsall: &Path, arch: &str) -> Result<Command, String> {
+    let build_dir = vcvarsall
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", vcvarsall.display()))?;
+    let cmd = lpm_common::platform::windows_system_directory()
+        .map_err(|e| format!("cannot locate the Windows system directory: {e}"))?
+        .join("cmd.exe");
+    let mut command = Command::new(cmd);
+    // `raw_arg`, because `arg` would quote the whole `/C "…"` payload
+    // again; `/S` makes cmd strip exactly the outermost pair of quotes.
+    command
+        .raw_arg(format!(
+            "/D /S /C \"\"{}\" {arch} && set\"",
+            vcvarsall.display()
+        ))
+        .current_dir(build_dir)
+        .env(NO_CURRENT_DIRECTORY_SEARCH_ENV, "1");
+    Ok(command)
 }
 
 /// Best-effort host-arch token for `vcvarsall.bat`. The pattern
@@ -1184,6 +1213,88 @@ mod tests {
             }
             Err(other) => panic!("expected HelperMissing, got {other:?}"),
         }
+    }
+
+    const VCVARSALL_UNDER_TEST_ENV: &str = "LPM_TEST_VCVARSALL_UNDER_TEST";
+
+    /// The capture runs outside the sandbox before any lifecycle script, from
+    /// whatever directory lpm was started in — usually the project root, which
+    /// a cloned repository controls. The Visual Studio scripts call `reg`,
+    /// `findstr`, `where` and others by bare name, so cmd.exe's
+    /// current-directory-first search must not reach the project. The capture
+    /// runs in a child test process because the working directory is
+    /// process-wide.
+    #[test]
+    fn msvc_env_capture_never_runs_commands_planted_in_the_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let build_dir = root.path().join(r"vs\VC\Auxiliary\Build");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&build_dir).unwrap();
+        let marker = root.path().join("planted-command-ran.txt");
+        for planted in ["reg.cmd", "findstr.cmd", "where.cmd"] {
+            std::fs::write(
+                project.join(planted),
+                format!("@echo {planted}>>\"{}\"\r\n", marker.display()),
+            )
+            .unwrap();
+        }
+        let vcvarsall = build_dir.join("vcvarsall.bat");
+        std::fs::write(
+            &vcvarsall,
+            "@echo off\r\n\
+             reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuild >nul 2>&1\r\n\
+             where cmd >nul 2>&1\r\n\
+             echo vcvars| findstr vcvars >nul\r\n\
+             set LPM_TEST_MSVC_CAPTURED=1\r\n\
+             exit /b 0\r\n",
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows_appcontainer::tests::msvc_env_capture_from_vcvarsall_under_test",
+                "--ignored",
+                "--nocapture",
+            ])
+            .current_dir(&project)
+            .env(VCVARSALL_UNDER_TEST_ENV, &vcvarsall)
+            .env_remove("NoDefaultCurrentDirectoryInExePath")
+            .output()
+            .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "commands planted in the working directory ran during the MSVC env capture: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+        );
+        assert!(
+            output.status.success(),
+            "capture in the child test process failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by msvc_env_capture_never_runs_commands_planted_in_the_working_directory"]
+    fn msvc_env_capture_from_vcvarsall_under_test() {
+        let vcvarsall = PathBuf::from(
+            std::env::var_os(VCVARSALL_UNDER_TEST_ENV).expect("set by the parent test"),
+        );
+        let additions = try_capture_from_vcvarsall(&vcvarsall, host_msvc_arch()).unwrap();
+        assert_eq!(
+            additions.get("LPM_TEST_MSVC_CAPTURED").map(String::as_str),
+            Some("1"),
+            "the capture must still return what vcvarsall.bat set",
+        );
+        assert!(
+            !additions
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("NoDefaultCurrentDirectoryInExePath")),
+            "the capture's own search hardening must not leak into lifecycle scripts",
+        );
     }
 
     #[test]
