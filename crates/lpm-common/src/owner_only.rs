@@ -364,12 +364,100 @@ impl ProcessUser {
     }
 }
 
-/// Sets `file`'s DACL to `sddl`'s, inheriting nothing. The handle needs
-/// `WRITE_DAC`.
-fn set_protected_dacl(
+/// Makes the directory at `path` with the owner and protected DACL that
+/// `sddl` gives, or gives them to a directory already there, which another
+/// account may have made first, without following a link to somewhere
+/// else. What is already inside keeps its own security. An owner other than
+/// the caller's own SID needs an elevated administrator, for the
+/// Administrators, or more.
+pub fn create_or_take_directory(path: &std::path::Path, sddl: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    };
+
+    let descriptor = security_descriptor(sddl)?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `wide` is NUL-terminated and `attributes` points to the live
+    // descriptor, so the directory is never there without it.
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+        return Err(error);
+    }
+
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(format!(
+            "{} is not a plain directory",
+            path.display()
+        )));
+    }
+    set_security_object(
+        &directory,
+        OWNER_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION,
+        &descriptor,
+    )
+}
+
+/// Whether `file` is owned by SYSTEM or the Administrators. The handle
+/// needs `READ_CONTROL`.
+pub fn owned_by_system_or_administrators(
     file: &impl std::os::windows::io::AsRawHandle,
-    sddl: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
+    let mut owner: PSID = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the handle stays open; the outputs receive a LocalFree-owned
+    // descriptor and a pointer into it.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+    // SAFETY: `owner` points into the live descriptor.
+    Ok(!owner.is_null()
+        && unsafe {
+            IsWellKnownSid(owner, WinLocalSystemSid) != 0
+                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+        })
+}
+
+/// The security descriptor `sddl` describes.
+fn security_descriptor(sddl: &str) -> std::io::Result<LocalSecurityDescriptor> {
     let encoded = sddl
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -387,15 +475,19 @@ fn set_protected_dacl(
     if converted == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let descriptor = LocalSecurityDescriptor(descriptor);
+    Ok(LocalSecurityDescriptor(descriptor))
+}
+
+/// Sets the parts of `file`'s security that `information` names from
+/// `descriptor`, without passing anything on to what is inside a directory.
+fn set_security_object(
+    file: &impl std::os::windows::io::AsRawHandle,
+    information: u32,
+    descriptor: &LocalSecurityDescriptor,
+) -> std::io::Result<()> {
     // SAFETY: the handle is valid for the call and the descriptor outlives it.
-    let status = unsafe {
-        NtSetSecurityObject(
-            file.as_raw_handle().cast(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor.0,
-        )
-    };
+    let status =
+        unsafe { NtSetSecurityObject(file.as_raw_handle().cast(), information, descriptor.0) };
     if status == 0 {
         Ok(())
     } else {
@@ -403,6 +495,19 @@ fn set_protected_dacl(
         let error = unsafe { RtlNtStatusToDosError(status) };
         Err(std::io::Error::from_raw_os_error(error as i32))
     }
+}
+
+/// Sets `file`'s DACL to `sddl`'s, inheriting nothing. The handle needs
+/// `WRITE_DAC`.
+fn set_protected_dacl(
+    file: &impl std::os::windows::io::AsRawHandle,
+    sddl: &str,
+) -> std::io::Result<()> {
+    set_security_object(
+        file,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        &security_descriptor(sddl)?,
+    )
 }
 
 #[cfg(test)]
@@ -511,6 +616,116 @@ mod tests {
             unsafe { LocalFree(text.cast()) };
         }
         others
+    }
+
+    /// The test user's SID, as SDDL writes it.
+    fn user_sid_string() -> String {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        let user = ProcessUser::query().unwrap();
+        let mut text = null_mut();
+        // SAFETY: the SID is valid; `text` receives a LocalFree-owned string.
+        assert_ne!(unsafe { ConvertSidToStringSidW(user.sid(), &mut text) }, 0);
+        // SAFETY: `text` is NUL-terminated.
+        let length = (0..)
+            .take_while(|offset| unsafe { *text.add(*offset) } != 0)
+            .count();
+        let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        // SAFETY: allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(text.cast()) };
+        sid
+    }
+
+    fn open_for_security(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+            WRITE_OWNER,
+        };
+
+        std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_directory_is_made_with_the_given_security_or_taken_over() {
+        let user = user_sid_string();
+        let sddl = format!("O:{user}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})");
+        let root = tempfile::tempdir().unwrap();
+
+        let made = root.path().join("made");
+        create_or_take_directory(&made, &sddl).unwrap();
+        assert!(made.is_dir());
+        assert!(others_let_in(&made).is_empty());
+
+        // Made first by someone else, open to every user.
+        let taken = root.path().join("taken");
+        std::fs::create_dir(&taken).unwrap();
+        set_protected_dacl(
+            &open_for_security(&taken),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;BU)",
+        )
+        .unwrap();
+        assert_eq!(others_let_in(&taken), ["S-1-5-32-545"]);
+        create_or_take_directory(&taken, &sddl).unwrap();
+        assert!(others_let_in(&taken).is_empty());
+    }
+
+    #[test]
+    fn a_directory_is_not_taken_through_a_link_or_in_place_of_a_file() {
+        let user = user_sid_string();
+        let sddl = format!("O:{user}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})");
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        set_protected_dacl(
+            &open_for_security(&target),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;BU)",
+        )
+        .unwrap();
+        let junction = root.path().join("junction");
+        let made = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+
+        assert!(create_or_take_directory(&junction, &sddl).is_err());
+        assert!(create_or_take_directory(&file, &sddl).is_err());
+        assert_eq!(others_let_in(&target), ["S-1-5-32-545"]);
+    }
+
+    #[test]
+    fn tells_system_and_administrator_owned_files_from_a_users() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+
+        // Windows gives C:\ProgramData to SYSTEM.
+        let program_data = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(r"C:\ProgramData")
+            .unwrap();
+        assert!(owned_by_system_or_administrators(&program_data).unwrap());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("user.toml");
+        std::fs::write(&path, b"").unwrap();
+        let file = open_for_security(&path);
+        set_security_object(
+            &file,
+            OWNER_SECURITY_INFORMATION,
+            &security_descriptor(&format!("O:{}", user_sid_string())).unwrap(),
+        )
+        .unwrap();
+        assert!(!owned_by_system_or_administrators(&file).unwrap());
     }
 
     #[test]

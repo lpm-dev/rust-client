@@ -24,11 +24,14 @@ pub(crate) fn ensure_command_allowed(command: &Commands) -> Result<(), LpmError>
 }
 
 #[cfg_attr(
-    not(unix),
-    expect(clippy::unnecessary_wraps, reason = "Unix requires effective root")
+    not(any(unix, windows)),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix requires effective root and Windows an elevated token"
+    )
 )]
 pub(crate) fn require_effective_root(helper: &str) -> Result<(), LpmError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = helper;
         Ok(())
@@ -42,11 +45,52 @@ pub(crate) fn require_effective_root(helper: &str) -> Result<(), LpmError> {
             "the internal {helper} helper requires effective UID 0"
         )))
     }
+
+    #[cfg(windows)]
+    if is_elevated() {
+        Ok(())
+    } else {
+        Err(LpmError::Forbidden(format!(
+            "the internal {helper} helper must run elevated, as an administrator"
+        )))
+    }
 }
 
 #[cfg(unix)]
 pub(crate) fn is_effective_root() -> bool {
     effective_uid() == 0
+}
+
+/// Whether the process runs with an elevated token, as an administrator's
+/// does after a UAC prompt or with UAC off.
+#[cfg(windows)]
+pub(crate) fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo-handle is valid; `token` receives a handle closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut length = 0;
+    // SAFETY: `elevation` is writable for the size passed.
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            std::ptr::from_mut(&mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        )
+    };
+    // SAFETY: `token` is open and closed once here.
+    unsafe { CloseHandle(token) };
+    read != 0 && elevation.TokenIsElevated != 0
 }
 
 fn is_sudo_transition() -> bool {
@@ -140,6 +184,24 @@ mod tests {
             .unwrap();
 
         assert!(is_privileged_helper(&command));
+    }
+
+    /// Any user could run the internal helpers directly, and a standard
+    /// user's could make `C:\ProgramData\lpm` theirs.
+    #[cfg(windows)]
+    #[test]
+    fn the_internal_helpers_need_an_elevated_token_on_windows() {
+        let required = require_effective_root("security-policy");
+        if is_elevated() {
+            assert!(required.is_ok());
+        } else {
+            assert!(
+                required
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must run elevated, as an administrator")
+            );
+        }
     }
 
     #[test]
