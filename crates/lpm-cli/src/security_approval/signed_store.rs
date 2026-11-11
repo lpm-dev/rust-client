@@ -640,7 +640,12 @@ mod tests {
             let digest = hex::encode(Sha256::digest(root.as_bytes()));
             format!("signing-secret-v1:{}", &digest[..16])
         };
-        let home = Path::new("/home/u");
+        // Earlier versions digested `home.join(".lpm")` as Windows spells it.
+        let (home, home_lpm) = if cfg!(windows) {
+            (Path::new(r"C:\Users\u"), r"C:\Users\u\.lpm")
+        } else {
+            (Path::new("/home/u"), "/home/u/.lpm")
+        };
 
         assert_eq!(
             earlier_keyring_account("signing-secret-v1", None, Some(home)),
@@ -660,7 +665,7 @@ mod tests {
                 Some(std::ffi::OsStr::new("")),
                 Some(home)
             ),
-            Some(digest("/home/u/.lpm"))
+            Some(digest(home_lpm))
         );
     }
 }

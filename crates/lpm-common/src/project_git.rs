@@ -810,16 +810,30 @@ pub(crate) fn locate_work_tree(
         return Err(GitProbeError::Failed("git returned no work tree".into()));
     };
     let git_path = match git_path {
-        Some(_) => Some(PathBuf::from(lines.next().ok_or_else(|| {
+        Some(_) => Some(native_git_path(lines.next().ok_or_else(|| {
             GitProbeError::Failed("git returned no repository path".into())
         })?)),
         None => None,
     };
     Ok(Some(WorkTree {
-        root: PathBuf::from(root),
+        root: native_git_path(root),
         prefix: prefix.to_owned(),
         git_path,
     }))
+}
+
+/// A path git printed. Git for Windows separates with `/`, which a path
+/// joined to it would mix with `\` in what users see, and which would be part
+/// of a name after a `\\?\` prefix; no Windows name holds a `/`.
+fn native_git_path(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(path)
+    }
 }
 
 /// The root of the git work tree that holds `dir`, and where `dir` is in

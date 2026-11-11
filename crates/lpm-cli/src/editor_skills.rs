@@ -100,12 +100,17 @@ mod tests {
             cursor_rules.join("owner.pkg--guide.md"),
         )
         .unwrap();
+        // Windows grants file symlinks only with Developer Mode or the
+        // symbolic-link privilege.
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(
+        if std::os::windows::fs::symlink_file(
             skills.join("guide.md"),
             cursor_rules.join("owner.pkg--guide.md"),
         )
-        .unwrap();
+        .is_err()
+        {
+            return;
+        }
         std::fs::write(cursor_rules.join("owner.pkg--api.md"), "user content").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(

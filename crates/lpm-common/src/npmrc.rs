@@ -525,8 +525,8 @@ fn append_repeated(
 #[cfg(test)]
 mod tests {
     use super::{
-        NPMRC_INTERPOLATED_VALUE_CAP_BYTES, interpolate_npmrc_env, npm_config_path,
-        parse_npmrc_ini_settings,
+        NPMRC_INTERPOLATED_VALUE_CAP_BYTES, expand_home_path, interpolate_npmrc_env,
+        npm_config_path, parse_npmrc_ini_settings,
     };
     use std::borrow::Cow;
     use std::cell::Cell;
@@ -607,6 +607,29 @@ mod tests {
         assert_eq!(
             resolved.as_deref(),
             Some(std::path::Path::new("/lower/npmrc"))
+        );
+    }
+
+    #[test]
+    fn a_tilde_path_expands_against_the_given_home_only() {
+        let home = std::path::Path::new(if cfg!(windows) {
+            r"C:\Users\u"
+        } else {
+            "/home/u"
+        });
+
+        assert_eq!(
+            expand_home_path("~/publish.npmrc".into(), Some(home)),
+            home.join("publish.npmrc")
+        );
+        assert_eq!(expand_home_path("~".into(), Some(home)), home);
+        assert_eq!(
+            expand_home_path("~other/publish.npmrc".into(), Some(home)),
+            std::path::Path::new("~other/publish.npmrc")
+        );
+        assert_eq!(
+            expand_home_path("~/publish.npmrc".into(), None),
+            std::path::Path::new("~/publish.npmrc")
         );
     }
 

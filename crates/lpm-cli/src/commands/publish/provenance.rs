@@ -1196,6 +1196,9 @@ mod tests {
         assert!(matches!(request, ProvenanceRequest::Disabled));
     }
 
+    // `dirs::home_dir` reads `$HOME` on Unix only; Windows asks the shell for
+    // the profile folder. `lpm_common`'s npmrc tests expand `~` on every host.
+    #[cfg(unix)]
     #[test]
     fn provenance_discovery_expands_a_tilde_userconfig_override() {
         let project = tempfile::tempdir().unwrap();
@@ -1312,6 +1315,10 @@ mod tests {
         assert!(error.contains(".npmrc"), "{error}");
     }
 
+    // Windows refuses to rename a directory while it is open, so this
+    // replacement cannot happen there; see `publish_common`'s
+    // `an_open_tarball_source_root_keeps_its_directory_in_place`.
+    #[cfg(unix)]
     #[test]
     fn project_relative_provenance_keeps_the_selected_project_generation() {
         let root = tempfile::tempdir().unwrap();

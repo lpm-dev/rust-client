@@ -3182,6 +3182,7 @@ pub(super) fn lpm_package_url(registry_url: &str, name: &str) -> Option<String> 
 mod transaction_root_tests {
     #[cfg(unix)]
     use super::open_publish_lock_directory;
+    #[cfg(unix)]
     use super::{ensure_publish_transaction_root_unchanged, select_publish_transaction_root};
     use crate::commands::publish::prepare::PublishSource;
 
@@ -3214,6 +3215,10 @@ mod transaction_root_tests {
         );
     }
 
+    // Windows refuses to rename a directory while it is open, so this
+    // replacement cannot happen there; see
+    // `an_open_publish_source_keeps_its_directory_in_place`.
+    #[cfg(unix)]
     #[test]
     fn publish_transaction_root_rejects_same_path_directory_replacement() {
         let root = tempfile::tempdir().unwrap();
@@ -3244,6 +3249,25 @@ mod transaction_root_tests {
             error.contains("changed") && error.contains("retry"),
             "{error}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_publish_source_keeps_its_directory_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let displaced = root.path().join("displaced");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"selected","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let source = PublishSource::open(&project).unwrap();
+
+        assert!(std::fs::rename(&project, &displaced).is_err());
+        drop(source);
+        std::fs::rename(&project, &displaced).unwrap();
     }
 
     #[cfg(unix)]

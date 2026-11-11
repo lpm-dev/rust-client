@@ -97,7 +97,8 @@ pub fn common_directory(directory: &Path) -> Option<PathBuf> {
 }
 
 /// A path from the bytes git writes or reads; on Windows, where git writes
-/// paths as UTF-8, only UTF-8 reads as one.
+/// paths as UTF-8 and separates them with `/`, only UTF-8 reads as one, and
+/// its separators become `\` so a path joined to it doesn't mix them.
 pub fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
@@ -107,7 +108,7 @@ pub fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     }
     #[cfg(not(unix))]
     {
-        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+        PathBuf::from(String::from_utf8_lossy(bytes).replace('/', "\\"))
     }
 }
 

@@ -1091,16 +1091,18 @@ mod tests {
 
     fn test_swiftpm_root(home: &Path) -> PathBuf {
         if cfg!(target_os = "macos") {
-            home.join("Library/org.swift.swiftpm")
+            home.join("Library").join("org.swift.swiftpm")
         } else if cfg!(windows) {
-            home.join("swiftpm-test-config/swiftpm")
+            home.join("swiftpm-test-config").join("swiftpm")
         } else {
             home.join(".swiftpm")
         }
     }
 
     fn write_global_signing_trust(home: &Path, config: &serde_json::Value) -> PathBuf {
-        let config_path = test_swiftpm_root(home).join("configuration/registries.json");
+        let config_path = test_swiftpm_root(home)
+            .join("configuration")
+            .join("registries.json");
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(&config_path, serde_json::to_vec(config).unwrap()).unwrap();
         config_path
@@ -1155,6 +1157,9 @@ mod tests {
             r#"{"security":{"registryOverrides":{"lpm.dev":null}}}"#,
             r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"onUntrustedCertificate":false}}}}}"#,
         ];
+        // The error names the file canonically, which spells out a Windows
+        // 8.3 short name such as `RUNNER~1` in the temp path.
+        let canonical_path = fs::canonicalize(&path).unwrap();
         let mut accepted = Vec::new();
         for original in cases {
             fs::write(&path, original).unwrap();
@@ -1162,12 +1167,12 @@ mod tests {
             if result.is_ok() || fs::read_to_string(&path).unwrap() != original {
                 accepted.push(original);
             } else {
+                let error = result.err().unwrap().to_string();
                 assert!(
-                    result
-                        .err()
-                        .unwrap()
-                        .to_string()
-                        .contains(path.to_str().unwrap())
+                    error.contains(path.to_str().unwrap())
+                        || error.contains(canonical_path.to_str().unwrap()),
+                    "{error} must name {}",
+                    path.display()
                 );
             }
         }

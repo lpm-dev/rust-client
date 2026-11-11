@@ -988,9 +988,20 @@ fn blocked_runtime_attempt_is_written_to_audit_log() {
 
         let audit_path = audit_log_path().unwrap();
         let content = std::fs::read_to_string(audit_path).unwrap();
-        assert!(content.contains("\"event\":\"guarded-attempt\""));
-        assert!(content.contains("trust-scope-widen"));
-        assert!(content.contains(&canonical_project_root(&project)));
+        let envelope: SignedAuditEnvelope = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(envelope.payload.event, "guarded-attempt");
+        assert!(
+            envelope
+                .payload
+                .scopes
+                .iter()
+                .any(|scope| scope == "trust-scope-widen")
+        );
+        // Compared parsed: JSON escapes the backslashes of a Windows path.
+        assert_eq!(
+            envelope.payload.project_root.as_deref(),
+            Some(canonical_project_root(&project).as_str())
+        );
     });
 }
 

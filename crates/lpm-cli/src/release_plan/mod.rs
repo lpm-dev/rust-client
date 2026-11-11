@@ -2367,21 +2367,77 @@ mod tests {
         persist_release_journal(&root, br#"{"schema_version":1}"#).unwrap();
         let journal = existing_release_journal_path(&root).unwrap().unwrap();
         let state_dir = release_state_dir(&root, false).unwrap().unwrap();
+        let current_user = {
+            use std::os::windows::io::AsRawHandle as _;
+            let file = std::fs::File::open(&journal).unwrap();
+            current_user_sid_for_owned_windows_handle(file.as_raw_handle()).unwrap()
+        };
 
         for (path, directory) in [
             (root.join(".lpm"), true),
             (state_dir, true),
             (journal, false),
         ] {
-            let sddl = windows_dacl_sddl(&path, directory);
-            assert!(sddl.starts_with("D:P"), "DACL is not protected: {sddl}");
-            assert!(
-                !sddl.contains(";;;WD)"),
-                "DACL grants Everyone access: {sddl}"
+            let inheritance = if directory { "OICI" } else { "" };
+            let expected = canonical_sddl(&format!(
+                "D:P(A;{inheritance};FA;;;{current_user})(A;{inheritance};FA;;;SY)"
+            ));
+            assert_eq!(
+                windows_dacl_sddl(&path, directory).trim_end_matches('\0'),
+                expected,
+                "the DACL must be protected and grant only the current user and SYSTEM"
             );
-            assert!(sddl.contains(";;;OW)"), "DACL omits owner access: {sddl}");
-            assert!(sddl.contains(";;;SY)"), "DACL omits SYSTEM access: {sddl}");
         }
+    }
+
+    /// `sddl` as Windows writes it back, naming well-known accounts by alias:
+    /// the built-in Administrator a CI runner uses is `LA`, not its SID.
+    #[cfg(windows)]
+    fn canonical_sddl(sddl: &str) -> String {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW,
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        let parsed = unsafe {
+            // SAFETY: `wide` is NUL-terminated and the output pointer is initialized.
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        };
+        assert_ne!(parsed, 0, "invalid SDDL {sddl}");
+        let mut text = null_mut();
+        let mut text_len = 0;
+        let converted = unsafe {
+            // SAFETY: `descriptor` came from the successful conversion above and both
+            // output values are initialized.
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut text_len,
+            )
+        };
+        assert_ne!(converted, 0);
+        let canonical = String::from_utf16_lossy(unsafe {
+            // SAFETY: the conversion returned `text_len` initialized UTF-16 code units.
+            std::slice::from_raw_parts(text, text_len as usize)
+        });
+        unsafe {
+            // SAFETY: both allocations came from the conversions above and are freed once.
+            let _ = LocalFree(text.cast());
+            let _ = LocalFree(descriptor.cast());
+        }
+        canonical.trim_end_matches('\0').to_owned()
     }
 
     #[cfg(windows)]

@@ -437,7 +437,7 @@ fn validate_publish_dependency_fields(pkg_json: &serde_json::Value) -> Result<()
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn read_publish_manifest_with_selection_hook(
     project_dir: &Path,
     after_selection: impl FnOnce(),
@@ -1527,6 +1527,10 @@ mod tests {
         );
     }
 
+    // Windows refuses to rename a directory while it is open, so this
+    // replacement cannot happen there; see `publish_common`'s
+    // `an_open_tarball_source_root_keeps_its_directory_in_place`.
+    #[cfg(unix)]
     #[test]
     fn selected_publish_project_cannot_be_replaced_before_manifest_open() {
         let root = tempfile::tempdir().unwrap();

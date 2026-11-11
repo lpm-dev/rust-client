@@ -1763,8 +1763,12 @@ async fn workspace_transitive_without_matching_member_errors_with_actionable_mes
         msg.contains("not a workspace"),
         "msg must explain why no member matched (project is not a workspace): {msg}",
     );
+    // The message names the directory canonically, which spells out a
+    // Windows 8.3 short name such as `RUNNER~1` in the temp path.
+    let canonical_src = std::fs::canonicalize(&src).unwrap();
     assert!(
-        msg.contains(&src.display().to_string()),
+        msg.contains(&src.display().to_string())
+            || msg.contains(&canonical_src.display().to_string()),
         "msg must reference the source dir for grep-ability: {msg}",
     );
 }

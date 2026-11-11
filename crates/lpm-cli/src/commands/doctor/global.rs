@@ -1155,7 +1155,7 @@ mod tests {
         let bin = install_root.join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
         for cmd in commands {
-            let target = bin.join(cmd);
+            let target = lpm_global::project_command_path(&bin, cmd);
             std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
             #[cfg(unix)]
             {
@@ -1204,7 +1204,10 @@ mod tests {
         make_ready_install_root(&install_root, &["bin-a"]);
         // Now corrupt the install: delete the bin target. Marker still
         // claims bin-a is there.
-        let bin_target = install_root.join("node_modules").join(".bin").join("bin-a");
+        let bin_target = lpm_global::project_command_path(
+            &install_root.join("node_modules").join(".bin"),
+            "bin-a",
+        );
         std::fs::remove_file(&bin_target).unwrap();
         assert!(!bin_target.exists());
 

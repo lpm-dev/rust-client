@@ -312,6 +312,16 @@ mod tests {
         project
     }
 
+    /// The repository's root as git names it: canonical, without the `\\?\`
+    /// prefix Windows' canonical form carries.
+    fn root_as_git_names_it(repository: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = std::fs::canonicalize(repository.path()).unwrap();
+        match root.to_str().and_then(|root| root.strip_prefix(r"\\?\")) {
+            Some(plain) => std::path::PathBuf::from(plain),
+            None => root,
+        }
+    }
+
     #[test]
     fn a_deploy_output_s_committed_dependencies_are_not_machine_local_state() {
         let project = repository();
@@ -551,8 +561,13 @@ mod tests {
     #[test]
     fn an_ignore_rule_s_file_is_named_as_it_is_on_disk() {
         // Git quotes a name with non-ASCII characters in its plain output,
-        // and a directory's name can hold `:<digits>:`.
-        for directory in ["apps:123:release", "apps-\u{FC}"] {
+        // and a directory's name can hold `:<digits>:`, except on Windows.
+        let directories: &[&str] = if cfg!(windows) {
+            &["apps-\u{FC}"]
+        } else {
+            &["apps:123:release", "apps-\u{FC}"]
+        };
+        for directory in directories {
             let repository = repository();
             let output = repository.path().join(directory).join("out");
             let state = output.join(".lpm");
@@ -570,7 +585,7 @@ mod tests {
 
             let check = check_deploy_output_dependencies_committable(&output).unwrap();
 
-            let root = std::fs::canonicalize(repository.path()).unwrap();
+            let root = root_as_git_names_it(&repository);
             let rule = format!(
                 "git ignores this whole deploy output, by `out/` on line 1 of {},",
                 root.join(directory).join(".gitignore").display()
@@ -610,7 +625,7 @@ mod tests {
         let check = check_deploy_output_dependencies_committable(&output).unwrap();
 
         assert_eq!(check.severity, Severity::Warn, "{}", check.detail);
-        let root = std::fs::canonicalize(repository.path()).unwrap();
+        let root = root_as_git_names_it(&repository);
         let rule = format!(
             "git ignores this whole deploy output, by `apps/` on line 1 of {},",
             root.join(".gitignore").display()
@@ -623,7 +638,7 @@ mod tests {
         let check = check_deploy_output_dependencies_committable(&output).unwrap();
         let rule = format!(
             "git ignores this whole deploy output, by `out/` on line 1 of {},",
-            root.join("apps/.gitignore").display()
+            root.join("apps").join(".gitignore").display()
         );
         assert!(check.detail.starts_with(&rule), "{}", check.detail);
         std::fs::remove_file(repository.path().join("apps/.gitignore")).unwrap();

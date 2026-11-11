@@ -2868,7 +2868,16 @@ fn safe_cap_metadata(
     match directory.symlink_metadata(name) {
         Ok(metadata) if metadata_is_link_or_reparse(&metadata) => Ok(None),
         Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // A manifest can name a file the filesystem can't hold, as `*` or `:`
+        // on Windows, which is as absent as one that isn't there.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename
+            ) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(LpmError::Io(error)),
     }
 }
@@ -8468,6 +8477,23 @@ mod tests {
         let (_, files) = create_tarball(&project, &manifest).unwrap();
 
         assert!(!files.iter().any(|file| file.path == "linked/private.txt"));
+    }
+
+    /// Publish and release keep a project selected by holding its root open.
+    /// Windows refuses to rename a directory while it is open, which stops the
+    /// same-path replacement the Unix tests have to detect.
+    #[cfg(windows)]
+    #[test]
+    fn an_open_tarball_source_root_keeps_its_directory_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let displaced = root.path().join("displaced");
+        std::fs::create_dir(&project).unwrap();
+        let opened = open_tarball_source_root(&project.canonicalize().unwrap()).unwrap();
+
+        assert!(std::fs::rename(&project, &displaced).is_err());
+        drop(opened);
+        std::fs::rename(&project, &displaced).unwrap();
     }
 
     #[cfg(windows)]

@@ -724,8 +724,11 @@ mod tests {
 
     fn scoped_home_dir() -> ScopedHomeDir {
         let dir = tempfile::tempdir().expect("tempdir");
+        // `HOME` alone doesn't move the LPM root on Windows, where it comes
+        // from the shell's profile folder, so `LPM_HOME` names it too.
         let env = crate::test_env::ScopedEnv::set([
             ("HOME", dir.path().as_os_str().to_owned()),
+            ("LPM_HOME", dir.path().join(".lpm").into_os_string()),
             (
                 "LPM_TEST_SECURITY_SECRET_HEX",
                 std::ffi::OsString::from(

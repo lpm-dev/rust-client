@@ -950,14 +950,9 @@ fn rollback_removed_targets(stages: &mut [StagedRemoval]) {
 }
 
 fn remove_path_if_present(path: &Path) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        let _ = std::fs::remove_file(path);
-    } else if metadata.is_dir() {
-        let _ = std::fs::remove_dir_all(path);
-    }
+    // A directory link on Windows needs `remove_dir`, which `remove_file`
+    // refuses; remove_path_entry picks the call for each kind of entry.
+    let _ = lpm_common::remove_path_entry(path);
 }
 
 fn materialize_target_at(
@@ -3549,7 +3544,7 @@ fn read_optional_state_bytes(path: &Path) -> Result<Option<Vec<u8>>, LpmError> {
 }
 
 /// A relative path as a project's committed record holds it, with `/`.
-fn portable_path(path: &Path) -> String {
+pub(super) fn portable_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
@@ -3732,10 +3727,33 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// Whether this host can create the directory symlink a `Link`
+    /// materialization needs. Windows grants one only with Developer Mode or
+    /// the symbolic-link privilege, and skills copy without it.
+    fn directory_symlinks_available() -> bool {
+        #[cfg(windows)]
+        {
+            let probe = tempfile::tempdir().unwrap();
+            std::os::windows::fs::symlink_dir(probe.path(), probe.path().join("link")).is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
+    /// A local source outside every test project. It must be absolute on the
+    /// host, as the canonicalized path of a real local source is.
+    const OUTSIDE_LOCAL_SOURCE: &str = if cfg!(windows) {
+        r"C:\skills"
+    } else {
+        "/tmp/skills"
+    };
+
     fn source_tree_with(name: &str, digest: &str, body: &str) -> SourceTree {
         SourceTree {
             descriptor: SourceDescriptor::Local {
-                path: "/tmp/skills".into(),
+                path: OUTSIDE_LOCAL_SOURCE.into(),
                 digest: digest.to_string(),
             },
             files: BTreeMap::from([(
@@ -3799,7 +3817,7 @@ mod tests {
                 calls.set(calls.get() + 1);
                 let mut candidate = tree.clone();
                 candidate.descriptor = SourceDescriptor::Local {
-                    path: "/tmp/skills".into(),
+                    path: OUTSIDE_LOCAL_SOURCE.into(),
                     digest: format!("{:064x}", calls.get()),
                 };
                 std::future::ready(Ok(candidate))
@@ -4672,9 +4690,18 @@ mod tests {
 
         install_skill(&store, &tree, &skill, &[AgentTarget::ClaudeCode], false).unwrap();
 
-        let committed =
-            std::fs::read_to_string(project.path().join("lpm-agent-skills.json")).unwrap();
-        assert!(!committed.contains('\\'), "{committed}");
+        let committed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(project.path().join("lpm-agent-skills.json")).unwrap(),
+        )
+        .unwrap();
+        for pointer in [
+            "/skills/release-notes/canonical_dir",
+            "/skills/release-notes/targets/codex/path",
+            "/skills/release-notes/targets/claude-code/path",
+        ] {
+            let path = committed.pointer(pointer).unwrap().as_str().unwrap();
+            assert!(!path.contains('\\'), "{pointer} = {path}");
+        }
         let inventory = inventory_scope(&store).unwrap();
         assert!(inventory[0].healthy);
         assert_eq!(inventory[0].agents.len(), 2);
@@ -4771,7 +4798,8 @@ mod tests {
         let skill = discovered_skill();
         install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
         std::fs::remove_dir_all(store.root.join("sources")).unwrap();
-        std::fs::remove_file(project.path().join(".agents/skills/release-notes")).unwrap();
+        lpm_common::remove_path_entry(&project.path().join(".agents/skills/release-notes"))
+            .unwrap();
         assert!(!project_skills_ready(project.path()));
         let loads = std::cell::Cell::new(0);
 
@@ -4874,6 +4902,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_placeholder_beside_existing_content_is_unhealthy_and_restored() {
+        if !directory_symlinks_available() {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
         let store = Store::for_scope(Scope::Project, project.path()).unwrap();
         install_skill(
@@ -4886,7 +4917,7 @@ mod tests {
         .unwrap();
         let target = project.path().join(".agents/skills/release-notes");
         let destination = std::fs::read_link(&target).unwrap();
-        std::fs::remove_file(&target).unwrap();
+        lpm_common::remove_path_entry(&target).unwrap();
         std::fs::write(&target, portable_path(&destination)).unwrap();
 
         let state = load_state(&store).unwrap();
@@ -4975,6 +5006,9 @@ mod tests {
 
     #[test]
     fn update_preserves_mixed_link_and_copy_materializations() {
+        if !directory_symlinks_available() {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
         let store = Store::for_scope(Scope::Project, project.path()).unwrap();
         let first_tree = source_tree();

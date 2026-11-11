@@ -493,9 +493,23 @@ fn resolve_lpm_project_paths(
         .into_iter()
         .filter_map(|(instance_id, path)| {
             let relative = path.strip_prefix(&canonical_root).ok()?;
-            Some((instance_id, relative.to_string_lossy().into_owned()))
+            Some((instance_id, lockfile_style_path(relative)))
         })
         .collect()
+}
+
+/// `relative` as lockfiles spell a package path, with `/` between its
+/// components on every platform, so a package reads the same whichever way
+/// discovery found it.
+fn lockfile_style_path(relative: &Path) -> String {
+    let mut path = String::with_capacity(relative.as_os_str().len());
+    for component in relative.components() {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(&component.as_os_str().to_string_lossy());
+    }
+    path
 }
 
 fn resolve_node_modules_target(
@@ -939,7 +953,7 @@ fn read_package_from_node_modules(
     let rel_path = pkg_dir
         .strip_prefix(project_root)
         .map_err(|error| fallback_inventory_error(pkg_dir, error))?;
-    let path = rel_path.to_string_lossy().to_string();
+    let path = lockfile_style_path(rel_path);
 
     let mut dep_names = Vec::new();
     if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
