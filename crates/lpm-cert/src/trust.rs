@@ -747,14 +747,33 @@ pub(crate) fn uninstall_ca_bytes(cert_pem: &[u8], display_path: &Path) -> Result
     Ok(())
 }
 
+/// Runs `operation` on a file holding `cert_pem`, staged beside
+/// `display_path` in LPM's certificate directory rather than the temporary
+/// directory, which sandboxed lifecycle scripts can write to.
+///
+/// The writer is closed before `operation` runs: Windows tools such as
+/// certutil can't open a file another handle is writing
+/// (`ERROR_SHARING_VIOLATION`). The file is checked through a read-only
+/// handle kept open until `operation` returns, which on Windows nobody else
+/// may write, rename or delete through, so the operation reads exactly the
+/// certificate that was checked.
 fn with_verified_certificate_file<T>(
     cert_pem: &[u8],
     display_path: &Path,
     operation: impl FnOnce(&Path) -> Result<T, LpmError>,
 ) -> Result<T, LpmError> {
+    let directory = display_path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .ok_or_else(|| {
+            LpmError::Cert(format!(
+                "cannot stage {} for the trust store outside its directory",
+                display_path.display()
+            ))
+        })?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".lpm-verified-ca-")
-        .tempfile()
+        .tempfile_in(directory)
         .map_err(|error| LpmError::Cert(format!("failed to stage verified CA: {error}")))?;
     use std::io::Write as _;
     temporary
@@ -762,24 +781,66 @@ fn with_verified_certificate_file<T>(
         .and_then(|()| temporary.flush())
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|error| LpmError::Cert(format!("failed to write verified CA: {error}")))?;
-    let result = operation(temporary.path())?;
-    let staged = lpm_common::read_file_capped(
-        temporary.path(),
-        lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
-    )
-    .map_err(|error| {
+    let temporary = temporary.into_temp_path();
+
+    // Declared after `temporary`, so it is closed before the file is removed.
+    let staged_file = open_staged_certificate(&temporary).map_err(|error| {
         LpmError::Cert(format!(
-            "failed to verify staged certificate for {} after the trust-store operation: {error}",
+            "failed to reopen the staged certificate for {}: {error}",
             display_path.display()
         ))
     })?;
+    let staged =
+        lpm_common::read_stream_capped(&staged_file, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| {
+                LpmError::Cert(format!(
+                    "failed to verify the staged certificate for {}: {error}",
+                    display_path.display()
+                ))
+            })?;
     if staged != cert_pem {
         return Err(LpmError::Cert(format!(
-            "staged certificate for {} changed while the trust-store operation ran",
+            "staged certificate for {} changed before the trust-store operation",
             display_path.display()
         )));
     }
+    let result = operation(&temporary)?;
+    // Elsewhere nothing stops another writer; the directory is LPM's own,
+    // and the file is checked again.
+    #[cfg(not(windows))]
+    {
+        let staged =
+            lpm_common::read_file_capped(&temporary, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+                .map_err(|error| {
+                    LpmError::Cert(format!(
+                        "failed to verify staged certificate for {} after the trust-store operation: {error}",
+                        display_path.display()
+                    ))
+                })?;
+        if staged != cert_pem {
+            return Err(LpmError::Cert(format!(
+                "staged certificate for {} changed while the trust-store operation ran",
+                display_path.display()
+            )));
+        }
+    }
+    drop(staged_file);
     Ok(result)
+}
+
+/// Opens the staged certificate to read. On Windows it shares the file with
+/// readers only, so the open fails while any other handle can still write
+/// it, and until it is closed nobody can start writing, renaming or
+/// deleting it.
+fn open_staged_certificate(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+    }
+    options.open(path)
 }
 
 // ── macOS ──────────────────────────────────────────────────────────────
@@ -1439,21 +1500,67 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
     }
 
     #[test]
-    fn verified_certificate_staging_detects_replacement_during_operation() {
+    fn verified_certificate_staging_hands_the_operation_the_checked_certificate() {
+        let ca_dir = tempfile::tempdir().unwrap();
+        let display_path = ca_dir.path().join("rootCA.pem");
         let (expected, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
         let (replacement, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
 
-        let error =
-            with_verified_certificate_file(expected.as_bytes(), Path::new("rootCA.pem"), |path| {
-                std::fs::write(path, replacement.as_bytes()).unwrap();
-                Ok(())
-            })
-            .unwrap_err();
+        let outcome = with_verified_certificate_file(expected.as_bytes(), &display_path, |path| {
+            assert_eq!(
+                path.parent(),
+                Some(ca_dir.path()),
+                "staged beside the CA, not in the temporary directory"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+            Ok(std::fs::write(path, replacement.as_bytes()).is_ok())
+        });
+
+        if cfg!(windows) {
+            assert!(
+                !outcome.unwrap(),
+                "nobody may write the staged certificate while the operation runs"
+            );
+        } else {
+            assert!(
+                outcome
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed while the trust-store operation ran")
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(ca_dir.path()).unwrap().count(),
+            0,
+            "the staged certificate is removed"
+        );
+    }
+
+    /// certutil, like other Windows tools, can't open a file another handle
+    /// is writing, which kept `lpm cert trust` from ever installing the CA.
+    #[cfg(windows)]
+    #[test]
+    fn certutil_can_read_the_staged_certificate() {
+        let ca_dir = tempfile::tempdir().unwrap();
+        let (expected, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
+
+        let output = with_verified_certificate_file(
+            expected.as_bytes(),
+            &ca_dir.path().join("rootCA.pem"),
+            |path| {
+                Command::new(certutil_executable()?)
+                    .arg("-dump")
+                    .arg(path)
+                    .output()
+                    .map_err(|error| LpmError::Cert(error.to_string()))
+            },
+        )
+        .unwrap();
 
         assert!(
-            error
-                .to_string()
-                .contains("changed while the trust-store operation ran")
+            output.status.success(),
+            "certutil -dump failed: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
