@@ -806,14 +806,16 @@ fn with_verified_certificate_file<T>(
     }
     // certutil runs elevated, in a logon session that may lack this one's
     // drive letters (`subst`, mapped drives), so it gets the path the system
-    // resolves the open file to.
+    // resolves the open file to; failing that, as on a volume with no drive
+    // letter, the path it was staged at, which the handle still pins.
     #[cfg(windows)]
-    let operation_path = resolved_path(&staged_file).map_err(|error| {
-        LpmError::Cert(format!(
-            "failed to resolve the staged certificate for {}: {error}",
+    let operation_path = resolved_path(&staged_file).unwrap_or_else(|error| {
+        tracing::debug!(
+            "using the staged path for {}: could not resolve it: {error}",
             display_path.display()
-        ))
-    })?;
+        );
+        temporary.to_path_buf()
+    });
     #[cfg(not(windows))]
     let operation_path = temporary.to_path_buf();
     let result = operation(&operation_path)?;
