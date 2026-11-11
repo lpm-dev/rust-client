@@ -1705,20 +1705,22 @@ pub fn project_publish_lock(project_dir: &Path) -> PathBuf {
 pub fn as_extended_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        let s = path.to_string_lossy();
-        // Skip if already prefixed with \\?\ or \\.\ (device namespace)
-        if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+        use std::path::{Component, Prefix};
+
+        // Already-prefixed and device paths stay as they are, and the prefix
+        // means nothing on a relative path.
+        let plain_absolute = path.is_absolute()
+            && matches!(
+                path.components().next(),
+                Some(Component::Prefix(prefix))
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..))
+            );
+        if !plain_absolute {
             return path.to_path_buf();
         }
-        // Skip relative paths — the prefix is only meaningful on absolute ones
-        if !path.is_absolute() {
-            return path.to_path_buf();
-        }
-        // UNC paths use \\?\UNC\server\share form
-        if let Some(stripped) = s.strip_prefix(r"\\") {
-            return PathBuf::from(format!(r"\\?\UNC\{stripped}"));
-        }
-        PathBuf::from(format!(r"\\?\{s}"))
+        // Windows resolves `/`, `.` and `..` in a plain path but not after
+        // `\\?\`, where a scoped package's `/` would end up inside a name.
+        absolute_extended_path(path).unwrap_or_else(|_| path.to_path_buf())
     }
     #[cfg(not(windows))]
     {
@@ -2190,6 +2192,28 @@ mod tests {
         let p = Path::new(r"C:\Users\test\AppData\Local\.lpm\global\installs\pkg@1.0.0");
         let got = as_extended_path(p);
         assert!(got.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn as_extended_path_keeps_naming_the_file_a_scoped_package_path_names() {
+        let p =
+            Path::new(r"C:\lpm\global\installs\tool@1.0.0\node_modules\@scope/name\.\package.json");
+        assert_eq!(
+            as_extended_path(p),
+            Path::new(
+                r"\\?\C:\lpm\global\installs\tool@1.0.0\node_modules\@scope\name\package.json"
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn as_extended_path_prefixes_a_unc_share() {
+        assert_eq!(
+            as_extended_path(Path::new(r"\\server\share\lpm")),
+            Path::new(r"\\?\UNC\server\share\lpm")
+        );
     }
 
     #[test]
