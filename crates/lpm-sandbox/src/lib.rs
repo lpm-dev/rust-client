@@ -1094,6 +1094,13 @@ pub fn spawn_tracked_command(
     }
 }
 
+/// The sandbox helper a GitHub release ships for this build's architecture.
+const RELEASE_HELPER_ASSET: &str = if cfg!(target_arch = "aarch64") {
+    "lpm-sandbox-helper-win32-arm64.exe"
+} else {
+    "lpm-sandbox-helper-win32-x64.exe"
+};
+
 fn helper_missing_message(searched: &[PathBuf]) -> String {
     let location = if searched.is_empty() {
         "beside the running lpm".to_string()
@@ -1110,7 +1117,7 @@ fn helper_missing_message(searched: &[PathBuf]) -> String {
          to restore it. For a cargo install, install it beside lpm with `cargo install --git \
          https://github.com/lpm-dev/rust-client --tag v{version} lpm-sandbox --bin \
          lpm-sandbox-helper`. For a binary from a GitHub release, save that release's \
-         lpm-sandbox-helper-win32-x64.exe beside it as lpm-sandbox-helper.exe. If it lives \
+         {RELEASE_HELPER_ASSET} beside it as lpm-sandbox-helper.exe. If it lives \
          elsewhere, set LPM_SANDBOX_HELPER to its path, or re-run with --no-sandbox to run \
          scripts without containment",
         version = env!("CARGO_PKG_VERSION"),
@@ -1473,11 +1480,15 @@ mod tests {
             )),
             "{message}"
         );
+        let asset = if cfg!(target_arch = "aarch64") {
+            "lpm-sandbox-helper-win32-arm64.exe"
+        } else {
+            "lpm-sandbox-helper-win32-x64.exe"
+        };
         assert!(
-            message.contains(
-                "save that release's lpm-sandbox-helper-win32-x64.exe beside it as \
-                 lpm-sandbox-helper.exe"
-            ),
+            message.contains(&format!(
+                "save that release's {asset} beside it as lpm-sandbox-helper.exe"
+            )),
             "{message}"
         );
         assert!(message.contains("LPM_SANDBOX_HELPER"), "{message}");
