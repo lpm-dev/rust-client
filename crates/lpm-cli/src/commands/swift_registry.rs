@@ -1157,6 +1157,9 @@ mod tests {
             r#"{"security":{"registryOverrides":{"lpm.dev":null}}}"#,
             r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"onUntrustedCertificate":false}}}}}"#,
         ];
+        // The error names the file canonically, which spells out a Windows
+        // 8.3 short name such as `RUNNER~1` in the temp path.
+        let canonical_path = fs::canonicalize(&path).unwrap();
         let mut accepted = Vec::new();
         for original in cases {
             fs::write(&path, original).unwrap();
@@ -1166,7 +1169,8 @@ mod tests {
             } else {
                 let error = result.err().unwrap().to_string();
                 assert!(
-                    error.contains(path.to_str().unwrap()),
+                    error.contains(path.to_str().unwrap())
+                        || error.contains(canonical_path.to_str().unwrap()),
                     "{error} must name {}",
                     path.display()
                 );
