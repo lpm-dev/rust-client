@@ -15,7 +15,8 @@ pub enum ClientMessage {
     Hello {
         /// LPM auth token.
         token: String,
-        /// Requested domain. None uses the Pro account's `<username>.lpm.fyi`.
+        /// Requested domain. None uses the Pro account's URL,
+        /// `<username>-<code>.lpm.fyi`.
         /// Wire format uses "subdomain" for backward compat with relay Worker.
         #[serde(rename = "subdomain")]
         domain: Option<String>,

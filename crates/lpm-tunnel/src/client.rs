@@ -927,8 +927,9 @@ pub struct TunnelOptions {
     /// family that answered.
     pub live_local_target: Option<Arc<RwLock<lpm_common::LocalTarget>>>,
     /// Full tunnel domain (e.g., "acme-api.lpm.llc"). If None, the relay uses
-    /// the Pro account's `<username>.lpm.fyi`. Organization tunnels need one of
-    /// the organization's claimed domains.
+    /// the Pro account's URL, `<username>-<code>.lpm.fyi`, where the code is
+    /// eight random characters. Organization tunnels need one of the
+    /// organization's claimed domains.
     /// If bare name without dot, ".lpm.fyi" is appended for backward compat.
     pub domain: Option<String>,
     /// Auth token for protecting the tunnel URL. When set, the relay
@@ -3499,7 +3500,6 @@ mod tests {
     fn relay_refusals_for_the_account_keep_their_code_and_explain_it() {
         for (code, advice) in [
             ("plan_required", "https://lpm.dev/pricing"),
-            ("domain_required", "https://lpm.dev/dashboard/settings"),
             ("billing_inactive", "billing settings"),
             ("account_not_found", "lpm login"),
         ] {
@@ -3601,7 +3601,6 @@ mod tests {
     fn relay_quota_errors_have_stable_retry_classification() {
         for code in [
             "plan_required",
-            "domain_required",
             "domain_not_owned",
             "concurrent_limit",
             "billing_inactive",

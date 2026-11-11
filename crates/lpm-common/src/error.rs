@@ -865,12 +865,8 @@ pub enum LpmError {
 }
 
 /// Relay codes that mean the account can't run a tunnel.
-pub const TUNNEL_ACCESS_CODES: [&str; 4] = [
-    "plan_required",
-    "domain_required",
-    "billing_inactive",
-    "account_not_found",
-];
+pub const TUNNEL_ACCESS_CODES: [&str; 3] =
+    ["plan_required", "billing_inactive", "account_not_found"];
 
 impl LpmError {
     /// Whether the registry said the thing asked for doesn't exist, or that
@@ -963,9 +959,6 @@ impl LpmError {
         let help = match code {
             "plan_required" => {
                 "Tunnels need a Pro plan, or one of your organization's claimed domains. Upgrade at https://lpm.dev/pricing, or name the organization's domain: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
-            }
-            "domain_required" => {
-                "Your tunnel URL comes from your lpm.dev username. Set one at https://lpm.dev/dashboard/settings, or name a domain you claimed: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
             }
             // The code comes back for a lapsed Pro account and for an
             // organization alike, and the relay doesn't say which.
