@@ -174,19 +174,30 @@ async fn check_authenticated_tunnel(client: &RegistryClient, domain: &str) -> Ch
             &format!("{domain} — claimed by another user or org"),
         );
     }
+    let held_as = held_as(&result);
     match check_tunnel_reachability(domain).await {
         TunnelReachability::Active => Check::pass(
             &doctor_catalog::TUNNEL_ACTIVE,
-            &format!("{domain} (claimed, active)"),
+            &format!("{domain} ({held_as}, active)"),
         ),
         TunnelReachability::Idle => Check::pass(
             &doctor_catalog::TUNNEL_IDLE,
-            &format!("{domain} (claimed, idle)"),
+            &format!("{domain} ({held_as}, idle)"),
         ),
         TunnelReachability::Unreachable => Check::warn(
             &doctor_catalog::TUNNEL_UNREACHABLE,
-            &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
+            &format!("{domain} ({held_as}) — unreachable, DNS may not be configured"),
         ),
+    }
+}
+
+/// How the account holds a domain the Registry says is its own: a claim, or
+/// its account URL, `<username>-<code>.lpm.fyi`, which needs no claim.
+fn held_as(lookup: &serde_json::Value) -> &'static str {
+    if lookup["accountUrl"].as_bool().unwrap_or(false) {
+        "account URL"
+    } else {
+        "claimed"
     }
 }
 
@@ -310,6 +321,22 @@ mod tests {
         assert!(matches!(checks[0].severity, Severity::Pass));
         assert!(checks[0].detail.contains("configured"));
         assert!(checks[0].detail.contains("login to verify"));
+    }
+
+    #[test]
+    fn an_account_url_is_reported_as_one_not_as_a_claim() {
+        assert_eq!(
+            held_as(&serde_json::json!({
+                "found": true,
+                "ownedByYou": true,
+                "accountUrl": true,
+            })),
+            "account URL"
+        );
+        assert_eq!(
+            held_as(&serde_json::json!({ "found": true, "ownedByYou": true })),
+            "claimed"
+        );
     }
 
     #[tokio::test]
