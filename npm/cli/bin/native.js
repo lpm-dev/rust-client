@@ -32,6 +32,11 @@ export const PLATFORMS = Object.freeze({
     lpm: "lpm",
     lpx: "lpx",
   },
+  "win32-arm64": {
+    pkg: "@lpm-registry/cli-win32-arm64",
+    lpm: "lpm.exe",
+    lpx: "lpx.exe",
+  },
   "win32-x64": {
     pkg: "@lpm-registry/cli-win32-x64",
     lpm: "lpm.exe",
@@ -82,7 +87,7 @@ export function resolveNativeBinary(options = {}) {
     throw new LpmWrapperError(
       `Unsupported platform: ${key}`,
       [
-        "LPM publishes native npm packages for macOS, Linux, and Windows on x64/arm64.",
+        "LPM publishes native npm packages for macOS (x64, arm64), Linux (x64, arm64, x64 musl), and Windows (x64, arm64).",
         "Use another install method from https://github.com/lpm-dev/rust-client.",
       ],
     );

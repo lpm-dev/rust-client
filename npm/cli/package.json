@@ -31,6 +31,7 @@
     "@lpm-registry/cli-linux-arm64": "0.86.0",
     "@lpm-registry/cli-linux-x64": "0.86.0",
     "@lpm-registry/cli-linux-x64-musl": "0.86.0",
+    "@lpm-registry/cli-win32-arm64": "0.86.0",
     "@lpm-registry/cli-win32-x64": "0.86.0"
   },
   "type": "module",

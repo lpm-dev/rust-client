@@ -3530,6 +3530,7 @@ fn detect_platform_for(
         )),
         ("linux", "aarch64") => Ok(("linux-arm64", "")),
         ("windows", "x86_64") => Ok(("win32-x64", ".exe")),
+        ("windows", "aarch64") => Ok(("win32-arm64", ".exe")),
         _ => Err(LpmError::Script(format!(
             "unsupported platform: {os}-{arch}. Download manually from https://github.com/lpm-dev/rust-client/releases"
         ))),
@@ -3624,6 +3625,18 @@ mod tests {
     }
 
     #[test]
+    fn detect_platform_selects_the_windows_asset_for_each_architecture() {
+        assert_eq!(
+            detect_platform_for("windows", "x86_64", None).unwrap(),
+            ("win32-x64", ".exe")
+        );
+        assert_eq!(
+            detect_platform_for("windows", "aarch64", None).unwrap(),
+            ("win32-arm64", ".exe")
+        );
+    }
+
+    #[test]
     fn standalone_release_asset_uses_a_bundle_zip_only_on_macos() {
         assert_eq!(
             standalone_asset_name_for("macos", "darwin-arm64", ""),
@@ -3636,6 +3649,10 @@ mod tests {
         assert_eq!(
             standalone_asset_name_for("windows", "win32-x64", ".exe"),
             "lpm-win32-x64.exe"
+        );
+        assert_eq!(
+            standalone_asset_name_for("windows", "win32-arm64", ".exe"),
+            "lpm-win32-arm64.exe"
         );
     }
 
@@ -6064,6 +6081,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 "linux-x64",
                 "linux-arm64",
                 "win32-x64",
+                "win32-arm64",
             ]
             .contains(&platform),
             "unexpected platform: {platform}"

@@ -25,9 +25,9 @@
 //! emission. To keep workspace CI green on POSIX runners we ship an
 //! explicit non-Windows stub `main()` that prints a one-line
 //! diagnostic and exits with a non-zero status. The release
-//! workflow only copies the helper into `cli-win32-x64`, so the
-//! stub never reaches end users (see release.yml and
-//! `npm/cli-win32-x64/package.json`).
+//! workflow only copies the helper into the Windows packages,
+//! `cli-win32-x64` and `cli-win32-arm64`, so the stub never reaches
+//! end users (see release.yml and `npm/cli-win32-*/package.json`).
 
 #[cfg(target_os = "windows")]
 fn main() {

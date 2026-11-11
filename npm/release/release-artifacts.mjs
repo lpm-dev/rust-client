@@ -21,6 +21,11 @@ export const PLATFORM_PACKAGES = Object.freeze([
     binary("lpm-linux-x64-musl", "lpm"),
     binary("lpm-linux-x64-musl", "lpx"),
   ], "musl"),
+  platformPackage("win32-arm64", "win32", "arm64", [
+    binary("lpm-win32-arm64.exe", "lpm.exe"),
+    binary("lpm-win32-arm64.exe", "lpx.exe"),
+    binary("lpm-sandbox-helper-win32-arm64.exe", "lpm-sandbox-helper.exe"),
+  ]),
   platformPackage("win32-x64", "win32", "x64", [
     binary("lpm-win32-x64.exe", "lpm.exe"),
     binary("lpm-win32-x64.exe", "lpx.exe"),

@@ -24,6 +24,7 @@ const PLATFORMS = [
   "@lpm-registry/cli-linux-arm64",
   "@lpm-registry/cli-linux-x64",
   "@lpm-registry/cli-linux-x64-musl",
+  "@lpm-registry/cli-win32-arm64",
   "@lpm-registry/cli-win32-x64",
 ];
 const NPM_PUBLISH_JOBS = Object.freeze([
@@ -33,7 +34,7 @@ const NPM_PUBLISH_JOBS = Object.freeze([
 ]);
 const NON_WAITING_STEP_MINUTES = 15;
 
-test("the platform scope covers all six platform packages and nothing else", () => {
+test("the platform scope covers all seven platform packages and nothing else", () => {
   assert.deepEqual([...PUBLICATION_SCOPES.platforms].sort(), PLATFORMS);
   assert.deepEqual(PUBLICATION_SCOPES.wrapper, [WRAPPER]);
 });
@@ -121,7 +122,7 @@ test("registry publication names every platform package npm never serves", async
       timeoutMs: 60_000,
     }),
     error => {
-      assert.match(error.message, /npm did not serve 2 of 6 package\(s\) in the platforms scope within 60s/);
+      assert.match(error.message, /npm did not serve 2 of 7 package\(s\) in the platforms scope within 60s/);
       assert.match(error.message, /cli-darwin-x64: .*HTTP 404/);
       assert.match(error.message, /cli-linux-x64-musl: .*HTTP 404/);
       assert.doesNotMatch(error.message, /cli-linux-arm64:/);
@@ -165,7 +166,7 @@ test("registry publication fails without retrying when npm lists the version wit
         ...registry.options,
       }),
       error => {
-        assert.match(error.message, /npm did not serve 1 of 6 package\(s\)/);
+        assert.match(error.message, /npm did not serve 1 of 7 package\(s\)/);
         assert.ok(error.message.includes(`cli-linux-arm64: ${message}`), error.message);
         return true;
       },
