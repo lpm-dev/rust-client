@@ -950,14 +950,9 @@ fn rollback_removed_targets(stages: &mut [StagedRemoval]) {
 }
 
 fn remove_path_if_present(path: &Path) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        let _ = std::fs::remove_file(path);
-    } else if metadata.is_dir() {
-        let _ = std::fs::remove_dir_all(path);
-    }
+    // A directory link on Windows needs `remove_dir`, which `remove_file`
+    // refuses; remove_path_entry picks the call for each kind of entry.
+    let _ = lpm_common::remove_path_entry(path);
 }
 
 fn materialize_target_at(
