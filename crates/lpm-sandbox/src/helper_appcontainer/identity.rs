@@ -458,9 +458,10 @@ mod tests {
         assert_eq!(lists_profile(&profiles, sid.0), Some(false));
     }
 
-    /// Makes `path` a directory this process can read but not change, as
-    /// `C:\Program Files\nodejs` is to its user: a best-effort grant there
-    /// never lands, yet the grant record names it.
+    /// Makes `path` a directory this process can read but not change while
+    /// it runs without privileges, as `C:\Program Files\nodejs` is to its
+    /// user: a best-effort grant there never lands, yet the grant record
+    /// names it.
     fn lock_directory(path: &Path) {
         let user = setup::current_user_sid().unwrap();
         // OWNER RIGHTS limits the owner to what it is granted.
@@ -507,7 +508,7 @@ mod tests {
         let profiles = profile_list().expect("the user's AppContainer profile list");
 
         assert_eq!(
-            run_revoke_only(&revoke_only_args(&name, &record)).unwrap(),
+            without_privileges(|| run_revoke_only(&revoke_only_args(&name, &record))).unwrap(),
             0
         );
 
@@ -530,7 +531,8 @@ mod tests {
         record_grants(&record, std::slice::from_ref(&locked)).unwrap();
         let profiles = profile_list().expect("the user's AppContainer profile list");
 
-        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+        let error =
+            without_privileges(|| run_revoke_only(&revoke_only_args(&name, &record))).unwrap_err();
 
         assert!(
             error.to_string().contains("cannot update permissions for"),
