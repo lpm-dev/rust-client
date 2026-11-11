@@ -157,17 +157,16 @@ const WINDOWS_POLICY_DIRECTORY_SECURITY: &str =
     "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
 fn ensure_policy_parent_for_write(path: &Path) -> Result<(), LpmError> {
-    let Some(parent) = path.parent() else {
-        return Err(managed_policy_error(
-            path,
-            "must have a managed parent directory",
-        ));
-    };
     #[cfg(all(windows, not(any(debug_assertions, test))))]
-    lpm_common::owner_only::create_or_take_directory(parent, WINDOWS_POLICY_DIRECTORY_SECURITY)
-        .map_err(|err| privileged_policy_io_error(path, "prepare", err))?;
+    reclaim_windows_policy_location(path, true)?;
     #[cfg(not(all(windows, not(any(debug_assertions, test)))))]
     {
+        let Some(parent) = path.parent() else {
+            return Err(managed_policy_error(
+                path,
+                "must have a managed parent directory",
+            ));
+        };
         #[cfg(unix)]
         let parent_existed = parent.exists();
         std::fs::create_dir_all(parent)
@@ -182,73 +181,83 @@ fn ensure_policy_parent_for_write(path: &Path) -> Result<(), LpmError> {
     validate_managed_policy_parent_authority(path)
 }
 
+/// How many times the helper moves aside something that keeps appearing
+/// where the policy directory goes, before it gives up.
+#[cfg(all(windows, any(test, not(debug_assertions))))]
+const WINDOWS_POLICY_DIRECTORY_ATTEMPTS: usize = 4;
+
 /// Before the privileged helper reads or writes the policy on Windows,
 /// where any user can make `C:\ProgramData\lpm` before an administrator
-/// does: moves aside a policy directory or policy file that isn't a plain
-/// one SYSTEM or the Administrators own — LPM never applied a policy from
-/// it — and gives the directory back to the Administrators.
+/// does: moves aside a policy directory or policy file that doesn't pass
+/// the policy's own checks — LPM never applied a policy from it — and,
+/// with `create`, makes the directory where there is none. The directory
+/// is made in place under the Administrators, never taken over, so no one
+/// else ever had a handle on it; moving aside leaves any handle on the old
+/// one with it.
 #[cfg(all(windows, any(test, not(debug_assertions))))]
-fn reclaim_windows_policy_location(path: &Path) -> Result<(), LpmError> {
+fn reclaim_windows_policy_location(path: &Path, create: bool) -> Result<(), LpmError> {
     let Some(parent) = path.parent() else {
         return Err(managed_policy_error(
             path,
             "must have a managed parent directory",
         ));
     };
-    match administrators_own_windows_entry(parent, true)
-        .map_err(|err| privileged_policy_io_error(path, "inspect", err))?
-    {
-        None => return Ok(()),
-        Some(true) => {}
-        // Moving it aside, rather than taking it, also leaves behind any
-        // handle its maker still has open on it.
-        Some(false) => set_aside_windows_policy_entry(path, parent)?,
+    let mut attempts = 0;
+    loop {
+        match windows_policy_entry(parent, true) {
+            WindowsPolicyEntry::Trusted => break,
+            WindowsPolicyEntry::Missing if !create => return Ok(()),
+            WindowsPolicyEntry::Missing => {
+                match lpm_common::owner_only::create_directory_in_place(
+                    parent,
+                    WINDOWS_POLICY_DIRECTORY_SECURITY,
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(privileged_policy_io_error(
+                            path,
+                            "create the directory of",
+                            error,
+                        ));
+                    }
+                }
+            }
+            WindowsPolicyEntry::Untrusted => set_aside_windows_policy_entry(path, parent)?,
+        }
+        attempts += 1;
+        if attempts > WINDOWS_POLICY_DIRECTORY_ATTEMPTS {
+            return Err(managed_policy_error(
+                parent,
+                "kept being replaced while LPM made it; stop whatever is creating it and try again",
+            ));
+        }
     }
-    lpm_common::owner_only::create_or_take_directory(parent, WINDOWS_POLICY_DIRECTORY_SECURITY)
-        .map_err(|err| privileged_policy_io_error(path, "reclaim the directory of", err))?;
-    if administrators_own_windows_entry(path, false)
-        .map_err(|err| privileged_policy_io_error(path, "inspect", err))?
-        == Some(false)
-    {
+    if windows_policy_entry(path, false) == WindowsPolicyEntry::Untrusted {
         set_aside_windows_policy_entry(path, path)?;
     }
     Ok(())
 }
 
-/// Whether what is at `path` is a plain directory (`directory`) or a
-/// regular file owned by SYSTEM or the Administrators, or `None` when
-/// nothing is there. A link is looked at, not followed, and isn't plain;
-/// what an administrator can't even inspect isn't theirs.
 #[cfg(all(windows, any(test, not(debug_assertions))))]
-fn administrators_own_windows_entry(path: &Path, directory: bool) -> std::io::Result<Option<bool>> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        READ_CONTROL,
-    };
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsPolicyEntry {
+    Missing,
+    /// Passes the checks LPM makes before it applies a policy.
+    Trusted,
+    Untrusted,
+}
 
-    let entry = match std::fs::OpenOptions::new()
-        .access_mode(READ_CONTROL)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-    {
-        Ok(entry) => entry,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ok(Some(false));
+/// What is at `path`, the policy directory (`directory`) or the policy.
+#[cfg(all(windows, any(test, not(debug_assertions))))]
+fn windows_policy_entry(path: &Path, directory: bool) -> WindowsPolicyEntry {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => WindowsPolicyEntry::Missing,
+        _ if validate_windows_admin_owned_path(path, directory).is_ok() => {
+            WindowsPolicyEntry::Trusted
         }
-        Err(error) => return Err(error),
-    };
-    let metadata = entry.metadata()?;
-    let plain = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        && if directory {
-            metadata.is_dir()
-        } else {
-            metadata.is_file()
-        };
-    Ok(Some(
-        plain && lpm_common::owner_only::owned_by_system_or_administrators(&entry)?,
-    ))
+        _ => WindowsPolicyEntry::Untrusted,
+    }
 }
 
 /// Renames `entry`, the policy or its directory, to a free name beside it:
@@ -303,10 +312,47 @@ fn give_windows_policy_to_administrators(path: &Path) -> Result<(), LpmError> {
 )]
 fn prepare_policy_location(path: &Path) -> Result<(), LpmError> {
     #[cfg(all(windows, not(any(debug_assertions, test))))]
-    reclaim_windows_policy_location(path)?;
+    reclaim_windows_policy_location(path, false)?;
     #[cfg(not(all(windows, not(any(debug_assertions, test)))))]
     let _ = path;
     Ok(())
+}
+
+/// What the privileged helper moved aside since `since` (see
+/// [`reclaim_windows_policy_location`]), found by the time in their names,
+/// since a move keeps the time something was made. Its own console, where
+/// it says so, closes when it exits.
+#[cfg(windows)]
+fn windows_policy_entries_set_aside_since(
+    path: &Path,
+    since: std::time::SystemTime,
+) -> Vec<String> {
+    let since = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut set_aside = Vec::new();
+    for entry in [path.parent(), Some(path)].into_iter().flatten() {
+        let (Some(directory), Some(name)) = (entry.parent(), entry.file_name()) else {
+            continue;
+        };
+        let prefix = format!("{}.untrusted-", name.to_string_lossy());
+        let Ok(listing) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for item in listing.flatten() {
+            let item_name = item.file_name().to_string_lossy().into_owned();
+            if item_name
+                .strip_prefix(&prefix)
+                .and_then(|stamp| stamp.parse::<u128>().ok())
+                .is_some_and(|stamp| stamp >= since)
+            {
+                set_aside.push(item.path().display().to_string());
+            }
+        }
+    }
+    set_aside.sort();
+    set_aside
 }
 
 /// Adds how to get rid of a managed policy that fails its ownership checks
@@ -476,6 +522,7 @@ pub(crate) fn install_managed_firewall_protection(
             ManagedProtectionChange::Unchanged
         },
         status: load_managed_protection_status()?,
+        set_aside: Vec::new(),
     })
 }
 
@@ -486,6 +533,7 @@ pub(crate) fn remove_managed_firewall_protection() -> Result<ManagedProtectionRe
         return Ok(ManagedProtectionReport {
             change: ManagedProtectionChange::Unchanged,
             status: managed_protection_status(&path, None),
+            set_aside: Vec::new(),
         });
     }
     let mut value = read_managed_policy_value(&path)?;
@@ -504,6 +552,7 @@ pub(crate) fn remove_managed_firewall_protection() -> Result<ManagedProtectionRe
         return Ok(ManagedProtectionReport {
             change: ManagedProtectionChange::Unchanged,
             status: load_managed_protection_status()?,
+            set_aside: Vec::new(),
         });
     }
     remove_empty_table(top, crate::npm_firewall_config::FIREWALL_CONFIG_SECTION);
@@ -517,6 +566,7 @@ pub(crate) fn remove_managed_firewall_protection() -> Result<ManagedProtectionRe
     Ok(ManagedProtectionReport {
         change: ManagedProtectionChange::Disabled,
         status: load_managed_protection_status()?,
+        set_aside: Vec::new(),
     })
 }
 
@@ -543,6 +593,20 @@ pub(crate) fn run_internal_managed_protection(
 }
 
 pub(crate) fn apply_managed_protection_with_privilege(
+    action: ManagedProtectionAction,
+) -> Result<ManagedProtectionReport, LpmError> {
+    #[cfg(windows)]
+    let started = std::time::SystemTime::now();
+    let report = apply_managed_protection_elevating(action)?;
+    #[cfg(windows)]
+    let report = ManagedProtectionReport {
+        set_aside: windows_policy_entries_set_aside_since(&managed_policy_path(), started),
+        ..report
+    };
+    Ok(report)
+}
+
+fn apply_managed_protection_elevating(
     action: ManagedProtectionAction,
 ) -> Result<ManagedProtectionReport, LpmError> {
     #[cfg(debug_assertions)]
@@ -592,6 +656,7 @@ pub(crate) fn apply_managed_protection_with_privilege(
         Ok(ManagedProtectionReport {
             change,
             status: after,
+            set_aside: Vec::new(),
         })
     }
 
@@ -666,7 +731,9 @@ fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<()
         GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, PSID,
     };
-    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
+    };
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
@@ -813,8 +880,18 @@ fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<()
             return Err(managed_policy_error(path, "has an unreadable DACL entry"));
         }
         let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
-        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
-            continue;
+        // Conditional, object and compound entries can grant access too
+        // (NTFS honours `(XA;…;(Member_of …))`), so only plain allow and
+        // deny entries are accepted.
+        match u32::from(header.AceType) {
+            ACCESS_ALLOWED_ACE_TYPE => {}
+            ACCESS_DENIED_ACE_TYPE => continue,
+            _ => {
+                return Err(managed_policy_error(
+                    path,
+                    "must not have conditional, object or other special access entries",
+                ));
+            }
         }
         let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
         if !windows_policy_access_can_modify(allowed.Mask) {
@@ -1248,22 +1325,14 @@ mod windows_policy_directory_tests {
                 .contains("must not grant write access to non-administrator principals")
         );
 
-        // Taken back where it is already there, and made so in the first place.
-        lpm_common::owner_only::create_or_take_directory(
-            &directory.0,
-            WINDOWS_POLICY_DIRECTORY_SECURITY,
-        )
-        .unwrap();
-        validate_windows_admin_owned_path(&directory.0, true).unwrap();
+        // Made in place, and the policy file written there, pass.
         std::fs::remove_dir(&directory.0).unwrap();
-        lpm_common::owner_only::create_or_take_directory(
+        lpm_common::owner_only::create_directory_in_place(
             &directory.0,
             WINDOWS_POLICY_DIRECTORY_SECURITY,
         )
         .unwrap();
         validate_windows_admin_owned_path(&directory.0, true).unwrap();
-
-        // The policy file written there passes too.
         let policy = directory.0.join("security-policy.toml");
         lpm_common::write_file_atomic_with_options(
             &policy,
@@ -1276,28 +1345,57 @@ mod windows_policy_directory_tests {
         validate_windows_admin_owned_path(&policy, false).unwrap();
     }
 
+    /// NTFS honours a conditional entry, so one that lets everyone write
+    /// counts as letting them write.
     #[test]
-    fn reclaiming_sets_aside_a_policy_no_administrator_owns() {
+    fn a_conditional_entry_granting_write_fails_the_checks() {
+        let Some(directory) = scratch_policy_directory("conditional") else {
+            return;
+        };
+        lpm_common::owner_only::create_directory_in_place(
+            &directory.0,
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(XA;OICI;FA;;;WD;(Member_of {SID(WD)}))",
+        )
+        .unwrap();
+        assert!(
+            validate_windows_admin_owned_path(&directory.0, true)
+                .unwrap_err()
+                .to_string()
+                .contains("must not have conditional")
+        );
+    }
+
+    #[test]
+    fn reclaiming_sets_aside_a_policy_that_fails_the_checks() {
         let Some(directory) = scratch_policy_directory("reclaim") else {
             return;
         };
-        std::fs::create_dir(&directory.0).unwrap();
+        lpm_common::owner_only::create_directory_in_place(
+            &directory.0,
+            WINDOWS_POLICY_DIRECTORY_SECURITY,
+        )
+        .unwrap();
         let policy = directory.0.join("security-policy.toml");
+        let started = std::time::SystemTime::now();
 
         // A file a user owns, or an administrator's own account.
         std::fs::write(&policy, "[firewall]\nmode = \"off\"\n").unwrap();
         give_to_current_user(&policy);
-        reclaim_windows_policy_location(&policy).unwrap();
+        reclaim_windows_policy_location(&policy, false).unwrap();
         validate_windows_admin_owned_path(&directory.0, true).unwrap();
         assert!(!policy.exists(), "moved aside");
         assert_eq!(set_aside_beside(&policy).len(), 1);
 
         // A directory in its place.
         std::fs::create_dir(&policy).unwrap();
-        give_to_current_user(&policy);
-        reclaim_windows_policy_location(&policy).unwrap();
+        reclaim_windows_policy_location(&policy, false).unwrap();
         assert!(!policy.exists(), "moved aside");
         assert_eq!(set_aside_beside(&policy).len(), 2);
+        assert_eq!(
+            windows_policy_entries_set_aside_since(&policy, started).len(),
+            2,
+            "both are reported"
+        );
 
         // A policy written by an administrator whose own account the system
         // made its owner goes to the Administrators, and then stays.
@@ -1305,29 +1403,38 @@ mod windows_policy_directory_tests {
         give_to_current_user(&policy);
         give_windows_policy_to_administrators(&policy).unwrap();
         validate_windows_admin_owned_path(&policy, false).unwrap();
-        reclaim_windows_policy_location(&policy).unwrap();
+        reclaim_windows_policy_location(&policy, false).unwrap();
         assert!(policy.exists());
         validate_windows_admin_owned_path(&policy, false).unwrap();
     }
 
     #[test]
-    fn reclaiming_sets_aside_a_policy_directory_no_administrator_owns() {
+    fn reclaiming_replaces_a_policy_directory_that_fails_the_checks() {
         let Some(directory) = scratch_policy_directory("aside") else {
             return;
         };
         let policy = directory.0.join("security-policy.toml");
 
-        // Made by a user, with a policy in it; the user may still hold a
-        // handle on it, which then leads to what was moved aside.
+        // Nothing is made where none was asked for.
+        reclaim_windows_policy_location(&policy, false).unwrap();
+        assert!(!directory.0.exists());
+
+        // Made the old way, open to every user, with a policy in it; or a
+        // user's own: moved aside with any handle still open on it, and a
+        // new one made in place.
         std::fs::create_dir(&directory.0).unwrap();
         std::fs::write(&policy, "[firewall]\nmode = \"off\"\n").unwrap();
-        give_to_current_user(&directory.0);
-        reclaim_windows_policy_location(&policy).unwrap();
+        reclaim_windows_policy_location(&policy, true).unwrap();
         validate_windows_admin_owned_path(&directory.0, true).unwrap();
         assert!(!policy.exists());
         let aside = set_aside_beside(&directory.0);
         assert_eq!(aside.len(), 1);
         assert!(aside[0].join("security-policy.toml").is_file());
+
+        give_to_current_user(&directory.0);
+        reclaim_windows_policy_location(&policy, true).unwrap();
+        validate_windows_admin_owned_path(&directory.0, true).unwrap();
+        assert_eq!(set_aside_beside(&directory.0).len(), 2);
 
         // A junction in its place is moved, not followed.
         std::fs::remove_dir(&directory.0).unwrap();
@@ -1340,9 +1447,9 @@ mod windows_policy_directory_tests {
             .output()
             .unwrap();
         assert!(made.status.success(), "{made:?}");
-        reclaim_windows_policy_location(&policy).unwrap();
+        reclaim_windows_policy_location(&policy, true).unwrap();
         validate_windows_admin_owned_path(&directory.0, true).unwrap();
-        assert_eq!(set_aside_beside(&directory.0).len(), 2);
+        assert_eq!(set_aside_beside(&directory.0).len(), 3);
         assert!(elsewhere.path().join("kept").exists());
     }
 }

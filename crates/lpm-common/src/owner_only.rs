@@ -364,63 +364,54 @@ impl ProcessUser {
     }
 }
 
-/// Makes the directory at `path` with the owner and protected DACL that
-/// `sddl` gives, or gives them to a directory already there, which another
-/// account may have made first, without following a link to somewhere
-/// else. What is already inside keeps its own security. An owner other than
-/// the caller's own SID needs an elevated administrator, for the
-/// Administrators, or more.
-pub fn create_or_take_directory(path: &std::path::Path, sddl: &str) -> std::io::Result<()> {
+/// Makes a directory at `path` with the owner and protected DACL that
+/// `sddl` gives, which no one else has had a handle on: it is made under a
+/// fresh name beside `path`, with that security from the start, and then
+/// renamed to `path`, which fails with [`std::io::ErrorKind::AlreadyExists`]
+/// when something got there first; nothing already there is taken over or
+/// replaced. An owner other than the caller's own SID needs an elevated
+/// administrator, for the Administrators, or more.
+pub fn create_directory_in_place(path: &std::path::Path, sddl: &str) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        READ_CONTROL, WRITE_DAC, WRITE_OWNER,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, MoveFileExW};
 
+    let wide = |path: &std::path::Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
     let descriptor = security_descriptor(sddl)?;
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
-    // SAFETY: `wide` is NUL-terminated and `attributes` points to the live
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut staging_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other(format!("{} has no file name", path.display())))?
+        .to_os_string();
+    staging_name.push(format!(".new-{stamp}"));
+    let staging = path.with_file_name(staging_name);
+    let (staging_wide, path_wide) = (wide(&staging), wide(path));
+    // SAFETY: the name is NUL-terminated and `attributes` points to the live
     // descriptor, so the directory is never there without it.
-    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } != 0 {
-        return Ok(());
+    if unsafe { CreateDirectoryW(staging_wide.as_ptr(), &attributes) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+    // Without MOVEFILE_REPLACE_EXISTING: whatever is at `path` stays.
+    // SAFETY: both names are NUL-terminated.
+    if unsafe { MoveFileExW(staging_wide.as_ptr(), path_wide.as_ptr(), 0) } == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = std::fs::remove_dir(&staging);
         return Err(error);
     }
-
-    let directory = std::fs::OpenOptions::new()
-        .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::other(format!(
-            "{} is not a plain directory",
-            path.display()
-        )));
-    }
-    set_security_object(
-        &directory,
-        OWNER_SECURITY_INFORMATION
-            | DACL_SECURITY_INFORMATION
-            | PROTECTED_DACL_SECURITY_INFORMATION,
-        &descriptor,
-    )
+    Ok(())
 }
 
 /// Makes the Administrators the owner of `file`, as only an elevated
@@ -664,41 +655,39 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_is_made_with_the_given_security_or_taken_over() {
+    fn a_directory_is_made_in_place_with_the_given_security() {
         let user = user_sid_string();
         let sddl = format!("O:{user}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})");
         let root = tempfile::tempdir().unwrap();
 
         let made = root.path().join("made");
-        create_or_take_directory(&made, &sddl).unwrap();
+        create_directory_in_place(&made, &sddl).unwrap();
         assert!(made.is_dir());
         assert!(others_let_in(&made).is_empty());
-
-        // Made first by someone else, open to every user.
-        let taken = root.path().join("taken");
-        std::fs::create_dir(&taken).unwrap();
-        set_protected_dacl(
-            &open_for_security(&taken),
-            "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;BU)",
-        )
-        .unwrap();
-        assert_eq!(others_let_in(&taken), ["S-1-5-32-545"]);
-        create_or_take_directory(&taken, &sddl).unwrap();
-        assert!(others_let_in(&taken).is_empty());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]
-    fn a_directory_is_not_taken_through_a_link_or_in_place_of_a_file() {
+    fn nothing_already_there_is_taken_or_replaced() {
         let user = user_sid_string();
         let sddl = format!("O:{user}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})");
         let root = tempfile::tempdir().unwrap();
+        let open_to_users = |path: &std::path::Path| {
+            set_protected_dacl(
+                &open_for_security(path),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;BU)",
+            )
+            .unwrap();
+        };
+
+        // A directory someone else made first, open to every user.
+        let directory = root.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        open_to_users(&directory);
+        // A junction to somewhere else, and a file.
         let target = root.path().join("target");
         std::fs::create_dir(&target).unwrap();
-        set_protected_dacl(
-            &open_for_security(&target),
-            "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;BU)",
-        )
-        .unwrap();
+        open_to_users(&target);
         let junction = root.path().join("junction");
         let made = std::process::Command::new("cmd")
             .args(["/D", "/C", "mklink", "/J"])
@@ -710,9 +699,19 @@ mod tests {
         let file = root.path().join("file");
         std::fs::write(&file, b"").unwrap();
 
-        assert!(create_or_take_directory(&junction, &sddl).is_err());
-        assert!(create_or_take_directory(&file, &sddl).is_err());
+        for path in [&directory, &junction, &file] {
+            assert_eq!(
+                create_directory_in_place(path, &sddl).unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(others_let_in(&directory), ["S-1-5-32-545"]);
         assert_eq!(others_let_in(&target), ["S-1-5-32-545"]);
+        assert!(file.is_file());
+        // No staging directory is left behind.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 4);
     }
 
     #[test]
