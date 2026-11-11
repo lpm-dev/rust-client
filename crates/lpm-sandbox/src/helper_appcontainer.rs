@@ -55,9 +55,9 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetHandleInformation, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
-    WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetHandleInformation,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
@@ -601,14 +601,15 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // rather than silently dropping containment.
     //
     // PATH-derived tool dirs (best_effort_readable_dirs) use the
-    // BEST-EFFORT path: a root-level failure logs WARN but the
+    // BEST-EFFORT path: a root-level failure is noted but the
     // spawn proceeds. This handles the SYSTEM-owned-tool-dir case
     // (e.g. `C:\Program Files\nodejs` is owned by SYSTEM and
     // unprivileged `lpm.exe` can't modify its DACL). The lifecycle
     // child either succeeds (script doesn't need that tool, or the
-    // tool happens to be in a user-writable location) or fails
-    // downstream with a clearer "tool not found" error than a hard
-    // sandbox-setup failure would give.
+    // tool happens to be in a user-writable location) or fails with
+    // its own "tool not found" error, and the noted directories are
+    // reported after it.
+    let mut unreadable_tools = Vec::new();
     for dir in &args.best_effort_readable_dirs {
         if dir
             .canonicalize()
@@ -616,13 +617,15 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         {
             continue;
         }
-        grant_dacl_ace_to_tree(
+        if let Some(reason) = grant_dacl_ace_to_tree(
             dir,
             outermost_writable_ancestor(dir, &args.writable_dirs),
             sid.0,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             /* strict_root */ false,
-        )?;
+        )? {
+            unreadable_tools.push((dir.clone(), reason));
+        }
     }
     for dir in &args.readable_dirs {
         grant_dacl_ace_to_tree(
@@ -813,6 +816,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     }
     // Descendants must stop before secret permissions are restored.
     drop(job);
+    if exit_code != 0 {
+        eprint!("{}", unreadable_tools_report(&unreadable_tools));
+    }
     for denial in secret_denials.iter_mut().rev() {
         denial.remove()?;
     }
@@ -1001,13 +1007,16 @@ fn build_capability_attr(
 ///
 /// `SET_ACCESS` replaces prior explicit entries for this SID while
 /// preserving every other trustee's ACL entries.
+///
+/// A best-effort root that gets no grant isn't an error: why it got none
+/// comes back for the caller to report if the script fails.
 fn grant_dacl_ace_to_tree(
     root: &Path,
     beneath: Option<&Path>,
     sid: PSID,
     access_mask: u32,
     strict_root: bool,
-) -> Result<(), AppContainerError> {
+) -> Result<Option<String>, AppContainerError> {
     // The root must exist + must not be a reparse point. Missing
     // paths are silently skipped.
     let meta = match std::fs::symlink_metadata(root) {
@@ -1018,7 +1027,7 @@ fn grant_dacl_ace_to_tree(
                 "skip DACL grant on nonexistent path {}",
                 root.display(),
             );
-            return Ok(());
+            return Ok(None);
         }
     };
     if is_reparse_point(&meta) {
@@ -1039,22 +1048,17 @@ fn grant_dacl_ace_to_tree(
         // links, virtual-store redirections, `winget` shims). Per
         // the same "warn-and-continue" contract that covers
         // SYSTEM-owned DACL failures, a reparse-point root on a
-        // best-effort entry logs WARN and the spawn proceeds — the
+        // best-effort entry is reported and the spawn proceeds — the
         // pre-fix behavior of hard-aborting on the first PATH-entry
         // junction defeats the entire best-effort lane.
-        tracing::warn!(
-            target: "lpm_sandbox::helper_appcontainer",
-            "best-effort DACL grant on {} skipped: reparse point (junction / \
-             symlink / mount point). The AppContainer child will not be able to \
-             read this subtree; lifecycle scripts that depend on tools at this \
-             path will fail with their own access-denied / not-found errors.",
-            root.display(),
-        );
-        return Ok(());
+        return Ok(Some(
+            "it is a link (junction, symlink or mount point), which the sandbox doesn't follow"
+                .to_owned(),
+        ));
     }
 
     if !strict_root && has_inheritable_appcontainer_access(root, access_mask) {
-        return Ok(());
+        return Ok(None);
     }
 
     // Root-grant failure handling depends on `strict_root`:
@@ -1068,15 +1072,15 @@ fn grant_dacl_ace_to_tree(
     //   sandbox can't deliver its contract.
     //
     // - **Best-effort (PATH-derived tool dirs):** failure is
-    //   logged at WARN and the spawn proceeds. The common case is
+    //   reported and the spawn proceeds. The common case is
     //   Win32 error 5 (ERROR_ACCESS_DENIED) on SYSTEM-owned tool
     //   dirs like `C:\Program Files\nodejs` — unprivileged
     //   `lpm.exe` can't modify their DACL. The AppContainer child
     //   ends up unable to read that subtree; if a lifecycle
-    //   script actually needs it the script's own failure (e.g.
+    //   script actually needs it, the script's own failure (e.g.
     //   "'node' is not recognized as an internal or external
-    //   command") is a clearer error surface than a hard sandbox-
-    //   setup failure that prints a raw Win32 error code.
+    //   command") comes first, followed by the directory and the
+    //   setup that grants it.
     let grant = (access_mask, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE);
     let tree = match beneath {
         Some(base) => setup::GrantTree::open_below(base, root),
@@ -1089,18 +1093,13 @@ fn grant_dacl_ace_to_tree(
     let tree = match tree {
         Ok(tree) => tree,
         Err(e) if strict_root => return Err(e),
-        Err(e) => {
-            tracing::warn!(
-                target: "lpm_sandbox::helper_appcontainer",
-                "best-effort DACL grant on {} failed: {e}. AppContainer child will not \
-                 be able to read this subtree; lifecycle scripts that depend on tools \
-                 in this path will fail with their own access-denied / not-found errors.",
-                root.display(),
-            );
-            // Don't walk — the root grant didn't land so descendants
-            // can't be reached anyway.
-            return Ok(());
-        }
+        // Don't walk — the root grant didn't land so descendants
+        // can't be reached anyway.
+        Err(AppContainerError::WriteDacl {
+            win32_error: ERROR_ACCESS_DENIED,
+            ..
+        }) => return Ok(Some("this user can't change its permissions".to_owned())),
+        Err(e) => return Ok(Some(e.to_string())),
     };
 
     if tree.is_directory() {
@@ -1113,7 +1112,29 @@ fn grant_dacl_ace_to_tree(
         });
     }
 
-    Ok(())
+    Ok(None)
+}
+
+/// What a failed script's output is told, after the script's own error,
+/// about the PATH directories its sandbox couldn't read: a script that
+/// ran a program from one fails with only the shell's "not recognized".
+fn unreadable_tools_report(unreadable: &[(PathBuf, String)]) -> String {
+    use std::fmt::Write as _;
+    if unreadable.is_empty() {
+        return String::new();
+    }
+    let mut report = String::from(
+        "lpm-sandbox-helper: the script ran without access to these directories on PATH:\n",
+    );
+    for (directory, reason) in unreadable {
+        let _ = writeln!(report, "  {}: {reason}", directory.display());
+    }
+    report.push_str(
+        "To let sandboxed scripts run programs from one, preview the permissions with \
+         `lpm doctor sandbox-setup --tool-dir <directory>` and apply them from an \
+         administrator terminal.\n",
+    );
+    report
 }
 
 /// The outermost of `writable` that holds `root` below it. Scripts can
@@ -2412,66 +2433,54 @@ mod tests {
 
     #[test]
     fn grant_dacl_ace_to_tree_distinguishes_strict_from_best_effort_on_root_failure() {
-        use windows_sys::Win32::Security::{
-            AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
-            TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
-        };
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
-
-        struct RevertImpersonation;
-        impl Drop for RevertImpersonation {
-            fn drop(&mut self) {
-                // SAFETY: this test established impersonation only on the current thread.
-                unsafe { RevertToSelf() };
-            }
-        }
         let tmp = tempfile::tempdir().unwrap();
         set_test_dacl(tmp.path(), "D:P(D;;RCWD;;;WD)(A;OICI;FA;;;OW)");
-        // Hosted administrators can bypass DACLs through backup/restore privileges.
-        // Disable privileges on a private thread token without changing parallel tests.
-        unsafe {
-            // SAFETY: all handles and output pointers are valid for the synchronous calls.
-            assert_ne!(ImpersonateSelf(SecurityImpersonation), 0);
-        }
-        let _revert = RevertImpersonation;
-        let mut token = ptr::null_mut();
-        unsafe {
-            // SAFETY: this thread is impersonating; token is an initialized output slot.
-            assert_ne!(
-                OpenThreadToken(
-                    GetCurrentThread(),
-                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                    1,
-                    &mut token
+        without_privileges(|| {
+            let sid = create_or_reuse_appcontainer_sid("LpmDeniedDaclTest").unwrap();
+            let strict = grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, true);
+            assert!(
+                matches!(
+                    strict,
+                    Err(AppContainerError::ReadDacl { .. })
+                        | Err(AppContainerError::WriteDacl { .. })
                 ),
-                0
+                "{strict:?}"
             );
-        }
-        let token = HandleGuard(token);
-        unsafe {
-            // SAFETY: disable-all ignores new-state and output buffers, which are null.
-            assert_ne!(
-                AdjustTokenPrivileges(
-                    token.as_raw(),
-                    1,
-                    ptr::null(),
-                    0,
-                    ptr::null_mut(),
-                    ptr::null_mut()
-                ),
-                0
+            let best_effort =
+                grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, false).unwrap();
+            assert_eq!(
+                best_effort.as_deref(),
+                Some("this user can't change its permissions")
             );
-        }
-        let sid = create_or_reuse_appcontainer_sid("LpmDeniedDaclTest").unwrap();
-        let strict = grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, true);
-        assert!(
-            matches!(
-                strict,
-                Err(AppContainerError::ReadDacl { .. }) | Err(AppContainerError::WriteDacl { .. })
+        });
+    }
+
+    #[test]
+    fn a_failed_script_is_told_which_path_directories_its_sandbox_could_not_read() {
+        assert_eq!(unreadable_tools_report(&[]), "");
+        let report = unreadable_tools_report(&[
+            (
+                PathBuf::from(r"C:\Program Files\nodejs"),
+                "this user can't change its permissions".to_owned(),
             ),
-            "{strict:?}"
+            (
+                PathBuf::from(r"C:\Users\me\nvm\current"),
+                "it is a link (junction, symlink or mount point), which the sandbox doesn't follow"
+                    .to_owned(),
+            ),
+        ]);
+        assert!(
+            report.contains(r"  C:\Program Files\nodejs: this user can't change its permissions"),
+            "{report}"
         );
-        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, FILE_GENERIC_READ, false).unwrap();
+        assert!(
+            report.contains(r"  C:\Users\me\nvm\current: it is a link"),
+            "{report}"
+        );
+        assert!(
+            report.contains("lpm doctor sandbox-setup --tool-dir <directory>"),
+            "{report}"
+        );
     }
 
     /// Reparse-point roots must honor `strict_root` too: a junction
@@ -2535,8 +2544,10 @@ mod tests {
             /* strict_root */ false,
         );
         assert!(
-            best_effort_result.is_ok(),
-            "strict_root=false must downgrade reparse-point refusal to WARN+continue; got {best_effort_result:?}",
+            best_effort_result.as_ref().is_ok_and(|reason| reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("link"))),
+            "strict_root=false must downgrade reparse-point refusal to a reported skip; got {best_effort_result:?}",
         );
     }
 }

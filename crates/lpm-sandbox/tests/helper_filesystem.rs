@@ -118,6 +118,58 @@ fn helper_preserves_an_extended_drive_working_directory() {
     );
 }
 
+/// A script that fails because a program on PATH was out of the sandbox's
+/// reach shows only the shell's "not recognized", so the helper names the
+/// PATH directories it couldn't grant, and only when the script fails.
+#[test]
+fn a_failed_script_is_told_which_path_directories_it_could_not_read() {
+    // Grants don't follow links, so a junction on PATH stays unreadable.
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("real-tools");
+    let tools = temporary.path().join("tools");
+    fs::create_dir(&target).unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&tools)
+        .arg(&target)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
+    let system = std::env::var("SystemRoot").unwrap();
+    for (exit_code, reported) in [(3, true), (0, false)] {
+        let mut argv = helper_argv_base();
+        argv.extend([
+            "--delete-appcontainer-profile".into(),
+            "--working-dir".into(),
+            format!(r"{system}\System32"),
+            "--readable-dir-best-effort".into(),
+            tools.display().to_string(),
+            "--".into(),
+            format!(r"{system}\System32\cmd.exe"),
+            "/d".into(),
+            "/c".into(),
+            format!("exit {exit_code}"),
+        ]);
+        let output = Command::cargo_bin("lpm-sandbox-helper")
+            .unwrap()
+            .args(argv)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains(&format!("  {}: it is a link", tools.display())),
+            reported,
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("lpm doctor sandbox-setup --tool-dir"),
+            reported,
+            "{stderr}"
+        );
+    }
+}
+
 fn helper_argv_base() -> Vec<String> {
     vec![
         "--protocol-version".into(),
