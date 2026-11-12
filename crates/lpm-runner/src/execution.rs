@@ -133,6 +133,15 @@ impl ExecutionSignals {
         } else {
             status
         };
+        // The child got the interrupt too and may have ended well; the run
+        // was interrupted all the same, and lpm exits with 128 + signal.
+        #[cfg(windows)]
+        let status = if self.is_stopped() {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(128 + self.signal.load(Ordering::Acquire) as u32)
+        } else {
+            status
+        };
         Ok(crate::shell::CapturedOutput {
             status,
             stdout: bounded_text(&output.stdout),
@@ -497,6 +506,24 @@ mod windows_tests {
 
         assert!(matches!(result, Err(LpmError::ExitCode(130))), "{result:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A captured child that ends well on Ctrl+C still reports the
+    /// interruption, as lpm exits with it, so a `--json` envelope built
+    /// from the status doesn't say the run succeeded.
+    #[test]
+    fn a_captured_child_that_ends_well_on_an_interrupt_reports_it() {
+        let signals = ExecutionSignals::new().unwrap();
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
+        });
+
+        let output = signals.capture(&mut ping(1)).unwrap();
+        interrupter.join().unwrap();
+
+        assert_eq!(output.status.code(), Some(130));
     }
 
     #[test]

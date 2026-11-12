@@ -308,7 +308,10 @@ fn remove_owned_cmd_shim(
 #[cfg(windows)]
 fn generated_cmd_shim_target(content: &str) -> Option<&str> {
     match content.strip_prefix(lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE) {
-        Some(body) => lpm_common::symlink::windows_node_cmd_shim_target(body),
+        // Builds before this shape ran Node in an `IF EXIST` block after the
+        // same preamble; one installed by them is still LPM's to remove.
+        Some(body) => lpm_common::symlink::windows_node_cmd_shim_target(body)
+            .or_else(|| lpm_common::symlink::windows_block_cmd_shim_target(body, "%dp0%node.exe")),
         None => lpm_common::symlink::windows_block_cmd_shim_target(content, "%~dp0\\node.exe"),
     }
 }
@@ -1298,6 +1301,35 @@ mod tests {
 
     /// Shims name their target relative to their own directory, as
     /// `%dp0%..\<package>\…`.
+    /// Every shape LPM has written a `.cmd` shim in is read back to its
+    /// target: this one's, the `IF EXIST` block builds before it wrote after
+    /// the same preamble, and earlier releases' `%~dp0` block.
+    #[cfg(windows)]
+    #[test]
+    fn generated_cmd_shims_of_every_shape_name_their_target() {
+        let preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE;
+        let target = r"%dp0%..\tool\bin\tool.js";
+        for node_path in [None, Some("%dp0%..")] {
+            let current = format!(
+                "{preamble}{}",
+                lpm_common::symlink::windows_node_cmd_shim_body(target, node_path)
+            );
+            assert_eq!(generated_cmd_shim_target(&current), Some(target));
+        }
+        let block = format!(
+            "{preamble}@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"{target}\" %*\r\n) \
+             ELSE (\r\n  node \"{target}\" %*\r\n)\r\n"
+        );
+        assert_eq!(generated_cmd_shim_target(&block), Some(target));
+        let earlier = "@IF EXIST \"%~dp0\\node.exe\" (\r\n  \"%~dp0\\node.exe\" \"C:\\t.js\" %*\r\n) \
+                       ELSE (\r\n  node \"C:\\t.js\" %*\r\n)\r\n";
+        assert_eq!(generated_cmd_shim_target(earlier), Some(r"C:\t.js"));
+        assert_eq!(
+            generated_cmd_shim_target(&format!("{preamble}@node x.js %*\r\n")),
+            None
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn remove_owned_cmd_shim_removes_a_shim_relative_to_its_directory() {
