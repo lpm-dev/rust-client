@@ -67,6 +67,29 @@ fn read_record(path: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// The trees `path` records, as a cleanup must have them: a record it can't
+/// read, or that another release wrote, may name trees still granted, so it
+/// is an error rather than none. A record that doesn't exist names none.
+fn read_record_strictly(path: &Path) -> Result<Vec<PathBuf>, AppContainerError> {
+    let unreadable = |source: std::io::Error| AppContainerError::GrantRecord {
+        path: path.to_path_buf(),
+        source,
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(unreadable(error)),
+    };
+    match serde_json::from_slice::<TreeRecord>(&bytes) {
+        Ok(record) if record.version == TREE_RECORD_VERSION => Ok(record.trees),
+        Ok(record) => Err(unreadable(std::io::Error::other(format!(
+            "written by another release (version {})",
+            record.version
+        )))),
+        Err(error) => Err(unreadable(std::io::Error::other(error))),
+    }
+}
+
 fn write_record(path: &Path, trees: &[PathBuf]) -> Result<(), AppContainerError> {
     let record = TreeRecord {
         version: TREE_RECORD_VERSION,
@@ -148,7 +171,7 @@ pub(super) fn record_grants(record: &Path, granted: &[PathBuf]) -> Result<(), Ap
 /// as a cleanup run does once the package leaves the project.
 pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut failed = None;
-    for tree in read_record(record) {
+    for tree in read_record_strictly(record)? {
         if let Err(error) = revoke_tree(&tree, sid, true) {
             failed.get_or_insert(error);
         }
@@ -172,9 +195,10 @@ pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerErr
 /// through, needs nothing.
 ///
 /// With `every_entry`, an entry below the root that still grants `sid`
-/// fails the revoke as the root would: the profile must outlive it, as a
-/// new one for the same project and package gets the same SID. An entry
-/// that vanished or became a link meanwhile holds nothing of it.
+/// fails the revoke as the root would, and so does one it can't list or
+/// inspect, which may: the profile must outlive them, as a new one for the
+/// same project and package gets the same SID. An entry that vanished or
+/// became a link meanwhile holds nothing of it.
 fn revoke_tree(root: &Path, sid: PSID, every_entry: bool) -> Result<(), AppContainerError> {
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
@@ -195,23 +219,25 @@ fn revoke_tree(root: &Path, sid: PSID, every_entry: bool) -> Result<(), AppConta
     setup::remove_allowed_aces_where(root, granted)?;
     if metadata.is_dir() {
         let failed = Mutex::new(None);
-        visit_entries_below(
-            root,
-            &|path| match setup::remove_allowed_aces_where(path, granted) {
-                Ok(_) => {}
-                Err(error) if every_entry && !left_the_tree(&error) => {
-                    failed
-                        .lock()
-                        .expect("revoke failure lock")
-                        .get_or_insert(error);
-                }
-                Err(error) => {
-                    tracing::debug!(path = %path.display(), "skip DACL revoke: {error}");
-                }
-            },
-        );
+        let unvisited = visit_entries_below(root, &|path| match setup::remove_allowed_aces_where(
+            path, granted,
+        ) {
+            Ok(_) => {}
+            Err(error) if every_entry && !left_the_tree(&error) => {
+                failed
+                    .lock()
+                    .expect("revoke failure lock")
+                    .get_or_insert(error);
+            }
+            Err(error) => {
+                tracing::debug!(path = %path.display(), "skip DACL revoke: {error}");
+            }
+        });
         if let Some(error) = failed.into_inner().expect("revoke failure lock") {
             return Err(error);
+        }
+        if every_entry && let Some((path, source)) = unvisited.into_iter().next() {
+            return Err(AppContainerError::InspectDaclPath { path, source });
         }
     }
     Ok(())
@@ -702,6 +728,74 @@ mod tests {
         assert!(record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(true));
         std::fs::remove_dir(&locked).unwrap();
+    }
+
+    /// A record that can't be read may name trees still granted; the
+    /// profile and the record stay until one that can be read is cleaned up.
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_when_its_record_can_t_be_read() {
+        let name = unique_name("LpmIdentityUnreadable");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("grants.json");
+        std::fs::write(&record, b"not json").unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+
+        assert!(
+            matches!(&error, AppContainerError::GrantRecord { path, .. } if path == &record),
+            "{error:?}"
+        );
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+    }
+
+    /// Part of a tree the cleanup can't list may hold the identity's grant,
+    /// as the directory below it here does.
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_while_part_of_a_tree_can_t_be_listed() {
+        struct DeniedListing(PathBuf, String);
+        impl Drop for DeniedListing {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls.exe")
+                    .arg(&self.0)
+                    .args(["/remove:d", &format!("*{}", self.1)])
+                    .output();
+            }
+        }
+        let name = unique_name("LpmIdentityUnlisted");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        let hidden = tree.join("hidden");
+        std::fs::create_dir_all(hidden.join("inner")).unwrap();
+        grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        let user = setup::current_user_sid().unwrap();
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&hidden)
+            .args(["/deny", &format!("*{user}:(RD)")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let _denied = DeniedListing(hidden.clone(), user);
+        let record = root.path().join("grants.json");
+        record_grants(&record, std::slice::from_ref(&tree)).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let unprivileged = ProcessWithoutPrivileges::new();
+        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+        drop(unprivileged);
+
+        assert!(
+            matches!(&error, AppContainerError::InspectDaclPath { path, .. } if path == &hidden),
+            "{error:?}"
+        );
+        assert!(grants(&hidden.join("inner"), sid.0));
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
     }
 
     #[test]
