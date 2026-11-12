@@ -1209,7 +1209,7 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
     )
     .unwrap();
     assert!(
-        shim.contains(r#""%dp0%node.exe" "%dp0%..\tool\bin\tool.js" %*"#),
+        shim.contains(r#""%_prog%" "%dp0%..\tool\bin\tool.js" %*"#),
         "{shim}"
     );
     // A project path typed in another case than the folders on disk still
@@ -1243,7 +1243,7 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
     }
     let shim = windows_cmd_shim(bin, Path::new(r"D:\store\tool.js"), None).unwrap();
     assert!(
-        shim.contains(r#""%dp0%node.exe" "D:\store\tool.js" %*"#),
+        shim.contains(r#""%_prog%" "D:\store\tool.js" %*"#),
         "{shim}"
     );
     assert!(windows_cmd_shim(bin, Path::new(r"D:\R&D\tool.js"), None).is_err());

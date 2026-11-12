@@ -344,11 +344,14 @@ fn shim_file_name(manager: &str) -> String {
 /// files in the OEM code page, so an LPM path with non-ASCII characters
 /// written into it would break. It finds the launcher through the `%dp0%`
 /// [`lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE`] sets, not `%~dp0`,
-/// which names the current directory when a script calls `"npm.cmd"`.
+/// which names the current directory when a script calls `"npm.cmd"`, and
+/// ends the batch file before the launcher starts, as
+/// [`lpm_common::symlink::windows_node_cmd_shim_body`] explains, so Ctrl+C
+/// asks nothing.
 fn shim_script(lpm: &Path, manager: &str) -> Vec<u8> {
     if cfg!(windows) {
         format!(
-            "{}@\"%dp0%{manager}.exe\" %*\r\n@exit /b %ERRORLEVEL%\r\n",
+            "{}@ENDLOCAL & GOTO #_undefined_# 2>NUL || TITLE %COMSPEC% & \"%dp0%{manager}.exe\" %*\r\n",
             lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
         )
         .into_bytes()

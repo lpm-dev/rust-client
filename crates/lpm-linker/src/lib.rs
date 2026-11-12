@@ -44,8 +44,9 @@ pub use validation::{
 /// What a project's command shims look like, recorded with each install so
 /// that a project linked by a release that wrote them differently counts as
 /// stale and is linked again: on Windows, `.cmd` shims that name their
-/// targets from `%dp0%`; elsewhere they haven't changed.
-pub const BIN_SHIM_FORMAT: &str = if cfg!(windows) { "cmd-dp0" } else { "1" };
+/// targets from `%dp0%` and end their batch file before Node starts;
+/// elsewhere they haven't changed.
+pub const BIN_SHIM_FORMAT: &str = if cfg!(windows) { "cmd-dp0-goto" } else { "1" };
 
 /// Clone a complete directory tree with one copy-on-write filesystem operation when supported.
 /// Returns `false` when the platform or filesystem cannot provide that operation.
