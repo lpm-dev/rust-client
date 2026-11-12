@@ -69,7 +69,7 @@ pub(super) async fn stage_sandbox_helper(
     verify_release_asset_digest(release, asset.sha256.clone(), asset_name)?;
     if human_output {
         install_ui::done_untrusted(&format!(
-            "Verified {asset_name} ({}) against the same signed checksums",
+            "Verified {asset_name} ({}) against v{version}'s signed checksums",
             lpm_common::format_bytes(asset.byte_len as u64)
         ));
     }
@@ -189,7 +189,19 @@ impl HelperSwap {
     /// executable can be renamed but not removed or replaced, so it is
     /// moved aside, under a name a later update sweeps, before the earlier
     /// one comes back.
-    pub(super) fn undo(self) -> std::io::Result<()> {
+    pub(super) fn undo(self) -> Result<(), String> {
+        let earlier = self
+            .backup
+            .as_deref()
+            .or(self.moved_aside.as_deref())
+            .map(plain_display);
+        self.put_back().map_err(|error| match earlier {
+            Some(earlier) => format!("{error}; the earlier one is at {earlier}"),
+            None => error.to_string(),
+        })
+    }
+
+    fn put_back(&self) -> std::io::Result<()> {
         let file_name = self
             .path
             .file_name()
@@ -229,6 +241,8 @@ impl HelperSwap {
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SandboxHelperStatus {
+    /// It is already the release's.
+    Current,
     /// It was replaced with the release's.
     Updated,
     /// The release's was put there, where there was none.
@@ -267,14 +281,17 @@ impl SandboxHelperReport {
     pub(super) fn to_json(&self) -> serde_json::Value {
         let mut json = serde_json::json!({
             "status": match &self.status {
+                SandboxHelperStatus::Current => "current",
                 SandboxHelperStatus::Updated => "updated",
                 SandboxHelperStatus::Installed => "installed",
                 SandboxHelperStatus::NotInRelease => "not_in_release",
                 SandboxHelperStatus::Failed(_) => "failed",
             },
             "path": plain_display(&self.path),
-            "backup_path": self.backup.as_deref().map(plain_display),
         });
+        if let Some(backup) = &self.backup {
+            json["backup_path"] = plain_display(backup).into();
+        }
         if let SandboxHelperStatus::Failed(error) = &self.status {
             json["error"] = error.clone().into();
         }
@@ -299,7 +316,7 @@ impl SandboxHelperReport {
             SandboxHelperStatus::Installed => {
                 install_ui::done_untrusted(&format!("Installed the sandbox helper at {path}"));
             }
-            SandboxHelperStatus::NotInRelease => {}
+            SandboxHelperStatus::Current | SandboxHelperStatus::NotInRelease => {}
             SandboxHelperStatus::Failed(error) => install_ui::warn_untrusted(&format!(
                 "couldn't bring the sandbox helper at {path} to this release's: {error}; run \
                  `lpm self-update` again to retry"
@@ -366,11 +383,23 @@ fn sandbox_helper_release(helper: &Path) -> Option<String> {
         .map(|release| release.trim().to_owned())
 }
 
+/// Whether a self-update on release `version` replaces a helper that says
+/// it comes from `reported`: unless it is this release's, or a later one's,
+/// which another account's update of the same installation may have put
+/// there.
+#[cfg(any(windows, test))]
+fn helper_needs_release(reported: Option<&str>, version: &str) -> bool {
+    reported.is_none_or(|reported| {
+        reported != version && !crate::release_lookup::is_newer_semver(reported, version)
+    })
+}
+
 /// Puts release `version`'s sandbox helper beside lpm when the one there is
-/// another release's, or there is none, for a standalone install already on
+/// an earlier release's, or none, for a standalone install already on
 /// `version`. The update to this release may have run under an earlier lpm,
 /// which left the helper as it was. A package manager's install brings its
-/// own helper. Says what it did, if anything; a failure leaves lpm as it is.
+/// own helper, and one where self-update can't change lpm is left alone.
+/// Says what it found or did; a failure leaves lpm as it is.
 #[cfg(windows)]
 pub(super) async fn refresh_stale_sandbox_helper(
     version: &str,
@@ -378,10 +407,6 @@ pub(super) async fn refresh_stale_sandbox_helper(
     account_home: &Path,
     human_output: bool,
 ) -> Option<SandboxHelperReport> {
-    let path = current_executable.with_file_name(SANDBOX_HELPER_FILE_NAME);
-    if sandbox_helper_release(&path).as_deref() == Some(version) {
-        return None;
-    }
     let standalone = update_site(account_home, current_executable)
         .and_then(|site| {
             detect_install_method_from_path_with_roots(
@@ -390,48 +415,77 @@ pub(super) async fn refresh_stale_sandbox_helper(
             )
         })
         .is_ok_and(|method| method == InstallMethod::Standalone);
-    if !standalone {
+    if !standalone || validate_standalone_install_location(current_executable).is_err() {
         return None;
     }
-    let refreshed = async {
-        let _installation_lock = windows_trust::try_acquire_installation_lock(current_executable)
-            .map_err(LpmError::Io)?
-            .ok_or_else(|| {
-                LpmError::SelfUpdate(
-                    "another self-update is changing this LPM installation".to_string(),
-                )
-            })?;
-        validate_standalone_install_location(current_executable)?;
-        let (platform, ext) = detect_platform()?;
-        let client = release_http_client()?;
-        let release = fetch_verified_release_manifest(&client, version, human_output).await?;
-        let Some(staged) = stage_sandbox_helper(
-            &client,
-            &release,
-            version,
-            &format!("lpm-sandbox-helper-{platform}{ext}"),
-            &path,
-            human_output,
-        )
-        .await?
-        else {
-            return Ok(SandboxHelperReport::new(
-                SandboxHelperStatus::NotInRelease,
-                path.clone(),
-            ));
-        };
-        validate_standalone_install_location(current_executable)?;
-        Ok::<_, LpmError>(install_staged_helper(staged)?.finish())
-    }
-    .await;
-    let mut report = refreshed.unwrap_or_else(|error| {
-        SandboxHelperReport::new(SandboxHelperStatus::Failed(error.to_string()), path)
-    });
+    let path = current_executable.with_file_name(SANDBOX_HELPER_FILE_NAME);
+    let mut report = refresh_sandbox_helper(version, current_executable, &path, human_output)
+        .await
+        .unwrap_or_else(|error| {
+            SandboxHelperReport::new(SandboxHelperStatus::Failed(error.to_string()), path)
+        });
     report.named_elsewhere = sandbox_helper_named_elsewhere(current_executable);
     if human_output {
         report.print();
     }
     Some(report)
+}
+
+/// [`refresh_stale_sandbox_helper`]'s work, under the installation lock, so
+/// the helper it asks is the one it replaces.
+#[cfg(windows)]
+async fn refresh_sandbox_helper(
+    version: &str,
+    current_executable: &Path,
+    path: &Path,
+    human_output: bool,
+) -> Result<SandboxHelperReport, LpmError> {
+    let _installation_lock = windows_trust::try_acquire_installation_lock(current_executable)
+        .map_err(LpmError::Io)?
+        .ok_or_else(|| {
+            LpmError::SelfUpdate(
+                "another self-update is changing this LPM installation".to_string(),
+            )
+        })?;
+    if !helper_needs_release(sandbox_helper_release(path).as_deref(), version) {
+        return Ok(SandboxHelperReport::new(
+            SandboxHelperStatus::Current,
+            path.to_path_buf(),
+        ));
+    }
+    validate_standalone_install_location(current_executable)?;
+    let (platform, ext) = detect_platform()?;
+    let client = release_http_client()?;
+    let release = fetch_verified_release_manifest(&client, version, human_output).await?;
+    let Some(staged) = stage_sandbox_helper(
+        &client,
+        &release,
+        version,
+        &format!("lpm-sandbox-helper-{platform}{ext}"),
+        path,
+        human_output,
+    )
+    .await?
+    else {
+        return Ok(SandboxHelperReport::new(
+            SandboxHelperStatus::NotInRelease,
+            path.to_path_buf(),
+        ));
+    };
+    validate_standalone_install_location(current_executable)?;
+    let mut report = install_staged_helper(staged)?.finish();
+    // One that still names another release would be replaced on every run.
+    let reported = sandbox_helper_release(path);
+    if reported.as_deref() != Some(version) {
+        report.status = SandboxHelperStatus::Failed(format!(
+            "release v{version}'s sandbox helper is in place but says it is {}",
+            reported.map_or_else(
+                || "of no release".to_string(),
+                |release| format!("v{release}")
+            )
+        ));
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -581,6 +635,18 @@ mod tests {
         );
     }
 
+    /// A helper is replaced unless it is this release's or a later one's,
+    /// which another account's update may have put there meanwhile; one
+    /// that doesn't say, as every helper before this one, is replaced.
+    #[test]
+    fn a_helper_from_another_release_is_replaced_but_never_downgraded() {
+        assert!(helper_needs_release(None, "0.87.0"));
+        assert!(helper_needs_release(Some("0.86.0"), "0.87.0"));
+        assert!(!helper_needs_release(Some("0.87.0"), "0.87.0"));
+        assert!(!helper_needs_release(Some("0.88.0"), "0.87.0"));
+        assert!(helper_needs_release(Some("0.87.0-nightly.1"), "0.87.0"));
+    }
+
     /// `--json` says what became of the helper, and names one
     /// `LPM_SANDBOX_HELPER` points at instead, by paths a person would
     /// type.
@@ -609,10 +675,14 @@ mod tests {
         );
         assert_eq!(failed.to_json()["status"], "failed");
         assert_eq!(failed.to_json()["error"], "offline");
-        assert_eq!(
+        let not_in_release =
             SandboxHelperReport::new(SandboxHelperStatus::NotInRelease, PathBuf::from("x"))
-                .to_json()["status"],
-            "not_in_release"
+                .to_json();
+        assert_eq!(not_in_release["status"], "not_in_release");
+        assert!(not_in_release.get("backup_path").is_none());
+        assert_eq!(
+            SandboxHelperReport::new(SandboxHelperStatus::Current, PathBuf::from("x")).to_json()["status"],
+            "current"
         );
         assert_eq!(
             plain_display(Path::new(r"\\?\Volume{0}\lpm.exe")),

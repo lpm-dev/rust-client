@@ -2291,19 +2291,23 @@ async fn run_standalone_update(
         let StagedAsset {
             temporary, sha256, ..
         } = assets.staged_binary;
+        // The helper goes beside lpm, so where lpm is must still be a place
+        // only its owner can change, as it is checked again before lpm itself
+        // is replaced. One that can't be swapped doesn't hold lpm back: the
+        // next self-update finds it stale and tries again.
         #[cfg(windows)]
         let helper = match assets.staged_helper {
             Some(staged) => {
-                // The helper goes beside lpm, so where lpm is must still be
-                // a place only its owner can change, as it is checked again
-                // before lpm itself is replaced.
                 validate_standalone_install_location(current_executable)?;
-                Some(install_staged_helper(staged)?)
+                Some(install_staged_helper(staged).map_err(|error| error.to_string()))
             }
             None => None,
         };
         #[cfg(windows)]
-        let helper_journal = helper.as_ref().and_then(HelperSwap::journal_entry);
+        let helper_journal = helper
+            .as_ref()
+            .and_then(|swap| swap.as_ref().ok())
+            .and_then(HelperSwap::journal_entry);
         #[cfg(not(windows))]
         let helper_journal = None;
         let installed = install_staged_binary_noting(
@@ -2319,24 +2323,24 @@ async fn run_standalone_update(
         }
         #[cfg(windows)]
         {
+            let path = current_executable.with_file_name(SANDBOX_HELPER_FILE_NAME);
             let mut report = match (helper, installed) {
-                (Some(swap), Ok(())) => swap.finish(),
-                (None, Ok(())) => SandboxHelperReport::new(
-                    SandboxHelperStatus::NotInRelease,
-                    current_executable.with_file_name(SANDBOX_HELPER_FILE_NAME),
-                ),
-                (Some(swap), Err(error)) => {
-                    let path = swap.path.clone();
+                (Some(Ok(swap)), Ok(())) => swap.finish(),
+                (Some(Err(reason)), Ok(())) => {
+                    SandboxHelperReport::new(SandboxHelperStatus::Failed(reason), path)
+                }
+                (None, Ok(())) => SandboxHelperReport::new(SandboxHelperStatus::NotInRelease, path),
+                (Some(Ok(swap)), Err(error)) => {
                     return Err(match swap.undo() {
                         Ok(()) => error,
                         Err(undo_error) => LpmError::SelfUpdate(format!(
-                            "{error}; nor could the earlier sandbox helper be put back \
-                             ({undo_error}), so this release's stays at {}",
+                            "{error}; nor could the earlier sandbox helper be put back at {}: \
+                             {undo_error}",
                             plain_display(&path)
                         )),
                     });
                 }
-                (None, Err(error)) => return Err(error),
+                (Some(Err(_)) | None, Err(error)) => return Err(error),
             };
             report.named_elsewhere = sandbox_helper_named_elsewhere(current_executable);
             if human_output {

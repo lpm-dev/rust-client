@@ -235,7 +235,7 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "renames an exclusively created same-directory NamedTempFile over the sandbox helper after moving a possibly running predecessor aside, with rollback",
     ),
     (
-        "crates/lpm-cli/src/commands/self_update/sandbox_helper.rs::undo",
+        "crates/lpm-cli/src/commands/self_update/sandbox_helper.rs::put_back",
         "renames a possibly running helper aside and its predecessor back, as a running executable can't be replaced, restoring the swap on failure",
     ),
     (
