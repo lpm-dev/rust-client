@@ -750,12 +750,21 @@ fn warn_execution_context_changed(script_name: &str, expected: &CacheContext) {
     {
         Ok(Some(path)) => tracing::warn!(
             "task '{script_name}' writes {}, which its cache inputs also match, so it is never reused from the cache; set `inputs` in lpm.json to leave out generated files",
-            lpm_common::sanitize_terminal_inline(&path.display().to_string())
+            lpm_common::sanitize_terminal_inline(&pattern_spelling(&path))
         ),
         _ => tracing::warn!(
             "task cache contract, inputs, dependencies, or runtime changed while task '{script_name}' ran; skipping cache publication"
         ),
     }
+}
+
+/// `path`, relative to the project, spelled as `inputs` and `outputs`
+/// patterns spell paths, with `/` on every platform.
+fn pattern_spelling(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn store_cache_with_context(
@@ -840,6 +849,14 @@ fn store_cache_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overlap warning names the file as an `inputs` pattern would, so
+    /// it reads the same on Windows, whose paths join with `\`.
+    #[test]
+    fn a_project_path_is_spelled_with_forward_slashes() {
+        let path = Path::new("src").join("generated").join("value.js");
+        assert_eq!(pattern_spelling(&path), "src/generated/value.js");
+    }
 
     fn completed_identity(value: &str) -> Arc<CompletedTaskCacheIdentity> {
         Arc::new(CompletedTaskCacheIdentity {

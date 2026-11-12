@@ -3020,6 +3020,28 @@ mod test_env {
         _guard: MutexGuard<'static, ()>,
     }
 
+    /// `vars` as the process applies them. Windows names a variable one way
+    /// whatever its case, so there clearing `npm_config_userconfig` after
+    /// setting `NPM_CONFIG_USERCONFIG`, two variables elsewhere, would undo
+    /// the set; a clear of a name the same update sets is left out.
+    pub(crate) fn applicable(
+        vars: Vec<(&'static str, Option<OsString>)>,
+    ) -> Vec<(&'static str, Option<OsString>)> {
+        if !cfg!(windows) {
+            return vars;
+        }
+        let set = vars
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        vars.into_iter()
+            .filter(|(key, value)| {
+                value.is_some() || !set.iter().any(|set| set.eq_ignore_ascii_case(key))
+            })
+            .collect()
+    }
+
     impl ScopedEnv {
         pub(crate) fn set<I>(vars: I) -> Self
         where
@@ -3032,7 +3054,7 @@ mod test_env {
         where
             I: IntoIterator<Item = (&'static str, Option<OsString>)>,
         {
-            let vars = vars.into_iter().collect::<Vec<_>>();
+            let vars = applicable(vars.into_iter().collect());
             let guard = lock_env();
             let previous = vars
                 .iter()
@@ -3074,6 +3096,28 @@ mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
+    #[test]
+    fn test_env_keeps_a_set_its_other_spelling_would_clear_on_windows() {
+        let applied = super::test_env::applicable(vec![
+            ("NPM_CONFIG_USERCONFIG", Some("custom.npmrc".into())),
+            ("npm_config_userconfig", None),
+            ("npm_config_globalconfig", None),
+        ]);
+        let names = applied.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        if cfg!(windows) {
+            assert_eq!(names, ["NPM_CONFIG_USERCONFIG", "npm_config_globalconfig"]);
+        } else {
+            assert_eq!(
+                names,
+                [
+                    "NPM_CONFIG_USERCONFIG",
+                    "npm_config_userconfig",
+                    "npm_config_globalconfig"
+                ]
+            );
+        }
+    }
+
     struct LocalEnvGuard {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -3083,7 +3127,7 @@ mod tests {
         where
             I: IntoIterator<Item = (&'static str, Option<std::ffi::OsString>)>,
         {
-            let vars = vars.into_iter().collect::<Vec<_>>();
+            let vars = super::test_env::applicable(vars.into_iter().collect());
             let previous = vars
                 .iter()
                 .map(|(key, _)| (*key, std::env::var_os(key)))
