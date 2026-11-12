@@ -178,9 +178,7 @@ pub(crate) mod windows_security {
     #[cfg(test)]
     pub(crate) fn descriptor_sddl(file: &std::fs::File) -> std::io::Result<String> {
         use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
-        };
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 
         let mut descriptor = null_mut();
         // SAFETY: The output descriptor pointer is initialized to null. `file` remains open for
@@ -200,7 +198,43 @@ pub(crate) mod windows_security {
         if status != ERROR_SUCCESS {
             return Err(std::io::Error::from_raw_os_error(status as i32));
         }
-        let descriptor = LocalSecurityDescriptor(descriptor);
+        descriptor_text(&LocalSecurityDescriptor(descriptor))
+    }
+
+    /// How SDDL spells the account `sid`: by an alias for some accounts,
+    /// such as `LA` for the built-in Administrator, which some CI runners
+    /// run as, else by the SID itself.
+    #[cfg(test)]
+    pub(crate) fn sddl_account(sid: &str) -> std::io::Result<String> {
+        let encoded = format!("D:(A;;FA;;;{sid})")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = null_mut();
+        // SAFETY: `encoded` is NUL-terminated and `descriptor` receives an
+        // allocation `LocalSecurityDescriptor` releases.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                encoded.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let text = descriptor_text(&LocalSecurityDescriptor(descriptor))?;
+        text.strip_prefix("D:(A;;FA;;;")
+            .and_then(|account| account.strip_suffix(')'))
+            .map(str::to_owned)
+            .ok_or_else(|| std::io::Error::other(format!("unexpected SDDL: {text}")))
+    }
+
+    #[cfg(test)]
+    fn descriptor_text(descriptor: &LocalSecurityDescriptor) -> std::io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+
         let mut text = null_mut();
         let mut text_len = 0;
         // SAFETY: `descriptor` is valid for the call. `text` and `text_len` are initialized output
@@ -219,9 +253,12 @@ pub(crate) mod windows_security {
         }
         // SAFETY: The conversion function returned a valid UTF-16 allocation containing
         // `text_len` code units. It remains allocated until `LocalFree` below.
+        // The length counts the terminating NUL.
         let decoded = String::from_utf16_lossy(unsafe {
             std::slice::from_raw_parts(text, text_len as usize)
-        });
+        })
+        .trim_end_matches('\0')
+        .to_owned();
         // SAFETY: `text` is allocated by the conversion function and is released once here.
         unsafe {
             let _ = LocalFree(text.cast());
@@ -1942,10 +1979,12 @@ mod tests {
         assert!(sddl.contains(";;;OW)"), "DACL omits owner rights: {sddl}");
         // An elevated terminal makes the Administrators the owner; the same
         // user's normal terminal still gets in.
-        let user = lpm_common::owner_only::process_user_sid().unwrap();
+        let user =
+            windows_security::sddl_account(&lpm_common::owner_only::process_user_sid().unwrap())
+                .unwrap();
         assert!(
             sddl.contains(&format!(";;;{user})")),
-            "DACL omits the user: {sddl}"
+            "DACL omits the user ({user}): {sddl}"
         );
         assert!(sddl.contains(";;;SY)"), "DACL omits SYSTEM: {sddl}");
     }
