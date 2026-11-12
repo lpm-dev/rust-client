@@ -1192,10 +1192,20 @@ pub(super) fn prepare<'a>(
         {
             continue;
         }
-        let canonical = tool
+        let entry = match tool
             .canonicalize()
-            .map_err(|error| failure(error.to_string()))?;
-        let entry = grant_for(&canonical, Permission::ToolReadExecute, &user_sid)?;
+            .map_err(|error| failure(error.to_string()))
+            .and_then(|canonical| grant_for(&canonical, Permission::ToolReadExecute, &user_sid))
+        {
+            Ok(entry) => entry,
+            // A tool directory this user can't open can't be checked for a
+            // capability either: it goes without, and the grant that
+            // follows reports it if the script fails.
+            Err(error) => {
+                tracing::debug!(path = %tool.display(), "skip tool capability: {error}");
+                continue;
+            }
+        };
         // A tool capability can authorize reads independently of the deny
         // for this invocation's SID. Exclude both ancestors and descendants
         // of protected paths from the capability set.

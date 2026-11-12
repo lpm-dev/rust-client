@@ -1014,7 +1014,8 @@ fn build_capability_attr(
 /// preserving every other trustee's ACL entries.
 ///
 /// A best-effort root it can't grant isn't an error: why comes back for
-/// the caller to report if the script fails. A link is skipped silently.
+/// the caller to report if the script fails. A link, or a path through
+/// one, is skipped silently.
 fn grant_dacl_ace_to_tree(
     root: &Path,
     beneath: Option<&Path>,
@@ -1023,17 +1024,19 @@ fn grant_dacl_ace_to_tree(
     strict_root: bool,
 ) -> Result<Option<String>, AppContainerError> {
     // The root must exist + must not be a reparse point. Missing
-    // paths are silently skipped.
+    // paths are silently skipped, and so is a strict root that can't
+    // be inspected; a best-effort one is reported.
     let meta = match std::fs::symlink_metadata(root) {
         Ok(m) => m,
-        Err(_) => {
+        Err(error) if strict_root || error.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(
                 target: "lpm_sandbox::helper_appcontainer",
-                "skip DACL grant on nonexistent path {}",
+                "skip DACL grant on {}: {error}",
                 root.display(),
             );
             return Ok(None);
         }
+        Err(error) => return Ok(Some(format!("this user can't open it: {error}"))),
     };
     if is_reparse_point(&meta) {
         if strict_root {
@@ -1105,12 +1108,10 @@ fn grant_dacl_ace_to_tree(
             win32_error: ERROR_ACCESS_DENIED,
             ..
         }) => return Ok(Some("this user can't change its permissions".to_owned())),
-        Err(AppContainerError::ReparsePointRoot { .. }) => {
-            return Ok(Some(
-                "it is reached through a link inside a writable folder, which the sandbox doesn't follow"
-                    .to_owned(),
-            ));
-        }
+        // Like a link on PATH, a link in a writable folder that the path
+        // passes through leads wherever it points, which another grant
+        // may well reach.
+        Err(AppContainerError::ReparsePointRoot { .. }) => return Ok(None),
         Err(e) => return Ok(Some(e.to_string())),
     };
 
@@ -1136,7 +1137,7 @@ fn unreadable_tools_report(unreadable: &[(PathBuf, String)]) -> String {
         return String::new();
     }
     let mut report = String::from(
-        "lpm-sandbox-helper: the script ran without access to these directories on PATH:\n",
+        "lpm-sandbox-helper: the sandbox couldn't give the script access to these directories on PATH:\n",
     );
     for (directory, reason) in unreadable {
         let _ = writeln!(report, "  {}: {reason}", directory.display());
