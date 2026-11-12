@@ -904,10 +904,12 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
             "nested-comspec":"\"%ComSpec%\" /d /c if 1==1",
             "nested-comspec-part":"\"%ComSpec:~0%\" /d /c \"node -e 0 &&\"",
             "closed-block":"if exist nonexistent (node -e 0 && capture)",
-            "piped-closed-block":"node -e 0 | if 1==2 (echo a & capture)"
+            "piped-closed-block":"node -e 0 | if 1==2 (echo a & capture)",
+            "expanded-folded":"node -e 0 %ᾳ%"
         }"#,
     );
-    project.write_file(".env", "CHAIN=\"&&\"\n");
+    // Windows takes `ᾳ` for `ᾼ`, though Rust upper-cases both to `ΑΙ`.
+    project.write_file(".env", "CHAIN=\"&&\"\nᾼ=\"&&\"\n");
 
     let mkdir: &[&str] = &["mkdir", "INJECTEDDIR"];
     for (script, args) in [
@@ -928,6 +930,7 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
         ("nested-comspec-part", mkdir),
         ("closed-block", &["else", "mkdir", "INJECTEDDIR"]),
         ("piped-closed-block", &["else", "mkdir", "INJECTEDDIR"]),
+        ("expanded-folded", mkdir),
     ] {
         let output = lpm(&project)
             .args(["run", script, "--"])
@@ -947,6 +950,63 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
         assert!(!project.file_exists("plain-target.txt"));
         assert!(!project.file_exists("args.json"), "{script} ran");
     }
+}
+
+/// Part of a variable holds nothing its value doesn't, so a script that uses
+/// one in an argument still gets arguments; and a `)` that closes no block
+/// is read as any other character, so it only keeps cmd.exe's readings of
+/// the arguments from being known.
+#[cfg(windows)]
+#[test]
+fn run_passes_arguments_past_part_of_a_variable_and_a_lone_parenthesis() {
+    let project = windows_argument_capture_project(
+        r#"{
+            "tagged":"capture --tag=%TIME:~0,2%",
+            "slashed":"capture %CD:\\=/%",
+            "lone-parenthesis":"capture :) a b"
+        }"#,
+    );
+
+    let watch: &[&str] = &["--watch", "two words"];
+    for (script, args, recorded_tail) in [
+        ("tagged", watch, watch),
+        ("slashed", watch, watch),
+        (
+            "lone-parenthesis",
+            &["--watch"],
+            &[":)", "a", "b", "--watch"],
+        ),
+    ] {
+        let _ = std::fs::remove_file(project.path().join("args.json"));
+        let output = lpm(&project)
+            .args(["run", script, "--"])
+            .args(args)
+            .output()
+            .expect("run script with part of a variable");
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recorded: Vec<String> = serde_json::from_value(recorded_arguments(&project, &output))
+            .expect("recorded arguments are strings");
+        assert!(
+            recorded.len() >= recorded_tail.len()
+                && recorded[recorded.len() - recorded_tail.len()..] == *recorded_tail,
+            "{script}: {recorded:?}"
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["run", "lone-parenthesis", "--", "two words"])
+        .output()
+        .expect("run script after a lone parenthesis");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot pass"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn strip_ansi(s: &str) -> String {

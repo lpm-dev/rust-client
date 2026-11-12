@@ -58,35 +58,18 @@ fn mark_script_child_env(env_vars: &mut dotenv::ChildEnv) {
     env_vars.insert_runtime(LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
 }
 
-/// Escape a runtime argument so the platform shell treats it as data.
+/// Append `arg` to `command` in single quotes, so `sh -c` takes it as data.
 #[cfg(not(windows))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the Windows implementation can reject unsafe cmd.exe arguments"
-)]
-fn shell_quote_arg(
-    arg: &str,
-    _script_cmd: &str,
-    _project_dir: &Path,
-    _path: &str,
-    _envs: &HashMap<String, String>,
-) -> Result<String, LpmError> {
-    let escaped = arg.replace('\'', "'\\''");
-    Ok(format!("'{escaped}'"))
-}
-
-#[cfg(windows)]
-fn shell_quote_arg(
-    arg: &str,
-    script_cmd: &str,
-    project_dir: &Path,
-    path: &str,
-    envs: &HashMap<String, String>,
-) -> Result<String, LpmError> {
-    windows_shell_quote_arg(
-        arg,
-        windows_argument_receiver(script_cmd, project_dir, path, envs),
-    )
+fn push_posix_quoted_arg(command: &mut String, arg: &str) {
+    command.push('\'');
+    for character in arg.chars() {
+        if character == '\'' {
+            command.push_str("'\\''");
+        } else {
+            command.push(character);
+        }
+    }
+    command.push('\'');
 }
 
 /// What gets the arguments appended to a script run through cmd.exe: the
@@ -251,8 +234,9 @@ fn windows_argument_receiver(
     envs: &HashMap<String, String>,
 ) -> WindowsArgumentReceiver {
     let project_value = |name: &str| {
+        let name = lpm_env::EnvName::new(name);
         envs.iter()
-            .find(|(key, _)| windows_same_variable_name(key, name))
+            .find(|(key, _)| lpm_env::EnvName::new(key) == name)
             .map(|(_, value)| value.clone())
     };
     // cmd.exe expands `%NAME%` before it reads the commands on the line.
@@ -262,7 +246,7 @@ fn windows_argument_receiver(
         } else if name.contains('=') {
             // Only cmd.exe's hidden variables have one, at the start.
             windows_dynamic_variable(name, script_cmd, project_dir)
-        } else if name.eq_ignore_ascii_case("PATH") {
+        } else if windows_same_variable_name(name, "PATH") {
             Some(path.to_owned())
         } else {
             project_value(name)
@@ -305,26 +289,26 @@ fn windows_argument_receiver(
     }
 }
 
-/// Whether Windows takes `a` and `b` as one variable's name: whatever their
-/// case, past ASCII too, a character at a time, so `ß` is not `SS` (from
-/// review).
+/// Whether Windows takes `a` and `b` as one variable's name, upper-casing
+/// them a UTF-16 unit at a time with its own table, so `ß` is not `SS` and
+/// `ᾳ` is `ᾼ`, where Rust's upper-casing differs on hundreds of characters.
 #[cfg(windows)]
 fn windows_same_variable_name(a: &str, b: &str) -> bool {
-    let upper = |character: char| {
-        let mut upper = character.to_uppercase();
-        match (upper.next(), upper.next()) {
-            (Some(single), None) => single,
-            _ => character,
-        }
-    };
-    a.chars().map(upper).eq(b.chars().map(upper))
+    lpm_env::EnvName::new(a) == lpm_env::EnvName::new(b)
 }
 
+/// Stands, in [`windows_expand_variables`]'s output, for part of a set
+/// variable (`%NAME:~1%`) or one with something replaced (`%NAME:a=b%`),
+/// which aren't worked out, so could be anything made of the value and the
+/// reference. A noncharacter, which Unicode keeps for a program's own use.
+#[cfg(any(test, windows))]
+const WINDOWS_UNWORKED_EXPANSION: char = '\u{FDD0}';
+
 /// `script_cmd` as cmd.exe expands it on a command line: each `%NAME%` that
-/// `value` gives a value replaced by it. An unset name keeps its `%`, and
-/// cmd.exe reads on from the `%` that closed it, which may open the next;
-/// a reference with a `:` (`%NAME:~1%`, `%NAME:a=b%`) is left as written,
-/// to be read as a variable.
+/// `value` gives a value replaced by it, and each `%NAME:~1%` or
+/// `%NAME:a=b%` by [`WINDOWS_UNWORKED_EXPANSION`]. An unset name keeps its
+/// `%`, and cmd.exe reads on from the `%` that closed it, which may open the
+/// next.
 #[cfg(any(test, windows))]
 fn windows_expand_variables(script_cmd: &str, value: &dyn Fn(&str) -> Option<String>) -> String {
     let mut expanded = String::with_capacity(script_cmd.len());
@@ -344,9 +328,7 @@ fn windows_expand_variables(script_cmd: &str, value: &dyn Fn(&str) -> Option<Str
                 rest = &after[end + 1..];
             }
             Some(_) => {
-                expanded.push('%');
-                expanded.push_str(reference);
-                expanded.push('%');
+                expanded.push(WINDOWS_UNWORKED_EXPANSION);
                 rest = &after[end + 1..];
             }
             None => {
@@ -368,18 +350,28 @@ fn windows_expand_variables(script_cmd: &str, value: &dyn Fn(&str) -> Option<Str
 /// included; and digits, a date, a time or its own directory for the rest.
 #[cfg(windows)]
 fn windows_dynamic_variable(name: &str, script_cmd: &str, project_dir: &Path) -> Option<String> {
-    match name.to_ascii_uppercase().as_str() {
-        "CD" | "__CD__" => Some(project_dir.display().to_string()),
-        "CMDCMDLINE" => Some(format!("\"{script_cmd}\"")),
-        hidden if hidden.starts_with('=') => Some("\"".to_owned()),
-        "CMDEXTVERSION"
-        | "DATE"
-        | "ERRORLEVEL"
-        | "HIGHESTNUMANODENUMBER"
-        | "RANDOM"
-        | "TIME"
-        | "__APPDIR__" => Some(String::new()),
-        _ => None,
+    let is = |dynamic: &str| windows_same_variable_name(name, dynamic);
+    if name.starts_with('=') {
+        Some("\"".to_owned())
+    } else if is("CD") || is("__CD__") {
+        Some(project_dir.display().to_string())
+    } else if is("CMDCMDLINE") {
+        Some(format!("\"{script_cmd}\""))
+    } else if [
+        "CMDEXTVERSION",
+        "DATE",
+        "ERRORLEVEL",
+        "HIGHESTNUMANODENUMBER",
+        "RANDOM",
+        "TIME",
+        "__APPDIR__",
+    ]
+    .into_iter()
+    .any(is)
+    {
+        Some(String::new())
+    } else {
+        None
     }
 }
 
@@ -424,14 +416,14 @@ fn windows_expansion_may_change_commands(
     percents.windows(2).any(|pair| {
         let ((start, quoted), (end, _)) = (pair[0], pair[1]);
         let reference = &script_cmd[start + 1..end];
-        // `%NAME:~1,3%` and `%NAME:old=new%` expand NAME, changed, to what
-        // isn't worked out here, so any such reference to a set variable
-        // counts (from review: `"%ComSpec:~0%"` is cmd.exe).
-        match reference.split_once(':') {
-            Some((name, _)) => value(name).is_some(),
-            None => value(reference)
-                .is_some_and(|value| changes(&value, quoted) || changes(reference, false)),
-        }
+        // `%NAME:~1,3%` takes part of NAME's value, and `%NAME:old=new%`
+        // replaces in it, so what either gives is made of the value and the
+        // reference. The reference goes from the line, so what it holds
+        // counts too, unless it is all in quotes.
+        let name = reference
+            .split_once(':')
+            .map_or(reference, |(name, _)| name);
+        value(name).is_some_and(|value| changes(&value, quoted) || changes(reference, quoted))
     })
 }
 
@@ -644,6 +636,9 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // Where the pipe's own cmd.exe starts reading the rest of the line.
     let mut piped_from = None;
     let mut grouped = false;
+    // Blocks a `(` may have opened and no `)` closed yet. Only a `(` where a
+    // command starts opens one, but every `(` is counted.
+    let mut open_blocks = 0usize;
     // Whether the last command closes a block with `)`.
     let mut closes = false;
     let mut quoted = false;
@@ -665,10 +660,17 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
                 redirects_last = false;
                 continue;
             }
-            '(' => grouped = true,
+            '(' => {
+                grouped = true;
+                open_blocks += 1;
+            }
             ')' => {
                 grouped = true;
-                closes = true;
+                // With no block open, cmd.exe reads a `)` as it reads a letter.
+                if open_blocks > 0 {
+                    open_blocks -= 1;
+                    closes = true;
+                }
             }
             '&' if matches!(previous, '<' | '>') => {}
             '&' | '|' => {
@@ -709,11 +711,12 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     }
     // Whether arguments after `if <condition>` or `for … do`, with or
     // without a command or an `else`, end up a command, a condition or an
-    // argument depends on what precedes them.
+    // argument depends on what precedes them. Part of a variable could name
+    // any command, cmd.exe included.
     let Some(first_word) = windows_first_word(command) else {
         return WindowsScriptTail::Nothing;
     };
-    if windows_may_be_conditional(&first_word) {
+    if windows_may_be_conditional(&first_word) || first_word.contains(WINDOWS_UNWORKED_EXPANSION) {
         return WindowsScriptTail::Nothing;
     }
     // cmd.exe, `call` and `start` read what follows them again as a command
@@ -725,7 +728,7 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // After a `)` cmd.exe takes no word but `else`, which would make what
     // follows the `else` of an `if` whose block the `)` closes, as in
     // `if exist dist (rimraf dist && tsc)`, though an operator inside the
-    // block seems to start the last command (from review).
+    // block seems to start the last command.
     if closes {
         return WindowsScriptTail::Nothing;
     }
@@ -849,13 +852,21 @@ pub fn assemble_shell_command(
     if extra_args.is_empty() {
         return Ok(script_cmd.to_string());
     }
+    // Finding the receiver looks for files along PATH, so once per command.
+    #[cfg(windows)]
+    let receiver = windows_argument_receiver(script_cmd, project_dir, path, envs);
+    #[cfg(not(windows))]
+    let _ = (project_dir, path, envs);
     let mut full_command = String::with_capacity(
         script_cmd.len() + extra_args.iter().map(|arg| arg.len() + 3).sum::<usize>(),
     );
     full_command.push_str(script_cmd);
     for arg in extra_args {
         full_command.push(' ');
-        full_command.push_str(&shell_quote_arg(arg, script_cmd, project_dir, path, envs)?);
+        #[cfg(windows)]
+        full_command.push_str(&windows_shell_quote_arg(arg, receiver)?);
+        #[cfg(not(windows))]
+        push_posix_quoted_arg(&mut full_command, arg);
     }
     Ok(full_command)
 }
@@ -3651,7 +3662,7 @@ mod tests {
             ("capture | node -e 0", Unknown),
             // After a `)` cmd.exe takes no word but `else`, which makes what
             // follows the `else` of the `if` it closes, whatever operator
-            // is inside (from review: these ran `else mkdir INJ`).
+            // is inside: these ran `else mkdir INJ`.
             ("node -e 0 && (capture)", Nothing),
             ("(node -e 0 && capture)", Nothing),
             ("if exist nonexist (node -e 0 && capture)", Nothing),
@@ -3660,9 +3671,13 @@ mod tests {
             ("IF exist x (node -e 0 | capture)", Nothing),
             ("node -e 0 | if 1==2 (echo a & capture)", Nothing),
             ("node -e 0 && capture (x)", Nothing),
+            // A `)` with no block open is a character like any other:
+            // cmd.exe runs `capture :) a b`.
+            ("capture :) a b", Unknown),
+            ("(node -e 0) && capture a)", Unknown),
             ("node -e 0 && capture (x", Unknown),
-            // A quoted name is one word, spaces and all (from review: these
-            // read as `start` and `cmd`).
+            // A quoted name is one word, spaces and all, not `start` or
+            // `cmd`.
             (
                 r#""C:\tools\start here\node.exe" x"#,
                 Command(r"C:\tools\start here\node.exe"),
@@ -3817,6 +3832,19 @@ mod tests {
         for (script, expected) in cases {
             assert_eq!(windows_script_tail(script), expected, "{script:?}");
         }
+
+        // Part of a variable, which could be anything, names the command,
+        // as `"%ComSpec:~0%"` names cmd.exe.
+        let unworked = WINDOWS_UNWORKED_EXPANSION;
+        for (script, expected) in [
+            (format!("\"{unworked}\" /d /c node -e 0"), Nothing),
+            (format!("{unworked}\\x.exe --flag"), Nothing),
+            (format!("node -e 0 && \"C:\\{unworked}\" x"), Nothing),
+            (format!("node -e 0 | \"{unworked}\" x"), Nothing),
+            (format!("capture --tag={unworked}"), Command("capture")),
+        ] {
+            assert_eq!(windows_script_tail(&script), expected, "{script:?}");
+        }
     }
 
     /// As measured with cmd.exe: an unset name keeps its `%`, and the `%`
@@ -3830,9 +3858,21 @@ mod tests {
             ("echo [%U%%A%]", "echo [%U%x]"),
             ("echo [a%b%A%c]", "echo [a%bxc]"),
             ("echo [%%A%%]", "echo [%x%]"),
-            // Left to be read as a variable: cmd.exe gives `[y]`.
-            ("echo [%A:x=y%]", "echo [%A:x=y%]"),
+            // Left as written: an unset one, read as a variable.
+            ("echo [%U:x=y%]", "echo [%U:x=y%]"),
             ("echo 100%", "echo 100%"),
+        ] {
+            assert_eq!(
+                windows_expand_variables(script, &value),
+                expanded,
+                "{script:?}"
+            );
+        }
+        // Part of a set variable isn't worked out.
+        let unworked = WINDOWS_UNWORKED_EXPANSION;
+        for (script, expanded) in [
+            ("echo [%A:x=y%]", format!("echo [{unworked}]")),
+            ("echo [%A:~0,1%%A%]", format!("echo [{unworked}x]")),
         ] {
             assert_eq!(
                 windows_expand_variables(script, &value),
@@ -3852,6 +3892,7 @@ mod tests {
             "QUOTE" => Some("a\"b".to_owned()),
             "FLAG" => Some("--watch".to_owned()),
             "BREAK" => Some("a\nb".to_owned()),
+            "PF(X)" => Some(r"C:\Program Files (x86)".to_owned()),
             _ => None,
         };
         for (script, changes) in [
@@ -3868,11 +3909,18 @@ mod tests {
             ("node build.js %~dp0 %CHAIN%", true),
             ("node build.js ^%CHAIN%", true),
             ("node build.js %CHAIN:~0,0%", true),
-            // Part of a value, or one with something replaced, isn't worked
-            // out: any such reference to a set variable counts.
-            ("node build.js %FLAG:~0,2%", true),
+            // Part of a value holds nothing the value doesn't, and a
+            // replacement nothing more than the value and the reference
+            // hold, so `%TIME:~0,2%` changes nothing.
+            ("node build.js %FLAG:~0,2%", false),
+            ("capture --tag=%FLAG:~0,2%", false),
+            ("node build.js %FLAG:-=/%", false),
             ("node build.js %UNSET:~0,2%", false),
             ("node build.js %FLAG:w=&%", true),
+            ("node build.js %FLAG:w=\"%", true),
+            // A reference in quotes takes nothing out of the commands.
+            ("\"%PF(X)%\\tool\\x.exe\" a", false),
+            ("%PF(X)%\\tool\\x.exe a", true),
             ("node build.js 100% done", false),
             ("node build.js", false),
         ] {
@@ -4082,8 +4130,35 @@ mod tests {
             ),
             WindowsArgumentReceiver::Nothing
         );
-        // From review: part of `ComSpec` is cmd.exe too, and Windows doesn't
-        // take `ß` for `ss`, as upper-casing it to `SS` would.
+        // Part of a variable that holds no operator leaves the arguments to
+        // the command it's an argument of.
+        std::fs::write(bin.join("capture.cmd"), "").unwrap();
+        for script in [
+            "capture --tag=%TIME:~0,2%",
+            "capture %DATE:~-4%",
+            r"capture %CD:\=/%",
+            "capture %FLAG:-=/%",
+        ] {
+            assert_eq!(
+                windows_argument_receiver(
+                    script,
+                    project.path(),
+                    path,
+                    &envs(&[("FLAG", "--watch")])
+                ),
+                WindowsArgumentReceiver::BatchFile,
+                "{script:?}"
+            );
+        }
+        // Windows matches names as it upper-cases them a character at a
+        // time, where `ᾳ` is `ᾼ`, though Rust upper-cases both to `ΑΙ`.
+        assert_eq!(
+            windows_argument_receiver("other %ᾳ%", project.path(), path, &envs(&[("ᾼ", "&&")])),
+            WindowsArgumentReceiver::Nothing
+        );
+        assert!(windows_same_variable_name("ᾳ", "ᾼ"));
+        // Part of `ComSpec` is cmd.exe too, and Windows doesn't take `ß` for
+        // `ss`, as upper-casing it to `SS` would.
         assert_eq!(
             windows_argument_receiver(
                 r#""%ComSpec:~0%" /d /c "node -e 0 &&""#,
