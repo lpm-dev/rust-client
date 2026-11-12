@@ -827,6 +827,9 @@ jobs:
       - name: Windows port backend tests
         run: cargo test --locked -p lpm-runner ports::tests
 
+      - name: Windows console interrupt tests
+        run: cargo test --locked -p lpm-runner execution::
+
       - name: Windows environment name tests
         run: |
           cargo test --locked -p lpm-runner dotenv::
