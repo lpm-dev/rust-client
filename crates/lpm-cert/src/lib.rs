@@ -432,7 +432,7 @@ fn warn_if_ca_bytes_expiring_soon(cert_pem: &[u8], display_path: &Path) {
 ///
 /// The mode is reapplied every call, not only at creation, because a pre-H11 install may
 /// have left the dir at `0o755`. Windows replaces inherited access with a protected
-/// owner-and-system DACL.
+/// DACL for the owner, the user LPM runs as and SYSTEM.
 pub fn create_dir_secure(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]

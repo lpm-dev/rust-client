@@ -217,8 +217,9 @@ fn keep_state_dir_owner_only_or_warn(
     }
 }
 
-/// Keeps the open state directory to its owner and SYSTEM, letting
-/// sandboxed lifecycle scripts through to what they are granted inside, as
+/// Keeps the open state directory to its owner, the user LPM runs as and
+/// SYSTEM, letting sandboxed lifecycle scripts through to what they are
+/// granted inside, as
 /// [`crate::owner_only::protect_state_directory`] does; what an earlier
 /// release left inside stops inheriting the project directory's access.
 #[cfg(windows)]
@@ -413,8 +414,9 @@ pub fn keep_existing_lpm_home_ignored(root: &Path) {
     }
 }
 
-/// Keeps the LPM home to its owner and SYSTEM on Windows, letting
-/// sandboxed lifecycle scripts through to the store they are granted, as
+/// Keeps the LPM home to its owner, the user LPM runs as and SYSTEM on
+/// Windows, letting sandboxed lifecycle scripts through to the store they
+/// are granted, as
 /// [`crate::owner_only::protect_state_directory`] does for what is created
 /// there from now on. What is already in it keeps its access: store files
 /// are hard links in projects' `node_modules`, and a home in the user's

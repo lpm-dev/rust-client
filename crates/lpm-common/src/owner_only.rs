@@ -175,8 +175,12 @@ pub fn keeps_others_out(file: &impl std::os::windows::io::AsRawHandle) -> std::i
 /// release made; without it only what is created there from now on is
 /// kept, as for the LPM home, whose store files are hard links in
 /// projects' `node_modules`. One kept by an earlier release, which named
-/// only the owner, has just its own DACL changed: what is inside was kept
-/// then, and is the user's.
+/// only the owner, gets the user's entry the same way: a `.lpm` all through,
+/// so that its folders hand it on to what is created in them (from review),
+/// and the home on its own DACL, as rewriting the store's would touch every
+/// file in it. Folders an earlier release made in the home still hand on
+/// the owner's entry alone, so what an elevated run creates in them stays
+/// the Administrators'.
 pub fn protect_state_directory(
     directory: &cap_std::fs::Dir,
     push_to_contents: bool,
@@ -198,11 +202,12 @@ pub fn protect_state_directory(
     let dacl = state_directory_dacl()?;
     match state_directory_access(&handle)? {
         StateDirectoryAccess::Kept => return Ok(false),
-        StateDirectoryAccess::KeptForTheOwner => set_protected_dacl(&handle, &dacl)?,
-        StateDirectoryAccess::Open if push_to_contents => {
+        StateDirectoryAccess::KeptForTheOwner | StateDirectoryAccess::Open if push_to_contents => {
             set_protected_tree_dacl(&final_path(&handle)?, &dacl)?;
         }
-        StateDirectoryAccess::Open => set_protected_dacl(&handle, &dacl)?,
+        StateDirectoryAccess::KeptForTheOwner | StateDirectoryAccess::Open => {
+            set_protected_dacl(&handle, &dacl)?;
+        }
     }
     Ok(true)
 }
@@ -1080,27 +1085,47 @@ mod tests {
     #[test]
     fn a_state_directory_an_earlier_release_kept_names_the_user_too() {
         let directory = tempfile::tempdir().unwrap();
+        let earlier_release = |state: &std::path::Path| {
+            std::fs::create_dir(state).unwrap();
+            set_protected_dacl(
+                &open_for_security(state),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;;0xa0;;;AC)",
+            )
+            .unwrap();
+            // Made while the earlier release kept it, so they hand on the
+            // owner's entry alone.
+            std::fs::create_dir(state.join("store")).unwrap();
+            std::fs::write(state.join("earlier.json"), b"{}").unwrap();
+            assert!(!user_gets_in_when_another_owns(state));
+            assert!(!user_gets_in_when_another_owns(&state.join("store")));
+        };
+        let open = |state: &std::path::Path| {
+            cap_std::fs::Dir::open_ambient_dir(state, cap_std::ambient_authority()).unwrap()
+        };
+
+        // A `.lpm` gets the user's entry all through, so what an elevated
+        // run creates in its folders lets the user in too (from review).
         let state = directory.path().join(".lpm");
-        std::fs::create_dir(&state).unwrap();
-        set_protected_dacl(
-            &open_for_security(&state),
-            "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;;0xa0;;;AC)",
-        )
-        .unwrap();
-        std::fs::write(state.join("earlier.json"), b"{}").unwrap();
-        assert!(!user_gets_in_when_another_owns(&state));
-        let open =
-            || cap_std::fs::Dir::open_ambient_dir(&state, cap_std::ambient_authority()).unwrap();
-
-        assert!(protect_state_directory(&open(), true).unwrap());
-        assert!(!protect_state_directory(&open(), true).unwrap());
-
+        earlier_release(&state);
+        assert!(protect_state_directory(&open(&state), true).unwrap());
+        assert!(!protect_state_directory(&open(&state), true).unwrap());
         assert!(user_gets_in_when_another_owns(&state));
         assert_eq!(others_let_in(&state), ["S-1-15-2-1"]);
-        std::fs::write(state.join("later.json"), b"{}").unwrap();
-        assert!(user_gets_in_when_another_owns(&state.join("later.json")));
-        // Only the directory's own DACL changed: what was inside is the
-        // user's, and kept as it was.
-        assert!(!user_gets_in_when_another_owns(&state.join("earlier.json")));
+        assert!(user_gets_in_when_another_owns(&state.join("earlier.json")));
+        std::fs::write(state.join("store").join("later.json"), b"{}").unwrap();
+        assert!(user_gets_in_when_another_owns(
+            &state.join("store").join("later.json")
+        ));
+
+        // The home gets it on its own DACL, for what is created in it from
+        // now on.
+        let home = directory.path().join("home");
+        earlier_release(&home);
+        assert!(protect_state_directory(&open(&home), false).unwrap());
+        assert!(!protect_state_directory(&open(&home), false).unwrap());
+        assert!(user_gets_in_when_another_owns(&home));
+        std::fs::write(home.join("later.json"), b"{}").unwrap();
+        assert!(user_gets_in_when_another_owns(&home.join("later.json")));
+        assert!(!user_gets_in_when_another_owns(&home.join("store")));
     }
 }
