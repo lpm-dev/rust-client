@@ -227,8 +227,16 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "swaps complete staged dlx entry directories with rollback while holding the dlx entry lock",
     ),
     (
-        "crates/lpm-cli/src/commands/self_update.rs::install_staged_binary",
+        "crates/lpm-cli/src/commands/self_update.rs::install_staged_binary_noting",
         "receives an exclusively created same-directory NamedTempFile; Windows needs a custom running-binary swap",
+    ),
+    (
+        "crates/lpm-cli/src/commands/self_update/sandbox_helper.rs::install_staged_helper",
+        "renames an exclusively created same-directory NamedTempFile over the sandbox helper after moving a possibly running predecessor aside, with rollback",
+    ),
+    (
+        "crates/lpm-cli/src/commands/self_update/sandbox_helper.rs::undo",
+        "renames a possibly running helper aside and its predecessor back, as a running executable can't be replaced, restoring the swap on failure",
     ),
     (
         "crates/lpm-cli/src/commands/self_update.rs::install_staged_macos_bundle",

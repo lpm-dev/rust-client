@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod cargo_metadata;
 mod download;
 mod probe;
+#[cfg(any(windows, test))]
+mod sandbox_helper;
 #[cfg(target_os = "macos")]
 mod validation;
 pub(crate) mod verify_release;
@@ -34,6 +36,12 @@ use self::download::{
 #[cfg(test)]
 use self::download::{create_staged_binary, finish_staged_binary};
 use self::probe::{BoundUpdateCommand, VersionProbe};
+#[cfg(windows)]
+use self::sandbox_helper::{
+    HelperSwap, SANDBOX_HELPER_FILE_NAME, SandboxHelperReport, SandboxHelperStatus, StagedHelper,
+    install_staged_helper, plain_display, refresh_stale_sandbox_helper,
+    sandbox_helper_named_elsewhere, stage_sandbox_helper,
+};
 #[cfg(windows)]
 pub(crate) use self::windows_trust::administrators_only_path;
 
@@ -165,9 +173,14 @@ pub async fn run(
 
     if !should_install_update(current, &latest, channel, target_channel) {
         #[cfg(windows)]
+        let sandbox_helper =
+            refresh_stale_sandbox_helper(current, &current_executable, &account_home, !json_output)
+                .await;
+        #[cfg(windows)]
         remove_what_earlier_updates_left(&current_executable);
         if json_output {
-            let json = serde_json::json!({
+            #[cfg_attr(not(windows), expect(unused_mut))]
+            let mut json = serde_json::json!({
                 "success": true,
                 "current": current,
                 "latest": latest,
@@ -178,6 +191,10 @@ pub async fn run(
                 "channel_changed": channel_changed,
                 "duration_ms": started.elapsed().as_millis() as u64,
             });
+            #[cfg(windows)]
+            if let Some(report) = &sandbox_helper {
+                json["sandbox_helper"] = report.to_json();
+            }
             println!("{}", serde_json::to_string_pretty(&json)?);
         } else if latest == current {
             install_ui::done_line(crate::install_ui::terminal_line!(
@@ -196,28 +213,12 @@ pub async fn run(
         return Ok(());
     }
 
-    let working_dir = std::env::current_dir().map_err(|error| {
-        LpmError::SelfUpdate(format!(
-            "could not resolve the working directory before self-update: {error}"
-        ))
-    })?;
-    let project_root = active_project_root(&working_dir, &account_home)?;
-    let environment_exclusion_root =
-        environment_exclusion_root(&working_dir, &project_root, &account_home)?;
-    if project_root
-        .as_deref()
-        .is_some_and(|root| current_executable.starts_with(root))
-    {
-        return Err(LpmError::SelfUpdate(
-            "self-update must be run from a global LPM installation, not a project-local executable"
-                .to_string(),
-        ));
-    }
-    let install_roots = InstallRoots::from_environment(
-        environment_exclusion_root.as_deref(),
-        &account_home,
-        &current_executable,
-    );
+    let UpdateSite {
+        working_dir,
+        project_root,
+        environment_exclusion_root,
+        install_roots,
+    } = update_site(&account_home, &current_executable)?;
     #[cfg(windows)]
     let _installation_lock =
         windows_trust::try_acquire_installation_lock(&current_executable)?.ok_or_else(|| {
@@ -353,7 +354,7 @@ pub async fn run(
         }
     }
 
-    let mut standalone_audit: Option<AttestationAudit> = None;
+    let mut standalone_update: Option<StandaloneUpdate> = None;
     match method {
         InstallMethod::Npm
         | InstallMethod::Pnpm
@@ -377,7 +378,7 @@ pub async fn run(
                 .verify_requested(&latest)?;
         }
         InstallMethod::Standalone => {
-            standalone_audit = Some(
+            standalone_update = Some(
                 run_standalone_update(&latest, &current_executable, &account_home, !json_output)
                     .await?,
             );
@@ -406,12 +407,12 @@ pub async fn run(
     }
 
     if json_output {
-        let audit = standalone_audit.as_ref().ok_or_else(|| {
+        let update = standalone_update.as_ref().ok_or_else(|| {
             LpmError::SelfUpdate(
                 "standalone self-update completed without an attestation audit".to_string(),
             )
         })?;
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": true,
             "current": current,
             "latest": latest,
@@ -423,9 +424,12 @@ pub async fn run(
             "channel_changed": channel_changed,
             "applied": true,
             "verified": true,
-            "attestation": audit_json(audit),
+            "attestation": audit_json(&update.audit),
             "duration_ms": started.elapsed().as_millis() as u64,
         });
+        if let Some(sandbox_helper) = &update.sandbox_helper {
+            json["sandbox_helper"] = sandbox_helper.clone();
+        }
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
         install_ui::done_line(crate::install_ui::terminal_line!(
@@ -1277,6 +1281,49 @@ fn open_self_update_lock_file(path: &Path) -> Result<std::fs::File, LpmError> {
         .write(true)
         .truncate(false)
         .open(path)?)
+}
+
+/// Where self-update runs and what it can tell lpm's installation by: the
+/// working directory, the project it is in, the root that bounds the
+/// package managers' environment, and their install roots.
+struct UpdateSite {
+    working_dir: PathBuf,
+    project_root: Option<PathBuf>,
+    environment_exclusion_root: Option<PathBuf>,
+    install_roots: InstallRoots,
+}
+
+/// The [`UpdateSite`] of lpm at `current_executable`, which must not be a
+/// project's own.
+fn update_site(account_home: &Path, current_executable: &Path) -> Result<UpdateSite, LpmError> {
+    let working_dir = std::env::current_dir().map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve the working directory before self-update: {error}"
+        ))
+    })?;
+    let project_root = active_project_root(&working_dir, account_home)?;
+    let environment_exclusion_root =
+        environment_exclusion_root(&working_dir, &project_root, account_home)?;
+    if project_root
+        .as_deref()
+        .is_some_and(|root| current_executable.starts_with(root))
+    {
+        return Err(LpmError::SelfUpdate(
+            "self-update must be run from a global LPM installation, not a project-local executable"
+                .to_string(),
+        ));
+    }
+    let install_roots = InstallRoots::from_environment(
+        environment_exclusion_root.as_deref(),
+        account_home,
+        current_executable,
+    );
+    Ok(UpdateSite {
+        working_dir,
+        project_root,
+        environment_exclusion_root,
+        install_roots,
+    })
 }
 
 fn active_project_root(
@@ -2201,7 +2248,7 @@ async fn run_standalone_update(
     current_executable: &Path,
     account_home: &Path,
     human_output: bool,
-) -> Result<AttestationAudit, LpmError> {
+) -> Result<StandaloneUpdate, LpmError> {
     validate_standalone_install_location(current_executable)?;
     #[cfg(not(target_os = "macos"))]
     let _ = account_home;
@@ -2228,8 +2275,10 @@ async fn run_standalone_update(
         install_staged_macos_bundle(&macos_layout, staged_bundle, version)?;
     }
 
+    #[cfg(target_os = "macos")]
+    let sandbox_helper = None;
     #[cfg(not(target_os = "macos"))]
-    {
+    let sandbox_helper = {
         VersionProbe::verify_staged(
             &assets.staged_binary.temporary,
             &assets.staged_binary.sha256,
@@ -2243,29 +2292,59 @@ async fn run_standalone_update(
             temporary, sha256, ..
         } = assets.staged_binary;
         #[cfg(windows)]
-        let helper = assets
-            .staged_helper
-            .map(install_staged_helper)
-            .transpose()?;
-        let installed = install_staged_binary(current_executable, temporary, &sha256);
-        #[cfg(windows)]
-        if let Some(helper) = helper {
-            if installed.is_ok() {
-                if human_output {
-                    install_ui::done_untrusted(&format!(
-                        "Updated the sandbox helper at {}",
-                        helper.path.display()
-                    ));
-                }
-                helper.finish();
-            } else {
-                helper.undo();
+        let helper = match assets.staged_helper {
+            Some(staged) => {
+                // The helper goes beside lpm, so where lpm is must still be
+                // a place only its owner can change, as it is checked again
+                // before lpm itself is replaced.
+                validate_standalone_install_location(current_executable)?;
+                Some(install_staged_helper(staged)?)
             }
-        }
-        installed?;
+            None => None,
+        };
         #[cfg(windows)]
-        warn_of_a_helper_elsewhere(current_executable, human_output);
-    }
+        let helper_journal = helper.as_ref().and_then(HelperSwap::journal_entry);
+        #[cfg(not(windows))]
+        let helper_journal = None;
+        let installed = install_staged_binary_noting(
+            current_executable,
+            temporary,
+            &sha256,
+            helper_journal.as_ref(),
+        );
+        #[cfg(not(windows))]
+        {
+            installed?;
+            None
+        }
+        #[cfg(windows)]
+        {
+            let mut report = match (helper, installed) {
+                (Some(swap), Ok(())) => swap.finish(),
+                (None, Ok(())) => SandboxHelperReport::new(
+                    SandboxHelperStatus::NotInRelease,
+                    current_executable.with_file_name(SANDBOX_HELPER_FILE_NAME),
+                ),
+                (Some(swap), Err(error)) => {
+                    let path = swap.path.clone();
+                    return Err(match swap.undo() {
+                        Ok(()) => error,
+                        Err(undo_error) => LpmError::SelfUpdate(format!(
+                            "{error}; nor could the earlier sandbox helper be put back \
+                             ({undo_error}), so this release's stays at {}",
+                            plain_display(&path)
+                        )),
+                    });
+                }
+                (None, Err(error)) => return Err(error),
+            };
+            report.named_elsewhere = sandbox_helper_named_elsewhere(current_executable);
+            if human_output {
+                report.print();
+            }
+            Some(report.to_json())
+        }
+    };
 
     tracing::info!(
         target: "lpm_cli::self_update",
@@ -2282,7 +2361,18 @@ async fn run_standalone_update(
         source_commit = %assets.audit.source_commit,
         "standalone self-update verified and applied"
     );
-    Ok(assets.audit)
+    Ok(StandaloneUpdate {
+        audit: assets.audit,
+        sandbox_helper,
+    })
+}
+
+/// What a standalone update did: the attestation it verified, and on
+/// Windows, what became of the sandbox helper beside lpm, as `--json`
+/// reports it.
+struct StandaloneUpdate {
+    audit: AttestationAudit,
+    sandbox_helper: Option<serde_json::Value>,
 }
 
 /// Render an `AttestationAudit` as the JSON shape callers see under
@@ -2312,20 +2402,6 @@ struct StandaloneAssets {
     #[cfg(windows)]
     staged_helper: Option<StagedHelper>,
     audit: AttestationAudit,
-}
-
-/// The file the sandbox looks for beside lpm on Windows, after any
-/// `LPM_SANDBOX_HELPER`.
-#[cfg(any(windows, test))]
-const SANDBOX_HELPER_FILE_NAME: &str = "lpm-sandbox-helper.exe";
-
-/// A release's sandbox helper, checked against its signed manifest and
-/// staged beside the helper at `path`.
-#[cfg(any(windows, test))]
-#[derive(Debug)]
-struct StagedHelper {
-    asset: StagedAsset,
-    path: PathBuf,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3285,51 +3361,6 @@ async fn verify_and_stage_for_standalone(
     })
 }
 
-/// Fetches the sandbox helper `asset_name` of release `version`, checks it
-/// against the release's verified manifest, and stages it beside
-/// `helper_path`, the helper it is to replace, which needn't exist yet.
-/// A release whose manifest lists no helper, from before one shipped,
-/// stages none, and the helper there stays.
-#[cfg(any(windows, test))]
-async fn stage_sandbox_helper(
-    client: &reqwest::Client,
-    release: &VerifiedReleaseManifest,
-    version: &str,
-    asset_name: &str,
-    helper_path: &Path,
-    human_output: bool,
-) -> Result<Option<StagedHelper>, LpmError> {
-    if !release.entries.contains_key(asset_name) {
-        if human_output {
-            install_ui::warn_untrusted(&format!(
-                "release v{version} ships no `{asset_name}`; the sandbox helper beside lpm \
-                 stays as it is"
-            ));
-        }
-        return Ok(None);
-    }
-    let asset_url = github_release_download_url(version, asset_name);
-    let asset = fetch_asset_to_staged_file(client, &asset_url, ASSET_MAX_BYTES, helper_path)
-        .await?
-        .ok_or_else(|| {
-            LpmError::SelfUpdate(format!(
-                "release v{version} advertises `{asset_name}` in SHA256SUMS.txt but the asset is missing at {} — release-pipeline bug",
-                safe_remote_label(&asset_url)
-            ))
-        })?;
-    verify_release_asset_digest(release, asset.sha256.clone(), asset_name)?;
-    if human_output {
-        install_ui::done_untrusted(&format!(
-            "Verified {asset_name} ({}) against the same signed checksums",
-            lpm_common::format_bytes(asset.byte_len as u64)
-        ));
-    }
-    Ok(Some(StagedHelper {
-        asset,
-        path: helper_path.to_path_buf(),
-    }))
-}
-
 #[cfg(test)]
 async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
     let destination = std::env::temp_dir().join("lpm-self-update-test-bin");
@@ -3345,11 +3376,24 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 /// (legal even with a live handle), then `rename(new, current_exe)`,
 /// then best-effort delete the `.old` (OS releases the handle when
 /// this process exits, so the delete will succeed on the next run).
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(test)]
 fn install_staged_binary(
     current_exe: &std::path::Path,
     temporary: tempfile::NamedTempFile,
     expected_sha256: &str,
+) -> Result<(), LpmError> {
+    install_staged_binary_noting(current_exe, temporary, expected_sha256, None)
+}
+
+/// [`install_staged_binary`], with `sandbox_helper`, what the update did
+/// to the sandbox helper beside lpm, recorded in the update journal too,
+/// so that a rollback to `<lpm>.previous` can find the helper's.
+#[cfg(any(not(target_os = "macos"), test))]
+fn install_staged_binary_noting(
+    current_exe: &std::path::Path,
+    temporary: tempfile::NamedTempFile,
+    expected_sha256: &str,
+    sandbox_helper: Option<&serde_json::Value>,
 ) -> Result<(), LpmError> {
     validate_standalone_install_location(current_exe)?;
     ensure_staged_file_unchanged(&temporary, expected_sha256)?;
@@ -3398,7 +3442,7 @@ fn install_staged_binary(
             "{}.update-journal.json",
             file_name.to_string_lossy()
         ));
-        let journal = serde_json::json!({
+        let mut journal = serde_json::json!({
             "version": 1,
             "backup_path": backup_path.display().to_string(),
             "current_exe": current_exe.display().to_string(),
@@ -3407,6 +3451,9 @@ fn install_staged_binary(
                 .map_or(0, |d| d.as_secs()),
             "previous_binary_version": crate::build_version::version(),
         });
+        if let Some(sandbox_helper) = sandbox_helper {
+            journal["sandbox_helper"] = sandbox_helper.clone();
+        }
         let journal_bytes = serde_json::to_vec_pretty(&journal).unwrap_or_default();
         if let Err(e) = lpm_common::write_file_atomic(&journal_path, journal_bytes) {
             tracing::warn!(
@@ -3503,123 +3550,6 @@ fn remove_what_earlier_updates_left(current_executable: &Path) {
     };
     remove_binaries_moved_aside_by_earlier_updates(directory, &name.to_string_lossy());
     remove_binaries_moved_aside_by_earlier_updates(directory, SANDBOX_HELPER_FILE_NAME);
-}
-
-/// The sandbox helper beside lpm, swapped for a release's. The one it
-/// replaced is kept aside until lpm's own binary is in place.
-#[cfg(any(windows, test))]
-#[derive(Debug)]
-struct HelperSwap {
-    path: PathBuf,
-    moved_aside: Option<PathBuf>,
-}
-
-/// Puts the staged helper where the sandbox looks for it, beside lpm. A
-/// helper already there, which may be running a lifecycle script, is
-/// copied to `<helper>.previous`, as lpm itself is, and moved aside under
-/// a name earlier updates' leftovers are swept by.
-#[cfg(any(windows, test))]
-fn install_staged_helper(staged: StagedHelper) -> Result<HelperSwap, LpmError> {
-    let StagedHelper { asset, path } = staged;
-    ensure_staged_file_unchanged(&asset.temporary, &asset.sha256)?;
-    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
-        return Err(LpmError::SelfUpdate(format!(
-            "the sandbox helper path {} has no directory or file name",
-            path.display()
-        )));
-    };
-    if asset.temporary.path().parent() != Some(parent) {
-        return Err(LpmError::SelfUpdate(
-            "the staged sandbox helper is not beside the one it replaces".to_string(),
-        ));
-    }
-    let file_name = file_name.to_string_lossy();
-
-    let moved_aside = match std::fs::symlink_metadata(&path) {
-        Ok(_) => {
-            let backup = parent.join(format!("{file_name}.previous"));
-            if let Err(error) = copy_executable_atomic(&path, &backup) {
-                tracing::warn!(
-                    target: "lpm_cli::self_update",
-                    helper = %path.display(),
-                    error = %error,
-                    "could not back up the sandbox helper before self-update"
-                );
-            }
-            remove_binaries_moved_aside_by_earlier_updates(parent, &file_name);
-            let aside = parent.join(format!("{file_name}.old.{}", std::process::id()));
-            std::fs::rename(&path, &aside).map_err(|error| {
-                LpmError::SelfUpdate(format!(
-                    "failed to move the sandbox helper {} aside: {error}",
-                    path.display()
-                ))
-            })?;
-            Some(aside)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(LpmError::SelfUpdate(format!(
-                "could not inspect the sandbox helper {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    let temporary = asset.temporary.into_temp_path();
-    if let Err(error) = std::fs::rename(&temporary, &path) {
-        if let Some(aside) = &moved_aside {
-            let _ = std::fs::rename(aside, &path);
-        }
-        return Err(LpmError::SelfUpdate(format!(
-            "failed to install the sandbox helper at {}: {error}",
-            path.display()
-        )));
-    }
-    Ok(HelperSwap { path, moved_aside })
-}
-
-#[cfg(any(windows, test))]
-impl HelperSwap {
-    /// Keeps the new helper. The one moved aside is removed now, or, while
-    /// it still runs a script, by a later update.
-    fn finish(self) {
-        if let Some(aside) = self.moved_aside {
-            let _ = std::fs::remove_file(aside);
-        }
-    }
-
-    /// Puts back the helper that was there, as lpm's own binary wasn't
-    /// replaced.
-    fn undo(self) {
-        let _ = std::fs::remove_file(&self.path);
-        if let Some(aside) = self.moved_aside {
-            let _ = std::fs::rename(aside, &self.path);
-        }
-    }
-}
-
-/// Says so when `LPM_SANDBOX_HELPER` names a helper other than the one
-/// beside lpm: the sandbox uses that one, which self-update leaves as it is.
-#[cfg(windows)]
-fn warn_of_a_helper_elsewhere(current_executable: &Path, human_output: bool) {
-    let Some(named) = std::env::var_os("LPM_SANDBOX_HELPER").filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let named = PathBuf::from(named);
-    let beside = current_executable.with_file_name(SANDBOX_HELPER_FILE_NAME);
-    if same_file::is_same_file(&named, &beside).unwrap_or(false) {
-        return;
-    }
-    let message = format!(
-        "LPM_SANDBOX_HELPER names {}, which self-update doesn't replace; save this release's \
-         sandbox helper there, or unset LPM_SANDBOX_HELPER to use the one beside lpm",
-        named.display()
-    );
-    if human_output {
-        install_ui::warn_untrusted(&message);
-    } else {
-        tracing::warn!(target: "lpm_cli::self_update", "{message}");
-    }
 }
 
 #[cfg(unix)]
@@ -4870,7 +4800,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     /// release fixture. Caller mounts the asset / manifest / bundle /
     /// release-tag responses on the supplied [`wiremock::MockServer`],
     /// then awaits the future — this helper just wires the env vars up.
-    async fn run_standalone_against_server<F>(
+    pub(super) async fn run_standalone_against_server<F>(
         server: &wiremock::MockServer,
         version: &str,
         fut: impl FnOnce() -> F,
@@ -5310,184 +5240,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             leftovers.is_empty(),
             "swap left behind unexpected staging files: {leftovers:?}"
         );
-    }
-
-    // ── the sandbox helper beside lpm on Windows ─────────────────
-
-    /// `contents`, staged to replace the sandbox helper at `path`.
-    fn staged_helper_at(path: &Path, contents: &[u8]) -> StagedHelper {
-        use std::io::Write as _;
-
-        let mut temporary = create_staged_binary(path).unwrap();
-        temporary.write_all(contents).unwrap();
-        StagedHelper {
-            asset: StagedAsset {
-                temporary: finish_staged_binary(temporary).unwrap(),
-                byte_len: contents.len(),
-                sha256: sha256_hex(contents),
-            },
-            path: path.to_path_buf(),
-        }
-    }
-
-    fn file_names_in(directory: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// From the Windows verification pass: `lpm self-update` replaced lpm
-    /// but left the sandbox helper of the release it came from.
-    #[test]
-    fn a_staged_sandbox_helper_replaces_the_one_beside_lpm_and_can_be_put_back() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(SANDBOX_HELPER_FILE_NAME);
-        std::fs::write(&path, b"earlier helper").unwrap();
-
-        let swap = install_staged_helper(staged_helper_at(&path, b"later helper")).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"later helper");
-        assert_eq!(
-            std::fs::read(directory.path().join("lpm-sandbox-helper.exe.previous")).unwrap(),
-            b"earlier helper"
-        );
-        // lpm's own binary couldn't be replaced.
-        swap.undo();
-        assert_eq!(std::fs::read(&path).unwrap(), b"earlier helper");
-
-        install_staged_helper(staged_helper_at(&path, b"later helper"))
-            .unwrap()
-            .finish();
-        assert_eq!(std::fs::read(&path).unwrap(), b"later helper");
-        assert_eq!(
-            file_names_in(directory.path()),
-            ["lpm-sandbox-helper.exe", "lpm-sandbox-helper.exe.previous"]
-        );
-    }
-
-    #[test]
-    fn a_staged_sandbox_helper_is_installed_where_there_was_none() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(SANDBOX_HELPER_FILE_NAME);
-
-        let swap = install_staged_helper(staged_helper_at(&path, b"helper")).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"helper");
-        swap.undo();
-        assert!(file_names_in(directory.path()).is_empty());
-
-        install_staged_helper(staged_helper_at(&path, b"helper"))
-            .unwrap()
-            .finish();
-        assert_eq!(file_names_in(directory.path()), ["lpm-sandbox-helper.exe"]);
-    }
-
-    /// A helper running a lifecycle script, in another lpm, is moved aside
-    /// rather than overwritten, and swept once it has exited.
-    #[cfg(windows)]
-    #[test]
-    fn a_running_sandbox_helper_is_moved_aside_and_swept_later() {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(SANDBOX_HELPER_FILE_NAME);
-        let system = std::env::var_os("SystemRoot").unwrap();
-        std::fs::copy(Path::new(&system).join(r"System32\PING.EXE"), &path).unwrap();
-        let mut running = std::process::Command::new(&path)
-            .args(["-n", "60", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .unwrap();
-
-        // While it runs, the helper moved aside can't be removed yet.
-        let installed =
-            install_staged_helper(staged_helper_at(&path, b"later helper")).map(HelperSwap::finish);
-        let names = file_names_in(directory.path());
-        running.kill().unwrap();
-        running.wait().unwrap();
-        installed.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"later helper");
-        let moved_aside = format!("lpm-sandbox-helper.exe.old.{}", std::process::id());
-        assert!(names.contains(&moved_aside), "{names:?}");
-
-        remove_binaries_moved_aside_by_earlier_updates(directory.path(), SANDBOX_HELPER_FILE_NAME);
-        assert_eq!(
-            file_names_in(directory.path()),
-            ["lpm-sandbox-helper.exe", "lpm-sandbox-helper.exe.previous"]
-        );
-    }
-
-    fn release_listing(entries: &[(&str, &[u8])]) -> VerifiedReleaseManifest {
-        VerifiedReleaseManifest {
-            publisher: None,
-            workflow_path: None,
-            workflow_ref: None,
-            integrated_time: chrono::Utc::now(),
-            log_index: 0,
-            log_id: String::new(),
-            leaf_cert_sha256: String::new(),
-            manifest_sha256: String::new(),
-            source_commit: String::new(),
-            entries: entries
-                .iter()
-                .map(|(name, contents)| ((*name).to_string(), sha256_hex(contents)))
-                .collect(),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_sandbox_helper_is_fetched_only_as_the_signed_manifest_lists_it() {
-        const ASSET: &str = "lpm-sandbox-helper-win32-arm64.exe";
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(format!(
-                "/download/v0.42.0/{ASSET}"
-            )))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(b"release helper".to_vec()),
-            )
-            .mount(&server)
-            .await;
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(SANDBOX_HELPER_FILE_NAME);
-
-        run_standalone_against_server(&server, "0.42.0", || async {
-            let client = release_http_client().unwrap();
-            let listed = release_listing(&[(ASSET, b"release helper")]);
-            let staged = stage_sandbox_helper(&client, &listed, "0.42.0", ASSET, &path, false)
-                .await
-                .unwrap()
-                .expect("a listed helper is staged");
-            assert_eq!(staged.path, path);
-            assert_eq!(
-                std::fs::read(staged.asset.temporary.path()).unwrap(),
-                b"release helper"
-            );
-            drop(staged);
-
-            let other = release_listing(&[(ASSET, b"another helper")]);
-            let refused = stage_sandbox_helper(&client, &other, "0.42.0", ASSET, &path, false)
-                .await
-                .expect_err("a helper the manifest doesn't list by its digest is refused");
-            assert!(
-                refused.to_string().contains("SHA-256 mismatch"),
-                "{refused}"
-            );
-
-            let earlier = release_listing(&[("lpm-win32-arm64.exe", b"lpm")]);
-            assert!(
-                stage_sandbox_helper(&client, &earlier, "0.42.0", ASSET, &path, false)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        })
-        .await;
-        // Nothing staged is left beside the helper.
-        assert!(file_names_in(directory.path()).is_empty());
     }
 
     /// Extension preservation: `with_extension("tmp")` would have

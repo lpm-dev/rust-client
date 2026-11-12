@@ -94,6 +94,21 @@ fn minimal_argv<'a>() -> Vec<&'a str> {
     ]
 }
 
+/// lpm asks the helper beside it which release it comes from, to tell one
+/// an earlier release left there.
+#[test]
+fn helper_reports_the_release_it_comes_from() {
+    let assert = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate built helper via CARGO_BIN_EXE")
+        .arg(lpm_sandbox::helper_protocol::RELEASE_FLAG)
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stdout).trim(),
+        lpm_sandbox::helper_protocol::HELPER_RELEASE
+    );
+}
+
 #[test]
 fn helper_rejects_protocol_version_mismatch_naming_remediation() {
     let mut argv = minimal_argv();
