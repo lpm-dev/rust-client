@@ -308,7 +308,7 @@ fn windows_argument_receiver(
 /// Whether Windows takes `a` and `b` as one variable's name: whatever their
 /// case, past ASCII too, a character at a time, so `ß` is not `SS` (from
 /// review).
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 fn windows_same_variable_name(a: &str, b: &str) -> bool {
     let upper = |character: char| {
         let mut upper = character.to_uppercase();
