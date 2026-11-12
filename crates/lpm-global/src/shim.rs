@@ -342,13 +342,13 @@ pub fn windows_shim_contents(
     bin_dir: &Path,
     shim: &Shim,
 ) -> Result<[(String, String); 3], ShimError> {
+    use lpm_common::symlink::{relative_path_on_one_volume, windows_plain_path};
     validate_windows_command_names(&shim.command_name)?;
     // A canonical `\\?\C:\…` target, as a local link's is, shares a volume
     // with the plain `C:\…` bin directory; and Node can't run it spelled so.
-    let bin_dir = windows_plain_path(bin_dir);
     let target_path = windows_plain_path(&shim.target);
     let target = target_path.to_string_lossy();
-    let path = match relative_to(&bin_dir, &target_path) {
+    let path = match relative_path_on_one_volume(&windows_plain_path(bin_dir), &target_path) {
         Some(relative) => ShimPath::Relative(relative.to_string_lossy().into_owned()),
         None => ShimPath::Absolute(target.clone().into_owned()),
     };
@@ -414,61 +414,6 @@ impl ShimPath {
             Self::Absolute(absolute) => absolute.clone(),
         }
     }
-}
-
-/// `path` without a `\\?\` prefix, on a drive path (`\\?\C:\…` is `C:\…`) or
-/// a network share's (`\\?\UNC\server\share\…` is `\\server\share\…`, from
-/// review), where the plain path names the same file: Win32 reads a name
-/// with a trailing `.` or space otherwise.
-fn windows_plain_path(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    let plain = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{share}")
-    } else if let Some(drive) = text
-        .strip_prefix(r"\\?\")
-        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
-    {
-        drive.to_string()
-    } else {
-        return path.to_path_buf();
-    };
-    if std::path::absolute(&plain).is_ok_and(|absolute| absolute == Path::new(&plain)) {
-        PathBuf::from(plain)
-    } else {
-        path.to_path_buf()
-    }
-}
-
-/// The way from `base` to `target` when both are absolute and on one volume,
-/// or none.
-fn relative_to(base: &Path, target: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    if !base.is_absolute() || !target.is_absolute() {
-        return None;
-    }
-    let base: Vec<Component<'_>> = base.components().collect();
-    let target: Vec<Component<'_>> = target.components().collect();
-    if base.first() != target.first()
-        || base
-            .iter()
-            .chain(&target)
-            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-    {
-        return None;
-    }
-    let shared = base
-        .iter()
-        .zip(&target)
-        .take_while(|(base, target)| base == target)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in shared..base.len() {
-        relative.push("..");
-    }
-    for part in &target[shared..] {
-        relative.push(part.as_os_str());
-    }
-    (!relative.as_os_str().is_empty()).then_some(relative)
 }
 
 // ─── Unix internals ───────────────────────────────────────────────────
@@ -871,29 +816,36 @@ mod tests {
         std::fs::write(bin_dir.join(name), legacy_bash_template(target)).unwrap();
     }
 
-    /// A link resolves its paths to `\\?\` ones, which Node can't run from;
-    /// a share's too (from review: `\\?\UNC\…` failed with `EISDIR`).
+    /// A link resolves its paths to `\\?\` ones, which Node can't run from,
+    /// a share's (`\\?\UNC\…`) too.
     #[cfg(windows)]
     #[test]
     fn windows_shims_name_paths_without_a_verbatim_prefix() {
-        for (path, plain) in [
-            (r"\\?\C:\pkg\bin\cli.js", r"C:\pkg\bin\cli.js"),
+        let preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE;
+        for (bin, target) in [
             (
-                r"\\?\UNC\server\share\pkg\bin\cli.js",
-                r"\\server\share\pkg\bin\cli.js",
+                r"C:\Users\dev\.lpm\bin",
+                r"\\?\C:\Users\dev\.lpm\global\installs\tsc\node_modules\.bin\tsc",
             ),
-            // Win32 would read these as other names.
-            (r"\\?\C:\pkg\bin\cli.", r"\\?\C:\pkg\bin\cli."),
             (
-                r"\\?\UNC\server\share\pkg\cli ",
-                r"\\?\UNC\server\share\pkg\cli ",
+                r"\\server\share\dev\.lpm\bin",
+                r"\\?\UNC\server\share\dev\.lpm\global\installs\tsc\node_modules\.bin\tsc",
             ),
-            (r"C:\pkg\bin\cli.js", r"C:\pkg\bin\cli.js"),
         ] {
+            let [cmd, ..] = windows_shim_contents(
+                Path::new(bin),
+                &Shim {
+                    command_name: "tsc".into(),
+                    target: PathBuf::from(target),
+                },
+            )
+            .unwrap();
             assert_eq!(
-                windows_plain_path(Path::new(path)),
-                Path::new(plain),
-                "{path}"
+                cmd.1,
+                format!(
+                    "{preamble}@\"%dp0%..\\global\\installs\\tsc\\node_modules\\.bin\\tsc.cmd\" %*\r\n"
+                ),
+                "{target}"
             );
         }
     }
@@ -924,6 +876,31 @@ mod tests {
         );
         for (name, text) in [cmd, ps1, bash] {
             assert!(text.is_ascii(), "{name}: {text}");
+        }
+        // A home typed in another case than its folders on disk, or a share
+        // named in another case, still shares them with the target.
+        for (bin, target) in [
+            (r"c:\users\çağrı\.lpm\bin", target),
+            (
+                r"\\fileserver\Home\.lpm\bin",
+                Path::new(r"\\FILESERVER\home\.lpm\global\installs\tsc\node_modules\.bin\tsc"),
+            ),
+        ] {
+            let [cmd, ..] = windows_shim_contents(
+                Path::new(bin),
+                &Shim {
+                    command_name: "tsc".into(),
+                    target: target.to_path_buf(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                cmd.1,
+                format!(
+                    "{preamble}@\"%dp0%..\\global\\installs\\tsc\\node_modules\\.bin\\tsc.cmd\" %*\r\n"
+                ),
+                "{bin}"
+            );
         }
         // Another volume can't be reached relatively.
         let [cmd, ..] = windows_shim_contents(

@@ -569,8 +569,6 @@ fn check_global_shim_targets(
     let mut mismatches = IssuePreview::default();
     let mut earlier = IssuePreview::default();
     let mut expectation_count = 0usize;
-    // The hint names packages, so each command comes with its package's
-    // name (from review).
     let mut verify = |command: &str, package: &str, target: &std::path::Path| {
         expectation_count += 1;
         match lpm_global::shim::verify_windows_shim_triple(&bin_dir, command, target) {
