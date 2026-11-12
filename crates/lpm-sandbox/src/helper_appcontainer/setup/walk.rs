@@ -307,11 +307,23 @@ fn names(
     Ok(Some(names))
 }
 
+#[cfg(test)]
 pub(super) fn children(
     root: &Target,
     path: &Path,
     sid: PSID,
     value: Option<(u32, u32)>,
+) -> Result<(), AppContainerError> {
+    children_saving(root, path, sid, value, None)
+}
+
+/// [`children`], adding to `journal`, on a removal, each DACL it replaces.
+pub(super) fn children_saving(
+    root: &Target,
+    path: &Path,
+    sid: PSID,
+    value: Option<(u32, u32)>,
+    mut journal: Option<&mut Vec<SavedDacl>>,
 ) -> Result<(), AppContainerError> {
     struct Frame {
         target: Target,
@@ -355,7 +367,12 @@ pub(super) fn children(
             Err(AppContainerError::ReparsePointRoot { .. }) => continue,
             Err(error) => return Err(error),
         };
-        update_pinned_ace(&child.handle, &child_path, sid, value)?;
+        match (value, journal.as_deref_mut()) {
+            (None, Some(journal)) => {
+                remove_pinned_ace_saving(&child.handle, &child_path, sid, journal)?;
+            }
+            _ => update_pinned_ace(&child.handle, &child_path, sid, value)?,
+        }
         if child.directory {
             stack.push(Frame {
                 target: child,

@@ -641,18 +641,33 @@ fn update_open_ace(
             let _updated = LocalAllocGuard(updated.cast());
             write_dacl(handle, path, updated)
         }
-        None => {
-            // SAFETY: both SIDs are valid for the comparison.
-            let (mut filtered, removed) =
-                super::dacl_without_allowed_aces_where(path, old, |ace| unsafe {
-                    EqualSid(ace, sid) != 0
-                })?;
-            if removed > 0 {
-                write_dacl(handle, path, filtered.as_mut_ptr().cast())?;
-            }
-            Ok(())
-        }
+        None => remove_open_ace(handle, path, sid).map(|_| ()),
     }
+}
+
+/// Takes `sid`'s allow entries out of the open object's DACL, writing
+/// nothing when it holds none, and gives back the DACL it had when it did.
+fn remove_open_ace(
+    handle: &HandleGuard,
+    path: &Path,
+    sid: PSID,
+) -> Result<Option<Vec<u32>>, AppContainerError> {
+    let (old, _descriptor) = read_dacl(handle, path)?;
+    // SAFETY: both SIDs are valid for the comparison.
+    let (mut filtered, removed) =
+        super::dacl_without_allowed_aces_where(path, old, |ace| unsafe {
+            EqualSid(ace, sid) != 0
+        })?;
+    if removed == 0 {
+        return Ok(None);
+    }
+    // SAFETY: `old` is the DACL inside the live descriptor, `AclSize` bytes long.
+    let size = usize::from(unsafe { (*old).AclSize });
+    let mut saved = vec![0u32; size.div_ceil(std::mem::size_of::<u32>())];
+    // SAFETY: `saved` holds at least `size` bytes and doesn't overlap `old`.
+    unsafe { ptr::copy_nonoverlapping(old.cast::<u8>(), saved.as_mut_ptr().cast::<u8>(), size) };
+    write_dacl(handle, path, filtered.as_mut_ptr().cast())?;
+    Ok(Some(saved))
 }
 
 /// A tree that receives a lifecycle grant: its root, opened once by path,
@@ -828,16 +843,85 @@ fn update_pinned_ace(
     sid: PSID,
     value: Option<(u32, u32)>,
 ) -> Result<(), AppContainerError> {
+    let _lock = lock_pinned(handle)?;
+    update_open_ace(handle, path, sid, value)
+}
+
+/// The lock on the object `handle` has open, which every DACL change to it
+/// takes.
+fn lock_pinned(handle: &HandleGuard) -> Result<impl Drop, AppContainerError> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the pinned file handle is live and the output is correctly sized.
     if unsafe { GetFileInformationByHandle(handle.as_raw(), &mut info) } == 0 {
         return Err(last_error("inspect the pinned permission target"));
     }
-    let _lock = lock_object(Identity {
+    lock_object(Identity {
         volume: info.dwVolumeSerialNumber,
         index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    })?;
-    update_open_ace(handle, path, sid, value)
+    })
+}
+
+/// A DACL a removal replaced, kept with the object it belongs to, so that
+/// undoing the run writes back exactly that.
+pub(super) struct SavedDacl {
+    handle: HandleGuard,
+    path: PathBuf,
+    dacl: Vec<u32>,
+}
+
+/// Takes `sid`'s entries out of the pinned object's DACL, as
+/// [`update_pinned_ace`] does, and adds the DACL it had to `journal` when
+/// it held any.
+pub(super) fn remove_pinned_ace_saving(
+    handle: &HandleGuard,
+    path: &Path,
+    sid: PSID,
+    journal: &mut Vec<SavedDacl>,
+) -> Result<(), AppContainerError> {
+    let _lock = lock_pinned(handle)?;
+    let Some(dacl) = remove_open_ace(handle, path, sid)? else {
+        return Ok(());
+    };
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: both process handles are this process's pseudo handle, and
+    // `handle` is live; the duplicate is owned by the guard below.
+    if unsafe {
+        windows_sys::Win32::Foundation::DuplicateHandle(
+            GetCurrentProcess(),
+            handle.as_raw(),
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        let error = last_error("keep the permission target open to undo a removal");
+        // Put this one back now: nothing else would.
+        let _ = write_dacl(handle, path, dacl.as_ptr().cast_mut().cast());
+        return Err(error);
+    }
+    journal.push(SavedDacl {
+        handle: HandleGuard(duplicate),
+        path: path.to_path_buf(),
+        dacl,
+    });
+    Ok(())
+}
+
+/// Writes back, newest first, the DACLs a removal replaced.
+fn restore_saved(journal: Vec<SavedDacl>) -> Result<(), AppContainerError> {
+    let mut first_error = None;
+    for mut saved in journal.into_iter().rev() {
+        let restored = lock_pinned(&saved.handle).and_then(|_lock| {
+            write_dacl(&saved.handle, &saved.path, saved.dacl.as_mut_ptr().cast())
+        });
+        if let Err(error) = restored {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Apply or remove only the previewed capabilities. This function never runs package scripts.
@@ -880,17 +964,34 @@ fn apply_plan(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
         })
         .collect::<Result<Vec<_>, AppContainerError>>()
         .map_err(|error| failure(format!("{}. Nothing was changed", setup_reason(error))))?;
+    // What each removal replaced, in order, to write back on a failure: a
+    // removal that granted the tree again would also reach files that never
+    // held the capability.
+    let mut removed: Vec<Vec<SavedDacl>> = Vec::with_capacity(plan.grants.len());
     for (index, entry) in plan.grants.iter().enumerate() {
         let (_, root, sid, _) = &targets[index];
-        let Err(error) = change_grant(entry, root, sid, !remove) else {
+        let changed = if remove {
+            let mut journal = Vec::new();
+            let changed = change_grant_saving(entry, root, sid, false, Some(&mut journal));
+            removed.push(journal);
+            changed
+        } else {
+            change_grant(entry, root, sid, true)
+        };
+        let Err(error) = changed else {
             continue;
         };
         let mut undo_error = None;
+        for journal in removed.drain(..).rev() {
+            if let Err(error) = restore_saved(journal) {
+                undo_error.get_or_insert(error);
+            }
+        }
         for (undone, entry) in plan.grants[..=index].iter().enumerate().rev() {
             let (_, root, sid, held) = &targets[undone];
             let undo = match (remove, *held) {
-                // A removal took this capability away: grant it again.
-                (true, true) => change_grant(entry, root, sid, true),
+                // A removal is undone from what it saved, above.
+                (true, _) => Ok(()),
                 // A grant that wasn't there before: remove it again.
                 (false, false) => change_grant(entry, root, sid, false),
                 // Applying again took away only the root's entry, while it
@@ -969,6 +1070,18 @@ fn change_grant(
     sid: &CapabilitySid,
     grant: bool,
 ) -> Result<(), AppContainerError> {
+    change_grant_saving(entry, root, sid, grant, None)
+}
+
+/// [`change_grant`], adding to `journal`, for a removal, each DACL it
+/// replaces, so that undoing it puts back only what was there.
+fn change_grant_saving(
+    entry: &Grant,
+    root: &walk::Target,
+    sid: &CapabilitySid,
+    grant: bool,
+    mut journal: Option<&mut Vec<SavedDacl>>,
+) -> Result<(), AppContainerError> {
     // Serialize the complete tree update separately from individual DACL
     // merges, including across administrator accounts and logon sessions.
     let _setup_lock = lock_named(&format!(
@@ -976,12 +1089,19 @@ fn change_grant(
         entry.capability_name
     ))?;
     let value = grant.then_some((entry.permission.mask(), entry.permission.inheritance()));
+    let remove_root = |journal: Option<&mut Vec<SavedDacl>>| match journal {
+        Some(journal) => remove_pinned_ace_saving(&root.handle, &entry.path, sid.raw(), journal),
+        None => update_pinned_ace(&root.handle, &entry.path, sid.raw(), None),
+    };
     if entry.permission == Permission::ToolReadExecute {
         // Re-applying also deactivates the root until the walk completes.
-        update_pinned_ace(&root.handle, &entry.path, sid.raw(), None)?;
-        walk::children(root, &entry.path, sid.raw(), value)?;
+        remove_root(journal.as_deref_mut())?;
+        walk::children_saving(root, &entry.path, sid.raw(), value, journal.as_deref_mut())?;
     }
-    update_pinned_ace(&root.handle, &entry.path, sid.raw(), value)
+    match value {
+        Some(_) => update_pinned_ace(&root.handle, &entry.path, sid.raw(), value),
+        None => remove_root(journal),
+    }
 }
 
 pub(super) struct PreparedAccess<'a> {
@@ -1271,6 +1391,62 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// A removal that stops partway puts back what it took away and nothing
+    /// more: a file in a tool tree that held no entry for the tool's
+    /// capability, such as one its owner kept from it, still holds none,
+    /// rather than gaining one as granting the tree again would give it.
+    #[test]
+    fn a_removal_that_stops_puts_back_only_what_it_took() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        let open = first.join("a-open.txt");
+        let kept_out = first.join("b-kept-out.txt");
+        std::fs::write(&open, "tool").unwrap();
+        std::fs::write(&kept_out, "private").unwrap();
+        let second = temporary.path().join("second");
+        std::fs::create_dir(&second).unwrap();
+        let user = current_user_sid().unwrap();
+        let plan = Plan {
+            grants: vec![
+                grant_for(&first, Permission::ToolReadExecute, &user).unwrap(),
+                grant_for(&second, Permission::ToolReadExecute, &user).unwrap(),
+            ],
+            user_sid: user.clone(),
+        };
+        apply_plan(&plan, false).unwrap();
+        let first_sid = capability_sid(&plan.grants[0].capability_name).unwrap();
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&kept_out)
+            .arg("/inheritance:d")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        update_ace(&kept_out, first_sid.raw(), None).unwrap();
+        // The removal of the second tree stops at a directory it can't
+        // change, after the first tree's removal went through.
+        let locked = second.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        lock_directory_for_test(&locked);
+
+        let error = without_privileges(|| apply_plan(&plan, true))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("It put back what it had changed"), "{error}");
+        let holds = |path: &Path| {
+            let (handle, _) = open_permissions(path, false).unwrap();
+            holds_ace(&handle, path, first_sid.raw()).unwrap()
+        };
+        assert!(
+            !holds(&kept_out),
+            "the removal's undo granted a file it never held"
+        );
+        assert!(holds(&first));
+        assert!(holds(&open));
+        std::fs::remove_dir(&locked).unwrap();
     }
 
     /// Applying again walks the tree with the root's entry taken away; a
