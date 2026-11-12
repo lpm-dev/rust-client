@@ -54,10 +54,14 @@ test("CI compiles experimental HTTP/3 with the required reqwest cfg", () => {
   assert.match(job, /cargo check --locked -p lpm-cli --features experimental-http3/);
 });
 
-function readCiWorkflow() {
+function readWorkflow(name) {
   return fs
-    .readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8")
+    .readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8")
     .replaceAll("\r\n", "\n");
+}
+
+function readCiWorkflow() {
+  return readWorkflow("ci.yml");
 }
 
 function ciJob(workflow, id) {
@@ -80,7 +84,11 @@ test("the required macOS check fails unless every macOS job passes", {
   assert.ok(gate, "missing macos-workspace job");
   assert.match(gate, /^    name: macOS workspace checks$/m);
   assert.match(gate, /^    permissions: \{\}$/m, "the gate reads no repository content");
-  assert.match(gate, /^    if: always\(\)$/m, "a gate skipped by a failed job counts as passing");
+  assert.match(
+    gate,
+    /^    if: \$\{\{ always\(\) && !github\.event\.pull_request\.draft \}\}$/m,
+    "a gate skipped by a failed job counts as passing",
+  );
   const needs = gate.match(/^    needs: \[([^\]]+)\]$/m)?.[1].split(",").map((job) => job.trim());
   assert.deepEqual(needs, ["macos-workspace-tests", "macos-build-checks"]);
   for (const job of needs) {
@@ -176,3 +184,57 @@ test("the CI workflow token can only read the repository", () => {
     assert.equal(grant[1].trim(), "{}", `a job widens the workflow token: ${grant[0].trim()}`);
   }
 });
+
+const DRAFT_GATE = "${{ !github.event.pull_request.draft }}";
+const DRAFT_GATE_AFTER_ANY_RESULT = "${{ always() && !github.event.pull_request.draft }}";
+
+test("draft pull requests run no CI jobs, and marking one ready runs them all", () => {
+  const pullRequestWorkflows = fs
+    .readdirSync(path.join(repoRoot, ".github/workflows"))
+    .filter((name) => /\.ya?ml$/.test(name))
+    .map((name) => [name, readWorkflow(name)])
+    .filter(([, workflow]) => /^  pull_request:$|^on:.*\bpull_request\b/m.test(workflowTriggers(workflow)));
+  assert.ok(pullRequestWorkflows.some(([name]) => name === "ci.yml"), "CI no longer runs on pull requests");
+
+  for (const [name, workflow] of pullRequestWorkflows) {
+    // Branch protection counts a skipped check as passing, so a draft's skipped
+    // checks must be replaced by a full run the moment the PR is marked ready.
+    const trigger = workflow.match(/^  pull_request:\n((?:    .*\n)*)/m)?.[1] ?? "";
+    assert.match(
+      trigger,
+      /^    types: \[opened, synchronize, reopened, ready_for_review\]$/m,
+      `${name} must run again when a draft is marked ready`,
+    );
+
+    const jobs = workflowJobs(workflow);
+    assert.ok(jobs.length > 0, `${name} has no jobs`);
+    for (const [id, job] of jobs) {
+      const condition = job.match(/^    if: (.*)$/m)?.[1];
+      assert.ok(
+        condition === DRAFT_GATE || condition === DRAFT_GATE_AFTER_ANY_RESULT || skipsPullRequests(condition),
+        `${name} job ${id} must skip draft PRs and nothing else (if: ${DRAFT_GATE}), ` +
+          `or not run on pull requests; found ${condition ?? "no condition"}`,
+      );
+    }
+  }
+});
+
+function workflowTriggers(workflow) {
+  const jobs = workflow.indexOf("\njobs:\n");
+  return jobs === -1 ? workflow : workflow.slice(0, jobs);
+}
+
+function workflowJobs(workflow) {
+  const jobs = workflow.indexOf("\njobs:\n");
+  if (jobs === -1) return [];
+  return [...workflow.slice(jobs).matchAll(/^  ([a-z][\w-]*):\n([\s\S]*?)(?=^  [a-z][\w-]*:$|(?![\s\S]))/gm)]
+    .map(([, id, job]) => [id, job]);
+}
+
+function skipsPullRequests(condition) {
+  if (condition === undefined) return false;
+  if (condition === "github.event_name != 'pull_request'") return true;
+  return condition
+    .split(" || ")
+    .every((clause) => /^github\.event_name == '(?:push|schedule|workflow_dispatch)'$/.test(clause));
+}
