@@ -2222,6 +2222,53 @@ fn global_unlink_preserves_legacy_wrapper_contents_and_retires_the_link() {
     );
 }
 
+/// A link an earlier release made has its commands in LPM's bin directory
+/// as that release wrote them, naming their targets whole; unlinking it
+/// recognizes and removes them.
+#[cfg(windows)]
+#[test]
+fn global_unlink_removes_commands_an_earlier_release_wrote() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let manifest = lpm_global::read_for(&root).unwrap();
+    let entry = manifest.packages.get("linked-tool").unwrap();
+    let legacy = lpm_global::shim::legacy_windows_shim_contents(&lpm_global::Shim {
+        command_name: "linked-tool".into(),
+        // Joined as releases join it, separators and all.
+        target: root
+            .global_root()
+            .join(&entry.root)
+            .join("node_modules/.bin")
+            .join("linked-tool"),
+    })
+    .unwrap();
+    // The sh file, which runs the .ps1 beside it, reads the same either way.
+    let mut changed = 0;
+    for (name, text) in &legacy {
+        let path = root.bin_dir().join(name);
+        if std::fs::read_to_string(&path).unwrap() != *text {
+            changed += 1;
+        }
+        std::fs::write(&path, text).unwrap();
+    }
+    assert_eq!(changed, 2, "the .cmd and .ps1 files change form");
+
+    lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .assert()
+        .success();
+
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        assert!(!artifact.exists(), "{}", artifact.display());
+    }
+}
+
 #[test]
 fn global_unlink_succeeds_when_the_checkout_and_wrapper_are_missing() {
     let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
@@ -2509,12 +2556,17 @@ fn interrupted_global_link_recovers_before_provenance_publication() {
 fn invalid_windows_global_launcher_target_leaves_no_unjournaled_wrapper() {
     let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
     let package = write_local_cli_package(&project);
+    // A package whose checkout a shim can't name in a .cmd file.
+    let unnameable = project.path().join("pkg&dir");
+    std::fs::create_dir(&unnameable).unwrap();
+    let unnameable = unnameable.join("linked-tool");
+    std::fs::rename(&package, &unnameable).unwrap();
     let home = project.home().join("lpm&home");
     let root = lpm_common::LpmRoot::from_dir(home.clone());
     lpm(&project)
         .env("LPM_HOME", &home)
         .args(["global", "link"])
-        .arg(&package)
+        .arg(&unnameable)
         .assert()
         .failure();
     assert!(!root.global_manifest().exists());
@@ -2525,9 +2577,21 @@ fn invalid_windows_global_launcher_target_leaves_no_unjournaled_wrapper() {
             .exists()
     );
     assert_eq!(
-        std::fs::read_dir(root.global_root().join("links"))
-            .unwrap()
-            .count(),
+        std::fs::read_dir(root.global_root().join("links")).map_or(0, Iterator::count),
         0
     );
+
+    // The shims name their targets from their own directory, so an LPM home
+    // a .cmd file couldn't spell out takes a link all the same.
+    let package = write_local_cli_package(&project);
+    lpm(&project)
+        .env("LPM_HOME", &home)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        let text = std::fs::read_to_string(&artifact).unwrap();
+        assert!(!text.contains("lpm&home"), "{}: {text}", artifact.display());
+    }
 }

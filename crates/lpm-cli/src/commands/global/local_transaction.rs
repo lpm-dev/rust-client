@@ -96,10 +96,14 @@ fn read_value(directory: &Dir, name: &str) -> Result<Option<Value>, LpmError> {
     Ok(Some(Value::File(text)))
 }
 
-fn artifacts(shim: &Shim) -> Result<Vec<Artifact>, LpmError> {
+/// The command files `shim` makes in `bin_dir`; with no `bin_dir`, the
+/// Windows files releases before relative shims made, which spelled the
+/// target out whole and which a link may still hold.
+fn artifacts(bin_dir: Option<&Path>, shim: &Shim) -> Result<Vec<Artifact>, LpmError> {
     lpm_global::shim::validate_command_name(&shim.command_name)?;
     #[cfg(unix)]
     {
+        let _ = bin_dir;
         Ok(vec![Artifact {
             name: shim.command_name.clone(),
             value: Value::Symlink(shim.target.clone()),
@@ -107,7 +111,11 @@ fn artifacts(shim: &Shim) -> Result<Vec<Artifact>, LpmError> {
     }
     #[cfg(windows)]
     {
-        Ok(lpm_global::shim::windows_shim_contents(shim)?
+        let contents = match bin_dir {
+            Some(bin_dir) => lpm_global::shim::windows_shim_contents(bin_dir, shim)?,
+            None => lpm_global::shim::legacy_windows_shim_contents(shim)?,
+        };
+        Ok(contents
             .into_iter()
             .map(|(name, value)| Artifact {
                 name,
@@ -117,13 +125,43 @@ fn artifacts(shim: &Shim) -> Result<Vec<Artifact>, LpmError> {
     }
 }
 
+/// `current`'s artifacts, each in the form `directory` holds it: as written
+/// now, or, where that is what is there, as an earlier release wrote it.
+/// `legacy` is `None` where no earlier release could have written them, as
+/// under an LPM home with a `&` in it.
+fn owned_forms(
+    directory: &Dir,
+    current: Vec<Artifact>,
+    legacy: Option<Vec<Artifact>>,
+) -> Result<Vec<Artifact>, LpmError> {
+    let Some(legacy) = legacy else {
+        return Ok(current);
+    };
+    current
+        .into_iter()
+        .zip(legacy)
+        .map(|(current, legacy)| {
+            let found = read_value(directory, &current.name)?;
+            Ok(if found.as_ref() == Some(&legacy.value) {
+                legacy
+            } else {
+                current
+            })
+        })
+        .collect()
+}
+
 pub(super) fn validate_bins(bins: &[super::LocalLinkBin]) -> Result<(), LpmError> {
+    // The whole target is checked, as the shim spells out at most that.
     let mut output = Vec::new();
     for bin in bins {
-        output.extend(artifacts(&Shim {
-            command_name: bin.command_name.clone(),
-            target: bin.target.clone(),
-        })?);
+        output.extend(artifacts(
+            None,
+            &Shim {
+                command_name: bin.command_name.clone(),
+                target: bin.target.clone(),
+            },
+        )?);
     }
     validate_artifacts(&output)?;
     if provenance_bytes(&output)?.len() as u64 > FILE_CAP {
@@ -152,33 +190,44 @@ fn validate_artifacts(artifacts: &[Artifact]) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// The command files of `package` in LPM's bin directory, as written now
+/// or, `legacy`, as releases before relative shims wrote them.
 fn global_artifacts(
     root: &LpmRoot,
     package: &str,
     entry: &PackageEntry,
     aliases: &BTreeMap<String, AliasEntry>,
+    legacy: bool,
 ) -> Result<Vec<Artifact>, LpmError> {
     wrapper_leaf(entry)?;
     let install_bin = root
         .global_root()
         .join(&entry.root)
         .join("node_modules/.bin");
+    let bin_dir = root.bin_dir();
+    let bin_dir = (!legacy).then_some(bin_dir.as_path());
     let mut result = Vec::new();
     for name in &entry.commands {
-        result.extend(artifacts(&Shim {
-            command_name: name.clone(),
-            target: install_bin.join(name),
-        })?);
+        result.extend(artifacts(
+            bin_dir,
+            &Shim {
+                command_name: name.clone(),
+                target: install_bin.join(name),
+            },
+        )?);
     }
     for (name, alias) in aliases {
         lpm_global::shim::validate_command_name(&alias.bin)?;
         if alias.package != package || !entry.commands.contains(&alias.bin) {
             return Err(invalid("invalid local-link alias owner or target"));
         }
-        result.extend(artifacts(&Shim {
-            command_name: name.clone(),
-            target: install_bin.join(&alias.bin),
-        })?);
+        result.extend(artifacts(
+            bin_dir,
+            &Shim {
+                command_name: name.clone(),
+                target: install_bin.join(&alias.bin),
+            },
+        )?);
     }
     validate_artifacts(&result)?;
     Ok(result)
@@ -351,12 +400,19 @@ pub(super) fn link(
     let result = (|| {
         sync(dirs.links())?;
         link.root_relative = format!("links/{}", leaf.to_string_lossy());
+        let wrapper_bin_dir = root
+            .global_root()
+            .join(&link.root_relative)
+            .join("node_modules/.bin");
         let mut wrapper = Vec::new();
         for bin in &link.bins {
-            wrapper.extend(artifacts(&Shim {
-                command_name: bin.command_name.clone(),
-                target: bin.target.clone(),
-            })?);
+            wrapper.extend(artifacts(
+                Some(&wrapper_bin_dir),
+                &Shim {
+                    command_name: bin.command_name.clone(),
+                    target: bin.target.clone(),
+                },
+            )?);
         }
         validate_artifacts(&wrapper)?;
         let provenance = provenance_bytes(&wrapper)?;
@@ -374,7 +430,7 @@ pub(super) fn link(
                 .collect(),
         };
         let aliases = BTreeMap::new();
-        let global = global_artifacts(root, &link.name, &entry, &aliases)?;
+        let global = global_artifacts(root, &link.name, &entry, &aliases, false)?;
         require_missing(dirs.bin(), &global)?;
         archive_slot = Some(create_private_directory(dirs.global(), "local-link")?);
         let (archive_name, archive_dir) = archive_slot
@@ -457,7 +513,13 @@ pub(super) fn unlink(
         .filter(|(_, owner)| owner.package == package)
         .map(|(name, owner)| (name.clone(), owner.clone()))
         .collect();
-    let global = global_artifacts(root, package, &entry, &aliases)?;
+    // A link an earlier release made holds its command files as that
+    // release wrote them; the journal records the form found.
+    let global = owned_forms(
+        dirs.bin(),
+        global_artifacts(root, package, &entry, &aliases, false)?,
+        global_artifacts(root, package, &entry, &aliases, true).ok(),
+    )?;
     require_owned(dirs.bin(), &global)?;
     // Older links have no immutable record of their wrapper contents.
     let preserve_wrapper = entry.integrity == "local-link";
@@ -769,7 +831,33 @@ fn validate(root: &LpmRoot, journal: &Journal) -> Result<(), LpmError> {
     {
         return Err(invalid("invalid local-link recovery archive"));
     }
-    if global_artifacts(root, &journal.package, &journal.entry, &journal.aliases)? != journal.global
+    let current = global_artifacts(
+        root,
+        &journal.package,
+        &journal.entry,
+        &journal.aliases,
+        false,
+    )?;
+    // Where no earlier release could have written them, only the current
+    // form counts.
+    let legacy = global_artifacts(
+        root,
+        &journal.package,
+        &journal.entry,
+        &journal.aliases,
+        true,
+    )
+    .ok();
+    if journal.global.len() != current.len()
+        || journal
+            .global
+            .iter()
+            .zip(&current)
+            .enumerate()
+            .any(|(index, (recorded, current))| {
+                recorded != current
+                    && legacy.as_ref().and_then(|legacy| legacy.get(index)) != Some(recorded)
+            })
     {
         return Err(invalid(
             "local-link journal commands do not match their recorded owner",

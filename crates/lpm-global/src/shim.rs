@@ -166,19 +166,15 @@ pub fn emit_shim(bin_dir: &Path, shim: &Shim) -> Result<EmittedShim, ShimError> 
 
     #[cfg(windows)]
     {
-        let target_str = shim.target.to_string_lossy();
-        validate_windows_target_path(&target_str)?;
-        let cmd_path = bin_dir.join(format!("{}.cmd", shim.command_name));
-        let ps1_path = bin_dir.join(format!("{}.ps1", shim.command_name));
-        let bash_path = bin_dir.join(&shim.command_name);
-
-        atomic_replace_file_windows(&cmd_path, &cmd_template(&target_str).into_bytes())?;
-        atomic_replace_file_windows(&ps1_path, &ps1_template(&target_str).into_bytes())?;
-        atomic_replace_file_windows(&bash_path, &bash_template(&target_str).into_bytes())?;
-
+        let mut artifacts = Vec::with_capacity(3);
+        for (name, contents) in windows_shim_contents(bin_dir, shim)? {
+            let path = bin_dir.join(name);
+            atomic_replace_file_windows(&path, contents.as_bytes())?;
+            artifacts.push(path);
+        }
         Ok(EmittedShim {
             command_name: shim.command_name.clone(),
-            artifacts: vec![cmd_path, ps1_path, bash_path],
+            artifacts,
         })
     }
 }
@@ -287,35 +283,30 @@ const WINDOWS_SHIM_CONTENT_CAP_BYTES: u64 = 64 * 1024;
 ///
 /// The check is compiled on every platform so the script formats can be
 /// regression-tested without a Windows host. Each artifact must be a bounded,
-/// regular, non-reparse file whose bytes exactly match the expected target.
+/// regular, non-reparse file whose bytes exactly match the expected target,
+/// as shims are written now or as releases before relative shims wrote them.
 pub fn verify_windows_shim_triple(
     bin_dir: &Path,
     command_name: &str,
     target: &Path,
 ) -> Result<(), ShimError> {
-    validate_command_name(command_name)?;
-    let target = target.to_string_lossy();
-    validate_windows_target_path(&target)?;
-    let expected = [
-        (
-            bin_dir.join(format!("{command_name}.cmd")),
-            cmd_template(&target),
-        ),
-        (
-            bin_dir.join(format!("{command_name}.ps1")),
-            ps1_template(&target),
-        ),
-        (bin_dir.join(command_name), bash_template(&target)),
-    ];
+    let shim = Shim {
+        command_name: command_name.to_string(),
+        target: target.to_path_buf(),
+    };
+    let current = windows_shim_contents(bin_dir, &shim)?;
+    let legacy = legacy_windows_shim_contents(&shim).ok();
 
-    for (path, expected_content) in expected {
+    for (index, (name, expected_content)) in current.into_iter().enumerate() {
+        let path = bin_dir.join(&name);
         let actual =
             lpm_common::read_text_file_capped_nofollow(&path, WINDOWS_SHIM_CONTENT_CAP_BYTES)
                 .map_err(|error| ShimError::InvalidArtifact {
                     path: path.clone(),
                     reason: error.to_string(),
                 })?;
-        if actual != expected_content {
+        let legacy_content = legacy.as_ref().map(|legacy| &legacy[index].1);
+        if actual != expected_content && Some(&actual) != legacy_content {
             return Err(ShimError::InvalidArtifact {
                 path,
                 reason: "content does not match the expected target".to_string(),
@@ -326,18 +317,115 @@ pub fn verify_windows_shim_triple(
     Ok(())
 }
 
-/// Expected Windows command files, including their shell-specific suffixes.
-pub fn windows_shim_contents(shim: &Shim) -> Result<[(String, String); 3], ShimError> {
-    validate_command_name(&shim.command_name)?;
-    validate_command_name(&format!("{}.cmd", shim.command_name))?;
-    validate_command_name(&format!("{}.ps1", shim.command_name))?;
+/// Expected Windows command files in `bin_dir`, including their
+/// shell-specific suffixes. They name the target relative to their own
+/// directory where it shares their volume: an absolute path in them is read
+/// in the console's code page by cmd.exe and in the ANSI one by Windows
+/// PowerShell 5.1, so a non-ASCII user folder broke every global command.
+pub fn windows_shim_contents(
+    bin_dir: &Path,
+    shim: &Shim,
+) -> Result<[(String, String); 3], ShimError> {
+    validate_windows_command_names(&shim.command_name)?;
+    let target = shim.target.to_string_lossy();
+    let path = match relative_to(bin_dir, &shim.target) {
+        Some(relative) => ShimPath::Relative(relative.to_string_lossy().into_owned()),
+        None => ShimPath::Absolute(target.clone().into_owned()),
+    };
+    validate_windows_target_path(path.text())?;
+    Ok([
+        (
+            format!("{}.cmd", shim.command_name),
+            cmd_template(&target, &path),
+        ),
+        (
+            format!("{}.ps1", shim.command_name),
+            ps1_template(&target, &path),
+        ),
+        (shim.command_name.clone(), bash_template(&target, &path)),
+    ])
+}
+
+/// The Windows command files releases before relative shims wrote, with
+/// `shim`'s target spelled out whole: what an existing shim may still hold.
+pub fn legacy_windows_shim_contents(shim: &Shim) -> Result<[(String, String); 3], ShimError> {
+    validate_windows_command_names(&shim.command_name)?;
     let target = shim.target.to_string_lossy();
     validate_windows_target_path(&target)?;
     Ok([
-        (format!("{}.cmd", shim.command_name), cmd_template(&target)),
-        (format!("{}.ps1", shim.command_name), ps1_template(&target)),
-        (shim.command_name.clone(), bash_template(&target)),
+        (
+            format!("{}.cmd", shim.command_name),
+            legacy_cmd_template(&target),
+        ),
+        (
+            format!("{}.ps1", shim.command_name),
+            legacy_ps1_template(&target),
+        ),
+        (shim.command_name.clone(), legacy_bash_template(&target)),
     ])
+}
+
+fn validate_windows_command_names(command_name: &str) -> Result<(), ShimError> {
+    validate_command_name(command_name)?;
+    validate_command_name(&format!("{command_name}.cmd"))?;
+    validate_command_name(&format!("{command_name}.ps1"))
+}
+
+/// How a Windows shim names its target.
+enum ShimPath {
+    /// The way from the shim's directory, with `\` separators.
+    Relative(String),
+    /// The whole path, for a target on another volume.
+    Absolute(String),
+}
+
+impl ShimPath {
+    fn text(&self) -> &str {
+        match self {
+            Self::Relative(text) | Self::Absolute(text) => text,
+        }
+    }
+
+    /// The path as a `.cmd` file that starts with
+    /// [`lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE`] spells it.
+    fn cmd(&self) -> String {
+        match self {
+            Self::Relative(relative) => format!("%dp0%{relative}"),
+            Self::Absolute(absolute) => absolute.clone(),
+        }
+    }
+}
+
+/// The way from `base` to `target` when both are absolute and on one volume,
+/// or none.
+fn relative_to(base: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !base.is_absolute() || !target.is_absolute() {
+        return None;
+    }
+    let base: Vec<Component<'_>> = base.components().collect();
+    let target: Vec<Component<'_>> = target.components().collect();
+    if base.first() != target.first()
+        || base
+            .iter()
+            .chain(&target)
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return None;
+    }
+    let shared = base
+        .iter()
+        .zip(&target)
+        .take_while(|(base, target)| base == target)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in shared..base.len() {
+        relative.push("..");
+    }
+    for part in &target[shared..] {
+        relative.push(part.as_os_str());
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
 }
 
 // ─── Unix internals ───────────────────────────────────────────────────
@@ -357,7 +445,69 @@ fn project_command_shim(target: &str) -> Option<String> {
         .then(|| format!("{target}.cmd"))
 }
 
-fn cmd_template(target: &str) -> String {
+fn cmd_template(target: &str, path: &ShimPath) -> String {
+    let preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE;
+    let script = path.cmd();
+    if project_command_shim(target).is_some() {
+        return format!("{preamble}@\"{script}.cmd\" %*\r\n");
+    }
+    // Prefer a co-located node.exe, fall back to PATH, as project shims do.
+    format!(
+        "{preamble}@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"{script}\" %*\r\n) ELSE (\r\n  node \"{script}\" %*\r\n)\r\n",
+    )
+}
+
+fn ps1_template(target: &str, path: &ShimPath) -> String {
+    let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    if project_command_shim(target).is_some() {
+        let command = match path {
+            ShimPath::Relative(relative) => format!(
+                "(Join-Path $PSScriptRoot {})",
+                literal(&format!("{relative}.cmd"))
+            ),
+            ShimPath::Absolute(absolute) => literal(&format!("{absolute}.cmd")),
+        };
+        return format!("#!/usr/bin/env pwsh\n& {command} @args\nexit $LASTEXITCODE\n");
+    }
+    let literal_target = match path {
+        ShimPath::Relative(relative) => format!("(Join-Path $basedir {})", literal(relative)),
+        ShimPath::Absolute(absolute) => literal(absolute),
+    };
+    format!(
+        "#!/usr/bin/env pwsh\n\
+         $basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent\n\
+         $exe = Join-Path $basedir 'node.exe'\n\
+         if (Test-Path $exe) {{ & $exe {literal_target} $args }}\n\
+         else {{ & node {literal_target} $args }}\n"
+    )
+}
+
+fn bash_template(target: &str, path: &ShimPath) -> String {
+    if project_command_shim(target).is_some() {
+        return legacy_bash_template(target);
+    }
+    let quoted = |text: &str| format!("'{}'", text.replace('\'', "'\"'\"'"));
+    let literal_target = match path {
+        ShimPath::Relative(relative) => {
+            format!("\"$basedir\"/{}", quoted(&relative.replace('\\', "/")))
+        }
+        ShimPath::Absolute(absolute) => quoted(absolute),
+    };
+    format!(
+        "#!/bin/sh\n\
+         basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\
+         case `uname` in\n\
+             *CYGWIN*|*MINGW*|*MSYS*) basedir=`cygpath -w \"$basedir\"` ;;\n\
+         esac\n\
+         if [ -x \"$basedir/node\" ]; then\n\
+             exec \"$basedir/node\"  {literal_target} \"$@\"\n\
+         else\n\
+             exec node  {literal_target} \"$@\"\n\
+         fi\n"
+    )
+}
+
+fn legacy_cmd_template(target: &str) -> String {
     if let Some(command) = project_command_shim(target) {
         return format!("@\"{command}\" %*\n");
     }
@@ -369,7 +519,7 @@ fn cmd_template(target: &str) -> String {
     )
 }
 
-fn ps1_template(target: &str) -> String {
+fn legacy_ps1_template(target: &str) -> String {
     if let Some(command) = project_command_shim(target) {
         let quoted = command.replace('\'', "''");
         return format!("#!/usr/bin/env pwsh\n& '{quoted}' @args\nexit $LASTEXITCODE\n");
@@ -391,7 +541,7 @@ fn ps1_template(target: &str) -> String {
     )
 }
 
-fn bash_template(target: &str) -> String {
+fn legacy_bash_template(target: &str) -> String {
     if project_command_shim(target).is_some() {
         return "#!/bin/sh\nexec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"$0.ps1\" \"$@\"\n".into();
     }
@@ -461,7 +611,12 @@ mod tests {
             .path()
             .join("$(touch injected)-`touch injected2`-'tool.js");
         let shim = dir.path().join("tool");
-        std::fs::write(&shim, bash_template(&target.to_string_lossy())).unwrap();
+        let text = target.to_string_lossy().into_owned();
+        std::fs::write(
+            &shim,
+            bash_template(&text, &ShimPath::Absolute(text.clone())),
+        )
+        .unwrap();
         let node = dir.path().join("node");
         std::fs::write(&node, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -482,7 +637,7 @@ mod tests {
     #[test]
     fn windows_powershell_shim_quotes_expansion_characters_literally() {
         let target = "C:/$(Start-Process calc)/`variable/'tool.js";
-        let text = ps1_template(target);
+        let text = ps1_template(target, &ShimPath::Absolute(target.into()));
         assert!(text.contains("& node 'C:/$(Start-Process calc)/`variable/''tool.js' $args"));
     }
 
@@ -492,7 +647,7 @@ mod tests {
             command_name: "x".repeat(253),
             target: PathBuf::from("C:/tool.js"),
         };
-        assert!(windows_shim_contents(&shim).is_err());
+        assert!(windows_shim_contents(Path::new("C:/bin"), &shim).is_err());
     }
 
     #[cfg(unix)]
@@ -506,10 +661,10 @@ mod tests {
         std::fs::write(&target, "#!/bin/sh\nprintf '%s\\n' \"$1\"\nexit 7\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         let wrapper = dir.path().join("global-tool");
-        std::fs::write(
-            &wrapper,
-            bash_template(&project_bin.join("tool").to_string_lossy()),
-        )
+        std::fs::write(&wrapper, {
+            let text = project_bin.join("tool").to_string_lossy().into_owned();
+            bash_template(&text, &ShimPath::Absolute(text.clone()))
+        })
         .unwrap();
         let powershell = dir.path().join("powershell.exe");
         std::fs::write(
@@ -551,11 +706,14 @@ mod tests {
         use std::os::windows::process::CommandExt;
         let dir = TempDir::new().unwrap();
         let root_text = dir.path().to_str().unwrap();
-        let root = Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(root_text));
+        // A user folder like `C:\Users\Çağrı`: cmd.exe and Windows
+        // PowerShell 5.1 read a path spelled out in a shim in the console's
+        // or the ANSI code page, so the shims must not spell it out.
+        let root = Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(root_text)).join("Çağrı");
         let project_bin = root.join("project with spaces/node_modules/.bin");
         std::fs::create_dir_all(&project_bin).unwrap();
         std::fs::write(project_bin.join("tool.cmd"), "@echo %~1\r\n@exit /b 7\r\n").unwrap();
-        let global_bin = root.join("global bin");
+        let global_bin = root.join("global !x! bin");
         emit_shim(
             &global_bin,
             &Shim {
@@ -578,6 +736,27 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello space"
+        );
+        // Found on PATH by a quoted name, from another directory, where
+        // `%~dp0` in a batch file's main body names the current directory;
+        // and with delayed expansion on, which would read `!x!` out of the
+        // shim's own path.
+        let path = std::env::join_paths(
+            std::iter::once(global_bin.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/v:on", "/s", "/c"])
+            .raw_arg("\"\"tool\" \"hello space\"\"")
+            .env("PATH", path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
             "hello space"
@@ -636,9 +815,76 @@ mod tests {
 
     fn write_windows_triple(bin_dir: &Path, name: &str, target: &str) {
         std::fs::create_dir_all(bin_dir).unwrap();
-        std::fs::write(bin_dir.join(format!("{name}.cmd")), cmd_template(target)).unwrap();
-        std::fs::write(bin_dir.join(format!("{name}.ps1")), ps1_template(target)).unwrap();
-        std::fs::write(bin_dir.join(name), bash_template(target)).unwrap();
+        std::fs::write(
+            bin_dir.join(format!("{name}.cmd")),
+            legacy_cmd_template(target),
+        )
+        .unwrap();
+        std::fs::write(
+            bin_dir.join(format!("{name}.ps1")),
+            legacy_ps1_template(target),
+        )
+        .unwrap();
+        std::fs::write(bin_dir.join(name), legacy_bash_template(target)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shims_name_their_target_relative_to_themselves() {
+        let bin = Path::new(r"C:\Users\Çağrı\.lpm\bin");
+        let target = Path::new(r"C:\Users\Çağrı\.lpm\global\installs\tsc\node_modules\.bin\tsc");
+        let [cmd, ps1, bash] = windows_shim_contents(
+            bin,
+            &Shim {
+                command_name: "tsc".into(),
+                target: target.to_path_buf(),
+            },
+        )
+        .unwrap();
+        let preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE;
+        assert_eq!(
+            cmd.1,
+            format!(
+                "{preamble}@\"%dp0%..\\global\\installs\\tsc\\node_modules\\.bin\\tsc.cmd\" %*\r\n"
+            )
+        );
+        assert_eq!(
+            ps1.1,
+            "#!/usr/bin/env pwsh\n& (Join-Path $PSScriptRoot '..\\global\\installs\\tsc\\node_modules\\.bin\\tsc.cmd') @args\nexit $LASTEXITCODE\n"
+        );
+        for (name, text) in [cmd, ps1, bash] {
+            assert!(text.is_ascii(), "{name}: {text}");
+        }
+        // Another volume can't be reached relatively.
+        let [cmd, ..] = windows_shim_contents(
+            bin,
+            &Shim {
+                command_name: "tsc".into(),
+                target: PathBuf::from(r"D:\tools\node_modules\.bin\tsc"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cmd.1,
+            format!("{preamble}@\"D:\\tools\\node_modules\\.bin\\tsc.cmd\" %*\r\n")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shim_verifier_accepts_the_current_triple_and_rejects_a_mix_of_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(r"global\pkg\node_modules\.bin\tool");
+        let shim = Shim {
+            command_name: "tool".into(),
+            target: target.clone(),
+        };
+        for (name, text) in windows_shim_contents(dir.path(), &shim).unwrap() {
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        assert!(verify_windows_shim_triple(dir.path(), "tool", &target).is_ok());
+        let other = dir.path().join(r"global\other\node_modules\.bin\tool");
+        assert!(verify_windows_shim_triple(dir.path(), "tool", &other).is_err());
     }
 
     #[test]
@@ -709,7 +955,7 @@ mod tests {
         let target = Path::new(r"C:\lpm\global\pkg\node_modules\.bin\tool");
         write_windows_triple(dir.path(), "tool", &target.to_string_lossy());
         let external = dir.path().join("external.cmd");
-        std::fs::write(&external, cmd_template(&target.to_string_lossy())).unwrap();
+        std::fs::write(&external, legacy_cmd_template(&target.to_string_lossy())).unwrap();
         std::fs::remove_file(dir.path().join("tool.cmd")).unwrap();
         std::os::unix::fs::symlink(&external, dir.path().join("tool.cmd")).unwrap();
 

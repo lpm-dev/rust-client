@@ -342,10 +342,16 @@ fn shim_file_name(manager: &str) -> String {
 /// The shim for `manager`. On Windows it hands off to the `.exe`
 /// launcher beside it, which keeps the file ASCII: cmd.exe reads batch
 /// files in the OEM code page, so an LPM path with non-ASCII characters
-/// written into it would break.
+/// written into it would break. It finds the launcher through the `%dp0%`
+/// [`lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE`] sets, not `%~dp0`,
+/// which names the current directory when a script calls `"npm.cmd"`.
 fn shim_script(lpm: &Path, manager: &str) -> Vec<u8> {
     if cfg!(windows) {
-        format!("@echo off\r\n\"%~dp0{manager}.exe\" %*\r\nexit /b %ERRORLEVEL%\r\n").into_bytes()
+        format!(
+            "{}@\"%dp0%{manager}.exe\" %*\r\n@exit /b %ERRORLEVEL%\r\n",
+            lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
+        )
+        .into_bytes()
     } else {
         let lpm = lpm.to_string_lossy();
         let quoted = lpm.replace('\'', r"'\''");
@@ -1530,6 +1536,37 @@ mod tests {
             script,
             "#!/bin/sh\nexec '/opt/it'\\''s lpm/lpm-rs' internal-nested-pm pnpm -- \"$@\"\n"
         );
+    }
+
+    /// A script that calls the shim by a quoted name finds it on PATH, and
+    /// the shim must still run the launcher beside itself, not one in the
+    /// script's directory.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shim_runs_the_launcher_beside_it_when_called_by_a_quoted_name() {
+        use std::os::windows::process::CommandExt as _;
+        let shims = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(
+            shims.path().join("pnpm.cmd"),
+            shim_script(Path::new("lpm"), "pnpm"),
+        )
+        .unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        std::fs::copy(system.join("hostname.exe"), shims.path().join("pnpm.exe")).unwrap();
+        let path = std::env::join_paths([shims.path().to_path_buf(), system.clone()]).unwrap();
+        let output = std::process::Command::new(system.join("cmd.exe"))
+            .args(["/d", "/s", "/c"])
+            .raw_arg("\"\"pnpm.cmd\"\"")
+            .env("PATH", path)
+            .current_dir(elsewhere.path())
+            .output()
+            .unwrap();
+        let expected = std::process::Command::new(system.join("hostname.exe"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected.stdout);
     }
 
     #[cfg(unix)]
