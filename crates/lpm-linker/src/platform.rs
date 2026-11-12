@@ -45,10 +45,9 @@ pub(crate) fn windows_cmd_shim(
 /// there from `bin_dir` when both are on one volume, else `path` itself.
 #[cfg(windows)]
 fn windows_cmd_shim_path(bin_dir: &Path, path: &Path) -> Result<String, String> {
-    let bin_dir = without_verbatim_prefix(bin_dir);
-    let path = without_verbatim_prefix(path);
-    let same_volume = bin_dir.components().next() == path.components().next();
-    match pathdiff::diff_paths(&path, &bin_dir).filter(|_| same_volume && path.is_absolute()) {
+    use lpm_common::symlink::{relative_path_on_one_volume, windows_plain_path};
+    let path = windows_plain_path(path);
+    match relative_path_on_one_volume(&windows_plain_path(bin_dir), &path) {
         Some(relative) => {
             let relative = relative.to_string_lossy();
             validate_cmd_path(&relative)?;
@@ -59,17 +58,6 @@ fn windows_cmd_shim_path(bin_dir: &Path, path: &Path) -> Result<String, String> 
             validate_cmd_path(&absolute)?;
             Ok(absolute.into_owned())
         }
-    }
-}
-
-/// `path` without the `\\?\` a canonicalized drive path starts with, so it
-/// compares with one built from the project's path, and Node can run it.
-#[cfg(windows)]
-fn without_verbatim_prefix(path: &Path) -> std::path::PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
-        _ => path.to_path_buf(),
     }
 }
 

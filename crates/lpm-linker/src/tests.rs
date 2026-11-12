@@ -1212,6 +1212,35 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
         shim.contains(r#""%dp0%node.exe" "%dp0%..\tool\bin\tool.js" %*"#),
         "{shim}"
     );
+    // A project path typed in another case than the folders on disk still
+    // shares them with the store, so the shim names no non-ASCII folder.
+    let shim = windows_cmd_shim(
+        Path::new(r"c:\users\çağrı\app\node_modules\.bin"),
+        Path::new(r"C:\Users\Çağrı\.lpm\store\tool\bin\tool.js"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        shim.contains(r#" "%dp0%..\..\..\.lpm\store\tool\bin\tool.js" %*"#),
+        "{shim}"
+    );
+    assert!(shim.is_ascii(), "{shim}");
+    // A share named in another case, or canonicalized, is the same share.
+    for target in [
+        r"\\FILESERVER\home\app\node_modules\tool\bin\tool.js",
+        r"\\?\UNC\fileserver\Home\app\node_modules\tool\bin\tool.js",
+    ] {
+        let shim = windows_cmd_shim(
+            Path::new(r"\\fileserver\Home\app\node_modules\.bin"),
+            Path::new(target),
+            None,
+        )
+        .unwrap();
+        assert!(
+            shim.contains(r#" "%dp0%..\tool\bin\tool.js" %*"#),
+            "{target}: {shim}"
+        );
+    }
     let shim = windows_cmd_shim(bin, Path::new(r"D:\store\tool.js"), None).unwrap();
     assert!(
         shim.contains(r#""%dp0%node.exe" "D:\store\tool.js" %*"#),

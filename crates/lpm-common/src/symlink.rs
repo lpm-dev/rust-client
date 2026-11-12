@@ -17,9 +17,7 @@
 //! this. Centralized so a future Windows correctness or security fix
 //! lands in one place.
 
-#[cfg(windows)]
-use std::path::PathBuf;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// Create a directory link from `link` pointing to `target`.
 ///
@@ -465,14 +463,178 @@ pub fn validate_cmd_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Suppress an "unused" warning on Unix — `Component` is referenced
-// only by the Windows `lexically_clean` helper.
+/// `path` without a `\\?\` prefix, on a drive path (`\\?\C:\…` is `C:\…`) or
+/// a network share's (`\\?\UNC\server\share\…` is `\\server\share\…`), where
+/// the plain path names the same file. A canonicalized path has the prefix,
+/// which Node can't run and which never shares a volume with a path built
+/// from a project's. Win32 reads a name with a trailing `.` or space
+/// otherwise, so such a path keeps it.
+pub fn windows_plain_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let plain = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{share}")
+    } else if let Some(drive) = text
+        .strip_prefix(r"\\?\")
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+    {
+        drive.to_string()
+    } else {
+        return path.to_path_buf();
+    };
+    if std::path::absolute(&plain).is_ok_and(|absolute| absolute == Path::new(&plain)) {
+        PathBuf::from(plain)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// The way from the directory `base` to `target`, a `..` for each of
+/// `base`'s own components and then the rest of `target`, when both are
+/// absolute and on one volume; `None` otherwise.
+///
+/// Names compare as the host's file system compares them. On Windows that is
+/// without case, so a home typed as `c:\users\çağrı` still shares its folders
+/// with the target's `C:\Users\Çağrı\…` on disk, and the way names none of
+/// them: a shim holding a non-ASCII folder name breaks when cmd.exe reads it
+/// in the console's code page.
+pub fn relative_path_on_one_volume(base: &Path, target: &Path) -> Option<PathBuf> {
+    if !base.is_absolute() || !target.is_absolute() {
+        return None;
+    }
+    let base: Vec<Component<'_>> = base.components().collect();
+    let target: Vec<Component<'_>> = target.components().collect();
+    if !same_component(base.first()?, target.first()?)
+        || base
+            .iter()
+            .chain(&target)
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return None;
+    }
+    let shared = base
+        .iter()
+        .zip(&target)
+        .take_while(|(base, target)| same_component(base, target))
+        .count();
+    let capacity = (base.len() - shared) * 3
+        + target[shared..]
+            .iter()
+            .map(|part| part.as_os_str().len() + 1)
+            .sum::<usize>();
+    let mut relative = PathBuf::with_capacity(capacity);
+    for _ in shared..base.len() {
+        relative.push("..");
+    }
+    for part in &target[shared..] {
+        relative.push(part.as_os_str());
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
+#[cfg(windows)]
+fn same_component(a: &Component<'_>, b: &Component<'_>) -> bool {
+    use std::path::Prefix;
+    match (a, b) {
+        // `Path` already gives a drive letter in either case as one `Disk`.
+        (Component::Prefix(a), Component::Prefix(b)) => match (a.kind(), b.kind()) {
+            (Prefix::UNC(server_a, share_a), Prefix::UNC(server_b, share_b))
+            | (Prefix::VerbatimUNC(server_a, share_a), Prefix::VerbatimUNC(server_b, share_b)) => {
+                same_windows_name(server_a, server_b) && same_windows_name(share_a, share_b)
+            }
+            (Prefix::Verbatim(a), Prefix::Verbatim(b))
+            | (Prefix::DeviceNS(a), Prefix::DeviceNS(b)) => same_windows_name(a, b),
+            (a, b) => a == b,
+        },
+        (Component::Normal(a), Component::Normal(b)) => same_windows_name(a, b),
+        (a, b) => a == b,
+    }
+}
+
 #[cfg(not(windows))]
-const _: fn(Component<'_>) = |_| {};
+fn same_component(a: &Component<'_>, b: &Component<'_>) -> bool {
+    a == b
+}
+
+/// Whether Windows takes `a` and `b` for one name: the ordinal comparison
+/// without case that NTFS and Win32 use, which folds non-ASCII letters too.
+#[cfg(windows)]
+fn same_windows_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    if a == b {
+        return true;
+    }
+    let a: Vec<u16> = a.encode_wide().collect();
+    let b: Vec<u16> = b.encode_wide().collect();
+    let (Ok(a_len), Ok(b_len)) = (i32::try_from(a.len()), i32::try_from(b.len())) else {
+        return false;
+    };
+    // SAFETY: both pointers reference initialized UTF-16 buffers for the
+    // exact lengths passed to the read-only API.
+    unsafe { CompareStringOrdinal(a.as_ptr(), a_len, b.as_ptr(), b_len, 1) == CSTR_EQUAL }
+}
 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_way_shares_folders_named_in_another_case() {
+        assert_eq!(
+            relative_path_on_one_volume(
+                Path::new(r"c:\users\çağrı\.lpm\global\bin"),
+                Path::new(r"C:\Users\Çağrı\.lpm\global\pkgs\tool\cli.js"),
+            ),
+            Some(PathBuf::from(r"..\pkgs\tool\cli.js"))
+        );
+        assert_eq!(
+            relative_path_on_one_volume(
+                Path::new(r"\\fileserver\Home\dev\bin"),
+                Path::new(r"\\FILESERVER\home\dev\pkgs\cli.js"),
+            ),
+            Some(PathBuf::from(r"..\pkgs\cli.js"))
+        );
+    }
+
+    #[test]
+    fn a_relative_way_needs_one_volume() {
+        for (base, target) in [
+            (r"C:\bin", r"D:\pkgs\cli.js"),
+            (r"\\server\one\bin", r"\\server\two\cli.js"),
+            (r"\\one\share\bin", r"\\two\share\cli.js"),
+            (r"C:\bin", r"\\server\share\cli.js"),
+            (r"C:\bin", r"pkgs\cli.js"),
+            (r"C:\bin", r"C:\bin\..\cli.js"),
+        ] {
+            assert_eq!(
+                relative_path_on_one_volume(Path::new(base), Path::new(target)),
+                None,
+                "{base} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_path_drops_the_verbatim_prefix_only_where_it_names_the_same_file() {
+        for (path, plain) in [
+            (r"\\?\C:\Users\dev\cli.js", r"C:\Users\dev\cli.js"),
+            (r"\\?\UNC\server\share\cli.js", r"\\server\share\cli.js"),
+            (r"C:\Users\dev\cli.js", r"C:\Users\dev\cli.js"),
+            (r"\\?\C:\Users\dev\trailing.", r"\\?\C:\Users\dev\trailing."),
+            (
+                r"\\?\UNC\server\share\trailing ",
+                r"\\?\UNC\server\share\trailing ",
+            ),
+            (r"\\?\Volume{0}\cli.js", r"\\?\Volume{0}\cli.js"),
+        ] {
+            assert_eq!(
+                windows_plain_path(Path::new(path)),
+                Path::new(plain),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn validate_cmd_path_allows_normal_path() {
@@ -647,6 +809,29 @@ mod tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_way_climbs_to_the_shared_folder_and_compares_names_exactly() {
+        assert_eq!(
+            relative_path_on_one_volume(
+                Path::new("/home/dev/.lpm/global/bin"),
+                Path::new("/home/dev/.lpm/global/pkgs/tool/cli.js"),
+            ),
+            Some(PathBuf::from("../pkgs/tool/cli.js"))
+        );
+        assert_eq!(
+            relative_path_on_one_volume(Path::new("/home/Dev/bin"), Path::new("/home/dev/cli.js")),
+            Some(PathBuf::from("../../dev/cli.js"))
+        );
+        assert_eq!(
+            relative_path_on_one_volume(Path::new("/home/dev"), Path::new("relative/cli.js")),
+            None
+        );
+        assert_eq!(
+            relative_path_on_one_volume(Path::new("/home/dev"), Path::new("/home/dev")),
+            None
+        );
+    }
 
     #[test]
     fn create_dir_symlink_round_trips_unix() {
