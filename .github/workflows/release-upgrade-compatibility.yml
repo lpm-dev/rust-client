@@ -2,6 +2,7 @@ name: Release upgrade compatibility
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/lpm-auth/**'
       - 'crates/lpm-cli/src/commands/self_update*'
@@ -30,6 +31,7 @@ env:
 
 jobs:
   compatibility:
+    if: ${{ !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
       matrix:
