@@ -569,12 +569,18 @@ fn check_global_shim_targets(
     let mut mismatches = IssuePreview::default();
     let mut earlier = IssuePreview::default();
     let mut expectation_count = 0usize;
-    let mut verify = |command: &str, target: &std::path::Path| {
+    // The hint names packages, so each command comes with its package's
+    // name (from review).
+    let mut verify = |command: &str, package: &str, target: &std::path::Path| {
         expectation_count += 1;
         match lpm_global::shim::verify_windows_shim_triple(&bin_dir, command, target) {
             Ok(lpm_global::shim::WindowsShimForm::Current) => {}
             Ok(lpm_global::shim::WindowsShimForm::EarlierRelease) => {
-                earlier.push(lpm_common::sanitize_for_terminal(command));
+                earlier.push(format!(
+                    "{} of {}",
+                    lpm_common::sanitize_for_terminal(command),
+                    lpm_common::sanitize_for_terminal(package)
+                ));
             }
             Err(error) => mismatches.push(format!(
                 "{}: {}",
@@ -583,14 +589,14 @@ fn check_global_shim_targets(
             )),
         }
     };
-    for entry in manifest.packages.values() {
+    for (package, entry) in &manifest.packages {
         let install_bin = root
             .global_root()
             .join(&entry.root)
             .join("node_modules")
             .join(".bin");
         for command in &entry.commands {
-            verify(command, &install_bin.join(command));
+            verify(command, package.as_str(), &install_bin.join(command));
         }
     }
     for (alias_name, alias_entry) in &manifest.aliases {
@@ -603,7 +609,7 @@ fn check_global_shim_targets(
             .join("node_modules")
             .join(".bin")
             .join(&alias_entry.bin);
-        verify(alias_name, &target);
+        verify(alias_name, alias_entry.package.as_str(), &target);
     }
 
     let plural = |count: usize| if count == 1 { "" } else { "s" };

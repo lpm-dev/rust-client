@@ -416,18 +416,26 @@ impl ShimPath {
     }
 }
 
-/// `path` without a `\\?\` prefix on a drive path, where the plain path names
-/// the same file: Win32 reads a name with a trailing `.` or space otherwise.
+/// `path` without a `\\?\` prefix, on a drive path (`\\?\C:\…` is `C:\…`) or
+/// a network share's (`\\?\UNC\server\share\…` is `\\server\share\…`, from
+/// review), where the plain path names the same file: Win32 reads a name
+/// with a trailing `.` or space otherwise.
 fn windows_plain_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest)
-            if rest.as_bytes().get(1) == Some(&b':')
-                && std::path::absolute(rest).is_ok_and(|absolute| absolute == Path::new(rest)) =>
-        {
-            PathBuf::from(rest)
-        }
-        _ => path.to_path_buf(),
+    let plain = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{share}")
+    } else if let Some(drive) = text
+        .strip_prefix(r"\\?\")
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+    {
+        drive.to_string()
+    } else {
+        return path.to_path_buf();
+    };
+    if std::path::absolute(&plain).is_ok_and(|absolute| absolute == Path::new(&plain)) {
+        PathBuf::from(plain)
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -861,6 +869,33 @@ mod tests {
         )
         .unwrap();
         std::fs::write(bin_dir.join(name), legacy_bash_template(target)).unwrap();
+    }
+
+    /// A link resolves its paths to `\\?\` ones, which Node can't run from;
+    /// a share's too (from review: `\\?\UNC\…` failed with `EISDIR`).
+    #[cfg(windows)]
+    #[test]
+    fn windows_shims_name_paths_without_a_verbatim_prefix() {
+        for (path, plain) in [
+            (r"\\?\C:\pkg\bin\cli.js", r"C:\pkg\bin\cli.js"),
+            (
+                r"\\?\UNC\server\share\pkg\bin\cli.js",
+                r"\\server\share\pkg\bin\cli.js",
+            ),
+            // Win32 would read these as other names.
+            (r"\\?\C:\pkg\bin\cli.", r"\\?\C:\pkg\bin\cli."),
+            (
+                r"\\?\UNC\server\share\pkg\cli ",
+                r"\\?\UNC\server\share\pkg\cli ",
+            ),
+            (r"C:\pkg\bin\cli.js", r"C:\pkg\bin\cli.js"),
+        ] {
+            assert_eq!(
+                windows_plain_path(Path::new(path)),
+                Path::new(plain),
+                "{path}"
+            );
+        }
     }
 
     #[cfg(windows)]
