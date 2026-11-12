@@ -104,11 +104,18 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     let schtasks = Path::new("schtasks");
     let task = windows_task_name(&user);
     // The task's run ends once the proxy has started, so ending the task
-    // stops nothing: the proxy running with the earlier listeners is asked
-    // to stop, so that the new one can take them.
-    if windows_user_task_exists(schtasks, &task)? {
-        stop_windows_proxy(&spec);
+    // stops nothing. The proxy the task started, with whatever home it
+    // gave it, is asked to stop, and so is one running for this home, as
+    // one started by hand would be, so that the task's can take the pipe
+    // and the listeners.
+    if windows_user_task_exists(schtasks, &task)?
+        && let Some(home) = windows_installed_task_home(schtasks, &task)
+        && !same_proxy_home(&home, &spec.lpm_home)
+    {
+        stop_windows_proxy(&spec.exe, &home);
     }
+    stop_windows_proxy(&spec.exe, &spec.lpm_home);
+    let left_running = windows_running_proxy(&spec.exe, &spec.lpm_home);
     remove_earlier_windows_launcher(&spec)?;
     let service_dir = spec
         .stdout_log
@@ -120,13 +127,19 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     let installed = install_windows_user_task(schtasks, &task, &task_file);
     let _ = std::fs::remove_file(&task_file);
     installed?;
-    // The task's result can't tell, as conhost ends with 0 whatever lpm did
-    // (from review: a failed start left no trace).
-    if !windows_proxy_comes_up(&spec, std::time::Duration::from_secs(10)) {
-        tracing::warn!(
+    // The task's result can't tell, as conhost ends with 0 whatever lpm did.
+    match windows_proxy_after_start(&spec, left_running, std::time::Duration::from_secs(10)) {
+        Some(pid) if Some(pid) == left_running => tracing::warn!(
+            "a proxy the sign-in task didn't start (pid {pid}) is still running for {}, so the \
+             task's couldn't start; stop it with `lpm proxy stop`, then run `lpm proxy install` \
+             again",
+            spec.lpm_home.display()
+        ),
+        Some(_) => {}
+        None => tracing::warn!(
             "the proxy the sign-in task started isn't running; {} says why",
             spec.stderr_log.display()
-        );
+        ),
     }
     if windows_user_task_exists(schtasks, WINDOWS_EARLIER_TASK_NAME).unwrap_or(false) {
         tracing::warn!(
@@ -138,10 +151,11 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     Ok(())
 }
 
-/// Stops the proxy this user's task started and removes the task, and the
-/// one earlier releases made for anyone's logon, and says whether there
-/// was one. That earlier task needs an administrator to remove: when it
-/// can't be, this user's is still removed, and the error says what is left.
+/// Stops the proxy this user's task started, with the home the task gives
+/// it whatever `LPM_HOME` this runs with, and removes the task, and the one
+/// earlier releases made for anyone's logon, and says whether there was
+/// one. That earlier task needs an administrator to remove: when it can't
+/// be, this user's is still removed, and the error says what is left.
 #[cfg(windows)]
 pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<bool, LpmError> {
     let user = windows_user_sid()?;
@@ -149,8 +163,20 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
     let task = windows_task_name(&user);
     let installed = windows_user_task_exists(schtasks, &task)?;
     let earlier = windows_user_task_exists(schtasks, WINDOWS_EARLIER_TASK_NAME)?;
-    if installed || earlier {
-        stop_windows_proxy(spec);
+    let task_home = installed.then(|| {
+        windows_installed_task_home(schtasks, &task).unwrap_or_else(|| spec.lpm_home.clone())
+    });
+    if let Some(home) = &task_home {
+        stop_windows_proxy(&spec.exe, home);
+    }
+    // The earlier task's batch file held the home it ran the proxy with,
+    // which was this one's unless `LPM_HOME` has changed since.
+    if earlier
+        && task_home
+            .as_ref()
+            .is_none_or(|home| !same_proxy_home(home, &spec.lpm_home))
+    {
+        stop_windows_proxy(&spec.exe, &spec.lpm_home);
     }
     if installed {
         uninstall_windows_user_task(schtasks, &task)?;
@@ -174,45 +200,73 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
     Ok(installed || earlier)
 }
 
-/// Asks the proxy running with `spec`'s home to stop, as `lpm proxy stop`
-/// does; one that isn't running is fine. Ending the task wouldn't stop it.
+/// Whether the proxies for LPM homes `a` and `b` are one, as they answer
+/// on one control pipe.
 #[cfg(windows)]
-fn stop_windows_proxy(spec: &ProxyServiceSpec) {
-    let stopped = Command::new(&spec.exe)
+fn same_proxy_home(a: &Path, b: &Path) -> bool {
+    lpm_proxy::proxy_pipe_name_for_root(a) == lpm_proxy::proxy_pipe_name_for_root(b)
+}
+
+/// Asks the proxy running with `home` to stop, as `lpm proxy stop` does,
+/// with lpm at `exe`; one that isn't running is fine. Ending the task
+/// wouldn't stop it.
+#[cfg(windows)]
+fn stop_windows_proxy(exe: &Path, home: &Path) {
+    let stopped = Command::new(exe)
         .args(["proxy", "stop", "--json"])
-        .env("LPM_HOME", &spec.lpm_home)
+        .env("LPM_HOME", home)
         .stdin(std::process::Stdio::null())
         .output();
     match stopped {
         Ok(output) if output.status.success() => {}
         Ok(output) => tracing::warn!(
-            "couldn't stop the running proxy ({}): {}; stop it with `lpm proxy stop`",
+            "couldn't stop the proxy running for {} ({}): {}; stop it with `lpm proxy stop`",
+            home.display(),
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ),
         Err(error) => {
             tracing::warn!(
-                "couldn't stop the running proxy: {error}; stop it with `lpm proxy stop`"
+                "couldn't stop the proxy running for {}: {error}; stop it with `lpm proxy stop`",
+                home.display()
             );
         }
     }
 }
 
-/// Whether the proxy running with `spec`'s home is up within `wait`, as
-/// `lpm proxy status` says.
+/// The process ID of the proxy running with `home`, as `lpm proxy status`
+/// gives it, run with lpm at `exe`.
 #[cfg(windows)]
-fn windows_proxy_comes_up(spec: &ProxyServiceSpec, wait: std::time::Duration) -> bool {
+fn windows_running_proxy(exe: &Path, home: &Path) -> Option<u32> {
+    let output = Command::new(exe)
+        .args(["proxy", "status", "--json"])
+        .env("LPM_HOME", home)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+    if status["running"] != true {
+        return None;
+    }
+    status["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+/// The process ID of the proxy running with `spec`'s home once one other
+/// than `left_running` is, or when `wait` is over, of whichever runs then.
+#[cfg(windows)]
+fn windows_proxy_after_start(
+    spec: &ProxyServiceSpec,
+    left_running: Option<u32>,
+    wait: std::time::Duration,
+) -> Option<u32> {
     let deadline = std::time::Instant::now() + wait;
     loop {
-        let running = Command::new(&spec.exe)
-            .args(["proxy", "status", "--json"])
-            .env("LPM_HOME", &spec.lpm_home)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
-            .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
-            .is_some_and(|status| status["running"] == true);
-        if running || std::time::Instant::now() >= deadline {
+        let running = windows_running_proxy(&spec.exe, &spec.lpm_home);
+        if running.is_some_and(|pid| Some(pid) != left_running)
+            || std::time::Instant::now() >= deadline
+        {
             return running;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -614,8 +668,7 @@ pub(super) fn render_unix_launcher(spec: &ProxyServiceSpec) -> String {
 /// and logs it is given. conhost doesn't pass on its command line as it
 /// was written: it splits it into arguments and joins them again, quoting
 /// only those with a space in them. So the task runs nothing that reads
-/// its command line any other way, such as cmd.exe, and no argument ends
-/// in a backslash, which such quoting would escape the closing quote with.
+/// its command line any other way, such as cmd.exe.
 #[cfg(any(test, windows))]
 pub(super) fn windows_task_command(spec: &ProxyServiceSpec) -> Vec<String> {
     let path = |path: &Path| path.display().to_string();
@@ -637,19 +690,27 @@ pub(super) fn windows_task_command(spec: &ProxyServiceSpec) -> Vec<String> {
 }
 
 /// The task earlier releases made, for any user's logon.
-#[cfg(any(windows, all(test, unix)))]
-pub(super) const WINDOWS_EARLIER_TASK_NAME: &str = r"\LPM\Proxy";
+#[cfg(windows)]
+const WINDOWS_EARLIER_TASK_NAME: &str = r"\LPM\Proxy";
 
 /// This user's task, by their SID: each account on a PC has its own.
-#[cfg(any(test, windows))]
-pub(super) fn windows_task_name(user_sid: &str) -> String {
+#[cfg(windows)]
+fn windows_task_name(user_sid: &str) -> String {
     format!(r"\LPM Proxy ({user_sid})")
 }
+
+/// What the logon task's documentation says before the LPM home it runs
+/// the proxy with, as hex of its UTF-8, which schtasks prints intact in any
+/// code page.
+#[cfg(any(test, windows))]
+const WINDOWS_TASK_HOME_LABEL: &str = "LPM_HOME as UTF-8, in hex: ";
 
 /// The Task Scheduler definition of the logon task: this user's logon
 /// starts [`windows_task_command`] in a console with no window (`conhost
 /// --headless`), with this user's own rights and at normal priority, on
-/// battery too. The paths go in this UTF-16 file, which holds any of them.
+/// battery too. The paths go in this UTF-16 file, which holds any of them,
+/// and the home also in its documentation, read by
+/// [`windows_task_home`].
 #[cfg(any(test, windows))]
 pub(super) fn render_windows_task_xml(
     spec: &ProxyServiceSpec,
@@ -671,6 +732,7 @@ pub(super) fn render_windows_task_xml(
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
          \x20 <RegistrationInfo>\r\n\
          \x20   <Description>Starts the LPM local proxy when this user signs in.</Description>\r\n\
+         {documentation}\
          \x20 </RegistrationInfo>\r\n\
          \x20 <Triggers>\r\n\
          \x20   <LogonTrigger>\r\n\
@@ -701,9 +763,51 @@ pub(super) fn render_windows_task_xml(
          \x20 </Actions>\r\n\
          </Task>\r\n",
         user = escape(user_sid),
+        documentation = spec
+            .lpm_home
+            .to_str()
+            .map_or_else(String::new, |home| format!(
+                "\x20   <Documentation>{WINDOWS_TASK_HOME_LABEL}{}</Documentation>\r\n",
+                hex::encode(home)
+            )),
         conhost = escape(&system_dir.join("conhost.exe").display().to_string()),
         arguments = escape(&arguments),
     )
+}
+
+/// The LPM home a logon task's definition, as `schtasks /Query /XML` prints
+/// it, says it runs the proxy with: in the console's code page, which may
+/// not hold the home's characters, or in UTF-16.
+#[cfg(any(test, windows))]
+pub(super) fn windows_task_home(definition: &[u8]) -> Option<std::path::PathBuf> {
+    let utf16 = definition
+        .strip_prefix(&[0xFF, 0xFE])
+        .or_else(|| (definition.get(1) == Some(&0)).then_some(definition));
+    let text = match utf16 {
+        Some(utf16) => String::from_utf16_lossy(
+            &utf16
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|unit| u16::from_le_bytes(*unit))
+                .collect::<Vec<_>>(),
+        ),
+        None => String::from_utf8_lossy(definition).into_owned(),
+    };
+    let documentation = text.split_once("<Documentation>")?.1;
+    let documentation = documentation.split_once("</Documentation>")?.0;
+    let encoded = documentation.trim().strip_prefix(WINDOWS_TASK_HOME_LABEL)?;
+    let home = String::from_utf8(hex::decode(encoded.trim()).ok()?).ok()?;
+    Some(std::path::PathBuf::from(home))
+}
+
+/// The LPM home the installed logon task `task` runs the proxy with, where
+/// its definition says.
+#[cfg(windows)]
+fn windows_installed_task_home(program: &Path, task: &str) -> Option<std::path::PathBuf> {
+    let definition =
+        run_checked_output(Command::new(program).args(["/Query", "/XML", "/TN", task])).ok()?;
+    windows_task_home(&definition.stdout)
 }
 
 /// Writes `xml` as Task Scheduler reads it: UTF-16 with a byte order mark.
@@ -726,9 +830,8 @@ fn windows_user_sid() -> Result<String, LpmError> {
 }
 
 /// `spec` with the paths the task runs lpm with as it hands them on: without
-/// a `\\?\` prefix where that names the same file, without a trailing
-/// backslash (see [`windows_task_command`]), and with no `%`, which Task
-/// Scheduler would read as part of an environment variable.
+/// a `\\?\` prefix where that names the same file, and with no `%`, which
+/// Task Scheduler would read as part of an environment variable.
 #[cfg(windows)]
 fn windows_plain_spec(spec: &ProxyServiceSpec) -> Result<ProxyServiceSpec, LpmError> {
     let plain = |path: &Path| -> Result<std::path::PathBuf, LpmError> {
@@ -743,9 +846,6 @@ fn windows_plain_spec(spec: &ProxyServiceSpec) -> Result<ProxyServiceSpec, LpmEr
             }
             _ => path.to_path_buf(),
         };
-        // Joining the components again drops a trailing separator, but for
-        // a drive's root, whose name holds no space to be quoted for.
-        let path: std::path::PathBuf = path.components().collect();
         if path.to_string_lossy().contains('%') {
             return Err(LpmError::Proxy(format!(
                 "can't start the proxy at sign-in through {}: Task Scheduler would read the `%` \
@@ -1203,7 +1303,8 @@ mod windows_task_tests {
     use super::*;
 
     /// Task Scheduler takes the logon task from a user who isn't elevated,
-    /// as a trigger for this user's logon alone needs no administrator.
+    /// as a trigger for this user's logon alone needs no administrator, and
+    /// gives back the home it runs the proxy with, past ASCII too.
     #[test]
     fn the_logon_task_registers_for_this_user_and_is_removed_again() {
         struct DeleteTask(String);
@@ -1249,6 +1350,10 @@ mod windows_task_tests {
         let _delete = DeleteTask(task.clone());
 
         assert!(windows_user_task_exists(schtasks, &task).unwrap());
+        assert_eq!(
+            windows_installed_task_home(schtasks, &task).as_ref(),
+            Some(&spec.lpm_home)
+        );
         assert!(uninstall_windows_user_task(schtasks, &task).unwrap());
         assert!(!windows_user_task_exists(schtasks, &task).unwrap());
         assert!(!uninstall_windows_user_task(schtasks, &task).unwrap());

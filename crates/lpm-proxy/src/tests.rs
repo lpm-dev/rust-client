@@ -1129,6 +1129,58 @@ fn proxy_pipe_name_for_root_is_stable_and_path_normalized() {
     assert!(backslash.starts_with(r"\\.\pipe\lpm-proxy-"));
 }
 
+/// The proxy started with a home spelled one way answers to `lpm proxy`
+/// run with it spelled another: a trailing separator, a `\\?\` prefix, a
+/// doubled separator or a `.` name the same home, and so the same pipe.
+#[test]
+fn every_spelling_of_a_home_names_one_pipe() {
+    use crate::paths::pipe_root_key;
+
+    for spellings in [
+        &[
+            r"C:\Users\Ada\home B",
+            r"C:\Users\Ada\home B\",
+            r"\\?\C:\Users\Ada\home B",
+            r"\\?\c:\users\ada\home b\",
+            r"C:\Users\\Ada\.\home B",
+        ][..],
+        &[
+            r"\\nas\my share\home",
+            r"\\nas\my share\home\",
+            r"\\?\UNC\nas\my share\home",
+        ][..],
+        &["/srv/lpm/home", "/srv/lpm/home/", "/srv//lpm/./home"][..],
+    ] {
+        for spelling in spellings {
+            assert_eq!(
+                pipe_root_key(spelling),
+                pipe_root_key(spellings[0]),
+                "{spelling}"
+            );
+        }
+    }
+    assert_ne!(pipe_root_key(r"\\nas\share"), pipe_root_key(r"\nas\share"));
+    // Today's homes keep the name earlier releases gave their pipes.
+    assert_eq!(pipe_root_key(r"C:\Users\Ada\.lpm"), "c:/users/ada/.lpm");
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home B");
+    std::fs::create_dir(&home).unwrap();
+    let mut trailing = home.clone().into_os_string();
+    trailing.push(std::path::MAIN_SEPARATOR_STR);
+    assert_eq!(
+        proxy_pipe_name_for_root(Path::new(&trailing)),
+        proxy_pipe_name_for_root(&home)
+    );
+    // Through a link, too, as the state the pipe answers for is the same.
+    let link = dir.path().join("link");
+    lpm_common::symlink::create_dir_symlink_or_junction(&home, &link).unwrap();
+    assert_eq!(
+        proxy_pipe_name_for_root(&link),
+        proxy_pipe_name_for_root(&home)
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn control_server_reports_registered_routes_until_stopped() {

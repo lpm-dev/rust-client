@@ -519,7 +519,7 @@ fn windows_task_runs_lpm_with_the_home_project_and_logs() {
     );
 }
 
-/// From review: conhost splits its command line into arguments and joins
+/// conhost splits its command line into arguments and joins
 /// them again, quoting only those with a space in them, and the cmd.exe
 /// command line the task used to give it came out in pieces. lpm's
 /// arguments come out as they went in.
@@ -634,6 +634,17 @@ fn the_sign_in_task_starts_the_proxy_in_the_project_with_its_home() {
     )
     .unwrap();
 
+    // node may take longer than the start's wait to get going, as in a
+    // parallel test run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let written = |path: &Path| std::fs::read_to_string(path).is_ok_and(|text| !text.is_empty());
+    while !(written(&record) && written(&out) && written(&err)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node wrote no record and logs"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let recorded: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
     assert_eq!(recorded["home"], home.display().to_string(), "{recorded}");
@@ -647,8 +658,17 @@ fn the_sign_in_task_starts_the_proxy_in_the_project_with_its_home() {
     );
     assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "listening");
     assert_eq!(std::fs::read_to_string(&err).unwrap().trim(), "warming up");
-    // Let node finish before its directory goes.
-    std::thread::sleep(Duration::from_millis(1000));
+    // node runs on for two seconds in the project, which can't be removed
+    // until it ends.
+    let dir = dir.keep();
+    while std::fs::remove_dir_all(&dir).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node kept {} in use",
+            dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A proxy that exits at once, as one whose ports are taken does, or a
@@ -736,6 +756,41 @@ fn windows_logon_task_is_the_users_own_and_runs_hidden() {
         assert!(xml.contains(element), "{element}: {xml}");
     }
     assert!(!xml.contains("R&D <bin>"), "{xml}");
+}
+
+/// Uninstall and reinstall stop the proxy the task started, with the home
+/// it gives it, whatever `LPM_HOME` they run with; and schtasks prints the
+/// definition in the console's code page, which may not hold the home.
+#[test]
+fn the_logon_task_says_which_home_it_runs_the_proxy_with() {
+    let mut spec = sample_service_spec();
+    spec.lpm_home = PathBuf::from(r"C:\Users\Çağrı\home B & <co>\");
+    let xml = render_windows_task_xml(
+        &spec,
+        "S-1-5-21-1-2-3-1001",
+        Path::new(r"C:\Windows\System32"),
+    );
+
+    assert_eq!(
+        windows_task_home(xml.as_bytes()),
+        Some(spec.lpm_home.clone())
+    );
+    let in_a_code_page = xml
+        .chars()
+        .map(|character| if character.is_ascii() { character } else { '?' })
+        .collect::<String>();
+    assert_eq!(
+        windows_task_home(in_a_code_page.as_bytes()),
+        Some(spec.lpm_home.clone())
+    );
+    let utf16 = xml
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(windows_task_home(&utf16), Some(spec.lpm_home.clone()));
+    let with_mark = [0xFF, 0xFE].into_iter().chain(utf16).collect::<Vec<_>>();
+    assert_eq!(windows_task_home(&with_mark), Some(spec.lpm_home));
+    assert_eq!(windows_task_home(b"<Task><RegistrationInfo/></Task>"), None);
 }
 
 #[test]

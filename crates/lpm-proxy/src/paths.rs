@@ -20,17 +20,51 @@ pub fn proxy_pipe_name_from_env() -> Result<String, ProxyError> {
     Ok(proxy_pipe_name_for_root(root.root()))
 }
 
+/// The control pipe of the proxy for the LPM home at `root`: one name for
+/// the home whatever its spelling, as [`pipe_root_key`] reads it, and
+/// whatever links lead to it.
 pub fn proxy_pipe_name_for_root(root: &Path) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
 
-    let normalized = root.to_string_lossy().replace('\\', "/").to_lowercase();
+    let identity = lpm_common::LpmRoot::from_dir(root).identity();
     let mut hash = FNV_OFFSET;
-    for byte in normalized.as_bytes() {
+    for byte in pipe_root_key(&identity.to_string_lossy()).as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!(r"\\.\pipe\lpm-proxy-{hash:016x}")
+}
+
+/// The text a home's pipe is named after: the home `root` spells, in
+/// lower case, with `/` for every separator, and without a `\\?\` prefix,
+/// an empty or `.` name or a trailing separator, so that `lpm proxy` finds
+/// the proxy however its home is spelled.
+pub(crate) fn pipe_root_key(root: &str) -> String {
+    let text = root.replace('\\', "/").to_lowercase();
+    let (lead, rest) = if let Some(unc) = text.strip_prefix("//?/unc/") {
+        ("//", unc)
+    } else if let Some(local) = text.strip_prefix("//?/") {
+        ("", local)
+    } else if let Some(unc) = text.strip_prefix("//") {
+        ("//", unc)
+    } else if let Some(absolute) = text.strip_prefix('/') {
+        ("/", absolute)
+    } else {
+        ("", text.as_str())
+    };
+    let mut key = String::with_capacity(text.len());
+    key.push_str(lead);
+    for name in rest
+        .split('/')
+        .filter(|name| !name.is_empty() && *name != ".")
+    {
+        if key.len() > lead.len() {
+            key.push('/');
+        }
+        key.push_str(name);
+    }
+    key
 }
 
 pub fn read_status() -> Result<ProxyStatus, ProxyError> {
