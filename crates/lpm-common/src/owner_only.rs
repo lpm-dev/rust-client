@@ -175,12 +175,16 @@ pub fn keeps_others_out(file: &impl std::os::windows::io::AsRawHandle) -> std::i
 /// release made; without it only what is created there from now on is
 /// kept, as for the LPM home, whose store files are hard links in
 /// projects' `node_modules`. One kept by an earlier release, which named
-/// only the owner, gets the user's entry the same way: a `.lpm` all through,
-/// so that its folders hand it on to what is created in them (from review),
-/// and the home on its own DACL, as rewriting the store's would touch every
-/// file in it. Folders an earlier release made in the home still hand on
-/// the owner's entry alone, so what an elevated run creates in them stays
-/// the Administrators'.
+/// only the owner, gets the user's entry the same way: a `.lpm` on
+/// everything in it that inherits, so that its folders hand it on to what
+/// is created in them, and the home on its own DACL, as rewriting the
+/// store's would touch every file in it. Folders an earlier release made in
+/// the home still hand on the owner's entry alone, so what an elevated run
+/// creates in them stays the Administrators'. Nor does the push reach,
+/// in a `.lpm`, what an earlier elevated run kept owner-only, which
+/// inherits nothing, or anything the user can't change the DACL of, such
+/// as what the Administrators own, which Windows passes over without an
+/// error; once pushed, the directory reads as kept, so neither is retried.
 pub fn protect_state_directory(
     directory: &cap_std::fs::Dir,
     push_to_contents: bool,
@@ -1103,8 +1107,8 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(state, cap_std::ambient_authority()).unwrap()
         };
 
-        // A `.lpm` gets the user's entry all through, so what an elevated
-        // run creates in its folders lets the user in too (from review).
+        // A `.lpm` gets the user's entry on what inherits in it, so what an
+        // elevated run creates in its folders lets the user in too.
         let state = directory.path().join(".lpm");
         earlier_release(&state);
         assert!(protect_state_directory(&open(&state), true).unwrap());
