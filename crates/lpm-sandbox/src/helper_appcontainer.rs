@@ -1720,6 +1720,34 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Makes `path`, a directory, one the test process can read but not change
+/// while it runs [`without_privileges`], as `C:\Program Files` is to an
+/// administrator. Entries it inherits become its own, a grant among them;
+/// the Administrators, SYSTEM and the user then lose theirs; and only
+/// reading is left, to the user and, through OWNER RIGHTS, to the owner,
+/// which for an elevated test is the Administrators.
+#[cfg(test)]
+fn lock_directory_for_test(path: &Path) {
+    let user = setup::current_user_sid().unwrap();
+    let icacls = |args: &[&str]| {
+        let output = std::process::Command::new("icacls.exe")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    };
+    icacls(&["/inheritance:d"]);
+    icacls(&[
+        "/remove:g",
+        "*S-1-5-32-544",
+        "*S-1-5-18",
+        &format!("*{user}"),
+    ]);
+    icacls(&["/grant", &format!("*{user}:(RX)"), "*S-1-3-4:(RX)"]);
+    assert!(!without_privileges(|| setup::can_change_permissions(path)));
+}
+
 /// Runs `run` on this thread with every privilege disabled. Hosted CI
 /// administrators hold backup and restore privileges that let them open
 /// any directory to change its DACL, so a test that needs one it can't

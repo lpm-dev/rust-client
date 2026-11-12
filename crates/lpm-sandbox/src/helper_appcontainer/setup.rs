@@ -853,6 +853,20 @@ pub fn apply(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
 }
 
 fn apply_plan(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
+    // Every tree's setup lock is held, taken in one order, from the first
+    // look until the last change or undo: another run's change to these
+    // trees can't land between what this run found and what it puts back.
+    let mut capabilities: Vec<&str> = plan
+        .grants
+        .iter()
+        .map(|entry| entry.capability_name.as_str())
+        .collect();
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    let _setup_locks = capabilities
+        .into_iter()
+        .map(|name| lock_named(&format!(r"Global\LpmSandboxSetup-{name}")))
+        .collect::<Result<Vec<_>, _>>()?;
     // Each directory is opened, and whether it holds its capability noted,
     // before any changes: what a failure puts back is what this run found.
     let targets = plan
@@ -893,7 +907,14 @@ fn apply_plan(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
             entry.path.display(),
             setup_reason(error)
         );
+        // Applying a tool tree again grants what it reaches below the root
+        // as it walks, and puts back only the root's own entry.
+        let reapplied_tool =
+            !remove && targets[index].3 && entry.permission == Permission::ToolReadExecute;
         return Err(failure(match undo_error {
+            None if reapplied_tool => format!(
+                "{stopped}. It put back what it had changed, except that files in that tool tree it reached may now be readable, as the rest of the tree already is"
+            ),
             None => format!("{stopped}. It put back what it had changed"),
             Some(undo_error) => format!(
                 "{stopped}. Putting back what it had changed failed too ({}), so some permissions may have changed; preview and retry the same operation",
@@ -1055,6 +1076,12 @@ pub(super) fn prepare<'a>(
     Ok(access)
 }
 
+/// Whether this thread can open `path` to change its permissions.
+#[cfg(test)]
+pub(super) fn can_change_permissions(path: &Path) -> bool {
+    open_permissions(path, true).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,17 +1196,7 @@ mod tests {
     /// privileges.
     fn unchangeable_directory(path: &Path) {
         std::fs::create_dir(path).unwrap();
-        let user = current_user_sid().unwrap();
-        // OWNER RIGHTS limits the owner to what it is granted.
-        let output = std::process::Command::new("icacls.exe")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("*{user}:(RX)"))
-            .args(["/grant:r", "*S-1-3-4:(RX)"])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert!(without_privileges(|| open_permissions(path, true).is_err()));
+        lock_directory_for_test(path);
     }
 
     #[test]
