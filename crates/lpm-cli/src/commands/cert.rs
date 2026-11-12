@@ -30,6 +30,16 @@ pub async fn run(
             "rotate",
         ),
         (extras.fail_on_missing, "--fail-on-missing", "rotate"),
+        (
+            extras.name_constraints == Some(true),
+            "--name-constraints",
+            "rotate",
+        ),
+        (
+            extras.name_constraints == Some(false),
+            "--no-name-constraints",
+            "rotate",
+        ),
         (extras.dry_run, "--dry-run", "reconcile"),
     ] {
         if present && action != required_action {

@@ -1254,7 +1254,7 @@ fn rotation_keeps_an_unconstrained_choice_and_limits_an_earlier_ca() {
     without_name_constraints_override();
     let new_ca_is_constrained = || {
         let cert = std::fs::read(paths::ca_cert_path().unwrap()).unwrap();
-        lpm_cert::ca::names_outside_constraints(&cert, &["example.com".to_string()])
+        lpm_cert::ca::names_outside_constraints(&cert, &["example.com".to_string()], &[])
             .unwrap()
             .len()
             == 1
@@ -1277,4 +1277,48 @@ fn rotation_keeps_an_unconstrained_choice_and_limits_an_earlier_ca() {
     let upgraded = rotate::rotate(rotate::RotateOptions::default()).unwrap();
     assert!(upgraded.name_constraints);
     assert!(new_ca_is_constrained());
+}
+
+/// Under a constrained CA an earlier release made, which lacks names this
+/// release permits, the way out keeps the CA limited: a plain rotate, not
+/// one that would let it sign any name.
+#[test]
+fn a_name_an_earlier_constrained_ca_lacks_is_fixed_by_a_plain_rotate() {
+    let (tmp, _g) = setup_home();
+    without_name_constraints_override();
+    let cert_path = paths::ca_cert_path().unwrap();
+    let key_path = paths::ca_key_path().unwrap();
+    lpm_cert::create_dir_secure(cert_path.parent().unwrap()).unwrap();
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "LPM Local Development CA");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: vec![
+            rcgen::GeneralSubtree::DnsName("localhost".into()),
+            rcgen::GeneralSubtree::DnsName(".test".into()),
+        ],
+        excluded_subtrees: Vec::new(),
+    });
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    lpm_cert::write_key_file(&key_path, key_pair.serialize_pem().as_bytes()).unwrap();
+    trust::install_ca(&cert_path).unwrap();
+    let project = tmp.path().join("proj-internal");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let Err(refused) = lpm_cert::ensure_https_with_consent_and_permitted_dns(
+        &project,
+        &["app.internal".to_string()],
+        &[],
+        lpm_cert::TrustStoreConsent::Decline,
+    ) else {
+        panic!("a name the earlier CA lacks was issued");
+    };
+    let refused = refused.to_string();
+    assert!(refused.contains("Run `lpm cert rotate` to"), "{refused}");
+    assert!(!refused.contains("--no-name-constraints"), "{refused}");
 }

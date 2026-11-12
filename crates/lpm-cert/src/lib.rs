@@ -478,15 +478,10 @@ fn resolve_consent(consent: TrustStoreConsent<'_>, cert_pem: &[u8]) -> Result<bo
         TrustStoreConsent::Decline => Ok(false),
         TrustStoreConsent::Prompt(callback) => {
             let info = cert::read_cert_info_bytes(cert_pem)?;
-            let constrained = ca::cert_has_name_constraints_bytes(cert_pem)?;
-            let permitted = if constrained {
-                ca::PERMITTED_NAMES_SUMMARY
-                    .split(", ")
-                    .map(str::to_owned)
-                    .collect()
-            } else {
-                vec!["any (no name constraints)".to_string()]
-            };
+            let summary = ca::constraints_summary(cert_pem)?;
+            let constrained = summary.is_some();
+            let permitted =
+                summary.unwrap_or_else(|| vec!["any (no name constraints)".to_string()]);
             let req = ConsentRequest {
                 fingerprint: cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?),
                 expires: info.not_after,
@@ -664,20 +659,32 @@ fn ensure_https_locked(
     let root = ensure_root_ca_pair_locked(&operation.ca)?;
     // A name the root may not sign would only fail in the browser, as a
     // chain error; say so here, before anything is installed.
-    let requested = extra_hostnames
-        .iter()
-        .chain(extra_permitted_dns_subtrees)
-        .cloned()
-        .collect::<Vec<_>>();
-    let outside = ca::names_outside_constraints(&root.cert_pem, &requested)?;
+    let outside = ca::names_outside_constraints(
+        &root.cert_pem,
+        extra_hostnames,
+        extra_permitted_dns_subtrees,
+    )?;
     if !outside.is_empty() {
-        return Err(LpmError::Cert(format!(
-            "the local CA is limited to local names ({}), and this project asks for {}. Run \
-             `lpm cert rotate --no-name-constraints` to replace it with a CA that may sign any \
-             name, whose key could then sign a certificate for any site",
-            ca::PERMITTED_NAMES_SUMMARY,
-            outside.join(", ")
-        )));
+        let only_unconstrained =
+            ca::names_outside_local_names(extra_hostnames, extra_permitted_dns_subtrees)?;
+        return Err(LpmError::Cert(if only_unconstrained.is_empty() {
+            // An earlier release's constrained CA, without names this
+            // release's permits: replacing it keeps it limited.
+            format!(
+                "the local CA predates names this release permits, and this project asks for \
+                 {}. Run `lpm cert rotate` to replace it with one limited to local names ({})",
+                outside.join(", "),
+                ca::PERMITTED_NAMES_SUMMARY
+            )
+        } else {
+            format!(
+                "the local CA is limited to local names ({}), and this project asks for {}. Run \
+                 `lpm cert rotate --no-name-constraints` to replace it with a CA that may sign any \
+                 name, whose key could then sign a certificate for any site",
+                ca::PERMITTED_NAMES_SUMMARY,
+                only_unconstrained.join(", ")
+            )
+        }));
     }
 
     let ca_freshly_installed = if root.generated {

@@ -599,6 +599,8 @@ fn cert_rejects_inapplicable_flags_without_mutating_material() {
         vec!["generate", "--project", "."],
         vec!["status", "--keep-old-trusted", "1"],
         vec!["trust", "--fail-on-missing"],
+        vec!["trust", "--name-constraints"],
+        vec!["generate", "--no-name-constraints"],
     ] {
         let output = cert_command(&project)
             .args(["--json", "cert"])

@@ -11,16 +11,24 @@ fn outside_root() -> LpmError {
     )
 }
 
-/// The names among `names`, hostnames, IP addresses or `*.`/`.` subtrees,
-/// that the PEM-encoded root's name constraints don't permit, in order; none
-/// when it has none. A subtree counts by a name in it.
+fn root_der(ca_cert_pem: &[u8]) -> Result<Vec<u8>, LpmError> {
+    pem::parse(ca_cert_pem)
+        .map(pem::Pem::into_contents)
+        .map_err(|error| LpmError::Cert(format!("invalid CA certificate PEM: {error}")))
+}
+
+/// Of `hostnames`, names or IP addresses a certificate would name, and
+/// `subtrees`, DNS subtrees a project intermediate would permit (`x` for `x`
+/// and the names below it, `.x` or `*.x` for those below it alone), the ones
+/// the PEM-encoded root's name constraints don't wholly permit, in order;
+/// none when it has none.
 pub(crate) fn names_outside_root(
     ca_cert_pem: &[u8],
-    names: &[String],
+    hostnames: &[String],
+    subtrees: &[String],
 ) -> Result<Vec<String>, LpmError> {
-    let pem = pem::parse(ca_cert_pem)
-        .map_err(|error| LpmError::Cert(format!("invalid CA certificate PEM: {error}")))?;
-    let (_, root) = x509_parser::parse_x509_certificate(pem.contents())
+    let der = root_der(ca_cert_pem)?;
+    let (_, root) = x509_parser::parse_x509_certificate(&der)
         .map_err(|error| LpmError::Cert(format!("invalid CA X.509: {error}")))?;
     let Some(constraints) = root
         .name_constraints()
@@ -29,29 +37,129 @@ pub(crate) fn names_outside_root(
         return Ok(Vec::new());
     };
     validate_supported_constraints(constraints.value)?;
-    Ok(names
+    let mut outside = Vec::new();
+    for hostname in hostnames {
+        let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+        let permitted = match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(address)) => permits(
+                constraints.value,
+                &GeneralName::IPAddress(&address.octets()),
+            ),
+            Ok(IpAddr::V6(address)) => permits(
+                constraints.value,
+                &GeneralName::IPAddress(&address.octets()),
+            ),
+            Err(_) => permits(constraints.value, &GeneralName::DNSName(&host)),
+        };
+        if !permitted {
+            outside.push(hostname.clone());
+        }
+    }
+    outside.extend(
+        subtrees
+            .iter()
+            .filter(|subtree| !subtree_permitted(constraints.value, subtree))
+            .cloned(),
+    );
+    Ok(outside)
+}
+
+/// Whether every name in the DNS subtree `subtree`, as
+/// [`names_outside_root`] spells subtrees, is one `constraints` permits: it
+/// lies within a permitted DNS subtree, and no excluded one reaches into it.
+fn subtree_permitted(constraints: &NameConstraints<'_>, subtree: &str) -> bool {
+    let subtree = subtree.trim().trim_end_matches('.').to_ascii_lowercase();
+    let (base, below_only) = match subtree
+        .strip_prefix("*.")
+        .or_else(|| subtree.strip_prefix('.'))
+    {
+        Some(base) => (base.to_owned(), true),
+        None => (subtree.clone(), false),
+    };
+    let within = |inner: &str, outer: &str| inner == outer || inner.ends_with(&format!(".{outer}"));
+    let dns_base = |name: &GeneralName<'_>| match name {
+        GeneralName::DNSName(name) => Some(name.trim_end_matches('.').to_ascii_lowercase()),
+        _ => None,
+    };
+    let permitted = constraints
+        .permitted_subtrees
+        .as_deref()
+        .unwrap_or_default();
+    let excluded = constraints.excluded_subtrees.as_deref().unwrap_or_default();
+    // A permitted subtree restricts only its own name type.
+    let dns_permitted = permitted
         .iter()
-        .filter(|name| {
-            let name = name.trim().to_ascii_lowercase();
-            let host = match name.strip_prefix("*.").or_else(|| name.strip_prefix('.')) {
-                Some(below) => format!("x.{below}"),
-                None => name,
-            };
-            let permitted = match host.parse::<IpAddr>() {
-                Ok(IpAddr::V4(address)) => permits(
-                    constraints.value,
-                    &GeneralName::IPAddress(&address.octets()),
-                ),
-                Ok(IpAddr::V6(address)) => permits(
-                    constraints.value,
-                    &GeneralName::IPAddress(&address.octets()),
-                ),
-                Err(_) => permits(constraints.value, &GeneralName::DNSName(&host)),
-            };
-            !permitted
-        })
-        .cloned()
-        .collect())
+        .filter_map(|permitted| dns_base(&permitted.base))
+        .collect::<Vec<_>>();
+    let contained = dns_permitted.is_empty()
+        || dns_permitted
+            .iter()
+            .any(|permitted| match permitted.strip_prefix('.') {
+                // `.p` holds the names below `p` alone.
+                Some(parent) if below_only => within(&base, parent),
+                Some(parent) => base.ends_with(&format!(".{parent}")),
+                None => within(&base, permitted),
+            });
+    // Any excluded subtree whose base is at, above or below this one's
+    // takes some of its names.
+    let reached = excluded
+        .iter()
+        .filter_map(|excluded| dns_base(&excluded.base))
+        .any(|excluded| {
+            let excluded = excluded.trim_start_matches('.');
+            within(&base, excluded) || within(excluded, &base)
+        });
+    contained && !reached
+}
+
+/// The PEM-encoded root's name constraints as a person reads them, `*.x`
+/// for the names below `x`, addresses as CIDR ranges, and excluded ones
+/// after `not`; `None` when it has none.
+pub(crate) fn constraints_summary(ca_cert_pem: &[u8]) -> Result<Option<Vec<String>>, LpmError> {
+    let der = root_der(ca_cert_pem)?;
+    let (_, root) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|error| LpmError::Cert(format!("invalid CA X.509: {error}")))?;
+    let Some(constraints) = root
+        .name_constraints()
+        .map_err(|error| LpmError::Cert(format!("invalid root name constraints: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let spell = |name: &GeneralName<'_>| match name {
+        GeneralName::DNSName(name) => Some(match name.strip_prefix('.') {
+            Some(parent) => format!("*.{parent}"),
+            None => (*name).to_owned(),
+        }),
+        GeneralName::IPAddress(range) => {
+            let (network, mask) = range.split_at(range.len() / 2);
+            let prefix: u32 = mask.iter().map(|byte| byte.count_ones()).sum();
+            let address = match network.len() {
+                4 => <[u8; 4]>::try_from(network).ok().map(IpAddr::from),
+                16 => <[u8; 16]>::try_from(network).ok().map(IpAddr::from),
+                _ => None,
+            }?;
+            Some(format!("{address}/{prefix}"))
+        }
+        _ => None,
+    };
+    let value = constraints.value;
+    Ok(Some(
+        value
+            .permitted_subtrees
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|subtree| spell(&subtree.base))
+            .chain(
+                value
+                    .excluded_subtrees
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|subtree| spell(&subtree.base).map(|name| format!("not {name}"))),
+            )
+            .collect(),
+    ))
 }
 
 pub(super) fn validate_requested_names(

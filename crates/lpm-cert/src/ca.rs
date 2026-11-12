@@ -101,14 +101,35 @@ pub fn cert_declines_name_constraints_bytes(cert_pem: &[u8]) -> Result<bool, Lpm
         .any(|unit| unit.as_str() == Ok(UNCONSTRAINED_UNIT)))
 }
 
-/// The names among `names`, hostnames, IP addresses or `*.`/`.` subtrees,
-/// that the PEM-encoded CA's name constraints don't permit; none when it has
-/// no constraints.
+/// Of `hostnames`, names or addresses a certificate would name, and
+/// `subtrees`, DNS subtrees a project intermediate would permit, the ones the
+/// PEM-encoded CA's name constraints don't wholly permit; none when it has no
+/// constraints.
 pub fn names_outside_constraints(
     cert_pem: &[u8],
-    names: &[String],
+    hostnames: &[String],
+    subtrees: &[String],
 ) -> Result<Vec<String>, LpmError> {
-    crate::cert::names_outside_root(cert_pem, names)
+    crate::cert::names_outside_root(cert_pem, hostnames, subtrees)
+}
+
+/// [`names_outside_constraints`] for a CA this release would make limited to
+/// local names: what only an unconstrained CA could sign.
+pub fn names_outside_local_names(
+    hostnames: &[String],
+    subtrees: &[String],
+) -> Result<Vec<String>, LpmError> {
+    let (local, _) = generate_ca_with_options(CaOptions {
+        name_constraints: true,
+    })
+    .map_err(|error| LpmError::Cert(format!("failed to model the local-names CA: {error}")))?;
+    names_outside_constraints(local.as_bytes(), hostnames, subtrees)
+}
+
+/// The PEM-encoded CA's name constraints as a person reads them; `None`
+/// when it has none.
+pub fn constraints_summary(cert_pem: &[u8]) -> Result<Option<Vec<String>>, LpmError> {
+    crate::cert::constraints_summary(cert_pem)
 }
 
 /// True iff the PEM-encoded CA at `path` carries a NameConstraints extension.
@@ -278,12 +299,10 @@ mod tests {
             name_constraints: true,
         })
         .unwrap();
-        let names = [
+        let hostnames = [
             "localhost",
             "app.localhost",
             "myapp.local",
-            "*.myapp.local",
-            ".api.test",
             "x.lpm.test",
             "app.internal",
             "router.home.arpa",
@@ -292,22 +311,91 @@ mod tests {
             "::1",
             "fe80::1",
             "staging.example.com",
-            "*.example.dev",
             "local",
             "8.8.8.8",
         ]
         .map(str::to_owned);
+        let subtrees =
+            ["myapp.local", ".api.test", "example.dev", ".example.dev"].map(str::to_owned);
 
         assert_eq!(
-            names_outside_constraints(constrained.as_bytes(), &names).unwrap(),
-            ["staging.example.com", "*.example.dev", "local", "8.8.8.8"]
+            names_outside_constraints(constrained.as_bytes(), &hostnames, &subtrees).unwrap(),
+            [
+                "staging.example.com",
+                "local",
+                "8.8.8.8",
+                "example.dev",
+                ".example.dev"
+            ]
         );
         let (unconstrained, _) = generate_ca_with_options(CaOptions::default()).unwrap();
         assert!(
-            names_outside_constraints(unconstrained.as_bytes(), &names)
+            names_outside_constraints(unconstrained.as_bytes(), &hostnames, &subtrees)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A subtree is permitted only when all of it is: within a permitted
+    /// subtree, with no excluded one reaching into it.
+    #[test]
+    fn a_subtree_with_an_excluded_part_is_not_permitted() {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: vec![GeneralSubtree::DnsName(".test".into())],
+            excluded_subtrees: vec![GeneralSubtree::DnsName("blocked.team.test".into())],
+        });
+        let root = params.self_signed(&key).unwrap().pem();
+        let subtrees = [
+            "team.test",
+            ".team.test",
+            "blocked.team.test",
+            "other.test",
+            ".other.test",
+            "test",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            names_outside_constraints(root.as_bytes(), &[], &subtrees).unwrap(),
+            ["team.test", ".team.test", "blocked.team.test", "test"]
+        );
+        assert_eq!(
+            constraints_summary(root.as_bytes()).unwrap(),
+            Some(vec![
+                "*.test".to_string(),
+                "not blocked.team.test".to_string()
+            ])
+        );
+    }
+
+    /// The consent lists the names the CA itself permits.
+    #[test]
+    fn a_constrained_cas_summary_lists_its_own_names() {
+        let (constrained, _) = generate_ca_with_options(CaOptions {
+            name_constraints: true,
+        })
+        .unwrap();
+        let summary = constraints_summary(constrained.as_bytes())
+            .unwrap()
+            .unwrap();
+        for name in [
+            "localhost",
+            "*.local",
+            "*.internal",
+            "127.0.0.0/8",
+            "::1/128",
+            "fe80::/10",
+        ] {
+            assert!(
+                summary.iter().any(|entry| entry == name),
+                "{name}: {summary:?}"
+            );
+        }
+        let (unconstrained, _) = generate_ca_with_options(CaOptions::default()).unwrap();
+        assert_eq!(constraints_summary(unconstrained.as_bytes()).unwrap(), None);
     }
 
     #[test]
