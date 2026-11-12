@@ -1141,15 +1141,17 @@ pub fn release_package_identity(project_dir: &Path, package: &str) -> Result<boo
 }
 
 /// [`release_package_identity`] for every identity whose project no
-/// longer exists, and how many it released.
-pub fn release_identities_of_removed_projects() -> Result<usize, SandboxError> {
+/// longer exists: how many it released, and why it couldn't release the
+/// others. One that keeps failing, as one whose grant only an
+/// administrator can remove does, doesn't hold back the rest.
+pub fn release_identities_of_removed_projects() -> (usize, Vec<SandboxError>) {
     #[cfg(target_os = "windows")]
     {
         windows_appcontainer::release_identities_of_removed_projects()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(0)
+        (0, Vec::new())
     }
 }
 
