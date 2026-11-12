@@ -821,16 +821,20 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
             "nested":"cmd/c capture",
             "piped-if":"node -e 0 | if 1==1 node -e 0 & capture",
             "piped-escaped-if":"node -e 0 | i^f 1==1 node -e 0 & capture",
-            "piped-if-paren":"node -e 0 | if(1)==(1) node -e 0 & capture"
+            "piped-if-paren":"node -e 0 | if(1)==(1) node -e 0 & capture",
+            "piped-redirected-if":"node -e 0 | 2>nul if 1==1 node -e 0 & capture"
         }"#,
     );
 
-    for script in [
-        "piped",
-        "nested",
-        "piped-if",
-        "piped-escaped-if",
-        "piped-if-paren",
+    // cmd.exe refuses a line with a redirection before `if`, so that script
+    // never runs, whatever its arguments.
+    for (script, runs) in [
+        ("piped", true),
+        ("nested", true),
+        ("piped-if", true),
+        ("piped-escaped-if", true),
+        ("piped-if-paren", true),
+        ("piped-redirected-if", false),
     ] {
         let _ = std::fs::remove_file(project.path().join("args.json"));
         let output = lpm(&project)
@@ -857,6 +861,11 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
             .args(["run", script, "--", "--flag=1", r"src\index.ts"])
             .output()
             .expect("run script with plain arguments");
+        if !runs {
+            assert!(!output.status.success(), "{script} ran");
+            assert!(!project.file_exists("args.json"), "{script} ran");
+            continue;
+        }
         assert!(
             output.status.success(),
             "{script}: {}",
@@ -872,6 +881,10 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
 
 /// After a trailing operator the arguments would be a command of their own,
 /// and after a trailing redirection the file it writes, so none are passed.
+/// Nor are they where cmd.exe would find either only after expanding a
+/// variable, from the project's `.env` or from LPM's own environment, or
+/// when another cmd.exe reads the line again: through a pipe or a nested
+/// cmd.exe, with one level of `^` taken out and variables expanded again.
 #[cfg(windows)]
 #[test]
 fn run_refuses_arguments_that_would_make_their_own_command() {
@@ -879,18 +892,31 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
         r#"{
             "dangling":"node -e 0 &&",
             "redirected":"capture >",
-            "conditional":"if 1==2 (node -e 0) else"
+            "conditional":"if 1==2 (node -e 0) else",
+            "expanded":"node -e 0 %CHAIN%",
+            "expanded-inherited":"node -e 0 %LPM_TEST_CHAIN%",
+            "piped-escaped-operator":"node -e 0 | echo X ^&",
+            "nested-conditional":"cmd /d /c if 1==1",
+            "piped-expanded-again":"node -e 0 | capture %LPM_TEST_AGAIN%"
         }"#,
     );
+    project.write_file(".env", "CHAIN=\"&&\"\n");
 
     for (script, args) in [
         ("dangling", ["mkdir", "INJECTEDDIR"]),
         ("redirected", ["plain-target.txt", "--flag"]),
         ("conditional", ["mkdir", "INJECTEDDIR"]),
+        ("expanded", ["mkdir", "INJECTEDDIR"]),
+        ("expanded-inherited", ["mkdir", "INJECTEDDIR"]),
+        ("piped-escaped-operator", ["mkdir", "INJECTEDDIR"]),
+        ("nested-conditional", ["mkdir", "INJECTEDDIR"]),
+        ("piped-expanded-again", ["mkdir", "INJECTEDDIR"]),
     ] {
         let output = lpm(&project)
             .args(["run", script, "--"])
             .args(args)
+            .env("LPM_TEST_CHAIN", "&&")
+            .env("LPM_TEST_AGAIN", "%LPM_TEST_CHAIN%")
             .output()
             .expect("run script ending without a command");
         let combined = format!(

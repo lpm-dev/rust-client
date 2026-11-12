@@ -108,7 +108,10 @@ enum WindowsArgumentReceiver {
     /// No command: the script ends in an operator, a redirection or an
     /// escape, so the arguments would make a command of their own or name a
     /// redirection's file; or its last command is an `if` or a `for`, where
-    /// they could be the command, the condition or the `else` branch.
+    /// they could be the command, the condition or the `else` branch; or a
+    /// variable it uses holds something that could make either so once
+    /// cmd.exe expands it; or either is so where another cmd.exe reads the
+    /// line again.
     Nothing,
 }
 
@@ -129,8 +132,11 @@ fn windows_shell_quote_arg(
     if receiver == WindowsArgumentReceiver::Nothing {
         return Err(LpmError::Script(format!(
             "cannot pass {arg:?} to this script: it ends in an operator, a redirection or an \
-             escape, or its last command is an `if`, a `for` or a variable that could be one, \
-             so on Windows its arguments could make a command of their own or name a file"
+             escape, its last command is an `if`, a `for` or a variable that could be one, or a \
+             variable it uses holds a quote, an operator, a redirection or a parenthesis; or it \
+             does once another cmd.exe reads it again, through a pipe, a nested cmd.exe, `call` \
+             or `start`. On Windows its arguments could then make a command of their own or \
+             name a file"
         )));
     }
     // Words cmd.exe gives no meaning to arrive intact however often it
@@ -246,6 +252,26 @@ fn windows_argument_receiver(
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.clone())
     };
+    // cmd.exe expands `%NAME%` before it reads the commands on the line.
+    let variable = |name: &str| {
+        if name.is_empty() || name.contains('\0') {
+            None
+        } else if name.contains('=') {
+            // Only cmd.exe's hidden variables have one, at the start.
+            windows_dynamic_variable(name, script_cmd, project_dir)
+        } else if name.eq_ignore_ascii_case("PATH") {
+            Some(path.to_owned())
+        } else {
+            project_value(name)
+                .or_else(|| {
+                    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+                })
+                .or_else(|| windows_dynamic_variable(name, script_cmd, project_dir))
+        }
+    };
+    if windows_expansion_may_change_commands(script_cmd, &variable) {
+        return WindowsArgumentReceiver::Nothing;
+    }
     let search_current_directory = project_value(NO_CURRENT_DIRECTORY_SEARCH_ENV).is_none()
         && std::env::var_os(NO_CURRENT_DIRECTORY_SEARCH_ENV).is_none();
     let pathext = project_value("PATHEXT")
@@ -258,6 +284,78 @@ fn windows_argument_receiver(
         search_current_directory,
         pathext.as_deref().unwrap_or(WINDOWS_DEFAULT_PATHEXT),
     )
+}
+
+/// What cmd.exe expands `%name%` to for a variable it provides itself when
+/// the environment sets none: the current directory for `CD`; for
+/// `CMDCMDLINE`, its own command line, which holds the script and its
+/// arguments in quotes; for its hidden ones, such as `=C:`, the current
+/// directory of drive C:, something taken as able to hold anything, a quote
+/// included; and digits, a date, a time or its own directory for the rest.
+#[cfg(windows)]
+fn windows_dynamic_variable(name: &str, script_cmd: &str, project_dir: &Path) -> Option<String> {
+    match name.to_ascii_uppercase().as_str() {
+        "CD" | "__CD__" => Some(project_dir.display().to_string()),
+        "CMDCMDLINE" => Some(format!("\"{script_cmd}\"")),
+        hidden if hidden.starts_with('=') => Some("\"".to_owned()),
+        "CMDEXTVERSION"
+        | "DATE"
+        | "ERRORLEVEL"
+        | "HIGHESTNUMANODENUMBER"
+        | "RANDOM"
+        | "TIME"
+        | "__APPDIR__" => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// Whether expanding `%NAME%`, which cmd.exe does before it reads the
+/// commands on the line, could change where [`windows_script_tail`] finds
+/// them: a variable holds a quote or a line break, or, where it isn't
+/// quoted, an operator, a redirection, a parenthesis or an escape, such as
+/// `CHAIN=&&` in `node -e 0 %CHAIN%`, which would make the arguments a
+/// command. `value` gives a variable's value as the script's cmd.exe sees
+/// it, or `None` where it has none, which leaves `%NAME%` as written. Each
+/// two neighbouring `%`s are taken as a variable, so whichever way cmd.exe
+/// pairs them is covered.
+#[cfg(any(test, windows))]
+fn windows_expansion_may_change_commands(
+    script_cmd: &str,
+    value: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    // Each `%`, and whether it is in quotes as [`windows_script_tail`] reads
+    // them, which is how cmd.exe reads them after the expansion as long as
+    // no value checked holds a quote.
+    let mut percents = Vec::new();
+    let mut quoted = false;
+    let mut characters = script_cmd.char_indices();
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '%' => percents.push((index, quoted)),
+            // A `^` doesn't keep a `%` from expanding: the expansion comes first.
+            '^' if !quoted => {
+                if let Some((next, '%')) = characters.next() {
+                    percents.push((next, quoted));
+                }
+            }
+            _ => {}
+        }
+    }
+    let changes = |text: &str, quoted: bool| {
+        text.chars().any(|character| {
+            matches!(character, '"' | '\r' | '\n') || (!quoted && "&|<>()^".contains(character))
+        })
+    };
+    percents.windows(2).any(|pair| {
+        let ((start, quoted), (end, _)) = (pair[0], pair[1]);
+        let reference = &script_cmd[start + 1..end];
+        // `%NAME:~1,3%` and `%NAME:old=new%` expand NAME, changed.
+        let name = reference
+            .split_once(':')
+            .map_or(reference, |(name, _)| name);
+        value(name).is_some_and(|value| changes(&value, quoted) || changes(reference, false))
+    })
 }
 
 /// [`windows_argument_receiver`], given whether cmd.exe looks for commands
@@ -359,25 +457,76 @@ fn windows_command_builtin(word: &str) -> Option<&'static str> {
     }
 }
 
-/// The first word of a command as cmd.exe reads it to decide what runs:
-/// after any leading delimiters and `@`, up to the next delimiter, with
-/// each `^` taken out and the character after it kept (`i^f` is `if`).
+/// The first word of a command as cmd.exe reads it to decide what runs, and
+/// the rest of the command after it: after any leading delimiters, `@`, `(`
+/// and redirections, which can come before the command (`2>nul call …`;
+/// cmd.exe refuses a line with one before `if` or `for`, read here as one
+/// anyway), up to the next delimiter, with each `^` taken out and the
+/// character after it kept (`i^f` is `if`). `None` where a redirection's
+/// file name runs into an unclosed quote, so what follows can't be told.
 #[cfg(any(test, windows))]
-fn windows_first_word(command: &str) -> String {
+fn windows_first_word(command: &str) -> Option<(String, &str)> {
     let mut word = String::new();
-    let mut characters = command
-        .trim_start_matches(|character: char| {
-            windows_is_space(character) || "@,;=".contains(character)
-        })
-        .chars();
-    while let Some(character) = characters.next() {
+    let text = windows_after_redirections(command)?;
+    let mut characters = text.char_indices();
+    while let Some((index, character)) = characters.next() {
         match character {
-            '^' => word.extend(characters.next()),
-            _ if windows_is_space(character) || ",;=".contains(character) => break,
+            '^' => word.extend(characters.next().map(|(_, escaped)| escaped)),
+            _ if windows_is_space(character) || ",;=".contains(character) => {
+                return Some((word, &text[index..]));
+            }
             _ => word.push(character),
         }
     }
-    word
+    Some((word, ""))
+}
+
+/// `command` from where its first word starts: after leading delimiters,
+/// `@`, `(`, and redirections such as `2>nul`, `>> "out file"` or `2>&1`.
+#[cfg(any(test, windows))]
+fn windows_after_redirections(command: &str) -> Option<&str> {
+    let mut rest = command;
+    loop {
+        rest = rest.trim_start_matches(|character: char| {
+            windows_is_space(character) || "@,;=(".contains(character)
+        });
+        let operator = rest
+            .strip_prefix(|character: char| character.is_ascii_digit())
+            .filter(|after| after.starts_with(['<', '>']))
+            .unwrap_or(rest);
+        let Some(after) = operator.strip_prefix(['<', '>']) else {
+            return Some(rest);
+        };
+        let after = after.strip_prefix('>').unwrap_or(after);
+        rest = match after.strip_prefix('&') {
+            // `2>&1` names a handle, not a file.
+            Some(handle) => handle.trim_start_matches(|character: char| character.is_ascii_digit()),
+            None => windows_after_word(after.trim_start_matches(windows_is_space))?,
+        };
+    }
+}
+
+/// `text` after its first word, a redirection's file name, which ends at a
+/// delimiter or another operator outside quotes and not escaped with `^`.
+/// `None` where a quote in it never closes.
+#[cfg(any(test, windows))]
+fn windows_after_word(text: &str) -> Option<&str> {
+    let mut quoted = false;
+    let mut characters = text.char_indices();
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '^' => {
+                characters.next();
+            }
+            _ if windows_is_space(character) || ",;=<>|&".contains(character) => {
+                return Some(&text[index..]);
+            }
+            _ => {}
+        }
+    }
+    (!quoted).then_some("")
 }
 
 /// Whether a command whose first word is `word` is, or may be once a
@@ -411,6 +560,8 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // An `if` or `for` after a pipe takes the rest of the line as its body,
     // `&` and all, into the pipe's cmd.exe.
     let mut piped_body = false;
+    // Where the pipe's own cmd.exe starts reading the rest of the line.
+    let mut piped_from = None;
     let mut grouped = false;
     let mut quoted = false;
     let mut redirects_last = false;
@@ -438,7 +589,13 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
                 piped = character == '|' && !doubled;
                 grouped = false;
                 start = index + if doubled { 2 } else { 1 };
-                if piped && windows_may_be_conditional(&windows_first_word(&script_cmd[start..])) {
+                if !piped_body {
+                    piped_from = piped.then_some(start);
+                }
+                if piped
+                    && windows_first_word(&script_cmd[start..])
+                        .is_none_or(|(word, _)| windows_may_be_conditional(&word))
+                {
                     piped_body = true;
                 }
             }
@@ -465,19 +622,34 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     // Whether arguments after `if <condition>` or `for … do`, with or
     // without a command or an `else`, end up a command, a condition or an
     // argument depends on what precedes them.
-    let first_word = windows_first_word(command);
+    let Some((first_word, after_word)) = windows_first_word(command) else {
+        return WindowsScriptTail::Nothing;
+    };
     if windows_may_be_conditional(&first_word) {
         return WindowsScriptTail::Nothing;
     }
-    if windows_command_builtin(&first_word).is_some() {
-        return WindowsScriptTail::Unknown;
+    // What another cmd.exe reads again of the line: a pipe's, from where it
+    // starts, a nested one, or `call` and `start`, from what they run.
+    let mut again: Vec<String> = piped_from
+        .map(|from| script_cmd[from..].to_owned())
+        .into_iter()
+        .collect();
+    if let Some(builtin) = windows_command_builtin(&first_word) {
+        // What follows the keyword in its word, as in `start.x`, and after.
+        let rest = format!("{}{after_word}", &first_word[builtin.len()..]);
+        again.push(if builtin == "start" {
+            windows_started_command(&rest).to_owned()
+        } else {
+            rest
+        });
+        return windows_read_again(&again);
     }
     // A pipe runs its commands in another cmd.exe, which reads them again.
     if piped || piped_body || grouped {
-        return WindowsScriptTail::Unknown;
+        return windows_read_again(&again);
     }
 
-    let name = match command.strip_prefix('"') {
+    let (name, after_name) = match command.strip_prefix('"') {
         Some(rest) => {
             let Some((name, after)) = rest.split_once('"') else {
                 return WindowsScriptTail::Unknown;
@@ -485,16 +657,24 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
             if !after.is_empty() && !after.starts_with(windows_is_space) {
                 return WindowsScriptTail::Unknown;
             }
-            name
+            (name, after)
         }
         None => {
             let name = command.split(windows_is_space).next().unwrap_or_default();
+            let after = &command[name.len()..];
             // cmd.exe ends an unquoted name at a `/`, as in `cmd/c`, so the
-            // command is not the one this name reads as.
-            if name.contains('/') {
-                return WindowsScriptTail::Unknown;
+            // command is not the one this name reads as. A shell it could be
+            // reads what follows again.
+            if let Some((program, _)) = name.split_once('/') {
+                if let Some(shell) = windows_reading_shell(program) {
+                    again.push(windows_shell_command(shell, &command[program.len()..]));
+                }
+                if let Some(shell) = windows_reading_shell(name) {
+                    again.push(windows_shell_command(shell, after));
+                }
+                return windows_read_again(&again);
             }
-            name
+            (name, after)
         }
     };
     // A name with these in it is a variable, a redirection, an escape or
@@ -504,14 +684,124 @@ fn windows_script_tail(script_cmd: &str) -> WindowsScriptTail<'_> {
     }
     // Split as Windows does, on either slash, whatever platform this runs on.
     let file_name = name.rsplit(['\\', '/']).next().unwrap_or_default();
+    if let Some(shell) = windows_reading_shell(name) {
+        again.push(windows_shell_command(shell, after_name));
+        return windows_read_again(&again);
+    }
     if file_name.is_empty()
-        || ["call", "cmd", "cmd.exe", "start", "if", "for"]
+        || ["if", "for"]
             .iter()
             .any(|keyword| file_name.eq_ignore_ascii_case(keyword))
     {
         return WindowsScriptTail::Unknown;
     }
     WindowsScriptTail::Command(name)
+}
+
+/// Which of cmd.exe, `call` and `start`, which read what follows them
+/// again, a command named `name` is, by its file name.
+#[cfg(any(test, windows))]
+fn windows_reading_shell(name: &str) -> Option<&'static str> {
+    let file_name = name.rsplit(['\\', '/']).next().unwrap_or_default();
+    ["cmd", "cmd.exe", "call", "start"]
+        .into_iter()
+        .find(|shell| file_name.eq_ignore_ascii_case(shell))
+}
+
+/// What `shell`, one of [`windows_reading_shell`]'s, runs given `rest`, what
+/// follows its name.
+#[cfg(any(test, windows))]
+fn windows_shell_command(shell: &str, rest: &str) -> String {
+    match shell {
+        "cmd" | "cmd.exe" => windows_nested_cmd_command(rest),
+        "start" => windows_started_command(rest),
+        _ => rest,
+    }
+    .to_owned()
+}
+
+/// The command a nested cmd.exe runs, given what follows its name: what
+/// follows its `/c` or `/k`, after any other switches; all of `rest` where
+/// there's neither.
+#[cfg(any(test, windows))]
+fn windows_nested_cmd_command(rest: &str) -> &str {
+    let mut switches = rest;
+    loop {
+        switches = switches.trim_start_matches(windows_is_space);
+        let Some(switch) = switches.strip_prefix('/') else {
+            return rest;
+        };
+        if switch.starts_with(['c', 'C', 'k', 'K']) {
+            return &switch[1..];
+        }
+        switches = switch
+            .trim_start_matches(|character: char| !windows_is_space(character) && character != '/');
+    }
+}
+
+/// The command `start` runs, given what follows it: after a title in quotes
+/// and its switches, with the value `/d`, `/node` and `/affinity` take.
+#[cfg(any(test, windows))]
+fn windows_started_command(rest: &str) -> &str {
+    let mut rest = rest.trim_start_matches(windows_is_space);
+    if let Some(title) = rest.strip_prefix('"') {
+        rest = title.split_once('"').map_or("", |(_, after)| after);
+    }
+    loop {
+        rest = rest.trim_start_matches(windows_is_space);
+        let Some(switch) = rest.strip_prefix('/') else {
+            return rest;
+        };
+        let end = switch
+            .find(|character: char| windows_is_space(character) || character == '/')
+            .unwrap_or(switch.len());
+        rest = &switch[end..];
+        if ["d", "node", "affinity"]
+            .iter()
+            .any(|takes_value| switch[..end].eq_ignore_ascii_case(takes_value))
+        {
+            rest = windows_after_word(rest.trim_start_matches(windows_is_space)).unwrap_or("");
+        }
+    }
+}
+
+/// [`WindowsScriptTail::Unknown`], or `Nothing` where another cmd.exe's
+/// reading of any of `texts` again could leave the arguments with no
+/// command: the first reading takes one level of `^` out, so `^&` is an
+/// operator to the second, and the second expands variables again, so a
+/// value holding `%OTHER%` expands there.
+#[cfg(any(test, windows))]
+fn windows_read_again(texts: &[String]) -> WindowsScriptTail<'static> {
+    let leaves_no_command = |text: &String| {
+        text.matches('%').count() > 1
+            || text.matches('!').count() > 1
+            || windows_script_tail(&windows_without_escapes(text)) == WindowsScriptTail::Nothing
+    };
+    if texts.iter().any(leaves_no_command) {
+        WindowsScriptTail::Nothing
+    } else {
+        WindowsScriptTail::Unknown
+    }
+}
+
+/// `text` with one level of `^` taken out outside quotes, as cmd.exe's
+/// first reading leaves it for another.
+#[cfg(any(test, windows))]
+fn windows_without_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quoted = false;
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '^' if !quoted => out.extend(characters.next()),
+            '"' => {
+                quoted = !quoted;
+                out.push(character);
+            }
+            _ => out.push(character),
+        }
+    }
+    out
 }
 
 /// Build the shell command for a script invocation by quoting every runtime
@@ -3349,7 +3639,7 @@ mod tests {
             ("node -e 0 | i^f 1==1 node -e 0 & capture", Unknown),
             ("node -e 0 | ^if 1==1 node -e 0 & capture", Unknown),
             ("node -e 0 | f^or %a in (1) do node -e 0 & capture", Unknown),
-            ("node -e 0 | %CONDITION% node -e 0 & capture", Unknown),
+            ("node -e 0 | %CONDITION% node -e 0 & capture", Nothing),
             ("if 1==1 node -e 0 & capture", Command("capture")),
             // cmd.exe also ends `call`'s and `start`'s names at `.+[]\:(`.
             ("start.capture", Unknown),
@@ -3420,9 +3710,88 @@ mod tests {
             ("node -e 0 && capture\u{180E}--x", Command("capture")),
             ("node -e 0 && if 1==1 capture", Nothing),
             ("node -e 0 | if 1==1 capture", Nothing),
+            // What another cmd.exe reads again: one level of `^` out, so
+            // `^&` is an operator there, and variables expanded once more.
+            ("node -e 0 | echo X ^&", Nothing),
+            ("node -e 0 | echo ^>", Nothing),
+            ("node -e 0 | capture %FLAG%", Nothing),
+            ("node -e 0 | capture !FLAG!", Nothing),
+            ("node -e 0 | capture ^^^& x", Unknown),
+            ("node -e 0 | cmd /c if 1==1", Nothing),
+            ("cmd /c echo X ^&", Nothing),
+            ("cmd /d /s /c if 1==1", Nothing),
+            ("cmd/c if 1==1", Nothing),
+            ("C:/Windows/System32/cmd /c if 1==1", Nothing),
+            (r"C:\Windows\System32\cmd.exe /k if 1==1", Nothing),
+            ("call echo X ^&", Nothing),
+            ("2>nul call echo X ^&", Nothing),
+            ("start /b cmd /c if 1==1", Nothing),
+            (r#"start "title" /d C:\ cmd /c if 1==1"#, Nothing),
+            (r#"start "title" /b capture"#, Unknown),
+            // A redirection, or a parenthesis, can come before the command.
+            // cmd.exe refuses a line with one before `if` or `for`; it is
+            // read as one anyway.
+            ("node -e 0 | 2>nul if 1==1 node -e 0 & capture", Unknown),
+            (
+                "node -e 0 | >out.txt for %a in (1) do node -e 0 & capture",
+                Unknown,
+            ),
+            ("node -e 0 | 2>&1 if 1==1 node -e 0 & capture", Unknown),
+            (
+                "node -e 0 | 2>> \"out file\" if 1==1 node -e 0 & capture",
+                Unknown,
+            ),
+            ("node -e 0 | >o^ x if 1==1 node -e 0 & capture", Unknown),
+            ("node -e 0 | (if 1==1 node -e 0 & capture", Unknown),
+            ("2>nul if 1==1", Nothing),
+            ("node -e 0 && 2>nul if 1==1 capture", Nothing),
+            ("node -e 0 | 2>nul if 1==1", Nothing),
+            (">o^ x if 1==1", Nothing),
+            ("2>nul for %a in (1) do", Nothing),
+            ("(if 1==1", Nothing),
+            ("2>nul capture --flag", Unknown),
         ];
         for (script, expected) in cases {
             assert_eq!(windows_script_tail(script), expected, "{script:?}");
+        }
+    }
+
+    /// cmd.exe expands `%NAME%` before it reads the commands on the line, so
+    /// a variable holding an operator can make the arguments a command.
+    #[test]
+    fn windows_variables_that_could_change_the_commands_are_found() {
+        let value = |name: &str| match name.to_ascii_uppercase().as_str() {
+            "CHAIN" => Some("&&".to_owned()),
+            "URL" => Some("https://registry.test/?a=1&b=2".to_owned()),
+            "QUOTE" => Some("a\"b".to_owned()),
+            "FLAG" => Some("--watch".to_owned()),
+            "BREAK" => Some("a\nb".to_owned()),
+            _ => None,
+        };
+        for (script, changes) in [
+            ("node -e 0 %CHAIN%", true),
+            ("node -e 0 %chain%", true),
+            ("node -e 0 %CHAIN% capture", true),
+            ("node build.js %URL%", true),
+            ("node build.js \"%URL%\"", false),
+            ("node build.js \"%QUOTE%\"", true),
+            ("node build.js %QUOTE%", true),
+            ("node build.js %FLAG%", false),
+            ("node build.js %BREAK%", true),
+            ("node build.js %UNSET%", false),
+            ("node build.js %~dp0 %CHAIN%", true),
+            ("node build.js ^%CHAIN%", true),
+            ("node build.js %CHAIN:~0,0%", true),
+            ("node build.js %FLAG:~0,2%", false),
+            ("node build.js %FLAG:w=&%", true),
+            ("node build.js 100% done", false),
+            ("node build.js", false),
+        ] {
+            assert_eq!(
+                windows_expansion_may_change_commands(script, &value),
+                changes,
+                "{script:?}"
+            );
         }
     }
 
@@ -3572,6 +3941,38 @@ mod tests {
             ),
             WindowsArgumentReceiver::Program
         );
+
+        // A variable cmd.exe expands into an operator, from the project's
+        // environment or its own, as `CD` is in a folder named `R&D`.
+        assert_eq!(
+            windows_argument_receiver(
+                "other %CHAIN%",
+                project.path(),
+                path,
+                &envs(&[("chain", "&&")])
+            ),
+            WindowsArgumentReceiver::Nothing
+        );
+        let r_and_d = project.path().join("R&D");
+        std::fs::create_dir(&r_and_d).unwrap();
+        for (directory, expected) in [
+            (r_and_d.as_path(), WindowsArgumentReceiver::Nothing),
+            (project.path(), WindowsArgumentReceiver::Program),
+        ] {
+            assert_eq!(
+                windows_argument_receiver(r"other %CD%\build.js", directory, path, &envs(&[])),
+                expected,
+                "{}",
+                directory.display()
+            );
+        }
+        for script in ["other %CMDCMDLINE%", r"other %=C:%\build.js"] {
+            assert_eq!(
+                windows_argument_receiver(script, project.path(), path, &envs(&[])),
+                WindowsArgumentReceiver::Nothing,
+                "{script:?}"
+            );
+        }
     }
 
     #[test]
