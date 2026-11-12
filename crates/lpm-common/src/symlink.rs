@@ -428,6 +428,23 @@ fn lexically_clean(p: &Path) -> PathBuf {
     out
 }
 
+/// The start of a `.cmd` shim that names paths relative to itself, as
+/// `%dp0%`, its own directory with a trailing `\`.
+///
+/// `dp0` is set in a subroutine: in a batch file's main body, `%~dp0` gives
+/// the current directory when cmd.exe found the file on PATH by a quoted
+/// name (`"tsc" …`, `call "tsc.cmd"`). `SETLOCAL` keeps `dp0` and the shim's
+/// other variables from the caller, with delayed expansion off so a `!` in a
+/// path stays literal. Lines end in CRLF: cmd.exe can miss a label in a file
+/// with bare LFs.
+pub const WINDOWS_CMD_SHIM_PREAMBLE: &str = "@GOTO start\r\n\
+                                             :find_dp0\r\n\
+                                             @SET \"dp0=%~dp0\"\r\n\
+                                             @EXIT /b\r\n\
+                                             :start\r\n\
+                                             @SETLOCAL DisableDelayedExpansion\r\n\
+                                             @CALL :find_dp0\r\n";
+
 /// Reject path strings containing cmd.exe metacharacters. Used before
 /// emitting a `.cmd` bin shim. Covers
 /// the sub-expression triple `( ) ;` and the quote-bypass triple

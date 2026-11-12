@@ -1179,7 +1179,7 @@ fn validate_cmd_path_allows_normal_path() {
 }
 
 /// Only what a shim must spell out is checked: a project path with `'`
-/// or `&` stays behind `%~dp0`, a target on another volume is written,
+/// or `&` stays behind `%dp0%`, a target on another volume is written,
 /// and checked, whole.
 #[test]
 #[cfg(windows)]
@@ -1193,13 +1193,28 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
             bin.parent(),
         )
         .unwrap(),
-        "@SET \"NODE_PATH=%~dp0\\..;%NODE_PATH%\"\n\
-         @IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"%~dp0\\..\\tool\\bin\\tool.js\" %*\n\
-         ) ELSE (\n  node \"%~dp0\\..\\tool\\bin\\tool.js\" %*\n)"
+        format!(
+            "{}@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n\
+             @IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n\
+             ) ELSE (\r\n  node \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n)\r\n",
+            lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
+        )
+    );
+    // A canonicalized target, as the v1 linkers have, still compares with
+    // a bin directory built from the project's path.
+    let shim = windows_cmd_shim(
+        bin,
+        Path::new(r"\\?\C:\work\O'Brien & R&D\node_modules\tool\bin\tool.js"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        shim.contains(r#""%dp0%node.exe" "%dp0%..\tool\bin\tool.js" %*"#),
+        "{shim}"
     );
     let shim = windows_cmd_shim(bin, Path::new(r"D:\store\tool.js"), None).unwrap();
     assert!(
-        shim.contains(r#""%~dp0\node.exe" "D:\store\tool.js" %*"#),
+        shim.contains(r#""%dp0%node.exe" "D:\store\tool.js" %*"#),
         "{shim}"
     );
     assert!(windows_cmd_shim(bin, Path::new(r"D:\R&D\tool.js"), None).is_err());

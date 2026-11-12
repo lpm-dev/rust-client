@@ -283,7 +283,7 @@ fn remove_owned_cmd_shim(
         return Ok(0);
     };
     // Shims name their target relative to their own directory.
-    let actual_target = match actual_target.strip_prefix("%~dp0\\") {
+    let actual_target = match actual_target.strip_prefix("%dp0%") {
         Some(relative) => shim_path
             .parent()
             .unwrap_or_else(|| Path::new(""))
@@ -302,25 +302,34 @@ fn remove_owned_cmd_shim(
     Ok(freed_bytes)
 }
 
+/// The target an LPM-written `.cmd` shim runs: one that sets `%dp0%` in
+/// [`lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE`] and names it from
+/// there, or one from an earlier release, which spelled it out.
 #[cfg(windows)]
 fn generated_cmd_shim_target(content: &str) -> Option<&str> {
-    const HEADER: &str = "@IF EXIST \"%~dp0\\node.exe\" (";
-    const LOCAL_NODE_PREFIX: &str = "  \"%~dp0\\node.exe\" \"";
     const PATH_NODE_PREFIX: &str = "  node \"";
     const TARGET_SUFFIX: &str = "\" %*";
+
+    let (content, node) = match content.strip_prefix(lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE)
+    {
+        Some(body) => (body, "%dp0%node.exe"),
+        None => (content, "%~dp0\\node.exe"),
+    };
+    let expected_header = format!("@IF EXIST \"{node}\" (");
+    let local_node_prefix = format!("  \"{node}\" \"");
 
     let mut lines = content.lines();
     let mut header = lines.next()?;
     if header.starts_with("@SET \"NODE_PATH=") && header.ends_with(";%NODE_PATH%\"") {
         header = lines.next()?;
     }
-    if header != HEADER {
+    if header != expected_header {
         return None;
     }
 
     let local_target = lines
         .next()?
-        .strip_prefix(LOCAL_NODE_PREFIX)?
+        .strip_prefix(local_node_prefix.as_str())?
         .strip_suffix(TARGET_SUFFIX)?;
     if lines.next()? != ") ELSE (" {
         return None;
@@ -1320,7 +1329,7 @@ mod tests {
     }
 
     /// Shims name their target relative to their own directory, as
-    /// `%~dp0\..\<package>\…`.
+    /// `%dp0%..\<package>\…`.
     #[cfg(windows)]
     #[test]
     fn remove_owned_cmd_shim_removes_a_shim_relative_to_its_directory() {
@@ -1342,7 +1351,8 @@ mod tests {
             std::fs::write(
                 path,
                 format!(
-                    "@SET \"NODE_PATH=%~dp0\\..;%NODE_PATH%\"\n@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"%~dp0\\..\\package\\bin\\{relative}\" %*\n) ELSE (\n  node \"%~dp0\\..\\package\\bin\\{relative}\" %*\n)",
+                    "{}@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"%dp0%..\\package\\bin\\{relative}\" %*\r\n) ELSE (\r\n  node \"%dp0%..\\package\\bin\\{relative}\" %*\r\n)\r\n",
+                    lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
                 ),
             )
             .unwrap();

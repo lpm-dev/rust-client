@@ -16,10 +16,11 @@ pub(crate) fn relative_symlink_target_from_parent(target: &Path, link_parent: &P
 /// a `node.exe` next to the shim, with `node_path` ahead of `NODE_PATH`.
 ///
 /// Paths on the shim's volume are written relative to its own directory
-/// (`%~dp0`), so the file holds neither the project's path, whose `'` or
-/// `&` the check below refuses, nor the store's, whose non-ASCII user
-/// folder cmd.exe would read in the console's code page and get wrong.
-/// `Err` says why a path can't be written into a `.cmd` file.
+/// (`%dp0%`, set by [`lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE`]), so
+/// the file holds neither the project's path, whose `'` or `&` the check
+/// below refuses, nor the store's, whose non-ASCII user folder cmd.exe would
+/// read in the console's code page and get wrong. `Err` says why a path
+/// can't be written into a `.cmd` file.
 #[cfg(windows)]
 pub(crate) fn windows_cmd_shim(
     bin_dir: &Path,
@@ -29,32 +30,46 @@ pub(crate) fn windows_cmd_shim(
     let target = windows_cmd_shim_path(bin_dir, target)?;
     let node_path = match node_path {
         Some(path) => format!(
-            "@SET \"NODE_PATH={};%NODE_PATH%\"\n",
+            "@SET \"NODE_PATH={};%NODE_PATH%\"\r\n",
             windows_cmd_shim_path(bin_dir, path)?
         ),
         None => String::new(),
     };
     Ok(format!(
-        "{node_path}@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target}\" %*\n) ELSE (\n  node \"{target}\" %*\n)",
+        "{preamble}{node_path}@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"{target}\" %*\r\n) ELSE (\r\n  node \"{target}\" %*\r\n)\r\n",
+        preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
     ))
 }
 
-/// `path` as a `.cmd` shim in `bin_dir` names it: `%~dp0\` and the way
+/// `path` as a `.cmd` shim in `bin_dir` names it: `%dp0%` and the way
 /// there from `bin_dir` when both are on one volume, else `path` itself.
 #[cfg(windows)]
 fn windows_cmd_shim_path(bin_dir: &Path, path: &Path) -> Result<String, String> {
+    let bin_dir = without_verbatim_prefix(bin_dir);
+    let path = without_verbatim_prefix(path);
     let same_volume = bin_dir.components().next() == path.components().next();
-    match pathdiff::diff_paths(path, bin_dir).filter(|_| same_volume && path.is_absolute()) {
+    match pathdiff::diff_paths(&path, &bin_dir).filter(|_| same_volume && path.is_absolute()) {
         Some(relative) => {
             let relative = relative.to_string_lossy();
             validate_cmd_path(&relative)?;
-            Ok(format!("%~dp0\\{relative}"))
+            Ok(format!("%dp0%{relative}"))
         }
         None => {
             let absolute = path.to_string_lossy();
             validate_cmd_path(&absolute)?;
             Ok(absolute.into_owned())
         }
+    }
+}
+
+/// `path` without the `\\?\` a canonicalized drive path starts with, so it
+/// compares with one built from the project's path, and Node can run it.
+#[cfg(windows)]
+fn without_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => path.to_path_buf(),
     }
 }
 
