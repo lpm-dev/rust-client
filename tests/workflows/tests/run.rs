@@ -905,11 +905,13 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
             "nested-comspec-part":"\"%ComSpec:~0%\" /d /c \"node -e 0 &&\"",
             "closed-block":"if exist nonexistent (node -e 0 && capture)",
             "piped-closed-block":"node -e 0 | if 1==2 (echo a & capture)",
-            "expanded-folded":"node -e 0 %ᾳ%"
+            "expanded-folded":"node -e 0 %ᾳ%",
+            "expanded-colon":"node -e 0 %A:%"
         }"#,
     );
-    // Windows takes `ᾳ` for `ᾼ`, though Rust upper-cases both to `ΑΙ`.
-    project.write_file(".env", "CHAIN=\"&&\"\nᾼ=\"&&\"\n");
+    // Windows takes `ᾳ` for `ᾼ`, though Rust upper-cases both to `ΑΙ`; and
+    // a `:` that ends a reference is part of the name, as in `%=C:%`.
+    project.write_file(".env", "CHAIN=\"&&\"\nᾼ=\"&&\"\nA:=\"&&\"\n");
 
     let mkdir: &[&str] = &["mkdir", "INJECTEDDIR"];
     for (script, args) in [
@@ -931,6 +933,7 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
         ("closed-block", &["else", "mkdir", "INJECTEDDIR"]),
         ("piped-closed-block", &["else", "mkdir", "INJECTEDDIR"]),
         ("expanded-folded", mkdir),
+        ("expanded-colon", mkdir),
     ] {
         let output = lpm(&project)
             .args(["run", script, "--"])

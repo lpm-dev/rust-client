@@ -306,7 +306,8 @@ const WINDOWS_UNWORKED_EXPANSION: char = '\u{FDD0}';
 
 /// `script_cmd` as cmd.exe expands it on a command line: each `%NAME%` that
 /// `value` gives a value replaced by it, and each `%NAME:~1%` or
-/// `%NAME:a=b%` by [`WINDOWS_UNWORKED_EXPANSION`]. An unset name keeps its
+/// `%NAME:a=b%` of a set variable, or reference with a `:` that names one
+/// with it, as `%=C:%` does, by [`WINDOWS_UNWORKED_EXPANSION`]. An unset name keeps its
 /// `%`, and cmd.exe reads on from the `%` that closed it, which may open the
 /// next.
 #[cfg(any(test, windows))]
@@ -321,14 +322,17 @@ fn windows_expand_variables(script_cmd: &str, value: &dyn Fn(&str) -> Option<Str
             break;
         };
         let reference = &after[..end];
-        let name = reference.split(':').next().unwrap_or_default();
-        match value(name) {
-            Some(value) if !reference.contains(':') => {
-                expanded.push_str(&value);
+        let whole = value(reference);
+        let unworked = reference
+            .split_once(':')
+            .is_some_and(|(name, _)| whole.is_some() || value(name).is_some());
+        match whole {
+            _ if unworked => {
+                expanded.push(WINDOWS_UNWORKED_EXPANSION);
                 rest = &after[end + 1..];
             }
-            Some(_) => {
-                expanded.push(WINDOWS_UNWORKED_EXPANSION);
+            Some(value) => {
+                expanded.push_str(&value);
                 rest = &after[end + 1..];
             }
             None => {
@@ -416,15 +420,41 @@ fn windows_expansion_may_change_commands(
     percents.windows(2).any(|pair| {
         let ((start, quoted), (end, _)) = (pair[0], pair[1]);
         let reference = &script_cmd[start + 1..end];
+        // What the expansion gives is made of a value and the reference,
+        // which goes from the line, so what it holds counts too, unless it
+        // is all in quotes.
+        let changes_with = |value: String| changes(&value, quoted) || changes(reference, quoted);
+        if value(reference).is_some_and(changes_with) {
+            return true;
+        }
         // `%NAME:~1,3%` takes part of NAME's value, and `%NAME:old=new%`
-        // replaces in it, so what either gives is made of the value and the
-        // reference. The reference goes from the line, so what it holds
-        // counts too, unless it is all in quotes.
-        let name = reference
-            .split_once(':')
-            .map_or(reference, |(name, _)| name);
-        value(name).is_some_and(|value| changes(&value, quoted) || changes(reference, quoted))
+        // replaces in it. Any other modifier isn't worked out, and could
+        // have cmd.exe read past the next `%`. A `:` that ends the
+        // reference may be part of a name instead, as in `%=C:%`, which is
+        // checked above.
+        reference.split_once(':').is_some_and(|(name, modifier)| {
+            value(name)
+                .is_some_and(|value| !windows_worked_out_modifier(modifier) || changes_with(value))
+        })
     })
+}
+
+/// Whether cmd.exe expands `%NAME:modifier%` to something made of NAME's
+/// value and the modifier alone: a substring, `~start` or `~start,length`,
+/// or a replacement, `old=new`.
+#[cfg(any(test, windows))]
+fn windows_worked_out_modifier(modifier: &str) -> bool {
+    let number = |text: &str| {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    match modifier.strip_prefix('~') {
+        Some(range) => match range.split_once(',') {
+            Some((start, length)) => number(start) && number(length),
+            None => number(range),
+        },
+        None => modifier.contains('='),
+    }
 }
 
 /// [`windows_argument_receiver`], given whether cmd.exe looks for commands
@@ -3868,11 +3898,13 @@ mod tests {
                 "{script:?}"
             );
         }
-        // Part of a set variable isn't worked out.
+        // Part of a set variable isn't worked out, nor is a reference whose
+        // `:` may be part of a set variable's name.
         let unworked = WINDOWS_UNWORKED_EXPANSION;
         for (script, expanded) in [
             ("echo [%A:x=y%]", format!("echo [{unworked}]")),
             ("echo [%A:~0,1%%A%]", format!("echo [{unworked}x]")),
+            ("echo [%A:%]", format!("echo [{unworked}]")),
         ] {
             assert_eq!(
                 windows_expand_variables(script, &value),
@@ -3893,6 +3925,8 @@ mod tests {
             "FLAG" => Some("--watch".to_owned()),
             "BREAK" => Some("a\nb".to_owned()),
             "PF(X)" => Some(r"C:\Program Files (x86)".to_owned()),
+            "A:" => Some("&&".to_owned()),
+            "TIME" => Some(String::new()),
             _ => None,
         };
         for (script, changes) in [
@@ -3918,6 +3952,16 @@ mod tests {
             ("node build.js %UNSET:~0,2%", false),
             ("node build.js %FLAG:w=&%", true),
             ("node build.js %FLAG:w=\"%", true),
+            // A `:` that ends a reference is part of the name, as in `%=C:%`.
+            ("node -e 0 %A:%", true),
+            ("node -e 0 %a:%", true),
+            // Any other modifier isn't worked out, and could take cmd.exe's
+            // reading past the next `%`.
+            ("node build.js %FLAG:x%", true),
+            ("node %TIME:x%B\"=y% & capture \"", true),
+            ("node build.js %FLAG:~-3%", false),
+            ("node build.js %FLAG:~1,-1%", false),
+            ("node build.js %FLAG:~%", true),
             // A reference in quotes takes nothing out of the commands.
             ("\"%PF(X)%\\tool\\x.exe\" a", false),
             ("%PF(X)%\\tool\\x.exe a", true),
