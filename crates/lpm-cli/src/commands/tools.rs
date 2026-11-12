@@ -300,12 +300,14 @@ async fn run_single_runner(
     } else {
         StdioMode::Inherit
     };
-    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
     let preparation = async {
         let root_hint = super::run::ensure_runtime(&boundary).await?;
         prepare_runner_runtime(&project_dir, &boundary, &root_hint, json_output).await
     }
     .await;
+    // Created once the runtime is ready: while one lives, Ctrl+C is left to
+    // the child, so a download before it could no longer be interrupted.
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
     let outcome = match preparation {
         Ok(runtime_hint) => {
             let worker_signals = Arc::clone(&signals);
@@ -888,8 +890,7 @@ pub async fn tool_workspace(
         }
     };
 
-    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
-    let runner_tasks = if matches!(tool, "test" | "bench") {
+    let runner_preparations = if matches!(tool, "test" | "bench") {
         let runner_tool = RunnerTool::from_label(tool)?;
         let boundary = Arc::new(workspace.root.clone());
         let root_hint = super::run::ensure_runtime(&workspace.root).await?;
@@ -907,18 +908,31 @@ pub async fn tool_workspace(
             } else {
                 Ok(lpm_runner::bin_path::ManagedRuntimeHint::Absent)
             };
-            tasks.push(RunnerTask {
-                stage: runner_tool.env_stage(),
-                boundary: Arc::clone(&boundary),
+            tasks.push((
+                runner_tool.env_stage(),
+                Arc::clone(&boundary),
                 runner,
                 runtime_hint,
-                signals: Arc::clone(&signals),
-            });
+            ));
         }
         Some(tasks)
     } else {
         None
     };
+    // Created once every runtime is ready, so Ctrl+C still ends a download.
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let runner_tasks = runner_preparations.map(|tasks| {
+        tasks
+            .into_iter()
+            .map(|(stage, boundary, runner, runtime_hint)| RunnerTask {
+                stage,
+                boundary,
+                runner,
+                runtime_hint,
+                signals: Arc::clone(&signals),
+            })
+            .collect::<Vec<_>>()
+    });
 
     let stdio = if json_output {
         StdioMode::Capture

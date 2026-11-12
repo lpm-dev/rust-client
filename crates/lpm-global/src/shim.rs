@@ -710,7 +710,8 @@ mod tests {
         let script = package.join("tool.js");
         std::fs::write(
             &script,
-            "process.stdout.write(process.argv.slice(2).join('|')); process.exit(3);\n",
+            "process.stdout.write([...process.argv.slice(2), process.env._prog ?? 'none', \
+             process.env.dp0 ?? 'none'].join('|')); process.exit(3);\n",
         )
         .unwrap();
         let global_bin = root.join("global bin");
@@ -739,7 +740,12 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello space|two");
+        // The shim's own variables are gone by the time Node runs: its batch
+        // file, and its SETLOCAL, ended first.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "hello space|two|none|none"
+        );
     }
 
     #[cfg(windows)]

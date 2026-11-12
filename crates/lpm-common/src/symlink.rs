@@ -433,7 +433,8 @@ fn lexically_clean(p: &Path) -> PathBuf {
 /// the current directory when cmd.exe found the file on PATH by a quoted
 /// name (`"tsc" …`, `call "tsc.cmd"`). `SETLOCAL` keeps `dp0` and the shim's
 /// other variables from the caller, with delayed expansion off so a `!` in a
-/// path stays literal. Lines end in CRLF: cmd.exe can miss a label in a file
+/// path stays literal while the batch file runs (see
+/// [`windows_node_cmd_shim_body`] for after). Lines end in CRLF: cmd.exe can miss a label in a file
 /// with bare LFs.
 pub const WINDOWS_CMD_SHIM_PREAMBLE: &str = "@GOTO start\r\n\
                                              :find_dp0\r\n\
@@ -443,28 +444,46 @@ pub const WINDOWS_CMD_SHIM_PREAMBLE: &str = "@GOTO start\r\n\
                                              @SETLOCAL DisableDelayedExpansion\r\n\
                                              @CALL :find_dp0\r\n";
 
+/// The lines of a node shim, after [`WINDOWS_CMD_SHIM_PREAMBLE`] and any
+/// `NODE_PATH` line, that choose the Node it runs, `%_prog%`: the `node.exe`
+/// beside the shim, else the first `node.exe` on `PATH`, looked up by name
+/// so that no `node.js` in the current directory, which `PATHEXT` would
+/// otherwise reach first, runs in its place, else `node` as cmd.exe finds
+/// it.
+const WINDOWS_NODE_CMD_SHIM_PROGRAM: &str = "@SET \"_prog=node\"\r\n\
+     @FOR %%I IN (node.exe) DO @IF NOT \"%%~$PATH:I\"==\"\" SET \"_prog=%%~$PATH:I\"\r\n\
+     @IF EXIST \"%dp0%node.exe\" SET \"_prog=%dp0%node.exe\"\r\n";
+
+/// How a node shim's last line starts, before the target: it ends the batch
+/// file with a `GOTO` to a label that isn't there, then runs Node.
+const WINDOWS_NODE_CMD_SHIM_RUN_ENDING_BATCH: &str =
+    "@ENDLOCAL & GOTO #_undefined_# 2>NUL || TITLE %COMSPEC% & \"%_prog%\" \"";
+
+/// How a node shim that keeps its batch file runs Node, before the target.
+const WINDOWS_NODE_CMD_SHIM_RUN: &str = "@\"%_prog%\" \"";
+
 /// The rest of a `.cmd` shim, after [`WINDOWS_CMD_SHIM_PREAMBLE`], that runs
-/// `target`, a path as a batch file names it, with Node: the `node.exe`
-/// beside the shim if there is one, else the one on `PATH`. With
-/// `node_path`, it puts that ahead of `NODE_PATH` for Node.
+/// `target`, a path as a batch file names it, with the Node
+/// [`WINDOWS_NODE_CMD_SHIM_PROGRAM`] chooses. With `node_path`, it puts that
+/// ahead of `NODE_PATH` for Node.
 ///
 /// The last line ends the batch file before Node starts, with a `GOTO` to a
 /// label that isn't there, as npm's shims do, so Ctrl+C reaches Node with no
 /// batch file left for cmd.exe to ask "Terminate batch job (Y/N)?" about.
-/// cmd.exe reads that line whole before it runs it, so `%_prog%` and
-/// `%dp0%` still hold the shim's values after `ENDLOCAL`. A shim that sets
-/// `NODE_PATH` keeps its batch file around Node instead, as after
-/// `ENDLOCAL` the `NODE_PATH` would reach what runs after the shim.
+/// cmd.exe reads that line whole before it runs it, so `%_prog%`, `%dp0%`
+/// and `%*` still hold the shim's values after `ENDLOCAL`; but the caller's
+/// delayed expansion, if it has that on, then applies to them, as it does
+/// with npm's shims. A shim that sets `NODE_PATH` keeps its batch file
+/// around Node instead, as after `ENDLOCAL` the `NODE_PATH` would reach what
+/// runs after the shim.
 pub fn windows_node_cmd_shim_body(target: &str, node_path: Option<&str>) -> String {
     match node_path {
         None => format!(
-            "@IF EXIST \"%dp0%node.exe\" (SET \"_prog=%dp0%node.exe\") ELSE (SET \"_prog=node\")\r\n\
-             @ENDLOCAL & GOTO #_undefined_# 2>NUL || TITLE %COMSPEC% & \"%_prog%\" \"{target}\" %*\r\n"
+            "{WINDOWS_NODE_CMD_SHIM_PROGRAM}{WINDOWS_NODE_CMD_SHIM_RUN_ENDING_BATCH}{target}\" %*\r\n"
         ),
         Some(node_path) => format!(
             "@SET \"NODE_PATH={node_path};%NODE_PATH%\"\r\n\
-             @IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"{target}\" %*\r\n\
-             ) ELSE (\r\n  node \"{target}\" %*\r\n)\r\n"
+             {WINDOWS_NODE_CMD_SHIM_PROGRAM}{WINDOWS_NODE_CMD_SHIM_RUN}{target}\" %*\r\n"
         ),
     }
 }
@@ -472,20 +491,26 @@ pub fn windows_node_cmd_shim_body(target: &str, node_path: Option<&str>) -> Stri
 /// The target a shim body [`windows_node_cmd_shim_body`] wrote runs, or
 /// `None` for anything else.
 pub fn windows_node_cmd_shim_target(body: &str) -> Option<&str> {
-    const PROGRAM: &str = "@IF EXIST \"%dp0%node.exe\" (SET \"_prog=%dp0%node.exe\") ELSE (SET \"_prog=node\")\r\n\
-                           @ENDLOCAL & GOTO #_undefined_# 2>NUL || TITLE %COMSPEC% & \"%_prog%\" \"";
-    if let Some(target) = body
-        .strip_prefix(PROGRAM)
-        .and_then(|rest| rest.strip_suffix("\" %*\r\n"))
-    {
-        return (!target.contains('"')).then_some(target);
-    }
-    windows_block_cmd_shim_target(body, "%dp0%node.exe")
+    let (rest, run) = match body.strip_prefix("@SET \"NODE_PATH=") {
+        Some(node_path) => {
+            let (line, rest) = node_path.split_once("\r\n")?;
+            if !line.ends_with(";%NODE_PATH%\"") {
+                return None;
+            }
+            (rest, WINDOWS_NODE_CMD_SHIM_RUN)
+        }
+        None => (body, WINDOWS_NODE_CMD_SHIM_RUN_ENDING_BATCH),
+    };
+    let target = rest
+        .strip_prefix(WINDOWS_NODE_CMD_SHIM_PROGRAM)?
+        .strip_prefix(run)?
+        .strip_suffix("\" %*\r\n")?;
+    (!target.contains(['"', '\r', '\n'])).then_some(target)
 }
 
-/// The target of a shim body that runs Node inside an `IF EXIST` block, the
-/// local `node` being `node` (`%dp0%node.exe`, or `%~dp0\node.exe` as
-/// earlier releases wrote), after a `NODE_PATH` line if there is one.
+/// The target of a shim that runs Node inside an `IF EXIST` block, as
+/// earlier releases wrote them, the local Node being `node`
+/// (`%~dp0\node.exe`), after a `NODE_PATH` line if there is one.
 pub fn windows_block_cmd_shim_target<'a>(body: &'a str, node: &str) -> Option<&'a str> {
     const PATH_NODE_PREFIX: &str = "  node \"";
     const TARGET_SUFFIX: &str = "\" %*";
@@ -1004,20 +1029,24 @@ mod cmd_shim_tests {
 
     /// A shim body that runs Node with no `NODE_PATH` ends its batch file
     /// before Node starts, so Ctrl+C asks nothing; one with `NODE_PATH`
-    /// keeps the block it had. Both are read back to their target.
+    /// keeps it. Both look Node up on `PATH` by name, and are read back to
+    /// their target.
     #[test]
     fn node_shim_bodies_end_the_batch_file_unless_they_set_node_path() {
         let target = r"%dp0%..\tool\bin\tool.js";
         let body = windows_node_cmd_shim_body(target, None);
         assert_eq!(
             body,
-            "@IF EXIST \"%dp0%node.exe\" (SET \"_prog=%dp0%node.exe\") ELSE (SET \"_prog=node\")\r\n\
+            "@SET \"_prog=node\"\r\n\
+             @FOR %%I IN (node.exe) DO @IF NOT \"%%~$PATH:I\"==\"\" SET \"_prog=%%~$PATH:I\"\r\n\
+             @IF EXIST \"%dp0%node.exe\" SET \"_prog=%dp0%node.exe\"\r\n\
              @ENDLOCAL & GOTO #_undefined_# 2>NUL || TITLE %COMSPEC% & \"%_prog%\" \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n"
         );
         assert_eq!(windows_node_cmd_shim_target(&body), Some(target));
 
         let with_node_path = windows_node_cmd_shim_body(target, Some("%dp0%.."));
         assert!(with_node_path.starts_with("@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n"));
+        assert!(with_node_path.ends_with("@\"%_prog%\" \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n"));
         assert!(!with_node_path.contains("GOTO"));
         assert_eq!(windows_node_cmd_shim_target(&with_node_path), Some(target));
 

@@ -133,6 +133,7 @@ export function runNativeCommand(command) {
   }
 
   const args = native.argsPrefix.concat(process.argv.slice(2));
+  waitThroughConsoleInterrupts();
   const result = spawnSync(native.path, args, {
     stdio: "inherit",
     env: process.env,
@@ -149,6 +150,22 @@ export function runNativeCommand(command) {
   }
 
   process.exit(result.status ?? 1);
+}
+
+function ignoreInterrupt() {}
+
+// On Windows Ctrl+C reaches every process on the console, and lpm waits for
+// its child to end before it does. Listening for it keeps this wrapper from
+// ending first and handing the shell back while lpm and its child still
+// read the console. Unix delivers it to the whole foreground process group,
+// and the wrapper forwards how lpm ended.
+export function waitThroughConsoleInterrupts(platform = process.platform) {
+  if (platform !== "win32") {
+    return false;
+  }
+  process.on("SIGINT", ignoreInterrupt);
+  process.on("SIGBREAK", ignoreInterrupt);
+  return true;
 }
 
 export class LpmWrapperError extends Error {

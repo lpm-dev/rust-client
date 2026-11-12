@@ -1319,8 +1319,12 @@ mod tests {
             std::fs::write(
                 path,
                 format!(
-                    "{}@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"%dp0%..\\package\\bin\\{relative}\" %*\r\n) ELSE (\r\n  node \"%dp0%..\\package\\bin\\{relative}\" %*\r\n)\r\n",
-                    lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
+                    "{}{}",
+                    lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
+                    lpm_common::symlink::windows_node_cmd_shim_body(
+                        &format!(r"%dp0%..\package\bin\{relative}"),
+                        Some("%dp0%..")
+                    )
                 ),
             )
             .unwrap();

@@ -10,6 +10,9 @@ pub struct ExecutionSignals {
     signal: Arc<AtomicUsize>,
     #[cfg(unix)]
     registrations: Vec<signal_hook::SigId>,
+    /// Console interrupts seen while this lived.
+    #[cfg(windows)]
+    presses: Arc<AtomicUsize>,
 }
 
 impl ExecutionSignals {
@@ -18,6 +21,8 @@ impl ExecutionSignals {
             signal: Arc::new(AtomicUsize::new(0)),
             #[cfg(unix)]
             registrations: Vec::with_capacity(2),
+            #[cfg(windows)]
+            presses: Arc::new(AtomicUsize::new(0)),
         };
         #[cfg(unix)]
         let signals = {
@@ -34,8 +39,15 @@ impl ExecutionSignals {
             signals
         };
         #[cfg(windows)]
-        console_interrupts::listen(&signals.signal);
+        console_interrupts::listen(&signals.signal, &signals.presses);
         Ok(signals)
+    }
+
+    /// Whether the console was interrupted more than once: the child, which
+    /// got the first interrupt itself, is then stopped.
+    #[cfg(windows)]
+    fn pressed_again(&self) -> bool {
+        self.presses.load(Ordering::Acquire) > 1
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -66,8 +78,7 @@ impl ExecutionSignals {
         self.check()?;
         #[cfg(unix)]
         let mut stopped_descendants = None;
-        #[cfg(windows)]
-        let mut interrupts = console_interrupts::Presses::default();
+
         let result = session.capture_output_with_spawn(
             command,
             lpm_common::TASK_OUTPUT_CAPTURE_BYTES + 1,
@@ -77,7 +88,7 @@ impl ExecutionSignals {
                     return None;
                 }
                 #[cfg(windows)]
-                if !interrupts.pressed_again() {
+                if !self.pressed_again() {
                     return None;
                 }
                 #[cfg(unix)]
@@ -160,8 +171,7 @@ impl ChildWait<'_> {
     pub fn wait(self, child: &mut std::process::Child) -> Result<ExitStatus, LpmError> {
         #[cfg(not(unix))]
         let started = std::time::Instant::now();
-        #[cfg(windows)]
-        let mut interrupts = console_interrupts::Presses::default();
+
         loop {
             #[cfg(unix)]
             self.wake.clear();
@@ -176,7 +186,7 @@ impl ChildWait<'_> {
             // The child shares the console, so it got the interrupt too and
             // ends as it sees fit; a second one stops it.
             #[cfg(windows)]
-            if self.signals.is_stopped() && interrupts.pressed_again() {
+            if self.signals.is_stopped() && self.signals.pressed_again() {
                 crate::ports::terminate_child_process_tree(child)?;
                 self.signals.check()?;
             }
@@ -304,8 +314,13 @@ mod console_interrupts {
     pub(super) const SIGINT: usize = 2;
     const SIGBREAK: usize = 21;
 
-    static LISTENERS: Mutex<Vec<Arc<AtomicUsize>>> = Mutex::new(Vec::new());
-    static PRESSES: AtomicUsize = AtomicUsize::new(0);
+    /// A live `ExecutionSignals`: the signal it records and its presses.
+    struct Listener {
+        signal: Arc<AtomicUsize>,
+        presses: Arc<AtomicUsize>,
+    }
+
+    static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
     static HANDLER: Once = Once::new();
 
     pub(super) fn signal_for(event: u32) -> Option<usize> {
@@ -314,6 +329,12 @@ mod console_interrupts {
             CTRL_BREAK_EVENT => Some(SIGBREAK),
             _ => None,
         }
+    }
+
+    /// Records one interrupt, `signal`, in a listener.
+    pub(super) fn notify(signal: &AtomicUsize, presses: &AtomicUsize, value: usize) {
+        signal.store(value, Ordering::Release);
+        presses.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Runs on a thread of its own that Windows starts for the event.
@@ -326,14 +347,13 @@ mod console_interrupts {
             // Nothing runs in the foreground: end lpm, as before.
             return FALSE;
         }
-        count_press();
         for listener in listeners.iter() {
-            listener.store(signal, Ordering::Release);
+            notify(&listener.signal, &listener.presses, signal);
         }
         TRUE
     }
 
-    pub(super) fn listen(signal: &Arc<AtomicUsize>) {
+    pub(super) fn listen(signal: &Arc<AtomicUsize>, presses: &Arc<AtomicUsize>) {
         HANDLER.call_once(|| {
             // SAFETY: the handler is a plain function that lives for the
             // whole process. Should Windows refuse it, Ctrl+C ends lpm, as
@@ -343,33 +363,17 @@ mod console_interrupts {
         LISTENERS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(Arc::clone(signal));
+            .push(Listener {
+                signal: Arc::clone(signal),
+                presses: Arc::clone(presses),
+            });
     }
 
     pub(super) fn stop_listening(signal: &Arc<AtomicUsize>) {
         LISTENERS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|listener| !Arc::ptr_eq(listener, signal));
-    }
-
-    pub(super) fn count_press() {
-        PRESSES.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// The presses a wait has seen since the interrupt it is ending for.
-    #[derive(Default)]
-    pub(super) struct Presses {
-        first: Option<usize>,
-    }
-
-    impl Presses {
-        /// Whether the console was interrupted again since this was first
-        /// asked, after an interrupt.
-        pub(super) fn pressed_again(&mut self) -> bool {
-            let presses = PRESSES.load(Ordering::Acquire);
-            *self.first.get_or_insert(presses) < presses
-        }
+            .retain(|listener| !Arc::ptr_eq(&listener.signal, signal));
     }
 }
 
@@ -455,12 +459,12 @@ mod windows_tests {
     #[test]
     fn a_console_interrupt_waits_for_the_child_to_end() {
         let signals = ExecutionSignals::new().unwrap();
-        let flag = Arc::clone(&signals.signal);
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
         // Records the interrupt the way the console handler does, without
         // raising one that every test in this process would get.
         let interrupter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            flag.store(console_interrupts::SIGINT, Ordering::Release);
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
         });
         let started = std::time::Instant::now();
 
@@ -479,12 +483,12 @@ mod windows_tests {
     #[test]
     fn a_second_console_interrupt_stops_the_child() {
         let signals = ExecutionSignals::new().unwrap();
-        let flag = Arc::clone(&signals.signal);
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
         let interrupter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            flag.store(console_interrupts::SIGINT, Ordering::Release);
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
             std::thread::sleep(std::time::Duration::from_millis(300));
-            console_interrupts::count_press();
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
         });
         let started = std::time::Instant::now();
 
