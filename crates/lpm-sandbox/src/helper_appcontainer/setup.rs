@@ -853,41 +853,92 @@ pub fn apply(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
 }
 
 fn apply_plan(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
+    // Each directory is opened, and whether it holds its capability noted,
+    // before any changes: what a failure puts back is what this run found.
     let targets = plan
         .grants
         .iter()
-        .map(|entry| Ok((pin_grant(entry)?, capability_sid(&entry.capability_name)?)))
+        .map(|entry| {
+            let (parents, root) = pin_grant(entry)?;
+            let sid = capability_sid(&entry.capability_name)?;
+            let held = holds_ace(&root.handle, &entry.path, sid.raw())?;
+            Ok((parents, root, sid, held))
+        })
         .collect::<Result<Vec<_>, AppContainerError>>()
-        .map_err(|error| failure(format!("{error}. Nothing was changed")))?;
+        .map_err(|error| failure(format!("{}. Nothing was changed", setup_reason(error))))?;
     for (index, entry) in plan.grants.iter().enumerate() {
-        let ((_, root), sid) = &targets[index];
+        let (_, root, sid, _) = &targets[index];
         let Err(error) = change_grant(entry, root, sid, !remove) else {
             continue;
         };
-        // Put back each earlier grant the run added or removed, and this
-        // one, which it may have changed halfway.
         let mut undo_error = None;
         for (undone, entry) in plan.grants[..=index].iter().enumerate().rev() {
-            if undone < index && entry.configured != remove {
-                continue;
-            }
-            let ((_, root), sid) = &targets[undone];
-            if let Err(error) = change_grant(entry, root, sid, entry.configured) {
+            let (_, root, sid, held) = &targets[undone];
+            let undo = match (remove, *held) {
+                // A removal took this capability away: grant it again.
+                (true, true) => change_grant(entry, root, sid, true),
+                // A grant that wasn't there before: remove it again.
+                (false, false) => change_grant(entry, root, sid, false),
+                // Applying again took away only the root's entry, while it
+                // walked the tree, and gave it back unless it stopped there.
+                (false, true) if undone == index => restore_root(entry, root, sid),
+                _ => Ok(()),
+            };
+            if let Err(error) = undo {
                 undo_error.get_or_insert(error);
             }
         }
         let stopped = format!(
-            "permission setup stopped at {}: {error}",
-            entry.path.display()
+            "permission setup stopped at {}: {}",
+            entry.path.display(),
+            setup_reason(error)
         );
         return Err(failure(match undo_error {
-            None => format!("{stopped}. Nothing was changed"),
+            None => format!("{stopped}. It put back what it had changed"),
             Some(undo_error) => format!(
-                "{stopped}. Putting back what it had changed failed too ({undo_error}), so some permissions may have changed; preview and retry the same operation"
+                "{stopped}. Putting back what it had changed failed too ({}), so some permissions may have changed; preview and retry the same operation",
+                setup_reason(undo_error)
             ),
         }));
     }
     Ok(())
+}
+
+/// `error`'s message without the "setup failed" its [`failure`] wrapper
+/// adds again.
+fn setup_reason(error: AppContainerError) -> String {
+    match error {
+        AppContainerError::Setup { reason } => reason,
+        other => other.to_string(),
+    }
+}
+
+/// Whether `path`'s DACL holds an access-allowed entry for `sid`.
+fn holds_ace(handle: &HandleGuard, path: &Path, sid: PSID) -> Result<bool, AppContainerError> {
+    let (dacl, _descriptor) = read_dacl(handle, path)?;
+    // SAFETY: both SIDs are valid for the comparison.
+    let (_, held) = super::dacl_without_allowed_aces_where(path, dacl, |ace| unsafe {
+        EqualSid(ace, sid) != 0
+    })?;
+    Ok(held > 0)
+}
+
+/// Gives `entry`'s root its capability entry back, as it had before.
+fn restore_root(
+    entry: &Grant,
+    root: &walk::Target,
+    sid: &CapabilitySid,
+) -> Result<(), AppContainerError> {
+    let _setup_lock = lock_named(&format!(
+        r"Global\LpmSandboxSetup-{}",
+        entry.capability_name
+    ))?;
+    update_pinned_ace(
+        &root.handle,
+        &entry.path,
+        sid.raw(),
+        Some((entry.permission.mask(), entry.permission.inheritance())),
+    )
 }
 
 /// Grants `entry`'s capability on its pinned `root`, or removes it.
@@ -1096,6 +1147,21 @@ mod tests {
             plan.grants.iter().any(|grant| grant.path == parent),
             !packages_can_traverse(&parent).unwrap()
         );
+
+        // A grant an earlier setup made there stays in the plan, so
+        // `--remove` still takes it away.
+        let user = current_user_sid().unwrap();
+        let earlier = grant_for(&open, Permission::Metadata, &user).unwrap();
+        let sid = capability_sid(&earlier.capability_name).unwrap();
+        update_ace(&open, sid.raw(), Some((METADATA_ACCESS, 0))).unwrap();
+        let plan = preview(&project, &[], None).unwrap();
+        assert!(
+            plan.grants
+                .iter()
+                .any(|grant| grant.path == open && grant.configured),
+            "{:?}",
+            plan.grants
+        );
     }
 
     /// Makes `path` a directory this process can read but not change, as
@@ -1172,7 +1238,8 @@ mod tests {
         let error = apply_plan(&plan, false).unwrap_err().to_string();
 
         assert!(error.contains("multiple hard links"), "{error}");
-        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(error.contains("It put back what it had changed"), "{error}");
+        assert_eq!(error.matches("setup failed").count(), 1, "{error}");
         assert!(
             !grant_for(&first, Permission::Metadata, &user)
                 .unwrap()
@@ -1187,6 +1254,105 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Applying again walks the tree with the root's entry taken away; a
+    /// walk that stops gives that entry back rather than leaving a tool
+    /// that worked unusable.
+    #[test]
+    fn a_reapply_that_stops_keeps_the_tool_it_had() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tool = temporary.path().join("tool");
+        std::fs::create_dir(&tool).unwrap();
+        std::fs::write(tool.join("a-tool.exe"), "tool").unwrap();
+        let user = current_user_sid().unwrap();
+        let plan = Plan {
+            grants: vec![grant_for(&tool, Permission::ToolReadExecute, &user).unwrap()],
+            user_sid: user.clone(),
+        };
+        apply_plan(&plan, false).unwrap();
+        let outside = temporary.path().join("outside.txt");
+        std::fs::write(&outside, "private").unwrap();
+        std::fs::hard_link(&outside, tool.join("z-linked.txt")).unwrap();
+
+        let error = apply_plan(&plan, false).unwrap_err().to_string();
+
+        assert!(error.contains("It put back what it had changed"), "{error}");
+        assert!(
+            grant_for(&tool, Permission::ToolReadExecute, &user)
+                .unwrap()
+                .configured
+        );
+    }
+
+    /// A removal walk passes a file with names outside the tree, and writes
+    /// nothing to one it holds no grant on: a rewrite would drop the
+    /// DACL's protected and auto-inherited flags.
+    #[test]
+    fn a_removal_leaves_a_hard_linked_file_it_never_granted_untouched() {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let tool = temporary.path().join("tool");
+        std::fs::create_dir(&tool).unwrap();
+        let outside = temporary.path().join("outside.txt");
+        std::fs::write(&outside, "private").unwrap();
+        let user = current_user_sid().unwrap();
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&outside)
+            .args(["/inheritance:d"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::hard_link(&outside, tool.join("linked.txt")).unwrap();
+        let descriptor = || {
+            let (handle, _) = open_permissions(&outside, false).unwrap();
+            let mut descriptor = ptr::null_mut();
+            // SAFETY: the handle has READ_CONTROL and the output is initialized.
+            let error = unsafe {
+                GetSecurityInfo(
+                    handle.as_raw(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(error, ERROR_SUCCESS);
+            let _descriptor = LocalAllocGuard(descriptor.cast());
+            let mut text = ptr::null_mut();
+            // SAFETY: the descriptor is live; the string is LocalFree-owned.
+            assert_ne!(
+                unsafe {
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        descriptor,
+                        1,
+                        DACL_SECURITY_INFORMATION,
+                        &mut text,
+                        ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let _text = LocalAllocGuard(text.cast());
+            let length = (0..)
+                .take_while(|&at| unsafe { *text.add(at) } != 0)
+                .count();
+            // SAFETY: the string has `length` initialized units.
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
+        };
+        let before = descriptor();
+        assert!(before.starts_with("D:PAI"), "{before}");
+        let entry = grant_for(&tool, Permission::ToolReadExecute, &user).unwrap();
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let (_parents, root) = pin_grant(&entry).unwrap();
+
+        change_grant(&entry, &root, &sid, false).unwrap();
+
+        assert_eq!(descriptor(), before);
     }
 
     #[test]
