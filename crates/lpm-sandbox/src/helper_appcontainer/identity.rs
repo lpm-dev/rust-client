@@ -523,10 +523,18 @@ mod tests {
     struct ProcessWithoutPrivileges {
         token: HandleGuard,
         previous: Vec<u64>,
+        // Held until the privileges are back: two tests that each took them
+        // away would otherwise give them back while the other still ran.
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
+
+    static PROCESS_PRIVILEGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl ProcessWithoutPrivileges {
         fn new() -> Self {
+            let serial = PROCESS_PRIVILEGES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             use windows_sys::Win32::Security::{
                 AdjustTokenPrivileges, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
             };
@@ -562,7 +570,11 @@ mod tests {
                 },
                 0
             );
-            Self { token, previous }
+            Self {
+                token,
+                previous,
+                _serial: serial,
+            }
         }
     }
 
