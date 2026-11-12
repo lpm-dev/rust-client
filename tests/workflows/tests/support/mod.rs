@@ -1075,7 +1075,7 @@ pub fn wait_for_lock_contention(
 /// `target/<profile>/<name>` derived from `current_exe()`'s
 /// grandparent — we use the same shape here.
 #[cfg(target_os = "windows")]
-fn locate_test_sandbox_helper() -> Option<PathBuf> {
+pub fn locate_test_sandbox_helper() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // current_exe = target/<profile>/deps/<test-binary>.exe
     // parent      = target/<profile>/deps/

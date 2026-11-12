@@ -837,6 +837,40 @@ mod tests {
         );
     }
 
+    /// The `sandbox_helper` object `lpm self-update --json` reports on
+    /// Windows, the same in the up-to-date and the applied-update envelopes,
+    /// for every status. A renamed status or key breaks the contract.
+    #[test]
+    fn the_sandbox_helper_json_has_a_stable_shape_for_every_status() {
+        let path = PathBuf::from(r"C:\Users\dev\.lpm\bin\lpm-sandbox-helper.exe");
+        let reports = [
+            SandboxHelperReport::new(SandboxHelperStatus::Current, path.clone()),
+            SandboxHelperReport {
+                backup: Some(PathBuf::from(
+                    r"C:\Users\dev\.lpm\bin\lpm-sandbox-helper.exe.previous",
+                )),
+                ..SandboxHelperReport::new(SandboxHelperStatus::Updated, path.clone())
+            },
+            SandboxHelperReport::new(SandboxHelperStatus::Installed, path.clone()),
+            SandboxHelperReport::new(SandboxHelperStatus::NotInRelease, path.clone()),
+            SandboxHelperReport {
+                backup_error: Some("Access is denied. (os error 5)".to_string()),
+                named_elsewhere: Some(PathBuf::from(r"D:\tools\lpm-sandbox-helper.exe")),
+                ..SandboxHelperReport::new(
+                    SandboxHelperStatus::Failed("the release ships a helper of v0.1.0".to_string()),
+                    path,
+                )
+            },
+        ];
+        insta::assert_json_snapshot!(
+            "sandbox_helper_json_for_every_status",
+            reports
+                .iter()
+                .map(SandboxHelperReport::to_json)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_staged_sandbox_helper_is_installed_where_there_was_none() {
         let directory = tempfile::tempdir().unwrap();

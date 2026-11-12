@@ -416,6 +416,68 @@ fn self_update_cache_hit_with_matching_latest_reports_up_to_date() {
     "#);
 }
 
+/// On Windows, an up-to-date standalone lpm reports the sandbox helper
+/// beside it, here the one its own build made, which is current.
+#[cfg(windows)]
+#[test]
+fn self_update_up_to_date_reports_the_sandbox_helper_beside_a_standalone_lpm() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    let current = read_current_version(&project);
+    let helper = support::locate_test_sandbox_helper()
+        .expect("lpm-sandbox-helper.exe must be built beside lpm-rs: cargo build -p lpm-sandbox");
+    let bin = project.home().join(".lpm").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let standalone = bin.join("lpm.exe");
+    std::fs::copy(assert_cmd::cargo::cargo_bin("lpm-rs"), &standalone).unwrap();
+    std::fs::copy(&helper, bin.join("lpm-sandbox-helper.exe")).unwrap();
+    std::fs::create_dir_all(cache_path(&project).parent().unwrap()).unwrap();
+    let payload = serde_json::json!({ "latest": current, "lastCheck": now_secs() });
+    std::fs::write(cache_path(&project), payload.to_string()).unwrap();
+
+    let output = lpm_from_path(&project, &standalone)
+        .env_remove("LPM_SANDBOX_HELPER")
+        .args(["--json", "self-update"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let mut envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["up_to_date"], true);
+    assert_eq!(envelope["sandbox_helper"]["status"], "current");
+    let reported = envelope["sandbox_helper"]["path"].as_str().unwrap();
+    assert_eq!(
+        std::fs::canonicalize(reported).unwrap(),
+        std::fs::canonicalize(bin.join("lpm-sandbox-helper.exe")).unwrap()
+    );
+
+    envelope["current"] = serde_json::json!("<current-version>");
+    envelope["latest"] = serde_json::json!("<current-version>");
+    envelope["duration_ms"] = serde_json::json!("<duration-ms>");
+    envelope["sandbox_helper"]["path"] =
+        serde_json::json!("<home>\\.lpm\\bin\\lpm-sandbox-helper.exe");
+    insta::assert_json_snapshot!(envelope, @r#"
+    {
+      "success": true,
+      "current": "<current-version>",
+      "latest": "<current-version>",
+      "up_to_date": true,
+      "cache_hit": true,
+      "channel": "stable",
+      "target_channel": "stable",
+      "channel_changed": false,
+      "duration_ms": "<duration-ms>",
+      "sandbox_helper": {
+        "status": "current",
+        "path": "<home>\\.lpm\\bin\\lpm-sandbox-helper.exe"
+      }
+    }
+    "#);
+}
+
 #[test]
 fn self_update_explicit_nightly_switch_returns_exact_npm_install_plan() {
     let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
