@@ -1,5 +1,11 @@
 // ── install state (delegated to crate::install_state) ──
 
+/// An install-hash file this release trusts: `hash`, and the format of the
+/// shims it links on Windows.
+fn current_hash_file(hash: &str) -> String {
+    format!("{hash}\ns:{}\n", lpm_linker::BIN_SHIM_FORMAT)
+}
+
 /// Set up a tempdir that looks like a post-install project:
 /// package.json, lpm.lock, node_modules/, .lpm/install-hash.
 fn setup_installed_project(dir: &std::path::Path) {
@@ -14,7 +20,11 @@ fn setup_installed_project(dir: &std::path::Path) {
     let lock = crate::commands::install::workspace_lockfile::active_lockfile_content(dir);
     let hash = crate::install_state::compute_install_hash(pkg, &lock);
     std::fs::create_dir_all(dir.join(".lpm")).unwrap();
-    std::fs::write(dir.join(".lpm").join("install-hash"), &hash).unwrap();
+    std::fs::write(
+        dir.join(".lpm").join("install-hash"),
+        current_hash_file(&hash),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -45,7 +55,11 @@ fn fast_exit_allows_v2_compatibility_root() {
     let pkg = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
     let lock = crate::commands::install::workspace_lockfile::active_lockfile_content(dir.path());
     let hash = crate::install_state::compute_install_hash(&pkg, &lock);
-    std::fs::write(dir.path().join(".lpm").join("install-hash"), hash).unwrap();
+    std::fs::write(
+        dir.path().join(".lpm").join("install-hash"),
+        current_hash_file(&hash),
+    )
+    .unwrap();
 
     assert!(
         crate::install_state::check_install_state(dir.path()).up_to_date,

@@ -6622,7 +6622,9 @@ mod tests {
 
         let hash = compute_install_hash(pkg, "");
         fs::create_dir_all(dir.path().join(".lpm")).unwrap();
-        fs::write(dir.path().join(".lpm/install-hash"), &hash).unwrap();
+        // With the shim format this release links, as the install writes it.
+        let file = format!("{hash}\ns:{}\n", lpm_linker::BIN_SHIM_FORMAT);
+        fs::write(dir.path().join(".lpm/install-hash"), file).unwrap();
 
         assert!(!needs_install(dir.path()).0);
     }
