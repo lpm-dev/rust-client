@@ -97,6 +97,7 @@ fn completions_hide_internal_commands_and_options_in_every_shell() {
             "internal-hosts-file",
             "internal-package-signals",
             "internal-security-policy",
+            "internal-cert-store",
             "internal-ts-transform",
             "internal-verify-release",
             "__run-file",

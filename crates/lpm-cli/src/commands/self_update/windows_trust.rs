@@ -81,6 +81,9 @@ impl Drop for InstallationLock {
 
 struct SecurityContext {
     user_storage: Vec<usize>,
+    /// Whether the current user counts as a trusted writer: true for what
+    /// this account runs, false for what an elevated process runs.
+    trusts_current_user: bool,
     system: LocalAlloc,
     administrators: LocalAlloc,
     trusted_installer: LocalAlloc,
@@ -89,9 +92,10 @@ struct SecurityContext {
 }
 
 impl SecurityContext {
-    fn load() -> Option<Self> {
+    fn load(trusts_current_user: bool) -> Option<Self> {
         Some(Self {
             user_storage: current_user_token()?,
+            trusts_current_user,
             system: sid_from_sddl("S-1-5-18")?,
             administrators: sid_from_sddl("S-1-5-32-544")?,
             trusted_installer: sid_from_sddl(
@@ -138,19 +142,30 @@ impl SecurityContext {
             .into_iter()
             .enumerate()
             .filter(|(index, _)| include_creator_owner || *index != candidates.len() - 1)
+            .filter(|(index, _)| self.trusts_current_user || *index != 0)
             // SAFETY: every candidate SID owns live backing storage in `self`.
             .any(|(_, candidate)| unsafe { EqualSid(sid, candidate) != 0 })
     }
 }
 
 pub(super) fn path_is_private_to_account(path: &Path, account_home: &Path) -> bool {
-    path_chain_has_private_dacl(path, account_home)
+    path_chain_has_private_dacl(path, account_home, true)
 }
 
 pub(super) fn path_is_trusted_system_install(path: &Path) -> bool {
     system_roots()
         .into_iter()
-        .any(|root| path_chain_has_private_dacl(path, &root))
+        .any(|root| path_chain_has_private_dacl(path, &root, true))
+}
+
+/// Whether `path` sits in a system install root, such as Program Files,
+/// with it and every folder up to that root changeable only by SYSTEM,
+/// Administrators and TrustedInstaller: what may run elevated, since
+/// nothing the user runs can replace it or plant a DLL beside it.
+pub(crate) fn path_is_administrators_only(path: &Path) -> bool {
+    system_roots()
+        .into_iter()
+        .any(|root| path_chain_has_private_dacl(path, &root, false))
 }
 
 pub(super) fn path_is_trusted_install_location(path: &Path, account_home: &Path) -> bool {
@@ -194,14 +209,14 @@ pub(super) fn path_has_trusted_dacl_to_root(path: &Path) -> bool {
     let Ok(path) = std::fs::canonicalize(path) else {
         return false;
     };
-    let Some(context) = SecurityContext::load() else {
+    let Some(context) = SecurityContext::load(true) else {
         return false;
     };
     path.ancestors()
         .all(|ancestor| path_entry_has_private_dacl(ancestor, &context))
 }
 
-fn path_chain_has_private_dacl(path: &Path, root: &Path) -> bool {
+fn path_chain_has_private_dacl(path: &Path, root: &Path, trusts_current_user: bool) -> bool {
     let Ok(path) = std::fs::canonicalize(path) else {
         return false;
     };
@@ -211,7 +226,7 @@ fn path_chain_has_private_dacl(path: &Path, root: &Path) -> bool {
     if !path_starts_with(&path, &root) {
         return false;
     }
-    let Some(context) = SecurityContext::load() else {
+    let Some(context) = SecurityContext::load(trusts_current_user) else {
         return false;
     };
     for ancestor in path.ancestors() {
@@ -583,7 +598,7 @@ mod tests {
 
     #[test]
     fn owner_rights_write_access_accepts_only_a_trusted_owner() {
-        let context = SecurityContext::load().unwrap();
+        let context = SecurityContext::load(true).unwrap();
         let owner_rights = sid_from_sddl("S-1-3-4").unwrap();
         let everyone = sid_from_sddl("S-1-1-0").unwrap();
         assert!(context.write_principal_is_trusted(owner_rights.0.cast(), context.current_user()));
@@ -593,6 +608,22 @@ mod tests {
         );
         assert!(!context.write_principal_is_trusted(owner_rights.0.cast(), everyone.0.cast()));
         assert!(!context.owner_is_trusted(owner_rights.0.cast()));
+    }
+
+    #[test]
+    fn administrators_only_trusts_system_folders_and_not_the_user() {
+        let context = SecurityContext::load(false).unwrap();
+        assert!(!context.owner_is_trusted(context.current_user()));
+        assert!(context.owner_is_trusted(context.administrators.0.cast()));
+        let account = tempfile::tempdir().unwrap();
+        let file = account.path().join("lpm.exe");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!path_is_administrators_only(&file));
+        let cmd = windows_directory()
+            .unwrap()
+            .join("System32")
+            .join("cmd.exe");
+        assert!(path_is_administrators_only(&cmd), "{}", cmd.display());
     }
 
     #[test]

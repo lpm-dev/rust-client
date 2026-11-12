@@ -370,16 +370,24 @@ pub fn set_windows_elevated_root_store(elevated: WindowsElevatedRootStore) {
 fn change_windows_root_store_elevated(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
     match WINDOWS_ELEVATED_ROOT_STORE.get() {
         Some(elevated) => elevated(change),
-        None => run_certutil_elevated(&change.certutil_args()),
+        None => change_windows_root_store_with_certutil(change),
     }
 }
 
-/// Makes `change` from a process that is already elevated, as the LPM
-/// CLI's elevated helper is: an added certificate must be the one its
-/// fingerprint names, a removed one is named by a thumbprint alone, and
-/// then certutil does it.
+/// Makes `change` by elevating certutil itself, whose UAC prompt names
+/// Microsoft: for an LPM that can't elevate its own executable safely.
 #[cfg(target_os = "windows")]
-pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
+pub fn change_windows_root_store_with_certutil(
+    change: &WindowsRootStoreChange,
+) -> Result<(), LpmError> {
+    run_certutil_elevated(&change.certutil_args())
+}
+
+/// Checks `change` as an elevated helper must before making it: an added
+/// certificate must be the only one in its file and the one its
+/// fingerprint names, and a removed one is named by a thumbprint alone.
+#[cfg(target_os = "windows")]
+pub fn check_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
     match change {
         WindowsRootStoreChange::Add { path, sha256 } => {
             let pem =
@@ -387,8 +395,24 @@ pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Resul
                     .map_err(|error| {
                         LpmError::Cert(format!("failed to read {}: {error}", path.display()))
                     })?;
-            let actual =
-                cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(&pem)?).replace(':', "");
+            let blocks = pem::parse_many(&pem)
+                .map_err(|error| LpmError::Cert(format!("invalid certificate PEM: {error}")))?;
+            let [certificate] = blocks.as_slice() else {
+                return Err(LpmError::Cert(format!(
+                    "{} must hold exactly one certificate",
+                    path.display()
+                )));
+            };
+            if certificate.tag() != "CERTIFICATE" {
+                return Err(LpmError::Cert(format!(
+                    "{} holds a {}, not a certificate",
+                    path.display(),
+                    certificate.tag()
+                )));
+            }
+            use sha2::Digest as _;
+            let digest: [u8; 32] = sha2::Sha256::digest(certificate.contents()).into();
+            let actual = cert::fingerprint_hex(&digest).replace(':', "");
             if !actual.eq_ignore_ascii_case(sha256) {
                 return Err(LpmError::Cert(format!(
                     "{} is not the certificate with SHA-256 fingerprint {sha256}",
@@ -404,6 +428,15 @@ pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Resul
             }
         }
     }
+    Ok(())
+}
+
+/// Makes `change` from a process that is already elevated, as the LPM
+/// CLI's elevated helper is, once [`check_windows_root_store_change`]
+/// accepts it; certutil does it.
+#[cfg(target_os = "windows")]
+pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
+    check_windows_root_store_change(change)?;
     let status = Command::new(certutil_executable()?)
         .args(change.certutil_args())
         .stdout(Stdio::null())
@@ -1781,22 +1814,41 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
     #[test]
     fn the_root_store_helper_checks_what_it_is_given() {
         let ca_dir = tempfile::tempdir().unwrap();
-        let (expected, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
+        let (expected, key) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
         let (other, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
-        let path = ca_dir.path().join("rootCA.pem");
-        std::fs::write(&path, other.as_bytes()).unwrap();
         let sha256 =
             cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(expected.as_bytes()).unwrap())
-                .replace(':', "");
+                .replace(':', "")
+                .to_lowercase();
+        let check = |content: String| {
+            let path = ca_dir.path().join("rootCA.pem");
+            std::fs::write(&path, content).unwrap();
+            check_windows_root_store_change(&WindowsRootStoreChange::Add {
+                path,
+                sha256: sha256.clone(),
+            })
+        };
 
-        let added = apply_windows_root_store_change(&WindowsRootStoreChange::Add { path, sha256 });
-        assert!(
-            added
-                .unwrap_err()
-                .to_string()
-                .contains("is not the certificate with SHA-256 fingerprint")
-        );
-        for sha1 in ["", "zz", "AB & calc", &"A".repeat(41)] {
+        check(expected.clone()).unwrap();
+        for (content, refusal) in [
+            (
+                other.clone(),
+                "is not the certificate with SHA-256 fingerprint",
+            ),
+            (
+                format!("{expected}{other}"),
+                "must hold exactly one certificate",
+            ),
+            (key, "not a certificate"),
+        ] {
+            let error = check(content).unwrap_err().to_string();
+            assert!(error.contains(refusal), "{error}");
+        }
+        check_windows_root_store_change(&WindowsRootStoreChange::Remove {
+            sha1: "0123456789abcdefABCDEF0123456789abcdef01".to_string(),
+        })
+        .unwrap();
+        for sha1 in ["", "zz", &"A".repeat(39), &"A".repeat(41)] {
             let removed = apply_windows_root_store_change(&WindowsRootStoreChange::Remove {
                 sha1: sha1.to_string(),
             });

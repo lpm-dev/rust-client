@@ -34,6 +34,8 @@ use self::download::{
 #[cfg(test)]
 use self::download::{create_staged_binary, finish_staged_binary};
 use self::probe::{BoundUpdateCommand, VersionProbe};
+#[cfg(windows)]
+pub(crate) use self::windows_trust::path_is_administrators_only;
 
 /// User-facing self-update reuses the banner cache file but with a much
 /// shorter success TTL: a second `lpm self-update` within 10 minutes
