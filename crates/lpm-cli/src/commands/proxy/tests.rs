@@ -794,33 +794,43 @@ fn the_logon_task_says_which_home_it_runs_the_proxy_with() {
 }
 
 /// Uninstall stops the proxy an earlier release's task started with its own
-/// home, read from the batch file that task ran.
+/// home, read from the batch file that task ran. schtasks prints the path
+/// with XML's references, `&amp;` for `&`, in UTF-16 or the console's code
+/// page.
 #[test]
 fn the_earlier_task_names_its_home_by_its_batch_file() {
     let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("earlier home");
+    let home = dir.path().join("R&D's earlier home");
     std::fs::create_dir(&home).unwrap();
     let definition = |command: &Path| {
         format!(
-            "<Task><Actions><Exec><Command>\"{}\"</Command></Exec></Actions></Task>",
-            command.display()
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+             <Task><Actions><Exec><Command>\"{}\"</Command></Exec></Actions></Task>",
+            command.display().to_string().replace('&', "&amp;")
         )
     };
 
+    let launcher = definition(&windows_earlier_launcher(&home));
     assert_eq!(
-        windows_earlier_task_home_from(&definition(&windows_earlier_launcher(&home))),
+        windows_earlier_task_home_from(launcher.as_bytes()),
         Some(home.clone())
     );
+    let utf16 = [0xFF, 0xFE]
+        .into_iter()
+        .chain(launcher.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect::<Vec<_>>();
+    assert_eq!(windows_earlier_task_home_from(&utf16), Some(home.clone()));
     assert_eq!(
-        windows_earlier_task_home_from(&definition(&home.join("start-proxy.cmd"))),
+        windows_earlier_task_home_from(definition(&home.join("start-proxy.cmd")).as_bytes()),
         None
     );
     let gone = dir.path().join("gone");
     assert_eq!(
-        windows_earlier_task_home_from(&definition(&windows_earlier_launcher(&gone))),
+        windows_earlier_task_home_from(definition(&windows_earlier_launcher(&gone)).as_bytes()),
         None
     );
-    assert_eq!(windows_earlier_task_home_from("<Task></Task>"), None);
+    assert_eq!(windows_earlier_task_home_from(b"<Task></Task>"), None);
+    assert_eq!(windows_earlier_task_home_from(b"<Command>unclosed"), None);
 }
 
 #[test]

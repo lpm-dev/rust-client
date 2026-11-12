@@ -303,15 +303,14 @@ pub(super) fn windows_earlier_launcher(home: &Path) -> std::path::PathBuf {
     home.join("services").join("proxy").join("start-proxy.cmd")
 }
 
-/// The LPM home an earlier release's task, whose definition `schtasks`
-/// printed as `definition`, ran the proxy with: the one its batch file is
-/// in. `None` where that isn't a home's launcher, or the home isn't there,
-/// as when the console's code page couldn't print its name.
+/// The LPM home an earlier release's task, whose definition `schtasks
+/// /Query /XML` printed as `definition`, ran the proxy with: the one its
+/// batch file is in. `None` where that isn't a home's launcher, or the home
+/// isn't there, as when the console's code page couldn't print its name.
 #[cfg(any(test, windows))]
-pub(super) fn windows_earlier_task_home_from(definition: &str) -> Option<std::path::PathBuf> {
-    let command = definition.split_once("<Command>")?.1;
-    let command = command.split_once("</Command>")?.0.trim().trim_matches('"');
-    let launcher = Path::new(command);
+pub(super) fn windows_earlier_task_home_from(definition: &[u8]) -> Option<std::path::PathBuf> {
+    let command = windows_task_element_text(&windows_task_definition_text(definition), "Command")?;
+    let launcher = Path::new(command.trim().trim_matches('"'));
     let home = launcher.parent()?.parent()?.parent()?;
     (windows_earlier_launcher(home) == launcher && home.is_dir()).then(|| home.to_path_buf())
 }
@@ -325,7 +324,7 @@ fn windows_earlier_task_home(program: &Path) -> Option<std::path::PathBuf> {
         WINDOWS_EARLIER_TASK_NAME,
     ]))
     .ok()?;
-    windows_earlier_task_home_from(&String::from_utf8_lossy(&definition.stdout))
+    windows_earlier_task_home_from(&definition.stdout)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -822,14 +821,24 @@ pub(super) fn render_windows_task_xml(
 }
 
 /// The LPM home a logon task's definition, as `schtasks /Query /XML` prints
-/// it, says it runs the proxy with: in the console's code page, which may
-/// not hold the home's characters, or in UTF-16.
+/// it, says it runs the proxy with.
 #[cfg(any(test, windows))]
 pub(super) fn windows_task_home(definition: &[u8]) -> Option<std::path::PathBuf> {
+    let documentation =
+        windows_task_element_text(&windows_task_definition_text(definition), "Documentation")?;
+    let encoded = documentation.trim().strip_prefix(WINDOWS_TASK_HOME_LABEL)?;
+    let home = String::from_utf8(hex::decode(encoded.trim()).ok()?).ok()?;
+    Some(std::path::PathBuf::from(home))
+}
+
+/// A task definition as `schtasks /Query /XML` prints it: in UTF-16, or in
+/// the console's code page, which may not hold every character of a path.
+#[cfg(any(test, windows))]
+fn windows_task_definition_text(definition: &[u8]) -> String {
     let utf16 = definition
         .strip_prefix(&[0xFF, 0xFE])
         .or_else(|| (definition.get(1) == Some(&0)).then_some(definition));
-    let text = match utf16 {
+    match utf16 {
         Some(utf16) => String::from_utf16_lossy(
             &utf16
                 .as_chunks::<2>()
@@ -839,12 +848,20 @@ pub(super) fn windows_task_home(definition: &[u8]) -> Option<std::path::PathBuf>
                 .collect::<Vec<_>>(),
         ),
         None => String::from_utf8_lossy(definition).into_owned(),
-    };
-    let documentation = text.split_once("<Documentation>")?.1;
-    let documentation = documentation.split_once("</Documentation>")?.0;
-    let encoded = documentation.trim().strip_prefix(WINDOWS_TASK_HOME_LABEL)?;
-    let home = String::from_utf8(hex::decode(encoded.trim()).ok()?).ok()?;
-    Some(std::path::PathBuf::from(home))
+    }
+}
+
+/// The text of the first `name` element of the task definition `text`, with
+/// its references (`&amp;` for `&`) read back. `None` where the definition
+/// isn't XML, or holds no such element or no text in it.
+#[cfg(any(test, windows))]
+fn windows_task_element_text(text: &str, name: &str) -> Option<String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let document = roxmltree::Document::parse(text).ok()?;
+    let element = document
+        .descendants()
+        .find(|node| node.has_tag_name(name))?;
+    element.text().map(str::to_owned)
 }
 
 /// The LPM home the installed logon task `task` runs the proxy with, where
