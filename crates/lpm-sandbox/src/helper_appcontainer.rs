@@ -817,7 +817,12 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // Descendants must stop before secret permissions are restored.
     drop(job);
     if exit_code != 0 {
-        eprint!("{}", unreadable_tools_report(&unreadable_tools));
+        // A reader gone from the other end of stderr mustn't change the
+        // exit code the script's caller sees.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            unreadable_tools_report(&unreadable_tools).as_bytes(),
+        );
     }
     for denial in secret_denials.iter_mut().rev() {
         denial.remove()?;
@@ -1008,8 +1013,8 @@ fn build_capability_attr(
 /// `SET_ACCESS` replaces prior explicit entries for this SID while
 /// preserving every other trustee's ACL entries.
 ///
-/// A best-effort root that gets no grant isn't an error: why it got none
-/// comes back for the caller to report if the script fails.
+/// A best-effort root it can't grant isn't an error: why comes back for
+/// the caller to report if the script fails. A link is skipped silently.
 fn grant_dacl_ace_to_tree(
     root: &Path,
     beneath: Option<&Path>,
@@ -1045,16 +1050,17 @@ fn grant_dacl_ace_to_tree(
         }
         // Best-effort (PATH-derived tool dirs): Windows ships a lot
         // of PATH entries as junctions/symlinks (per-user OneDrive
-        // links, virtual-store redirections, `winget` shims). Per
-        // the same "warn-and-continue" contract that covers
-        // SYSTEM-owned DACL failures, a reparse-point root on a
-        // best-effort entry is reported and the spawn proceeds — the
-        // pre-fix behavior of hard-aborting on the first PATH-entry
-        // junction defeats the entire best-effort lane.
-        return Ok(Some(
-            "it is a link (junction, symlink or mount point), which the sandbox doesn't follow"
-                .to_owned(),
-        ));
+        // links, virtual-store redirections, `winget` shims, nvm's
+        // `C:\Program Files\nodejs`). Per the same "warn-and-continue"
+        // contract that covers SYSTEM-owned DACL failures, a
+        // reparse-point root on a best-effort entry is skipped and the
+        // spawn proceeds — the pre-fix behavior of hard-aborting on
+        // the first PATH-entry junction defeats the entire best-effort
+        // lane. It isn't reported either: whether a program is
+        // reachable through a link depends on the link's own
+        // permissions and its target's, which another PATH entry may
+        // grant, as nvm's own directory does.
+        return Ok(None);
     }
 
     if !strict_root && has_inheritable_appcontainer_access(root, access_mask) {
@@ -1099,6 +1105,12 @@ fn grant_dacl_ace_to_tree(
             win32_error: ERROR_ACCESS_DENIED,
             ..
         }) => return Ok(Some("this user can't change its permissions".to_owned())),
+        Err(AppContainerError::ReparsePointRoot { .. }) => {
+            return Ok(Some(
+                "it is reached through a link inside a writable folder, which the sandbox doesn't follow"
+                    .to_owned(),
+            ));
+        }
         Err(e) => return Ok(Some(e.to_string())),
     };
 
@@ -2285,7 +2297,11 @@ mod tests {
         std::fs::write(&child, b"tool").unwrap();
         let before = security_descriptor(&child);
         let sid = create_or_reuse_appcontainer_sid("LpmExistingToolAccessTest").unwrap();
-        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, mask, false).unwrap();
+        // Already readable: nothing to grant, and nothing to report.
+        assert_eq!(
+            grant_dacl_ace_to_tree(tmp.path(), None, sid.0, mask, false).unwrap(),
+            None
+        );
         let after = security_descriptor(&child);
         assert_eq!(before, after);
     }
@@ -2348,7 +2364,11 @@ mod tests {
         std::fs::write(&child, b"tool").unwrap();
         let before = security_descriptor(&child);
         let sid = create_or_reuse_appcontainer_sid("LpmSplitToolAccessTest").unwrap();
-        grant_dacl_ace_to_tree(tmp.path(), None, sid.0, mask, false).unwrap();
+        // Already readable: nothing to grant, and nothing to report.
+        assert_eq!(
+            grant_dacl_ace_to_tree(tmp.path(), None, sid.0, mask, false).unwrap(),
+            None
+        );
         let after = security_descriptor(&child);
         assert_eq!(before, after);
     }
@@ -2464,19 +2484,18 @@ mod tests {
                 "this user can't change its permissions".to_owned(),
             ),
             (
-                PathBuf::from(r"C:\Users\me\nvm\current"),
-                "it is a link (junction, symlink or mount point), which the sandbox doesn't follow"
-                    .to_owned(),
+                PathBuf::from(r"C:\Program Files\GitHub CLI"),
+                "this user can't change its permissions".to_owned(),
             ),
         ]);
-        assert!(
-            report.contains(r"  C:\Program Files\nodejs: this user can't change its permissions"),
-            "{report}"
-        );
-        assert!(
-            report.contains(r"  C:\Users\me\nvm\current: it is a link"),
-            "{report}"
-        );
+        for directory in [r"C:\Program Files\nodejs", r"C:\Program Files\GitHub CLI"] {
+            assert!(
+                report.contains(&format!(
+                    "  {directory}: this user can't change its permissions"
+                )),
+                "{report}"
+            );
+        }
         assert!(
             report.contains("lpm doctor sandbox-setup --tool-dir <directory>"),
             "{report}"
@@ -2532,10 +2551,11 @@ mod tests {
             "strict_root=true must refuse a reparse-point root; got {strict_result:?}",
         );
 
-        // Best-effort: warn + continue. Pre-patch the reparse-point branch
+        // Best-effort: skip + continue. Pre-patch the reparse-point branch
         // returned Err before the strict_root check fired, so a PATH-derived
         // best-effort dir that happened to be a junction (common on Windows)
-        // hard-aborted the entire spawn.
+        // hard-aborted the entire spawn. A skipped link isn't reported:
+        // another PATH entry may make it readable.
         let best_effort_result = grant_dacl_ace_to_tree(
             &junction,
             None,
@@ -2544,10 +2564,8 @@ mod tests {
             /* strict_root */ false,
         );
         assert!(
-            best_effort_result.as_ref().is_ok_and(|reason| reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("link"))),
-            "strict_root=false must downgrade reparse-point refusal to a reported skip; got {best_effort_result:?}",
+            matches!(best_effort_result, Ok(None)),
+            "strict_root=false must downgrade reparse-point refusal to a silent skip; got {best_effort_result:?}",
         );
     }
 }

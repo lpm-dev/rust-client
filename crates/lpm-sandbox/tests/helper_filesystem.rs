@@ -123,18 +123,22 @@ fn helper_preserves_an_extended_drive_working_directory() {
 /// PATH directories it couldn't grant, and only when the script fails.
 #[test]
 fn a_failed_script_is_told_which_path_directories_it_could_not_read() {
-    // Grants don't follow links, so a junction on PATH stays unreadable.
+    // A PATH directory inside a writable root is opened from that root,
+    // never through a link a script could have made there, so one reached
+    // through a junction gets no grant, whatever the runner's privileges.
     let temporary = tempfile::tempdir().unwrap();
-    let target = temporary.path().join("real-tools");
-    let tools = temporary.path().join("tools");
-    fs::create_dir(&target).unwrap();
-    let status = std::process::Command::new("cmd")
+    let writable = temporary.path().canonicalize().unwrap().join("project");
+    let target = writable.join("real-tools");
+    fs::create_dir_all(target.join("bin")).unwrap();
+    let link = writable.join("tools");
+    let output = std::process::Command::new("cmd")
         .args(["/d", "/c", "mklink", "/J"])
-        .arg(&tools)
+        .arg(&link)
         .arg(&target)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "mklink /J failed");
+    assert!(output.status.success(), "{output:?}");
+    let tools = link.join("bin");
     let system = std::env::var("SystemRoot").unwrap();
     for (exit_code, reported) in [(3, true), (0, false)] {
         let mut argv = helper_argv_base();
@@ -142,6 +146,8 @@ fn a_failed_script_is_told_which_path_directories_it_could_not_read() {
             "--delete-appcontainer-profile".into(),
             "--working-dir".into(),
             format!(r"{system}\System32"),
+            "--writable-dir".into(),
+            writable.display().to_string(),
             "--readable-dir-best-effort".into(),
             tools.display().to_string(),
             "--".into(),
@@ -158,7 +164,7 @@ fn a_failed_script_is_told_which_path_directories_it_could_not_read() {
         assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
-            stderr.contains(&format!("  {}: it is a link", tools.display())),
+            stderr.contains(&format!("  {}: ", tools.display())),
             reported,
             "{stderr}"
         );
