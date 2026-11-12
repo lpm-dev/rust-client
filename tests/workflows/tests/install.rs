@@ -8400,6 +8400,118 @@ async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
     );
 }
 
+/// `@modelcontextprotocol/sdk` lists `zod` as both a dependency and a peer.
+/// Its own dependency provides it, so a second `zod` elsewhere in the
+/// install, such as a dependent's narrower `zod@^3`, must not make its peer
+/// ambiguous.
+#[tokio::test]
+async fn a_peer_its_package_also_depends_on_installs_beside_another_version_of_it() {
+    let mock = MockRegistry::start().await;
+
+    let mut versions = serde_json::Map::new();
+    let mut tarballs = Vec::new();
+    for version in ["3.25.0", "4.0.0"] {
+        let manifest = serde_json::json!({ "name": "schema-lib", "version": version });
+        let index = format!("module.exports = '{version}';\n");
+        let tarball = make_tarball_from_pkg_json(manifest, &[("index.js", index.as_bytes())]);
+        versions.insert(
+            version.to_string(),
+            serde_json::json!({
+                "name": "schema-lib",
+                "version": version,
+                "dist": {
+                    "tarball": mock.tarball_url("schema-lib", version),
+                    "integrity": compute_integrity(&tarball),
+                },
+            }),
+        );
+        tarballs.push((version, tarball));
+    }
+    mock.with_package_metadata_and_tarballs(
+        "schema-lib",
+        serde_json::json!({
+            "name": "schema-lib",
+            "dist-tags": { "latest": "4.0.0" },
+            "versions": versions,
+            "time": {
+                "3.25.0": "2025-01-01T00:00:00.000Z",
+                "4.0.0": "2025-01-01T00:00:00.000Z",
+            },
+        }),
+        &tarballs,
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "sdk-like",
+            "version": "1.0.0",
+            "dependencies": { "schema-lib": "^3.25.0 || ^4.0.0" },
+            "peerDependencies": { "schema-lib": "^3.25.0 || ^4.0.0" },
+        }),
+        &[("index.js", b"module.exports = require('schema-lib');\n")],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "sdk-host",
+            "version": "1.0.0",
+            "dependencies": { "sdk-like": "^1.0.0", "schema-lib": "^3.24.0" },
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('schema-lib') + ' ' + require('sdk-like');\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"own-copy-peer","version":"1.0.0","dependencies":{"sdk-host":"^1.0.0"}}"#,
+    );
+    let loaded_versions = || {
+        let output = std::process::Command::new("node")
+            .current_dir(project.path())
+            .arg("-e")
+            .arg("process.stdout.write(require('sdk-host'))")
+            .output()
+            .expect("run sdk-host require");
+        assert!(
+            output.status.success(),
+            "sdk-host require failed\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout).expect("utf-8 versions")
+    };
+
+    for args in [
+        &["install", "--no-security-summary", "--no-skills"][..],
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+        ][..],
+    ] {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(args)
+            .output()
+            .expect("run install");
+        assert!(
+            output.status.success(),
+            "`lpm {}` must install a peer its package also depends on\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            loaded_versions(),
+            "3.25.0 4.0.0",
+            "sdk-host keeps its schema-lib@^3 copy, and sdk-like loads its own dependency",
+        );
+        std::fs::remove_dir_all(project.path().join("node_modules"))
+            .expect("remove node_modules before the lockfile install");
+    }
+}
+
 #[tokio::test]
 async fn warm_v2_lockfile_peer_install_resolves_peer_after_relink() {
     let mock = MockRegistry::start().await;

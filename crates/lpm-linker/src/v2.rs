@@ -714,7 +714,10 @@ fn link_v2_finalize_inner(
 ///   migration-state installs), derive peers locally by reading the
 ///   target's `package.json` from `<store>/objects/<sri>/` and
 ///   intersecting `peerDependencies` against the install set's
-///   resolved versions.
+///   resolved versions. A peer the package also lists as its own
+///   dependency is left out, as the resolver leaves it out: that
+///   dependency provides it, so other copies elsewhere in the install
+///   don't make it ambiguous.
 ///
 /// `peerDependenciesMeta.optional` controls log behavior on a
 /// missing peer:
@@ -788,7 +791,9 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
             continue;
         }
 
-        let (peer_deps, peer_deps_meta) = match lpm_workspace::parse_peer_dependencies(&content) {
+        let (peer_deps, peer_deps_meta) = match lpm_workspace::parse_unshadowed_peer_dependencies(
+            &content,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(
