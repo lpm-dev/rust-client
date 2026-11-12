@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main, "codex/**"]
+    types: [opened, synchronize, reopened, ready_for_review]
   # `workflow_dispatch` lets developers run the long audits on demand;
   # `schedule` catches real-world project regressions without waiting on a
   # user report. The jobs are gated to these triggers because they clone
@@ -37,16 +38,19 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
   windows-filesystem:
+    if: ${{ !github.event.pull_request.draft }}
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
   # The same gate on GitHub's ARM64 Windows runner, where the win32-arm64
   # release builds and runs.
   windows-filesystem-arm64:
+    if: ${{ !github.event.pull_request.draft }}
     uses: ./.github/workflows/windows-filesystem-gate.yml
     with:
       runner: windows-11-arm
 
   release-check:
+    if: ${{ !github.event.pull_request.draft }}
     name: Release compiler warnings (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -80,6 +84,7 @@ jobs:
         run: cargo check --locked --release -p lpm-cli -p lpm-sandbox --bins
 
   lint:
+    if: ${{ !github.event.pull_request.draft }}
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -240,6 +245,7 @@ jobs:
         run: node --test npm/release/tests/*.test.mjs
 
   musl:
+    if: ${{ !github.event.pull_request.draft }}
     name: Linux musl x64
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -301,6 +307,7 @@ jobs:
             sh /work/tests/npm-musl/run.sh /work/$binary
 
   experimental-http3:
+    if: ${{ !github.event.pull_request.draft }}
     name: Experimental HTTP/3 feature
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -334,6 +341,7 @@ jobs:
         run: cargo check --locked -p lpm-cli --features experimental-http3
 
   test:
+    if: ${{ !github.event.pull_request.draft }}
     name: Fast tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -437,6 +445,7 @@ jobs:
           cargo test --release --locked -p lpm-vault --features acceptance-test-hooks --test acceptance_response_signing
 
   macos-workspace-tests:
+    if: ${{ !github.event.pull_request.draft }}
     name: macOS workspace tests
     runs-on: macos-latest
     # From a cold cache, the 3-core runner can spend 35 minutes compiling the
@@ -497,6 +506,7 @@ jobs:
         run: scripts/ci/with-hermetic-workflow-cli.sh --prebuilt cargo nextest run --locked --workspace --features lpm-cli/internal-test-sigstore-mock --no-fail-fast --status-level slow --final-status-level fail
 
   macos-build-checks:
+    if: ${{ !github.event.pull_request.draft }}
     name: macOS clippy, keychain and app bundle checks
     runs-on: macos-latest
     timeout-minutes: 60
@@ -545,8 +555,9 @@ jobs:
     name: macOS workspace checks
     needs: [macos-workspace-tests, macos-build-checks]
     # Branch protection requires this check and counts a skipped job as
-    # passing, so it has to run, and fail, when a macOS job fails.
-    if: always()
+    # passing, so it has to run, and fail, when a macOS job fails. Draft PRs
+    # skip it with the jobs it waits on; marking the PR ready runs them all.
+    if: ${{ always() && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     permissions: {}
     timeout-minutes: 5
@@ -706,6 +717,7 @@ jobs:
         run: cargo +nightly fuzz run env_backup_passphrase -- -runs=2000
 
   wiping-allocator-miri:
+    if: ${{ !github.event.pull_request.draft }}
     name: Wiping allocator under Miri
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -737,6 +749,7 @@ jobs:
           cargo +nightly miri test --locked -p lpm-env-ffi backup::tests::null_pointers_with_a_length_are_invalid_input -- --exact
 
   engine-compatibility:
+    if: ${{ !github.event.pull_request.draft }}
     name: The shipped engine reads local history
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -768,6 +781,7 @@ jobs:
         run: bash scripts/ci/check-engine-compatibility.sh v0.84.0
 
   windows-platform-backends:
+    if: ${{ !github.event.pull_request.draft }}
     name: Windows platform backend runtime checks
     runs-on: windows-latest
     timeout-minutes: 30
@@ -858,6 +872,7 @@ jobs:
   # Lint and the macOS job run Clippy on Unix only, so code behind
   # `cfg(windows)` or `cfg(not(unix))` is linted nowhere else.
   windows-clippy:
+    if: ${{ !github.event.pull_request.draft }}
     name: Windows clippy
     runs-on: windows-latest
     timeout-minutes: 45

@@ -17,7 +17,12 @@ const job = (source, name, nextName) => {
 
 test("PR CI rejects release-profile warnings on every supported operating system", () => {
   const check = job(workflow("ci.yml"), "release-check", "lint");
-  assert.doesNotMatch(check, /^ {4}if:|^ +continue-on-error:/m);
+  assert.deepEqual(
+    check.match(/^ {4}if:.*$/gm),
+    ["    if: ${{ !github.event.pull_request.draft }}"],
+    "release warnings may skip draft PRs and nothing else",
+  );
+  assert.doesNotMatch(check, /^ +continue-on-error:/m);
   assert.match(check, /os: \[ubuntu-latest, macos-15, windows-latest\]/);
   assert.match(check, /RUSTFLAGS: "-D warnings"/);
   assert.match(check, /cargo check --locked --release -p lpm-cli -p lpm-sandbox --bins/);
