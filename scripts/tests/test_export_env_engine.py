@@ -51,7 +51,7 @@ def metadata(packages, edges, workspace=None):
 def fake_sysroot(directory):
     """A toolchain sysroot with the license files the notices read."""
     licenses = directory / 'share/doc/rust'
-    (licenses / 'licenses').mkdir(parents=True)
+    (licenses / 'licenses').mkdir(parents=True, exist_ok=True)
     (licenses / 'licenses/MIT.txt').write_text(MIT_TEXT)
     (licenses / 'COPYRIGHT-library.html').write_text(STD_NOTICE)
     return directory
@@ -206,6 +206,7 @@ class EngineExportTests(unittest.TestCase):
                 if args[0] == 'cargo':
                     if failure == 'canonical':
                         self.assertEqual(kwargs['cwd'], kwargs['cwd'].resolve())
+                        self.assertTrue(kwargs['cwd'].is_relative_to((Path(temporary) / 'target-real').resolve()))
                     if failure == 'remap-spaces':
                         # macOS's temporary directory is reached through the /var symlink; Linux's isn't.
                         homes = dict.fromkeys([str(cargo_home.resolve()), str(cargo_home)])
@@ -252,30 +253,19 @@ class EngineExportTests(unittest.TestCase):
                 if args[0] == 'cargo': return ENGINE_METADATA
                 return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 
-            import contextlib
-            original_temporary_directory = tempfile.TemporaryDirectory
-            real = Path(temporary) / 'frozen-real'
-            real.mkdir()
-            alias = Path(temporary) / 'frozen-alias'
-            alias.symlink_to(real, target_is_directory=True)
+            target = Path(temporary) / 'target'
+            if failure == 'canonical':
+                (Path(temporary) / 'target-real').mkdir()
+                target.symlink_to(Path(temporary) / 'target-real', target_is_directory=True)
             cargo_home = Path(temporary) / 'cargo home with spaces'
             if failure == 'cargo-home-alias':
                 (Path(temporary) / 'cargo-real').mkdir()
                 cargo_home = Path(temporary) / 'cargo-alias'
                 cargo_home.symlink_to(Path(temporary) / 'cargo-real', target_is_directory=True)
 
-            @contextlib.contextmanager
-            def temporary_directory(**options):
-                if failure == 'canonical' and options.get('prefix') == 'lpm-env-source-':
-                    with original_temporary_directory(dir=real, **options) as name:
-                        yield str(alias / Path(name).name)
-                else:
-                    with original_temporary_directory(**options) as name:
-                        yield name
-
-            with patch.dict(exporter.os.environ, {'CARGO_HOME': str(cargo_home)}), patch.object(exporter.tempfile, 'TemporaryDirectory', side_effect=temporary_directory), patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
+            with patch.dict(exporter.os.environ, {'CARGO_HOME': str(cargo_home)}), patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
                 with self.assertRaises((RuntimeError, subprocess.CalledProcessError)) as raised:
-                    exporter.export(root, Path(temporary) / 'target', output)
+                    exporter.export(root, target, output)
             # An earlier step's failure, such as too little free disk, would otherwise pass the scenario without running it.
             if failure == 'mutation':
                 self.assertEqual(str(raised.exception), 'Engine sources changed during export')
@@ -325,14 +315,16 @@ class EngineExportTests(unittest.TestCase):
                 exporter.export(root, Path(temporary) / 'target', output)
             self.assertIn('The Rust standard library', (output / exporter.NOTICES).read_text())
 
-    def exported_with(self, root, temporary, output, built):
-        """Export root with stubbed tools, recording the toolchain each cargo and rustc call names in built."""
+    def exported_with(self, root, temporary, output, built, on_build=lambda directory, env: None):
+        """Export root with stubbed tools, recording the toolchain each cargo and rustc call names in built.
+        on_build sees the directory and environment of each Cargo build."""
         paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
         sysroot = fake_sysroot(Path(temporary) / 'sysroot')
 
         def command(args, **kwargs):
             if args[0] == 'cargo':
                 built.append(args[1])
+                on_build(kwargs['cwd'], kwargs['env'])
                 library = Path(kwargs['env']['CARGO_TARGET_DIR']) / args[-1] / 'release/liblpm_env_ffi.a'
                 library.parent.mkdir(parents=True, exist_ok=True)
                 library.write_bytes(b'library')
@@ -354,6 +346,66 @@ class EngineExportTests(unittest.TestCase):
 
         with patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
             exporter.export(root, Path(temporary) / 'target', output)
+
+    @staticmethod
+    def files(directory):
+        """The content and modification time of each file under directory."""
+        return {str(path.relative_to(directory)): (path.read_bytes(), path.stat().st_mtime_ns) for path in directory.rglob('*') if path.is_file()}
+
+    def test_a_later_export_into_the_same_target_gives_cargo_the_same_directory_and_flags(self):
+        """Cargo rebuilds every crate when its compiler flags change, and the flags name the directory it builds in."""
+        with tempfile.TemporaryDirectory() as temporary:
+            builds = []
+            for checkout in ['first', 'second']:
+                root = Path(temporary) / checkout / 'source'
+                write_sources(root)
+                self.exported_with(root, temporary, Path(temporary) / 'engine', [],
+                                   lambda directory, env: builds.append((directory, env['CARGO_ENCODED_RUSTFLAGS'])))
+            self.assertEqual(len(builds), 4)
+            self.assertEqual(set(builds), {builds[0]})
+            directory = builds[0][0]
+            self.assertEqual(directory, directory.resolve())
+            self.assertTrue(directory.is_relative_to((Path(temporary) / 'target').resolve()))
+
+    def test_a_later_export_rewrites_only_the_sources_that_changed(self):
+        """Cargo rebuilds a crate whose source is newer than its last build. A fresh checkout's files are all
+        new, so a file whose bytes haven't changed keeps the time of the export that first captured it."""
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / 'first/source'
+            write_sources(first)
+            (first / 'crates/lpm-env/src/removed.rs').write_text('removed')
+            (first / 'crates/lpm-env/src/module.rs').write_text('a file that becomes a directory')
+            (first / 'crates/lpm-env/src/nested').mkdir()
+            (first / 'crates/lpm-env/src/nested/inner.rs').write_text('a directory that becomes a file')
+            builds = []
+            self.exported_with(first, temporary, Path(temporary) / 'engine', [], lambda directory, env: builds.append(directory))
+            directory = builds[0]
+            self.assertIn('crates/lpm-env/src/removed.rs', self.files(directory))
+
+            (directory / 'crates/lpm-env/src/link.rs').symlink_to(first / 'crates/lpm-env/src/lib.rs')
+            (directory / 'crates/linked').symlink_to(first / 'crates/lpm-env', target_is_directory=True)
+            long_ago = 1_000_000_000 * 10**9
+            for path in directory.rglob('*'):
+                if path.is_file():
+                    exporter.os.utime(path, ns=(long_ago, long_ago))
+            second = Path(temporary) / 'second/source'
+            write_sources(second)
+            (second / 'crates/lpm-env-source/src/lib.rs').write_text('changed')
+            (second / 'crates/lpm-env/src/added.rs').write_text('added')
+            (second / 'crates/lpm-env/src/module.rs').mkdir()
+            (second / 'crates/lpm-env/src/module.rs/inner.rs').write_text('now a directory')
+            (second / 'crates/lpm-env/src/nested').write_text('now a file')
+            seen = []
+            self.exported_with(second, temporary, Path(temporary) / 'engine', [], lambda directory, env: seen.append(self.files(directory)))
+
+            self.assertEqual(seen[0], seen[1])
+            self.assertEqual({name: content for name, (content, _) in seen[0].items()},
+                             {name: content for name, (content, _) in self.files(second).items()})
+            rewritten = {name for name, (_, modified) in seen[0].items() if modified != long_ago}
+            self.assertEqual(rewritten, {'crates/lpm-env-source/src/lib.rs', 'crates/lpm-env/src/added.rs',
+                                         'crates/lpm-env/src/module.rs/inner.rs', 'crates/lpm-env/src/nested'})
+            for name in rewritten:
+                self.assertGreater(seen[0][name][1], long_ago)
 
     def test_builds_and_provenance_use_the_toolchain_the_revision_pins(self):
         with tempfile.TemporaryDirectory() as temporary:
