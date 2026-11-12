@@ -191,7 +191,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::InternalSecurityPolicy(args) => {
             Some(crate::security_approval::run_internal_managed_protection(
                 args.action,
-                args.report.as_deref(),
+                args.run.as_deref(),
             ))
         }
         _ => None,
