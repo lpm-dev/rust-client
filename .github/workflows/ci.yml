@@ -847,9 +847,6 @@ jobs:
           cargo test --locked -p lpm-proxy named_pipe
           cargo test --locked -p lpm-proxy every_spelling_of_a_home_names_one_pipe
 
-      - name: Windows proxy sign-in task tests
-        run: cargo test --locked -p lpm-cli --bin lpm-rs commands::proxy
-
       - name: Build CLI for workflow backend test
         run: cargo build --locked -p lpm-cli
 

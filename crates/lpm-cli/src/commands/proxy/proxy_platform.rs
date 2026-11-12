@@ -114,9 +114,14 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     {
         stop_windows_proxy(&spec.exe, &home);
     }
-    stop_windows_proxy(&spec.exe, &spec.lpm_home);
+    if stop_windows_proxy(&spec.exe, &spec.lpm_home) {
+        tracing::warn!(
+            "stopped the proxy running for {}, so that the sign-in task's can take its place",
+            spec.lpm_home.display()
+        );
+    }
     let left_running = windows_running_proxy(&spec.exe, &spec.lpm_home);
-    remove_earlier_windows_launcher(&spec)?;
+    remove_earlier_windows_launcher(&spec.launcher_path)?;
     let service_dir = spec
         .stdout_log
         .parent()
@@ -169,19 +174,24 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
     if let Some(home) = &task_home {
         stop_windows_proxy(&spec.exe, home);
     }
-    // The earlier task's batch file held the home it ran the proxy with,
-    // which was this one's unless `LPM_HOME` has changed since.
-    if earlier
+    // The earlier task ran `<home>\services\proxy\start-proxy.cmd`, so its
+    // home is read from that, or taken to be this one's where it can't be.
+    let earlier_home = earlier
+        .then(|| windows_earlier_task_home(schtasks).unwrap_or_else(|| spec.lpm_home.clone()));
+    if let Some(home) = &earlier_home
         && task_home
             .as_ref()
-            .is_none_or(|home| !same_proxy_home(home, &spec.lpm_home))
+            .is_none_or(|task_home| !same_proxy_home(task_home, home))
     {
-        stop_windows_proxy(&spec.exe, &spec.lpm_home);
+        stop_windows_proxy(&spec.exe, home);
     }
     if installed {
         uninstall_windows_user_task(schtasks, &task)?;
     }
-    remove_earlier_windows_launcher(spec)?;
+    remove_earlier_windows_launcher(&spec.launcher_path)?;
+    if let Some(home) = &earlier_home {
+        remove_earlier_windows_launcher(&windows_earlier_launcher(home))?;
+    }
     if earlier {
         uninstall_windows_user_task(schtasks, WINDOWS_EARLIER_TASK_NAME).map_err(|error| {
             LpmError::Proxy(format!(
@@ -208,17 +218,20 @@ fn same_proxy_home(a: &Path, b: &Path) -> bool {
 }
 
 /// Asks the proxy running with `home` to stop, as `lpm proxy stop` does,
-/// with lpm at `exe`; one that isn't running is fine. Ending the task
-/// wouldn't stop it.
+/// with lpm at `exe`, and says whether one did; one that isn't running is
+/// fine. Ending the task wouldn't stop it.
 #[cfg(windows)]
-fn stop_windows_proxy(exe: &Path, home: &Path) {
+fn stop_windows_proxy(exe: &Path, home: &Path) -> bool {
     let stopped = Command::new(exe)
         .args(["proxy", "stop", "--json"])
         .env("LPM_HOME", home)
         .stdin(std::process::Stdio::null())
         .output();
     match stopped {
-        Ok(output) if output.status.success() => {}
+        Ok(output) if output.status.success() => {
+            return serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .is_ok_and(|result| result["stopped"] == true);
+        }
         Ok(output) => tracing::warn!(
             "couldn't stop the proxy running for {} ({}): {}; stop it with `lpm proxy stop`",
             home.display(),
@@ -232,6 +245,7 @@ fn stop_windows_proxy(exe: &Path, home: &Path) {
             );
         }
     }
+    false
 }
 
 /// The process ID of the proxy running with `home`, as `lpm proxy status`
@@ -273,13 +287,45 @@ fn windows_proxy_after_start(
     }
 }
 
-/// Removes the batch file an earlier release's task ran, which none runs now.
+/// Removes `launcher`, the batch file an earlier release's task ran, which
+/// none runs now.
 #[cfg(windows)]
-fn remove_earlier_windows_launcher(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
-    match std::fs::remove_file(&spec.launcher_path) {
+fn remove_earlier_windows_launcher(launcher: &Path) -> Result<(), LpmError> {
+    match std::fs::remove_file(launcher) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(LpmError::Io(error)),
         _ => Ok(()),
     }
+}
+
+/// The batch file an earlier release's task ran the proxy for `home` with.
+#[cfg(any(test, windows))]
+pub(super) fn windows_earlier_launcher(home: &Path) -> std::path::PathBuf {
+    home.join("services").join("proxy").join("start-proxy.cmd")
+}
+
+/// The LPM home an earlier release's task, whose definition `schtasks`
+/// printed as `definition`, ran the proxy with: the one its batch file is
+/// in. `None` where that isn't a home's launcher, or the home isn't there,
+/// as when the console's code page couldn't print its name.
+#[cfg(any(test, windows))]
+pub(super) fn windows_earlier_task_home_from(definition: &str) -> Option<std::path::PathBuf> {
+    let command = definition.split_once("<Command>")?.1;
+    let command = command.split_once("</Command>")?.0.trim().trim_matches('"');
+    let launcher = Path::new(command);
+    let home = launcher.parent()?.parent()?.parent()?;
+    (windows_earlier_launcher(home) == launcher && home.is_dir()).then(|| home.to_path_buf())
+}
+
+#[cfg(windows)]
+fn windows_earlier_task_home(program: &Path) -> Option<std::path::PathBuf> {
+    let definition = run_checked_output(Command::new(program).args([
+        "/Query",
+        "/XML",
+        "/TN",
+        WINDOWS_EARLIER_TASK_NAME,
+    ]))
+    .ok()?;
+    windows_earlier_task_home_from(&String::from_utf8_lossy(&definition.stdout))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -830,8 +876,12 @@ fn windows_user_sid() -> Result<String, LpmError> {
 }
 
 /// `spec` with the paths the task runs lpm with as it hands them on: without
-/// a `\\?\` prefix where that names the same file, and with no `%`, which
-/// Task Scheduler would read as part of an environment variable.
+/// a `\\?\` prefix where that names the same file, without a trailing
+/// separator, and with no `%`, which Task Scheduler would read as part of an
+/// environment variable. None of them needs a trailing separator, and one
+/// would end in an escaped quote were conhost to quote a path with a space
+/// without escaping it, as [`windows_task_command`] allows for; Windows
+/// 11's conhost passes it intact.
 #[cfg(windows)]
 fn windows_plain_spec(spec: &ProxyServiceSpec) -> Result<ProxyServiceSpec, LpmError> {
     let plain = |path: &Path| -> Result<std::path::PathBuf, LpmError> {
@@ -846,6 +896,9 @@ fn windows_plain_spec(spec: &ProxyServiceSpec) -> Result<ProxyServiceSpec, LpmEr
             }
             _ => path.to_path_buf(),
         };
+        // Joining the components again drops a trailing separator, but for
+        // a drive's root.
+        let path: std::path::PathBuf = path.components().collect();
         if path.to_string_lossy().contains('%') {
             return Err(LpmError::Proxy(format!(
                 "can't start the proxy at sign-in through {}: Task Scheduler would read the `%` \

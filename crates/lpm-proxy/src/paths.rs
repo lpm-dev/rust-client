@@ -21,15 +21,16 @@ pub fn proxy_pipe_name_from_env() -> Result<String, ProxyError> {
 }
 
 /// The control pipe of the proxy for the LPM home at `root`: one name for
-/// the home whatever its spelling, as [`pipe_root_key`] reads it, and
-/// whatever links lead to it.
+/// the home whatever its spelling, as [`pipe_root_key`] reads it. Links on
+/// the way aren't resolved: an elevated session doesn't see the user's
+/// mapped or `subst` drives, so a name resolved there would differ from the
+/// one the user's own proxy took.
 pub fn proxy_pipe_name_for_root(root: &Path) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
 
-    let identity = lpm_common::LpmRoot::from_dir(root).identity();
     let mut hash = FNV_OFFSET;
-    for byte in pipe_root_key(&identity.to_string_lossy()).as_bytes() {
+    for byte in pipe_root_key(&root.to_string_lossy()).as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }

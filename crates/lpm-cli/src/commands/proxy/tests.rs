@@ -793,6 +793,36 @@ fn the_logon_task_says_which_home_it_runs_the_proxy_with() {
     assert_eq!(windows_task_home(b"<Task><RegistrationInfo/></Task>"), None);
 }
 
+/// Uninstall stops the proxy an earlier release's task started with its own
+/// home, read from the batch file that task ran.
+#[test]
+fn the_earlier_task_names_its_home_by_its_batch_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("earlier home");
+    std::fs::create_dir(&home).unwrap();
+    let definition = |command: &Path| {
+        format!(
+            "<Task><Actions><Exec><Command>\"{}\"</Command></Exec></Actions></Task>",
+            command.display()
+        )
+    };
+
+    assert_eq!(
+        windows_earlier_task_home_from(&definition(&windows_earlier_launcher(&home))),
+        Some(home.clone())
+    );
+    assert_eq!(
+        windows_earlier_task_home_from(&definition(&home.join("start-proxy.cmd"))),
+        None
+    );
+    let gone = dir.path().join("gone");
+    assert_eq!(
+        windows_earlier_task_home_from(&definition(&windows_earlier_launcher(&gone))),
+        None
+    );
+    assert_eq!(windows_earlier_task_home_from("<Task></Task>"), None);
+}
+
 #[test]
 fn macos_forwarder_launch_daemon_execs_hidden_forwarder_config() {
     let spec = sample_forwarder_spec();

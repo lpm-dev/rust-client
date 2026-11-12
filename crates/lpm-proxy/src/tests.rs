@@ -1172,13 +1172,6 @@ fn every_spelling_of_a_home_names_one_pipe() {
         proxy_pipe_name_for_root(Path::new(&trailing)),
         proxy_pipe_name_for_root(&home)
     );
-    // Through a link, too, as the state the pipe answers for is the same.
-    let link = dir.path().join("link");
-    lpm_common::symlink::create_dir_symlink_or_junction(&home, &link).unwrap();
-    assert_eq!(
-        proxy_pipe_name_for_root(&link),
-        proxy_pipe_name_for_root(&home)
-    );
 }
 
 #[cfg(unix)]
