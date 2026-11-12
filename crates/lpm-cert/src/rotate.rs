@@ -118,6 +118,10 @@ pub struct RotateOptions {
     /// If `Some(days)`, do not uninstall the old CA in this run; schedule its
     /// removal `days` from now via `~/.lpm/cert-grace.json`.
     pub keep_old_trusted_days: Option<u32>,
+    /// Whether the new CA is limited to local names. `None` follows
+    /// `LPM_CERT_NAME_CONSTRAINTS`, else keeps a CA made unconstrained on
+    /// request so, and limits any other.
+    pub name_constraints: Option<bool>,
 }
 
 impl Default for RotateOptions {
@@ -126,6 +130,7 @@ impl Default for RotateOptions {
             extra_projects: Vec::new(),
             skip_missing: true,
             keep_old_trusted_days: None,
+            name_constraints: None,
         }
     }
 }
@@ -142,6 +147,8 @@ pub struct RotateResult {
     pub old_ca_uninstalled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_ca_removal_scheduled: Option<String>,
+    /// Whether the new CA is limited to local names.
+    pub name_constraints: bool,
 }
 
 /// Run the rotation flow. Returns a structured summary suitable for the JSON
@@ -600,6 +607,8 @@ fn rotation_result_from_journal(journal: &RotationJournal) -> RotateResult {
         new_fingerprint: journal.new_fingerprint.clone(),
         reissued_leaves: journal.reissued_leaves.clone(),
         skipped_missing: journal.skipped_missing.clone(),
+        name_constraints: ca::cert_has_name_constraints_bytes(journal.new_cert_pem.as_bytes())
+            .unwrap_or(false),
         old_ca_uninstalled: !grace_window,
         old_ca_removal_scheduled: journal.removes_at.clone(),
     }
@@ -705,8 +714,13 @@ fn stage_and_run(
     old_fp_hex: &str,
     mode_label: &'static str,
 ) -> Result<RotateResult, LpmError> {
+    let name_constraints = match opts.name_constraints.or_else(ca::name_constraints_override) {
+        Some(chosen) => chosen,
+        None => !ca::cert_declines_name_constraints_bytes(old_cert_bytes)?,
+    };
     let (new_cert_pem, new_key_pem) =
-        ca::generate_ca().map_err(|e| LpmError::Cert(format!("failed to generate new CA: {e}")))?;
+        ca::generate_ca_with_options(ca::CaOptions { name_constraints })
+            .map_err(|e| LpmError::Cert(format!("failed to generate new CA: {e}")))?;
     ca_dir.write_ca_pair(
         "rootCA.pem.next",
         "rootCA-key.pem.next",
@@ -748,7 +762,7 @@ fn stage_and_run(
     audit::append(audit::AuditAction::CaGenerate {
         fingerprint: new_fp_hex.clone(),
         validity_days: ca::CA_VALIDITY_DAYS,
-        name_constraints: ca::wants_name_constraints(),
+        name_constraints,
     })?;
 
     // Step 2: install staged CA into the trust store.

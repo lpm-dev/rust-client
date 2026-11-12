@@ -32,6 +32,10 @@ fn permitted_subtrees() -> Vec<GeneralSubtree> {
         GeneralSubtree::DnsName(".local".into()),
         GeneralSubtree::DnsName(".lpm.test".into()),
         GeneralSubtree::DnsName(".test".into()),
+        // The private-use names `cert.extraPermittedDns` accepts without
+        // `allowPublicDns`, as `name_constraints` lists them.
+        GeneralSubtree::DnsName(".internal".into()),
+        GeneralSubtree::DnsName(".home.arpa".into()),
         GeneralSubtree::IpAddress(
             CidrSubnet::from_str("127.0.0.0/8").expect("static loopback CIDR"),
         ),
@@ -55,16 +59,56 @@ fn permitted_subtrees() -> Vec<GeneralSubtree> {
     ]
 }
 
-/// Whether `LPM_CERT_NAME_CONSTRAINTS` is set to a truthy value in the current process.
-///
-/// Used both by `generate_ca()` (to decide whether to emit the extension on new CAs)
-/// and by `ensure_https()` (to detect "user opted in, but the on-disk CA predates the
-/// flag and is unconstrained").
+/// The organizational unit of a CA LPM made without name constraints because
+/// it was asked to, which tells it apart from one an earlier release made
+/// without them. The common name stays as it was: trust stores are searched
+/// by it.
+const UNCONSTRAINED_UNIT: &str = "Not limited to local names, as asked";
+
+/// The names [`permitted_subtrees`] lets a constrained CA sign, as a person
+/// reads them.
+pub const PERMITTED_NAMES_SUMMARY: &str = "localhost, *.localhost, *.local, *.test, *.lpm.test, \
+     *.internal, *.home.arpa, loopback, private and link-local addresses";
+
+/// What `LPM_CERT_NAME_CONSTRAINTS` asks for: `Some(false)` for `0`, `false`,
+/// `no` or `off`; `Some(true)` for any other value; `None` when it is unset.
+pub fn name_constraints_override() -> Option<bool> {
+    let value = std::env::var(NAME_CONSTRAINTS_ENV).ok()?;
+    Some(!matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    ))
+}
+
+/// Whether a new CA is limited to local names: unless
+/// `LPM_CERT_NAME_CONSTRAINTS` turns that off. Verified to be enforced by
+/// Windows CryptoAPI, macOS's Security framework and OpenSSL.
 pub fn wants_name_constraints() -> bool {
-    matches!(
-        std::env::var(NAME_CONSTRAINTS_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-    )
+    name_constraints_override().unwrap_or(true)
+}
+
+/// Whether the PEM-encoded CA was made without name constraints because it
+/// was asked to, by `lpm cert rotate --no-name-constraints` or
+/// `LPM_CERT_NAME_CONSTRAINTS=0`.
+pub fn cert_declines_name_constraints_bytes(cert_pem: &[u8]) -> Result<bool, LpmError> {
+    let pem = pem::parse(cert_pem)
+        .map_err(|e| LpmError::Cert(format!("invalid CA certificate PEM: {e}")))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|e| LpmError::Cert(format!("invalid CA X.509: {e}")))?;
+    Ok(cert
+        .subject()
+        .iter_organizational_unit()
+        .any(|unit| unit.as_str() == Ok(UNCONSTRAINED_UNIT)))
+}
+
+/// The names among `names`, hostnames, IP addresses or `*.`/`.` subtrees,
+/// that the PEM-encoded CA's name constraints don't permit; none when it has
+/// no constraints.
+pub fn names_outside_constraints(
+    cert_pem: &[u8],
+    names: &[String],
+) -> Result<Vec<String>, LpmError> {
+    crate::cert::names_outside_root(cert_pem, names)
 }
 
 /// True iff the PEM-encoded CA at `path` carries a NameConstraints extension.
@@ -129,8 +173,9 @@ pub(crate) fn cert_allows_project_intermediates_bytes(cert_pem: &[u8]) -> Result
 /// Options for `generate_ca_with_options`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaOptions {
-    /// If `true`, attach the RFC 5280 NameConstraints extension to the CA. Ignores
-    /// the `LPM_CERT_NAME_CONSTRAINTS` env var.
+    /// If `true`, attach the RFC 5280 NameConstraints extension to the CA;
+    /// if `false`, mark it as made without them on request. Ignores the
+    /// `LPM_CERT_NAME_CONSTRAINTS` env var.
     pub name_constraints: bool,
 }
 
@@ -138,9 +183,8 @@ pub struct CaOptions {
 ///
 /// Returns `(cert_pem, key_pem)` as PEM-encoded strings.
 ///
-/// NameConstraints are attached only when the `LPM_CERT_NAME_CONSTRAINTS` env var is
-/// truthy (`1`/`true`/`yes`/`on`); the default omits the extension. Default-on requires
-/// verified client-side enforcement across the supported browsers and TLS stacks.
+/// NameConstraints limit it to local names unless `LPM_CERT_NAME_CONSTRAINTS` is `0`,
+/// `false`, `no` or `off`, which marks it as unconstrained on request.
 pub fn generate_ca() -> Result<(String, String), Box<dyn std::error::Error>> {
     generate_ca_with_options(CaOptions {
         name_constraints: wants_name_constraints(),
@@ -157,6 +201,9 @@ pub fn generate_ca_with_options(
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "LPM Local Development CA");
     dn.push(DnType::OrganizationName, "LPM");
+    if !opts.name_constraints {
+        dn.push(DnType::OrganizationalUnitName, UNCONSTRAINED_UNIT);
+    }
     params.distinguished_name = dn;
 
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
@@ -182,6 +229,86 @@ pub fn generate_ca_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new CA is limited to local names unless `LPM_CERT_NAME_CONSTRAINTS`
+    /// turns that off, and one made unlimited so is marked as asked for.
+    #[test]
+    fn new_cas_are_limited_to_local_names_unless_asked_not_to() {
+        let _serial = crate::test_env_lock();
+        let previous = std::env::var_os(NAME_CONSTRAINTS_ENV);
+        let generated = |value: Option<&str>| {
+            // SAFETY: the test env lock serializes this process's env.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(NAME_CONSTRAINTS_ENV, value),
+                    None => std::env::remove_var(NAME_CONSTRAINTS_ENV),
+                }
+            }
+            let (cert, _) = generate_ca().unwrap();
+            (
+                cert_has_name_constraints_bytes(cert.as_bytes()).unwrap(),
+                cert_declines_name_constraints_bytes(cert.as_bytes()).unwrap(),
+            )
+        };
+        let results = [None, Some("1"), Some("0"), Some("off"), Some("FALSE")].map(generated);
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(NAME_CONSTRAINTS_ENV, value),
+                None => std::env::remove_var(NAME_CONSTRAINTS_ENV),
+            }
+        }
+        assert_eq!(
+            results,
+            [
+                (true, false),
+                (true, false),
+                (false, true),
+                (false, true),
+                (false, true)
+            ]
+        );
+    }
+
+    /// The names a project asks for that a constrained CA may not sign are
+    /// the ones named; an unconstrained CA may sign any.
+    #[test]
+    fn names_a_constrained_ca_may_not_sign_are_named() {
+        let (constrained, _) = generate_ca_with_options(CaOptions {
+            name_constraints: true,
+        })
+        .unwrap();
+        let names = [
+            "localhost",
+            "app.localhost",
+            "myapp.local",
+            "*.myapp.local",
+            ".api.test",
+            "x.lpm.test",
+            "app.internal",
+            "router.home.arpa",
+            "127.0.0.1",
+            "192.168.1.20",
+            "::1",
+            "fe80::1",
+            "staging.example.com",
+            "*.example.dev",
+            "local",
+            "8.8.8.8",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            names_outside_constraints(constrained.as_bytes(), &names).unwrap(),
+            ["staging.example.com", "*.example.dev", "local", "8.8.8.8"]
+        );
+        let (unconstrained, _) = generate_ca_with_options(CaOptions::default()).unwrap();
+        assert!(
+            names_outside_constraints(unconstrained.as_bytes(), &names)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn generate_ca_produces_valid_pem() {
@@ -276,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn ca_cert_has_no_name_constraints_by_default() {
+    fn a_ca_made_without_name_constraints_has_none() {
         let (cert_pem, _) = generate_ca_with_options(CaOptions {
             name_constraints: false,
         })

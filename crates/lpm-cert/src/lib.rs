@@ -478,24 +478,20 @@ fn resolve_consent(consent: TrustStoreConsent<'_>, cert_pem: &[u8]) -> Result<bo
         TrustStoreConsent::Decline => Ok(false),
         TrustStoreConsent::Prompt(callback) => {
             let info = cert::read_cert_info_bytes(cert_pem)?;
-            let mut permitted = vec![
-                "localhost".to_string(),
-                "*.local".to_string(),
-                "*.test".to_string(),
-                "127.0.0.0/8".to_string(),
-                "RFC1918 private IPs".to_string(),
-                "::1".to_string(),
-            ];
-            if !ca::wants_name_constraints() {
-                permitted = vec![
-                    "any (no name constraints — set LPM_CERT_NAME_CONSTRAINTS=1 to scope)".into(),
-                ];
-            }
+            let constrained = ca::cert_has_name_constraints_bytes(cert_pem)?;
+            let permitted = if constrained {
+                ca::PERMITTED_NAMES_SUMMARY
+                    .split(", ")
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                vec!["any (no name constraints)".to_string()]
+            };
             let req = ConsentRequest {
                 fingerprint: cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?),
                 expires: info.not_after,
                 permitted_names: permitted,
-                name_constraints_enabled: ca::wants_name_constraints(),
+                name_constraints_enabled: constrained,
             };
             callback(&req)
         }
@@ -666,6 +662,23 @@ fn ensure_https_locked(
     let project_cert_dir = paths::open_project_cert_directory(project_dir, true)?
         .ok_or_else(|| LpmError::Cert("failed to create project certificate directory".into()))?;
     let root = ensure_root_ca_pair_locked(&operation.ca)?;
+    // A name the root may not sign would only fail in the browser, as a
+    // chain error; say so here, before anything is installed.
+    let requested = extra_hostnames
+        .iter()
+        .chain(extra_permitted_dns_subtrees)
+        .cloned()
+        .collect::<Vec<_>>();
+    let outside = ca::names_outside_constraints(&root.cert_pem, &requested)?;
+    if !outside.is_empty() {
+        return Err(LpmError::Cert(format!(
+            "the local CA is limited to local names ({}), and this project asks for {}. Run \
+             `lpm cert rotate --no-name-constraints` to replace it with a CA that may sign any \
+             name, whose key could then sign a certificate for any site",
+            ca::PERMITTED_NAMES_SUMMARY,
+            outside.join(", ")
+        )));
+    }
 
     let ca_freshly_installed = if root.generated {
         let fp_hex = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(&root.cert_pem)?);
@@ -700,11 +713,15 @@ fn ensure_https_locked(
 
         approved
     } else {
-        if ca::wants_name_constraints() && !ca::cert_has_name_constraints_bytes(&root.cert_pem)? {
+        if ca::wants_name_constraints()
+            && !ca::cert_has_name_constraints_bytes(&root.cert_pem)?
+            && !ca::cert_declines_name_constraints_bytes(&root.cert_pem)?
+        {
             tracing::warn!(
                 target: "lpm_cert",
-                "LPM_CERT_NAME_CONSTRAINTS is set but the installed CA at {} predates this build and has no name constraints. Run `lpm cert rotate` to replace it with a constrained CA.",
-                root.cert_path.display()
+                "the local CA at {} predates name constraints, so its key could sign a certificate for any site. Run `lpm cert rotate` to replace it with one limited to local names ({}), or `lpm cert rotate --no-name-constraints` to keep it unlimited",
+                root.cert_path.display(),
+                ca::PERMITTED_NAMES_SUMMARY
             );
         }
         warn_if_ca_bytes_expiring_soon(&root.cert_pem, &root.cert_path);

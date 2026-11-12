@@ -315,6 +315,16 @@ pub(crate) struct CertArgs {
     /// Dry run for reconcile: report what would happen without mutating.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
+
+    /// On rotate, make the new CA one that may sign any name, not only local
+    /// ones, as a project with a public hostname needs. Its key could then
+    /// sign a certificate for any site. Later rotations keep it so.
+    #[arg(long = "no-name-constraints", conflicts_with = "name_constraints")]
+    pub(crate) no_name_constraints: bool,
+
+    /// On rotate, limit the new CA to local names again.
+    #[arg(long = "name-constraints")]
+    pub(crate) name_constraints: bool,
 }
 
 #[derive(Args)]

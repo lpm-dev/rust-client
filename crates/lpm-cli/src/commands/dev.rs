@@ -1176,7 +1176,7 @@ fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
         if !req.name_constraints_enabled {
             println!(
                 "    {}",
-                "Note: NameConstraints disabled — set LPM_CERT_NAME_CONSTRAINTS=1 to scope the CA"
+                "Note: this CA may sign any name, as asked; `lpm cert rotate --name-constraints` limits it to local ones"
                     .dimmed()
             );
         }

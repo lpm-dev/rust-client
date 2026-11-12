@@ -4,6 +4,7 @@
 //! Default SANs: localhost, 127.0.0.1, ::1 — plus any user-specified hostnames.
 
 mod root_constraints;
+pub(crate) use root_constraints::names_outside_root;
 
 use lpm_common::LpmError;
 use rcgen::{

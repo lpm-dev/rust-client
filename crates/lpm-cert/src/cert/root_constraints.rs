@@ -7,8 +7,51 @@ use x509_parser::extensions::{GeneralName, NameConstraints};
 
 fn outside_root() -> LpmError {
     LpmError::Cert(
-        "active root CA name constraints do not permit every requested hostname; use a permitted local hostname or explicitly rotate the CA with the intended constraint policy".into(),
+        "the local CA's name constraints don't permit every requested hostname; use a local name, or run `lpm cert rotate --no-name-constraints` to replace the CA with one that may sign any name".into(),
     )
+}
+
+/// The names among `names`, hostnames, IP addresses or `*.`/`.` subtrees,
+/// that the PEM-encoded root's name constraints don't permit, in order; none
+/// when it has none. A subtree counts by a name in it.
+pub(crate) fn names_outside_root(
+    ca_cert_pem: &[u8],
+    names: &[String],
+) -> Result<Vec<String>, LpmError> {
+    let pem = pem::parse(ca_cert_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid CA certificate PEM: {error}")))?;
+    let (_, root) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|error| LpmError::Cert(format!("invalid CA X.509: {error}")))?;
+    let Some(constraints) = root
+        .name_constraints()
+        .map_err(|error| LpmError::Cert(format!("invalid root name constraints: {error}")))?
+    else {
+        return Ok(Vec::new());
+    };
+    validate_supported_constraints(constraints.value)?;
+    Ok(names
+        .iter()
+        .filter(|name| {
+            let name = name.trim().to_ascii_lowercase();
+            let host = match name.strip_prefix("*.").or_else(|| name.strip_prefix('.')) {
+                Some(below) => format!("x.{below}"),
+                None => name,
+            };
+            let permitted = match host.parse::<IpAddr>() {
+                Ok(IpAddr::V4(address)) => permits(
+                    constraints.value,
+                    &GeneralName::IPAddress(&address.octets()),
+                ),
+                Ok(IpAddr::V6(address)) => permits(
+                    constraints.value,
+                    &GeneralName::IPAddress(&address.octets()),
+                ),
+                Err(_) => permits(constraints.value, &GeneralName::DNSName(&host)),
+            };
+            !permitted
+        })
+        .cloned()
+        .collect())
 }
 
 pub(super) fn validate_requested_names(
