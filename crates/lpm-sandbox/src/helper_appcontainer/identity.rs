@@ -516,34 +516,6 @@ mod tests {
         assert_eq!(lists_profile(&profiles, sid.0), Some(false));
     }
 
-    /// Makes `path` a directory this process can read but not change while
-    /// it runs without privileges, as `C:\Program Files\nodejs` is to its
-    /// user: a best-effort grant there never lands, yet the grant record
-    /// names it.
-    fn lock_directory(path: &Path) {
-        let user = setup::current_user_sid().unwrap();
-        // Entries inherited from the tree become the directory's own, a
-        // grant among them; then only reading is left, to this user and,
-        // through OWNER RIGHTS, to the owner, an elevated test's too.
-        let icacls = |args: &[&str]| {
-            let output = std::process::Command::new("icacls.exe")
-                .arg(path)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{args:?}: {output:?}");
-        };
-        icacls(&["/inheritance:d"]);
-        icacls(&[
-            "/remove:g",
-            "*S-1-5-32-544",
-            "*S-1-5-18",
-            &format!("*{user}"),
-        ]);
-        icacls(&["/grant", &format!("*{user}:(RX)"), "*S-1-3-4:(RX)"]);
-        assert!(!without_privileges(|| setup::can_change_permissions(path)));
-    }
-
     /// Disables every privilege of this process until it drops, for a check
     /// the revoke's walker threads make as well as this one: hosted CI
     /// administrators hold backup and restore privileges that open any
@@ -648,7 +620,7 @@ mod tests {
         grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
         let locked = root.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
-        lock_directory(&locked);
+        lock_directory_for_test(&locked);
         let record = root.path().join("grants.json");
         record_grants(&record, &[locked.clone(), tree.clone()]).unwrap();
         let profiles = profile_list().expect("the user's AppContainer profile list");
@@ -673,7 +645,7 @@ mod tests {
         let locked = root.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
         grant_dacl_ace_to_tree(&locked, None, sid.0, FILE_GENERIC_READ, true).unwrap();
-        lock_directory(&locked);
+        lock_directory_for_test(&locked);
         let record = root.path().join("grants.json");
         record_grants(&record, std::slice::from_ref(&locked)).unwrap();
         let profiles = profile_list().expect("the user's AppContainer profile list");
@@ -706,7 +678,7 @@ mod tests {
         let locked = tree.join("locked");
         std::fs::create_dir_all(&locked).unwrap();
         grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
-        lock_directory(&locked);
+        lock_directory_for_test(&locked);
         assert!(grants(&locked, sid.0));
         let record = root.path().join("grants.json");
         record_grants(&record, std::slice::from_ref(&tree)).unwrap();
