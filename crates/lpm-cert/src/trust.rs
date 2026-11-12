@@ -782,6 +782,13 @@ fn with_verified_certificate_file<T>(
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|error| LpmError::Cert(format!("failed to write verified CA: {error}")))?;
     let temporary = temporary.into_temp_path();
+    #[cfg(windows)]
+    crate::paths::windows_security::let_administrators_read(&temporary).map_err(|error| {
+        LpmError::Cert(format!(
+            "failed to let administrators read the staged certificate for {}: {error}",
+            display_path.display()
+        ))
+    })?;
 
     // Declared after `temporary`, so it is closed before the file is removed.
     let staged_file = open_staged_certificate(&temporary).map_err(|error| {
@@ -914,9 +921,17 @@ fn resolved_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
     } else {
         resolved.to_vec()
     };
-    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
-        &plain,
-    )))
+    let plain = std::path::PathBuf::from(std::ffi::OsString::from_wide(&plain));
+    // Win32 path handling drops a trailing `.` or space from a name, so the
+    // plain path to a file in a folder named `ca.` would name one in `ca`;
+    // the verbatim path is kept then, which names only this file. certutil
+    // can't open it, so the operation fails instead of reading another.
+    if std::path::absolute(&plain).ok().as_ref() != Some(&plain) {
+        return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            resolved,
+        )));
+    }
+    Ok(plain)
 }
 
 // ── macOS ──────────────────────────────────────────────────────────────
@@ -1594,6 +1609,15 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
                 path.display()
             );
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+            // Readable by whichever administrator approves the prompt.
+            #[cfg(windows)]
+            assert!(
+                crate::paths::windows_security::descriptor_sddl(
+                    &std::fs::File::open(path).unwrap()
+                )
+                .unwrap()
+                .contains("(A;;FR;;;BA)")
+            );
             Ok(std::fs::write(path, replacement.as_bytes()).is_ok())
         });
 
@@ -1615,6 +1639,35 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
             0,
             "the staged certificate is removed"
         );
+    }
+
+    /// A certificate directory named `ca.` is reached by a plain path as
+    /// `ca`, where someone else's certificate may wait; its staged
+    /// certificate is handed on by its verbatim path.
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_path_win32_would_read_differently_stays_verbatim() {
+        let base = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(base.path()).unwrap();
+        let dotted = std::path::PathBuf::from(format!(
+            r"\\?\{}\ca.",
+            canonical.to_string_lossy().trim_start_matches(r"\\?\")
+        ));
+        std::fs::create_dir(&dotted).unwrap();
+        // The folder a plain path to `ca.` would reach.
+        std::fs::create_dir(base.path().join("ca")).unwrap();
+        let (expected, _) = crate::ca::generate_ca_with_options(Default::default()).unwrap();
+
+        with_verified_certificate_file(expected.as_bytes(), &dotted.join("rootCA.pem"), |path| {
+            assert!(
+                path.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                path.display()
+            );
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir(&dotted).unwrap();
     }
 
     /// certutil, like other Windows tools, can't open a file another handle
