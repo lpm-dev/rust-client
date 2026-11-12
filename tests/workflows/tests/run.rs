@@ -901,7 +901,10 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
             "nested-quoted":"cmd /d /c \"if 1==1\"",
             "nested-r":"cmd /d /r if 1==1",
             "nested-semicolon":"cmd; /d /c if 1==1",
-            "nested-comspec":"\"%ComSpec%\" /d /c if 1==1"
+            "nested-comspec":"\"%ComSpec%\" /d /c if 1==1",
+            "nested-comspec-part":"\"%ComSpec:~0%\" /d /c \"node -e 0 &&\"",
+            "closed-block":"if exist nonexistent (node -e 0 && capture)",
+            "piped-closed-block":"node -e 0 | if 1==2 (echo a & capture)"
         }"#,
     );
     project.write_file(".env", "CHAIN=\"&&\"\n");
@@ -922,6 +925,9 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
         ("nested-r", mkdir),
         ("nested-semicolon", mkdir),
         ("nested-comspec", mkdir),
+        ("nested-comspec-part", mkdir),
+        ("closed-block", &["else", "mkdir", "INJECTEDDIR"]),
+        ("piped-closed-block", &["else", "mkdir", "INJECTEDDIR"]),
     ] {
         let output = lpm(&project)
             .args(["run", script, "--"])
