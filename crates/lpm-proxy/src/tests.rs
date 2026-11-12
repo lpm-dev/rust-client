@@ -1174,6 +1174,42 @@ fn every_spelling_of_a_home_names_one_pipe() {
     );
 }
 
+/// A proxy an earlier release started named its pipe after the home exactly
+/// as spelled, and keeps that name until it stops. Wherever this release
+/// names the home's pipe otherwise, `lpm proxy` looks under that name too.
+/// The earlier names are pinned as that release computed them.
+#[test]
+fn a_proxy_an_earlier_release_started_is_looked_for_under_the_pipe_it_named() {
+    for (home, earlier) in [
+        (r"C:\lpm-home\", r"\\.\pipe\lpm-proxy-4d257bb2ad8b3a35"),
+        (r"\\?\C:\lpm-home", r"\\.\pipe\lpm-proxy-0142d32938a59b84"),
+        (r"C:\lpm\\home", r"\\.\pipe\lpm-proxy-c7b048df2919dc35"),
+        (r"C:\lpm\.\home", r"\\.\pipe\lpm-proxy-6cd3654d68ca58d9"),
+        (
+            r"\\?\UNC\nas\share\home",
+            r"\\.\pipe\lpm-proxy-47881a6e0c17ca3c",
+        ),
+        (r"C:\", r"\\.\pipe\lpm-proxy-f69750190d7df3b5"),
+    ] {
+        let home = Path::new(home);
+        assert_eq!(
+            proxy_pipe_names_for_root(home),
+            [proxy_pipe_name_for_root(home), earlier.to_string()],
+            "{}",
+            home.display()
+        );
+    }
+    for home in [r"C:\Users\Ada\.lpm", r"\\nas\share\home", "/srv/lpm/home"] {
+        let home = Path::new(home);
+        assert_eq!(
+            proxy_pipe_names_for_root(home),
+            [proxy_pipe_name_for_root(home)],
+            "{}",
+            home.display()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn control_server_reports_registered_routes_until_stopped() {
@@ -1975,6 +2011,71 @@ async fn named_pipe_control_server_reports_registered_routes_until_stopped() {
     assert_eq!(stopped, ProxyResponse::Stopped);
     server.await.unwrap().unwrap();
     assert!(!state_path.exists());
+}
+
+#[cfg(windows)]
+fn unique_pipe_names(label: &str) -> [String; 2] {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    [
+        format!(r"\\.\pipe\lpm-proxy-test-{label}-current-{unique}"),
+        format!(r"\\.\pipe\lpm-proxy-test-{label}-earlier-{unique}"),
+    ]
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn named_pipe_client_finds_a_proxy_on_its_earlier_pipe_and_prefers_the_current_one() {
+    let user = current_user_sid_sddl().unwrap();
+    let names = unique_pipe_names("client");
+
+    let missing = connect_first_named_pipe_client(&names).await.unwrap_err();
+    assert!(
+        matches!(&missing, ProxyError::IpcUnavailable(message) if message.contains(&names[0])),
+        "{missing}"
+    );
+
+    let _earlier = create_named_pipe_server(&names[1], true, &user).unwrap();
+    let (_, connected) = connect_first_named_pipe_client(&names).await.unwrap();
+    assert_eq!(connected, names[1]);
+
+    let _current = create_named_pipe_server(&names[0], true, &user).unwrap();
+    let (_, connected) = connect_first_named_pipe_client(&names).await.unwrap();
+    assert_eq!(connected, names[0]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn named_pipe_daemon_does_not_start_beside_a_proxy_on_its_earlier_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = unique_pipe_names("daemon");
+    let earlier_name = names[1].clone();
+    let earlier_state = dir.path().join("earlier.json");
+    let earlier =
+        tokio::spawn(async move { serve_control_at_pipe(&earlier_name, &earlier_state).await });
+    wait_for_control_pipe_server(&names[1]).await;
+
+    let refused = crate::control::serve_control_at_first_pipe(
+        &names,
+        &dir.path().join("current.json"),
+        ProxyDaemonOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&refused, ProxyError::Ipc(message) if message.contains(&names[1])),
+        "{refused}"
+    );
+
+    let stopped = send_request_to_pipe(&names[1], ProxyRequest::Stop)
+        .await
+        .unwrap();
+    assert_eq!(stopped, ProxyResponse::Stopped);
+    earlier.await.unwrap().unwrap();
 }
 
 #[cfg(windows)]

@@ -14,10 +14,10 @@ pub fn proxy_socket_path_from_env() -> Result<PathBuf, ProxyError> {
 }
 
 #[cfg(windows)]
-pub fn proxy_pipe_name_from_env() -> Result<String, ProxyError> {
+pub fn proxy_pipe_names_from_env() -> Result<Vec<String>, ProxyError> {
     let root =
         lpm_common::LpmRoot::from_env().map_err(|err| ProxyError::StatePath(err.to_string()))?;
-    Ok(proxy_pipe_name_for_root(root.root()))
+    Ok(proxy_pipe_names_for_root(root.root()))
 }
 
 /// The control pipe of the proxy for the LPM home at `root`: one name for
@@ -26,11 +26,31 @@ pub fn proxy_pipe_name_from_env() -> Result<String, ProxyError> {
 /// mapped or `subst` drives, so a name resolved there would differ from the
 /// one the user's own proxy took.
 pub fn proxy_pipe_name_for_root(root: &Path) -> String {
+    pipe_name_for_key(&pipe_root_key(&root.to_string_lossy()))
+}
+
+/// The control pipes to look for the proxy of the home at `root` on, in
+/// order: [`proxy_pipe_name_for_root`]'s, then, where it differs, the name
+/// earlier releases gave it, after the home exactly as spelled in lower case
+/// with `/` separators. A proxy one of them started keeps that name until it
+/// stops, so `lpm proxy` still finds it after an upgrade, and a new proxy
+/// doesn't start beside it.
+pub fn proxy_pipe_names_for_root(root: &Path) -> Vec<String> {
+    let mut names = Vec::with_capacity(2);
+    names.push(proxy_pipe_name_for_root(root));
+    let earlier = pipe_name_for_key(&root.to_string_lossy().replace('\\', "/").to_lowercase());
+    if earlier != names[0] {
+        names.push(earlier);
+    }
+    names
+}
+
+fn pipe_name_for_key(key: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
 
     let mut hash = FNV_OFFSET;
-    for byte in pipe_root_key(&root.to_string_lossy()).as_bytes() {
+    for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
