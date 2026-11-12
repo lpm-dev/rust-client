@@ -236,48 +236,60 @@ pub(crate) enum CertStoreAction {
 }
 
 /// The elevated helper that changes the Windows Root store for `lpm cert`
-/// and the commands that set up HTTPS: adds the certificate in `file`, which
-/// must have the SHA-256 fingerprint `sha256`, or removes the one with the
-/// SHA-1 thumbprint `sha1`.
+/// and the commands that set up HTTPS: adds `certificate`, its DER in
+/// base64, which must have the SHA-256 fingerprint `sha256`, or removes the
+/// one with the SHA-1 thumbprint `sha1`.
 pub(crate) fn run_internal_cert_store(
     action: CertStoreAction,
-    file: Option<&Path>,
+    certificate: Option<&str>,
     sha256: Option<&str>,
     sha1: Option<&str>,
 ) -> Result<(), LpmError> {
     crate::privilege::require_effective_root("certificate-trust")?;
     #[cfg(windows)]
-    {
-        lpm_cert::trust::apply_windows_root_store_change(&cert_store_change(
-            action, file, sha256, sha1,
-        )?)
+    match cert_store_request(action, certificate, sha256, sha1)? {
+        CertStoreRequest::Add { der, sha256 } => {
+            lpm_cert::trust::add_windows_root_certificate(&der, &sha256)
+        }
+        CertStoreRequest::Remove { sha1 } => lpm_cert::trust::apply_windows_root_store_change(
+            &lpm_cert::trust::WindowsRootStoreChange::Remove { sha1 },
+        ),
     }
     #[cfg(not(windows))]
     {
-        let _ = (action, file, sha256, sha1);
+        let _ = (action, certificate, sha256, sha1);
         Err(LpmError::Cert(
             "the certificate-trust helper changes the Windows Root store only".into(),
         ))
     }
 }
 
-/// The change `internal-cert-store`'s arguments ask for.
+/// What `internal-cert-store`'s arguments ask for.
 #[cfg(windows)]
-fn cert_store_change(
+#[derive(Debug, PartialEq, Eq)]
+enum CertStoreRequest {
+    Add { der: Vec<u8>, sha256: String },
+    Remove { sha1: String },
+}
+
+#[cfg(windows)]
+fn cert_store_request(
     action: CertStoreAction,
-    file: Option<&Path>,
+    certificate: Option<&str>,
     sha256: Option<&str>,
     sha1: Option<&str>,
-) -> Result<lpm_cert::trust::WindowsRootStoreChange, LpmError> {
-    use lpm_cert::trust::WindowsRootStoreChange;
+) -> Result<CertStoreRequest, LpmError> {
+    use base64::Engine as _;
 
     let missing = |flag: &str| LpmError::Cert(format!("internal-cert-store needs {flag}"));
     Ok(match action {
-        CertStoreAction::Add => WindowsRootStoreChange::Add {
-            path: file.ok_or_else(|| missing("--file"))?.to_path_buf(),
+        CertStoreAction::Add => CertStoreRequest::Add {
+            der: base64::engine::general_purpose::STANDARD
+                .decode(certificate.ok_or_else(|| missing("--certificate"))?)
+                .map_err(|error| LpmError::Cert(format!("--certificate isn't base64: {error}")))?,
             sha256: sha256.ok_or_else(|| missing("--sha256"))?.to_string(),
         },
-        CertStoreAction::Remove => WindowsRootStoreChange::Remove {
+        CertStoreAction::Remove => CertStoreRequest::Remove {
             sha1: sha1.ok_or_else(|| missing("--sha1"))?.to_string(),
         },
     })
@@ -309,7 +321,7 @@ pub(crate) fn change_windows_root_store_through_helper(
     };
     crate::elevation::run_exe_helper(
         &helper,
-        &internal_cert_store_args(change),
+        &internal_cert_store_args(change)?,
         "Password for LPM certificate trust: ",
         "certificate-trust",
     )
@@ -319,17 +331,24 @@ pub(crate) fn change_windows_root_store_through_helper(
     })
 }
 
-/// The `lpm internal-cert-store` arguments that make `change`.
+/// The `lpm internal-cert-store` arguments that make `change`. A certificate
+/// to add goes by value, read here from the file this LPM staged, so the
+/// elevated helper opens no file, which a link could lead to a network
+/// share where it would sign in as the administrator who approved it.
 #[cfg(windows)]
-fn internal_cert_store_args(change: &lpm_cert::trust::WindowsRootStoreChange) -> Vec<String> {
+fn internal_cert_store_args(
+    change: &lpm_cert::trust::WindowsRootStoreChange,
+) -> Result<Vec<String>, LpmError> {
+    use base64::Engine as _;
     use lpm_cert::trust::WindowsRootStoreChange;
 
-    match change {
+    Ok(match change {
         WindowsRootStoreChange::Add { path, sha256 } => vec![
             "internal-cert-store".to_string(),
             "add".to_string(),
-            "--file".to_string(),
-            path.display().to_string(),
+            "--certificate".to_string(),
+            base64::engine::general_purpose::STANDARD
+                .encode(lpm_cert::trust::windows_certificate_der(path)?),
             "--sha256".to_string(),
             sha256.clone(),
         ],
@@ -339,7 +358,7 @@ fn internal_cert_store_args(change: &lpm_cert::trust::WindowsRootStoreChange) ->
             "--sha1".to_string(),
             sha1.clone(),
         ],
-    }
+    })
 }
 
 fn run_generate(
@@ -530,31 +549,65 @@ mod tests {
             unsafe { LocalFree(argv.cast()) };
             args
         };
-        for change in [
-            WindowsRootStoreChange::Add {
-                path: r"C:\Users\O'Brien & Co\.lpm\certs\.lpm-verified ca 1".into(),
-                sha256: "AB".repeat(32),
-            },
-            WindowsRootStoreChange::Remove {
-                sha1: "cd".repeat(20),
-            },
+        // The certificate goes by value: the helper gets its DER, not the
+        // path of the file this LPM staged it in.
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("O'Brien & Co").join(".lpm-verified ca 1");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        let (ca, _) = lpm_cert::ca::generate_ca_with_options(Default::default()).unwrap();
+        std::fs::write(&staged, &ca).unwrap();
+        let der = {
+            use base64::Engine as _;
+            let body: String = ca
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .unwrap()
+        };
+        for (change, request) in [
+            (
+                WindowsRootStoreChange::Add {
+                    path: staged.clone(),
+                    sha256: "AB".repeat(32),
+                },
+                CertStoreRequest::Add {
+                    der,
+                    sha256: "AB".repeat(32),
+                },
+            ),
+            (
+                WindowsRootStoreChange::Remove {
+                    sha1: "cd".repeat(20),
+                },
+                CertStoreRequest::Remove {
+                    sha1: "cd".repeat(20),
+                },
+            ),
         ] {
+            let args = internal_cert_store_args(&change).unwrap();
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.contains(&*staged.to_string_lossy()))
+            );
             let line = format!(
                 r#""C:\Program Files\LPM\lpm.exe" {}"#,
-                crate::elevation::quote_windows_args(&internal_cert_store_args(&change))
+                crate::elevation::quote_windows_args(&args)
             );
             let cli = crate::cli::Cli::try_parse_from(split(&line)).unwrap();
             let Some(crate::cli::Commands::InternalCertStore(args)) = cli.command else {
                 panic!("{line} is not internal-cert-store");
             };
-            let parsed = cert_store_change(
+            let parsed = cert_store_request(
                 args.action,
-                args.file.as_deref(),
+                args.certificate.as_deref(),
                 args.sha256.as_deref(),
                 args.sha1.as_deref(),
             )
             .unwrap();
-            assert_eq!(parsed, change, "{line}");
+            assert_eq!(parsed, request, "{line}");
         }
     }
 

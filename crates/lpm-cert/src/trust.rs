@@ -383,14 +383,14 @@ pub fn change_windows_root_store_with_certutil(
     run_certutil_elevated(&change.certutil_args())
 }
 
-/// Checks `change` as an elevated helper must before making it: an added
-/// certificate must be the only one in its file and the one its
-/// fingerprint names, and a removed one is named by a thumbprint alone.
+/// Checks `change` before an elevated LPM makes it: an added certificate
+/// must be the only one in its file and the one its fingerprint names, and
+/// a removed one is named by a thumbprint alone.
 #[cfg(target_os = "windows")]
 pub fn check_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
     match change {
         WindowsRootStoreChange::Add { path, sha256 } => {
-            checked_certificate(path, sha256)?;
+            checked_certificate(&windows_certificate_der(path)?, sha256)?;
         }
         WindowsRootStoreChange::Remove { sha1 } => {
             if sha1.len() != 40 || !sha1.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -403,18 +403,11 @@ pub fn check_windows_root_store_change(change: &WindowsRootStoreChange) -> Resul
     Ok(())
 }
 
-/// The certificate in `path`, written out again as PEM, once the file is
-/// exactly one X.509 certificate whose SHA-256 fingerprint is `sha256`.
-/// `path` must be on a local drive: an elevated process reading a network
-/// path would offer an administrator's credentials to wherever it leads.
+/// The DER encoding of the certificate in `path`, which must hold exactly
+/// one PEM `CERTIFICATE` block: what the elevated helper is handed, by
+/// value, so it opens no file whoever started it names.
 #[cfg(target_os = "windows")]
-fn checked_certificate(path: &Path, sha256: &str) -> Result<Vec<u8>, LpmError> {
-    if !is_local_drive_path(path) {
-        return Err(LpmError::Cert(format!(
-            "{} is not a file on a local drive",
-            path.display()
-        )));
-    }
+pub fn windows_certificate_der(path: &Path) -> Result<Vec<u8>, LpmError> {
     let pem = lpm_common::read_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
         .map_err(|error| LpmError::Cert(format!("failed to read {}: {error}", path.display())))?;
     let blocks = pem::parse_many(&pem)
@@ -432,66 +425,57 @@ fn checked_certificate(path: &Path, sha256: &str) -> Result<Vec<u8>, LpmError> {
             certificate.tag()
         )));
     }
+    Ok(certificate.contents().to_vec())
+}
+
+/// `der` written out as PEM, once it is exactly one X.509 certificate whose
+/// SHA-256 fingerprint is `sha256`.
+#[cfg(target_os = "windows")]
+fn checked_certificate(der: &[u8], sha256: &str) -> Result<Vec<u8>, LpmError> {
     // A container such as PKCS #7 can wear the label and hold several.
-    let der = certificate.contents();
     if !x509_parser::parse_x509_certificate(der).is_ok_and(|(rest, _)| rest.is_empty()) {
-        return Err(LpmError::Cert(format!(
-            "{} doesn't hold one X.509 certificate",
-            path.display()
-        )));
+        return Err(LpmError::Cert(
+            "the certificate given isn't one X.509 certificate".into(),
+        ));
     }
     use sha2::Digest as _;
     let digest: [u8; 32] = sha2::Sha256::digest(der).into();
     let actual = cert::fingerprint_hex(&digest).replace(':', "");
     if !actual.eq_ignore_ascii_case(sha256) {
         return Err(LpmError::Cert(format!(
-            "{} is not the certificate with SHA-256 fingerprint {sha256}",
-            path.display()
+            "the certificate given is not the one with SHA-256 fingerprint {sha256}"
         )));
     }
     Ok(pem::encode(&pem::Pem::new("CERTIFICATE", der.to_vec())).into_bytes())
 }
 
-/// Whether `path` is on a drive with a letter that isn't a network one.
+/// For the elevated helper: adds the certificate `der`, once it is one
+/// X.509 certificate with the SHA-256 fingerprint `sha256`, from a copy
+/// staged and pinned in this process's own temporary directory.
 #[cfg(target_os = "windows")]
-fn is_local_drive_path(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
-
-    let Some(Component::Prefix(prefix)) = path.components().next() else {
-        return false;
-    };
-    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
-        return false;
-    };
-    let root: Vec<u16> = format!("{}:\\", char::from(letter))
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
-    // SAFETY: `root` is NUL-terminated and lives through the call.
-    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
-    // DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_RAMDISK.
-    matches!(kind, 2 | 3 | 6)
+pub fn add_windows_root_certificate(der: &[u8], sha256: &str) -> Result<(), LpmError> {
+    let certificate = checked_certificate(der, sha256)?;
+    with_certificate_staged_in(
+        &std::env::temp_dir(),
+        &certificate,
+        Path::new("rootCA.pem"),
+        |staged| {
+            run_certutil(&[
+                std::ffi::OsStr::new("-addstore"),
+                std::ffi::OsStr::new("Root"),
+                staged.as_os_str(),
+            ])
+        },
+    )
 }
 
-/// Makes `change` from a process that is already elevated, as the LPM
-/// CLI's elevated helper is, once [`check_windows_root_store_change`]
-/// accepts it; certutil does it.
+/// Makes `change` from a process that is already elevated, once
+/// [`check_windows_root_store_change`] accepts it; certutil does it.
 #[cfg(target_os = "windows")]
 pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
     match change {
         WindowsRootStoreChange::Add { path, sha256 } => {
-            let certificate = checked_certificate(path, sha256)?;
-            // Whoever started this helper named the file, which may change
-            // once checked, so certutil reads a copy staged here and pinned
-            // until it is done, in this process's own temporary directory.
-            with_certificate_staged_in(&std::env::temp_dir(), &certificate, path, |staged| {
-                run_certutil(&[
-                    std::ffi::OsStr::new("-addstore"),
-                    std::ffi::OsStr::new("Root"),
-                    staged.as_os_str(),
-                ])
-            })
+            add_windows_root_certificate(&windows_certificate_der(path)?, sha256)
         }
         WindowsRootStoreChange::Remove { .. } => {
             check_windows_root_store_change(change)?;
@@ -1907,10 +1891,7 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
 
         check(expected.clone()).unwrap();
         for (content, refusal) in [
-            (
-                other.clone(),
-                "is not the certificate with SHA-256 fingerprint",
-            ),
+            (other.clone(), "is not the one with SHA-256 fingerprint"),
             (
                 format!("{expected}{other}"),
                 "must hold exactly one certificate",
@@ -1922,7 +1903,7 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
                     "CERTIFICATE",
                     vec![0x30, 0x03, 0x02, 0x01, 0x00],
                 )),
-                "doesn't hold one X.509 certificate",
+                "isn't one X.509 certificate",
             ),
             (
                 {
@@ -1930,20 +1911,31 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
                     der.extend_from_slice(&[0x30, 0x00]);
                     pem::encode(&pem::Pem::new("CERTIFICATE", der))
                 },
-                "doesn't hold one X.509 certificate",
+                "isn't one X.509 certificate",
             ),
         ] {
             let error = check(content).unwrap_err().to_string();
             assert!(error.contains(refusal), "{error}");
         }
-        // Refused before any read, which would reach out over the network.
-        let error = check_windows_root_store_change(&WindowsRootStoreChange::Add {
-            path: r"\\localhost\lpm-share\rootCA.pem".into(),
-            sha256: sha256.clone(),
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("not a file on a local drive"), "{error}");
+        // As the elevated helper gets a certificate, by value: refused before
+        // certutil runs where it isn't one X.509 certificate, or not this one.
+        let der = pem::parse(other.as_bytes()).unwrap().contents().to_vec();
+        for (der, refusal) in [
+            (der.clone(), "is not the one with SHA-256 fingerprint"),
+            (
+                vec![0x30, 0x03, 0x02, 0x01, 0x00],
+                "isn't one X.509 certificate",
+            ),
+            (
+                [der, vec![0x30, 0x00]].concat(),
+                "isn't one X.509 certificate",
+            ),
+        ] {
+            let error = add_windows_root_certificate(&der, &sha256)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(refusal), "{error}");
+        }
         check_windows_root_store_change(&WindowsRootStoreChange::Remove {
             sha1: "0123456789abcdefABCDEF0123456789abcdef01".to_string(),
         })

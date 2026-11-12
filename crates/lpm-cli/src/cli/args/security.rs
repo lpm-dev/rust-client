@@ -15,9 +15,10 @@ pub(crate) struct InternalSecurityPolicyArgs {
 pub(crate) struct InternalCertStoreArgs {
     #[arg(value_enum)]
     pub(crate) action: commands::cert::CertStoreAction,
-    /// The certificate to add.
-    #[arg(long, value_name = "PATH", required_if_eq("action", "add"))]
-    pub(crate) file: Option<std::path::PathBuf>,
+    /// The certificate to add, its DER in base64: given by value, so the
+    /// elevated helper opens no file whoever started it names.
+    #[arg(long, value_name = "BASE64", required_if_eq("action", "add"))]
+    pub(crate) certificate: Option<String>,
     /// The SHA-256 fingerprint, in hex, the added certificate must have.
     #[arg(long, required_if_eq("action", "add"))]
     pub(crate) sha256: Option<String>,

@@ -202,7 +202,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Commands::InternalCertStore(args) => Some(commands::cert::run_internal_cert_store(
             args.action,
-            args.file.as_deref(),
+            args.certificate.as_deref(),
             args.sha256.as_deref(),
             args.sha1.as_deref(),
         )),
