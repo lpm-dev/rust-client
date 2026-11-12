@@ -1319,10 +1319,13 @@ mod tests {
         std::fs::write(&target, "").unwrap();
         emit_shim(&bin, &shim("eslint", target.to_str().unwrap())).unwrap();
 
+        // The node.exe beside the shim, else the first node.exe on PATH,
+        // else `node` as cmd.exe finds it.
         let cmd = std::fs::read_to_string(bin.join("eslint.cmd")).unwrap();
-        assert!(cmd.contains("@IF EXIST"));
-        assert!(cmd.contains("ELSE"));
-        assert!(cmd.contains("node"));
+        assert!(cmd.contains("@IF EXIST \"%dp0%node.exe\" SET \"_prog=%dp0%node.exe\""));
+        assert!(cmd.contains("SET \"_prog=%%~$PATH:I\""));
+        assert!(cmd.contains("@SET \"_prog=node\""));
+        assert!(cmd.contains("\"%_prog%\""));
     }
 
     #[test]
