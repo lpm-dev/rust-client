@@ -416,6 +416,13 @@ pub(super) fn link(
         }
         validate_artifacts(&wrapper)?;
         let provenance = provenance_bytes(&wrapper)?;
+        // As read back by unlink and recovery; the current form can be longer
+        // than the one `validate_bins` measured.
+        if provenance.len() as u64 > FILE_CAP {
+            return Err(invalid(
+                "local-link command inventory exceeds the size limit",
+            ));
+        }
         let entry = PackageEntry {
             saved_spec: format!("link:{}", link.source_dir.display()),
             resolved: link.version.clone(),

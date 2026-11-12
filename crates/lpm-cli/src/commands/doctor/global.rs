@@ -567,7 +567,22 @@ fn check_global_shim_targets(
     let bin_dir = root.bin_dir();
 
     let mut mismatches = IssuePreview::default();
+    let mut earlier = IssuePreview::default();
     let mut expectation_count = 0usize;
+    let mut verify = |command: &str, target: &std::path::Path| {
+        expectation_count += 1;
+        match lpm_global::shim::verify_windows_shim_triple(&bin_dir, command, target) {
+            Ok(lpm_global::shim::WindowsShimForm::Current) => {}
+            Ok(lpm_global::shim::WindowsShimForm::EarlierRelease) => {
+                earlier.push(lpm_common::sanitize_for_terminal(command));
+            }
+            Err(error) => mismatches.push(format!(
+                "{}: {}",
+                lpm_common::sanitize_for_terminal(command),
+                lpm_common::sanitize_for_terminal(&error.to_string()),
+            )),
+        }
+    };
     for entry in manifest.packages.values() {
         let install_bin = root
             .global_root()
@@ -575,18 +590,7 @@ fn check_global_shim_targets(
             .join("node_modules")
             .join(".bin");
         for command in &entry.commands {
-            expectation_count += 1;
-            if let Err(error) = lpm_global::shim::verify_windows_shim_triple(
-                &bin_dir,
-                command,
-                &install_bin.join(command),
-            ) {
-                mismatches.push(format!(
-                    "{}: {}",
-                    lpm_common::sanitize_for_terminal(command),
-                    lpm_common::sanitize_for_terminal(&error.to_string()),
-                ));
-            }
+            verify(command, &install_bin.join(command));
         }
     }
     for (alias_name, alias_entry) in &manifest.aliases {
@@ -599,37 +603,45 @@ fn check_global_shim_targets(
             .join("node_modules")
             .join(".bin")
             .join(&alias_entry.bin);
-        expectation_count += 1;
-        if let Err(error) =
-            lpm_global::shim::verify_windows_shim_triple(&bin_dir, alias_name, &target)
-        {
-            mismatches.push(format!(
-                "{}: {}",
-                lpm_common::sanitize_for_terminal(alias_name),
-                lpm_common::sanitize_for_terminal(&error.to_string()),
-            ));
-        }
+        verify(alias_name, &target);
     }
 
-    if mismatches.is_empty() {
-        return Check::pass(
-            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    // `lpm install -g` refuses a package already installed.
+    const REINSTALL: &str = "`lpm uninstall -g <pkg>` then `lpm install -g <pkg>` (or \
+                             `lpm global unlink` and `lpm global link` for a link)";
+    if !mismatches.is_empty() {
+        let (preview, more) = mismatches.rendered("; ");
+        return Check::warn(
+            &doctor_catalog::GLOBAL_SHIM_TARGETS_STALE,
             &format!(
-                "{} owned shim triple{} verified",
-                expectation_count,
-                if expectation_count == 1 { "" } else { "s" },
+                "{} shim triple{} with altered or stale content ({preview}{more}). Fix hint: \
+                 {REINSTALL} writes them again.",
+                mismatches.len(),
+                plural(mismatches.len()),
             ),
         );
     }
-    let (preview, more) = mismatches.rendered("; ");
-    Check::warn(
-        &doctor_catalog::GLOBAL_SHIM_TARGETS_STALE,
+    if !earlier.is_empty() {
+        let (preview, more) = earlier.rendered(", ");
+        return Check::warn(
+            &doctor_catalog::GLOBAL_SHIM_TARGETS_STALE,
+            &format!(
+                "{} shim triple{} written by an earlier release ({preview}{more}). They name \
+                 the target by its whole path, which fails where LPM's home has a non-ASCII \
+                 character or a `&` in it, and, found on PATH by a quoted name, look for \
+                 `node.exe` in the current directory. Fix hint: {REINSTALL} writes them as this \
+                 release does.",
+                earlier.len(),
+                plural(earlier.len()),
+            ),
+        );
+    }
+    Check::pass(
+        &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
         &format!(
-            "{} shim triple{} with altered or stale content ({}{}). Fix hint: re-run `lpm install -g <pkg>` to reclaim the shim.",
-            mismatches.len(),
-            if mismatches.len() == 1 { "" } else { "s" },
-            preview,
-            more,
+            "{expectation_count} owned shim triple{} verified",
+            plural(expectation_count),
         ),
     )
 }

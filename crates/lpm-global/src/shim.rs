@@ -279,7 +279,18 @@ pub fn artifacts_complete(bin_dir: &Path, command_name: &str) -> bool {
 
 const WINDOWS_SHIM_CONTENT_CAP_BYTES: u64 = 64 * 1024;
 
-/// Verify the complete Windows shim triple against the canonical templates.
+/// The form a Windows shim triple is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsShimForm {
+    /// As shims are written now.
+    Current,
+    /// As releases before relative shims wrote it, naming its target whole,
+    /// which a non-ASCII or `&` LPM home breaks.
+    EarlierRelease,
+}
+
+/// Verify the complete Windows shim triple against the canonical templates,
+/// and say which form it is in.
 ///
 /// The check is compiled on every platform so the script formats can be
 /// regression-tested without a Windows host. Each artifact must be a bounded,
@@ -289,7 +300,7 @@ pub fn verify_windows_shim_triple(
     bin_dir: &Path,
     command_name: &str,
     target: &Path,
-) -> Result<(), ShimError> {
+) -> Result<WindowsShimForm, ShimError> {
     let shim = Shim {
         command_name: command_name.to_string(),
         target: target.to_path_buf(),
@@ -297,6 +308,7 @@ pub fn verify_windows_shim_triple(
     let current = windows_shim_contents(bin_dir, &shim)?;
     let legacy = legacy_windows_shim_contents(&shim).ok();
 
+    let mut form = WindowsShimForm::Current;
     for (index, (name, expected_content)) in current.into_iter().enumerate() {
         let path = bin_dir.join(&name);
         let actual =
@@ -305,16 +317,20 @@ pub fn verify_windows_shim_triple(
                     path: path.clone(),
                     reason: error.to_string(),
                 })?;
-        let legacy_content = legacy.as_ref().map(|legacy| &legacy[index].1);
-        if actual != expected_content && Some(&actual) != legacy_content {
-            return Err(ShimError::InvalidArtifact {
-                path,
-                reason: "content does not match the expected target".to_string(),
-            });
+        if actual == expected_content {
+            continue;
         }
+        if legacy.as_ref().map(|legacy| &legacy[index].1) == Some(&actual) {
+            form = WindowsShimForm::EarlierRelease;
+            continue;
+        }
+        return Err(ShimError::InvalidArtifact {
+            path,
+            reason: "content does not match the expected target".to_string(),
+        });
     }
 
-    Ok(())
+    Ok(form)
 }
 
 /// Expected Windows command files in `bin_dir`, including their
@@ -327,8 +343,12 @@ pub fn windows_shim_contents(
     shim: &Shim,
 ) -> Result<[(String, String); 3], ShimError> {
     validate_windows_command_names(&shim.command_name)?;
-    let target = shim.target.to_string_lossy();
-    let path = match relative_to(bin_dir, &shim.target) {
+    // A canonical `\\?\C:\…` target, as a local link's is, shares a volume
+    // with the plain `C:\…` bin directory; and Node can't run it spelled so.
+    let bin_dir = windows_plain_path(bin_dir);
+    let target_path = windows_plain_path(&shim.target);
+    let target = target_path.to_string_lossy();
+    let path = match relative_to(&bin_dir, &target_path) {
         Some(relative) => ShimPath::Relative(relative.to_string_lossy().into_owned()),
         None => ShimPath::Absolute(target.clone().into_owned()),
     };
@@ -393,6 +413,21 @@ impl ShimPath {
             Self::Relative(relative) => format!("%dp0%{relative}"),
             Self::Absolute(absolute) => absolute.clone(),
         }
+    }
+}
+
+/// `path` without a `\\?\` prefix on a drive path, where the plain path names
+/// the same file: Win32 reads a name with a trailing `.` or space otherwise.
+fn windows_plain_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.as_bytes().get(1) == Some(&b':')
+                && std::path::absolute(rest).is_ok_and(|absolute| absolute == Path::new(rest)) =>
+        {
+            PathBuf::from(rest)
+        }
+        _ => path.to_path_buf(),
     }
 }
 

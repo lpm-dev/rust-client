@@ -951,6 +951,62 @@ fn global_link_creates_manifest_entry_and_global_shim_for_local_package() {
     }
 }
 
+/// On Windows a link's commands run through its wrapper shims, which name
+/// the checkout from their own directory, not by the canonical `\\?\` path
+/// the link resolves, which Node can't run.
+#[cfg(windows)]
+#[test]
+fn global_link_commands_run_on_windows() {
+    use std::os::windows::process::CommandExt as _;
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package_dir = project.path().join("linked-js");
+    std::fs::create_dir_all(package_dir.join("bin")).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"linked-js","version":"1.0.0","bin":{"linked-js":"bin/linked-js.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("bin").join("linked-js.js"),
+        "console.log('linked-js:' + process.argv[2]);\n",
+    )
+    .unwrap();
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package_dir)
+        .assert()
+        .success();
+
+    let root = isolated_lpm_root(&project);
+    let entry_root = lpm_global::read_for(&root).unwrap().packages["linked-js"]
+        .root
+        .clone();
+    let wrapper_bin = root
+        .global_root()
+        .join(entry_root)
+        .join("node_modules")
+        .join(".bin");
+    for bin_dir in [root.bin_dir(), wrapper_bin] {
+        for artifact in lpm_global::expected_artifacts(&bin_dir, "linked-js") {
+            let text = std::fs::read_to_string(&artifact).unwrap();
+            assert!(!text.contains(r"\\?\"), "{}: {text}", artifact.display());
+        }
+    }
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c"])
+        .raw_arg(format!(
+            "\"\"{}\" ok\"",
+            root.bin_dir().join("linked-js.cmd").display()
+        ))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "linked-js:ok"
+    );
+}
+
 #[test]
 fn global_unlink_removes_local_link_manifest_entry_and_shims() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
