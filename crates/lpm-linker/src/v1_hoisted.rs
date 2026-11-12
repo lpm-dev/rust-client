@@ -2,7 +2,7 @@ use crate::layout::LayoutPaths;
 use crate::materialize::link_dir_recursive;
 use crate::platform::create_symlink_or_junction;
 #[cfg(windows)]
-use crate::platform::validate_cmd_path;
+use crate::platform::windows_cmd_shim;
 #[cfg(unix)]
 use crate::platform::{make_bin_target_executable, relative_symlink_target_from_parent};
 use crate::types::{LinkResult, LinkTarget, Materialization, MaterializedPackage};
@@ -784,15 +784,13 @@ fn create_bin_links_hoisted(
 
             #[cfg(windows)]
             {
-                let target_str = target.to_string_lossy();
-                // Validate target path before interpolating into .cmd
-                if let Err(reason) = validate_cmd_path(&target_str) {
-                    tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
-                    continue;
-                }
-                let cmd_content = format!(
-                    "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
-                );
+                let cmd_content = match windows_cmd_shim(&bin_dir, &target, None) {
+                    Ok(content) => content,
+                    Err(reason) => {
+                        tracing::warn!("bin: skipping .cmd shim for {cmd_name}: {reason}");
+                        continue;
+                    }
+                };
                 let cmd_path = bin_dir.join(format!("{cmd_name}.cmd"));
                 std::fs::write(&cmd_path, cmd_content)?;
             }

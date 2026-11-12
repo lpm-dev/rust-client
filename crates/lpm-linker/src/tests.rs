@@ -1178,6 +1178,41 @@ fn validate_cmd_path_allows_normal_path() {
     assert!(validate_cmd_path("C:\\Users\\foo\\node_modules").is_ok());
 }
 
+/// Only what a shim must spell out is checked: a project path with `'`
+/// or `&` stays behind `%~dp0`, a target on another volume is written,
+/// and checked, whole.
+#[test]
+#[cfg(windows)]
+fn windows_cmd_shims_name_paths_relative_to_themselves() {
+    use crate::platform::windows_cmd_shim;
+    let bin = Path::new(r"C:\work\O'Brien & R&D\node_modules\.bin");
+    assert_eq!(
+        windows_cmd_shim(
+            bin,
+            Path::new(r"C:\work\O'Brien & R&D\node_modules\tool\bin\tool.js"),
+            bin.parent(),
+        )
+        .unwrap(),
+        "@SET \"NODE_PATH=%~dp0\\..;%NODE_PATH%\"\n\
+         @IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"%~dp0\\..\\tool\\bin\\tool.js\" %*\n\
+         ) ELSE (\n  node \"%~dp0\\..\\tool\\bin\\tool.js\" %*\n)"
+    );
+    let shim = windows_cmd_shim(bin, Path::new(r"D:\store\tool.js"), None).unwrap();
+    assert!(
+        shim.contains(r#""%~dp0\node.exe" "D:\store\tool.js" %*"#),
+        "{shim}"
+    );
+    assert!(windows_cmd_shim(bin, Path::new(r"D:\R&D\tool.js"), None).is_err());
+    assert!(
+        windows_cmd_shim(
+            bin,
+            Path::new(r"C:\work\O'Brien & R&D\node_modules\x%PATH%\tool.js"),
+            None
+        )
+        .is_err()
+    );
+}
+
 // Permission bits
 #[cfg(unix)]
 #[test]

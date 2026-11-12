@@ -282,8 +282,15 @@ fn remove_owned_cmd_shim(
     let Some(actual_target) = generated_cmd_shim_target(&content) else {
         return Ok(0);
     };
-    let Some(actual_canonical) =
-        crate::project_fs::canonicalize_with_missing_tail(Path::new(actual_target))
+    // Shims name their target relative to their own directory.
+    let actual_target = match actual_target.strip_prefix("%~dp0\\") {
+        Some(relative) => shim_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(relative),
+        None => PathBuf::from(actual_target),
+    };
+    let Some(actual_canonical) = crate::project_fs::canonicalize_with_missing_tail(&actual_target)
     else {
         return Ok(0);
     };
@@ -1310,6 +1317,45 @@ mod tests {
             shim.symlink_metadata().is_err(),
             "an LPM-generated shim must be removed when its raw target resolves to the expected file"
         );
+    }
+
+    /// Shims name their target relative to their own directory, as
+    /// `%~dp0\..\<package>\…`.
+    #[cfg(windows)]
+    #[test]
+    fn remove_owned_cmd_shim_removes_a_shim_relative_to_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("node_modules").join(".bin");
+        let target = dir
+            .path()
+            .join("node_modules")
+            .join("package")
+            .join("bin")
+            .join("cli.js");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "console.log('ok')\n").unwrap();
+        let other = bin.join("other.cmd");
+        let shim = bin.join("cli.cmd");
+        for path in [&shim, &other] {
+            let relative = if path == &shim { "cli.js" } else { "other.js" };
+            std::fs::write(
+                path,
+                format!(
+                    "@SET \"NODE_PATH=%~dp0\\..;%NODE_PATH%\"\n@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"%~dp0\\..\\package\\bin\\{relative}\" %*\n) ELSE (\n  node \"%~dp0\\..\\package\\bin\\{relative}\" %*\n)",
+                ),
+            )
+            .unwrap();
+        }
+
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&bin, cap_std::ambient_authority()).unwrap();
+        for path in [&shim, &other] {
+            remove_owned_cmd_shim(&directory, path, &target).unwrap();
+        }
+
+        assert!(shim.symlink_metadata().is_err());
+        assert!(other.is_file(), "a shim for another file must be preserved");
     }
 
     #[cfg(windows)]
