@@ -39,7 +39,7 @@ pub(crate) fn names_outside_root(
     validate_supported_constraints(constraints.value)?;
     let mut outside = Vec::new();
     for hostname in hostnames {
-        let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+        let host = hostname.to_ascii_lowercase();
         let permitted = match host.parse::<IpAddr>() {
             Ok(IpAddr::V4(address)) => permits(
                 constraints.value,

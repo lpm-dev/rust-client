@@ -721,6 +721,21 @@ fn stage_and_run(
     let (new_cert_pem, new_key_pem) =
         ca::generate_ca_with_options(ca::CaOptions { name_constraints })
             .map_err(|e| LpmError::Cert(format!("failed to generate new CA: {e}")))?;
+    // Reissuing runs after the new CA is trusted; a project it couldn't sign
+    // for is better named now, before anything changes.
+    let project_dirs = collect_project_dirs(&opts.extra_projects)?;
+    if let Some((dir, names)) = first_project_outside(new_cert_pem.as_bytes(), &project_dirs)? {
+        return Err(LpmError::Cert(format!(
+            "the new CA would be limited to local names ({}), but the certificate of {} names \
+             {}. Run `lpm cert rotate --no-name-constraints` for a CA that may sign any name, or \
+             remove {} for `lpm dev` to issue it again with the names it uses now. Nothing was \
+             changed",
+            ca::PERMITTED_NAMES_SUMMARY,
+            dir.display(),
+            names.join(", "),
+            dir.join(".lpm").join("certs").display()
+        )));
+    }
     ca_dir.write_ca_pair(
         "rootCA.pem.next",
         "rootCA-key.pem.next",
@@ -812,7 +827,6 @@ fn stage_and_run(
     let staged_key_pem = std::str::from_utf8(&staged_key_bytes)
         .map_err(|error| LpmError::Cert(format!("invalid UTF-8 in staged CA key: {error}")))?;
 
-    let project_dirs = collect_project_dirs(&opts.extra_projects)?;
     let mut leaf_rollback = LeafRollback::default();
 
     let mut reissued: Vec<String> = Vec::new();
@@ -1721,6 +1735,30 @@ fn collect_project_dirs(extras: &[PathBuf]) -> Result<Vec<PathBuf>, LpmError> {
 /// Loopback aliases like `127.0.0.2` or `127.1.2.3` are NOT defaults — they
 /// must round-trip through rotation. Only the literal `127.0.0.1` / `::1` /
 /// `localhost` are filtered.
+/// The first of `project_dirs` whose certificate names, or whose project CA
+/// permits, names `ca_cert_pem` may not sign, with those names.
+fn first_project_outside(
+    ca_cert_pem: &[u8],
+    project_dirs: &[PathBuf],
+) -> Result<Option<(PathBuf, Vec<String>)>, LpmError> {
+    for dir in project_dirs.iter().filter(|dir| dir.exists()) {
+        let Some(leaf_dir) = paths::open_project_cert_directory(dir, false)? else {
+            continue;
+        };
+        let leaf_cert = leaf_dir.path().join("cert.pem");
+        if !leaf_cert.exists() {
+            continue;
+        }
+        let names = preserved_extra_hostnames(&leaf_cert).unwrap_or_default();
+        let subtrees = cert::read_project_dns_constraints(&leaf_cert).unwrap_or_default();
+        let outside = ca::names_outside_constraints(ca_cert_pem, &names, &subtrees)?;
+        if !outside.is_empty() {
+            return Ok(Some((dir.clone(), outside)));
+        }
+    }
+    Ok(None)
+}
+
 fn preserved_extra_hostnames(leaf_path: &Path) -> Result<Vec<String>, LpmError> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     const DEFAULT_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);

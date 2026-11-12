@@ -1176,7 +1176,7 @@ fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
         if !req.name_constraints_enabled {
             println!(
                 "    {}",
-                "Note: this CA may sign any name, as asked; `lpm cert rotate --name-constraints` limits it to local ones"
+                "Note: this CA may sign any name; `lpm cert rotate --name-constraints` limits it to local ones"
                     .dimmed()
             );
         }
@@ -1441,9 +1441,26 @@ pub async fn run(
                     }
                     extend_unique_hostnames(&mut extra_hostnames, local_domain_hostnames_for_cert);
                     if let Some(ref info) = net_info {
-                        for addr in &info.addresses {
-                            if !addr.is_ipv6 {
-                                push_unique_hostname(&mut extra_hostnames, addr.ip.clone());
+                        let addresses = info
+                            .addresses
+                            .iter()
+                            .filter(|addr| !addr.is_ipv6)
+                            .map(|addr| addr.ip.clone())
+                            .collect::<Vec<_>>();
+                        // An address the CA may not sign, such as a public
+                        // one, is left out rather than failing the session.
+                        let refused = lpm_cert::names_the_root_would_refuse(&addresses)?;
+                        if !refused.is_empty() {
+                            tracing::warn!(
+                                "not naming {} in the certificate: the local CA signs only local \
+                                 and private addresses; `lpm cert rotate --no-name-constraints` \
+                                 replaces it with one that may sign any",
+                                refused.join(", ")
+                            );
+                        }
+                        for address in addresses {
+                            if !refused.contains(&address) {
+                                push_unique_hostname(&mut extra_hostnames, address);
                             }
                         }
                     }

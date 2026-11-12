@@ -201,7 +201,8 @@ fn a_new_root_ca_keeps_the_structure_an_earlier_release_gave_it() {
         structure(&earlier[0], &[SUBJECT_KEY_IDENTIFIER, NAME_CONSTRAINTS])
     );
     // The constraints changed on purpose, by adding the private-use names
-    // `cert.extraPermittedDns` accepts without `allowPublicDns`.
+    // `cert.extraPermittedDns` accepts without `allowPublicDns`, and two
+    // ranges no public site uses: shared address space and benchmarking.
     let permitted = |der: &[u8]| -> Vec<String> {
         parse(der)
             .name_constraints()
@@ -227,6 +228,11 @@ fn a_new_root_ca_keeps_the_structure_an_earlier_release_gave_it() {
             .iter()
             .filter(|subtree| !earlier_permitted.contains(subtree))
             .collect::<Vec<_>>(),
-        [r#"DNSName(".internal")"#, r#"DNSName(".home.arpa")"#]
+        [
+            r#"DNSName(".internal")"#,
+            r#"DNSName(".home.arpa")"#,
+            "IPAddress([100, 64, 0, 0, 255, 192, 0, 0])",
+            "IPAddress([198, 18, 0, 0, 255, 254, 0, 0])",
+        ]
     );
 }

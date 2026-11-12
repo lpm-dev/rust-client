@@ -52,6 +52,15 @@ fn permitted_subtrees() -> Vec<GeneralSubtree> {
         GeneralSubtree::IpAddress(
             CidrSubnet::from_str("169.254.0.0/16").expect("static IPv4 link-local"),
         ),
+        // Not publicly routable either: the shared address space VPNs such
+        // as Tailscale use, which `lpm dev --network` names, and the
+        // benchmarking range some VPNs and VM bridges use.
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("100.64.0.0/10").expect("static shared address space"),
+        ),
+        GeneralSubtree::IpAddress(
+            CidrSubnet::from_str("198.18.0.0/15").expect("static benchmarking range"),
+        ),
         GeneralSubtree::IpAddress(CidrSubnet::from_str("fc00::/7").expect("static IPv6 ULA")),
         GeneralSubtree::IpAddress(
             CidrSubnet::from_str("fe80::/10").expect("static IPv6 link-local"),
@@ -68,14 +77,17 @@ const UNCONSTRAINED_UNIT: &str = "Not limited to local names, as asked";
 /// The names [`permitted_subtrees`] lets a constrained CA sign, as a person
 /// reads them.
 pub const PERMITTED_NAMES_SUMMARY: &str = "localhost, *.localhost, *.local, *.test, *.lpm.test, \
-     *.internal, *.home.arpa, loopback, private and link-local addresses";
+     *.internal, *.home.arpa, loopback, private, shared and link-local addresses";
 
 /// What `LPM_CERT_NAME_CONSTRAINTS` asks for: `Some(false)` for `0`, `false`,
 /// `no` or `off`; `Some(true)` for any other value; `None` when it is unset.
 pub fn name_constraints_override() -> Option<bool> {
-    let value = std::env::var(NAME_CONSTRAINTS_ENV).ok()?;
+    parse_name_constraints_override(std::env::var(NAME_CONSTRAINTS_ENV).ok().as_deref())
+}
+
+fn parse_name_constraints_override(value: Option<&str>) -> Option<bool> {
     Some(!matches!(
-        value.trim().to_ascii_lowercase().as_str(),
+        value?.trim().to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"
     ))
 }
@@ -252,45 +264,36 @@ mod tests {
     use super::*;
 
     /// A new CA is limited to local names unless `LPM_CERT_NAME_CONSTRAINTS`
-    /// turns that off, and one made unlimited so is marked as asked for.
+    /// turns that off, and one made unlimited is marked as asked for.
     #[test]
     fn new_cas_are_limited_to_local_names_unless_asked_not_to() {
-        let _serial = crate::test_env_lock();
-        let previous = std::env::var_os(NAME_CONSTRAINTS_ENV);
-        let generated = |value: Option<&str>| {
-            // SAFETY: the test env lock serializes this process's env.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(NAME_CONSTRAINTS_ENV, value),
-                    None => std::env::remove_var(NAME_CONSTRAINTS_ENV),
-                }
-            }
-            let (cert, _) = generate_ca().unwrap();
-            (
-                cert_has_name_constraints_bytes(cert.as_bytes()).unwrap(),
-                cert_declines_name_constraints_bytes(cert.as_bytes()).unwrap(),
-            )
-        };
-        let results = [None, Some("1"), Some("0"), Some("off"), Some("FALSE")].map(generated);
-        // SAFETY: as above.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(NAME_CONSTRAINTS_ENV, value),
-                None => std::env::remove_var(NAME_CONSTRAINTS_ENV),
-            }
+        assert_eq!(parse_name_constraints_override(None), None);
+        for (value, chosen) in [
+            ("1", true),
+            ("on", true),
+            ("0", false),
+            ("off", false),
+            (" FALSE ", false),
+            ("no", false),
+        ] {
+            assert_eq!(
+                parse_name_constraints_override(Some(value)),
+                Some(chosen),
+                "{value:?}"
+            );
         }
-        assert_eq!(
-            results,
-            [
-                (true, false),
-                (true, false),
-                (false, true),
-                (false, true),
-                (false, true)
-            ]
-        );
+        for name_constraints in [true, false] {
+            let (cert, _) = generate_ca_with_options(CaOptions { name_constraints }).unwrap();
+            assert_eq!(
+                cert_has_name_constraints_bytes(cert.as_bytes()).unwrap(),
+                name_constraints
+            );
+            assert_eq!(
+                cert_declines_name_constraints_bytes(cert.as_bytes()).unwrap(),
+                !name_constraints
+            );
+        }
     }
-
     /// The names a project asks for that a constrained CA may not sign are
     /// the ones named; an unconstrained CA may sign any.
     #[test]
@@ -308,6 +311,8 @@ mod tests {
             "router.home.arpa",
             "127.0.0.1",
             "192.168.1.20",
+            "100.100.1.2",
+            "198.18.0.9",
             "::1",
             "fe80::1",
             "staging.example.com",

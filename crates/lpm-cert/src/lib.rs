@@ -204,7 +204,7 @@ fn ensure_root_ca_pair_locked(ca_dir: &paths::GlobalCaDirectory) -> Result<RootC
             audit::append_best_effort(audit::AuditAction::CaGenerate {
                 fingerprint,
                 validity_days: ca::CA_VALIDITY_DAYS,
-                name_constraints: ca::wants_name_constraints(),
+                name_constraints: ca::cert_has_name_constraints_bytes(cert_pem.as_bytes())?,
             });
             true
         }
@@ -490,6 +490,27 @@ fn resolve_consent(consent: TrustStoreConsent<'_>, cert_pem: &[u8]) -> Result<bo
             };
             callback(&req)
         }
+    }
+}
+
+/// Of `hostnames`, the ones the local CA may not sign: the active root's
+/// constraints decide, or, before there is one, those a new one would get.
+/// For names a caller can leave out, such as `lpm dev --network`'s addresses.
+pub fn names_the_root_would_refuse(hostnames: &[String]) -> Result<Vec<String>, LpmError> {
+    let cert_path = paths::ca_cert_path()?;
+    match lpm_common::read_text_file_capped(
+        &cert_path,
+        lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(root) => ca::names_outside_constraints(root.as_bytes(), hostnames, &[]),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) if ca::wants_name_constraints() => {
+            ca::names_outside_local_names(hostnames, &[])
+        }
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(Vec::new()),
+        Err(error) => Err(LpmError::Cert(format!(
+            "failed to read CA cert at {}: {error}",
+            cert_path.display()
+        ))),
     }
 }
 

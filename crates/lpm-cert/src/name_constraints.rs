@@ -21,7 +21,14 @@ const LOCAL_TLD_ALLOWLIST: &[&str] = &["local", "test", "localhost", "internal",
 ///
 /// Each entry is the bare suffix without the leading dot. An entry whose `host` ends in
 /// any of these is redundant on a CA that already carries the built-in subtree.
-const BUILTIN_DNS_SUFFIXES: &[&str] = &["localhost", "local", "test", "lpm.test"];
+const BUILTIN_DNS_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "test",
+    "lpm.test",
+    "internal",
+    "home.arpa",
+];
 
 /// One accepted entry from `cert.extra_permitted_dns`.
 ///
