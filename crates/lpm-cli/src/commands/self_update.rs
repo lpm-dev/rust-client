@@ -38,9 +38,9 @@ use self::download::{create_staged_binary, finish_staged_binary};
 use self::probe::{BoundUpdateCommand, VersionProbe};
 #[cfg(windows)]
 use self::sandbox_helper::{
-    HelperSwap, SANDBOX_HELPER_FILE_NAME, SandboxHelperReport, SandboxHelperStatus, StagedHelper,
-    install_staged_helper, plain_display, refresh_stale_sandbox_helper,
-    sandbox_helper_named_elsewhere, stage_sandbox_helper,
+    HelperInstallError, HelperSwap, SANDBOX_HELPER_FILE_NAME, SandboxHelperReport,
+    SandboxHelperStatus, StagedHelper, install_staged_helper, plain_display,
+    refresh_stale_sandbox_helper, sandbox_helper_named_elsewhere, stage_sandbox_helper,
 };
 #[cfg(windows)]
 pub(crate) use self::windows_trust::administrators_only_path;
@@ -2293,13 +2293,18 @@ async fn run_standalone_update(
         } = assets.staged_binary;
         // The helper goes beside lpm, so where lpm is must still be a place
         // only its owner can change, as it is checked again before lpm itself
-        // is replaced. One that can't be swapped doesn't hold lpm back: the
-        // next self-update finds it stale and tries again.
+        // is replaced. One that can't be swapped, leaving the earlier one,
+        // doesn't hold lpm back: the next self-update finds it stale and tries
+        // again. One that leaves no helper there does.
         #[cfg(windows)]
         let helper = match assets.staged_helper {
             Some(staged) => {
                 validate_standalone_install_location(current_executable)?;
-                Some(install_staged_helper(staged).map_err(|error| error.to_string()))
+                match install_staged_helper(staged) {
+                    Ok(swap) => Some(Ok(swap)),
+                    Err(HelperInstallError::Unchanged(error)) => Some(Err(error.to_string())),
+                    Err(HelperInstallError::Missing(error)) => return Err(error),
+                }
             }
             None => None,
         };

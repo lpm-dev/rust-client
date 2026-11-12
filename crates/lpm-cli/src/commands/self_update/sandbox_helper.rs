@@ -92,25 +92,68 @@ pub(super) struct HelperSwap {
     backup_error: Option<String>,
 }
 
+/// Why a release's sandbox helper isn't in place.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(super) enum HelperInstallError {
+    /// The helper beside lpm, or its absence, is as it was.
+    Unchanged(LpmError),
+    /// No helper is where the sandbox looks for one: the release's couldn't
+    /// be put there, nor the earlier one back. lpm itself mustn't be
+    /// replaced then, or its sandbox would have no helper.
+    Missing(LpmError),
+}
+
+#[cfg(windows)]
+impl HelperInstallError {
+    pub(super) fn into_error(self) -> LpmError {
+        match self {
+            Self::Unchanged(error) | Self::Missing(error) => error,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Display for HelperInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unchanged(error) | Self::Missing(error) => error.fmt(f),
+        }
+    }
+}
+
 /// Puts the staged helper where the sandbox looks for it, beside lpm. A
 /// helper already there, which may be running a lifecycle script, is
 /// copied to `<helper>.previous`, as lpm itself is, and moved aside under
 /// a name earlier updates' leftovers are swept by. Anything there but a
-/// file, which the sweep wouldn't remove, is refused.
+/// file, which the sweep wouldn't remove, is refused. An error says whether
+/// the helper there is as it was.
 #[cfg(any(windows, test))]
-pub(super) fn install_staged_helper(staged: StagedHelper) -> Result<HelperSwap, LpmError> {
+pub(super) fn install_staged_helper(
+    staged: StagedHelper,
+) -> Result<HelperSwap, HelperInstallError> {
+    install_staged_helper_renaming(staged, |from, to| std::fs::rename(from, to))
+}
+
+/// [`install_staged_helper`], moving files with `rename`.
+#[cfg(any(windows, test))]
+fn install_staged_helper_renaming(
+    staged: StagedHelper,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<HelperSwap, HelperInstallError> {
+    let unchanged = HelperInstallError::Unchanged;
     let StagedHelper { asset, path } = staged;
-    ensure_staged_file_unchanged(&asset.temporary, &asset.sha256)?;
+    ensure_staged_file_unchanged(&asset.temporary, &asset.sha256).map_err(unchanged)?;
     let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
-        return Err(LpmError::SelfUpdate(format!(
+        return Err(unchanged(LpmError::SelfUpdate(format!(
             "the sandbox helper path {} has no directory or file name",
             plain_display(&path)
-        )));
+        ))));
     };
     if asset.temporary.path().parent() != Some(parent) {
-        return Err(LpmError::SelfUpdate(
+        return Err(unchanged(LpmError::SelfUpdate(
             "the staged sandbox helper is not beside the one it replaces".to_string(),
-        ));
+        )));
     }
     let file_name = file_name.to_string_lossy();
 
@@ -118,11 +161,11 @@ pub(super) fn install_staged_helper(staged: StagedHelper) -> Result<HelperSwap, 
     let mut backup_error = None;
     let moved_aside = match std::fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_file() => {
-            return Err(LpmError::SelfUpdate(format!(
+            return Err(unchanged(LpmError::SelfUpdate(format!(
                 "{} isn't a file, so self-update won't put the sandbox helper there; move it \
                  away and run `lpm self-update` again",
                 plain_display(&path)
-            )));
+            ))));
         }
         Ok(_) => {
             let previous = parent.join(format!("{file_name}.previous"));
@@ -132,31 +175,44 @@ pub(super) fn install_staged_helper(staged: StagedHelper) -> Result<HelperSwap, 
             }
             remove_binaries_moved_aside_by_earlier_updates(parent, &file_name);
             let aside = parent.join(format!("{file_name}.old.{}", std::process::id()));
-            std::fs::rename(&path, &aside).map_err(|error| {
-                LpmError::SelfUpdate(format!(
+            rename(&path, &aside).map_err(|error| {
+                unchanged(LpmError::SelfUpdate(format!(
                     "failed to move the sandbox helper {} aside: {error}",
                     plain_display(&path)
-                ))
+                )))
             })?;
             Some(aside)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            return Err(LpmError::SelfUpdate(format!(
+            return Err(unchanged(LpmError::SelfUpdate(format!(
                 "could not inspect the sandbox helper {}: {error}",
                 plain_display(&path)
-            )));
+            ))));
         }
     };
     let temporary = asset.temporary.into_temp_path();
-    if let Err(error) = std::fs::rename(&temporary, &path) {
-        if let Some(aside) = &moved_aside {
-            let _ = std::fs::rename(aside, &path);
-        }
-        return Err(LpmError::SelfUpdate(format!(
+    if let Err(error) = rename(&temporary, &path) {
+        let failed = format!(
             "failed to install the sandbox helper at {}: {error}",
             plain_display(&path)
-        )));
+        );
+        let Some(aside) = &moved_aside else {
+            return Err(unchanged(LpmError::SelfUpdate(failed)));
+        };
+        return Err(match rename(aside, &path) {
+            Ok(()) => unchanged(LpmError::SelfUpdate(failed)),
+            Err(restore_error) => HelperInstallError::Missing(LpmError::SelfUpdate(format!(
+                "{failed}; nor could the earlier one be put back: {restore_error}. It is at \
+                 {}{}: move it to {} so sandboxed scripts can run",
+                plain_display(aside),
+                backup
+                    .as_deref()
+                    .map(|copy| format!(", with a copy at {}", plain_display(copy)))
+                    .unwrap_or_default(),
+                plain_display(&path),
+            ))),
+        });
     }
     Ok(HelperSwap {
         path,
@@ -473,7 +529,9 @@ async fn refresh_sandbox_helper(
         ));
     };
     validate_standalone_install_location(current_executable)?;
-    let mut report = install_staged_helper(staged)?.finish();
+    let mut report = install_staged_helper(staged)
+        .map_err(HelperInstallError::into_error)?
+        .finish();
     // One that still names another release would be replaced on every run.
     let reported = sandbox_helper_release(path);
     if reported.as_deref() != Some(version) {
@@ -573,6 +631,95 @@ mod tests {
         assert!(refused.to_string().contains("isn't a file"), "{refused}");
         assert!(path.is_dir());
         assert_eq!(file_names_in(directory.path()), ["lpm-sandbox-helper.exe"]);
+    }
+
+    /// `rename`, failing from its `fail_from`th call on, counting from 1.
+    fn renaming_until(fail_from: usize) -> impl FnMut(&Path, &Path) -> std::io::Result<()> {
+        let mut calls = 0;
+        move |from, to| {
+            calls += 1;
+            if calls >= fail_from {
+                Err(std::io::Error::other("injected rename failure"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        }
+    }
+
+    /// A helper that can't be put in place, where the earlier one can't be
+    /// put back either, leaves none where the sandbox looks: the update
+    /// stops before lpm itself is replaced, and says where the earlier one
+    /// is.
+    #[test]
+    fn a_helper_swap_that_cannot_put_the_earlier_helper_back_stops_the_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SANDBOX_HELPER_FILE_NAME);
+        std::fs::write(&path, b"earlier helper").unwrap();
+
+        let error = install_staged_helper_renaming(
+            staged_helper_at(&path, b"later helper"),
+            renaming_until(2),
+        )
+        .unwrap_err();
+        let HelperInstallError::Missing(error) = error else {
+            panic!("the helper is gone, but the error says it is as it was: {error}");
+        };
+        assert!(!path.exists());
+        let aside = directory
+            .path()
+            .join(format!("lpm-sandbox-helper.exe.old.{}", std::process::id()));
+        assert_eq!(std::fs::read(&aside).unwrap(), b"earlier helper");
+        let message = error.to_string();
+        assert!(message.contains(&plain_display(&aside)), "{message}");
+        assert!(
+            message.contains(&plain_display(
+                &directory.path().join("lpm-sandbox-helper.exe.previous")
+            )),
+            "{message}"
+        );
+    }
+
+    /// A helper that can't be put in place leaves the earlier one there, or
+    /// none where there was none, and lpm itself may still be updated.
+    #[test]
+    fn a_helper_swap_that_fails_leaves_the_earlier_helper_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SANDBOX_HELPER_FILE_NAME);
+        std::fs::write(&path, b"earlier helper").unwrap();
+
+        // Moving the earlier helper aside fails.
+        let error = install_staged_helper_renaming(
+            staged_helper_at(&path, b"later helper"),
+            renaming_until(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, HelperInstallError::Unchanged(_)), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"earlier helper");
+
+        // Putting the release's in place fails, and the earlier one comes back.
+        let mut calls = 0;
+        let error =
+            install_staged_helper_renaming(staged_helper_at(&path, b"later helper"), |from, to| {
+                calls += 1;
+                if calls == 2 {
+                    Err(std::io::Error::other("injected rename failure"))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error, HelperInstallError::Unchanged(_)), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"earlier helper");
+
+        // There was none, and there still is none.
+        std::fs::remove_file(&path).unwrap();
+        let error = install_staged_helper_renaming(
+            staged_helper_at(&path, b"later helper"),
+            renaming_until(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, HelperInstallError::Unchanged(_)), "{error}");
+        assert!(!path.exists());
     }
 
     /// The update says when the copy of the earlier helper couldn't be
