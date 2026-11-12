@@ -34,9 +34,6 @@ pub(crate) mod windows_security {
         FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
     };
 
-    const OWNER_SYSTEM_FILE_DACL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)";
-    const OWNER_SYSTEM_DIRECTORY_DACL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
-
     struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
 
     impl Drop for LocalSecurityDescriptor {
@@ -50,7 +47,11 @@ pub(crate) mod windows_security {
     }
 
     pub(super) fn protect_cap_file(file: &cap_std::fs::File) -> std::io::Result<()> {
-        apply_sddl(file.as_raw_handle().cast(), OWNER_SYSTEM_FILE_DACL, true)
+        apply_sddl(
+            file.as_raw_handle().cast(),
+            &lpm_common::owner_only::owner_only_file_dacl()?,
+            true,
+        )
     }
 
     pub(super) fn protect_directory(dir: &cap_std::fs::Dir) -> std::io::Result<()> {
@@ -75,7 +76,7 @@ pub(crate) mod windows_security {
         }
         apply_sddl(
             file.as_raw_handle().cast(),
-            OWNER_SYSTEM_DIRECTORY_DACL,
+            &lpm_common::owner_only::owner_only_directory_dacl()?,
             true,
         )
     }
@@ -117,7 +118,7 @@ pub(crate) mod windows_security {
         }
         apply_sddl(
             file.as_raw_handle().cast(),
-            OWNER_SYSTEM_DIRECTORY_DACL,
+            &lpm_common::owner_only::owner_only_directory_dacl()?,
             true,
         )
     }
@@ -1939,6 +1940,13 @@ mod tests {
             "DACL still grants Everyone: {sddl}"
         );
         assert!(sddl.contains(";;;OW)"), "DACL omits owner rights: {sddl}");
+        // An elevated terminal makes the Administrators the owner; the same
+        // user's normal terminal still gets in.
+        let user = lpm_common::owner_only::process_user_sid().unwrap();
+        assert!(
+            sddl.contains(&format!(";;;{user})")),
+            "DACL omits the user: {sddl}"
+        );
         assert!(sddl.contains(";;;SY)"), "DACL omits SYSTEM: {sddl}");
     }
 

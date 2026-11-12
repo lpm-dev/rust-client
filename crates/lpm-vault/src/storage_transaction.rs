@@ -953,9 +953,6 @@ mod windows_security {
         DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
 
-    const OWNER_SYSTEM_FILE_DACL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)";
-    const OWNER_SYSTEM_DIRECTORY_DACL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
-
     struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
 
     impl Drop for LocalSecurityDescriptor {
@@ -967,7 +964,10 @@ mod windows_security {
     }
 
     pub(super) fn protect_file(file: &cap_std::fs::File) -> std::io::Result<()> {
-        apply_sddl(file.as_raw_handle().cast(), OWNER_SYSTEM_FILE_DACL)
+        apply_sddl(
+            file.as_raw_handle().cast(),
+            &lpm_common::owner_only::owner_only_file_dacl()?,
+        )
     }
 
     pub(super) fn protect_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
@@ -995,7 +995,10 @@ mod windows_security {
                 "vault storage directory handle is not a regular directory",
             ));
         }
-        apply_sddl(file.as_raw_handle().cast(), OWNER_SYSTEM_DIRECTORY_DACL)
+        apply_sddl(
+            file.as_raw_handle().cast(),
+            &lpm_common::owner_only::owner_only_directory_dacl()?,
+        )
     }
 
     fn apply_sddl(
