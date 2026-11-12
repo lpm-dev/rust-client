@@ -364,6 +364,107 @@ async fn ensure_detached_started_with_options(
     })
 }
 
+/// Starts the proxy as the Windows sign-in task `lpm proxy install`
+/// registers asks: lpm with `args`, `proxy start` and its listeners, in the
+/// background, in `project`, with `home` as its LPM home and its output
+/// appended to the logs. The task runs in no window, and conhost ends
+/// with 0 whatever lpm did, so why the proxy didn't start goes to the
+/// `stderr` log as well.
+pub(crate) fn run_internal_proxy_service(
+    home: &Path,
+    project: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    args: &[std::ffi::OsString],
+) -> Result<(), LpmError> {
+    let open = |path: &Path| -> Result<std::fs::File, LpmError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(LpmError::Io)
+    };
+    let stdout_log = open(stdout)?;
+    let mut stderr_log = open(stderr)?;
+    let program = std::env::current_exe().map_err(LpmError::Io)?;
+    let started = start_proxy_service(
+        &program,
+        home,
+        project,
+        stdout_log,
+        &stderr_log,
+        args,
+        PROXY_SERVICE_STARTUP,
+    );
+    if let Err(error) = &started {
+        use std::io::Write as _;
+        let _ = writeln!(
+            stderr_log,
+            "lpm: the proxy didn't start at sign-in: {error}"
+        );
+    }
+    started
+}
+
+/// How long a proxy started at sign-in must keep running to count as
+/// started: one that can't start, as when another program holds its
+/// ports, exits sooner.
+const PROXY_SERVICE_STARTUP: Duration = Duration::from_secs(5);
+
+/// [`run_internal_proxy_service`]'s start of `program`, which stands in for
+/// lpm in tests.
+fn start_proxy_service(
+    program: &Path,
+    home: &Path,
+    project: &Path,
+    stdout_log: std::fs::File,
+    stderr_log: &std::fs::File,
+    args: &[std::ffi::OsString],
+    startup: Duration,
+) -> Result<(), LpmError> {
+    if !project.is_dir() {
+        return Err(LpmError::Proxy(format!(
+            "its project directory {} isn't there",
+            project.display()
+        )));
+    }
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env("LPM_HOME", home)
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stdout(stdout_log)
+        .stderr(stderr_log.try_clone().map_err(LpmError::Io)?);
+    detach_background_command(&mut command);
+    #[cfg(windows)]
+    prepare_detached_spawn_handles().map_err(|err| {
+        LpmError::Proxy(format!(
+            "failed to prepare detached proxy daemon handles: {err}"
+        ))
+    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|err| LpmError::Proxy(format!("failed to start the proxy: {err}")))?;
+    let deadline = Instant::now() + startup;
+    while Instant::now() < deadline {
+        // One that ends well was stopped, as by `lpm proxy stop`.
+        match child.try_wait().map_err(LpmError::Io)? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => {
+                return Err(LpmError::Proxy(format!(
+                    "it exited ({status}) before it was up; what it said is above"
+                )));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    Ok(())
+}
+
 fn detach_background_command(command: &mut std::process::Command) {
     #[cfg(unix)]
     {

@@ -686,6 +686,12 @@ fn print_service_json(action: &str, changed: bool, dry_run: bool, plan: &ProxySe
         .privileged_forwarder
         .as_ref()
         .map(privileged_forwarder_json);
+    // The Windows sign-in task runs lpm itself, with no launcher script.
+    let launcher = if cfg!(windows) {
+        &plan.user_service.exe
+    } else {
+        &plan.user_service.launcher_path
+    };
     println!(
         "{}",
         serde_json::json!({
@@ -694,7 +700,7 @@ fn print_service_json(action: &str, changed: bool, dry_run: bool, plan: &ProxySe
             "changed": changed,
             "dryRun": dry_run,
             "service": plan.user_service.label,
-            "launcher": plan.user_service.launcher_path,
+            "launcher": launcher,
             "args": plan.user_service.start_args,
             "privilegedForwarder": forwarder,
         })

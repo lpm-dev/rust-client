@@ -491,26 +491,219 @@ fn unix_launcher_execs_proxy_start_with_quoted_paths() {
     assert!(launcher.contains("exec '/tmp/LPM Bin/lpm-rs' proxy start --tls-port 9443"));
 }
 
-/// cmd.exe reads a batch file in the console's code page, so the launcher
-/// holds no path: it finds LPM's home from its own place in it and gets lpm
-/// and the project as arguments.
+/// The logon task has conhost run lpm itself, which gets the home, project
+/// and logs as arguments, and the proxy's command after `--`.
 #[test]
-fn windows_launcher_holds_no_path() {
+fn windows_task_runs_lpm_with_the_home_project_and_logs() {
+    let spec = sample_service_spec();
+
+    assert_eq!(
+        windows_task_command(&spec),
+        [
+            "/tmp/LPM Bin/lpm-rs",
+            "internal-proxy-service",
+            "--home",
+            "/tmp/lpm home",
+            "--project",
+            "/tmp/project dir",
+            "--stdout",
+            "/tmp/lpm home/services/proxy/proxy.out.log",
+            "--stderr",
+            "/tmp/lpm home/services/proxy/proxy.err.log",
+            "--",
+            "proxy",
+            "start",
+            "--tls-port",
+            "9443",
+        ]
+    );
+}
+
+/// From review: conhost splits its command line into arguments and joins
+/// them again, quoting only those with a space in them, and the cmd.exe
+/// command line the task used to give it came out in pieces. lpm's
+/// arguments come out as they went in.
+#[cfg(windows)]
+#[test]
+fn the_windows_task_command_survives_conhost_joining_it_again() {
     let mut spec = sample_service_spec();
-    spec.lpm_home = PathBuf::from("/tmp/Çağrı/.lpm");
-    spec.launcher_path = spec.lpm_home.join("services/proxy/start-proxy.cmd");
-    spec.stdout_log = spec.lpm_home.join("services/proxy/proxy.out.log");
-    spec.stderr_log = spec.lpm_home.join("services/proxy/proxy.err.log");
+    spec.exe = PathBuf::from(r"C:\Program Files\LPM\lpm.exe");
+    spec.lpm_home = PathBuf::from(r"C:\Users\John Smith & Çağrı\.lpm");
+    spec.working_dir = PathBuf::from(r"D:\R&D (p q)\app ^!x!");
+    spec.stdout_log = spec.lpm_home.join(r"services\proxy\proxy.out.log");
+    spec.stderr_log = spec.lpm_home.join(r"services\proxy\proxy.err.log");
+    let command = windows_task_command(&spec);
 
-    let launcher = render_windows_launcher(&spec);
+    let arguments = command_line_arguments(&quote_windows_command(&command));
+    assert_eq!(arguments, command);
+    let joined_again = arguments
+        .iter()
+        .map(|argument| {
+            if argument.contains(' ') {
+                format!("\"{argument}\"")
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(command_line_arguments(&joined_again), command);
+}
 
-    assert!(launcher.is_ascii(), "{launcher}");
-    assert!(launcher.starts_with(lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE));
-    assert!(launcher.contains(r#"@FOR %%I IN ("%dp0%..\..") DO @SET "LPM_HOME=%%~fI""#));
-    assert!(launcher.contains("@CD /D \"%~2\" || EXIT /B 1\r\n"));
-    assert!(launcher.contains(
-        r#"@"%~1" proxy start --tls-port 9443 >>"%dp0%proxy.out.log" 2>>"%dp0%proxy.err.log""#
-    ));
+/// The arguments a program started with `command_line` reads.
+#[cfg(windows)]
+fn command_line_arguments(command_line: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+    // The first word is the program's name, which is read by other rules.
+    let wide = format!("program {command_line}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut count = 0;
+    // SAFETY: `wide` is NUL-terminated; the result is freed below.
+    let argv = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+    assert!(!argv.is_null());
+    let arguments = (1..usize::try_from(count).unwrap())
+        .map(|index| {
+            // SAFETY: CommandLineToArgvW returned `count` NUL-terminated strings.
+            let argument = unsafe { *argv.add(index) };
+            let length = (0..)
+                .take_while(|offset| unsafe { *argument.add(*offset) } != 0)
+                .count();
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(argument, length) })
+        })
+        .collect();
+    // SAFETY: the array came from CommandLineToArgvW and is freed once.
+    unsafe { LocalFree(argv.cast()) };
+    arguments
+}
+
+/// node.exe on `PATH`, which stands in for lpm.
+#[cfg(windows)]
+fn node_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node.exe"))
+        .find(|node| node.is_file())
+}
+
+/// As the sign-in task runs it, under a home and a project whose paths hold
+/// spaces, `&` and what no code page holds, lpm's proxy starts in the
+/// project with that home and its output in the logs. node stands in for
+/// lpm: it runs the script `proxy` in the project, which records what it got
+/// and keeps running.
+#[cfg(windows)]
+#[test]
+fn the_sign_in_task_starts_the_proxy_in_the_project_with_its_home() {
+    let Some(node) = node_on_path() else {
+        eprintln!("skipped: no node.exe on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("Çağrı home & co");
+    let project = dir.path().join("R&D Çağrı (p q)");
+    std::fs::create_dir_all(&project).unwrap();
+    let record = dir.path().join("record.json");
+    std::fs::write(
+        project.join("proxy"),
+        format!(
+            "require('fs').writeFileSync({:?}, JSON.stringify({{home: process.env.LPM_HOME, \
+             cwd: process.cwd(), args: process.argv.slice(2)}}));\n\
+             console.log('listening'); console.error('warming up');\n\
+             setTimeout(() => {{}}, 2000);\n",
+            record.display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("proxy.out.log");
+    let err = dir.path().join("proxy.err.log");
+    let args: Vec<std::ffi::OsString> = ["proxy", "start", "--tls-port", "9443"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+
+    start_proxy_service(
+        &node,
+        &home,
+        &project,
+        std::fs::File::create(&out).unwrap(),
+        &std::fs::File::create(&err).unwrap(),
+        &args,
+        Duration::from_millis(1500),
+    )
+    .unwrap();
+
+    let recorded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    assert_eq!(recorded["home"], home.display().to_string(), "{recorded}");
+    assert_eq!(
+        std::fs::canonicalize(recorded["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&project).unwrap()
+    );
+    assert_eq!(
+        recorded["args"],
+        serde_json::json!(["start", "--tls-port", "9443"])
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "listening");
+    assert_eq!(std::fs::read_to_string(&err).unwrap().trim(), "warming up");
+    // Let node finish before its directory goes.
+    std::thread::sleep(Duration::from_millis(1000));
+}
+
+/// A proxy that exits at once, as one whose ports are taken does, or a
+/// project that is gone, fails the start, which is logged; one stopped
+/// at once, which ends well, doesn't.
+#[cfg(windows)]
+#[test]
+fn a_sign_in_start_that_fails_says_so() {
+    let Some(node) = node_on_path() else {
+        eprintln!("skipped: no node.exe on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("proxy"), "process.exit(3);\n").unwrap();
+    let log = || std::fs::File::create(dir.path().join("log")).unwrap();
+    let args = [std::ffi::OsString::from("proxy")];
+
+    let exited = start_proxy_service(
+        &node,
+        dir.path(),
+        dir.path(),
+        log(),
+        &log(),
+        &args,
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(
+        exited.to_string().contains("exited (exit code: 3)"),
+        "{exited}"
+    );
+
+    std::fs::write(dir.path().join("proxy"), "process.exit(0);\n").unwrap();
+    start_proxy_service(
+        &node,
+        dir.path(),
+        dir.path(),
+        log(),
+        &log(),
+        &args,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    let gone = start_proxy_service(
+        &node,
+        dir.path(),
+        &dir.path().join("gone"),
+        log(),
+        &log(),
+        &args,
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(gone.to_string().contains("isn't there"), "{gone}");
 }
 
 /// The logon task is this user's own, needs no administrator, runs in no
@@ -536,9 +729,9 @@ fn windows_logon_task_is_the_users_own_and_runs_hidden() {
         "<RunLevel>LeastPrivilege</RunLevel>",
         "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
         "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+        "<Priority>5</Priority>",
         "conhost.exe</Command>",
-        "<Arguments>--headless &quot;",
-        r"Çağrı\R&amp;D &lt;bin&gt;\lpm.exe",
+        r"<Arguments>--headless &quot;C:\Users\Çağrı\R&amp;D &lt;bin&gt;\lpm.exe&quot; internal-proxy-service --home ",
     ] {
         assert!(xml.contains(element), "{element}: {xml}");
     }

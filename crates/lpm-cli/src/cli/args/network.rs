@@ -380,3 +380,23 @@ pub(crate) struct InternalHostsFileArgs {
     #[arg(long)]
     pub(crate) expected_blocks: Option<usize>,
 }
+
+#[derive(Args)]
+pub(crate) struct InternalProxyServiceArgs {
+    /// LPM home the proxy runs with.
+    #[arg(long)]
+    pub(crate) home: std::path::PathBuf,
+    /// Project directory the proxy runs in.
+    #[arg(long)]
+    pub(crate) project: std::path::PathBuf,
+    /// Log the proxy's standard output is appended to.
+    #[arg(long)]
+    pub(crate) stdout: std::path::PathBuf,
+    /// Log the proxy's standard error, and why it didn't start, is
+    /// appended to.
+    #[arg(long)]
+    pub(crate) stderr: std::path::PathBuf,
+    /// The lpm command that runs the proxy, after `--`.
+    #[arg(last = true)]
+    pub(crate) args: Vec<std::ffi::OsString>,
+}
