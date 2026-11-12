@@ -158,14 +158,26 @@ pub(super) fn path_is_trusted_system_install(path: &Path) -> bool {
         .any(|root| path_chain_has_private_dacl(path, &root, true))
 }
 
-/// Whether `path` sits in a system install root, such as Program Files,
-/// with it and every folder up to that root changeable only by SYSTEM,
-/// Administrators and TrustedInstaller: what may run elevated, since
-/// nothing the user runs can replace it or plant a DLL beside it.
-pub(crate) fn path_is_administrators_only(path: &Path) -> bool {
-    system_roots()
+/// `path` resolved, without links or a `\\?\` prefix, when it sits in a
+/// system install root, such as Program Files, with it and every folder up
+/// to that root changeable only by SYSTEM, Administrators and
+/// TrustedInstaller: the path to run elevated, since nothing the user runs
+/// can replace it, plant a DLL beside it, or repoint it before it starts.
+pub(crate) fn administrators_only_path(path: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    if !system_roots()
         .into_iter()
-        .any(|root| path_chain_has_private_dacl(path, &root, false))
+        .any(|root| path_chain_has_private_dacl(&resolved, &root, false))
+    {
+        return None;
+    }
+    let text = resolved.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(drive_path) if drive_path.as_bytes().get(1) == Some(&b':') => {
+            Some(PathBuf::from(drive_path))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn path_is_trusted_install_location(path: &Path, account_home: &Path) -> bool {
@@ -618,12 +630,29 @@ mod tests {
         let account = tempfile::tempdir().unwrap();
         let file = account.path().join("lpm.exe");
         std::fs::write(&file, b"").unwrap();
-        assert!(!path_is_administrators_only(&file));
-        let cmd = windows_directory()
-            .unwrap()
-            .join("System32")
-            .join("cmd.exe");
-        assert!(path_is_administrators_only(&cmd), "{}", cmd.display());
+        assert_eq!(administrators_only_path(&file), None);
+        let system32 = windows_directory().unwrap().join("System32");
+        let cmd = system32.join("cmd.exe");
+        // Resolving gives the case on disk, `C:\Windows` for `C:\WINDOWS`.
+        let is_cmd = |path: Option<PathBuf>| {
+            path.is_some_and(|path| {
+                path.to_string_lossy()
+                    .eq_ignore_ascii_case(&cmd.to_string_lossy())
+            })
+        };
+        assert!(is_cmd(administrators_only_path(&cmd)));
+
+        // Reached through a junction the user owns, and could repoint after
+        // the check, the path to run is the junction's target.
+        let link = account.path().join("tools");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&system32)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(is_cmd(administrators_only_path(&link.join("cmd.exe"))));
     }
 
     #[test]

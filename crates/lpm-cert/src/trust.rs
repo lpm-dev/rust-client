@@ -390,35 +390,7 @@ pub fn change_windows_root_store_with_certutil(
 pub fn check_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
     match change {
         WindowsRootStoreChange::Add { path, sha256 } => {
-            let pem =
-                lpm_common::read_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
-                    .map_err(|error| {
-                        LpmError::Cert(format!("failed to read {}: {error}", path.display()))
-                    })?;
-            let blocks = pem::parse_many(&pem)
-                .map_err(|error| LpmError::Cert(format!("invalid certificate PEM: {error}")))?;
-            let [certificate] = blocks.as_slice() else {
-                return Err(LpmError::Cert(format!(
-                    "{} must hold exactly one certificate",
-                    path.display()
-                )));
-            };
-            if certificate.tag() != "CERTIFICATE" {
-                return Err(LpmError::Cert(format!(
-                    "{} holds a {}, not a certificate",
-                    path.display(),
-                    certificate.tag()
-                )));
-            }
-            use sha2::Digest as _;
-            let digest: [u8; 32] = sha2::Sha256::digest(certificate.contents()).into();
-            let actual = cert::fingerprint_hex(&digest).replace(':', "");
-            if !actual.eq_ignore_ascii_case(sha256) {
-                return Err(LpmError::Cert(format!(
-                    "{} is not the certificate with SHA-256 fingerprint {sha256}",
-                    path.display()
-                )));
-            }
+            checked_certificate(path, sha256)?;
         }
         WindowsRootStoreChange::Remove { sha1 } => {
             if sha1.len() != 40 || !sha1.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -431,14 +403,108 @@ pub fn check_windows_root_store_change(change: &WindowsRootStoreChange) -> Resul
     Ok(())
 }
 
+/// The certificate in `path`, written out again as PEM, once the file is
+/// exactly one X.509 certificate whose SHA-256 fingerprint is `sha256`.
+/// `path` must be on a local drive: an elevated process reading a network
+/// path would offer an administrator's credentials to wherever it leads.
+#[cfg(target_os = "windows")]
+fn checked_certificate(path: &Path, sha256: &str) -> Result<Vec<u8>, LpmError> {
+    if !is_local_drive_path(path) {
+        return Err(LpmError::Cert(format!(
+            "{} is not a file on a local drive",
+            path.display()
+        )));
+    }
+    let pem = lpm_common::read_file_capped(path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| LpmError::Cert(format!("failed to read {}: {error}", path.display())))?;
+    let blocks = pem::parse_many(&pem)
+        .map_err(|error| LpmError::Cert(format!("invalid certificate PEM: {error}")))?;
+    let [certificate] = blocks.as_slice() else {
+        return Err(LpmError::Cert(format!(
+            "{} must hold exactly one certificate",
+            path.display()
+        )));
+    };
+    if certificate.tag() != "CERTIFICATE" {
+        return Err(LpmError::Cert(format!(
+            "{} holds a {}, not a certificate",
+            path.display(),
+            certificate.tag()
+        )));
+    }
+    // A container such as PKCS #7 can wear the label and hold several.
+    let der = certificate.contents();
+    if !x509_parser::parse_x509_certificate(der).is_ok_and(|(rest, _)| rest.is_empty()) {
+        return Err(LpmError::Cert(format!(
+            "{} doesn't hold one X.509 certificate",
+            path.display()
+        )));
+    }
+    use sha2::Digest as _;
+    let digest: [u8; 32] = sha2::Sha256::digest(der).into();
+    let actual = cert::fingerprint_hex(&digest).replace(':', "");
+    if !actual.eq_ignore_ascii_case(sha256) {
+        return Err(LpmError::Cert(format!(
+            "{} is not the certificate with SHA-256 fingerprint {sha256}",
+            path.display()
+        )));
+    }
+    Ok(pem::encode(&pem::Pem::new("CERTIFICATE", der.to_vec())).into_bytes())
+}
+
+/// Whether `path` is on a drive with a letter that isn't a network one.
+#[cfg(target_os = "windows")]
+fn is_local_drive_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
+        return false;
+    };
+    let root: Vec<u16> = format!("{}:\\", char::from(letter))
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: `root` is NUL-terminated and lives through the call.
+    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    // DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_RAMDISK.
+    matches!(kind, 2 | 3 | 6)
+}
+
 /// Makes `change` from a process that is already elevated, as the LPM
 /// CLI's elevated helper is, once [`check_windows_root_store_change`]
 /// accepts it; certutil does it.
 #[cfg(target_os = "windows")]
 pub fn apply_windows_root_store_change(change: &WindowsRootStoreChange) -> Result<(), LpmError> {
-    check_windows_root_store_change(change)?;
+    match change {
+        WindowsRootStoreChange::Add { path, sha256 } => {
+            let certificate = checked_certificate(path, sha256)?;
+            // Whoever started this helper named the file, which may change
+            // once checked, so certutil reads a copy staged here and pinned
+            // until it is done, in this process's own temporary directory.
+            with_certificate_staged_in(&std::env::temp_dir(), &certificate, path, |staged| {
+                run_certutil(&[
+                    std::ffi::OsStr::new("-addstore"),
+                    std::ffi::OsStr::new("Root"),
+                    staged.as_os_str(),
+                ])
+            })
+        }
+        WindowsRootStoreChange::Remove { .. } => {
+            check_windows_root_store_change(change)?;
+            let args = change.certutil_args();
+            run_certutil(&args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_certutil(args: &[&std::ffi::OsStr]) -> Result<(), LpmError> {
     let status = Command::new(certutil_executable()?)
-        .args(change.certutil_args())
+        .args(args)
         .stdout(Stdio::null())
         .status()
         .map_err(|error| LpmError::Cert(format!("failed to run certutil: {error}")))?;
@@ -900,6 +966,16 @@ fn with_verified_certificate_file<T>(
                 display_path.display()
             ))
         })?;
+    with_certificate_staged_in(directory, cert_pem, display_path, operation)
+}
+
+/// [`with_verified_certificate_file`], staging in `directory`.
+fn with_certificate_staged_in<T>(
+    directory: &Path,
+    cert_pem: &[u8],
+    display_path: &Path,
+    operation: impl FnOnce(&Path) -> Result<T, LpmError>,
+) -> Result<T, LpmError> {
     let mut temporary = tempfile::Builder::new()
         .prefix(".lpm-verified-ca-")
         .tempfile_in(directory)
@@ -1840,10 +1916,34 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
                 "must hold exactly one certificate",
             ),
             (key, "not a certificate"),
+            // Labelled a certificate, but not one: as a PKCS #7 bundle can be.
+            (
+                pem::encode(&pem::Pem::new(
+                    "CERTIFICATE",
+                    vec![0x30, 0x03, 0x02, 0x01, 0x00],
+                )),
+                "doesn't hold one X.509 certificate",
+            ),
+            (
+                {
+                    let mut der = pem::parse(expected.as_bytes()).unwrap().contents().to_vec();
+                    der.extend_from_slice(&[0x30, 0x00]);
+                    pem::encode(&pem::Pem::new("CERTIFICATE", der))
+                },
+                "doesn't hold one X.509 certificate",
+            ),
         ] {
             let error = check(content).unwrap_err().to_string();
             assert!(error.contains(refusal), "{error}");
         }
+        // Refused before any read, which would reach out over the network.
+        let error = check_windows_root_store_change(&WindowsRootStoreChange::Add {
+            path: r"\\localhost\lpm-share\rootCA.pem".into(),
+            sha256: sha256.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not a file on a local drive"), "{error}");
         check_windows_root_store_change(&WindowsRootStoreChange::Remove {
             sha1: "0123456789abcdefABCDEF0123456789abcdef01".to_string(),
         })

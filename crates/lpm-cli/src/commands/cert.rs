@@ -299,12 +299,16 @@ pub(crate) fn change_windows_root_store_through_helper(
     if crate::privilege::is_elevated() {
         return lpm_cert::trust::apply_windows_root_store_change(change);
     }
-    let helper_is_protected = std::env::current_exe()
-        .is_ok_and(|exe| crate::commands::self_update::path_is_administrators_only(&exe));
-    if !helper_is_protected {
+    // The path checked is the path elevated: resolved, it holds no link the
+    // user could repoint between the check and the prompt.
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|exe| crate::commands::self_update::administrators_only_path(&exe));
+    let Some(helper) = helper else {
         return lpm_cert::trust::change_windows_root_store_with_certutil(change);
-    }
-    crate::elevation::run_current_exe_helper(
+    };
+    crate::elevation::run_exe_helper(
+        &helper,
         &internal_cert_store_args(change),
         "Password for LPM certificate trust: ",
         "certificate-trust",
