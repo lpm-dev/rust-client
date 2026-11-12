@@ -966,6 +966,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Tunnel(reason) => {
             diagnostic_lines("Tunnel error", Some(reason), error)
         }
+        lpm_common::LpmError::Proxy(reason) => diagnostic_lines("Proxy error", Some(reason), error),
         lpm_common::LpmError::TunnelAccess { code, message, .. } => diagnostic_lines(
             "Tunnel unavailable",
             Some(&format!("{message} ({code})")),

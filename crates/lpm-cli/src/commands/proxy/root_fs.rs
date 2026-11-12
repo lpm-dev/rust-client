@@ -117,7 +117,7 @@ pub(super) fn private_root_directory(
     )?;
     let directory = path_from_command_output(&created.stdout);
     if directory.parent() != Some(parent) {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "mktemp created {} outside {}",
             directory.display(),
             parent.display()
@@ -154,13 +154,13 @@ pub(super) fn write_root_file(
     mode: &str,
 ) -> Result<(), LpmError> {
     let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "{} is not a file path",
             destination.display()
         )));
     };
     let refuse = |reason: String| {
-        LpmError::Script(format!("cannot write {}: {reason}", destination.display()))
+        LpmError::Proxy(format!("cannot write {}: {reason}", destination.display()))
     };
     if let Some(reason) = changeable_by_others(parent, trusted_uid) {
         return Err(refuse(reason));
@@ -199,7 +199,7 @@ pub(super) fn write_root_file(
 pub(super) fn rename_onto(privileged: &Path, from: &Path, to: &Path) -> Result<(), LpmError> {
     match std::fs::symlink_metadata(to) {
         Ok(metadata) if metadata.is_dir() => {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "{} is a directory, not a file",
                 to.display()
             )));
@@ -207,7 +207,7 @@ pub(super) fn rename_onto(privileged: &Path, from: &Path, to: &Path) -> Result<(
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "inspect {}: {error}",
                 to.display()
             )));
@@ -291,9 +291,9 @@ pub(super) fn open_for_copy(path: &Path) -> Result<std::fs::File, LpmError> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .map_err(|error| LpmError::Script(format!("open {}: {error}", path.display())))?;
+        .map_err(|error| LpmError::Proxy(format!("open {}: {error}", path.display())))?;
     if !file.metadata().map_err(LpmError::Io)?.is_file() {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "{} is not a regular file",
             path.display()
         )));

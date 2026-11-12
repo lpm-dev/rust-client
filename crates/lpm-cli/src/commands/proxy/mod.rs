@@ -52,18 +52,18 @@ pub async fn run(options: ProxyRunOptions<'_>) -> Result<(), LpmError> {
     if public_tls_port.is_some()
         && (action != "start" || tls_port.is_none() || public_tls_port == Some(0))
     {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--public-tls-port` requires `proxy start --tls-port` and a nonzero public port"
                 .into(),
         ));
     }
     if forwarder_config.is_some() && action != "forwarder" {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--forwarder-config` is only valid for the internal proxy forwarder".into(),
         ));
     }
     if replace && !(action == "install" && privileged_ports) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--replace` is only valid with `lpm proxy install --privileged-ports`".into(),
         ));
     }
@@ -80,34 +80,34 @@ pub async fn run(options: ProxyRunOptions<'_>) -> Result<(), LpmError> {
         .await;
     }
     if detach && action != "start" {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--detach` is only valid as `lpm proxy start --detach`".into(),
         ));
     }
     if privileged_ports && !matches!(action, "install" | "uninstall") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--privileged-ports` is only valid with `lpm proxy install` or `lpm proxy uninstall`"
                 .into(),
         ));
     }
     if http_port.is_some() && !matches!(action, "start" | "install") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--http-port` is only valid with `lpm proxy start` or `lpm proxy install`".into(),
         ));
     }
     if http_redirect_port.is_some() && !matches!(action, "start" | "install") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--http-redirect-port` is only valid with `lpm proxy start` or `lpm proxy install`"
                 .into(),
         ));
     }
     if http_redirect_port.is_some() && tls_port.is_none() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--http-redirect-port <port>` requires `--tls-port <port>`".into(),
         ));
     }
     if tls_port.is_some() && !matches!(action, "start" | "install") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--tls-port` is only valid with `lpm proxy start` or `lpm proxy install`".into(),
         ));
     }
@@ -138,7 +138,7 @@ pub async fn run(options: ProxyRunOptions<'_>) -> Result<(), LpmError> {
             tls_port,
         ),
         "uninstall" => proxy_service::run_uninstall(json_output, privileged_ports),
-        _ => Err(LpmError::Script(format!(
+        _ => Err(LpmError::Proxy(format!(
             "unknown proxy action '{action}'. Available: status, list, start, stop, install, uninstall"
         ))),
     }
@@ -154,17 +154,17 @@ async fn run_forwarder_action(
     forwarder_config: Option<&Path>,
 ) -> Result<(), LpmError> {
     if json_output || detach || privileged_ports {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "the internal proxy forwarder does not accept CLI output or service flags".into(),
         ));
     }
     if http_port.is_some() || http_redirect_port.is_some() || tls_port.is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "the internal proxy forwarder reads listeners from `--forwarder-config`".into(),
         ));
     }
     let config_path = forwarder_config.ok_or_else(|| {
-        LpmError::Script("the internal proxy forwarder requires `--forwarder-config <path>`".into())
+        LpmError::Proxy("the internal proxy forwarder requires `--forwarder-config <path>`".into())
     })?;
     run_forwarder(config_path).await
 }
@@ -172,16 +172,16 @@ async fn run_forwarder_action(
 #[cfg(unix)]
 async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
     if proxy_service::current_effective_uid() != 0 {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "the internal proxy forwarder must run as root".into(),
         ));
     }
     let bytes = lpm_common::read_file_capped(config_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        .map_err(|error| LpmError::Script(error.to_string()))?;
+        .map_err(|error| LpmError::Proxy(error.to_string()))?;
     let config: proxy_service::PrivilegedForwarderConfig =
-        serde_json::from_slice(&bytes).map_err(|err| LpmError::Script(err.to_string()))?;
+        serde_json::from_slice(&bytes).map_err(|err| LpmError::Proxy(err.to_string()))?;
     if config.rules.is_empty() {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "forwarder config {} has no rules",
             config_path.display()
         )));
@@ -190,7 +190,7 @@ async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
     let mut listeners = Vec::with_capacity(config.rules.len());
     for rule in &config.rules {
         if !rule.listen_addr.ip().is_loopback() {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "forwarder listen address must be loopback, got {}",
                 rule.listen_addr
             )));
@@ -198,12 +198,12 @@ async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
         let listener = tokio::net::TcpListener::bind(rule.listen_addr)
             .await
             .map_err(|err| {
-                LpmError::Script(format!("bind TCP forwarder on {}: {err}", rule.listen_addr))
+                LpmError::Proxy(format!("bind TCP forwarder on {}: {err}", rule.listen_addr))
             })?;
         listeners.push((rule.target, listener));
     }
     lpm_proxy::drop_root_privileges(config.target_uid)
-        .map_err(|err| LpmError::Script(err.to_string()))?;
+        .map_err(|err| LpmError::Proxy(err.to_string()))?;
 
     let mut handles = Vec::with_capacity(listeners.len());
     for (target, listener) in listeners {
@@ -214,7 +214,7 @@ async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
         );
         handles.push(
             lpm_proxy::start_guarded_tcp_forwarder(listener, guard)
-                .map_err(|err| LpmError::Script(err.to_string()))?,
+                .map_err(|err| LpmError::Proxy(err.to_string()))?,
         );
     }
 
@@ -225,7 +225,7 @@ async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
 
 #[cfg(not(unix))]
 async fn run_forwarder(_config_path: &Path) -> Result<(), LpmError> {
-    Err(LpmError::Script(
+    Err(LpmError::Proxy(
         "the internal proxy forwarder is only supported on Unix platforms".into(),
     ))
 }
@@ -271,7 +271,7 @@ async fn run_start(
         return run_start_detached(project_dir, json_output, options).await;
     }
     if json_output {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`lpm proxy start --json` is not supported for foreground mode; use `lpm proxy status --json` from another shell"
             .into(),
         ));
@@ -296,7 +296,7 @@ async fn run_start(
     install_ui::phase_untrusted(&message);
     lpm_proxy::serve_control_default_with_options(options)
         .await
-        .map_err(|err| LpmError::Script(err.to_string()))?;
+        .map_err(|err| LpmError::Proxy(err.to_string()))?;
     install_ui::done("local proxy control daemon stopped");
     Ok(())
 }
@@ -349,13 +349,13 @@ async fn ensure_detached_started_with_options(
     append_listener_args(&mut command, options);
     #[cfg(windows)]
     prepare_detached_spawn_handles().map_err(|err| {
-        LpmError::Script(format!(
+        LpmError::Proxy(format!(
             "failed to prepare detached proxy daemon handles: {err}"
         ))
     })?;
     let mut child = command
         .spawn()
-        .map_err(|err| LpmError::Script(format!("failed to start detached proxy daemon: {err}")))?;
+        .map_err(|err| LpmError::Proxy(format!("failed to start detached proxy daemon: {err}")))?;
 
     let status = wait_for_detached_start(&mut child).await?;
     Ok(DetachedProxyStart {
@@ -468,7 +468,7 @@ async fn wait_for_detached_start(child: &mut std::process::Child) -> Result<Prox
             {
                 return Ok(running);
             }
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "detached proxy daemon exited before becoming ready ({status}); run `lpm proxy start` in the foreground for details"
             )));
         }
@@ -479,7 +479,7 @@ async fn wait_for_detached_start(child: &mut std::process::Child) -> Result<Prox
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let _ = child.kill();
-    Err(LpmError::Script(
+    Err(LpmError::Proxy(
         "detached proxy daemon did not become ready within 10s".into(),
     ))
 }
@@ -499,7 +499,7 @@ pub(super) fn resolve_start_options(
         });
     }
 
-    let Some(config) = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)? else {
+    let Some(config) = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Proxy)? else {
         return Ok(lpm_proxy::ProxyDaemonOptions::default());
     };
     Ok(start_options_from_config(&config))
@@ -529,16 +529,16 @@ async fn run_stop(json_output: bool) -> Result<(), LpmError> {
     let stopped = match lpm_proxy::send_request(lpm_proxy::ProxyRequest::Stop).await {
         Ok(lpm_proxy::ProxyResponse::Stopped) => true,
         Ok(lpm_proxy::ProxyResponse::Error { message }) => {
-            return Err(LpmError::Script(message));
+            return Err(LpmError::Proxy(message));
         }
         Ok(other) => {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "unexpected proxy stop response: {other:?}"
             )));
         }
         Err(lpm_proxy::ProxyError::IpcUnavailable(_))
         | Err(lpm_proxy::ProxyError::IpcUnsupported) => false,
-        Err(err) => return Err(LpmError::Script(err.to_string())),
+        Err(err) => return Err(LpmError::Proxy(err.to_string())),
     };
 
     if json_output {
@@ -560,7 +560,7 @@ async fn run_stop(json_output: bool) -> Result<(), LpmError> {
 async fn read_status() -> Result<ProxyStatus, LpmError> {
     lpm_proxy::status()
         .await
-        .map_err(|err| LpmError::Script(err.to_string()))
+        .map_err(|err| LpmError::Proxy(err.to_string()))
 }
 
 fn print_status_json(status: &ProxyStatus) {

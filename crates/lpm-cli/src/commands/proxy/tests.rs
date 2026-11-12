@@ -410,7 +410,7 @@ fn privileged_forwarder_remove_check_rejects_other_uid_cleanup() {
 fn privileged_forwarder_cleanup_error_names_remaining_root_artifacts() {
     let spec = sample_forwarder_spec();
     let message =
-        format_privileged_forwarder_cleanup_error(&LpmError::Script("sudo failed".into()), &spec);
+        format_privileged_forwarder_cleanup_error(&LpmError::Proxy("sudo failed".into()), &spec);
 
     assert!(message.contains("sudo failed"), "got {message}");
     assert!(
@@ -491,15 +491,58 @@ fn unix_launcher_execs_proxy_start_with_quoted_paths() {
     assert!(launcher.contains("exec '/tmp/LPM Bin/lpm-rs' proxy start --tls-port 9443"));
 }
 
+/// cmd.exe reads a batch file in the console's code page, so the launcher
+/// holds no path: it finds LPM's home from its own place in it and gets lpm
+/// and the project as arguments.
 #[test]
-fn windows_launcher_quotes_paths_and_start_arguments() {
-    let spec = sample_service_spec();
+fn windows_launcher_holds_no_path() {
+    let mut spec = sample_service_spec();
+    spec.lpm_home = PathBuf::from("/tmp/Çağrı/.lpm");
+    spec.launcher_path = spec.lpm_home.join("services/proxy/start-proxy.cmd");
+    spec.stdout_log = spec.lpm_home.join("services/proxy/proxy.out.log");
+    spec.stderr_log = spec.lpm_home.join("services/proxy/proxy.err.log");
 
     let launcher = render_windows_launcher(&spec);
 
-    assert!(launcher.contains("set \"LPM_HOME=/tmp/lpm home\""));
-    assert!(launcher.contains("cd /d \"/tmp/project dir\" || exit /b 1"));
-    assert!(launcher.contains("\"/tmp/LPM Bin/lpm-rs\" proxy start --tls-port 9443"));
+    assert!(launcher.is_ascii(), "{launcher}");
+    assert!(launcher.starts_with(lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE));
+    assert!(launcher.contains(r#"@FOR %%I IN ("%dp0%..\..") DO @SET "LPM_HOME=%%~fI""#));
+    assert!(launcher.contains("@CD /D \"%~2\" || EXIT /B 1\r\n"));
+    assert!(launcher.contains(
+        r#"@"%~1" proxy start --tls-port 9443 >>"%dp0%proxy.out.log" 2>>"%dp0%proxy.err.log""#
+    ));
+}
+
+/// The logon task is this user's own, needs no administrator, runs in no
+/// window and for as long as the user is signed in; the paths, in the
+/// UTF-16 definition, can be anything.
+#[test]
+fn windows_logon_task_is_the_users_own_and_runs_hidden() {
+    let mut spec = sample_service_spec();
+    spec.exe = PathBuf::from(r"C:\Users\Çağrı\R&D <bin>\lpm.exe");
+
+    let xml = render_windows_task_xml(
+        &spec,
+        "S-1-5-21-1-2-3-1001",
+        Path::new(r"C:\Windows\System32"),
+    );
+
+    assert_eq!(
+        xml.matches("<UserId>S-1-5-21-1-2-3-1001</UserId>").count(),
+        2
+    );
+    for element in [
+        "<LogonType>InteractiveToken</LogonType>",
+        "<RunLevel>LeastPrivilege</RunLevel>",
+        "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+        "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+        "conhost.exe</Command>",
+        "<Arguments>--headless &quot;",
+        r"Çağrı\R&amp;D &lt;bin&gt;\lpm.exe",
+    ] {
+        assert!(xml.contains(element), "{element}: {xml}");
+    }
+    assert!(!xml.contains("R&D <bin>"), "{xml}");
 }
 
 #[test]

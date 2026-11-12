@@ -16,7 +16,7 @@ use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn trusted_sudo() -> Result<&'static Path, LpmError> {
     crate::elevation::trusted_sudo().ok_or_else(|| {
-        LpmError::Script(crate::elevation::trusted_sudo_not_found_message(
+        LpmError::Proxy(crate::elevation::trusted_sudo_not_found_message(
             "proxy forwarder",
         ))
     })
@@ -46,15 +46,17 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     Ok(())
 }
 
+/// Removes the user service, and says whether there was one.
 #[cfg(target_os = "macos")]
-pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
+pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<bool, LpmError> {
     let target = macos_launchctl_target(spec.label);
     uninstall_macos_user_agent(Path::new("launchctl"), &target)?;
     let plist_path = macos_launch_agent_path(spec.label)?;
-    if plist_path.exists() {
+    let installed = plist_path.exists();
+    if installed {
         std::fs::remove_file(plist_path).map_err(LpmError::Io)?;
     }
-    Ok(())
+    Ok(installed)
 }
 
 #[cfg(target_os = "linux")]
@@ -70,51 +72,83 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     Ok(())
 }
 
+/// Removes the user service, and says whether there was one.
 #[cfg(target_os = "linux")]
-pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
+pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<bool, LpmError> {
     let unit_name = linux_systemd_unit_name(spec.label);
-    uninstall_linux_user_unit(Path::new("systemctl"), &unit_name)?;
     let unit_path = linux_systemd_user_unit_path(spec.label)?;
-    if unit_path.exists() {
+    let installed = unit_path.exists();
+    uninstall_linux_user_unit(Path::new("systemctl"), &unit_name)?;
+    if installed {
         std::fs::remove_file(unit_path).map_err(LpmError::Io)?;
     }
     if spec.launcher_path.exists() {
         std::fs::remove_file(&spec.launcher_path).map_err(LpmError::Io)?;
     }
     run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-    Ok(())
+    Ok(installed)
 }
 
+/// Registers a task that starts the proxy when this user signs in, in no
+/// window. Its logon trigger is this user's alone: one for any user's
+/// logon, which `schtasks /SC ONLOGON` makes, needs an administrator.
 #[cfg(windows)]
 pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
-    write_windows_launcher(spec)?;
-    install_windows_user_task(
-        Path::new("schtasks"),
-        windows_task_name(spec.label),
-        &spec.launcher_path,
-    )?;
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
-    uninstall_windows_user_task(Path::new("schtasks"), windows_task_name(spec.label))?;
-    if spec.launcher_path.exists() {
-        std::fs::remove_file(&spec.launcher_path).map_err(LpmError::Io)?;
+    let user = windows_user_sid()?;
+    let spec = windows_plain_spec(spec)?;
+    write_windows_launcher(&spec)?;
+    let system = lpm_common::platform::windows_system_directory().map_err(|error| {
+        LpmError::Proxy(format!(
+            "couldn't find the Windows system directory: {error}"
+        ))
+    })?;
+    let task_file = spec.launcher_path.with_file_name("proxy-task.xml");
+    write_windows_task_xml(&task_file, &render_windows_task_xml(&spec, &user, &system))?;
+    let installed =
+        install_windows_user_task(Path::new("schtasks"), &windows_task_name(&user), &task_file);
+    let _ = std::fs::remove_file(&task_file);
+    installed?;
+    if windows_user_task_exists(Path::new("schtasks"), WINDOWS_EARLIER_TASK_NAME).unwrap_or(false) {
+        tracing::warn!(
+            "the task an earlier LPM release made, {WINDOWS_EARLIER_TASK_NAME}, also starts a proxy \
+             when anyone signs in; remove it from an administrator terminal with \
+             `schtasks /Delete /TN {WINDOWS_EARLIER_TASK_NAME} /F`"
+        );
     }
     Ok(())
 }
 
+/// Removes this user's task, and the one earlier releases made for anyone's
+/// logon where this user may, and says whether there was one.
+#[cfg(windows)]
+pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<bool, LpmError> {
+    let user = windows_user_sid()?;
+    let mut removed =
+        uninstall_windows_user_task(Path::new("schtasks"), &windows_task_name(&user))?;
+    match uninstall_windows_user_task(Path::new("schtasks"), WINDOWS_EARLIER_TASK_NAME) {
+        Ok(earlier) => removed |= earlier,
+        Err(error) => tracing::warn!(
+            "couldn't remove the task an earlier LPM release made, {WINDOWS_EARLIER_TASK_NAME}: \
+             {error}; remove it from an administrator terminal with \
+             `schtasks /Delete /TN {WINDOWS_EARLIER_TASK_NAME} /F`"
+        ),
+    }
+    if spec.launcher_path.exists() {
+        std::fs::remove_file(&spec.launcher_path).map_err(LpmError::Io)?;
+    }
+    Ok(removed)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(super) fn install_proxy_service_platform(_spec: &ProxyServiceSpec) -> Result<(), LpmError> {
-    Err(LpmError::Script(
+    Err(LpmError::Proxy(
         "`lpm proxy install` is not supported on this platform".into(),
     ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub(super) fn uninstall_proxy_service_platform(_spec: &ProxyServiceSpec) -> Result<(), LpmError> {
-    Err(LpmError::Script(
+pub(super) fn uninstall_proxy_service_platform(_spec: &ProxyServiceSpec) -> Result<bool, LpmError> {
+    Err(LpmError::Proxy(
         "`lpm proxy uninstall` is not supported on this platform".into(),
     ))
 }
@@ -247,7 +281,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
 pub(super) fn install_privileged_forwarder_platform(
     _spec: &PrivilegedForwarderSpec,
 ) -> Result<(), LpmError> {
-    Err(LpmError::Script(
+    Err(LpmError::Proxy(
         "`lpm proxy install --privileged-ports` is only supported on Linux and macOS".into(),
     ))
 }
@@ -256,20 +290,20 @@ pub(super) fn install_privileged_forwarder_platform(
 pub(super) fn uninstall_privileged_forwarder_platform(
     _spec: &PrivilegedForwarderSpec,
 ) -> Result<(), LpmError> {
-    Err(LpmError::Script(
+    Err(LpmError::Proxy(
         "`lpm proxy uninstall --privileged-ports` is only supported on Linux and macOS".into(),
     ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn privileged_forwarder_config_json(spec: &PrivilegedForwarderSpec) -> Result<String, LpmError> {
-    serde_json::to_string_pretty(&spec.config).map_err(|err| LpmError::Script(err.to_string()))
+    serde_json::to_string_pretty(&spec.config).map_err(|err| LpmError::Proxy(err.to_string()))
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn macos_launch_agent_path(label: &str) -> Result<PathBuf, LpmError> {
     let home = dirs::home_dir().ok_or_else(|| {
-        LpmError::Script("could not determine home directory for LaunchAgent install".into())
+        LpmError::Proxy("could not determine home directory for LaunchAgent install".into())
     })?;
     Ok(home
         .join("Library")
@@ -382,7 +416,7 @@ pub(super) fn linux_systemd_user_unit_path(label: &str) -> Result<PathBuf, LpmEr
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .ok_or_else(|| {
-            LpmError::Script("could not determine config directory for systemd user unit".into())
+            LpmError::Proxy("could not determine config directory for systemd user unit".into())
         })?;
     Ok(config_home
         .join("systemd")
@@ -494,27 +528,165 @@ pub(super) fn write_windows_launcher(spec: &ProxyServiceSpec) -> Result<(), LpmE
     std::fs::write(&spec.launcher_path, render_windows_launcher(spec)).map_err(LpmError::Io)
 }
 
+/// The batch file the logon task runs as `<launcher> <lpm> <project>`. It
+/// holds no path: cmd.exe reads a batch file in the console's code page, so
+/// a non-ASCII one written into it would break. It finds LPM's home from
+/// its own place in it, gets the rest as arguments, and logs beside itself,
+/// as it runs in no window.
 #[cfg(any(test, windows))]
 pub(super) fn render_windows_launcher(spec: &ProxyServiceSpec) -> String {
-    let mut command = Vec::with_capacity(1 + spec.start_args.len());
-    command.push(spec.exe.display().to_string());
-    command.extend(spec.start_args.iter().cloned());
+    let up = spec
+        .launcher_path
+        .parent()
+        .and_then(|directory| directory.strip_prefix(&spec.lpm_home).ok())
+        .map_or(0, |below| below.components().count());
+    let home = if up == 0 {
+        ".".to_string()
+    } else {
+        vec![".."; up].join("\\")
+    };
+    let log = |path: &Path| {
+        path.file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    };
     format!(
-        "@echo off\r\nset \"LPM_HOME={}\"\r\ncd /d \"{}\" || exit /b 1\r\n{}\r\n",
-        spec.lpm_home.display(),
-        spec.working_dir.display(),
-        quote_windows_command(&command),
+        "{preamble}@FOR %%I IN (\"%dp0%{home}\") DO @SET \"LPM_HOME=%%~fI\"\r\n\
+         @CD /D \"%~2\" || EXIT /B 1\r\n\
+         @\"%~1\" {args} >>\"%dp0%{stdout}\" 2>>\"%dp0%{stderr}\"\r\n",
+        preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
+        args = quote_windows_command(&spec.start_args),
+        stdout = log(&spec.stdout_log),
+        stderr = log(&spec.stderr_log),
     )
 }
 
-#[cfg(windows)]
-pub(super) fn windows_task_name(_label: &str) -> &'static str {
-    r"\LPM\Proxy"
+/// The task earlier releases made, for any user's logon.
+#[cfg(any(windows, all(test, unix)))]
+pub(super) const WINDOWS_EARLIER_TASK_NAME: &str = r"\LPM\Proxy";
+
+/// This user's task, by their SID: each account on a PC has its own.
+#[cfg(any(test, windows))]
+pub(super) fn windows_task_name(user_sid: &str) -> String {
+    format!(r"\LPM Proxy ({user_sid})")
 }
 
-#[cfg(any(windows, all(test, unix)))]
-pub(super) fn quote_windows_task_command(path: &Path) -> String {
-    quote_windows_command(&[path.display().to_string()])
+/// The Task Scheduler definition of the logon task: this user's logon
+/// starts the launcher through cmd.exe in a console with no window
+/// (`conhost --headless`), with this user's own rights, for as long as they
+/// stay signed in, on battery too. The paths go in this UTF-16 file, which
+/// holds any of them, and from it to the launcher as arguments.
+#[cfg(any(test, windows))]
+pub(super) fn render_windows_task_xml(
+    spec: &ProxyServiceSpec,
+    user_sid: &str,
+    system_dir: &Path,
+) -> String {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    // `cmd /s /c` takes the outer quotes off what follows and runs the rest.
+    let arguments = format!(
+        r#"--headless "{}" /d /v:off /s /c ""{}" "{}" "{}"""#,
+        system_dir.join("cmd.exe").display(),
+        spec.launcher_path.display(),
+        spec.exe.display(),
+        spec.working_dir.display(),
+    );
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
+         \x20 <RegistrationInfo>\r\n\
+         \x20   <Description>Starts the LPM local proxy when this user signs in.</Description>\r\n\
+         \x20 </RegistrationInfo>\r\n\
+         \x20 <Triggers>\r\n\
+         \x20   <LogonTrigger>\r\n\
+         \x20     <Enabled>true</Enabled>\r\n\
+         \x20     <UserId>{user}</UserId>\r\n\
+         \x20   </LogonTrigger>\r\n\
+         \x20 </Triggers>\r\n\
+         \x20 <Principals>\r\n\
+         \x20   <Principal id=\"Author\">\r\n\
+         \x20     <UserId>{user}</UserId>\r\n\
+         \x20     <LogonType>InteractiveToken</LogonType>\r\n\
+         \x20     <RunLevel>LeastPrivilege</RunLevel>\r\n\
+         \x20   </Principal>\r\n\
+         \x20 </Principals>\r\n\
+         \x20 <Settings>\r\n\
+         \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n\
+         \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n\
+         \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n\
+         \x20   <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n\
+         \x20   <Enabled>true</Enabled>\r\n\
+         \x20 </Settings>\r\n\
+         \x20 <Actions Context=\"Author\">\r\n\
+         \x20   <Exec>\r\n\
+         \x20     <Command>{conhost}</Command>\r\n\
+         \x20     <Arguments>{arguments}</Arguments>\r\n\
+         \x20   </Exec>\r\n\
+         \x20 </Actions>\r\n\
+         </Task>\r\n",
+        user = escape(user_sid),
+        conhost = escape(&system_dir.join("conhost.exe").display().to_string()),
+        arguments = escape(&arguments),
+    )
+}
+
+/// Writes `xml` as Task Scheduler reads it: UTF-16 with a byte order mark.
+#[cfg(windows)]
+fn write_windows_task_xml(path: &Path, xml: &str) -> Result<(), LpmError> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        bytes.extend(unit.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(LpmError::Io)
+}
+
+#[cfg(windows)]
+fn windows_user_sid() -> Result<String, LpmError> {
+    lpm_sandbox::helper_appcontainer::setup::current_user_sid().map_err(|error| {
+        LpmError::Proxy(format!(
+            "couldn't read this Windows user's identity: {error}"
+        ))
+    })
+}
+
+/// `spec` with the paths the task hands cmd.exe as it can read them: without
+/// a `\\?\` prefix, which `cd` refuses, where that names the same file, and
+/// with no `%`, which cmd.exe would read as part of a variable.
+#[cfg(windows)]
+fn windows_plain_spec(spec: &ProxyServiceSpec) -> Result<ProxyServiceSpec, LpmError> {
+    let plain = |path: &Path| -> Result<std::path::PathBuf, LpmError> {
+        let text = path.to_string_lossy();
+        let path = match text.strip_prefix(r"\\?\") {
+            Some(rest)
+                if rest.as_bytes().get(1) == Some(&b':')
+                    && std::path::absolute(rest)
+                        .is_ok_and(|absolute| absolute == Path::new(rest)) =>
+            {
+                std::path::PathBuf::from(rest)
+            }
+            _ => path.to_path_buf(),
+        };
+        if path.to_string_lossy().contains('%') {
+            return Err(LpmError::Proxy(format!(
+                "can't start the proxy at sign-in through {}: cmd.exe would read the `%` in it as \
+                 part of a variable",
+                path.display()
+            )));
+        }
+        Ok(path)
+    };
+    Ok(ProxyServiceSpec {
+        exe: plain(&spec.exe)?,
+        working_dir: plain(&spec.working_dir)?,
+        // Together, so the launcher finds the home from its place in it.
+        lpm_home: plain(&spec.lpm_home)?,
+        launcher_path: plain(&spec.launcher_path)?,
+        ..spec.clone()
+    })
 }
 
 #[cfg(any(test, windows))]
@@ -580,7 +752,7 @@ pub(super) fn run_checked_output(command: &mut Command) -> Result<std::process::
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(LpmError::Script(format!(
+    Err(LpmError::Proxy(format!(
         "`{}` failed with {}{}{}",
         format_command_for_error(command),
         output.status,
@@ -614,7 +786,7 @@ pub(super) fn require_success(
     if status.success() {
         return Ok(());
     }
-    Err(LpmError::Script(format!(
+    Err(LpmError::Proxy(format!(
         "`{}` failed with {status}",
         format_command_for_error(command),
     )))
@@ -722,8 +894,10 @@ fn uninstall_macos_user_agent(program: &Path, target: &str) -> Result<(), LpmErr
     run_macos_bootout(Command::new(program).args(["bootout", target]))
 }
 
+/// Registers `task` from the definition in `task_file`, replacing and
+/// stopping one already there, and starts it.
 #[cfg(any(windows, all(test, unix)))]
-fn install_windows_user_task(program: &Path, task: &str, launcher: &Path) -> Result<(), LpmError> {
+fn install_windows_user_task(program: &Path, task: &str, task_file: &Path) -> Result<(), LpmError> {
     if windows_user_task_exists(program, task)? {
         run_checked(Command::new(program).args(["/End", "/TN", task]))?;
     }
@@ -732,12 +906,8 @@ fn install_windows_user_task(program: &Path, task: &str, launcher: &Path) -> Res
             .arg("/Create")
             .arg("/TN")
             .arg(task)
-            .arg("/SC")
-            .arg("ONLOGON")
-            .arg("/TR")
-            .arg(quote_windows_task_command(launcher))
-            .arg("/RL")
-            .arg("LIMITED")
+            .arg("/XML")
+            .arg(task_file)
             .arg("/F"),
     )?;
     run_checked(Command::new(program).arg("/Run").arg("/TN").arg(task))?;
@@ -757,13 +927,15 @@ fn windows_user_task_exists(program: &Path, task: &str) -> Result<bool, LpmError
     }))
 }
 
+/// Stops and removes `task`, and says whether there was one.
 #[cfg(any(windows, all(test, unix)))]
-fn uninstall_windows_user_task(program: &Path, task: &str) -> Result<(), LpmError> {
+fn uninstall_windows_user_task(program: &Path, task: &str) -> Result<bool, LpmError> {
     if !windows_user_task_exists(program, task)? {
-        return Ok(());
+        return Ok(false);
     }
     run_checked(Command::new(program).args(["/End", "/TN", task]))?;
-    run_checked(Command::new(program).args(["/Delete", "/TN", task, "/F"]))
+    run_checked(Command::new(program).args(["/Delete", "/TN", task, "/F"]))?;
+    Ok(true)
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -775,7 +947,7 @@ fn run_macos_bootout(command: &mut Command) -> Result<(), LpmError> {
     if output.status.success() || output.status.code() == Some(3) {
         return Ok(());
     }
-    Err(LpmError::Script(format!(
+    Err(LpmError::Proxy(format!(
         "`{}` failed with {}: {}",
         format_command_for_error(command),
         output.status,
@@ -947,5 +1119,135 @@ exit 0
             .env(CHILD, "1").output().unwrap();
         assert!(output.status.success());
         assert!(!String::from_utf8_lossy(&output.stdout).contains(MARKER));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_task_tests {
+    use super::*;
+
+    /// Task Scheduler takes the logon task from a user who isn't elevated,
+    /// as a trigger for this user's logon alone needs no administrator.
+    #[test]
+    fn the_logon_task_registers_for_this_user_and_is_removed_again() {
+        struct DeleteTask(String);
+        impl Drop for DeleteTask {
+            fn drop(&mut self) {
+                let _ = Command::new("schtasks")
+                    .args(["/Delete", "/TN", &self.0, "/F"])
+                    .output();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_home = dir.path().join("Çağrı home");
+        let service_dir = lpm_home.join("services").join("proxy");
+        let spec = ProxyServiceSpec {
+            label: "dev.lpm.proxy",
+            exe: dir.path().join("lpm.exe"),
+            working_dir: dir.path().to_path_buf(),
+            lpm_home,
+            start_args: vec!["proxy".into(), "start".into()],
+            launcher_path: service_dir.join("start-proxy.cmd"),
+            stdout_log: service_dir.join("proxy.out.log"),
+            stderr_log: service_dir.join("proxy.err.log"),
+        };
+        let user = windows_user_sid().unwrap();
+        let system = lpm_common::platform::windows_system_directory().unwrap();
+        let task_file = dir.path().join("proxy-task.xml");
+        write_windows_task_xml(&task_file, &render_windows_task_xml(&spec, &user, &system))
+            .unwrap();
+        let task = format!(r"\LPM Proxy test {}", std::process::id());
+        let schtasks = Path::new("schtasks");
+
+        run_checked(
+            Command::new(schtasks)
+                .arg("/Create")
+                .arg("/TN")
+                .arg(&task)
+                .arg("/XML")
+                .arg(&task_file)
+                .arg("/F"),
+        )
+        .unwrap();
+        let _delete = DeleteTask(task.clone());
+
+        assert!(windows_user_task_exists(schtasks, &task).unwrap());
+        assert!(uninstall_windows_user_task(schtasks, &task).unwrap());
+        assert!(!windows_user_task_exists(schtasks, &task).unwrap());
+        assert!(!uninstall_windows_user_task(schtasks, &task).unwrap());
+    }
+
+    /// Run as the task runs it, under a home and a project whose paths no
+    /// code page holds, the launcher sets LPM's home and the project
+    /// directory, and hands lpm its arguments. node stands in for lpm: it
+    /// runs the script `proxy` in the project, which records what it got.
+    #[test]
+    fn the_launcher_runs_lpm_in_the_project_with_its_home() {
+        let Some(node) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("node.exe"))
+            .find(|node| node.is_file())
+        else {
+            eprintln!("skipped: no node.exe on PATH");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_home = dir.path().join("Çağrı home");
+        let service_dir = lpm_home.join("services").join("proxy");
+        let project = dir.path().join("R&D Çağrı");
+        std::fs::create_dir_all(&project).unwrap();
+        let record = dir.path().join("record.json");
+        std::fs::write(
+            project.join("proxy"),
+            format!(
+                "require('fs').writeFileSync({:?}, JSON.stringify({{home: process.env.LPM_HOME, \
+                 cwd: process.cwd(), args: process.argv.slice(2)}}));\n",
+                record.display().to_string()
+            ),
+        )
+        .unwrap();
+        let spec = ProxyServiceSpec {
+            label: "dev.lpm.proxy",
+            exe: node.clone(),
+            working_dir: project.clone(),
+            lpm_home: lpm_home.clone(),
+            start_args: vec![
+                "proxy".into(),
+                "start".into(),
+                "--tls-port".into(),
+                "9443".into(),
+            ],
+            launcher_path: service_dir.join("start-proxy.cmd"),
+            stdout_log: service_dir.join("proxy.out.log"),
+            stderr_log: service_dir.join("proxy.err.log"),
+        };
+        write_windows_launcher(&spec).unwrap();
+        let system = lpm_common::platform::windows_system_directory().unwrap();
+
+        use std::os::windows::process::CommandExt as _;
+        let output = Command::new(system.join("cmd.exe"))
+            .args(["/d", "/v:off", "/s", "/c"])
+            .raw_arg(format!(
+                r#"""{}" "{}" "{}"""#,
+                spec.launcher_path.display(),
+                node.display(),
+                project.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        let same = |value: &serde_json::Value, path: &Path| {
+            std::fs::canonicalize(value.as_str().unwrap()).unwrap()
+                == std::fs::canonicalize(path).unwrap()
+        };
+        assert!(same(&recorded["home"], &lpm_home), "{recorded}");
+        assert!(same(&recorded["cwd"], &project), "{recorded}");
+        assert_eq!(
+            recorded["args"],
+            serde_json::json!(["start", "--tls-port", "9443"])
+        );
     }
 }

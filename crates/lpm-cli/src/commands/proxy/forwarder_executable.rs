@@ -241,7 +241,7 @@ fn install_checked(
 ) -> Result<(), LpmError> {
     let install_dir = &executable.install_dir;
     let refuse = |reason: String| {
-        LpmError::Script(format!(
+        LpmError::Proxy(format!(
             "cannot install the privileged forwarder under {}: {reason}",
             install_dir.display()
         ))
@@ -277,7 +277,7 @@ fn create_root_owned_directory(install_dir: &Path, privileged: &Path) -> Result<
         .map_err(LpmError::Io)?
         .is_dir();
     if !is_directory {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "{} must be a directory, not a link or a file",
             install_dir.display()
         )));
@@ -313,7 +313,7 @@ fn install_staged_copy(
         #[cfg(target_os = "macos")]
         copy_bundle_as_root(privileged, executable, &staged, &checks.bundle)?;
         #[cfg(not(target_os = "macos"))]
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "{} is an app bundle, which only macOS installs",
             executable.source.display()
         )));
@@ -408,7 +408,7 @@ fn copy_bundle_as_root(
 
     let source = &executable.source;
     let not_lpm = |what: &dyn std::fmt::Display| {
-        LpmError::Script(format!(
+        LpmError::Proxy(format!(
             "{what} is not part of LPM's app bundle, so it is not copied for the privileged forwarder"
         ))
     };
@@ -429,7 +429,7 @@ fn copy_bundle_as_root(
             let entry = entry.map_err(LpmError::Io)?;
             entries += 1;
             if entries > policy.max_entries {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Proxy(format!(
                     "{} holds more than the {} entries LPM's app bundle may",
                     source.display(),
                     policy.max_entries
@@ -459,7 +459,7 @@ fn copy_bundle_as_root(
         .iter()
         .find(|required| !executables.contains(required) && !others.contains(required))
     {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Proxy(format!(
             "{} lacks {}, so it is not LPM's app bundle",
             source.display(),
             missing.display()
@@ -482,7 +482,7 @@ fn copy_bundle_as_root(
             limit,
         )?
         else {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "{} is larger than LPM's app bundle may be",
                 path.display()
             )));
@@ -512,7 +512,7 @@ fn verify_staged_copy(staged: &Path, trusted_uid: u32) -> Result<(), LpmError> {
     let mut pending = vec![staged.to_path_buf()];
     while let Some(path) = pending.pop() {
         let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-            LpmError::Script(format!("inspect staged {}: {error}", path.display()))
+            LpmError::Proxy(format!("inspect staged {}: {error}", path.display()))
         })?;
         let owner = metadata.uid();
         let mode = metadata.mode();
@@ -522,7 +522,7 @@ fn verify_staged_copy(staged: &Path, trusted_uid: u32) -> Result<(), LpmError> {
             || mode & 0o6022 != 0
             || has_extended_acl(&path)?
         {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "the staged forwarder executable {} is not safe for root to run (owner UID {owner}, mode {:o})",
                 path.display(),
                 mode & 0o7777
@@ -540,7 +540,7 @@ fn verify_staged_copy(staged: &Path, trusted_uid: u32) -> Result<(), LpmError> {
 #[cfg(target_os = "macos")]
 fn has_extended_acl(path: &Path) -> Result<bool, LpmError> {
     lpm_common::macos_acl::has_extended_acl_at(path)
-        .map_err(|error| LpmError::Script(format!("read the ACL of {}: {error}", path.display())))
+        .map_err(|error| LpmError::Proxy(format!("read the ACL of {}: {error}", path.display())))
 }
 
 /// A Linux ACL grants no more than the mode's group bits, which the checks
@@ -577,7 +577,7 @@ fn running_code_requirement(app_bundle: bool) -> Result<Option<String>, LpmError
             lpm_release_requirement()
         ))),
         (Some(cdhash), false) => Ok(Some(format!(r#"=cdhash H"{cdhash}""#))),
-        (None, true) => Err(LpmError::Script(
+        (None, true) => Err(LpmError::Proxy(
             "the running lpm app bundle has no code signature".into(),
         )),
         (None, false) => Ok(None),
@@ -624,7 +624,7 @@ fn verify_code_requirement(staged: &Path, requirement: &str) -> Result<(), LpmEr
     )
     .map(drop)
     .map_err(|error| {
-        LpmError::Script(format!(
+        LpmError::Proxy(format!(
             "the staged forwarder executable {} does not carry the code signature of the lpm that is running: {error}",
             staged.display()
         ))
