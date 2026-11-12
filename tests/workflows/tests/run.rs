@@ -809,16 +809,14 @@ fn run_passes_cmd_metacharacters_as_literal_arguments() {
     }
 }
 
-/// Through a pipe or a nested cmd.exe, which `cmd/c` is, cmd.exe reads the
-/// arguments again a number of times that depends on what runs, so only
-/// words it gives no meaning to are passed.
+/// Through a pipe, cmd.exe reads the arguments again a number of times that
+/// depends on what runs, so only words it gives no meaning to are passed.
 #[cfg(windows)]
 #[test]
 fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
     let project = windows_argument_capture_project(
         r#"{
             "piped":"node -e 0 | capture",
-            "nested":"cmd/c capture",
             "piped-if":"node -e 0 | if 1==1 node -e 0 & capture",
             "piped-escaped-if":"node -e 0 | i^f 1==1 node -e 0 & capture",
             "piped-if-paren":"node -e 0 | if(1)==(1) node -e 0 & capture",
@@ -830,7 +828,6 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
     // never runs, whatever its arguments.
     for (script, runs) in [
         ("piped", true),
-        ("nested", true),
         ("piped-if", true),
         ("piped-escaped-if", true),
         ("piped-if-paren", true),
@@ -882,9 +879,10 @@ fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
 /// After a trailing operator the arguments would be a command of their own,
 /// and after a trailing redirection the file it writes, so none are passed.
 /// Nor are they where cmd.exe would find either only after expanding a
-/// variable, from the project's `.env` or from LPM's own environment, or
-/// when another cmd.exe reads the line again: through a pipe or a nested
-/// cmd.exe, with one level of `^` taken out and variables expanded again.
+/// variable, from the project's `.env` or from LPM's own environment; when
+/// a pipe's cmd.exe reads the line again, with one level of `^` taken out
+/// and variables expanded again; or to a nested cmd.exe, which reads its
+/// command line again however it is written.
 #[cfg(windows)]
 #[test]
 fn run_refuses_arguments_that_would_make_their_own_command() {
@@ -896,21 +894,34 @@ fn run_refuses_arguments_that_would_make_their_own_command() {
             "expanded":"node -e 0 %CHAIN%",
             "expanded-inherited":"node -e 0 %LPM_TEST_CHAIN%",
             "piped-escaped-operator":"node -e 0 | echo X ^&",
+            "piped-expanded-again":"node -e 0 | capture %LPM_TEST_AGAIN%",
+            "nested":"cmd/c capture",
             "nested-conditional":"cmd /d /c if 1==1",
-            "piped-expanded-again":"node -e 0 | capture %LPM_TEST_AGAIN%"
+            "nested-grouped":"cmd /d /c if 1==2 (echo a)",
+            "nested-quoted":"cmd /d /c \"if 1==1\"",
+            "nested-r":"cmd /d /r if 1==1",
+            "nested-semicolon":"cmd; /d /c if 1==1",
+            "nested-comspec":"\"%ComSpec%\" /d /c if 1==1"
         }"#,
     );
     project.write_file(".env", "CHAIN=\"&&\"\n");
 
+    let mkdir: &[&str] = &["mkdir", "INJECTEDDIR"];
     for (script, args) in [
-        ("dangling", ["mkdir", "INJECTEDDIR"]),
-        ("redirected", ["plain-target.txt", "--flag"]),
-        ("conditional", ["mkdir", "INJECTEDDIR"]),
-        ("expanded", ["mkdir", "INJECTEDDIR"]),
-        ("expanded-inherited", ["mkdir", "INJECTEDDIR"]),
-        ("piped-escaped-operator", ["mkdir", "INJECTEDDIR"]),
-        ("nested-conditional", ["mkdir", "INJECTEDDIR"]),
-        ("piped-expanded-again", ["mkdir", "INJECTEDDIR"]),
+        ("dangling", mkdir),
+        ("redirected", &["plain-target.txt", "--flag"]),
+        ("conditional", mkdir),
+        ("expanded", mkdir),
+        ("expanded-inherited", mkdir),
+        ("piped-escaped-operator", mkdir),
+        ("piped-expanded-again", mkdir),
+        ("nested", mkdir),
+        ("nested-conditional", mkdir),
+        ("nested-grouped", &["else", "mkdir", "INJECTEDDIR"]),
+        ("nested-quoted", mkdir),
+        ("nested-r", mkdir),
+        ("nested-semicolon", mkdir),
+        ("nested-comspec", mkdir),
     ] {
         let output = lpm(&project)
             .args(["run", script, "--"])
