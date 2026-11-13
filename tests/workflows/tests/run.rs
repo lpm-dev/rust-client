@@ -708,76 +708,308 @@ fn run_without_lpm_json_rejects_a_standard_env_symlink_outside_the_project() {
     );
 }
 
+/// A project whose `capture` shim runs `record-args.js`, which records the
+/// arguments it gets in `args.json`. The script must not be named after the
+/// command: cmd.exe looks in the project first and, through `PATHEXT`, would
+/// run a `capture.js` there with Windows Script Host instead of the shim.
 #[cfg(windows)]
-#[test]
-fn run_passes_cmd_metacharacters_as_literal_arguments() {
-    let project = TempProject::empty(
-        r#"{
+fn windows_argument_capture_project(scripts: &str) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{
             "name":"windows-literal-args",
             "version":"1.0.0",
-            "scripts":{"capture":"capture"}
-        }"#,
-    );
+            "scripts":{scripts}
+        }}"#
+    ));
     project.write_file(
-        "capture.js",
+        "record-args.js",
         "require('fs').writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));\n",
     );
     std::fs::create_dir_all(project.path().join("node_modules/.bin"))
         .expect("create local bin directory");
     project.write_file(
         "node_modules/.bin/capture.cmd",
-        "@ECHO OFF\r\nnode \"%~dp0\\..\\..\\capture.js\" %*\r\n",
+        "@ECHO OFF\r\nnode \"%~dp0\\..\\..\\record-args.js\" %*\r\n",
     );
+    project
+}
+
+/// The arguments `record-args.js` recorded last, or a failure that shows
+/// what lpm printed.
+#[cfg(windows)]
+fn recorded_arguments(project: &TempProject, output: &std::process::Output) -> serde_json::Value {
+    let recorded =
+        std::fs::read_to_string(project.path().join("args.json")).unwrap_or_else(|error| {
+            panic!(
+                "no args.json in {} ({error}); lpm printed:\n{}{}",
+                project.path().display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    serde_json::from_str(&recorded).expect("parse recorded arguments")
+}
+
+/// Arguments reach the script's last command intact, whether that is the
+/// `capture.cmd` shim, which has cmd.exe read them twice, or `node`, which
+/// gets them after one reading — wherever the script's first word points.
+#[cfg(windows)]
+#[test]
+fn run_passes_cmd_metacharacters_as_literal_arguments() {
+    let project = windows_argument_capture_project(
+        r#"{
+            "capture":"capture",
+            "chained":"node -e 0 && capture",
+            "reverse":"capture && node record-args.js"
+        }"#,
+    );
+    // The quote-escaping payload comes before `quoted"value`, whose odd
+    // number of quotes would otherwise leave it inside a quoted stretch.
+    let args = [
+        "x\" & echo PWNED>injected-marker & \"",
+        "",
+        "two words",
+        "tab\tvalue",
+        "snowman-☃",
+        "a&b",
+        "c|d",
+        "e<f",
+        "g>h",
+        "%PATH%",
+        "!delayed!",
+        "quoted\"value",
+        "trail\\",
+        "--flag=1",
+        "& echo PWNED > injected-marker",
+    ];
+
+    for script in ["capture", "chained", "reverse"] {
+        let _ = std::fs::remove_file(project.path().join("args.json"));
+        let output = lpm(&project)
+            .args(["run", script, "--"])
+            .args(args)
+            .output()
+            .expect("run script with cmd.exe metacharacters");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !project.file_exists("injected-marker"),
+            "{script}: an argument ran as a command"
+        );
+        assert!(output.status.success(), "{script} failed:\n{combined}");
+        assert_eq!(
+            recorded_arguments(&project, &output),
+            serde_json::json!(args),
+            "{script}"
+        );
+    }
+}
+
+/// Through a pipe, cmd.exe reads the arguments again a number of times that
+/// depends on what runs, so only words it gives no meaning to are passed.
+#[cfg(windows)]
+#[test]
+fn run_refuses_arguments_cmd_would_read_again_on_the_way() {
+    let project = windows_argument_capture_project(
+        r#"{
+            "piped":"node -e 0 | capture",
+            "piped-if":"node -e 0 | if 1==1 node -e 0 & capture",
+            "piped-escaped-if":"node -e 0 | i^f 1==1 node -e 0 & capture",
+            "piped-if-paren":"node -e 0 | if(1)==(1) node -e 0 & capture",
+            "piped-redirected-if":"node -e 0 | 2>nul if 1==1 node -e 0 & capture"
+        }"#,
+    );
+
+    // cmd.exe refuses a line with a redirection before `if`, so that script
+    // never runs, whatever its arguments.
+    for (script, runs) in [
+        ("piped", true),
+        ("piped-if", true),
+        ("piped-escaped-if", true),
+        ("piped-if-paren", true),
+        ("piped-redirected-if", false),
+    ] {
+        let _ = std::fs::remove_file(project.path().join("args.json"));
+        let output = lpm(&project)
+            .args([
+                "run",
+                script,
+                "--",
+                "--flag=1",
+                "x\" & echo PWNED>injected-marker & \"",
+            ])
+            .output()
+            .expect("run script with cmd.exe metacharacters");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{script} ran:\n{combined}");
+        assert!(combined.contains("cannot pass"), "{combined}");
+        assert!(!project.file_exists("args.json"), "{script} ran");
+        assert!(!project.file_exists("injected-marker"));
+
+        let output = lpm(&project)
+            .args(["run", script, "--", "--flag=1", r"src\index.ts"])
+            .output()
+            .expect("run script with plain arguments");
+        if !runs {
+            assert!(!output.status.success(), "{script} ran");
+            assert!(!project.file_exists("args.json"), "{script} ran");
+            continue;
+        }
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            recorded_arguments(&project, &output),
+            serde_json::json!(["--flag=1", r"src\index.ts"]),
+            "{script}"
+        );
+    }
+}
+
+/// After a trailing operator the arguments would be a command of their own,
+/// and after a trailing redirection the file it writes, so none are passed.
+/// Nor are they where cmd.exe would find either only after expanding a
+/// variable, from the project's `.env` or from LPM's own environment; when
+/// a pipe's cmd.exe reads the line again, with one level of `^` taken out
+/// and variables expanded again; or to a nested cmd.exe, which reads its
+/// command line again however it is written.
+#[cfg(windows)]
+#[test]
+fn run_refuses_arguments_that_would_make_their_own_command() {
+    let project = windows_argument_capture_project(
+        r#"{
+            "dangling":"node -e 0 &&",
+            "redirected":"capture >",
+            "conditional":"if 1==2 (node -e 0) else",
+            "expanded":"node -e 0 %CHAIN%",
+            "expanded-inherited":"node -e 0 %LPM_TEST_CHAIN%",
+            "piped-escaped-operator":"node -e 0 | echo X ^&",
+            "piped-expanded-again":"node -e 0 | capture %LPM_TEST_AGAIN%",
+            "nested":"cmd/c capture",
+            "nested-conditional":"cmd /d /c if 1==1",
+            "nested-grouped":"cmd /d /c if 1==2 (echo a)",
+            "nested-quoted":"cmd /d /c \"if 1==1\"",
+            "nested-r":"cmd /d /r if 1==1",
+            "nested-semicolon":"cmd; /d /c if 1==1",
+            "nested-comspec":"\"%ComSpec%\" /d /c if 1==1",
+            "nested-comspec-part":"\"%ComSpec:~0%\" /d /c \"node -e 0 &&\"",
+            "closed-block":"if exist nonexistent (node -e 0 && capture)",
+            "piped-closed-block":"node -e 0 | if 1==2 (echo a & capture)",
+            "expanded-folded":"node -e 0 %ᾳ%",
+            "expanded-colon":"node -e 0 %A:%"
+        }"#,
+    );
+    // Windows takes `ᾳ` for `ᾼ`, though Rust upper-cases both to `ΑΙ`; and
+    // a `:` that ends a reference is part of the name, as in `%=C:%`.
+    project.write_file(".env", "CHAIN=\"&&\"\nᾼ=\"&&\"\nA:=\"&&\"\n");
+
+    let mkdir: &[&str] = &["mkdir", "INJECTEDDIR"];
+    for (script, args) in [
+        ("dangling", mkdir),
+        ("redirected", &["plain-target.txt", "--flag"]),
+        ("conditional", mkdir),
+        ("expanded", mkdir),
+        ("expanded-inherited", mkdir),
+        ("piped-escaped-operator", mkdir),
+        ("piped-expanded-again", mkdir),
+        ("nested", mkdir),
+        ("nested-conditional", mkdir),
+        ("nested-grouped", &["else", "mkdir", "INJECTEDDIR"]),
+        ("nested-quoted", mkdir),
+        ("nested-r", mkdir),
+        ("nested-semicolon", mkdir),
+        ("nested-comspec", mkdir),
+        ("nested-comspec-part", mkdir),
+        ("closed-block", &["else", "mkdir", "INJECTEDDIR"]),
+        ("piped-closed-block", &["else", "mkdir", "INJECTEDDIR"]),
+        ("expanded-folded", mkdir),
+        ("expanded-colon", mkdir),
+    ] {
+        let output = lpm(&project)
+            .args(["run", script, "--"])
+            .args(args)
+            .env("LPM_TEST_CHAIN", "&&")
+            .env("LPM_TEST_AGAIN", "%LPM_TEST_CHAIN%")
+            .output()
+            .expect("run script ending without a command");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{script} ran:\n{combined}");
+        assert!(combined.contains("ends in an operator"), "{combined}");
+        assert!(!project.file_exists("INJECTEDDIR"));
+        assert!(!project.file_exists("plain-target.txt"));
+        assert!(!project.file_exists("args.json"), "{script} ran");
+    }
+}
+
+/// Part of a variable holds nothing its value doesn't, so a script that uses
+/// one in an argument still gets arguments; and a `)` that closes no block
+/// is read as any other character, so it only keeps cmd.exe's readings of
+/// the arguments from being known.
+#[cfg(windows)]
+#[test]
+fn run_passes_arguments_past_part_of_a_variable_and_a_lone_parenthesis() {
+    let project = windows_argument_capture_project(
+        r#"{
+            "tagged":"capture --tag=%TIME:~0,2%",
+            "slashed":"capture %CD:\\=/%",
+            "lone-parenthesis":"capture :) a b"
+        }"#,
+    );
+
+    let watch: &[&str] = &["--watch", "two words"];
+    for (script, args, recorded_tail) in [
+        ("tagged", watch, watch),
+        ("slashed", watch, watch),
+        (
+            "lone-parenthesis",
+            &["--watch"],
+            &[":)", "a", "b", "--watch"],
+        ),
+    ] {
+        let _ = std::fs::remove_file(project.path().join("args.json"));
+        let output = lpm(&project)
+            .args(["run", script, "--"])
+            .args(args)
+            .output()
+            .expect("run script with part of a variable");
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recorded: Vec<String> = serde_json::from_value(recorded_arguments(&project, &output))
+            .expect("recorded arguments are strings");
+        assert!(
+            recorded.len() >= recorded_tail.len()
+                && recorded[recorded.len() - recorded_tail.len()..] == *recorded_tail,
+            "{script}: {recorded:?}"
+        );
+    }
 
     let output = lpm(&project)
-        .args([
-            "run",
-            "capture",
-            "--",
-            "",
-            "two words",
-            "tab\tvalue",
-            "snowman-☃",
-            "a&b",
-            "c|d",
-            "e<f",
-            "g>h",
-            "%PATH%",
-            "!delayed!",
-            "quoted\"value",
-            "trail\\",
-            "& echo PWNED > injected-marker",
-        ])
+        .args(["run", "lone-parenthesis", "--", "two words"])
         .output()
-        .expect("run script with cmd.exe metacharacters");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
+        .expect("run script after a lone parenthesis");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot pass"),
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    assert!(output.status.success(), "script failed:\n{combined}");
-    let args: serde_json::Value =
-        serde_json::from_str(&project.read_file("args.json")).expect("parse captured arguments");
-    assert_eq!(
-        args,
-        serde_json::json!([
-            "",
-            "two words",
-            "tab\tvalue",
-            "snowman-☃",
-            "a&b",
-            "c|d",
-            "e<f",
-            "g>h",
-            "%PATH%",
-            "!delayed!",
-            "quoted\"value",
-            "trail\\",
-            "& echo PWNED > injected-marker"
-        ])
-    );
-    assert!(!project.file_exists("injected-marker"));
 }
 
 fn strip_ansi(s: &str) -> String {
