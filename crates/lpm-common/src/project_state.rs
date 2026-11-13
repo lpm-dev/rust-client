@@ -421,10 +421,43 @@ pub fn keep_existing_lpm_home_ignored(root: &Path) {
 /// there from now on. What is already in it keeps its access: store files
 /// are hard links in projects' `node_modules`, and a home in the user's
 /// profile inherits the profile's.
+///
+/// The home's own ignore file is the exception. Where this gives the home
+/// the user's entry, an earlier release's ignore file, which LPM wrote, is
+/// written again, as one written from an administrator terminal is the
+/// Administrators' and lets no one else read it.
 #[cfg(windows)]
 fn keep_lpm_home_owner_only_or_warn(directory: &cap_std::fs::Dir, root: &Path) {
-    if let Err(error) = crate::owner_only::protect_state_directory(directory, false) {
-        tracing::warn!("could not keep {} to its owner: {error}", root.display());
+    match crate::owner_only::protect_state_directory(directory, false) {
+        Ok(true) => rewrite_lpm_home_ignore(directory, root),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("could not keep {} to its owner: {error}", root.display()),
+    }
+}
+
+/// Writes the home's ignore file again where it holds what LPM writes
+/// there, so that it gets what a new file gets; one someone else wrote is
+/// left as it is.
+#[cfg(windows)]
+fn rewrite_lpm_home_ignore(directory: &cap_std::fs::Dir, root: &Path) {
+    let name = OsStr::new(PROJECT_STATE_IGNORE_FILE);
+    if !matches!(
+        read_ignore_file(directory, name),
+        Ok(Some((existing, _))) if existing == PROJECT_STATE_IGNORE.as_bytes()
+    ) {
+        return;
+    }
+    if let Err(error) = crate::write_file_atomic_in_dir_with_options(
+        directory,
+        name,
+        crate::AtomicWriteOptions::new().unix_mode(0o644),
+        |file| std::io::Write::write_all(file, PROJECT_STATE_IGNORE.as_bytes()),
+    ) {
+        tracing::debug!(
+            "could not write {} again in {}: {error}",
+            PROJECT_STATE_IGNORE_FILE,
+            root.display()
+        );
     }
 }
 

@@ -1132,4 +1132,43 @@ mod tests {
         assert!(user_gets_in_when_another_owns(&home.join("later.json")));
         assert!(!user_gets_in_when_another_owns(&home.join("store")));
     }
+
+    /// An earlier release run from an administrator terminal wrote the
+    /// home's ignore file in a home that named only the owner, so the user
+    /// couldn't read it. Once the home gets the user's entry, LPM's own
+    /// ignore file is written again and lets the user in; one someone else
+    /// wrote is left as it is.
+    #[test]
+    fn the_home_ignore_file_an_earlier_release_wrote_lets_the_user_in_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let earlier_home = |name: &str, ignore: &str| {
+            let home = directory.path().join(name);
+            std::fs::create_dir(&home).unwrap();
+            set_protected_dacl(
+                &open_for_security(&home),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;;0xa0;;;AC)",
+            )
+            .unwrap();
+            std::fs::write(home.join(".gitignore"), ignore).unwrap();
+            assert!(!user_gets_in_when_another_owns(&home.join(".gitignore")));
+            home
+        };
+
+        let home = earlier_home("home", crate::project_state::PROJECT_STATE_IGNORE);
+        crate::project_state::guard_lpm_home(&home).unwrap();
+        assert!(user_gets_in_when_another_owns(&home.join(".gitignore")));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".gitignore")).unwrap(),
+            crate::project_state::PROJECT_STATE_IGNORE
+        );
+
+        let theirs = earlier_home("theirs", "*\n# kept by hand\n");
+        crate::project_state::guard_lpm_home(&theirs).unwrap();
+        assert!(user_gets_in_when_another_owns(&theirs));
+        assert!(!user_gets_in_when_another_owns(&theirs.join(".gitignore")));
+        assert_eq!(
+            std::fs::read_to_string(theirs.join(".gitignore")).unwrap(),
+            "*\n# kept by hand\n"
+        );
+    }
 }
