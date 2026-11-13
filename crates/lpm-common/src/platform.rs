@@ -103,6 +103,39 @@ pub fn translated_by_rosetta() -> bool {
     false
 }
 
+/// The Windows system directory, normally `C:\Windows\System32`.
+///
+/// Asked of Windows itself rather than read from `SystemRoot` or found
+/// on `PATH`, so a program LPM starts from here (such as `cmd.exe`) can't
+/// be swapped through the environment or the working directory.
+#[cfg(windows)]
+pub fn windows_system_directory() -> std::io::Result<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let capacity = u32::try_from(buffer.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows system directory path is too long",
+            )
+        })?;
+        // SAFETY: `buffer` is writable for `capacity` UTF-16 units for the
+        // duration of this synchronous call.
+        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), capacity) } as usize;
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written < buffer.len() {
+            buffer.truncate(written);
+            return Ok(std::path::PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        buffer.resize(written + 1, 0);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn has_glibc_loader() -> bool {
     const CANDIDATES: &[&str] = &[
@@ -138,6 +171,14 @@ mod tests {
         } else {
             assert!(probed.is_none(), "non-linux host must return None");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_directory_is_the_absolute_directory_holding_cmd_exe() {
+        let system = windows_system_directory().unwrap();
+        assert!(system.is_absolute(), "{}", system.display());
+        assert!(system.join("cmd.exe").is_file(), "{}", system.display());
     }
 
     #[test]
