@@ -1327,11 +1327,12 @@ mod transactional_tests {
         let trust_dir = home.path().join("trust");
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let (cert, _) = ca::generate_ca().unwrap();
+        let cert_path = home.path().join("rootCA.pem");
         trust::fail_next_install_after_mutation();
 
-        ensure_ca_trusted(cert.as_bytes(), Path::new("rootCA.pem")).unwrap();
+        ensure_ca_trusted(cert.as_bytes(), &cert_path).unwrap();
 
-        assert!(trust::is_ca_installed_bytes(cert.as_bytes(), Path::new("rootCA.pem")).unwrap());
+        assert!(trust::is_ca_installed_bytes(cert.as_bytes(), &cert_path).unwrap());
     }
 
     #[test]
@@ -1341,12 +1342,13 @@ mod transactional_tests {
         let trust_dir = home.path().join("trust");
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let (cert, _) = ca::generate_ca().unwrap();
-        trust::install_ca_bytes(cert.as_bytes(), Path::new("rootCA.pem")).unwrap();
+        let cert_path = home.path().join("rootCA.pem");
+        trust::install_ca_bytes(cert.as_bytes(), &cert_path).unwrap();
         trust::fail_next_uninstall_after_mutation();
 
-        ensure_ca_untrusted(cert.as_bytes(), Path::new("rootCA.pem")).unwrap();
+        ensure_ca_untrusted(cert.as_bytes(), &cert_path).unwrap();
 
-        assert!(!trust::is_ca_installed_bytes(cert.as_bytes(), Path::new("rootCA.pem")).unwrap());
+        assert!(!trust::is_ca_installed_bytes(cert.as_bytes(), &cert_path).unwrap());
     }
 
     #[test]

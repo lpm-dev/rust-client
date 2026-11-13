@@ -80,6 +80,29 @@ pub(crate) mod windows_security {
         )
     }
 
+    /// Lets administrators read the public certificate staged at `path`,
+    /// with nobody else gaining access: certutil runs as whichever
+    /// administrator approves the prompt, and a standard user's prompt
+    /// asks for another account's credentials.
+    pub(crate) fn let_administrators_read(path: &Path) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(
+                "staged certificate path is not a regular file",
+            ));
+        }
+        apply_sddl(
+            file.as_raw_handle().cast(),
+            "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FR;;;BA)",
+            true,
+        )
+    }
+
     pub(crate) fn protect_directory_path(path: &Path) -> std::io::Result<()> {
         let file = std::fs::OpenOptions::new()
             .access_mode(READ_CONTROL | WRITE_DAC)
@@ -152,7 +175,7 @@ pub(crate) mod windows_security {
     }
 
     #[cfg(test)]
-    pub(super) fn descriptor_sddl(file: &std::fs::File) -> std::io::Result<String> {
+    pub(crate) fn descriptor_sddl(file: &std::fs::File) -> std::io::Result<String> {
         use windows_sys::Win32::Foundation::ERROR_SUCCESS;
         use windows_sys::Win32::Security::Authorization::{
             ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
