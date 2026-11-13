@@ -7,7 +7,7 @@ use lpm_common::{ExclusiveLockHandle, LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 #[cfg(all(unix, any(test, not(target_os = "linux"))))]
@@ -277,8 +277,8 @@ pub fn check_port(port: u16) -> PortStatus {
 }
 
 pub(crate) fn loopback_port_available(port: u16) -> bool {
-    bind_probe_available("127.0.0.1", port)
-        && bind_probe_available("::1", port)
+    bind_probe_available(Ipv4Addr::LOCALHOST.into(), port)
+        && bind_probe_available(Ipv6Addr::LOCALHOST.into(), port)
         && no_wildcard_listener(port)
 }
 
@@ -289,7 +289,8 @@ pub(crate) fn loopback_port_available(port: u16) -> bool {
 /// already see wildcard listeners.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn no_wildcard_listener(port: u16) -> bool {
-    bind_probe_available("0.0.0.0", port) && bind_probe_available("::", port)
+    bind_probe_available(Ipv4Addr::UNSPECIFIED.into(), port)
+        && bind_probe_available(Ipv6Addr::UNSPECIFIED.into(), port)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -297,11 +298,11 @@ fn no_wildcard_listener(_port: u16) -> bool {
     true
 }
 
-fn bind_probe_available(host: &str, port: u16) -> bool {
-    match TcpListener::bind((host, port)) {
+fn bind_probe_available(address: IpAddr, port: u16) -> bool {
+    match bind_without_listening(SocketAddr::new(address, port)) {
         Ok(_) => true,
         Err(err)
-            if host.contains(':')
+            if address.is_ipv6()
                 && matches!(
                     err.kind(),
                     std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
@@ -311,6 +312,23 @@ fn bind_probe_available(host: &str, port: u16) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// A TCP socket bound to `address` as [`std::net::TcpListener::bind`] binds one, with
+/// `SO_REUSEADDR` on Unix, but not listening: a bind already fails where
+/// another socket holds the address. Listening on the wildcard address is
+/// what makes Windows Firewall, and macOS's application firewall, ask the
+/// user whether to let lpm accept connections it never takes.
+fn bind_without_listening(address: SocketAddr) -> std::io::Result<socket2::Socket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    Ok(socket)
 }
 
 /// Find the next available port starting from `start`.
@@ -4281,6 +4299,7 @@ fn project_hash(project_dir: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[cfg(target_os = "linux")]
     use crate::test_support::KillOnDropChild;
@@ -4321,6 +4340,21 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "background descendant retained the process-probe worker for {elapsed:?}"
         );
+    }
+
+    /// The probe binds without listening, so it takes no connection while
+    /// it holds the port, and Windows Firewall has no listener to ask the
+    /// user about.
+    #[test]
+    fn the_port_probe_binds_without_listening() {
+        let probe = bind_without_listening("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = probe.local_addr().unwrap().as_socket().unwrap();
+
+        let connected =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2));
+
+        assert!(connected.is_err(), "the probe accepted a connection");
+        assert!(!loopback_port_available(address.port()));
     }
 
     #[test]
