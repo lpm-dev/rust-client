@@ -13,13 +13,22 @@ use lpm_common::LpmError;
 
 /// Bare-name TLD suffixes that are "obviously local" and never need
 /// `cert.allowPublicDns`. Match is case-insensitive on a trailing `.<tld>`.
+/// The root CA permits each of these too (`ca::permitted_subtrees`), so a
+/// name accepted here without `allowPublicDns` can be signed.
 const LOCAL_TLD_ALLOWLIST: &[&str] = &["local", "test", "localhost", "internal", "home.arpa"];
 
 /// Suffixes already covered by the built-in permitted_subtrees in `ca::permitted_subtrees`.
 ///
 /// Each entry is the bare suffix without the leading dot. An entry whose `host` ends in
 /// any of these is redundant on a CA that already carries the built-in subtree.
-const BUILTIN_DNS_SUFFIXES: &[&str] = &["localhost", "local", "test", "lpm.test"];
+const BUILTIN_DNS_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "test",
+    "lpm.test",
+    "internal",
+    "home.arpa",
+];
 
 /// One accepted entry from `cert.extra_permitted_dns`.
 ///

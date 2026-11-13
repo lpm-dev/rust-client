@@ -6,12 +6,7 @@ fn constrained_root_refuses_outside_hostnames_before_issuance() {
         name_constraints: true,
     })
     .unwrap();
-    for host in [
-        "app.internal",
-        "app.home.arpa",
-        "staging.example.com",
-        "8.8.8.8",
-    ] {
+    for host in ["app.dev", "intranet.corp", "staging.example.com", "8.8.8.8"] {
         let names = vec![host.to_owned()];
         assert!(
             generate_project_cert(&root, &key, &names).is_err(),

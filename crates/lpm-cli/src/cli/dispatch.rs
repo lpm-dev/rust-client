@@ -3074,6 +3074,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                 keep_old_trusted,
                 fail_on_missing,
                 dry_run,
+                no_name_constraints,
+                name_constraints,
             } = args;
             let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cwd = match action.as_str() {
@@ -3091,6 +3093,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                     keep_old_trusted_days: keep_old_trusted,
                     fail_on_missing,
                     dry_run,
+                    name_constraints: if no_name_constraints {
+                        Some(false)
+                    } else {
+                        name_constraints.then_some(true)
+                    },
                 },
             )
             .await

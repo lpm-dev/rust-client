@@ -8,6 +8,9 @@ pub struct ExtraArgs {
     pub keep_old_trusted_days: Option<u32>,
     pub fail_on_missing: bool,
     pub dry_run: bool,
+    /// On rotate, whether the new CA is limited to local names; `None`
+    /// keeps the current CA's choice.
+    pub name_constraints: Option<bool>,
 }
 
 /// Run the `lpm cert` subcommand.
@@ -27,6 +30,16 @@ pub async fn run(
             "rotate",
         ),
         (extras.fail_on_missing, "--fail-on-missing", "rotate"),
+        (
+            extras.name_constraints == Some(true),
+            "--name-constraints",
+            "rotate",
+        ),
+        (
+            extras.name_constraints == Some(false),
+            "--no-name-constraints",
+            "rotate",
+        ),
         (extras.dry_run, "--dry-run", "reconcile"),
     ] {
         if present && action != required_action {
@@ -81,6 +94,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
                     "expires": status.ca_expires,
                     "subject": status.ca_subject,
                     "days_until_expiry": days_remaining,
+                    "name_constraints": status.ca_name_constraints,
                 },
                 "project": {
                     "exists": status.project_cert_exists,
@@ -111,6 +125,14 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         if let Some(expires) = &status.ca_expires {
             print_field("expires", expires);
         }
+        print_field(
+            "signs",
+            if status.ca_name_constraints.is_some() {
+                "local names only"
+            } else {
+                "any name (no name constraints)"
+            },
+        );
         if let Some(days) = days_remaining {
             let txt = format!("{days} days");
             let colored = if days < 30 {
@@ -417,6 +439,7 @@ async fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError
         extra_projects: extras.extra_projects,
         skip_missing: !extras.fail_on_missing,
         keep_old_trusted_days: extras.keep_old_trusted_days,
+        name_constraints: extras.name_constraints,
     };
     let result = lpm_cert::rotate::rotate(opts)?;
 
@@ -429,6 +452,14 @@ async fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError
     print_field("mode", result.mode);
     print_field("old_fingerprint", &result.old_fingerprint);
     print_field("new_fingerprint", &result.new_fingerprint);
+    print_field(
+        "name_constraints",
+        if result.name_constraints {
+            "local names only"
+        } else {
+            "none: may sign any name"
+        },
+    );
     print_field("reissued", result.reissued_leaves.len().to_string());
     if !result.skipped_missing.is_empty() {
         print_field("skipped_missing", result.skipped_missing.len().to_string());

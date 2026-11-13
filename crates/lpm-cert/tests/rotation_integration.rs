@@ -1172,3 +1172,234 @@ fn rotate_preserves_custom_loopback_alias_ip_san() {
         "rotation must preserve 127.0.0.2 — only the literal 127.0.0.1 / ::1 / localhost are defaults; loopback aliases must round-trip, got {after:?}"
     );
 }
+
+/// A CA as an earlier release made it: no name constraints, and nothing to
+/// say that was asked for.
+fn seed_earlier_release_root_ca() {
+    let cert_path = paths::ca_cert_path().unwrap();
+    let key_path = paths::ca_key_path().unwrap();
+    lpm_cert::create_dir_secure(cert_path.parent().unwrap()).unwrap();
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "LPM Local Development CA");
+    dn.push(DnType::OrganizationName, "LPM");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    lpm_cert::write_key_file(&key_path, key_pair.serialize_pem().as_bytes()).unwrap();
+    trust::install_ca(&cert_path).unwrap();
+}
+
+fn seed_root_ca_with(name_constraints: bool) {
+    let cert_path = paths::ca_cert_path().unwrap();
+    let key_path = paths::ca_key_path().unwrap();
+    lpm_cert::create_dir_secure(cert_path.parent().unwrap()).unwrap();
+    let (cert_pem, key_pem) =
+        lpm_cert::ca::generate_ca_with_options(lpm_cert::ca::CaOptions { name_constraints })
+            .unwrap();
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    lpm_cert::write_key_file(&key_path, key_pem.as_bytes()).unwrap();
+    trust::install_ca(&cert_path).unwrap();
+}
+
+fn without_name_constraints_override() {
+    // SAFETY: callers hold the binary's serial guard.
+    unsafe { std::env::remove_var("LPM_CERT_NAME_CONSTRAINTS") };
+}
+
+/// Under a CA limited to local names, a project that asks for a public name
+/// is stopped before anything is issued, with the command that widens the
+/// CA, rather than left to a chain error in the browser.
+#[test]
+fn a_public_name_under_a_local_ca_is_refused_with_the_way_to_widen_it() {
+    let (tmp, _g) = setup_home();
+    without_name_constraints_override();
+    seed_root_ca_with(true);
+    let project = tmp.path().join("proj-public");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let Err(refused) = lpm_cert::ensure_https_with_consent_and_permitted_dns(
+        &project,
+        &["staging.example.com".to_string(), "app.test".to_string()],
+        &[],
+        lpm_cert::TrustStoreConsent::Decline,
+    ) else {
+        panic!("a public name was issued");
+    };
+    let refused = refused.to_string();
+    assert!(refused.contains("staging.example.com"), "{refused}");
+    assert!(!refused.contains("app.test"), "{refused}");
+    assert!(
+        refused.contains("lpm cert rotate --no-name-constraints"),
+        "{refused}"
+    );
+
+    lpm_cert::ensure_https_with_consent_and_permitted_dns(
+        &project,
+        &["app.test".to_string()],
+        &[],
+        lpm_cert::TrustStoreConsent::Decline,
+    )
+    .expect("a local name is issued");
+}
+
+/// Rotation keeps a CA made unconstrained on request so, limits one an
+/// earlier release made, and does as asked when told.
+#[test]
+fn rotation_keeps_an_unconstrained_choice_and_limits_an_earlier_ca() {
+    let (_tmp, _g) = setup_home();
+    without_name_constraints_override();
+    let new_ca_is_constrained = || {
+        let cert = std::fs::read(paths::ca_cert_path().unwrap()).unwrap();
+        lpm_cert::ca::names_outside_constraints(&cert, &["example.com".to_string()], &[])
+            .unwrap()
+            .len()
+            == 1
+    };
+
+    seed_root_ca_with(false);
+    let kept = rotate::rotate(rotate::RotateOptions::default()).unwrap();
+    assert!(!kept.name_constraints);
+    assert!(!new_ca_is_constrained());
+
+    let limited = rotate::rotate(rotate::RotateOptions {
+        name_constraints: Some(true),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(limited.name_constraints);
+    assert!(new_ca_is_constrained());
+
+    seed_earlier_release_root_ca();
+    let upgraded = rotate::rotate(rotate::RotateOptions::default()).unwrap();
+    assert!(upgraded.name_constraints);
+    assert!(new_ca_is_constrained());
+}
+
+/// Under a constrained CA an earlier release made, which lacks names this
+/// release permits, the way out keeps the CA limited: a plain rotate, not
+/// one that would let it sign any name.
+#[test]
+fn a_name_an_earlier_constrained_ca_lacks_is_fixed_by_a_plain_rotate() {
+    let (tmp, _g) = setup_home();
+    without_name_constraints_override();
+    let cert_path = paths::ca_cert_path().unwrap();
+    let key_path = paths::ca_key_path().unwrap();
+    lpm_cert::create_dir_secure(cert_path.parent().unwrap()).unwrap();
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "LPM Local Development CA");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: vec![
+            rcgen::GeneralSubtree::DnsName("localhost".into()),
+            rcgen::GeneralSubtree::DnsName(".test".into()),
+        ],
+        excluded_subtrees: Vec::new(),
+    });
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    lpm_cert::write_key_file(&key_path, key_pair.serialize_pem().as_bytes()).unwrap();
+    trust::install_ca(&cert_path).unwrap();
+    let project = tmp.path().join("proj-internal");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let Err(refused) = lpm_cert::ensure_https_with_consent_and_permitted_dns(
+        &project,
+        &["app.internal".to_string()],
+        &[],
+        lpm_cert::TrustStoreConsent::Decline,
+    ) else {
+        panic!("a name the earlier CA lacks was issued");
+    };
+    let refused = refused.to_string();
+    assert!(refused.contains("Run `lpm cert rotate` to"), "{refused}");
+    assert!(!refused.contains("--no-name-constraints"), "{refused}");
+}
+
+/// A rotation to a CA limited to local names names the project whose
+/// certificate it couldn't reissue before it changes anything, rather than
+/// after the new CA is trusted.
+#[test]
+fn rotation_names_a_project_the_new_ca_couldnt_sign_for_before_changing_anything() {
+    let (tmp, _g) = setup_home();
+    without_name_constraints_override();
+    seed_earlier_release_root_ca();
+    let project = tmp.path().join("proj-public");
+    seed_project_leaf_with_extras(&project, &["staging.example.com".to_string()]);
+    let before = std::fs::read(paths::ca_cert_path().unwrap()).unwrap();
+
+    let refused = rotate::rotate(rotate::RotateOptions::default())
+        .unwrap_err()
+        .to_string();
+
+    assert!(refused.contains("staging.example.com"), "{refused}");
+    assert!(refused.contains("proj-public"), "{refused}");
+    assert!(refused.contains("--no-name-constraints"), "{refused}");
+    assert!(refused.contains("Nothing was changed"), "{refused}");
+    assert_eq!(
+        std::fs::read(paths::ca_cert_path().unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        !paths::ca_cert_path()
+            .unwrap()
+            .with_extension("pem.next")
+            .exists()
+    );
+
+    let widened = rotate::rotate(rotate::RotateOptions {
+        name_constraints: Some(false),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(!widened.name_constraints);
+}
+
+/// LPM_CERT_NAME_CONSTRAINTS decides over the choice a CA records, either
+/// way, and a flag decides over both.
+#[test]
+fn the_environment_decides_over_a_recorded_choice_and_a_flag_over_both() {
+    let (_tmp, _g) = setup_home();
+    seed_root_ca_with(false);
+    // SAFETY: the binary's serial guard is held.
+    unsafe { std::env::set_var("LPM_CERT_NAME_CONSTRAINTS", "1") };
+    let limited = rotate::rotate(rotate::RotateOptions::default());
+    unsafe { std::env::set_var("LPM_CERT_NAME_CONSTRAINTS", "0") };
+    let widened = rotate::rotate(rotate::RotateOptions::default());
+    let flagged = rotate::rotate(rotate::RotateOptions {
+        name_constraints: Some(true),
+        ..Default::default()
+    });
+    without_name_constraints_override();
+
+    assert!(limited.unwrap().name_constraints);
+    assert!(!widened.unwrap().name_constraints);
+    assert!(flagged.unwrap().name_constraints);
+}
+
+/// `lpm dev --network` leaves out the addresses the CA may not sign: before
+/// there is one, those a new one would refuse; after, what it refuses.
+#[test]
+fn the_addresses_the_ca_would_refuse_are_named() {
+    let (_tmp, _g) = setup_home();
+    without_name_constraints_override();
+    let addresses = ["192.168.1.2", "100.100.1.1", "8.8.8.8"].map(str::to_owned);
+
+    assert_eq!(
+        lpm_cert::names_the_root_would_refuse(&addresses).unwrap(),
+        ["8.8.8.8"]
+    );
+    seed_root_ca_with(false);
+    assert!(
+        lpm_cert::names_the_root_would_refuse(&addresses)
+            .unwrap()
+            .is_empty()
+    );
+}

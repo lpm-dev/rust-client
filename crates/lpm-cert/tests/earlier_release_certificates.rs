@@ -13,6 +13,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 const SUBJECT_KEY_IDENTIFIER: &str = "2.5.29.14";
 const AUTHORITY_KEY_IDENTIFIER: &str = "2.5.29.35";
+const NAME_CONSTRAINTS: &str = "2.5.29.30";
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -194,8 +195,44 @@ fn a_new_root_ca_keeps_the_structure_an_earlier_release_gave_it() {
     })
     .unwrap();
 
+    let (new, earlier) = (ders(&ca), ders(&read("ca.pem")));
     assert_eq!(
-        structure(&ders(&ca)[0], &[SUBJECT_KEY_IDENTIFIER]),
-        structure(&ders(&read("ca.pem"))[0], &[SUBJECT_KEY_IDENTIFIER])
+        structure(&new[0], &[SUBJECT_KEY_IDENTIFIER, NAME_CONSTRAINTS]),
+        structure(&earlier[0], &[SUBJECT_KEY_IDENTIFIER, NAME_CONSTRAINTS])
+    );
+    // The constraints changed on purpose, by adding the private-use names
+    // `cert.extraPermittedDns` accepts without `allowPublicDns`, and two
+    // ranges no public site uses: shared address space and benchmarking.
+    let permitted = |der: &[u8]| -> Vec<String> {
+        parse(der)
+            .name_constraints()
+            .unwrap()
+            .unwrap()
+            .value
+            .permitted_subtrees
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .map(|subtree| format!("{:?}", subtree.base))
+            .collect()
+    };
+    let (new_permitted, earlier_permitted) = (permitted(&new[0]), permitted(&earlier[0]));
+    assert!(
+        earlier_permitted
+            .iter()
+            .all(|subtree| new_permitted.contains(subtree)),
+        "{new_permitted:?}"
+    );
+    assert_eq!(
+        new_permitted
+            .iter()
+            .filter(|subtree| !earlier_permitted.contains(subtree))
+            .collect::<Vec<_>>(),
+        [
+            r#"DNSName(".internal")"#,
+            r#"DNSName(".home.arpa")"#,
+            "IPAddress([100, 64, 0, 0, 255, 192, 0, 0])",
+            "IPAddress([198, 18, 0, 0, 255, 254, 0, 0])",
+        ]
     );
 }
