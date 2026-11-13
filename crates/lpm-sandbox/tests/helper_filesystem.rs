@@ -118,6 +118,135 @@ fn helper_preserves_an_extended_drive_working_directory() {
     );
 }
 
+/// A script that fails because a program on PATH was out of the sandbox's
+/// reach shows only the shell's "not recognized", so the helper names the
+/// PATH directories it couldn't grant, and only when the script fails.
+#[test]
+fn a_failed_script_is_told_which_path_directories_it_could_not_read() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FileDispositionInfo,
+        SetFileInformationByHandle,
+    };
+
+    // Nothing opens a directory pending deletion, whatever the runner's
+    // privileges, though its name still lists, so the helper can neither
+    // resolve nor grant this one.
+    let temporary = tempfile::tempdir().unwrap();
+    let removed = temporary
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("removed-tools");
+    fs::create_dir(&removed).unwrap();
+    let pending = fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&removed)
+        .unwrap();
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the handle stays open for the call, and the buffer is the
+    // class's record.
+    let marked = unsafe {
+        SetFileInformationByHandle(
+            pending.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    assert_ne!(marked, 0, "mark the directory for deletion");
+    let system = std::env::var("SystemRoot").unwrap();
+    for (exit_code, reported) in [(3, true), (0, false)] {
+        let mut argv = helper_argv_base();
+        argv.extend([
+            "--delete-appcontainer-profile".into(),
+            "--working-dir".into(),
+            format!(r"{system}\System32"),
+            "--readable-dir-best-effort".into(),
+            removed.display().to_string(),
+            "--".into(),
+            format!(r"{system}\System32\cmd.exe"),
+            "/d".into(),
+            "/c".into(),
+            format!("exit {exit_code}"),
+        ]);
+        let output = Command::cargo_bin("lpm-sandbox-helper")
+            .unwrap()
+            .args(argv)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains(&format!("  {}: ", removed.display())),
+            reported,
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("lpm doctor sandbox-setup --tool-dir"),
+            reported,
+            "{stderr}"
+        );
+    }
+}
+
+/// A PATH directory inside a writable root is opened from that root, never
+/// through a link a script could have made there, so one reached through a
+/// junction gets no grant of its own. It isn't reported, though: the script
+/// still reaches what the junction leads to wherever another grant covers
+/// it, here the writable root itself.
+#[test]
+fn a_path_directory_through_a_link_in_a_writable_root_is_not_reported() {
+    let temporary = tempfile::tempdir().unwrap();
+    let writable = temporary.path().canonicalize().unwrap().join("project");
+    let target = writable.join("real-tools");
+    fs::create_dir_all(target.join("bin")).unwrap();
+    fs::write(target.join("bin").join("probe.cmd"), "@echo REACHED\r\n").unwrap();
+    let link = writable.join("tools");
+    let output = std::process::Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let tools = link.join("bin");
+    let system = std::env::var("SystemRoot").unwrap();
+    let mut argv = helper_argv_base();
+    argv.extend([
+        "--delete-appcontainer-profile".into(),
+        "--working-dir".into(),
+        format!(r"{system}\System32"),
+        "--writable-dir".into(),
+        writable.display().to_string(),
+        "--readable-dir-best-effort".into(),
+        tools.display().to_string(),
+        "--env".into(),
+        format!(r"PATH={};{system}\System32", tools.display()),
+        "--".into(),
+        format!(r"{system}\System32\cmd.exe"),
+        "/d".into(),
+        "/c".into(),
+        "probe & exit 3".into(),
+    ]);
+    let output = Command::cargo_bin("lpm-sandbox-helper")
+        .unwrap()
+        .args(argv)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("REACHED"),
+        "{output:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("couldn't give the script access"),
+        "{output:?}"
+    );
+}
+
 fn helper_argv_base() -> Vec<String> {
     vec![
         "--protocol-version".into(),
