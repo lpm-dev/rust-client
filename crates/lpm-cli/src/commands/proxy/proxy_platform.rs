@@ -91,9 +91,23 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
 
 /// Registers a task that starts the proxy when this user signs in, in no
 /// window. Its logon trigger is this user's alone: one for any user's
-/// logon, which `schtasks /SC ONLOGON` makes, needs an administrator.
+/// logon, which `schtasks /SC ONLOGON` makes, needs an administrator. It
+/// takes the place of the task earlier releases made for anyone's logon,
+/// which it removes where this user may.
 #[cfg(windows)]
 pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
+    // The task runs lpm with this user's limited token, which can't write to
+    // what an elevated token makes in the home: its owner is the
+    // Administrators.
+    if crate::privilege::is_elevated_over_a_limited_token() {
+        return Err(LpmError::Proxy(
+            "run `lpm proxy install` from a normal terminal: the sign-in task starts the proxy \
+             as you, without administrator rights, and couldn't write to what this \
+             administrator terminal would make in the LPM home. Only `lpm proxy uninstall`, to \
+             remove what an earlier release installed, needs an administrator terminal"
+                .into(),
+        ));
+    }
     let user = windows_user_sid()?;
     let spec = windows_plain_spec(spec)?;
     let system = lpm_common::platform::windows_system_directory().map_err(|error| {
@@ -103,25 +117,45 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     })?;
     let schtasks = Path::new("schtasks");
     let task = windows_task_name(&user);
+    let task_home = if windows_user_task_exists(schtasks, &task)? {
+        windows_installed_task_home(schtasks, &task)
+    } else {
+        None
+    };
+    let earlier_home = windows_earlier_task_home_or(schtasks, &spec.lpm_home)?;
+    check_windows_service_folders(
+        &distinct_proxy_homes([Some(spec.lpm_home.as_path()), earlier_home.as_deref()]),
+        ", then `lpm proxy install` again from this one",
+    )?;
     // The task's run ends once the proxy has started, so ending the task
-    // stops nothing. The proxy the task started, with whatever home it
-    // gave it, is asked to stop, and so is one running for this home, as
+    // stops nothing. The proxies the tasks started, with whatever homes they
+    // gave them, are asked to stop, and so is one running for this home, as
     // one started by hand would be, so that the task's can take the pipe
     // and the listeners.
-    if windows_user_task_exists(schtasks, &task)?
-        && let Some(home) = windows_installed_task_home(schtasks, &task)
-        && !same_proxy_home(&home, &spec.lpm_home)
-    {
-        stop_windows_proxy(&spec.exe, &home);
+    for home in distinct_proxy_homes([task_home.as_deref(), earlier_home.as_deref()]) {
+        if !same_proxy_home(home, &spec.lpm_home) {
+            stop_windows_proxy(&spec.exe, home);
+        }
     }
     if stop_windows_proxy(&spec.exe, &spec.lpm_home) {
         tracing::warn!(
-            "stopped the proxy running for {}, so that the sign-in task's can take its place",
+            "stopped the proxy running for {}, so that the sign-in task's proxy can take its place",
             spec.lpm_home.display()
         );
     }
     let left_running = windows_running_proxy(&spec.exe, &spec.lpm_home);
     remove_earlier_windows_launcher(&spec.launcher_path)?;
+    if let Some(home) = &earlier_home {
+        remove_earlier_windows_launcher(&windows_earlier_launcher(home))?;
+        if let Err(error) = uninstall_windows_user_task(schtasks, WINDOWS_EARLIER_TASK_NAME) {
+            tracing::warn!(
+                "couldn't remove the task an earlier LPM release made, \
+                 {WINDOWS_EARLIER_TASK_NAME}, which would start a proxy when anyone signs in: \
+                 {error}; remove it from an administrator terminal with \
+                 `schtasks /Delete /TN {WINDOWS_EARLIER_TASK_NAME} /F`"
+            );
+        }
+    }
     let service_dir = spec
         .stdout_log
         .parent()
@@ -146,53 +180,60 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
             spec.stderr_log.display()
         ),
     }
-    if windows_user_task_exists(schtasks, WINDOWS_EARLIER_TASK_NAME).unwrap_or(false) {
-        tracing::warn!(
-            "the task an earlier LPM release made, {WINDOWS_EARLIER_TASK_NAME}, also starts a proxy \
-             when anyone signs in; remove it from an administrator terminal with \
-             `schtasks /Delete /TN {WINDOWS_EARLIER_TASK_NAME} /F`"
-        );
-    }
     Ok(())
 }
 
 /// Stops the proxy this user's task started, with the home the task gives
 /// it whatever `LPM_HOME` this runs with, and removes the task, and the one
 /// earlier releases made for anyone's logon, and says whether there was
-/// one. That earlier task needs an administrator to remove: when it can't
-/// be, this user's is still removed, and the error says what is left.
+/// one. Each Windows user has one sign-in task, as each macOS or Linux user
+/// has one service, so it goes whichever home it was for. The earlier task
+/// needs an administrator to remove: when it can't be, this user's is still
+/// removed, and the error says what is left.
 #[cfg(windows)]
 pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<bool, LpmError> {
     let user = windows_user_sid()?;
     let schtasks = Path::new("schtasks");
     let task = windows_task_name(&user);
     let installed = windows_user_task_exists(schtasks, &task)?;
-    let earlier = windows_user_task_exists(schtasks, WINDOWS_EARLIER_TASK_NAME)?;
     let task_home = installed.then(|| {
         windows_installed_task_home(schtasks, &task).unwrap_or_else(|| spec.lpm_home.clone())
     });
-    if let Some(home) = &task_home {
-        stop_windows_proxy(&spec.exe, home);
-    }
-    // The earlier task ran `<home>\services\proxy\start-proxy.cmd`, so its
-    // home is read from that, or taken to be this one's where it can't be.
-    let earlier_home = earlier
-        .then(|| windows_earlier_task_home(schtasks).unwrap_or_else(|| spec.lpm_home.clone()));
-    if let Some(home) = &earlier_home
-        && task_home
-            .as_ref()
-            .is_none_or(|task_home| !same_proxy_home(task_home, home))
-    {
+    let earlier_home = windows_earlier_task_home_or(schtasks, &spec.lpm_home)?;
+    let homes = distinct_proxy_homes([
+        Some(spec.lpm_home.as_path()),
+        task_home.as_deref(),
+        earlier_home.as_deref(),
+    ]);
+    check_windows_service_folders(&homes, "")?;
+    for home in distinct_proxy_homes([task_home.as_deref(), earlier_home.as_deref()]) {
         stop_windows_proxy(&spec.exe, home);
     }
     if installed {
         uninstall_windows_user_task(schtasks, &task)?;
     }
+    if let Some(home) = &task_home
+        && !same_proxy_home(home, &spec.lpm_home)
+    {
+        tracing::warn!(
+            "removed this user's sign-in task, which ran the proxy for {}, not for {}: each \
+             Windows user has one",
+            home.display(),
+            spec.lpm_home.display()
+        );
+    }
     remove_earlier_windows_launcher(&spec.launcher_path)?;
     if let Some(home) = &earlier_home {
         remove_earlier_windows_launcher(&windows_earlier_launcher(home))?;
     }
-    if earlier {
+    // Only where this user also has a limited token is a folder the
+    // Administrators own one they can't use.
+    if crate::privilege::is_elevated_over_a_limited_token() {
+        for home in &homes {
+            remove_administrators_service_folder(home);
+        }
+    }
+    if earlier_home.is_some() {
         uninstall_windows_user_task(schtasks, WINDOWS_EARLIER_TASK_NAME).map_err(|error| {
             LpmError::Proxy(format!(
                 "{}couldn't remove the task an earlier LPM release made, \
@@ -207,7 +248,164 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
             ))
         })?;
     }
-    Ok(installed || earlier)
+    Ok(installed || earlier_home.is_some())
+}
+
+/// The home the task earlier releases made for anyone's logon runs the
+/// proxy with, where there is that task. It ran
+/// `<home>\services\proxy\start-proxy.cmd`, so its home is read from that,
+/// or taken to be `home` where it can't be.
+#[cfg(windows)]
+fn windows_earlier_task_home_or(
+    program: &Path,
+    home: &Path,
+) -> Result<Option<std::path::PathBuf>, LpmError> {
+    Ok(
+        windows_user_task_exists(program, WINDOWS_EARLIER_TASK_NAME)?
+            .then(|| windows_earlier_task_home(program).unwrap_or_else(|| home.to_path_buf())),
+    )
+}
+
+/// `homes`, but for each proxy, the first of the homes it answers for.
+#[cfg(windows)]
+fn distinct_proxy_homes<const N: usize>(homes: [Option<&Path>; N]) -> Vec<&Path> {
+    let mut distinct: Vec<&Path> = Vec::with_capacity(N);
+    for home in homes.into_iter().flatten() {
+        if !distinct.iter().any(|seen| same_proxy_home(seen, home)) {
+            distinct.push(home);
+        }
+    }
+    distinct
+}
+
+/// What LPM keeps in a home's proxy service folder: the batch file earlier
+/// releases' task ran, the task's definition while it is registered, and
+/// the proxy's logs.
+#[cfg(windows)]
+const WINDOWS_SERVICE_FILES: [&str; 4] = [
+    "start-proxy.cmd",
+    "proxy-task.xml",
+    "proxy.out.log",
+    "proxy.err.log",
+];
+
+/// Stops before anything changes where this terminal can't change the
+/// proxy service folder of one of `homes`, or what LPM keeps in it, with
+/// what to run then: an earlier release's install had to run from an
+/// administrator terminal, which left the folder to the Administrators and
+/// let in no one else.
+#[cfg(windows)]
+fn check_windows_service_folders(homes: &[&Path], then: &str) -> Result<(), LpmError> {
+    match homes
+        .iter()
+        .find_map(|home| windows_unchangeable_service_entry(home))
+    {
+        Some(path) => Err(LpmError::Proxy(format!(
+            "this terminal can't change {}: an earlier LPM release's `lpm proxy install`, run \
+             from an administrator terminal as it had to be, left it to the Administrators. Run \
+             `lpm proxy uninstall` once from an administrator terminal{then}",
+            path.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The first of `home`'s proxy service folder and what LPM keeps in it
+/// that this process may not change as installing and running the proxy
+/// do: add to the folder, or to `services` until it is there, write to the
+/// logs, and remove the earlier batch file. `None` where it may, or none
+/// of them is there.
+#[cfg(windows)]
+fn windows_unchangeable_service_entry(home: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_DELETE_CHILD,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    };
+
+    let denied = |path: &Path, access: u32, flags: u32| {
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .custom_flags(flags)
+            .open(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    };
+    let services = home.join("services");
+    let folder = services.join("proxy");
+    let (directory, access) = if folder.is_dir() {
+        (folder.clone(), FILE_ADD_FILE)
+    } else {
+        (services, FILE_ADD_SUBDIRECTORY)
+    };
+    if denied(&directory, access, FILE_FLAG_BACKUP_SEMANTICS) {
+        return Some(directory);
+    }
+    // Either the file's own entry or its folder's lets a file be removed.
+    let launcher = folder.join("start-proxy.cmd");
+    if denied(&launcher, DELETE, 0)
+        && denied(&folder, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS)
+    {
+        return Some(launcher);
+    }
+    ["proxy.out.log", "proxy.err.log"]
+        .into_iter()
+        .map(|name| folder.join(name))
+        .find(|log| denied(log, FILE_APPEND_DATA, 0))
+}
+
+/// Removes `home`'s proxy service folder where the Administrators own it,
+/// as an earlier release's install from an administrator terminal left it,
+/// so that this user's install can make it again: what LPM keeps in it,
+/// then the folder, and `services` once that is empty. Only a run from an
+/// administrator terminal gets in to do it.
+#[cfg(windows)]
+fn remove_administrators_service_folder(home: &Path) {
+    let services = home.join("services");
+    let folder = services.join("proxy");
+    let left_behind = |path: &Path, error: std::io::Error| {
+        tracing::warn!(
+            "couldn't remove {}, which the Administrators own: {error}; remove it from this \
+             terminal, so that `lpm proxy install` works from a normal one",
+            path.display()
+        );
+    };
+    if windows_owned_by_administrators(&folder) {
+        for name in WINDOWS_SERVICE_FILES {
+            let path = folder.join(name);
+            match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    left_behind(&path, error);
+                }
+                _ => {}
+            }
+        }
+        match std::fs::remove_dir(&folder) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                left_behind(&folder, error);
+            }
+            _ => {}
+        }
+    }
+    if windows_owned_by_administrators(&services)
+        && let Err(error) = std::fs::remove_dir(&services)
+    {
+        left_behind(&services, error);
+    }
+}
+
+/// Whether SYSTEM or the Administrators own the folder at `path`; `false`
+/// where it isn't there, or this process may not read its owner.
+#[cfg(windows)]
+fn windows_owned_by_administrators(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+
+    std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .and_then(|folder| lpm_common::owner_only::owned_by_system_or_administrators(&folder))
+        .unwrap_or(false)
 }
 
 /// Whether the proxies for LPM homes `a` and `b` are one, as they answer
@@ -1371,6 +1569,219 @@ exit 0
 #[cfg(all(test, windows))]
 mod windows_task_tests {
     use super::*;
+
+    /// Runs `icacls` with `args`, as the tests change who may do what.
+    fn icacls(args: &[&std::ffi::OsStr]) {
+        let output = Command::new("icacls").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "icacls {args:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Denies this user `rights` on `path` until dropped, as an earlier
+    /// release's install from an administrator terminal left its service
+    /// folder: the user may still change the DACL of what they own.
+    struct Denied(std::path::PathBuf, String);
+
+    impl Denied {
+        fn new(path: &Path, rights: &str) -> Self {
+            let user = format!("*{}", windows_user_sid().unwrap());
+            icacls(&[
+                path.as_os_str(),
+                "/deny".as_ref(),
+                format!("{user}:({rights})").as_ref(),
+            ]);
+            Self(path.to_path_buf(), user)
+        }
+    }
+
+    impl Drop for Denied {
+        fn drop(&mut self) {
+            let _ = Command::new("icacls")
+                .arg(&self.0)
+                .args(["/remove:d", &self.1])
+                .output();
+        }
+    }
+
+    /// Runs `run` on this thread with every privilege disabled. Hosted CI
+    /// administrators hold backup and restore privileges, which open any
+    /// folder with backup semantics, as the check opens folders, whatever
+    /// its DACL says. Other threads keep the process token.
+    fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                // SAFETY: impersonation was established on this thread only.
+                unsafe { RevertToSelf() };
+            }
+        }
+        // SAFETY: ImpersonateSelf takes no pointers.
+        assert_ne!(unsafe { ImpersonateSelf(SecurityImpersonation) }, 0);
+        let _revert = Revert;
+        let mut token = std::ptr::null_mut();
+        // SAFETY: this thread is impersonating; `token` is an output slot.
+        assert_ne!(
+            unsafe {
+                OpenThreadToken(
+                    GetCurrentThread(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    1,
+                    &mut token,
+                )
+            },
+            0
+        );
+        // SAFETY: disable-all ignores the new-state and output buffers,
+        // which are null; `token` is open and closed once here.
+        let adjusted = unsafe {
+            let adjusted = AdjustTokenPrivileges(
+                token,
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            CloseHandle(token);
+            adjusted
+        };
+        assert_ne!(adjusted, 0);
+        run()
+    }
+
+    fn unchangeable_entry(home: &Path) -> Option<std::path::PathBuf> {
+        without_privileges(|| windows_unchangeable_service_entry(home))
+    }
+
+    fn service_folder_with_files(home: &Path) -> std::path::PathBuf {
+        let folder = home.join("services").join("proxy");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in WINDOWS_SERVICE_FILES {
+            std::fs::write(folder.join(name), name).unwrap();
+        }
+        folder
+    }
+
+    /// Install and uninstall stop before changing anything where this
+    /// terminal can't add to the home's proxy service folder, write to its
+    /// logs, or remove the earlier batch file, naming what it can't change
+    /// and what to run; a folder the user may change passes.
+    #[test]
+    fn a_service_folder_this_terminal_cannot_change_is_named_before_anything_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(unchangeable_entry(&home), None);
+
+        let services = home.join("services");
+        std::fs::create_dir_all(&services).unwrap();
+        {
+            let _denied = Denied::new(&services, "AD");
+            assert_eq!(unchangeable_entry(&home).as_ref(), Some(&services));
+        }
+
+        let folder = service_folder_with_files(&home);
+        assert_eq!(unchangeable_entry(&home), None);
+        {
+            let _denied = Denied::new(&folder, "WD");
+            assert_eq!(unchangeable_entry(&home).as_ref(), Some(&folder));
+            let error = without_privileges(|| {
+                check_windows_service_folders(
+                    &[dir.path(), &home],
+                    ", then `lpm proxy install` again from this one",
+                )
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&folder.display().to_string()), "{error}");
+            assert!(
+                error.contains(
+                    "Run `lpm proxy uninstall` once from an administrator terminal, then \
+                     `lpm proxy install` again from this one"
+                ),
+                "{error}"
+            );
+        }
+
+        let launcher = folder.join("start-proxy.cmd");
+        {
+            let _file = Denied::new(&launcher, "DE");
+            assert_eq!(unchangeable_entry(&home), None);
+            let _folder = Denied::new(&folder, "DC");
+            assert_eq!(unchangeable_entry(&home).as_ref(), Some(&launcher));
+        }
+
+        let log = folder.join("proxy.err.log");
+        {
+            let _denied = Denied::new(&log, "AD");
+            assert_eq!(unchangeable_entry(&home).as_ref(), Some(&log));
+        }
+        assert_eq!(unchangeable_entry(&home), None);
+        assert!(without_privileges(|| check_windows_service_folders(&[&home], "")).is_ok());
+    }
+
+    /// From an administrator terminal, uninstall removes a service folder
+    /// the Administrators own, with what LPM keeps in it, so that the user's
+    /// own install can make it again; what else is in it stays, and so does
+    /// a folder the user owns.
+    #[test]
+    fn a_service_folder_the_administrators_own_is_removed_with_what_lpm_keeps_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let users = dir.path().join("users");
+        let folder = service_folder_with_files(&users);
+        icacls(&[
+            folder.as_os_str(),
+            "/setowner".as_ref(),
+            format!("*{}", windows_user_sid().unwrap()).as_ref(),
+        ]);
+        assert!(!windows_owned_by_administrators(&folder));
+        remove_administrators_service_folder(&users);
+        for name in WINDOWS_SERVICE_FILES {
+            assert!(folder.join(name).is_file(), "{name}");
+        }
+
+        let administrators = dir.path().join("administrators");
+        let folder = service_folder_with_files(&administrators);
+        if !windows_owned_by_administrators(&folder) {
+            // Only an elevated token can make the Administrators the owner
+            // of what it creates; this run's doesn't.
+            return;
+        }
+        remove_administrators_service_folder(&administrators);
+        assert!(!administrators.join("services").exists());
+
+        let folder = service_folder_with_files(&administrators);
+        std::fs::write(folder.join("notes.txt"), "kept").unwrap();
+        remove_administrators_service_folder(&administrators);
+        assert!(folder.join("notes.txt").is_file());
+        for name in WINDOWS_SERVICE_FILES {
+            assert!(!folder.join(name).exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn homes_one_proxy_answers_for_are_taken_once() {
+        assert_eq!(
+            distinct_proxy_homes([
+                Some(Path::new(r"C:\lpm-home")),
+                None,
+                Some(Path::new(r"c:\LPM-HOME\")),
+                Some(Path::new(r"C:\other")),
+            ]),
+            [Path::new(r"C:\lpm-home"), Path::new(r"C:\other")]
+        );
+    }
 
     /// Task Scheduler takes the logon task from a user who isn't elevated,
     /// as a trigger for this user's logon alone needs no administrator, and
