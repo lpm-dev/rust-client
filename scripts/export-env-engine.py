@@ -2,6 +2,7 @@
 """Export a pinned universal macOS engine from immutable source inputs."""
 import argparse
 import fcntl
+import filecmp
 import hashlib
 import html
 import json
@@ -212,6 +213,35 @@ def third_party_notices(packages, mit_text, data_notices, std_notice):
     return '\n'.join(parts)
 
 
+def capture(root, paths, frozen):
+    """Make frozen hold exactly the files root has at paths.
+
+    Cargo rebuilds a crate when a source is newer than its last build, and a
+    fresh checkout's files are all new. A file whose bytes frozen already
+    holds is therefore left alone, time included, and a changed file is
+    written anew, which gives it the time of this capture.
+    """
+    wanted = {}
+    for raw in paths:
+        if raw:
+            relative = Path(os.fsdecode(raw))
+            if (root / relative).is_file():
+                wanted[relative] = root / relative
+    frozen.mkdir(parents=True, exist_ok=True)
+    for directory, directories, names in os.walk(frozen, topdown=False):
+        for path in [Path(directory) / name for name in names + directories]:
+            if path.is_symlink() or (path.is_file() and path.relative_to(frozen) not in wanted):
+                path.unlink()
+            elif path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+    for relative, source in wanted.items():
+        destination = frozen / relative
+        if not destination.is_file() or not filecmp.cmp(source, destination, shallow=False):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+        shutil.copymode(source, destination)
+
+
 def export(root, target_dir, output):
     target_dir = target_dir.resolve() / 'env-engine-export'
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -238,18 +268,11 @@ def export_locked(root, target_dir, output):
             raise RuntimeError('Engine inputs do not match the recorded revision: ' + relative)
     paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=root).split(b'\0')
     targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin']
-    with tempfile.TemporaryDirectory(prefix='lpm-env-source-') as temporary, tempfile.TemporaryDirectory(prefix='.lpm-env-export-', dir=output.parent) as publication:
-        frozen = Path(temporary).resolve()
-        for raw in paths:
-            if not raw:
-                continue
-            relative = Path(os.fsdecode(raw))
-            source = root / relative
-            if not source.is_file():
-                continue
-            destination = frozen / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+    with tempfile.TemporaryDirectory(prefix='.lpm-env-export-', dir=output.parent) as publication:
+        # The compiler flags name this directory, and Cargo rebuilds every crate when they change, so each
+        # export into a target builds in the same place. The lock on the target keeps it to one export.
+        frozen = target_dir / 'source'
+        capture(root, paths, frozen)
         sources = source_hashes(frozen)
         if source_hashes(root) != sources:
             raise RuntimeError('Engine sources changed during capture')
