@@ -656,7 +656,7 @@ pub(super) fn project_root_for_state(
 /// project `.npmrc`; `cwd` without a `package.json` around it, where npm
 /// itself reads one.
 pub(super) fn npmrc_project_dir(cwd: &std::path::Path, json_output: bool) -> std::path::PathBuf {
-    let home = dirs::home_dir();
+    let home = lpm_common::npm_home_dir();
     let dir = lpm_registry::npmrc::project_npmrc_dir(cwd, home.as_deref())
         .unwrap_or_else(|| cwd.to_path_buf());
     if dir != cwd && !json_output {

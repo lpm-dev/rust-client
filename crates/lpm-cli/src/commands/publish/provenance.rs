@@ -148,7 +148,7 @@ fn resolve_provenance_request_with_sources(
         });
     }
 
-    let home = dirs::home_dir();
+    let home = lpm_common::npm_home_dir();
     let project_npmrc_path = publish_project_npmrc_path(project_dir);
     let project = npmrc_request(&project_npmrc_path)?;
     let user_path = lpm_common::npm_user_config_path(home.as_deref());
@@ -1196,9 +1196,6 @@ mod tests {
         assert!(matches!(request, ProvenanceRequest::Disabled));
     }
 
-    // `dirs::home_dir` reads `$HOME` on Unix only; Windows asks the shell for
-    // the profile folder. `lpm_common`'s npmrc tests expand `~` on every host.
-    #[cfg(unix)]
     #[test]
     fn provenance_discovery_expands_a_tilde_userconfig_override() {
         let project = tempfile::tempdir().unwrap();
@@ -1206,6 +1203,7 @@ mod tests {
         std::fs::write(home.path().join("publish.npmrc"), "provenance=true\n").unwrap();
         let _env = ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("NPM_CONFIG_PROVENANCE", None),
             ("npm_config_provenance", None),
             ("NPM_CONFIG_PROVENANCE_FILE", None),

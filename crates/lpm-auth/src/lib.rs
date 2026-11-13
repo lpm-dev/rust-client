@@ -2071,7 +2071,7 @@ pub fn clear_refresh_token(registry: &str) -> Result<(), String> {
 ///
 /// Merges npm's global, user, and project layers in precedence order.
 fn parse_npmrc_token() -> Result<Option<String>, String> {
-    let home = dirs::home_dir();
+    let home = lpm_common::npm_home_dir();
     let user_path = lpm_common::npm_user_config_path(home.as_deref());
     let user_layer = user_path
         .as_deref()
@@ -3020,6 +3020,28 @@ mod test_env {
         _guard: MutexGuard<'static, ()>,
     }
 
+    /// `vars` as the process applies them. Windows names a variable one way
+    /// whatever its case, so there clearing `npm_config_userconfig` after
+    /// setting `NPM_CONFIG_USERCONFIG`, two variables elsewhere, would undo
+    /// the set; a clear of a name the same update sets is left out.
+    pub(crate) fn applicable(
+        vars: Vec<(&'static str, Option<OsString>)>,
+    ) -> Vec<(&'static str, Option<OsString>)> {
+        if !cfg!(windows) {
+            return vars;
+        }
+        let set = vars
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        vars.into_iter()
+            .filter(|(key, value)| {
+                value.is_some() || !set.iter().any(|set| set.eq_ignore_ascii_case(key))
+            })
+            .collect()
+    }
+
     impl ScopedEnv {
         pub(crate) fn set<I>(vars: I) -> Self
         where
@@ -3032,7 +3054,7 @@ mod test_env {
         where
             I: IntoIterator<Item = (&'static str, Option<OsString>)>,
         {
-            let vars = vars.into_iter().collect::<Vec<_>>();
+            let vars = applicable(vars.into_iter().collect());
             let guard = lock_env();
             let previous = vars
                 .iter()
@@ -3074,6 +3096,28 @@ mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
+    #[test]
+    fn test_env_keeps_a_set_its_other_spelling_would_clear_on_windows() {
+        let applied = super::test_env::applicable(vec![
+            ("NPM_CONFIG_USERCONFIG", Some("custom.npmrc".into())),
+            ("npm_config_userconfig", None),
+            ("npm_config_globalconfig", None),
+        ]);
+        let names = applied.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        if cfg!(windows) {
+            assert_eq!(names, ["NPM_CONFIG_USERCONFIG", "npm_config_globalconfig"]);
+        } else {
+            assert_eq!(
+                names,
+                [
+                    "NPM_CONFIG_USERCONFIG",
+                    "npm_config_userconfig",
+                    "npm_config_globalconfig"
+                ]
+            );
+        }
+    }
+
     struct LocalEnvGuard {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -3083,7 +3127,7 @@ mod tests {
         where
             I: IntoIterator<Item = (&'static str, Option<std::ffi::OsString>)>,
         {
-            let vars = vars.into_iter().collect::<Vec<_>>();
+            let vars = super::test_env::applicable(vars.into_iter().collect());
             let previous = vars
                 .iter()
                 .map(|(key, _)| (*key, std::env::var_os(key)))
@@ -3119,6 +3163,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(temp.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(temp.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(temp.path().join(".lpm").into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
@@ -4092,6 +4137,7 @@ mod tests {
         std::fs::create_dir_all(repository.join(".git")).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(repository.clone().into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
@@ -4212,6 +4258,7 @@ mod tests {
         std::os::unix::fs::symlink(&state, &alias).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(alias.into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
@@ -4621,6 +4668,7 @@ mod tests {
         );
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             (
                 "NPM_CONFIG_USERCONFIG",
@@ -4644,6 +4692,7 @@ mod tests {
         );
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("NPM_CONFIG_USERCONFIG", Some("~/custom.npmrc".into())),
             ("npm_config_userconfig", None),
@@ -4672,6 +4721,7 @@ mod tests {
         std::fs::set_permissions(&userconfig, std::fs::Permissions::from_mode(0o622)).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             (
                 "NPM_CONFIG_USERCONFIG",
@@ -5112,6 +5162,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("create acceptance home");
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.as_os_str().to_owned())),
             ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
             ("ACCEPTANCE_RUN_DIR", Some(run_dir.into_os_string())),
             ("ACCEPTANCE_RUN_ID", Some("release-file-auth".into())),
