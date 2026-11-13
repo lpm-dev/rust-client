@@ -1720,6 +1720,87 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Makes `path`, a directory, one the test process can read but not change
+/// while it runs [`without_privileges`], as `C:\Program Files` is to an
+/// administrator. Entries it inherits become its own, a grant among them;
+/// the Administrators, SYSTEM and the user then lose theirs; and only
+/// reading is left, to the user and, through OWNER RIGHTS, to the owner,
+/// which for an elevated test is the Administrators.
+#[cfg(test)]
+fn lock_directory_for_test(path: &Path) {
+    let user = setup::current_user_sid().unwrap();
+    let icacls = |args: &[&str]| {
+        let output = std::process::Command::new("icacls.exe")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    };
+    icacls(&["/inheritance:d"]);
+    icacls(&[
+        "/remove:g",
+        "*S-1-5-32-544",
+        "*S-1-5-18",
+        &format!("*{user}"),
+    ]);
+    icacls(&["/grant", &format!("*{user}:(RX)"), "*S-1-3-4:(RX)"]);
+    assert!(!without_privileges(|| setup::can_change_permissions(path)));
+}
+
+/// Runs `run` on this thread with every privilege disabled. Hosted CI
+/// administrators hold backup and restore privileges that let them open
+/// any directory to change its DACL, so a test that needs one it can't
+/// change runs its check here. Other threads keep the process token.
+#[cfg(test)]
+fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    struct RevertImpersonation;
+    impl Drop for RevertImpersonation {
+        fn drop(&mut self) {
+            // SAFETY: impersonation was established on this thread only.
+            unsafe { RevertToSelf() };
+        }
+    }
+    // SAFETY: ImpersonateSelf takes no pointers.
+    assert_ne!(unsafe { ImpersonateSelf(SecurityImpersonation) }, 0);
+    let _revert = RevertImpersonation;
+    let mut token = ptr::null_mut();
+    // SAFETY: this thread is impersonating; token is an initialized output slot.
+    assert_ne!(
+        unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                1,
+                &mut token,
+            )
+        },
+        0
+    );
+    let token = HandleGuard(token);
+    // SAFETY: disable-all ignores the new-state and output buffers, which are null.
+    assert_ne!(
+        unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw(),
+                1,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        0
+    );
+    run()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

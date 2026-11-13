@@ -105,7 +105,12 @@ impl Target {
         }
     }
 
-    fn child(&self, name: &OsStr, path: &Path) -> Result<Self, AppContainerError> {
+    fn child(
+        &self,
+        name: &OsStr,
+        path: &Path,
+        single_link: bool,
+    ) -> Result<Self, AppContainerError> {
         let mut components = Path::new(name).components();
         if !matches!(components.next(), Some(std::path::Component::Normal(_)))
             || components.next().is_some()
@@ -118,7 +123,7 @@ impl Target {
             path,
             true,
             true,
-            true,
+            single_link,
         )
     }
 
@@ -182,10 +187,13 @@ impl Target {
             });
         }
         if status < 0 {
-            return Err(AppContainerError::ReadDacl {
-                path: path.to_path_buf(),
-                // SAFETY: status is the NTSTATUS returned by NtCreateFile.
-                win32_error: unsafe { RtlNtStatusToDosError(status) },
+            let path = path.to_path_buf();
+            // SAFETY: status is the NTSTATUS returned by NtCreateFile.
+            let win32_error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(if write {
+                AppContainerError::WriteDacl { path, win32_error }
+            } else {
+                AppContainerError::ReadDacl { path, win32_error }
             });
         }
         let handle = HandleGuard(raw);
@@ -299,11 +307,23 @@ fn names(
     Ok(Some(names))
 }
 
+#[cfg(test)]
 pub(super) fn children(
     root: &Target,
     path: &Path,
     sid: PSID,
     value: Option<(u32, u32)>,
+) -> Result<(), AppContainerError> {
+    children_saving(root, path, sid, value, None)
+}
+
+/// [`children`], adding to `journal`, on a removal, each DACL it replaces.
+pub(super) fn children_saving(
+    root: &Target,
+    path: &Path,
+    sid: PSID,
+    value: Option<(u32, u32)>,
+    mut journal: Option<&mut Vec<SavedDacl>>,
 ) -> Result<(), AppContainerError> {
     struct Frame {
         target: Target,
@@ -340,12 +360,19 @@ pub(super) fn children(
             },
         };
         let child_path = directory.join(&name);
-        let child = match target.child(&name, &child_path) {
+        // A file with names outside the tree is never granted, but removing
+        // a grant can't widen access, so a removal passes it.
+        let child = match target.child(&name, &child_path, value.is_some()) {
             Ok(child) => child,
             Err(AppContainerError::ReparsePointRoot { .. }) => continue,
             Err(error) => return Err(error),
         };
-        update_pinned_ace(&child.handle, &child_path, sid, value)?;
+        match (value, journal.as_deref_mut()) {
+            (None, Some(journal)) => {
+                remove_pinned_ace_saving(&child.handle, &child_path, sid, journal)?;
+            }
+            _ => update_pinned_ace(&child.handle, &child_path, sid, value)?,
+        }
         if child.directory {
             stack.push(Frame {
                 target: child,

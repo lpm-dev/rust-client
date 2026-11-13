@@ -268,9 +268,12 @@ fn open_permissions(
         )
     };
     if raw == INVALID_HANDLE_VALUE {
-        return Err(AppContainerError::ReadDacl {
-            path: path.to_path_buf(),
-            win32_error: unsafe { GetLastError() },
+        let path = path.to_path_buf();
+        let win32_error = unsafe { GetLastError() };
+        return Err(if write {
+            AppContainerError::WriteDacl { path, win32_error }
+        } else {
+            AppContainerError::ReadDacl { path, win32_error }
         });
     }
     let handle = HandleGuard(raw);
@@ -376,11 +379,30 @@ pub fn preview_paths(
         }
         paths.insert(tool, Permission::ToolReadExecute);
     }
-    let grants = paths
-        .into_iter()
-        .map(|(path, permission)| grant_for(&path, permission, &user_sid))
-        .collect::<Result<_, _>>()?;
+    let mut grants = Vec::new();
+    for (path, permission) in paths {
+        let grant = grant_for(&path, permission, &user_sid)?;
+        // A sandboxed run needs nothing on an ancestor every AppContainer
+        // may traverse already, as `C:\Program Files` lets them, and such
+        // a directory is often one administrators can't change.
+        if permission == Permission::Metadata
+            && !grant.configured
+            && packages_can_traverse(&grant.path)?
+        {
+            continue;
+        }
+        grants.push(grant);
+    }
     Ok(Plan { user_sid, grants })
+}
+
+/// Whether every AppContainer may already read `path`'s metadata and
+/// traverse it, so a sandboxed run needs no capability or grant there.
+fn packages_can_traverse(path: &Path) -> Result<bool, AppContainerError> {
+    let mut buffer = vec![0; 64];
+    let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut buffer)?;
+    let (handle, _) = open_permissions(path, false)?;
+    has_grant(&handle, path, packages.Sid, METADATA_ACCESS, 0)
 }
 
 /// Find protected ancestors that need setup, without changing permissions or walking trees.
@@ -393,17 +415,14 @@ pub fn required_metadata_setup(roots: &[PathBuf]) -> Result<Vec<PathBuf>, AppCon
             .map_err(|error| failure(error.to_string()))?;
         ancestors.extend(root.ancestors().skip(1).map(Path::to_path_buf));
     }
-    let mut buffer = vec![0; 64];
-    let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut buffer)?;
     let mut missing = Vec::new();
     for path in ancestors {
-        if grant_for(&path, Permission::Metadata, &user)?.configured {
+        if grant_for(&path, Permission::Metadata, &user)?.configured
+            || packages_can_traverse(&path)?
+        {
             continue;
         }
-        let (handle, _) = open_permissions(&path, false)?;
-        if !has_grant(&handle, &path, packages.Sid, METADATA_ACCESS, 0)?
-            && open_permissions(&path, true).is_err()
-        {
+        if open_permissions(&path, true).is_err() {
             missing.push(path);
         }
     }
@@ -622,11 +641,33 @@ fn update_open_ace(
             let _updated = LocalAllocGuard(updated.cast());
             write_dacl(handle, path, updated)
         }
-        None => {
-            let mut filtered = dacl_without_allowed_aces_for_sid(path, old, sid)?;
-            write_dacl(handle, path, filtered.as_mut_ptr().cast())
-        }
+        None => remove_open_ace(handle, path, sid).map(|_| ()),
     }
+}
+
+/// Takes `sid`'s allow entries out of the open object's DACL, writing
+/// nothing when it holds none, and gives back the DACL it had when it did.
+fn remove_open_ace(
+    handle: &HandleGuard,
+    path: &Path,
+    sid: PSID,
+) -> Result<Option<Vec<u32>>, AppContainerError> {
+    let (old, _descriptor) = read_dacl(handle, path)?;
+    // SAFETY: both SIDs are valid for the comparison.
+    let (mut filtered, removed) =
+        super::dacl_without_allowed_aces_where(path, old, |ace| unsafe {
+            EqualSid(ace, sid) != 0
+        })?;
+    if removed == 0 {
+        return Ok(None);
+    }
+    // SAFETY: `old` is the DACL inside the live descriptor, `AclSize` bytes long.
+    let size = usize::from(unsafe { (*old).AclSize });
+    let mut saved = vec![0u32; size.div_ceil(std::mem::size_of::<u32>())];
+    // SAFETY: `saved` holds at least `size` bytes and doesn't overlap `old`.
+    unsafe { ptr::copy_nonoverlapping(old.cast::<u8>(), saved.as_mut_ptr().cast::<u8>(), size) };
+    write_dacl(handle, path, filtered.as_mut_ptr().cast())?;
+    Ok(Some(saved))
 }
 
 /// A tree that receives a lifecycle grant: its root, opened once by path,
@@ -802,50 +843,265 @@ fn update_pinned_ace(
     sid: PSID,
     value: Option<(u32, u32)>,
 ) -> Result<(), AppContainerError> {
+    let _lock = lock_pinned(handle)?;
+    update_open_ace(handle, path, sid, value)
+}
+
+/// The lock on the object `handle` has open, which every DACL change to it
+/// takes.
+fn lock_pinned(handle: &HandleGuard) -> Result<impl Drop, AppContainerError> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the pinned file handle is live and the output is correctly sized.
     if unsafe { GetFileInformationByHandle(handle.as_raw(), &mut info) } == 0 {
         return Err(last_error("inspect the pinned permission target"));
     }
-    let _lock = lock_object(Identity {
+    lock_object(Identity {
         volume: info.dwVolumeSerialNumber,
         index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    })?;
-    update_open_ace(handle, path, sid, value)
+    })
+}
+
+/// A DACL a removal replaced, kept with the object it belongs to, so that
+/// undoing the run writes back exactly that.
+pub(super) struct SavedDacl {
+    handle: HandleGuard,
+    path: PathBuf,
+    dacl: Vec<u32>,
+}
+
+/// Takes `sid`'s entries out of the pinned object's DACL, as
+/// [`update_pinned_ace`] does, and adds the DACL it had to `journal` when
+/// it held any.
+pub(super) fn remove_pinned_ace_saving(
+    handle: &HandleGuard,
+    path: &Path,
+    sid: PSID,
+    journal: &mut Vec<SavedDacl>,
+) -> Result<(), AppContainerError> {
+    let _lock = lock_pinned(handle)?;
+    let Some(dacl) = remove_open_ace(handle, path, sid)? else {
+        return Ok(());
+    };
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: both process handles are this process's pseudo handle, and
+    // `handle` is live; the duplicate is owned by the guard below.
+    if unsafe {
+        windows_sys::Win32::Foundation::DuplicateHandle(
+            GetCurrentProcess(),
+            handle.as_raw(),
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        let error = last_error("keep the permission target open to undo a removal");
+        // Put this one back now: nothing else would.
+        let _ = write_dacl(handle, path, dacl.as_ptr().cast_mut().cast());
+        return Err(error);
+    }
+    journal.push(SavedDacl {
+        handle: HandleGuard(duplicate),
+        path: path.to_path_buf(),
+        dacl,
+    });
+    Ok(())
+}
+
+/// Writes back, newest first, the DACLs a removal replaced.
+fn restore_saved(journal: Vec<SavedDacl>) -> Result<(), AppContainerError> {
+    let mut first_error = None;
+    for mut saved in journal.into_iter().rev() {
+        let restored = lock_pinned(&saved.handle).and_then(|_lock| {
+            write_dacl(&saved.handle, &saved.path, saved.dacl.as_mut_ptr().cast())
+        });
+        if let Err(error) = restored {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Apply or remove only the previewed capabilities. This function never runs package scripts.
-/// A failure can leave some grants applied or removed; repeat the preview and retry.
+/// It opens every directory before it changes one, and a failure partway
+/// puts back what it had changed.
 pub fn apply(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
     if !is_elevated()? {
         return Err(failure(
             "open an administrator terminal to apply or remove permissions; keep publishing in your normal terminal",
         ));
     }
-    for entry in &plan.grants {
-        let (_parents, root) = pin_grant(entry)?;
-        let sid = capability_sid(&entry.capability_name)?;
-        // Serialize the complete tree update separately from individual DACL
-        // merges, including across administrator accounts and logon sessions.
-        let _setup_lock = lock_named(&format!(
-            r"Global\LpmSandboxSetup-{}",
-            entry.capability_name
-        ))?;
-        let value = (!remove).then_some((entry.permission.mask(), entry.permission.inheritance()));
-        let result = (|| {
-            if entry.permission == Permission::ToolReadExecute {
-                // Re-applying also deactivates the root until the walk completes.
-                update_pinned_ace(&root.handle, &entry.path, sid.raw(), None)?;
-                walk::children(&root, &entry.path, sid.raw(), value)?;
+    apply_plan(plan, remove)
+}
+
+fn apply_plan(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
+    // Every tree's setup lock is held, taken in one order, from the first
+    // look until the last change or undo: another run's change to these
+    // trees can't land between what this run found and what it puts back.
+    let mut capabilities: Vec<&str> = plan
+        .grants
+        .iter()
+        .map(|entry| entry.capability_name.as_str())
+        .collect();
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    let _setup_locks = capabilities
+        .into_iter()
+        .map(|name| lock_named(&format!(r"Global\LpmSandboxSetup-{name}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Each directory is opened, and whether it holds its capability noted,
+    // before any changes: what a failure puts back is what this run found.
+    let targets = plan
+        .grants
+        .iter()
+        .map(|entry| {
+            let (parents, root) = pin_grant(entry)?;
+            let sid = capability_sid(&entry.capability_name)?;
+            let held = holds_ace(&root.handle, &entry.path, sid.raw())?;
+            Ok((parents, root, sid, held))
+        })
+        .collect::<Result<Vec<_>, AppContainerError>>()
+        .map_err(|error| failure(format!("{}. Nothing was changed", setup_reason(error))))?;
+    // What each removal replaced, in order, to write back on a failure: a
+    // removal that granted the tree again would also reach files that never
+    // held the capability.
+    let mut removed: Vec<Vec<SavedDacl>> = Vec::with_capacity(plan.grants.len());
+    for (index, entry) in plan.grants.iter().enumerate() {
+        let (_, root, sid, _) = &targets[index];
+        let changed = if remove {
+            let mut journal = Vec::new();
+            let changed = change_grant_saving(entry, root, sid, false, Some(&mut journal));
+            removed.push(journal);
+            changed
+        } else {
+            change_grant(entry, root, sid, true)
+        };
+        let Err(error) = changed else {
+            continue;
+        };
+        let mut undo_error = None;
+        for journal in removed.drain(..).rev() {
+            if let Err(error) = restore_saved(journal) {
+                undo_error.get_or_insert(error);
             }
-            update_pinned_ace(&root.handle, &entry.path, sid.raw(), value)
-        })();
-        result.map_err(|error: AppContainerError| failure(format!(
-            "permission setup stopped at {}: {error}. Some permissions may have changed; preview and retry the same operation",
-            entry.path.display()
-        )))?;
+        }
+        for (undone, entry) in plan.grants[..=index].iter().enumerate().rev() {
+            let (_, root, sid, held) = &targets[undone];
+            let undo = match (remove, *held) {
+                // A removal is undone from what it saved, above.
+                (true, _) => Ok(()),
+                // A grant that wasn't there before: remove it again.
+                (false, false) => change_grant(entry, root, sid, false),
+                // Applying again took away only the root's entry, while it
+                // walked the tree, and gave it back unless it stopped there.
+                (false, true) if undone == index => restore_root(entry, root, sid),
+                _ => Ok(()),
+            };
+            if let Err(error) = undo {
+                undo_error.get_or_insert(error);
+            }
+        }
+        let stopped = format!(
+            "permission setup stopped at {}: {}",
+            entry.path.display(),
+            setup_reason(error)
+        );
+        // Applying a tool tree again grants what it reaches below the root
+        // as it walks, and puts back only the root's own entry.
+        let reapplied_tool =
+            !remove && targets[index].3 && entry.permission == Permission::ToolReadExecute;
+        return Err(failure(match undo_error {
+            None if reapplied_tool => format!(
+                "{stopped}. It put back what it had changed, except that files in that tool tree it reached may now be readable, as the rest of the tree already is"
+            ),
+            None => format!("{stopped}. It put back what it had changed"),
+            Some(undo_error) => format!(
+                "{stopped}. Putting back what it had changed failed too ({}), so some permissions may have changed; preview and retry the same operation",
+                setup_reason(undo_error)
+            ),
+        }));
     }
     Ok(())
+}
+
+/// `error`'s message without the "setup failed" its [`failure`] wrapper
+/// adds again.
+fn setup_reason(error: AppContainerError) -> String {
+    match error {
+        AppContainerError::Setup { reason } => reason,
+        other => other.to_string(),
+    }
+}
+
+/// Whether `path`'s DACL holds an access-allowed entry for `sid`.
+fn holds_ace(handle: &HandleGuard, path: &Path, sid: PSID) -> Result<bool, AppContainerError> {
+    let (dacl, _descriptor) = read_dacl(handle, path)?;
+    // SAFETY: both SIDs are valid for the comparison.
+    let (_, held) = super::dacl_without_allowed_aces_where(path, dacl, |ace| unsafe {
+        EqualSid(ace, sid) != 0
+    })?;
+    Ok(held > 0)
+}
+
+/// Gives `entry`'s root its capability entry back, as it had before.
+fn restore_root(
+    entry: &Grant,
+    root: &walk::Target,
+    sid: &CapabilitySid,
+) -> Result<(), AppContainerError> {
+    let _setup_lock = lock_named(&format!(
+        r"Global\LpmSandboxSetup-{}",
+        entry.capability_name
+    ))?;
+    update_pinned_ace(
+        &root.handle,
+        &entry.path,
+        sid.raw(),
+        Some((entry.permission.mask(), entry.permission.inheritance())),
+    )
+}
+
+/// Grants `entry`'s capability on its pinned `root`, or removes it.
+fn change_grant(
+    entry: &Grant,
+    root: &walk::Target,
+    sid: &CapabilitySid,
+    grant: bool,
+) -> Result<(), AppContainerError> {
+    change_grant_saving(entry, root, sid, grant, None)
+}
+
+/// [`change_grant`], adding to `journal`, for a removal, each DACL it
+/// replaces, so that undoing it puts back only what was there.
+fn change_grant_saving(
+    entry: &Grant,
+    root: &walk::Target,
+    sid: &CapabilitySid,
+    grant: bool,
+    mut journal: Option<&mut Vec<SavedDacl>>,
+) -> Result<(), AppContainerError> {
+    // Serialize the complete tree update separately from individual DACL
+    // merges, including across administrator accounts and logon sessions.
+    let _setup_lock = lock_named(&format!(
+        r"Global\LpmSandboxSetup-{}",
+        entry.capability_name
+    ))?;
+    let value = grant.then_some((entry.permission.mask(), entry.permission.inheritance()));
+    let remove_root = |journal: Option<&mut Vec<SavedDacl>>| match journal {
+        Some(journal) => remove_pinned_ace_saving(&root.handle, &entry.path, sid.raw(), journal),
+        None => update_pinned_ace(&root.handle, &entry.path, sid.raw(), None),
+    };
+    if entry.permission == Permission::ToolReadExecute {
+        // Re-applying also deactivates the root until the walk completes.
+        remove_root(journal.as_deref_mut())?;
+        walk::children_saving(root, &entry.path, sid.raw(), value, journal.as_deref_mut())?;
+    }
+    match value {
+        Some(_) => update_pinned_ace(&root.handle, &entry.path, sid.raw(), value),
+        None => remove_root(journal),
+    }
 }
 
 pub(super) struct PreparedAccess<'a> {
@@ -896,19 +1152,13 @@ pub(super) fn prepare<'a>(
                 .map(Path::to_path_buf),
         );
     }
-    let mut package_sid_buffer = vec![0; 64];
-    let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut package_sid_buffer)?;
     for path in ancestors {
         let entry = grant_for(&path, Permission::Metadata, &user_sid)?;
         if entry.configured {
             access
                 .capabilities
                 .push(capability_sid(&entry.capability_name)?);
-        } else {
-            let (handle, _) = open_permissions(&path, false)?;
-            if has_grant(&handle, &path, packages.Sid, METADATA_ACCESS, 0)? {
-                continue;
-            }
+        } else if !packages_can_traverse(&path)? {
             update_ace(&path, invocation.0, Some((METADATA_ACCESS, 0)))
                 .map_err(|_| AppContainerError::SetupRequired { path: path.clone() })?;
             access.temporary.push(path);
@@ -944,6 +1194,12 @@ pub(super) fn prepare<'a>(
         }
     }
     Ok(access)
+}
+
+/// Whether this thread can open `path` to change its permissions.
+#[cfg(test)]
+pub(super) fn can_change_permissions(path: &Path) -> bool {
+    open_permissions(path, true).is_ok()
 }
 
 #[cfg(test)]
@@ -1011,6 +1267,285 @@ mod tests {
         let replacement = grant_for(&path, Permission::Metadata, &user).unwrap();
         assert_ne!(initial.identity, replacement.identity);
         assert_ne!(initial.capability_name, replacement.capability_name);
+    }
+
+    /// `C:\Program Files` lets every AppContainer traverse it, and is
+    /// owned by TrustedInstaller, so administrators can't change it.
+    #[test]
+    fn preview_leaves_out_ancestors_every_app_container_can_traverse() {
+        let temporary = tempfile::tempdir().unwrap();
+        let open = temporary.path().join("open");
+        let project = open.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut buffer = vec![0; 64];
+        let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut buffer).unwrap();
+        update_ace(&open, packages.Sid, Some((METADATA_ACCESS, 0))).unwrap();
+
+        let plan = preview(&project, &[], None).unwrap();
+
+        let open = canonical_directory(&open).unwrap();
+        assert!(
+            !plan.grants.iter().any(|grant| grant.path == open),
+            "{:?}",
+            plan.grants
+        );
+        let parent = canonical_directory(temporary.path()).unwrap();
+        assert_eq!(
+            plan.grants.iter().any(|grant| grant.path == parent),
+            !packages_can_traverse(&parent).unwrap()
+        );
+
+        // A grant an earlier setup made there stays in the plan, so
+        // `--remove` still takes it away.
+        let user = current_user_sid().unwrap();
+        let earlier = grant_for(&open, Permission::Metadata, &user).unwrap();
+        let sid = capability_sid(&earlier.capability_name).unwrap();
+        update_ace(&open, sid.raw(), Some((METADATA_ACCESS, 0))).unwrap();
+        let plan = preview(&project, &[], None).unwrap();
+        assert!(
+            plan.grants
+                .iter()
+                .any(|grant| grant.path == open && grant.configured),
+            "{:?}",
+            plan.grants
+        );
+    }
+
+    /// Makes `path` a directory this process can read but not change, as
+    /// `C:\Program Files` is to an administrator, while it runs without
+    /// privileges.
+    fn unchangeable_directory(path: &Path) {
+        std::fs::create_dir(path).unwrap();
+        lock_directory_for_test(path);
+    }
+
+    #[test]
+    fn setup_changes_nothing_when_one_directory_cannot_be_changed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        let locked = temporary.path().join("locked");
+        unchangeable_directory(&locked);
+        let user = current_user_sid().unwrap();
+        let plan = Plan {
+            grants: vec![
+                grant_for(&first, Permission::Metadata, &user).unwrap(),
+                grant_for(&locked, Permission::Metadata, &user).unwrap(),
+            ],
+            user_sid: user.clone(),
+        };
+
+        let error = without_privileges(|| apply_plan(&plan, false))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot update permissions for"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(
+            !grant_for(&first, Permission::Metadata, &user)
+                .unwrap()
+                .configured
+        );
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    #[test]
+    fn setup_that_stops_partway_puts_back_what_it_changed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let tool = temporary.path().join("tool");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&tool).unwrap();
+        // Entries are listed in name order, so the walk grants this file
+        // before it stops at the hard link.
+        let granted = tool.join("a-granted.txt");
+        std::fs::write(&granted, "tool").unwrap();
+        let outside = temporary.path().join("outside.txt");
+        std::fs::write(&outside, "private").unwrap();
+        std::fs::hard_link(&outside, tool.join("z-linked.txt")).unwrap();
+        let user = current_user_sid().unwrap();
+        let plan = Plan {
+            grants: vec![
+                grant_for(&first, Permission::Metadata, &user).unwrap(),
+                grant_for(&tool, Permission::ToolReadExecute, &user).unwrap(),
+            ],
+            user_sid: user.clone(),
+        };
+
+        let error = apply_plan(&plan, false).unwrap_err().to_string();
+
+        assert!(error.contains("multiple hard links"), "{error}");
+        assert!(error.contains("It put back what it had changed"), "{error}");
+        assert_eq!(error.matches("setup failed").count(), 1, "{error}");
+        assert!(
+            !grant_for(&first, Permission::Metadata, &user)
+                .unwrap()
+                .configured
+        );
+        let sid = capability_sid(&plan.grants[1].capability_name).unwrap();
+        for path in [&tool, &granted] {
+            let (handle, _) = open_permissions(path, false).unwrap();
+            assert!(
+                !has_grant(&handle, path, sid.raw(), TOOL_ACCESS, 0).unwrap(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// A removal that stops partway puts back what it took away and nothing
+    /// more: a file in a tool tree that held no entry for the tool's
+    /// capability, such as one its owner kept from it, still holds none,
+    /// rather than gaining one as granting the tree again would give it.
+    #[test]
+    fn a_removal_that_stops_puts_back_only_what_it_took() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        let open = first.join("a-open.txt");
+        let kept_out = first.join("b-kept-out.txt");
+        std::fs::write(&open, "tool").unwrap();
+        std::fs::write(&kept_out, "private").unwrap();
+        let second = temporary.path().join("second");
+        std::fs::create_dir(&second).unwrap();
+        let user = current_user_sid().unwrap();
+        let plan = Plan {
+            grants: vec![
+                grant_for(&first, Permission::ToolReadExecute, &user).unwrap(),
+                grant_for(&second, Permission::ToolReadExecute, &user).unwrap(),
+            ],
+            user_sid: user.clone(),
+        };
+        apply_plan(&plan, false).unwrap();
+        let first_sid = capability_sid(&plan.grants[0].capability_name).unwrap();
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&kept_out)
+            .arg("/inheritance:d")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        update_ace(&kept_out, first_sid.raw(), None).unwrap();
+        // The removal of the second tree stops at a directory it can't
+        // change, after the first tree's removal went through.
+        let locked = second.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        lock_directory_for_test(&locked);
+
+        let error = without_privileges(|| apply_plan(&plan, true))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("It put back what it had changed"), "{error}");
+        let holds = |path: &Path| {
+            let (handle, _) = open_permissions(path, false).unwrap();
+            holds_ace(&handle, path, first_sid.raw()).unwrap()
+        };
+        assert!(
+            !holds(&kept_out),
+            "the removal's undo granted a file it never held"
+        );
+        assert!(holds(&first));
+        assert!(holds(&open));
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    /// Applying again walks the tree with the root's entry taken away; a
+    /// walk that stops gives that entry back rather than leaving a tool
+    /// that worked unusable.
+    #[test]
+    fn a_reapply_that_stops_keeps_the_tool_it_had() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tool = temporary.path().join("tool");
+        std::fs::create_dir(&tool).unwrap();
+        std::fs::write(tool.join("a-tool.exe"), "tool").unwrap();
+        let user = current_user_sid().unwrap();
+        let plan = Plan {
+            grants: vec![grant_for(&tool, Permission::ToolReadExecute, &user).unwrap()],
+            user_sid: user.clone(),
+        };
+        apply_plan(&plan, false).unwrap();
+        let outside = temporary.path().join("outside.txt");
+        std::fs::write(&outside, "private").unwrap();
+        std::fs::hard_link(&outside, tool.join("z-linked.txt")).unwrap();
+
+        let error = apply_plan(&plan, false).unwrap_err().to_string();
+
+        assert!(error.contains("It put back what it had changed"), "{error}");
+        assert!(
+            grant_for(&tool, Permission::ToolReadExecute, &user)
+                .unwrap()
+                .configured
+        );
+    }
+
+    /// A removal walk passes a file with names outside the tree, and writes
+    /// nothing to one it holds no grant on: a rewrite would drop the
+    /// DACL's protected and auto-inherited flags.
+    #[test]
+    fn a_removal_leaves_a_hard_linked_file_it_never_granted_untouched() {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let tool = temporary.path().join("tool");
+        std::fs::create_dir(&tool).unwrap();
+        let outside = temporary.path().join("outside.txt");
+        std::fs::write(&outside, "private").unwrap();
+        let user = current_user_sid().unwrap();
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&outside)
+            .args(["/inheritance:d"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::hard_link(&outside, tool.join("linked.txt")).unwrap();
+        let descriptor = || {
+            let (handle, _) = open_permissions(&outside, false).unwrap();
+            let mut descriptor = ptr::null_mut();
+            // SAFETY: the handle has READ_CONTROL and the output is initialized.
+            let error = unsafe {
+                GetSecurityInfo(
+                    handle.as_raw(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(error, ERROR_SUCCESS);
+            let _descriptor = LocalAllocGuard(descriptor.cast());
+            let mut text = ptr::null_mut();
+            // SAFETY: the descriptor is live; the string is LocalFree-owned.
+            assert_ne!(
+                unsafe {
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        descriptor,
+                        1,
+                        DACL_SECURITY_INFORMATION,
+                        &mut text,
+                        ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let _text = LocalAllocGuard(text.cast());
+            let length = (0..)
+                .take_while(|&at| unsafe { *text.add(at) } != 0)
+                .count();
+            // SAFETY: the string has `length` initialized units.
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
+        };
+        let before = descriptor();
+        assert!(before.starts_with("D:PAI"), "{before}");
+        let entry = grant_for(&tool, Permission::ToolReadExecute, &user).unwrap();
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let (_parents, root) = pin_grant(&entry).unwrap();
+
+        change_grant(&entry, &root, &sid, false).unwrap();
+
+        assert_eq!(descriptor(), before);
     }
 
     #[test]
