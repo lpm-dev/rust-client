@@ -762,6 +762,35 @@ pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, Workspa
     ))
 }
 
+/// Parse the `peerDependencies` that a package's own dependencies don't shadow.
+///
+/// A peer the same manifest also lists in `dependencies` or
+/// `optionalDependencies` is provided by that dependency, as the resolver
+/// treats it, so it and its `peerDependenciesMeta` entry are left out.
+pub fn parse_unshadowed_peer_dependencies(
+    content: &[u8],
+) -> Result<PeerDepsResult, WorkspaceError> {
+    let parsed: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(content))
+        .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
+    let Some(obj) = parsed.as_object() else {
+        return Ok((HashMap::new(), HashMap::new()));
+    };
+    let mut peers = lossy_string_map_from_value(obj.get("peerDependencies"));
+    let mut meta = peer_meta_map_from_value(obj.get("peerDependenciesMeta"));
+    for field in ["dependencies", "optionalDependencies"] {
+        let Some(own) = obj.get(field).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, range) in own {
+            if range.is_string() {
+                peers.remove(name);
+                meta.remove(name);
+            }
+        }
+    }
+    Ok((peers, meta))
+}
+
 /// Parse only the `bin` field from already-read `package.json` bytes.
 ///
 /// Parses through `serde_json::Value` so duplicate keys and non-string map
@@ -1378,6 +1407,31 @@ mod tests {
         let (deps, meta) = parse_peer_dependencies(json).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps.get("react").map(|s| s.as_str()), Some("^19.0.0"));
+        assert!(meta.get("react").unwrap().optional);
+    }
+
+    #[test]
+    fn unshadowed_peers_leave_out_peers_the_package_also_depends_on() {
+        let json = br#"{
+            "name": "sdk-like",
+            "dependencies": { "zod": "^3.25 || ^4.0", "skip-bool": false },
+            "optionalDependencies": { "fsevents": "^2.3.0" },
+            "peerDependencies": {
+                "zod": "^3.25 || ^4.0",
+                "fsevents": "^2.3.0",
+                "skip-bool": "^1.0.0",
+                "react": "^19.0.0"
+            },
+            "peerDependenciesMeta": {
+                "zod": { "optional": true },
+                "react": { "optional": true }
+            }
+        }"#;
+        let (deps, meta) = parse_unshadowed_peer_dependencies(json).unwrap();
+        let mut names: Vec<&str> = deps.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["react", "skip-bool"]);
+        assert!(!meta.contains_key("zod"));
         assert!(meta.get("react").unwrap().optional);
     }
 
