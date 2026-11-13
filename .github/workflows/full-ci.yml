@@ -1,0 +1,104 @@
+name: Full CI
+
+# The Windows filesystem gates and the macOS workspace tests take most of a
+# run's runner time, so a pull request runs them once for its whole stack. They
+# run on the head no other branch builds on, the stack's top, which holds every
+# commit of the members below it. When they pass, the `Full CI` status that
+# branch protection requires is set on that head and on each member it
+# contains.
+#
+# The `full-ci` label runs them on a member below the top, and a run started by
+# hand runs them on any branch.
+on:
+  pull_request:
+    branches: [main, "codex/**"]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer commit, or the label, replaces the pull request's run. Any other
+# label starts a run that does nothing, in a group of its own so that it
+# cancels nothing.
+concurrency:
+  group: full-ci-${{ github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'full-ci') && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Full CI plan
+    if: ${{ !github.event.pull_request.draft && (github.event.action != 'labeled' || github.event.label.name == 'full-ci') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Which branches build on this head is a question about commits, so
+          # the history comes without the files of older commits.
+          fetch-depth: 0
+          filter: tree:0
+          sparse-checkout: scripts/ci
+
+      - name: Decide whether the full tier runs on this head
+        id: plan
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          LABELED: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') && 'yes' || '' }}
+        run: >-
+          python3 scripts/ci/full-ci.py plan
+          --event "$GITHUB_EVENT_NAME"
+          --head-sha "$HEAD_SHA"
+          --head-ref "$HEAD_REF"
+          --github-output "$GITHUB_OUTPUT"
+          ${LABELED:+--labeled}
+
+  windows-filesystem:
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' }}
+    uses: ./.github/workflows/windows-filesystem-gate.yml
+
+  windows-filesystem-arm64:
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' }}
+    uses: ./.github/workflows/windows-filesystem-gate.yml
+    with:
+      runner: windows-11-arm
+
+  macos-workspace-tests:
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' }}
+    uses: ./.github/workflows/macos-workspace-tests.yml
+
+  report:
+    name: Full CI result
+    needs: [plan, windows-filesystem, windows-filesystem-arm64, macos-workspace-tests]
+    # A cancelled run reports nothing, so a head whose run was replaced keeps
+    # no status and cannot merge on it.
+    if: ${{ !cancelled() && needs.plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Set the Full CI status
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >-
+          python3 scripts/ci/full-ci.py report
+          --head-sha "$HEAD_SHA"
+          --head-ref "$HEAD_REF"
+          --run-url "$RUN_URL"
