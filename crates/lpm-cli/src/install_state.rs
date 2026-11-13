@@ -988,7 +988,7 @@ fn check_install_state_with_paths(
         };
     };
     let cached_hash = cached_hash_file.lines().next().unwrap_or("").trim();
-    if cached_hash != current_hash {
+    if cached_hash != current_hash || !bin_shims_current(&cached_hash_file) {
         return InstallState {
             up_to_date: false,
             hash: Some(current_hash),
@@ -1015,6 +1015,18 @@ fn check_install_state_with_paths(
         up_to_date,
         hash: Some(current_hash),
     }
+}
+
+/// Whether the install recorded in `install_hash` wrote command shims the
+/// way this release does. On Windows a project linked before `.cmd` shims
+/// named their targets from `%dp0%` has shims that break for a non-ASCII
+/// user folder, or none at all under a path with `'` or `&`, so it is linked
+/// again once; elsewhere shims haven't changed.
+fn bin_shims_current(install_hash: &str) -> bool {
+    !cfg!(windows)
+        || install_hash
+            .lines()
+            .any(|line| line.strip_prefix("s:") == Some(lpm_linker::BIN_SHIM_FORMAT))
 }
 
 fn project_uses_other_virtual_store(project_dir: &Path, selected: lpm_store::StoreVersion) -> bool {
@@ -1113,6 +1125,9 @@ fn try_mtime_fast_path(
     let content =
         lpm_common::read_text_file_capped(&hash_file, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
             .ok()?;
+    if !bin_shims_current(&content) {
+        return None;
+    }
 
     let mut lines = content.lines();
     let stored_hash = lines.next()?.trim();
@@ -1382,8 +1397,9 @@ fn write_install_hash_with_metadata(
     let platform_str = platform_tuple_key(platform);
     let security_analysis_str = metadata.security_analysis_policy.as_str();
     let node_runtime_fingerprint = metadata.node_runtime_fingerprint.unwrap_or("none");
+    let bin_shim_format = lpm_linker::BIN_SHIM_FORMAT;
     let content = format!(
-        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\n"
+        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\ns:{bin_shim_format}\n"
     );
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
@@ -1619,6 +1635,12 @@ mod tests {
         crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir)
     }
 
+    /// An install-hash file with `hash` and nothing else this release needs
+    /// to trust it, as one from the slow path's point of view.
+    fn current_hash_file(hash: &str) -> String {
+        format!("{hash}\ns:{}\n", lpm_linker::BIN_SHIM_FORMAT)
+    }
+
     fn setup_up_to_date_project() -> TempDir {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
@@ -1628,7 +1650,11 @@ mod tests {
         fs::create_dir_all(p.join(".lpm")).unwrap();
         let hash =
             compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
-        fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
+        fs::write(
+            p.join(".lpm").join("install-hash"),
+            current_hash_file(&hash),
+        )
+        .unwrap();
         dir
     }
 
@@ -2028,7 +2054,9 @@ mod tests {
         // Bare write — v1 format only.
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
         let state = check_install_state(p);
-        assert!(state.up_to_date);
+        // On Windows the install it records wrote `.cmd` shims as releases
+        // before `%dp0%` did, so the project is linked again once.
+        assert_eq!(state.up_to_date, !cfg!(windows));
     }
 
     #[test]
@@ -2078,7 +2106,42 @@ mod tests {
         assert_eq!(lines.next(), Some("a:disabled"));
         assert_eq!(lines.next(), Some("e:none"));
         assert_eq!(lines.next(), Some("n:none"));
+        assert_eq!(
+            lines.next(),
+            Some(format!("s:{}", lpm_linker::BIN_SHIM_FORMAT).as_str())
+        );
         assert_eq!(lines.next(), None);
+    }
+
+    /// A project linked before `.cmd` shims named their targets from
+    /// `%dp0%` holds shims that break for a non-ASCII user folder, or none
+    /// under a path with `'` or `&`; it isn't up to date until linked again.
+    #[cfg(windows)]
+    #[test]
+    fn a_project_linked_with_older_windows_shims_is_not_up_to_date() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let _home = scoped_home_for(p);
+        let pkg = r#"{"dependencies":{}}"#;
+        fs::write(p.join("package.json"), pkg).unwrap();
+        lpm_lockfile::Lockfile::default()
+            .write_to_file(&p.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let hash = check_install_state_with_content(p, pkg).hash.unwrap();
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::default()).unwrap();
+        assert!(check_install_state_with_content(p, pkg).up_to_date);
+
+        let hash_file = p.join(".lpm").join("install-hash");
+        let older: String = fs::read_to_string(&hash_file)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("s:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&hash_file, older).unwrap();
+
+        assert!(!check_install_state_with_content(p, pkg).up_to_date);
     }
 
     #[test]
@@ -3114,7 +3177,11 @@ mod tests {
         fs::create_dir_all(p.join("node_modules/.lpm")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
         let hash = compute_install_hash(pkg_json, &lock);
-        fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
+        fs::write(
+            p.join(".lpm").join("install-hash"),
+            current_hash_file(&hash),
+        )
+        .unwrap();
 
         let state = check_install_state(p);
         assert!(state.up_to_date, "empty legacy dir must not gate install");
@@ -3152,7 +3219,7 @@ mod tests {
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm/hoisted")).unwrap();
         let hash = compute_install_hash(pkg_json, &lock);
-        fs::write(p.join(".lpm/install-hash"), &hash).unwrap();
+        fs::write(p.join(".lpm/install-hash"), current_hash_file(&hash)).unwrap();
 
         let v1 = check_install_state_with_linker_integrity_and_dependency_engine(
             p,

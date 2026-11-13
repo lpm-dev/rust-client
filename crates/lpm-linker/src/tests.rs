@@ -1178,6 +1178,85 @@ fn validate_cmd_path_allows_normal_path() {
     assert!(validate_cmd_path("C:\\Users\\foo\\node_modules").is_ok());
 }
 
+/// Only what a shim must spell out is checked: a project path with `'`
+/// or `&` stays behind `%dp0%`, a target on another volume is written,
+/// and checked, whole.
+#[test]
+#[cfg(windows)]
+fn windows_cmd_shims_name_paths_relative_to_themselves() {
+    use crate::platform::windows_cmd_shim;
+    let bin = Path::new(r"C:\work\O'Brien & R&D\node_modules\.bin");
+    assert_eq!(
+        windows_cmd_shim(
+            bin,
+            Path::new(r"C:\work\O'Brien & R&D\node_modules\tool\bin\tool.js"),
+            bin.parent(),
+        )
+        .unwrap(),
+        format!(
+            "{}@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n\
+             @IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n\
+             ) ELSE (\r\n  node \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n)\r\n",
+            lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
+        )
+    );
+    // A canonicalized target, as the v1 linkers have, still compares with
+    // a bin directory built from the project's path.
+    let shim = windows_cmd_shim(
+        bin,
+        Path::new(r"\\?\C:\work\O'Brien & R&D\node_modules\tool\bin\tool.js"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        shim.contains(r#""%dp0%node.exe" "%dp0%..\tool\bin\tool.js" %*"#),
+        "{shim}"
+    );
+    // A project path typed in another case than the folders on disk still
+    // shares them with the store, so the shim names no non-ASCII folder.
+    let shim = windows_cmd_shim(
+        Path::new(r"c:\users\çağrı\app\node_modules\.bin"),
+        Path::new(r"C:\Users\Çağrı\.lpm\store\tool\bin\tool.js"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        shim.contains(r#" "%dp0%..\..\..\.lpm\store\tool\bin\tool.js" %*"#),
+        "{shim}"
+    );
+    assert!(shim.is_ascii(), "{shim}");
+    // A share named in another case, or canonicalized, is the same share.
+    for target in [
+        r"\\FILESERVER\home\app\node_modules\tool\bin\tool.js",
+        r"\\?\UNC\fileserver\Home\app\node_modules\tool\bin\tool.js",
+    ] {
+        let shim = windows_cmd_shim(
+            Path::new(r"\\fileserver\Home\app\node_modules\.bin"),
+            Path::new(target),
+            None,
+        )
+        .unwrap();
+        assert!(
+            shim.contains(r#" "%dp0%..\tool\bin\tool.js" %*"#),
+            "{target}: {shim}"
+        );
+    }
+    let shim = windows_cmd_shim(bin, Path::new(r"D:\store\tool.js"), None).unwrap();
+    assert!(
+        shim.contains(r#""%dp0%node.exe" "D:\store\tool.js" %*"#),
+        "{shim}"
+    );
+    assert!(windows_cmd_shim(bin, Path::new(r"D:\R&D\tool.js"), None).is_err());
+    assert!(
+        windows_cmd_shim(
+            bin,
+            Path::new(r"C:\work\O'Brien & R&D\node_modules\x%PATH%\tool.js"),
+            None
+        )
+        .is_err()
+    );
+}
+
 // Permission bits
 #[cfg(unix)]
 #[test]

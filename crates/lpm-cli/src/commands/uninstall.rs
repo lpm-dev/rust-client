@@ -282,8 +282,15 @@ fn remove_owned_cmd_shim(
     let Some(actual_target) = generated_cmd_shim_target(&content) else {
         return Ok(0);
     };
-    let Some(actual_canonical) =
-        crate::project_fs::canonicalize_with_missing_tail(Path::new(actual_target))
+    // Shims name their target relative to their own directory.
+    let actual_target = match actual_target.strip_prefix("%dp0%") {
+        Some(relative) => shim_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(relative),
+        None => PathBuf::from(actual_target),
+    };
+    let Some(actual_canonical) = crate::project_fs::canonicalize_with_missing_tail(&actual_target)
     else {
         return Ok(0);
     };
@@ -295,25 +302,34 @@ fn remove_owned_cmd_shim(
     Ok(freed_bytes)
 }
 
+/// The target an LPM-written `.cmd` shim runs: one that sets `%dp0%` in
+/// [`lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE`] and names it from
+/// there, or one from an earlier release, which spelled it out.
 #[cfg(windows)]
 fn generated_cmd_shim_target(content: &str) -> Option<&str> {
-    const HEADER: &str = "@IF EXIST \"%~dp0\\node.exe\" (";
-    const LOCAL_NODE_PREFIX: &str = "  \"%~dp0\\node.exe\" \"";
     const PATH_NODE_PREFIX: &str = "  node \"";
     const TARGET_SUFFIX: &str = "\" %*";
+
+    let (content, node) = match content.strip_prefix(lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE)
+    {
+        Some(body) => (body, "%dp0%node.exe"),
+        None => (content, "%~dp0\\node.exe"),
+    };
+    let expected_header = format!("@IF EXIST \"{node}\" (");
+    let local_node_prefix = format!("  \"{node}\" \"");
 
     let mut lines = content.lines();
     let mut header = lines.next()?;
     if header.starts_with("@SET \"NODE_PATH=") && header.ends_with(";%NODE_PATH%\"") {
         header = lines.next()?;
     }
-    if header != HEADER {
+    if header != expected_header {
         return None;
     }
 
     let local_target = lines
         .next()?
-        .strip_prefix(LOCAL_NODE_PREFIX)?
+        .strip_prefix(local_node_prefix.as_str())?
         .strip_suffix(TARGET_SUFFIX)?;
     if lines.next()? != ") ELSE (" {
         return None;
@@ -1310,6 +1326,46 @@ mod tests {
             shim.symlink_metadata().is_err(),
             "an LPM-generated shim must be removed when its raw target resolves to the expected file"
         );
+    }
+
+    /// Shims name their target relative to their own directory, as
+    /// `%dp0%..\<package>\…`.
+    #[cfg(windows)]
+    #[test]
+    fn remove_owned_cmd_shim_removes_a_shim_relative_to_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("node_modules").join(".bin");
+        let target = dir
+            .path()
+            .join("node_modules")
+            .join("package")
+            .join("bin")
+            .join("cli.js");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "console.log('ok')\n").unwrap();
+        let other = bin.join("other.cmd");
+        let shim = bin.join("cli.cmd");
+        for path in [&shim, &other] {
+            let relative = if path == &shim { "cli.js" } else { "other.js" };
+            std::fs::write(
+                path,
+                format!(
+                    "{}@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"%dp0%..\\package\\bin\\{relative}\" %*\r\n) ELSE (\r\n  node \"%dp0%..\\package\\bin\\{relative}\" %*\r\n)\r\n",
+                    lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
+                ),
+            )
+            .unwrap();
+        }
+
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&bin, cap_std::ambient_authority()).unwrap();
+        for path in [&shim, &other] {
+            remove_owned_cmd_shim(&directory, path, &target).unwrap();
+        }
+
+        assert!(shim.symlink_metadata().is_err());
+        assert!(other.is_file(), "a shim for another file must be preserved");
     }
 
     #[cfg(windows)]

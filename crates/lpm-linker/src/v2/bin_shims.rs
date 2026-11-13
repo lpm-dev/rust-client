@@ -10,12 +10,17 @@ use lpm_store::v2::Store;
 use super::V2Target;
 use super::compat_island::{CompatibilityLinks, manifest_needs_bin_compatibility};
 use super::keymap::KeyMap;
+#[cfg(windows)]
+use super::reconcile::root_link_names;
 use super::reconcile::{ensure_real_dir, is_direct, remove_node_modules_entry};
 use crate::validate_bin_name;
 use crate::validation::validate_bin_target;
 
 struct BinLinkSpec {
     cmd_name: String,
+    /// The bin script. On Windows a project shim reaches it through the
+    /// project's own link to the package, so the `.cmd` names it relative
+    /// to the project however far away the store is.
     target: PathBuf,
     needs_project_node_path: bool,
     #[cfg(unix)]
@@ -220,9 +225,18 @@ pub(super) fn create_bin_links_v2(
                     continue;
                 }
             };
+            // The project's root link leads to the same package directory,
+            // except for a compatibility copy, which lives in the project.
+            #[cfg(windows)]
+            let target = match (compatibility_pkg_dir, root_link_names(&v2t.target).first()) {
+                (None, Some(root_name)) => project_node_modules.join(root_name).join(&bin_rel_path),
+                _ => bin_target.clone(),
+            };
+            #[cfg(unix)]
+            let target = bin_target.clone();
             specs.push(BinLinkSpec {
                 cmd_name,
-                target: bin_target.clone(),
+                target,
                 needs_project_node_path,
                 #[cfg(unix)]
                 unix_invocation,
@@ -307,30 +321,18 @@ fn emit_bin_specs(
             // under cmd.exe; `.cmd` shim is the cross-version
             // path that works on every Windows lpm has shipped
             // on.)
-            let target_str = spec.target.to_string_lossy();
-            if let Err(reason) = lpm_common::symlink::validate_cmd_path(&target_str) {
-                tracing::warn!(
-                    "virtual-store linker: skipping .cmd shim for {}: {reason}",
-                    spec.cmd_name
-                );
-                continue;
-            }
-            let node_path_prefix = if spec.needs_project_node_path {
-                let node_path_str = project_node_modules.to_string_lossy();
-                if let Err(reason) = lpm_common::symlink::validate_cmd_path(&node_path_str) {
-                    tracing::warn!(
-                        "virtual-store linker: skipping .cmd shim for {}: {reason}",
-                        spec.cmd_name
-                    );
-                    continue;
-                }
-                format!("@SET \"NODE_PATH={node_path_str};%NODE_PATH%\"\n")
-            } else {
-                String::new()
-            };
-            let cmd_content = format!(
-                "{node_path_prefix}@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
-            );
+            let node_path = spec.needs_project_node_path.then_some(project_node_modules);
+            let cmd_content =
+                match crate::platform::windows_cmd_shim(bin_dir, &spec.target, node_path) {
+                    Ok(content) => content,
+                    Err(reason) => {
+                        tracing::warn!(
+                            "virtual-store linker: skipping .cmd shim for {}: {reason}",
+                            spec.cmd_name
+                        );
+                        continue;
+                    }
+                };
             let cmd_path = bin_dir.join(format!("{}.cmd", spec.cmd_name));
             if lpm_common::read_file_capped(&cmd_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
                 .is_ok_and(|existing| existing == cmd_content.as_bytes())
@@ -424,7 +426,7 @@ pub fn create_lifecycle_bin_links(
                 }
             };
             #[cfg(windows)]
-            if let Err(error) = lpm_common::symlink::validate_cmd_path(&target.to_string_lossy()) {
+            if let Err(error) = crate::platform::windows_cmd_shim(bin_dir, &target, None) {
                 tracing::warn!("rejecting lifecycle bin {name}: {error}");
                 continue;
             }

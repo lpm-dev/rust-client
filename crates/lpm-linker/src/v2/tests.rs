@@ -1148,6 +1148,96 @@ fn plain_install_links_bins_but_skips_compat_island() {
     );
 }
 
+/// A user named O'Brien, or Çağrı, gets `.cmd` shims that run: they name
+/// the package through the project's own link, so they hold neither the
+/// project's path, whose `'` and `&` cmd.exe can't take, nor the store's,
+/// whose non-ASCII user folder cmd.exe reads in the console's code page.
+#[cfg(windows)]
+#[test]
+fn windows_bin_shims_run_whatever_the_project_and_store_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("Çağrı").join("store"));
+    let tool_sri = synthetic_sri(b"v2/windows-shim-paths/tool");
+    write_object(
+        &store,
+        &tool_sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"},"dependencies":{"helper":"1.0.0"}}"#,
+            ),
+            (
+                "bin/tool.js",
+                b"console.log('tool ran with ' + process.argv.slice(2).join(' '))\n",
+            ),
+        ],
+    );
+    let helper_sri = synthetic_sri(b"v2/windows-shim-paths/helper");
+    write_object(
+        &store,
+        &helper_sri,
+        &[("package.json", br#"{"name":"helper","version":"1.0.0"}"#)],
+    );
+    for folder in ["plain", "O'Brien & R&D (Çağrı) !x!"] {
+        let project = tmp.path().join(folder).join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut tool = target("tool", "1.0.0", &tool_sri, true);
+        Arc::make_mut(&mut tool.target).dependencies =
+            vec![LinkDependency::registry("helper", "1.0.0")];
+
+        link_packages_v2(
+            &project,
+            vec![tool, target("helper", "1.0.0", &helper_sri, false)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        let shim = bin_shim_path(&project, "tool");
+        let content = std::fs::read(&shim).expect("tool's .cmd shim");
+        let text = String::from_utf8_lossy(&content);
+        assert!(content.is_ascii(), "{folder}: {text}");
+        assert!(text.contains(r"%dp0%..\tool\bin\tool.js"), "{text}");
+        assert!(
+            text.contains(r#"@SET "NODE_PATH=%dp0%..;%NODE_PATH%""#),
+            "{text}"
+        );
+        let output = std::process::Command::new(&shim)
+            .arg("hello")
+            .output()
+            .expect("run the shim");
+        assert!(output.status.success(), "{folder}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("tool ran with hello"),
+            "{folder}: {output:?}"
+        );
+
+        // Found on PATH by a quoted name, from another directory, where
+        // `%~dp0` in a batch file's main body names the current directory;
+        // and with delayed expansion on, which would read `!x!` out of the
+        // project's path.
+        use std::os::windows::process::CommandExt as _;
+        let path = std::env::join_paths(
+            std::iter::once(project.join("node_modules").join(".bin"))
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/v:on", "/s", "/c"])
+            .raw_arg("\"\"tool\" hello\"")
+            .env("PATH", path)
+            .current_dir(tmp.path())
+            .output()
+            .expect("run the shim through PATH");
+        assert!(output.status.success(), "{folder}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("tool ran with hello"),
+            "{folder}: {output:?}"
+        );
+    }
+}
+
 #[test]
 fn link_packages_v2_materializes_direct_bin_without_unrelated_direct_deps() {
     let tmp = tempfile::tempdir().unwrap();
