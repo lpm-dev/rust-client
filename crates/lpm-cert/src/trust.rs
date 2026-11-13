@@ -311,30 +311,13 @@ fn linux_trust_source_install_args<'a>(cert_path: &'a str, source_path: &'a str)
 
 #[cfg(target_os = "windows")]
 fn certutil_executable() -> Result<std::path::PathBuf, LpmError> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    let mut buffer = vec![0_u16; 260];
-    loop {
-        let buffer_len = u32::try_from(buffer.len())
-            .map_err(|_| LpmError::Cert("Windows system directory path is too long".into()))?;
-        // SAFETY: the buffer is writable for `buffer_len` UTF-16 units and
-        // remains valid for this synchronous call.
-        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_len) };
-        if written == 0 {
-            return Err(LpmError::Cert(format!(
-                "failed to resolve Windows system directory: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let written = written as usize;
-        if written < buffer.len() {
-            buffer.truncate(written);
-            return Ok(std::path::PathBuf::from(OsString::from_wide(&buffer)).join("certutil.exe"));
-        }
-        buffer.resize(written.saturating_add(1), 0);
-    }
+    let mut certutil = lpm_common::platform::windows_system_directory().map_err(|error| {
+        LpmError::Cert(format!(
+            "failed to resolve Windows system directory: {error}"
+        ))
+    })?;
+    certutil.push("certutil.exe");
+    Ok(certutil)
 }
 
 #[cfg(target_os = "windows")]

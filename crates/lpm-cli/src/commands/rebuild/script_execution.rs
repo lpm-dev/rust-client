@@ -759,8 +759,11 @@ pub(super) fn platform_shell_invocation(cmd: &str) -> Result<(PathBuf, Vec<Strin
     }
     #[cfg(windows)]
     {
+        let mut shell = lpm_common::platform::windows_system_directory()
+            .map_err(|error| format!("failed to resolve Windows system directory: {error}"))?;
+        shell.push("cmd.exe");
         Ok((
-            windows_system_directory()?.join("cmd.exe"),
+            shell,
             vec![
                 "/D".to_string(),
                 "/S".to_string(),
@@ -775,34 +778,6 @@ pub(super) fn platform_shell_invocation(cmd: &str) -> Result<(PathBuf, Vec<Strin
             PathBuf::from("/bin/sh"),
             vec!["-c".to_string(), cmd.to_string()],
         ))
-    }
-}
-
-#[cfg(windows)]
-fn windows_system_directory() -> Result<PathBuf, String> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    let mut buffer = vec![0_u16; 260];
-    loop {
-        let buffer_len = u32::try_from(buffer.len())
-            .map_err(|_| "Windows system directory path is too long".to_string())?;
-        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_len) };
-        if written == 0 {
-            return Err(format!(
-                "failed to resolve Windows system directory: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let written = written as usize;
-        if written < buffer.len() {
-            buffer.truncate(written);
-            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
-        }
-
-        buffer.resize(written.saturating_add(1), 0);
     }
 }
 
