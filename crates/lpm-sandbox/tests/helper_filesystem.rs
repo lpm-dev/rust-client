@@ -308,7 +308,11 @@ try {{
 const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 
 /// PowerShell that writes a line through the handle with value `handle`,
-/// which only exists in its process if it was inherited.
+/// which only exists in its process if it was inherited. In a child that
+/// didn't inherit it the value can still name a handle of its own, such as
+/// a file it opened to read: then the stream holds the bytes it couldn't
+/// write, and its finalizer, trying again, would crash PowerShell after
+/// `NO-HANDLE`.
 fn ps_write_through_handle(handle: usize) -> String {
     format!(
         r#"
@@ -321,6 +325,7 @@ try {{
     $stream.Flush()
     [Console]::WriteLine('WROTE')
 }} catch {{
+    if ($stream) {{ [GC]::SuppressFinalize($stream) }}
     [Console]::WriteLine('NO-HANDLE')
 }}
 "#
