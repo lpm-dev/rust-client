@@ -164,6 +164,51 @@ fn cert_status_human_reports_ready_state_with_slim_completion() {
     );
 }
 
+/// `lpm cert status` says whether the CA may sign only local names, and its
+/// JSON lists the names, as `lpm cert rotate` lifts the limit and puts it
+/// back.
+#[test]
+fn cert_status_reports_whether_the_ca_is_limited_to_local_names() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    let run = |args: &[&str]| {
+        let output = cert_command(&project).args(args).output().unwrap();
+        assert_success(&output, &format!("lpm {}", args.join(" ")));
+        output
+    };
+    let status = || {
+        let json = json_envelope(
+            &run(&["cert", "status", "--json"]),
+            "lpm cert status --json",
+        );
+        let human = String::from_utf8_lossy(&run(&["cert", "status"]).stdout).into_owned();
+        (json["ca"]["name_constraints"].clone(), human)
+    };
+
+    run(&["cert", "trust", "--json"]);
+    let (names, human) = status();
+    let names = names.as_array().expect("a limited CA lists its names");
+    for name in ["localhost", "*.localhost", "127.0.0.0/8", "::1/128"] {
+        assert!(
+            names.contains(&serde_json::json!(name)),
+            "{name}: {names:?}"
+        );
+    }
+    assert!(human.contains("signs      local names only"), "{human}");
+
+    run(&["cert", "rotate", "--no-name-constraints", "--json"]);
+    let (names, human) = status();
+    assert_eq!(names, serde_json::Value::Null);
+    assert!(
+        human.contains("signs      any name (no name constraints)"),
+        "{human}"
+    );
+
+    run(&["cert", "rotate", "--name-constraints", "--json"]);
+    let (names, human) = status();
+    assert!(names.is_array(), "{names}");
+    assert!(human.contains("signs      local names only"), "{human}");
+}
+
 #[test]
 fn cert_trust_json_generates_ca_and_installs_into_isolated_test_store() {
     let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);

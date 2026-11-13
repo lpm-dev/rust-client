@@ -587,6 +587,9 @@ pub struct CertStatus {
     pub ca_expires: Option<String>,
     /// CA certificate subject CN.
     pub ca_subject: Option<String>,
+    /// The names the CA may sign for, as a person reads them, where it is
+    /// limited to them; `None` where it may sign any name, or there is none.
+    pub ca_name_constraints: Option<Vec<String>>,
     /// Whether a project certificate exists.
     pub project_cert_exists: bool,
     /// Project certificate expiry date (if exists).
@@ -930,16 +933,23 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
     let ca_cert_path = paths::ca_cert_path()?;
     let ca_exists = ca_cert_path.exists();
 
-    let (ca_trusted, ca_expires, ca_subject) = if ca_exists {
+    let (ca_trusted, ca_expires, ca_subject, ca_name_constraints) = if ca_exists {
         let trusted = trust::is_ca_installed(&ca_cert_path).unwrap_or(false);
         let info = cert::read_cert_info(&ca_cert_path).ok();
+        let name_constraints = lpm_common::read_file_capped(
+            &ca_cert_path,
+            lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+        )
+        .ok()
+        .and_then(|pem| ca::constraints_summary(&pem).ok().flatten());
         (
             trusted,
             info.as_ref().map(|i| i.not_after.clone()),
             info.as_ref().map(|i| i.subject.clone()),
+            name_constraints,
         )
     } else {
-        (false, None, None)
+        (false, None, None, None)
     };
 
     let material = paths::inspect_project_cert_material(project_dir)?;
@@ -980,6 +990,7 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
         ca_trusted,
         ca_expires,
         ca_subject,
+        ca_name_constraints,
         project_cert_exists,
         project_cert_expires,
         project_cert_hostnames,

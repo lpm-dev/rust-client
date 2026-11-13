@@ -94,6 +94,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
                     "expires": status.ca_expires,
                     "subject": status.ca_subject,
                     "days_until_expiry": days_remaining,
+                    "name_constraints": status.ca_name_constraints,
                 },
                 "project": {
                     "exists": status.project_cert_exists,
@@ -124,6 +125,14 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         if let Some(expires) = &status.ca_expires {
             print_field("expires", expires);
         }
+        print_field(
+            "signs",
+            if status.ca_name_constraints.is_some() {
+                "local names only"
+            } else {
+                "any name (no name constraints)"
+            },
+        );
         if let Some(days) = days_remaining {
             let txt = format!("{days} days");
             let colored = if days < 30 {

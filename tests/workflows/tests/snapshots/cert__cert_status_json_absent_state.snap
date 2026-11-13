@@ -9,7 +9,8 @@ expression: envelope
     "trusted": false,
     "expires": null,
     "subject": null,
-    "days_until_expiry": null
+    "days_until_expiry": null,
+    "name_constraints": null
   },
   "project": {
     "exists": false,
