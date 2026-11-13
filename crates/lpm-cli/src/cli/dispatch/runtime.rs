@@ -14,10 +14,22 @@ pub(in crate::cli) fn keep_state_ignored_at_exit_from(started_in: &std::path::Pa
     }
 }
 
-/// A helper that reads stdin and writes stdout and nothing else, so the exit
-/// hook isn't set up to write for it on any path, an early error included.
+/// A helper that writes nothing of a project's or the LPM home's, so the
+/// exit hook isn't set up to write for it on any path, an early error
+/// included: one that reads stdin and writes stdout and nothing else, and
+/// the elevated helpers, which would otherwise write, as the administrator
+/// who approved them, in whatever directory they were started from (from
+/// review).
 fn writes_nothing(command: Option<&Commands>) -> bool {
-    matches!(command, Some(Commands::InternalPackageSignals(_)))
+    matches!(
+        command,
+        Some(
+            Commands::InternalPackageSignals(_)
+                | Commands::InternalHostsFile(_)
+                | Commands::InternalSecurityPolicy(_)
+                | Commands::InternalCertStore(_)
+        )
+    )
 }
 
 /// Keeps the project's `.lpm` and the LPM home out of git as the command
@@ -147,8 +159,25 @@ fn install_runtime_worker_threads(
 #[cfg(test)]
 mod tests {
     use super::super::Cli;
-    use super::install_runtime_worker_threads;
+    use super::{install_runtime_worker_threads, writes_nothing};
     use clap::Parser;
+
+    /// The elevated helpers keep what the exit hook would write, a
+    /// project's `.lpm` and its `.gitignore`, as they found it.
+    #[test]
+    fn the_elevated_helpers_leave_project_state_alone_as_they_end() {
+        for argv in [
+            &["lpm", "internal-package-signals"][..],
+            &["lpm", "internal-hosts-file", "clean"][..],
+            &["lpm", "internal-security-policy", "enable-enforce"][..],
+            &["lpm", "internal-cert-store", "remove", "--sha1", "AB"][..],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(writes_nothing(cli.command.as_ref()), "{argv:?}");
+        }
+        let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
+        assert!(!writes_nothing(cli.command.as_ref()));
+    }
 
     #[test]
     fn install_runtime_limits_default_workers_to_available_cpus_or_two() {

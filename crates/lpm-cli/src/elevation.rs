@@ -83,7 +83,24 @@ pub(crate) fn run_current_exe_helper(
             "could not resolve the current executable for the privileged {helper} helper: {error}"
         ))
     })?;
-    run_platform_helper(&exe, args, prompt, helper)
+    run_exe_helper(&exe, args, prompt, helper)
+}
+
+/// Runs `exe`, an LPM executable, elevated as the privileged `helper`.
+pub(crate) fn run_exe_helper(
+    exe: &Path,
+    args: &[String],
+    prompt: &str,
+    helper: &str,
+) -> Result<(), LpmError> {
+    // `lpx` reads every command line as `lpx dlx …`, so an elevated `lpx`
+    // would run a package named after the helper instead of the helper.
+    if exe.file_stem() == Some(std::ffi::OsStr::new("lpx")) {
+        return Err(LpmError::Registry(format!(
+            "the privileged {helper} helper runs from lpm, not lpx"
+        )));
+    }
+    run_platform_helper(exe, args, prompt, helper)
 }
 
 #[cfg(unix)]
@@ -277,7 +294,7 @@ fn wide_str(value: &str) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn quote_windows_args(args: &[String]) -> String {
+pub(crate) fn quote_windows_args(args: &[String]) -> String {
     args.iter()
         .map(|arg| quote_windows_arg(arg))
         .collect::<Vec<_>>()
