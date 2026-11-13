@@ -147,3 +147,43 @@ fn doctor_catalog_explains_the_windows_setup_requirement() {
     assert!(text.contains("sandbox_setup_required"));
     assert!(text.contains("sandbox-setup"));
 }
+
+/// Windows asks to elevate a program whose name holds "setup", as this test
+/// binary's does, before it starts, unless its manifest says it runs as its
+/// caller. The package's build script embeds one in every test binary, so
+/// these tests run from an unelevated terminal.
+#[cfg(all(windows, target_env = "msvc"))]
+#[test]
+fn this_test_binary_declares_it_runs_as_its_caller() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+    };
+    // `CREATEPROCESS_MANIFEST_RESOURCE_ID` and `RT_MANIFEST`, as integer
+    // resource names.
+    const MANIFEST_ID: usize = 1;
+    const MANIFEST_TYPE: usize = 24;
+
+    // SAFETY: the null name asks for this process's own module, which stays
+    // loaded; the resource data it holds lives as long as the module.
+    let manifest = unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        assert!(!module.is_null());
+        let resource = FindResourceW(
+            module,
+            MANIFEST_ID as *const u16,
+            MANIFEST_TYPE as *const u16,
+        );
+        assert!(
+            !resource.is_null(),
+            "the test binary has no embedded manifest"
+        );
+        let size = SizeofResource(module, resource) as usize;
+        let data = LockResource(LoadResource(module, resource));
+        assert!(!data.is_null());
+        String::from_utf8_lossy(std::slice::from_raw_parts(data.cast::<u8>(), size)).into_owned()
+    };
+    assert!(
+        manifest.contains("requestedExecutionLevel") && manifest.contains("asInvoker"),
+        "{manifest}"
+    );
+}
