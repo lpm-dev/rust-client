@@ -41,19 +41,19 @@ jobs:
   # run's runner time. A pull request leaves them to the Full CI workflow,
   # which runs them once for a whole stack, on its top member.
   windows-filesystem:
-    if: ${{ github.event_name != 'pull_request' }}
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
   # The same gate on GitHub's ARM64 Windows runner, where the win32-arm64
   # release builds and runs.
   windows-filesystem-arm64:
-    if: ${{ github.event_name != 'pull_request' }}
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/windows-filesystem-gate.yml
     with:
       runner: windows-11-arm
 
   macos-workspace-tests:
-    if: ${{ github.event_name != 'pull_request' }}
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/macos-workspace-tests.yml
 
   release-check:
@@ -504,22 +504,19 @@ jobs:
     # passing, so it has to run, and fail, when a macOS job fails. Draft PRs
     # skip it with the jobs it waits on; marking the PR ready runs them all.
     # A pull request's workspace tests run in the Full CI workflow, whose
-    # status branch protection requires as well.
+    # status branch protection requires as well, so here they are skipped.
     if: ${{ always() && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+    permissions: {}
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: scripts/ci
-
       - name: Require every macOS job to pass
         env:
           NEEDS: ${{ toJSON(needs) }}
           DEFERRED: ${{ github.event_name == 'pull_request' && 'macos-workspace-tests' || '' }}
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-          python3 scripts/ci/full-ci.py require ${DEFERRED:+--deferred "$DEFERRED"}
+          jq -e --arg deferred "$DEFERRED" 'to_entries | all(.value.result == "success" or (.key == $deferred and .value.result == "skipped"))' <<<"$NEEDS" >/dev/null
 
   full-nextest:
     name: Full isolated nextest

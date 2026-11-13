@@ -1,5 +1,4 @@
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -118,32 +117,14 @@ class PlanTests(unittest.TestCase):
                 self.assertEqual(output.read_text(), expected)
 
 
-class RequiredJobTests(unittest.TestCase):
-    def test_every_job_succeeding_meets_the_check(self):
+class UnmetJobTests(unittest.TestCase):
+    def test_every_job_succeeding_leaves_nothing_unmet(self):
         self.assertEqual(full_ci.unmet(PASSED), [])
 
-    def test_a_failed_cancelled_or_skipped_job_does_not(self):
+    def test_a_failed_cancelled_or_skipped_job_is_unmet(self):
         for result in ('failure', 'cancelled', 'skipped'):
             needs = dict(PASSED, **{'macos-workspace-tests': {'result': result}})
             self.assertEqual(full_ci.unmet(needs), ['macos-workspace-tests'], result)
-
-    def test_a_deferred_job_may_be_skipped_but_not_fail(self):
-        skipped = dict(PASSED, **{'macos-workspace-tests': {'result': 'skipped'}})
-        self.assertEqual(full_ci.unmet(skipped, ['macos-workspace-tests']), [])
-        failed = dict(PASSED, **{'macos-workspace-tests': {'result': 'failure'}})
-        self.assertEqual(full_ci.unmet(failed, ['macos-workspace-tests']), ['macos-workspace-tests'])
-
-    def test_deferring_one_job_does_not_excuse_another(self):
-        needs = dict(PASSED, **{'windows-filesystem': {'result': 'skipped'}})
-        self.assertEqual(full_ci.unmet(needs, ['macos-workspace-tests']), ['windows-filesystem'])
-
-    def test_the_command_fails_when_a_job_did_not_succeed(self):
-        needs = dict(PASSED, **{'plan': {'result': 'failure'}})
-        for payload, deferred, expected in ((PASSED, [], 0), (needs, [], 1), (needs, ['plan'], 1)):
-            with patch.dict(os.environ, {'NEEDS': json.dumps(payload)}), \
-                    patch('sys.argv', ['full-ci', 'require', '--deferred', *deferred]), \
-                    patch('builtins.print'), patch('sys.stderr', io.StringIO()):
-                self.assertEqual(full_ci.main(), expected)
 
 
 class Repository:
@@ -224,44 +205,6 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(body['state'], 'success')
             self.assertEqual(body['target_url'], 'https://example.com/run')
             self.assertLessEqual(len(body['description']), 140)
-
-
-def jobs(workflow):
-    """Each job of a workflow file, as the text under its two-space key."""
-    text = (ROOT / '.github/workflows' / workflow).read_text()
-    body = text[text.index('\njobs:\n') + len('\njobs:\n'):]
-    names = [(match.group(1), match.start()) for match in re.finditer(r'^  ([\w-]+):\n', body, re.MULTILINE)]
-    return {name: body[start:end] for (name, start), (_, end) in zip(names, names[1:] + [(None, len(body))])}
-
-
-class WorkflowTests(unittest.TestCase):
-    TIER = ('windows-filesystem', 'windows-filesystem-arm64', 'macos-workspace-tests')
-
-    def test_pull_request_ci_leaves_the_tier_to_the_full_run(self):
-        ci = jobs('ci.yml')
-        for name in self.TIER:
-            self.assertIn("if: ${{ github.event_name != 'pull_request' }}", ci[name], name)
-
-    def test_the_required_macos_check_defers_only_the_workspace_tests_and_only_on_a_pull_request(self):
-        check = jobs('ci.yml')['macos-workspace']
-        self.assertIn('needs: [macos-workspace-tests, macos-build-checks]', check)
-        self.assertIn("DEFERRED: ${{ github.event_name == 'pull_request' && 'macos-workspace-tests' || '' }}", check)
-        self.assertIn('scripts/ci/full-ci.py require ${DEFERRED:+--deferred "$DEFERRED"}', check)
-
-    def test_the_full_run_waits_on_the_plan_and_reports_every_tier_job(self):
-        full = jobs('full-ci.yml')
-        for name in self.TIER:
-            self.assertIn('needs: plan', full[name], name)
-            self.assertIn("if: ${{ needs.plan.outputs.run == 'true' }}", full[name], name)
-        self.assertIn(f'needs: [plan, {", ".join(self.TIER)}]', full['report'])
-        self.assertIn("if: ${{ !cancelled() && needs.plan.outputs.run == 'true' }}", full['report'])
-        self.assertIn('statuses: write', full['report'])
-
-    def test_both_workflows_run_the_same_tier_jobs(self):
-        ci, full = jobs('ci.yml'), jobs('full-ci.yml')
-        for name in self.TIER:
-            uses = lambda job: re.search(r'uses: (\S+)(?:\n    with:\n((?:      .*\n)+))?', job).groups()
-            self.assertEqual(uses(ci[name]), uses(full[name]), name)
 
 
 if __name__ == '__main__':

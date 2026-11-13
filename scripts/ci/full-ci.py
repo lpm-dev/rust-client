@@ -9,7 +9,6 @@ them too:
   plan     says whether a pull request's head is one the tier runs on
   report   sets the `Full CI` commit status on the head that was tested and,
            when it passed, on each stack member that head contains
-  require  fails unless every job a required check waits on succeeded
 """
 import argparse
 import json
@@ -60,14 +59,9 @@ def plan(event, labeled, above):
     return True, 'No other branch builds on this head, so the full tier runs on it.'
 
 
-def unmet(needs, deferred=()):
-    """The jobs that did not succeed; a deferred one may also have been skipped."""
-    failed = []
-    for name in sorted(needs):
-        accepted = {'success', 'skipped'} if name in deferred else {'success'}
-        if (needs[name] or {}).get('result') not in accepted:
-            failed.append(name)
-    return failed
+def unmet(needs):
+    """The jobs that did not succeed."""
+    return [name for name in sorted(needs) if (needs[name] or {}).get('result') != 'success']
 
 
 def open_pull(api, owner, ref):
@@ -156,15 +150,6 @@ def run_report(arguments):
     return 0
 
 
-def run_require(arguments):
-    failed = unmet(json.loads(os.environ['NEEDS']), arguments.deferred)
-    if failed:
-        print('These jobs did not succeed: ' + ', '.join(failed), file=sys.stderr)
-        return 1
-    print('Every job this check waits on succeeded.')
-    return 0
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -183,10 +168,6 @@ def main():
     reporting.add_argument('--head-ref', required=True)
     reporting.add_argument('--run-url', required=True)
     reporting.set_defaults(run=run_report)
-
-    requiring = commands.add_parser('require')
-    requiring.add_argument('--deferred', nargs='*', default=[])
-    requiring.set_defaults(run=run_require)
 
     arguments = parser.parse_args()
     return arguments.run(arguments)
