@@ -5,6 +5,10 @@ use clap::{Args, Subcommand};
 pub(crate) struct InternalSecurityPolicyArgs {
     #[arg(value_enum)]
     pub(crate) action: crate::security_approval::ManagedProtectionAction,
+    /// The caller's name for this run, which the helper's record of what it
+    /// moved aside carries (Windows).
+    #[arg(long, value_name = "ID")]
+    pub(crate) run: Option<String>,
 }
 
 #[derive(Args)]

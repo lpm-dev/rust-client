@@ -345,6 +345,10 @@ impl ManagedProtectionChange {
 pub struct ManagedProtectionReport {
     pub change: ManagedProtectionChange,
     pub status: ManagedProtectionStatus,
+    /// Where a policy, or its directory, that LPM never applied was moved
+    /// to make way (on Windows, where any user can make one first).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub set_aside: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

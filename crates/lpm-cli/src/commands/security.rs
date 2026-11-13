@@ -548,6 +548,7 @@ pub async fn run(
                 } else {
                     print_protect_status(&report.status);
                     print_protect_change("Protection", report.change);
+                    print_protect_set_aside(&report.set_aside);
                 }
                 Ok(())
             }
@@ -560,6 +561,7 @@ pub async fn run(
                 } else {
                     print_protect_status(&report.status);
                     print_protect_change("Protection", report.change);
+                    print_protect_set_aside(&report.set_aside);
                 }
                 Ok(())
             }
@@ -604,15 +606,26 @@ pub async fn run(
 }
 
 fn print_protect_report_json(report: &security_approval::ManagedProtectionReport) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "success": true,
-            "change": report.change.as_str(),
-            "protect": report.status,
-        }))
-        .unwrap()
-    );
+    let mut output = serde_json::json!({
+        "success": true,
+        "change": report.change.as_str(),
+        "protect": report.status,
+    });
+    if !report.set_aside.is_empty() {
+        output["set_aside"] = serde_json::json!(report.set_aside);
+    }
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+/// Says where a policy LPM never applied was moved: an administrator who
+/// made it with their own account as owner may want its settings back.
+fn print_protect_set_aside(set_aside: &[String]) {
+    for path in set_aside {
+        install_ui::warn_untrusted(&format!(
+            "Moved {path} aside: it didn't pass the managed policy's checks, so LPM never \
+             applied it. Copy any settings you want to keep into the policy."
+        ));
+    }
 }
 
 fn print_protect_change(label: &str, change: security_approval::ManagedProtectionChange) {
