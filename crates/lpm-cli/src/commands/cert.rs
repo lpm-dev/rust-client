@@ -464,10 +464,26 @@ async fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError
     if !result.skipped_missing.is_empty() {
         print_field("skipped_missing", result.skipped_missing.len().to_string());
     }
+    print_field(
+        "new_ca_trusted",
+        if result.new_ca_trusted {
+            "true"
+        } else {
+            "false"
+        },
+    );
     if let Some(when) = &result.old_ca_removal_scheduled {
         print_field("old_ca_removes_at", when);
     } else if result.old_ca_uninstalled {
         print_field("old_ca_uninstalled", "true");
+    }
+    if !result.new_ca_trusted {
+        println!(
+            "  {}",
+            install_ui::dim(
+                "The old CA wasn't trusted, so the new one isn't either. Run `lpm cert trust` to trust it."
+            )
+        );
     }
     Ok(())
 }
