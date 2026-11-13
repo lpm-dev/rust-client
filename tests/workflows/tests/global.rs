@@ -951,6 +951,62 @@ fn global_link_creates_manifest_entry_and_global_shim_for_local_package() {
     }
 }
 
+/// On Windows a link's commands run through its wrapper shims, which name
+/// the checkout from their own directory, not by the canonical `\\?\` path
+/// the link resolves, which Node can't run.
+#[cfg(windows)]
+#[test]
+fn global_link_commands_run_on_windows() {
+    use std::os::windows::process::CommandExt as _;
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package_dir = project.path().join("linked-js");
+    std::fs::create_dir_all(package_dir.join("bin")).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"linked-js","version":"1.0.0","bin":{"linked-js":"bin/linked-js.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("bin").join("linked-js.js"),
+        "console.log('linked-js:' + process.argv[2]);\n",
+    )
+    .unwrap();
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package_dir)
+        .assert()
+        .success();
+
+    let root = isolated_lpm_root(&project);
+    let entry_root = lpm_global::read_for(&root).unwrap().packages["linked-js"]
+        .root
+        .clone();
+    let wrapper_bin = root
+        .global_root()
+        .join(entry_root)
+        .join("node_modules")
+        .join(".bin");
+    for bin_dir in [root.bin_dir(), wrapper_bin] {
+        for artifact in lpm_global::expected_artifacts(&bin_dir, "linked-js") {
+            let text = std::fs::read_to_string(&artifact).unwrap();
+            assert!(!text.contains(r"\\?\"), "{}: {text}", artifact.display());
+        }
+    }
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c"])
+        .raw_arg(format!(
+            "\"\"{}\" ok\"",
+            root.bin_dir().join("linked-js.cmd").display()
+        ))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "linked-js:ok"
+    );
+}
+
 #[test]
 fn global_unlink_removes_local_link_manifest_entry_and_shims() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
@@ -2222,6 +2278,53 @@ fn global_unlink_preserves_legacy_wrapper_contents_and_retires_the_link() {
     );
 }
 
+/// A link an earlier release made has its commands in LPM's bin directory
+/// as that release wrote them, naming their targets whole; unlinking it
+/// recognizes and removes them.
+#[cfg(windows)]
+#[test]
+fn global_unlink_removes_commands_an_earlier_release_wrote() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let manifest = lpm_global::read_for(&root).unwrap();
+    let entry = manifest.packages.get("linked-tool").unwrap();
+    let legacy = lpm_global::shim::legacy_windows_shim_contents(&lpm_global::Shim {
+        command_name: "linked-tool".into(),
+        // Joined as releases join it, separators and all.
+        target: root
+            .global_root()
+            .join(&entry.root)
+            .join("node_modules/.bin")
+            .join("linked-tool"),
+    })
+    .unwrap();
+    // The sh file, which runs the .ps1 beside it, reads the same either way.
+    let mut changed = 0;
+    for (name, text) in &legacy {
+        let path = root.bin_dir().join(name);
+        if std::fs::read_to_string(&path).unwrap() != *text {
+            changed += 1;
+        }
+        std::fs::write(&path, text).unwrap();
+    }
+    assert_eq!(changed, 2, "the .cmd and .ps1 files change form");
+
+    lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .assert()
+        .success();
+
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        assert!(!artifact.exists(), "{}", artifact.display());
+    }
+}
+
 #[test]
 fn global_unlink_succeeds_when_the_checkout_and_wrapper_are_missing() {
     let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
@@ -2509,12 +2612,17 @@ fn interrupted_global_link_recovers_before_provenance_publication() {
 fn invalid_windows_global_launcher_target_leaves_no_unjournaled_wrapper() {
     let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
     let package = write_local_cli_package(&project);
+    // A package whose checkout a shim can't name in a .cmd file.
+    let unnameable = project.path().join("pkg&dir");
+    std::fs::create_dir(&unnameable).unwrap();
+    let unnameable = unnameable.join("linked-tool");
+    std::fs::rename(&package, &unnameable).unwrap();
     let home = project.home().join("lpm&home");
     let root = lpm_common::LpmRoot::from_dir(home.clone());
     lpm(&project)
         .env("LPM_HOME", &home)
         .args(["global", "link"])
-        .arg(&package)
+        .arg(&unnameable)
         .assert()
         .failure();
     assert!(!root.global_manifest().exists());
@@ -2525,9 +2633,21 @@ fn invalid_windows_global_launcher_target_leaves_no_unjournaled_wrapper() {
             .exists()
     );
     assert_eq!(
-        std::fs::read_dir(root.global_root().join("links"))
-            .unwrap()
-            .count(),
+        std::fs::read_dir(root.global_root().join("links")).map_or(0, Iterator::count),
         0
     );
+
+    // The shims name their targets from their own directory, so an LPM home
+    // a .cmd file couldn't spell out takes a link all the same.
+    let package = write_local_cli_package(&project);
+    lpm(&project)
+        .env("LPM_HOME", &home)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        let text = std::fs::read_to_string(&artifact).unwrap();
+        assert!(!text.contains("lpm&home"), "{}: {text}", artifact.display());
+    }
 }
