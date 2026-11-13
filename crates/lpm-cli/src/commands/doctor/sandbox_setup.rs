@@ -151,10 +151,14 @@ pub fn run(
                     "apply_args": apply_args
                 }))?
             );
-        } else if apply || remove {
+        } else if apply {
             println!(
-                "Sandbox permissions {operation} completed. Run publishing from your normal terminal."
+                "Sandbox permissions apply completed. Go back to your normal terminal to install \
+                 and run scripts: what lpm creates from this administrator one belongs to the \
+                 Administrators."
             );
+        } else if remove {
+            println!("Sandbox permissions remove completed.");
         } else {
             println!(
                 "Preview only. Review these permissions, then run this command in an administrator PowerShell terminal:"
