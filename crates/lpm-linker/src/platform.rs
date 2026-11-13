@@ -28,16 +28,13 @@ pub(crate) fn windows_cmd_shim(
     node_path: Option<&Path>,
 ) -> Result<String, String> {
     let target = windows_cmd_shim_path(bin_dir, target)?;
-    let node_path = match node_path {
-        Some(path) => format!(
-            "@SET \"NODE_PATH={};%NODE_PATH%\"\r\n",
-            windows_cmd_shim_path(bin_dir, path)?
-        ),
-        None => String::new(),
-    };
+    let node_path = node_path
+        .map(|path| windows_cmd_shim_path(bin_dir, path))
+        .transpose()?;
     Ok(format!(
-        "{preamble}{node_path}@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"{target}\" %*\r\n) ELSE (\r\n  node \"{target}\" %*\r\n)\r\n",
-        preamble = lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
+        "{}{}",
+        lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
+        lpm_common::symlink::windows_node_cmd_shim_body(&target, node_path.as_deref())
     ))
 }
 

@@ -1194,10 +1194,12 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
         )
         .unwrap(),
         format!(
-            "{}@SET \"NODE_PATH=%dp0%..;%NODE_PATH%\"\r\n\
-             @IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n\
-             ) ELSE (\r\n  node \"%dp0%..\\tool\\bin\\tool.js\" %*\r\n)\r\n",
-            lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE
+            "{}{}",
+            lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
+            lpm_common::symlink::windows_node_cmd_shim_body(
+                r"%dp0%..\tool\bin\tool.js",
+                Some("%dp0%..")
+            )
         )
     );
     // A canonicalized target, as the v1 linkers have, still compares with
@@ -1209,7 +1211,7 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
     )
     .unwrap();
     assert!(
-        shim.contains(r#""%dp0%node.exe" "%dp0%..\tool\bin\tool.js" %*"#),
+        shim.contains(r#""%_prog%" "%dp0%..\tool\bin\tool.js" %*"#),
         "{shim}"
     );
     // A project path typed in another case than the folders on disk still
@@ -1243,7 +1245,7 @@ fn windows_cmd_shims_name_paths_relative_to_themselves() {
     }
     let shim = windows_cmd_shim(bin, Path::new(r"D:\store\tool.js"), None).unwrap();
     assert!(
-        shim.contains(r#""%dp0%node.exe" "D:\store\tool.js" %*"#),
+        shim.contains(r#""%_prog%" "D:\store\tool.js" %*"#),
         "{shim}"
     );
     assert!(windows_cmd_shim(bin, Path::new(r"D:\R&D\tool.js"), None).is_err());

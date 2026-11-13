@@ -441,7 +441,8 @@ fn cmd_template(target: &str, path: &ShimPath) -> String {
     }
     // Prefer a co-located node.exe, fall back to PATH, as project shims do.
     format!(
-        "{preamble}@IF EXIST \"%dp0%node.exe\" (\r\n  \"%dp0%node.exe\" \"{script}\" %*\r\n) ELSE (\r\n  node \"{script}\" %*\r\n)\r\n",
+        "{preamble}{}",
+        lpm_common::symlink::windows_node_cmd_shim_body(&script, None)
     )
 }
 
@@ -688,6 +689,65 @@ mod tests {
             "hello space"
         );
     }
+    /// A shim ends its batch file before Node starts, so Ctrl+C asks
+    /// nothing; Node still gets the arguments, and cmd.exe ends with its
+    /// exit code.
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_shims_end_their_batch_file_and_keep_nodes_exit_code() {
+        use std::os::windows::process::CommandExt;
+        if std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .all(|directory| !directory.join("node.exe").is_file())
+        {
+            eprintln!("skipped: no node.exe on PATH");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let root_text = dir.path().to_str().unwrap();
+        let root = Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(root_text)).join("Çağrı");
+        let package = root.join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let script = package.join("tool.js");
+        std::fs::write(
+            &script,
+            "process.stdout.write([...process.argv.slice(2), process.env._prog ?? 'none', \
+             process.env.dp0 ?? 'none'].join('|')); process.exit(3);\n",
+        )
+        .unwrap();
+        let global_bin = root.join("global bin");
+        emit_shim(
+            &global_bin,
+            &Shim {
+                command_name: "tool".into(),
+                target: script,
+            },
+        )
+        .unwrap();
+        let shim = std::fs::read_to_string(global_bin.join("tool.cmd")).unwrap();
+        assert!(shim.contains("GOTO #_undefined_#"), "{shim}");
+
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/s", "/c"])
+            .raw_arg(format!(
+                "\"\"{}\" \"hello space\" two\"",
+                global_bin.join("tool.cmd").display()
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The shim's own variables are gone by the time Node runs: its batch
+        // file, and its SETLOCAL, ended first.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "hello space|two|none|none"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_global_shims_forward_arguments_and_exit_code_to_project_shims() {
@@ -1259,10 +1319,13 @@ mod tests {
         std::fs::write(&target, "").unwrap();
         emit_shim(&bin, &shim("eslint", target.to_str().unwrap())).unwrap();
 
+        // The node.exe beside the shim, else the first node.exe on PATH,
+        // else `node` as cmd.exe finds it.
         let cmd = std::fs::read_to_string(bin.join("eslint.cmd")).unwrap();
-        assert!(cmd.contains("@IF EXIST"));
-        assert!(cmd.contains("ELSE"));
-        assert!(cmd.contains("node"));
+        assert!(cmd.contains("@IF EXIST \"%dp0%node.exe\" SET \"_prog=%dp0%node.exe\""));
+        assert!(cmd.contains("SET \"_prog=%%~$PATH:I\""));
+        assert!(cmd.contains("@SET \"_prog=node\""));
+        assert!(cmd.contains("\"%_prog%\""));
     }
 
     #[test]

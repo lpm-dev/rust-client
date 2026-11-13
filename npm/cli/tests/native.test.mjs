@@ -10,6 +10,7 @@ import {
   detectLinuxLibc,
   platformKey,
   resolveNativeBinary,
+  waitThroughConsoleInterrupts,
 } from "../bin/native.js";
 import {
   installNativeBinaries,
@@ -642,3 +643,21 @@ function makeRecorderBinary() {
   fs.chmodSync(binaryPath, 0o755);
   return { binaryPath, outputPath };
 }
+
+test("the wrapper waits through console interrupts on Windows only", () => {
+  const before = process.listenerCount("SIGINT");
+  assert.equal(waitThroughConsoleInterrupts("linux"), false);
+  assert.equal(process.listenerCount("SIGINT"), before);
+
+  assert.equal(waitThroughConsoleInterrupts("win32"), true);
+  try {
+    assert.equal(process.listenerCount("SIGINT"), before + 1);
+    assert.equal(process.listenerCount("SIGBREAK"), 1);
+  } finally {
+    for (const signal of ["SIGINT", "SIGBREAK"]) {
+      for (const listener of process.listeners(signal).slice(signal === "SIGINT" ? before : 0)) {
+        process.removeListener(signal, listener);
+      }
+    }
+  }
+});
