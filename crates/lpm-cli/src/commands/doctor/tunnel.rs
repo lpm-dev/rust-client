@@ -85,11 +85,12 @@ pub(super) async fn check_tunnel_domain_from_config(
     let subdomain = parts[0];
     let base_domain = parts[1];
 
-    // Check subdomain format
-    if subdomain.len() < 3 || subdomain.len() > 32 {
+    // An account URL, `<username>-<code>.lpm.fyi`, can be longer than the 32
+    // characters of most claims, so only the DNS label limit applies here.
+    if subdomain.len() < 3 || subdomain.len() > 63 {
         checks.push(Check::warn(
             &doctor_catalog::TUNNEL_SUBDOMAIN_LENGTH,
-            &format!("subdomain \"{subdomain}\" must be 3-32 characters"),
+            &format!("subdomain \"{subdomain}\" must be 3-63 characters"),
         ));
         return checks;
     }
@@ -173,19 +174,30 @@ async fn check_authenticated_tunnel(client: &RegistryClient, domain: &str) -> Ch
             &format!("{domain} — claimed by another user or org"),
         );
     }
+    let held_as = held_as(&result);
     match check_tunnel_reachability(domain).await {
         TunnelReachability::Active => Check::pass(
             &doctor_catalog::TUNNEL_ACTIVE,
-            &format!("{domain} (claimed, active)"),
+            &format!("{domain} ({held_as}, active)"),
         ),
         TunnelReachability::Idle => Check::pass(
             &doctor_catalog::TUNNEL_IDLE,
-            &format!("{domain} (claimed, idle)"),
+            &format!("{domain} ({held_as}, idle)"),
         ),
         TunnelReachability::Unreachable => Check::warn(
             &doctor_catalog::TUNNEL_UNREACHABLE,
-            &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
+            &format!("{domain} ({held_as}) — unreachable, DNS may not be configured"),
         ),
+    }
+}
+
+/// How the account holds a domain the Registry says is its own: a claim, or
+/// its account URL, `<username>-<code>.lpm.fyi`, which needs no claim.
+fn held_as(lookup: &serde_json::Value) -> &'static str {
+    if lookup["accountUrl"].as_bool().unwrap_or(false) {
+        "account URL"
+    } else {
+        "claimed"
     }
 }
 
@@ -311,6 +323,41 @@ mod tests {
         assert!(checks[0].detail.contains("login to verify"));
     }
 
+    #[test]
+    fn an_account_url_is_reported_as_one_not_as_a_claim() {
+        assert_eq!(
+            held_as(&serde_json::json!({
+                "found": true,
+                "ownedByYou": true,
+                "accountUrl": true,
+            })),
+            "account URL"
+        );
+        assert_eq!(
+            held_as(&serde_json::json!({ "found": true, "ownedByYou": true })),
+            "claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_check_passes_a_long_account_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_url = format!("{}-ab3k9mzq.lpm.fyi", "a".repeat(39));
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            format!(r#"{{ "tunnel": {{ "domain": "{account_url}" }} }}"#),
+        )
+        .unwrap();
+        let client = RegistryClient::new();
+        let checks = check_tunnel_domain(dir.path(), &client, false).await;
+        assert_eq!(checks.len(), 1);
+        assert!(
+            matches!(checks[0].severity, Severity::Pass),
+            "{}",
+            checks[0].detail
+        );
+    }
+
     #[tokio::test]
     async fn tunnel_check_warns_short_subdomain() {
         let dir = tempfile::tempdir().unwrap();
@@ -323,7 +370,7 @@ mod tests {
         let checks = check_tunnel_domain(dir.path(), &client, false).await;
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Warn));
-        assert!(checks[0].detail.contains("3-32 characters"));
+        assert!(checks[0].detail.contains("3-63 characters"));
     }
 
     #[tokio::test]

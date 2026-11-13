@@ -1639,7 +1639,7 @@ async fn run_claim(
             )));
         }
         return Err(LpmError::Tunnel(format!(
-            "'{domain}' is not a valid tunnel domain.\n  Subdomain must be 3-32 lowercase alphanumeric chars or hyphens, no leading/trailing hyphen.\n  Example: my-app.lpm.llc"
+            "'{domain}' is not a valid tunnel domain.\n  Subdomain must be 3-63 lowercase alphanumeric chars or hyphens, no leading/trailing hyphen.\n  Example: my-app.lpm.llc"
         )));
     }
 
@@ -2888,15 +2888,18 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
 /// Validate a tunnel domain for claiming.
 ///
 /// Valid format: `<subdomain>.<base>` where:
-/// - subdomain is 3-32 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen
+/// - subdomain is 3-63 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen
 /// - base domain contains at least one dot (e.g., `lpm.fyi`, `lpm.llc`)
+///
+/// LPM.dev Registry limits most claims to 32 characters; only the account's
+/// own username or organization slug, or an account URL held for it, can be
+/// longer. It decides that, since only it knows which names are the account's.
 fn is_valid_tunnel_domain(domain: &str) -> bool {
     let Some((subdomain, base)) = domain.split_once('.') else {
         return false;
     };
-    // Subdomain: 3-32 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen
     subdomain.len() >= 3
-		&& subdomain.len() <= 32
+		&& subdomain.len() <= 63
 		&& subdomain
 			.chars()
 			.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -4963,8 +4966,19 @@ mod tests {
 
     #[test]
     fn invalid_tunnel_domain_too_long() {
-        let long = "a".repeat(33);
+        let long = "a".repeat(64);
         assert!(!is_valid_tunnel_domain(&format!("{long}.lpm.llc")));
+    }
+
+    #[test]
+    fn tunnel_domain_as_long_as_an_account_url_is_left_to_the_registry() {
+        let account_url = format!("{}-ab3k9mzq", "a".repeat(39));
+        assert_eq!(account_url.len(), 48);
+        assert!(is_valid_tunnel_domain(&format!("{account_url}.lpm.fyi")));
+        assert!(is_valid_tunnel_domain(&format!(
+            "{}.lpm.llc",
+            "a".repeat(63)
+        )));
     }
 
     #[test]

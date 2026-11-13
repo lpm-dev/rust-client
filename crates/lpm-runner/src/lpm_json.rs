@@ -332,8 +332,8 @@ pub struct CertBlock {
 pub struct TunnelConfig {
     /// Full tunnel domain (e.g., "acme-api.lpm.llc"). Setting it enables the
     /// tunnel for `lpm dev`. With `lpm dev --tunnel` and no domain, a Pro
-    /// account uses `<username>.lpm.fyi`; organization tunnels need one of
-    /// the organization's claimed domains.
+    /// account uses its account URL, `<username>-<code>.lpm.fyi`;
+    /// organization tunnels need one of the organization's claimed domains.
     #[serde(default)]
     pub domain: Option<String>,
 }
