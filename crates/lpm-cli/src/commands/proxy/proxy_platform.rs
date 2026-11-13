@@ -93,7 +93,8 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
 /// window. Its logon trigger is this user's alone: one for any user's
 /// logon, which `schtasks /SC ONLOGON` makes, needs an administrator. It
 /// takes the place of the task earlier releases made for anyone's logon,
-/// which it removes where this user may.
+/// and stops before changing anything where this user may not remove that
+/// task, or change what that release's install left in the home.
 #[cfg(windows)]
 pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
     // The task runs lpm with this user's limited token, which can't write to
@@ -123,10 +124,22 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
         None
     };
     let earlier_home = windows_earlier_task_home_or(schtasks, &spec.lpm_home)?;
+    let then = ", then `lpm proxy install` again from this one";
     check_windows_service_folders(
         &distinct_proxy_homes([Some(spec.lpm_home.as_path()), earlier_home.as_deref()]),
-        ", then `lpm proxy install` again from this one",
+        then,
     )?;
+    // The earlier task goes first, as the one change that may need an
+    // administrator: where it can't, nothing has changed yet.
+    if earlier_home.is_some() {
+        uninstall_windows_user_task(schtasks, WINDOWS_EARLIER_TASK_NAME).map_err(|error| {
+            LpmError::Proxy(format!(
+                "couldn't remove the task an earlier LPM release made, \
+                 {WINDOWS_EARLIER_TASK_NAME}, which starts a proxy when anyone signs in: \
+                 {error}. Run `lpm proxy uninstall` once from an administrator terminal{then}"
+            ))
+        })?;
+    }
     // The task's run ends once the proxy has started, so ending the task
     // stops nothing. The proxies the tasks started, with whatever homes they
     // gave them, are asked to stop, and so is one running for this home, as
@@ -147,14 +160,6 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     remove_earlier_windows_launcher(&spec.launcher_path)?;
     if let Some(home) = &earlier_home {
         remove_earlier_windows_launcher(&windows_earlier_launcher(home))?;
-        if let Err(error) = uninstall_windows_user_task(schtasks, WINDOWS_EARLIER_TASK_NAME) {
-            tracing::warn!(
-                "couldn't remove the task an earlier LPM release made, \
-                 {WINDOWS_EARLIER_TASK_NAME}, which would start a proxy when anyone signs in: \
-                 {error}; remove it from an administrator terminal with \
-                 `schtasks /Delete /TN {WINDOWS_EARLIER_TASK_NAME} /F`"
-            );
-        }
     }
     let service_dir = spec
         .stdout_log
@@ -301,20 +306,20 @@ fn check_windows_service_folders(homes: &[&Path], then: &str) -> Result<(), LpmE
         .find_map(|home| windows_unchangeable_service_entry(home))
     {
         Some(path) => Err(LpmError::Proxy(format!(
-            "this terminal can't change {}: an earlier LPM release's `lpm proxy install`, run \
-             from an administrator terminal as it had to be, left it to the Administrators. Run \
-             `lpm proxy uninstall` once from an administrator terminal{then}",
+            "this terminal can't change {}. An earlier LPM release's `lpm proxy install` had to \
+             run from an administrator terminal, which leaves what it makes to the \
+             Administrators. Run `lpm proxy uninstall` once from an administrator terminal{then}",
             path.display()
         ))),
         None => Ok(()),
     }
 }
 
-/// The first of `home`'s proxy service folder and what LPM keeps in it
+/// The first of `home`, its proxy service folder and what LPM keeps in it
 /// that this process may not change as installing and running the proxy
-/// do: add to the folder, or to `services` until it is there, write to the
-/// logs, and remove the earlier batch file. `None` where it may, or none
-/// of them is there.
+/// do: add to the home, where the proxy keeps its state, and to the folder,
+/// or to `services` until it is there, write to the logs, and remove the
+/// earlier batch file. `None` where it may, or none of them is there.
 #[cfg(windows)]
 fn windows_unchangeable_service_entry(home: &Path) -> Option<std::path::PathBuf> {
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -330,6 +335,10 @@ fn windows_unchangeable_service_entry(home: &Path) -> Option<std::path::PathBuf>
             .open(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
     };
+    // The proxy keeps its state in the home itself.
+    if denied(home, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS) {
+        return Some(home.to_path_buf());
+    }
     let services = home.join("services");
     let folder = services.join("proxy");
     let (directory, access) = if folder.is_dir() {
@@ -1673,15 +1682,20 @@ mod windows_task_tests {
     }
 
     /// Install and uninstall stop before changing anything where this
-    /// terminal can't add to the home's proxy service folder, write to its
-    /// logs, or remove the earlier batch file, naming what it can't change
-    /// and what to run; a folder the user may change passes.
+    /// terminal can't add to the home or its proxy service folder, write to
+    /// the logs, or remove the earlier batch file, naming what it can't
+    /// change and what to run; a home the user may change passes.
     #[test]
     fn a_service_folder_this_terminal_cannot_change_is_named_before_anything_changes() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         assert_eq!(unchangeable_entry(&home), None);
+        {
+            // As the home itself is left, where the proxy keeps its state.
+            let _denied = Denied::new(&home, "WD");
+            assert_eq!(unchangeable_entry(&home).as_ref(), Some(&home));
+        }
 
         let services = home.join("services");
         std::fs::create_dir_all(&services).unwrap();

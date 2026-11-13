@@ -61,7 +61,8 @@ pub(super) fn run_install(
         install_ui::done("local proxy service installed");
         if plan.privileged_forwarder.is_some() {
             install_ui::done("privileged local-domain forwarder installed");
-        } else {
+        } else if !cfg!(windows) {
+            // Windows lets any user bind 80 and 443, so it has no forwarder.
             install_ui::warn(
                 "the service is user-scoped; use `lpm proxy install --privileged-ports` for Unix 80/443 forwarding",
             );
