@@ -26,8 +26,20 @@ fn nonempty_env_os(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
+/// The home directory npm reads `~/.npmrc` from and expands `~` to, as
+/// Node's `os.homedir()` gives it: on Windows `USERPROFILE` where set, which
+/// Node reads before asking Windows for the profile folder, and elsewhere
+/// `HOME`, as [`dirs::home_dir`] reads it.
+pub fn npm_home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(profile) = nonempty_env_os("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    dirs::home_dir()
+}
+
 pub fn npm_config_path(name: &str) -> Option<PathBuf> {
-    npm_config_path_with_home(name, dirs::home_dir().as_deref())
+    npm_config_path_with_home(name, npm_home_dir().as_deref())
 }
 
 pub fn npm_config_path_with_home(name: &str, home: Option<&Path>) -> Option<PathBuf> {
@@ -581,6 +593,30 @@ mod tests {
                 .is_some_and(|warning| warning.contains("suppressed")),
             "the bounded output must disclose suppression: {warnings:?}"
         );
+    }
+
+    /// npm on Windows reads `~/.npmrc` from `USERPROFILE`, which Node's
+    /// `os.homedir()` reads first, so a profile set apart from the account's
+    /// own folder is the one lpm reads too; an empty one is passed over.
+    #[cfg(windows)]
+    #[test]
+    fn npm_home_on_windows_is_the_profile_node_reads() {
+        use super::npm_home_dir;
+
+        let profile = tempfile::tempdir().unwrap();
+        let earlier = std::env::var_os("USERPROFILE");
+        unsafe { std::env::set_var("USERPROFILE", profile.path()) };
+        let set = npm_home_dir();
+        unsafe { std::env::set_var("USERPROFILE", "") };
+        let empty = npm_home_dir();
+        unsafe {
+            match earlier {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+        assert_eq!(set.as_deref(), Some(profile.path()));
+        assert_eq!(empty, dirs::home_dir());
     }
 
     #[test]

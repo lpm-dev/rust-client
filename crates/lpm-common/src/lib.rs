@@ -90,8 +90,8 @@ pub use npmrc::{
     NPMRC_DIAGNOSTIC_LIMIT, NPMRC_INTERPOLATED_VALUE_CAP_BYTES, NpmrcIniSetting, NpmrcIniValue,
     NpmrcInterpolationError, decode_npmrc_ini_fragment, interpolate_npmrc_env, npm_config_path,
     npm_config_path_with_home, npm_global_config_path, npm_global_config_path_from_user_config,
-    npm_user_config_path, npmrc_can_influence_config_discovery, parse_npmrc_ini_settings,
-    push_npmrc_diagnostic,
+    npm_home_dir, npm_user_config_path, npmrc_can_influence_config_discovery,
+    parse_npmrc_ini_settings, push_npmrc_diagnostic,
 };
 pub use package_instance::{PackageInstanceId, ResolutionNodeId, artifact_binding_id};
 pub use package_name::PackageName;

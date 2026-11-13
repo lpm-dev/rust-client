@@ -252,7 +252,7 @@ impl NpmrcConfig {
     /// home dir (for `lpm install -g`). The walker handles both shapes
     /// via `find_project_root`.
     pub fn load_from_filesystem(cwd: &Path) -> Self {
-        let home = dirs::home_dir();
+        let home = lpm_common::npm_home_dir();
         let discovery = Self::discover_layer_paths(cwd, home.as_deref());
         Self::load_from_discovery(discovery, &|name| std::env::var(name).ok())
     }

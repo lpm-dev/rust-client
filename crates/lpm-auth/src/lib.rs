@@ -2071,7 +2071,7 @@ pub fn clear_refresh_token(registry: &str) -> Result<(), String> {
 ///
 /// Merges npm's global, user, and project layers in precedence order.
 fn parse_npmrc_token() -> Result<Option<String>, String> {
-    let home = dirs::home_dir();
+    let home = lpm_common::npm_home_dir();
     let user_path = lpm_common::npm_user_config_path(home.as_deref());
     let user_layer = user_path
         .as_deref()
@@ -3163,6 +3163,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(temp.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(temp.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(temp.path().join(".lpm").into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
@@ -4136,6 +4137,7 @@ mod tests {
         std::fs::create_dir_all(repository.join(".git")).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(repository.clone().into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
@@ -4256,6 +4258,7 @@ mod tests {
         std::os::unix::fs::symlink(&state, &alias).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(alias.into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
@@ -4665,6 +4668,7 @@ mod tests {
         );
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             (
                 "NPM_CONFIG_USERCONFIG",
@@ -4688,6 +4692,7 @@ mod tests {
         );
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("NPM_CONFIG_USERCONFIG", Some("~/custom.npmrc".into())),
             ("npm_config_userconfig", None),
@@ -4716,6 +4721,7 @@ mod tests {
         std::fs::set_permissions(&userconfig, std::fs::Permissions::from_mode(0o622)).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
             ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             (
                 "NPM_CONFIG_USERCONFIG",
@@ -5156,6 +5162,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("create acceptance home");
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.as_os_str().to_owned())),
+            ("USERPROFILE", Some(home.as_os_str().to_owned())),
             ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
             ("ACCEPTANCE_RUN_DIR", Some(run_dir.into_os_string())),
             ("ACCEPTANCE_RUN_ID", Some("release-file-auth".into())),
