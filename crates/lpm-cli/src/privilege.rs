@@ -65,10 +65,34 @@ pub(crate) fn is_effective_root() -> bool {
 /// does after a UAC prompt or with UAC off.
 #[cfg(windows)]
 pub(crate) fn is_elevated() -> bool {
+    use windows_sys::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
+
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    read_process_token(TokenElevation, &mut elevation) && elevation.TokenIsElevated != 0
+}
+
+/// Whether the process runs elevated after a UAC prompt, so that its user
+/// also has a limited token: the one their sign-in, their normal terminals
+/// and their logon tasks get, which can't write to what this process makes
+/// for the Administrators to own. With UAC off there is no other token.
+#[cfg(windows)]
+pub(crate) fn is_elevated_over_a_limited_token() -> bool {
+    use windows_sys::Win32::Security::{TokenElevationType, TokenElevationTypeFull};
+
+    let mut elevation_type = 0;
+    read_process_token(TokenElevationType, &mut elevation_type)
+        && elevation_type == TokenElevationTypeFull
+}
+
+/// Reads `class` of the process's token into `value`, which must be the
+/// type Windows writes for it; says whether it could.
+#[cfg(windows)]
+fn read_process_token<T>(
+    class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    value: &mut T,
+) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token: HANDLE = std::ptr::null_mut();
@@ -76,21 +100,21 @@ pub(crate) fn is_elevated() -> bool {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return false;
     }
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut length = 0;
-    // SAFETY: `elevation` is writable for the size passed.
+    // SAFETY: `value` is writable for the size passed, and its type is the
+    // one Windows writes for `class`, as the callers pass it.
     let read = unsafe {
         GetTokenInformation(
             token,
-            TokenElevation,
-            std::ptr::from_mut(&mut elevation).cast(),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            class,
+            std::ptr::from_mut(value).cast(),
+            std::mem::size_of::<T>() as u32,
             &mut length,
         )
     };
     // SAFETY: `token` is open and closed once here.
     unsafe { CloseHandle(token) };
-    read != 0 && elevation.TokenIsElevated != 0
+    read != 0
 }
 
 fn is_sudo_transition() -> bool {

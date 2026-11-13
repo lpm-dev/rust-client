@@ -19,7 +19,8 @@ pub(in crate::cli) fn keep_state_ignored_at_exit_from(started_in: &std::path::Pa
 /// included: one that reads stdin and writes stdout and nothing else, and
 /// the elevated helpers, which would otherwise write, as the administrator
 /// who approved them, in whatever directory they were started from (from
-/// review).
+/// review); and the proxy's sign-in task, which starts in the system
+/// directory and has the proxy it starts run in the project.
 fn writes_nothing(command: Option<&Commands>) -> bool {
     matches!(
         command,
@@ -28,6 +29,7 @@ fn writes_nothing(command: Option<&Commands>) -> bool {
                 | Commands::InternalHostsFile(_)
                 | Commands::InternalSecurityPolicy(_)
                 | Commands::InternalCertStore(_)
+                | Commands::InternalProxyService(_)
         )
     )
 }
@@ -171,6 +173,21 @@ mod tests {
             &["lpm", "internal-hosts-file", "clean"][..],
             &["lpm", "internal-security-policy", "enable-enforce"][..],
             &["lpm", "internal-cert-store", "remove", "--sha1", "AB"][..],
+            &[
+                "lpm",
+                "internal-proxy-service",
+                "--home",
+                "h",
+                "--project",
+                "p",
+                "--stdout",
+                "o",
+                "--stderr",
+                "e",
+                "--",
+                "proxy",
+                "start",
+            ][..],
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             assert!(writes_nothing(cli.command.as_ref()), "{argv:?}");

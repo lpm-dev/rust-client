@@ -26,7 +26,7 @@ pub(super) fn run_install(
     let listener_flags_explicit =
         http_port.is_some() || http_redirect_port.is_some() || tls_port.is_some();
     if privileged_ports && !listener_flags_explicit {
-        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Proxy)?;
         let redirect = config
             .as_ref()
             .and_then(|config| config.proxy.as_ref())
@@ -61,7 +61,8 @@ pub(super) fn run_install(
         install_ui::done("local proxy service installed");
         if plan.privileged_forwarder.is_some() {
             install_ui::done("privileged local-domain forwarder installed");
-        } else {
+        } else if !cfg!(windows) {
+            // Windows lets any user bind 80 and 443, so it has no forwarder.
             install_ui::warn(
                 "the service is user-scoped; use `lpm proxy install --privileged-ports` for Unix 80/443 forwarding",
             );
@@ -79,14 +80,23 @@ pub(super) fn run_uninstall(json_output: bool, privileged_ports: bool) -> Result
 
     if let Some(forwarder) = &plan.privileged_forwarder {
         uninstall_privileged_forwarder_platform(forwarder).map_err(|err| {
-            LpmError::Script(format_privileged_forwarder_cleanup_error(&err, forwarder))
+            LpmError::Proxy(format_privileged_forwarder_cleanup_error(&err, forwarder))
         })?;
     }
-    uninstall_proxy_service_platform(&plan.user_service)?;
+    let removed = uninstall_proxy_service_platform(&plan.user_service)?;
     if json_output {
-        print_service_json("uninstall", true, false, &plan);
+        print_service_json(
+            "uninstall",
+            removed || plan.privileged_forwarder.is_some(),
+            false,
+            &plan,
+        );
     } else {
-        install_ui::done("local proxy service removed");
+        if removed {
+            install_ui::done("local proxy service removed");
+        } else {
+            install_ui::warn("no local proxy service was installed");
+        }
         if plan.privileged_forwarder.is_some() {
             install_ui::done("privileged local-domain forwarder removed");
         }
@@ -220,7 +230,7 @@ impl PrivilegedForwarderSpec {
             let _ = requested_options;
             let _ = listener_flags_explicit;
             let _ = replace_existing;
-            Err(LpmError::Script(
+            Err(LpmError::Proxy(
                 "`--privileged-ports` is only supported on Unix platforms".into(),
             ))
         }
@@ -232,7 +242,7 @@ impl PrivilegedForwarderSpec {
                 let _ = requested_options;
                 let _ = listener_flags_explicit;
                 let _ = replace_existing;
-                return Err(LpmError::Script(
+                return Err(LpmError::Proxy(
                     "`--privileged-ports` is only supported on Linux and macOS".into(),
                 ));
             }
@@ -244,7 +254,7 @@ impl PrivilegedForwarderSpec {
                 validate_privileged_external_options(external_options)?;
                 let target_uid = current_effective_uid();
                 if target_uid == 0 {
-                    return Err(LpmError::Script(
+                    return Err(LpmError::Proxy(
                     "`lpm proxy install --privileged-ports` must be run as the target user, not with sudo"
                         .into(),
                 ));
@@ -296,7 +306,7 @@ impl PrivilegedForwarderSpec {
     fn for_uninstall() -> Result<Self, LpmError> {
         #[cfg(not(unix))]
         {
-            Err(LpmError::Script(
+            Err(LpmError::Proxy(
                 "`--privileged-ports` is only supported on Unix platforms".into(),
             ))
         }
@@ -305,7 +315,7 @@ impl PrivilegedForwarderSpec {
         {
             #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
             {
-                return Err(LpmError::Script(
+                return Err(LpmError::Proxy(
                     "`--privileged-ports` is only supported on Linux and macOS".into(),
                 ));
             }
@@ -383,7 +393,7 @@ impl PrivilegedForwarderConfig {
             ));
         }
         if rules.is_empty() {
-            return Err(LpmError::Script(
+            return Err(LpmError::Proxy(
                 "`--privileged-ports` requires at least one low-port HTTPS or redirect listener"
                     .into(),
             ));
@@ -439,7 +449,7 @@ pub(super) fn privileged_external_options(
     listener_flags_explicit: bool,
 ) -> Result<lpm_proxy::ProxyDaemonOptions, LpmError> {
     if requested_options.http_port.is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--privileged-ports` supports HTTPS plus HTTP redirect only; plain `--http-port` is not forwarded in v1"
                 .into(),
         ));
@@ -476,7 +486,7 @@ pub(super) fn validate_privileged_external_options(
     options: lpm_proxy::ProxyDaemonOptions,
 ) -> Result<(), LpmError> {
     if options.http_redirect_port.is_some() && options.tls_port.is_none() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Proxy(
             "`--privileged-ports` HTTP redirect forwarding requires an HTTPS listener".into(),
         ));
     }
@@ -489,7 +499,7 @@ pub(super) fn validate_privileged_external_options(
     }
     for (label, port) in privileged_ports {
         if !(1..1024).contains(&port) {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "`--privileged-ports` expects low external listener ports; {label} port {port} does not need the Unix forwarder"
             )));
         }
@@ -522,7 +532,7 @@ pub(super) fn reject_conflicting_privileged_forwarder_owner(
 ) -> Result<(), LpmError> {
     match read_existing_privileged_forwarder_owner(config_path)? {
         Some(owner_uid) if owner_uid != target_uid && !replace_existing => {
-            Err(LpmError::Script(format!(
+            Err(LpmError::Proxy(format!(
                 "privileged proxy forwarder is already owned by UID {owner_uid}; refusing to replace it for UID {target_uid}. Re-run `lpm proxy install --privileged-ports --replace` to intentionally replace it, or delete {} with administrator approval.",
                 config_path.display()
             )))
@@ -537,7 +547,7 @@ pub(super) fn reject_removing_foreign_privileged_forwarder(
     target_uid: u32,
 ) -> Result<(), LpmError> {
     match read_existing_privileged_forwarder_owner(config_path)? {
-        Some(owner_uid) if owner_uid != target_uid => Err(LpmError::Script(format!(
+        Some(owner_uid) if owner_uid != target_uid => Err(LpmError::Proxy(format!(
             "privileged proxy forwarder is owned by UID {owner_uid}; refusing to remove it as UID {target_uid}"
         ))),
         _ => Ok(()),
@@ -559,7 +569,7 @@ fn read_existing_privileged_forwarder_owner(config_path: &Path) -> Result<Option
             Ok(bytes) => bytes,
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
             Err(err) => {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Proxy(format!(
                     "read existing privileged proxy forwarder config {}: {err}",
                     config_path.display()
                 )));
@@ -568,7 +578,7 @@ fn read_existing_privileged_forwarder_owner(config_path: &Path) -> Result<Option
     serde_json::from_slice::<ForwarderOwner>(&bytes)
         .map(|owner| Some(owner.target_uid))
         .map_err(|err| {
-            LpmError::Script(format!(
+            LpmError::Proxy(format!(
                 "parse existing privileged proxy forwarder config {}: {err}",
                 config_path.display()
             ))
@@ -651,7 +661,7 @@ pub(super) fn reject_privileged_user_service_ports(
         .filter(|port| (1..1024).contains(port))
         .collect::<Vec<_>>();
         if !privileged.is_empty() {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Proxy(format!(
                 "`lpm proxy install` installs a user-scoped service and cannot bind privileged ports {}. Use `lpm proxy install --privileged-ports` for Unix 80/443 forwarding, or set `proxy.port` to a high port such as 9443.",
                 privileged
                     .iter()
@@ -677,6 +687,12 @@ fn print_service_json(action: &str, changed: bool, dry_run: bool, plan: &ProxySe
         .privileged_forwarder
         .as_ref()
         .map(privileged_forwarder_json);
+    // The Windows sign-in task runs lpm itself, with no launcher script.
+    let launcher = if cfg!(windows) {
+        &plan.user_service.exe
+    } else {
+        &plan.user_service.launcher_path
+    };
     println!(
         "{}",
         serde_json::json!({
@@ -685,7 +701,7 @@ fn print_service_json(action: &str, changed: bool, dry_run: bool, plan: &ProxySe
             "changed": changed,
             "dryRun": dry_run,
             "service": plan.user_service.label,
-            "launcher": plan.user_service.launcher_path,
+            "launcher": launcher,
             "args": plan.user_service.start_args,
             "privilegedForwarder": forwarder,
         })

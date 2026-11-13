@@ -1129,6 +1129,127 @@ fn proxy_pipe_name_for_root_is_stable_and_path_normalized() {
     assert!(backslash.starts_with(r"\\.\pipe\lpm-proxy-"));
 }
 
+/// The proxy started with a home spelled one way answers to `lpm proxy`
+/// run with it spelled another: a trailing separator, a `\\?\` prefix, a
+/// doubled separator or a `.` name the same home, and so the same pipe.
+#[test]
+fn every_spelling_of_a_home_names_one_pipe() {
+    use crate::paths::pipe_root_key;
+
+    for spellings in [
+        &[
+            r"C:\Users\Ada\home B",
+            r"C:\Users\Ada\home B\",
+            r"\\?\C:\Users\Ada\home B",
+            r"\\?\c:\users\ada\home b\",
+            r"C:\Users\\Ada\.\home B",
+        ][..],
+        &[
+            r"\\nas\my share\home",
+            r"\\nas\my share\home\",
+            r"\\?\UNC\nas\my share\home",
+        ][..],
+        &["/srv/lpm/home", "/srv/lpm/home/", "/srv//lpm/./home"][..],
+    ] {
+        for spelling in spellings {
+            assert_eq!(
+                pipe_root_key(spelling),
+                pipe_root_key(spellings[0]),
+                "{spelling}"
+            );
+        }
+    }
+    assert_ne!(pipe_root_key(r"\\nas\share"), pipe_root_key(r"\nas\share"));
+    // Today's homes keep the name earlier releases gave their pipes.
+    assert_eq!(pipe_root_key(r"C:\Users\Ada\.lpm"), "c:/users/ada/.lpm");
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home B");
+    std::fs::create_dir(&home).unwrap();
+    let mut trailing = home.clone().into_os_string();
+    trailing.push(std::path::MAIN_SEPARATOR_STR);
+    assert_eq!(
+        proxy_pipe_name_for_root(Path::new(&trailing)),
+        proxy_pipe_name_for_root(&home)
+    );
+}
+
+/// A proxy an earlier release started named its pipe after the home exactly
+/// as spelled, and keeps that name until it stops. Wherever this release
+/// names the home's pipe otherwise, `lpm proxy` looks under that name too.
+/// The earlier names are pinned as that release computed them.
+#[test]
+fn a_proxy_an_earlier_release_started_is_looked_for_under_the_pipe_it_named() {
+    for (home, earlier) in [
+        (r"C:\lpm-home\", r"\\.\pipe\lpm-proxy-4d257bb2ad8b3a35"),
+        (r"\\?\C:\lpm-home", r"\\.\pipe\lpm-proxy-0142d32938a59b84"),
+        (r"C:\lpm\\home", r"\\.\pipe\lpm-proxy-c7b048df2919dc35"),
+        (r"C:\lpm\.\home", r"\\.\pipe\lpm-proxy-6cd3654d68ca58d9"),
+        (
+            r"\\?\UNC\nas\share\home",
+            r"\\.\pipe\lpm-proxy-47881a6e0c17ca3c",
+        ),
+        (r"C:\", r"\\.\pipe\lpm-proxy-f69750190d7df3b5"),
+    ] {
+        let home = Path::new(home);
+        let names = proxy_pipe_names_for_root(home);
+        assert_eq!(
+            names[0],
+            proxy_pipe_name_for_root(home),
+            "{}",
+            home.display()
+        );
+        assert!(
+            names.contains(&earlier.to_string()),
+            "{}: {names:?}",
+            home.display()
+        );
+    }
+    let home = Path::new("/srv/lpm/home");
+    assert_eq!(
+        proxy_pipe_names_for_root(home),
+        [proxy_pipe_name_for_root(home)]
+    );
+}
+
+/// An earlier release's proxy started with a trailing separator or a
+/// `\\?\` prefix on its home is found however the home is spelled now,
+/// as the names it may have taken are looked for whatever the spelling.
+#[test]
+fn a_proxy_an_earlier_release_started_is_found_under_another_spelling_of_its_home() {
+    let earlier_names = [
+        r"\\.\pipe\lpm-proxy-4d257bb2ad8b3a35", // C:\lpm-home\
+        r"\\.\pipe\lpm-proxy-0142d32938a59b84", // \\?\C:\lpm-home
+        r"\\.\pipe\lpm-proxy-ca287a0b41678391", // \\?\C:\lpm-home\
+    ];
+    let current = proxy_pipe_name_for_root(Path::new(r"C:\lpm-home"));
+    assert_eq!(current, r"\\.\pipe\lpm-proxy-21e5b67294b3d058");
+    for home in [
+        r"C:\lpm-home",
+        r"c:\LPM-HOME",
+        "C:/lpm-home",
+        r"C:\lpm-home\",
+        r"\\?\C:\lpm-home",
+        r"C:\.\lpm-home",
+    ] {
+        let names = proxy_pipe_names_for_root(Path::new(home));
+        assert_eq!(names[0], current, "{home}");
+        for earlier in earlier_names {
+            assert!(names.contains(&earlier.to_string()), "{home}: {names:?}");
+        }
+    }
+    for home in [r"\\nas\share\home", r"\\?\UNC\nas\share\home\"] {
+        let names = proxy_pipe_names_for_root(Path::new(home));
+        for earlier in [
+            r"\\.\pipe\lpm-proxy-47881a6e0c17ca3c", // \\?\UNC\nas\share\home
+            r"\\.\pipe\lpm-proxy-a40efbfe8c6c5e49", // \\?\UNC\nas\share\home\
+            r"\\.\pipe\lpm-proxy-fc29a69541fbbbb8", // \\nas\share\home\
+        ] {
+            assert!(names.contains(&earlier.to_string()), "{home}: {names:?}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn control_server_reports_registered_routes_until_stopped() {
@@ -1930,6 +2051,71 @@ async fn named_pipe_control_server_reports_registered_routes_until_stopped() {
     assert_eq!(stopped, ProxyResponse::Stopped);
     server.await.unwrap().unwrap();
     assert!(!state_path.exists());
+}
+
+#[cfg(windows)]
+fn unique_pipe_names(label: &str) -> [String; 2] {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    [
+        format!(r"\\.\pipe\lpm-proxy-test-{label}-current-{unique}"),
+        format!(r"\\.\pipe\lpm-proxy-test-{label}-earlier-{unique}"),
+    ]
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn named_pipe_client_finds_a_proxy_on_its_earlier_pipe_and_prefers_the_current_one() {
+    let user = current_user_sid_sddl().unwrap();
+    let names = unique_pipe_names("client");
+
+    let missing = connect_first_named_pipe_client(&names).await.unwrap_err();
+    assert!(
+        matches!(&missing, ProxyError::IpcUnavailable(message) if message.contains(&names[0])),
+        "{missing}"
+    );
+
+    let _earlier = create_named_pipe_server(&names[1], true, &user).unwrap();
+    let (_, connected) = connect_first_named_pipe_client(&names).await.unwrap();
+    assert_eq!(connected, names[1]);
+
+    let _current = create_named_pipe_server(&names[0], true, &user).unwrap();
+    let (_, connected) = connect_first_named_pipe_client(&names).await.unwrap();
+    assert_eq!(connected, names[0]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn named_pipe_daemon_does_not_start_beside_a_proxy_on_its_earlier_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = unique_pipe_names("daemon");
+    let earlier_name = names[1].clone();
+    let earlier_state = dir.path().join("earlier.json");
+    let earlier =
+        tokio::spawn(async move { serve_control_at_pipe(&earlier_name, &earlier_state).await });
+    wait_for_control_pipe_server(&names[1]).await;
+
+    let refused = crate::control::serve_control_at_first_pipe(
+        &names,
+        &dir.path().join("current.json"),
+        ProxyDaemonOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&refused, ProxyError::Ipc(message) if message.contains(&names[1])),
+        "{refused}"
+    );
+
+    let stopped = send_request_to_pipe(&names[1], ProxyRequest::Stop)
+        .await
+        .unwrap();
+    assert_eq!(stopped, ProxyResponse::Stopped);
+    earlier.await.unwrap().unwrap();
 }
 
 #[cfg(windows)]

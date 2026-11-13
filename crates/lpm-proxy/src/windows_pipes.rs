@@ -5,41 +5,69 @@ use crate::control::{ControlStreamContext, handle_control_request};
 pub(crate) async fn connect_named_pipe_client(
     pipe_name: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, ProxyError> {
+    connect_first_named_pipe_client(&[pipe_name])
+        .await
+        .map(|(client, _)| client)
+}
+
+/// Connects to the first of `pipe_names` a server listens on, and says
+/// which. Every round tries each name in order, so a missing or busy pipe is
+/// waited for no longer than with one name. An error other than a missing or
+/// busy pipe ends the wait on the first name, and passes over the others,
+/// which are only earlier names for the same proxy.
+#[cfg(windows)]
+pub(crate) async fn connect_first_named_pipe_client<S: AsRef<str> + Sync>(
+    pipe_names: &[S],
+) -> Result<(tokio::net::windows::named_pipe::NamedPipeClient, &str), ProxyError> {
     use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT,
     };
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 
+    let Some(first_name) = pipe_names.first().map(AsRef::as_ref) else {
+        return Err(ProxyError::Ipc("no control pipe to connect to".into()));
+    };
+    let wide_names: Vec<Vec<u16>> = pipe_names
+        .iter()
+        .map(|name| wide_null(name.as_ref()))
+        .collect();
     let mut attempts = 0u8;
-    let pipe_name_wide = wide_null(pipe_name);
     loop {
-        let ready = unsafe {
-            // SAFETY: `pipe_name_wide` is a nul-terminated UTF-16 string that
-            // remains alive for the duration of the call.
-            WaitNamedPipeW(pipe_name_wide.as_ptr(), 250)
-        };
-        if ready == 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error().map(|code| code as u32) {
-                Some(ERROR_FILE_NOT_FOUND | ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY)
-                    if attempts < 40 =>
-                {
-                    attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    continue;
+        let mut first_unavailable = None;
+        for (index, (pipe_name, wide_name)) in pipe_names.iter().zip(&wide_names).enumerate() {
+            let pipe_name = pipe_name.as_ref();
+            let ready = unsafe {
+                // SAFETY: `wide_name` is a nul-terminated UTF-16 string that
+                // remains alive for the duration of the call.
+                WaitNamedPipeW(wide_name.as_ptr(), 250)
+            };
+            let err = if ready == 0 {
+                std::io::Error::last_os_error()
+            } else {
+                match ClientOptions::new().open(pipe_name) {
+                    Ok(client) => return Ok((client, pipe_name)),
+                    Err(err) => err,
                 }
-                _ => return Err(ipc_pipe_connect_error(err, pipe_name)),
+            };
+            let unavailable = matches!(
+                err.raw_os_error().map(|code| code as u32),
+                Some(ERROR_FILE_NOT_FOUND | ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY)
+            );
+            if index == 0 {
+                if !unavailable {
+                    return Err(ipc_pipe_connect_error(err, pipe_name));
+                }
+                first_unavailable = Some(err);
             }
         }
-        match ClientOptions::new().open(pipe_name) {
-            Ok(client) => return Ok(client),
-            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && attempts < 40 => {
-                attempts += 1;
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(err) => return Err(ipc_pipe_connect_error(err, pipe_name)),
+        if attempts >= 40 {
+            let err = first_unavailable
+                .unwrap_or_else(|| std::io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32));
+            return Err(ipc_pipe_connect_error(err, first_name));
         }
+        attempts += 1;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

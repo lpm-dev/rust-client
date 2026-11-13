@@ -58,11 +58,12 @@ pub use http::{
     start_http_frontend_on_listener_with_upstream, start_http_proxy, start_http_proxy_on_listener,
 };
 #[cfg(windows)]
-pub use paths::proxy_pipe_name_from_env;
+pub use paths::proxy_pipe_names_from_env;
 #[cfg(unix)]
 pub use paths::proxy_socket_path_from_env;
 pub use paths::{
-    proxy_pipe_name_for_root, proxy_state_path_from_env, read_status, read_status_from_path,
+    proxy_pipe_name_for_root, proxy_pipe_names_for_root, proxy_state_path_from_env, read_status,
+    read_status_from_path,
 };
 #[cfg(unix)]
 pub use platform::drop_root_privileges;
@@ -115,6 +116,6 @@ pub(crate) use tls::{
 pub(crate) use unix_transport::ipc_connect_error;
 #[cfg(windows)]
 pub(crate) use windows_pipes::{
-    connect_named_pipe_client, create_named_pipe_server, current_user_sid_sddl,
-    handle_windows_control_stream,
+    connect_first_named_pipe_client, connect_named_pipe_client, create_named_pipe_server,
+    current_user_sid_sddl, handle_windows_control_stream,
 };

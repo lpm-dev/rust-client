@@ -272,13 +272,14 @@ pub async fn register(routes: Vec<Route>) -> Result<RouteLease, ProxyError> {
 
     #[cfg(windows)]
     {
-        let pipe_name = proxy_pipe_name_from_env()?;
-        let (lease_id, client) = register_lease_to_pipe(&pipe_name, routes).await?;
+        let pipe_names = proxy_pipe_names_from_env()?;
+        let (client, pipe_name) = connect_first_named_pipe_client(&pipe_names).await?;
+        let (lease_id, client) = register_lease_on_stream(client, routes).await?;
         Ok(RouteLease {
             lease_id: Some(lease_id),
             connection: Some(LeaseConnection::NamedPipe(client)),
             pending_operation: None,
-            pipe_name: Some(pipe_name),
+            pipe_name: Some(pipe_name.to_owned()),
         })
     }
 
@@ -304,13 +305,14 @@ pub async fn register_staged() -> Result<RouteLease, ProxyError> {
 
     #[cfg(windows)]
     {
-        let pipe_name = proxy_pipe_name_from_env()?;
-        let (lease_id, client) = register_staged_lease_to_pipe(&pipe_name).await?;
+        let pipe_names = proxy_pipe_names_from_env()?;
+        let (client, pipe_name) = connect_first_named_pipe_client(&pipe_names).await?;
+        let (lease_id, client) = register_staged_lease_on_stream(client).await?;
         Ok(RouteLease {
             lease_id: Some(lease_id),
             connection: Some(LeaseConnection::NamedPipe(client)),
             pending_operation: None,
-            pipe_name: Some(pipe_name),
+            pipe_name: Some(pipe_name.to_owned()),
         })
     }
 
@@ -381,35 +383,6 @@ pub(crate) async fn register_staged_lease_to_path(
         .await
         .map_err(|err| ipc_connect_error(err, socket_path))?;
     register_staged_lease_on_stream(stream).await
-}
-
-#[cfg(windows)]
-pub(crate) async fn register_lease_to_pipe(
-    pipe_name: &str,
-    routes: Vec<Route>,
-) -> Result<
-    (
-        RouteLeaseId,
-        tokio::net::windows::named_pipe::NamedPipeClient,
-    ),
-    ProxyError,
-> {
-    let client = connect_named_pipe_client(pipe_name).await?;
-    register_lease_on_stream(client, routes).await
-}
-
-#[cfg(windows)]
-async fn register_staged_lease_to_pipe(
-    pipe_name: &str,
-) -> Result<
-    (
-        RouteLeaseId,
-        tokio::net::windows::named_pipe::NamedPipeClient,
-    ),
-    ProxyError,
-> {
-    let client = connect_named_pipe_client(pipe_name).await?;
-    register_staged_lease_on_stream(client).await
 }
 
 pub(crate) async fn register_lease_on_stream<S>(
@@ -712,7 +685,9 @@ pub async fn send_request(request: ProxyRequest) -> Result<ProxyResponse, ProxyE
 
     #[cfg(windows)]
     {
-        return send_request_to_pipe(&proxy_pipe_name_from_env()?, request).await;
+        let pipe_names = proxy_pipe_names_from_env()?;
+        let (client, _) = connect_first_named_pipe_client(&pipe_names).await?;
+        send_request_on_stream(client, request).await
     }
 
     #[cfg(not(any(unix, windows)))]

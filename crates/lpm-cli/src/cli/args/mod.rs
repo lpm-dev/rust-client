@@ -612,6 +612,12 @@ pub(crate) enum Commands {
     #[command(name = "internal-hosts-file", hide = true)]
     InternalHostsFile(network::InternalHostsFileArgs),
 
+    /// Hidden target of the Windows sign-in task `lpm proxy install`
+    /// registers: starts the proxy in the background with the home,
+    /// project and logs the task names.
+    #[command(name = "internal-proxy-service", hide = true)]
+    InternalProxyService(network::InternalProxyServiceArgs),
+
     /// Hidden sudo helper for the fixed OS-managed security policy.
     #[command(name = "internal-security-policy", hide = true)]
     InternalSecurityPolicy(security::InternalSecurityPolicyArgs),

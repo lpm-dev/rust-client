@@ -45,8 +45,8 @@ pub async fn serve_control_default_with_options(
     let root =
         lpm_common::LpmRoot::from_env().map_err(|err| ProxyError::StatePath(err.to_string()))?;
     ensure_lpm_root(root.root())?;
-    let pipe_name = proxy_pipe_name_for_root(root.root());
-    serve_control_at_pipe_with_options(&pipe_name, &root.proxy_state(), options).await
+    let pipe_names = proxy_pipe_names_for_root(root.root());
+    serve_control_at_first_pipe(&pipe_names, &root.proxy_state(), options).await
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -194,12 +194,30 @@ pub async fn serve_control_at_pipe_with_options(
     state_path: &Path,
     options: ProxyDaemonOptions,
 ) -> Result<(), ProxyError> {
-    match send_request_to_pipe(pipe_name, ProxyRequest::Status).await {
-        Ok(_) => {
-            return Err(ProxyError::Ipc(format!(
-                "local proxy daemon already owns {pipe_name}"
-            )));
-        }
+    serve_control_at_first_pipe(&[pipe_name], state_path, options).await
+}
+
+/// Serves the control pipe `pipe_names[0]`, unless a proxy already answers
+/// on one of `pipe_names`.
+#[cfg(windows)]
+pub(crate) async fn serve_control_at_first_pipe<S: AsRef<str> + Sync>(
+    pipe_names: &[S],
+    state_path: &Path,
+    options: ProxyDaemonOptions,
+) -> Result<(), ProxyError> {
+    let Some(pipe_name) = pipe_names.first().map(AsRef::as_ref) else {
+        return Err(ProxyError::Ipc("no control pipe to serve".into()));
+    };
+    match connect_first_named_pipe_client(pipe_names).await {
+        Ok((client, owned)) => match send_request_on_stream(client, ProxyRequest::Status).await {
+            Ok(_) => {
+                return Err(ProxyError::Ipc(format!(
+                    "local proxy daemon already owns {owned}"
+                )));
+            }
+            Err(ProxyError::IpcUnavailable(_)) => {}
+            Err(err) => return Err(err),
+        },
         Err(ProxyError::IpcUnavailable(_)) => {}
         Err(err) => return Err(err),
     }

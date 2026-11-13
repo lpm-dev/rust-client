@@ -843,7 +843,9 @@ jobs:
         run: cargo test --locked -p lpm-common --test process_output
 
       - name: Windows proxy named-pipe tests
-        run: cargo test --locked -p lpm-proxy named_pipe
+        run: |
+          cargo test --locked -p lpm-proxy named_pipe
+          cargo test --locked -p lpm-proxy every_spelling_of_a_home_names_one_pipe
 
       - name: Build CLI for workflow backend test
         run: cargo build --locked -p lpm-cli

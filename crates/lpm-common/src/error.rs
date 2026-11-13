@@ -601,6 +601,15 @@ pub enum LpmError {
     )]
     Tunnel(String),
 
+    /// The local proxy, or the service that starts it, couldn't be set up,
+    /// started or stopped. The message says what failed.
+    #[error("proxy error: {0}")]
+    #[diagnostic(
+        code(lpm::proxy),
+        help("Run `lpm proxy status` to see whether the local proxy is running.")
+    )]
+    Proxy(String),
+
     /// The relay refused a tunnel because the account can't run one, such
     /// as a plan without tunnels. Retrying doesn't help until the account changes.
     #[error("tunnel unavailable: {message} ({code})")]
@@ -1033,6 +1042,7 @@ impl LpmError {
             LpmError::LpmHome(_) => "lpm_home",
             LpmError::Sandbox(_) => "sandbox",
             LpmError::Tunnel(_) => "tunnel",
+            LpmError::Proxy(_) => "proxy",
             LpmError::TunnelAccess { .. } => "tunnel_access",
             LpmError::TunnelDomain { .. } => "tunnel_domain",
             LpmError::Store(_) => "store",

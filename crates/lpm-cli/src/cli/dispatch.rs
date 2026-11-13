@@ -247,6 +247,19 @@ async fn async_main(cli: Cli) -> Result<()> {
         commands::run::nested_pm::exit_with_shim(&args.manager, args.args.clone());
     }
 
+    if let Commands::InternalProxyService(args) = &command {
+        if let Err(error) = commands::proxy::run_internal_proxy_service(
+            &args.home,
+            &args.project,
+            &args.stdout,
+            &args.stderr,
+            &args.args,
+        ) {
+            exit_with_lpm_error(&error, cli.json);
+        }
+        return Ok(());
+    }
+
     if let Commands::InternalTsTransform(args) = &command {
         let result = if args.persistent {
             lpm_runner::ts_transform::run_persistent_stdio()
@@ -3327,6 +3340,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Commands::InternalTsTransform(_)
         | Commands::InternalNestedPm(_)
+        | Commands::InternalProxyService(_)
         | Commands::InternalVerifyRelease(_)
         | Commands::InternalPackageSignals(_) => {
             unreachable!("handled before async command dispatch")
