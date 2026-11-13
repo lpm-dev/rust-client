@@ -303,7 +303,7 @@ fn open_windows_directory(
             "transaction directory requires a single name",
         ));
     }
-    let owner_only_sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+    let owner_only_sddl = lpm_common::owner_only::owner_only_directory_dacl()?
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
