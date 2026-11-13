@@ -30,19 +30,53 @@ pub fn proxy_pipe_name_for_root(root: &Path) -> String {
 }
 
 /// The control pipes to look for the proxy of the home at `root` on, in
-/// order: [`proxy_pipe_name_for_root`]'s, then, where it differs, the name
+/// order: [`proxy_pipe_name_for_root`]'s, then, where they differ, the names
 /// earlier releases gave it, after the home exactly as spelled in lower case
-/// with `/` separators. A proxy one of them started keeps that name until it
-/// stops, so `lpm proxy` still finds it after an upgrade, and a new proxy
-/// doesn't start beside it.
+/// with `/` separators (see [`earlier_pipe_keys`]). A proxy one of them
+/// started keeps that name until it stops, so `lpm proxy` still finds it
+/// after an upgrade, and a new proxy doesn't start beside it.
 pub fn proxy_pipe_names_for_root(root: &Path) -> Vec<String> {
-    let mut names = Vec::with_capacity(2);
-    names.push(proxy_pipe_name_for_root(root));
-    let earlier = pipe_name_for_key(&root.to_string_lossy().replace('\\', "/").to_lowercase());
-    if earlier != names[0] {
-        names.push(earlier);
+    let spelled = root.to_string_lossy();
+    let key = pipe_root_key(&spelled);
+    let earlier = earlier_pipe_keys(&spelled, &key);
+    let mut names = Vec::with_capacity(1 + earlier.len());
+    names.push(pipe_name_for_key(&key));
+    for key in earlier.iter().flatten() {
+        let name = pipe_name_for_key(key);
+        if !names.contains(&name) {
+            names.push(name);
+        }
     }
     names
+}
+
+/// The texts an earlier release may have named the pipe of the home
+/// `spelled` names after, `key` being [`pipe_root_key`]'s: the home as
+/// `spelled`, and for a Windows path also `key` with a trailing separator,
+/// a `\\?\` prefix or both, the ways one home's spellings most often
+/// differ that [`pipe_root_key`] reads as one.
+fn earlier_pipe_keys(spelled: &str, key: &str) -> [Option<String>; 4] {
+    let as_spelled = Some(spelled.replace('\\', "/").to_lowercase());
+    let verbatim = if let Some(unc) = key.strip_prefix("//") {
+        format!("//?/unc/{unc}")
+    } else if key.as_bytes().get(1) == Some(&b':') {
+        format!("//?/{key}")
+    } else {
+        return [as_spelled, None, None, None];
+    };
+    let with_separator = |key: &str| {
+        if key.ends_with('/') {
+            key.to_owned()
+        } else {
+            format!("{key}/")
+        }
+    };
+    [
+        as_spelled,
+        Some(with_separator(key)),
+        Some(with_separator(&verbatim)),
+        Some(verbatim),
+    ]
 }
 
 fn pipe_name_for_key(key: &str) -> String {

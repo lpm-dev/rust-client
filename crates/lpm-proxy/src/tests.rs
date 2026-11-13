@@ -1192,21 +1192,61 @@ fn a_proxy_an_earlier_release_started_is_looked_for_under_the_pipe_it_named() {
         (r"C:\", r"\\.\pipe\lpm-proxy-f69750190d7df3b5"),
     ] {
         let home = Path::new(home);
+        let names = proxy_pipe_names_for_root(home);
         assert_eq!(
-            proxy_pipe_names_for_root(home),
-            [proxy_pipe_name_for_root(home), earlier.to_string()],
+            names[0],
+            proxy_pipe_name_for_root(home),
             "{}",
+            home.display()
+        );
+        assert!(
+            names.contains(&earlier.to_string()),
+            "{}: {names:?}",
             home.display()
         );
     }
-    for home in [r"C:\Users\Ada\.lpm", r"\\nas\share\home", "/srv/lpm/home"] {
-        let home = Path::new(home);
-        assert_eq!(
-            proxy_pipe_names_for_root(home),
-            [proxy_pipe_name_for_root(home)],
-            "{}",
-            home.display()
-        );
+    let home = Path::new("/srv/lpm/home");
+    assert_eq!(
+        proxy_pipe_names_for_root(home),
+        [proxy_pipe_name_for_root(home)]
+    );
+}
+
+/// An earlier release's proxy started with a trailing separator or a
+/// `\\?\` prefix on its home is found however the home is spelled now,
+/// as the names it may have taken are looked for whatever the spelling.
+#[test]
+fn a_proxy_an_earlier_release_started_is_found_under_another_spelling_of_its_home() {
+    let earlier_names = [
+        r"\\.\pipe\lpm-proxy-4d257bb2ad8b3a35", // C:\lpm-home\
+        r"\\.\pipe\lpm-proxy-0142d32938a59b84", // \\?\C:\lpm-home
+        r"\\.\pipe\lpm-proxy-ca287a0b41678391", // \\?\C:\lpm-home\
+    ];
+    let current = proxy_pipe_name_for_root(Path::new(r"C:\lpm-home"));
+    assert_eq!(current, r"\\.\pipe\lpm-proxy-21e5b67294b3d058");
+    for home in [
+        r"C:\lpm-home",
+        r"c:\LPM-HOME",
+        "C:/lpm-home",
+        r"C:\lpm-home\",
+        r"\\?\C:\lpm-home",
+        r"C:\.\lpm-home",
+    ] {
+        let names = proxy_pipe_names_for_root(Path::new(home));
+        assert_eq!(names[0], current, "{home}");
+        for earlier in earlier_names {
+            assert!(names.contains(&earlier.to_string()), "{home}: {names:?}");
+        }
+    }
+    for home in [r"\\nas\share\home", r"\\?\UNC\nas\share\home\"] {
+        let names = proxy_pipe_names_for_root(Path::new(home));
+        for earlier in [
+            r"\\.\pipe\lpm-proxy-47881a6e0c17ca3c", // \\?\UNC\nas\share\home
+            r"\\.\pipe\lpm-proxy-a40efbfe8c6c5e49", // \\?\UNC\nas\share\home\
+            r"\\.\pipe\lpm-proxy-fc29a69541fbbbb8", // \\nas\share\home\
+        ] {
+            assert!(names.contains(&earlier.to_string()), "{home}: {names:?}");
+        }
     }
 }
 
