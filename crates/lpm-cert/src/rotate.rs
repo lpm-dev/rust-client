@@ -2,7 +2,9 @@
 //!
 //! Default (hard-cutover) sequence:
 //!   1. Generate fresh CA + key into `rootCA.pem.next` / `rootCA-key.pem.next`.
-//!   2. Trust-store install the staged CA (dual-root window opens).
+//!   2. Trust-store install the staged CA (dual-root window opens), where the
+//!      old CA is trusted; an untrusted CA's successor stays untrusted, and
+//!      steps 2 and 6 change no trust store.
 //!   3. Reissue every reachable project leaf against the staged CA.
 //!   4. Verify each reissued leaf chains to the staged CA.
 //!   5. Promote staged → active, save old as `.previous` for transitional logging.
@@ -74,6 +76,15 @@ struct RotationJournal {
     skipped_missing: Vec<String>,
     #[serde(default)]
     removes_at: Option<String>,
+    /// Whether the old root was in the trust store when the rotation began.
+    /// The new root goes there only then, and a rollback puts the old one
+    /// back only then. Earlier releases always trusted the new root.
+    #[serde(default = "earlier_rotations_trusted")]
+    trusted: bool,
+}
+
+fn earlier_rotations_trusted() -> bool {
+    true
 }
 
 impl RotationJournal {
@@ -149,6 +160,9 @@ pub struct RotateResult {
     pub old_ca_removal_scheduled: Option<String>,
     /// Whether the new CA is limited to local names.
     pub name_constraints: bool,
+    /// Whether the new CA is in the trust store: it is where the old one
+    /// was, and rotation leaves an untrusted CA's successor untrusted.
+    pub new_ca_trusted: bool,
 }
 
 /// Run the rotation flow. Returns a structured summary suitable for the JSON
@@ -310,7 +324,9 @@ fn recover_pending_rotation_result(
             journal.old_key(),
         )?;
         ensure_ca_untrusted(journal.new_cert(), &ca_dir.path("rootCA.pem.next"))?;
-        ensure_ca_trusted(journal.old_cert(), &ca_dir.path("rootCA.pem"))?;
+        if journal.trusted {
+            ensure_ca_trusted(journal.old_cert(), &ca_dir.path("rootCA.pem"))?;
+        }
         match (&journal.previous_cert_pem, &journal.previous_key_pem) {
             (Some(cert), Some(key)) => ca_dir.write_ca_pair(
                 "rootCA.pem.previous",
@@ -403,7 +419,9 @@ fn reconcile_promoted_rotation(
         journal.new_cert(),
         journal.new_key(),
     )?;
-    ensure_ca_trusted(journal.new_cert(), &ca_dir.path("rootCA.pem"))?;
+    if journal.trusted {
+        ensure_ca_trusted(journal.new_cert(), &ca_dir.path("rootCA.pem"))?;
+    }
 
     if journal.mode == "grace_window" {
         reconcile_grace_schedule(ca_dir, journal)?;
@@ -499,15 +517,20 @@ fn reconcile_old_root_uninstall(
         write_rotation_journal(ca_dir, journal)?;
     }
     if journal.phase == RotationPhase::OldUntrustPending {
-        ensure_ca_untrusted(journal.old_cert(), &ca_dir.path("rootCA.pem.previous"))?;
-        if !audit_contains_fingerprint_action("ca.trust_uninstall", &journal.old_fingerprint, None)?
-        {
-            audit::append(audit::AuditAction::CaTrustUninstall {
-                fingerprint: journal.old_fingerprint.clone(),
-                store: crate::trust_store_label(),
-                status: audit::AuditStatus::Ok,
-                error: None,
-            })?;
+        if journal.trusted {
+            ensure_ca_untrusted(journal.old_cert(), &ca_dir.path("rootCA.pem.previous"))?;
+            if !audit_contains_fingerprint_action(
+                "ca.trust_uninstall",
+                &journal.old_fingerprint,
+                None,
+            )? {
+                audit::append(audit::AuditAction::CaTrustUninstall {
+                    fingerprint: journal.old_fingerprint.clone(),
+                    store: crate::trust_store_label(),
+                    status: audit::AuditStatus::Ok,
+                    error: None,
+                })?;
+            }
         }
         journal.phase = RotationPhase::CleanupPending;
         write_rotation_journal(ca_dir, journal)?;
@@ -609,8 +632,9 @@ fn rotation_result_from_journal(journal: &RotationJournal) -> RotateResult {
         skipped_missing: journal.skipped_missing.clone(),
         name_constraints: ca::cert_has_name_constraints_bytes(journal.new_cert_pem.as_bytes())
             .unwrap_or(false),
-        old_ca_uninstalled: !grace_window,
+        old_ca_uninstalled: !grace_window && journal.trusted,
         old_ca_removal_scheduled: journal.removes_at.clone(),
+        new_ca_trusted: journal.trusted,
     }
 }
 
@@ -666,6 +690,23 @@ fn rotate_locked(
     let old_key_bytes = ca_dir.read("rootCA-key.pem")?;
     let old_fp = cert::fingerprint_sha256_bytes(&old_cert_bytes)?;
     let old_fp_hex = cert::fingerprint_hex(&old_fp);
+    // Rotating replaces the CA; it doesn't decide whether to trust one. A
+    // CA that was never put in the trust store, as `lpm cert generate`
+    // leaves one where trust is declined, gets a successor that isn't
+    // either.
+    let trusted = trust::is_ca_installed_bytes(&old_cert_bytes, &active_cert).map_err(|error| {
+        LpmError::Cert(format!(
+            "couldn't tell whether the CA at {} is trusted, so nothing was rotated: {error}",
+            active_cert.display()
+        ))
+    })?;
+    if !trusted && opts.keep_old_trusted_days.is_some() {
+        return Err(LpmError::Cert(format!(
+            "--keep-old-trusted keeps the old CA trusted for a while, but the CA at {} isn't \
+             trusted; rotate without it, or trust the CA first with `lpm cert trust`",
+            active_cert.display()
+        )));
+    }
 
     audit::append(audit::AuditAction::CaRotateBegin {
         old_fingerprint: old_fp_hex.clone(),
@@ -680,6 +721,7 @@ fn rotate_locked(
         &old_key_bytes,
         &old_fp_hex,
         mode_label,
+        trusted,
     );
     match result {
         Ok(r) => Ok(r),
@@ -713,6 +755,7 @@ fn stage_and_run(
     old_key_bytes: &[u8],
     old_fp_hex: &str,
     mode_label: &'static str,
+    trusted: bool,
 ) -> Result<RotateResult, LpmError> {
     let name_constraints = match opts.name_constraints.or_else(ca::name_constraints_override) {
         Some(chosen) => chosen,
@@ -772,6 +815,7 @@ fn stage_and_run(
         reissued_leaves: Vec::new(),
         skipped_missing: Vec::new(),
         removes_at: None,
+        trusted,
     };
     write_rotation_journal(ca_dir, &journal)?;
     audit::append(audit::AuditAction::CaGenerate {
@@ -780,44 +824,46 @@ fn stage_and_run(
         name_constraints,
     })?;
 
-    // Step 2: install staged CA into the trust store.
-    let staged_cert = ca_dir.path("rootCA.pem.next");
-    journal.phase = RotationPhase::NewTrustPending;
-    write_rotation_journal(ca_dir, &journal)?;
-    match trust::install_ca_bytes(&staged_cert_bytes, &staged_cert) {
-        Ok(()) => {
-            journal.phase = RotationPhase::NewTrusted;
-            write_rotation_journal(ca_dir, &journal)?;
-            if let Err(error) = audit::append(audit::AuditAction::CaTrustInstall {
-                fingerprint: new_fp_hex.clone(),
-                store: crate::trust_store_label(),
-                status: audit::AuditStatus::Ok,
-                error: None,
-            }) {
-                return rotate_abort_after_staged_install(
-                    ca_dir,
-                    &staged_cert_bytes,
-                    &new_fp_hex,
-                    old_fp_hex,
-                    "trust_install_audit",
-                    error.to_string(),
-                );
+    // Step 2: install staged CA into the trust store, where the old one is.
+    if trusted {
+        let staged_cert = ca_dir.path("rootCA.pem.next");
+        journal.phase = RotationPhase::NewTrustPending;
+        write_rotation_journal(ca_dir, &journal)?;
+        match trust::install_ca_bytes(&staged_cert_bytes, &staged_cert) {
+            Ok(()) => {
+                journal.phase = RotationPhase::NewTrusted;
+                write_rotation_journal(ca_dir, &journal)?;
+                if let Err(error) = audit::append(audit::AuditAction::CaTrustInstall {
+                    fingerprint: new_fp_hex.clone(),
+                    store: crate::trust_store_label(),
+                    status: audit::AuditStatus::Ok,
+                    error: None,
+                }) {
+                    return rotate_abort_after_staged_install(
+                        ca_dir,
+                        &staged_cert_bytes,
+                        &new_fp_hex,
+                        old_fp_hex,
+                        "trust_install_audit",
+                        error.to_string(),
+                    );
+                }
             }
-        }
-        Err(e) => {
-            audit::append_best_effort(audit::AuditAction::CaTrustInstall {
-                fingerprint: new_fp_hex.clone(),
-                store: crate::trust_store_label(),
-                status: audit::AuditStatus::Error,
-                error: Some(e.to_string()),
-            });
-            audit::append_best_effort(audit::AuditAction::CaRotateFailed {
-                old_fingerprint: old_fp_hex.to_string(),
-                new_fingerprint: Some(new_fp_hex),
-                step: "trust_install",
-                error: e.to_string(),
-            });
-            return Err(e);
+            Err(e) => {
+                audit::append_best_effort(audit::AuditAction::CaTrustInstall {
+                    fingerprint: new_fp_hex.clone(),
+                    store: crate::trust_store_label(),
+                    status: audit::AuditStatus::Error,
+                    error: Some(e.to_string()),
+                });
+                audit::append_best_effort(audit::AuditAction::CaRotateFailed {
+                    old_fingerprint: old_fp_hex.to_string(),
+                    new_fingerprint: Some(new_fp_hex),
+                    step: "trust_install",
+                    error: e.to_string(),
+                });
+                return Err(e);
+            }
         }
     }
 
@@ -966,6 +1012,7 @@ fn stage_and_run(
             old_key_bytes,
             &staged_cert_bytes,
             previous_pair.as_ref(),
+            trusted,
             error,
         ));
     }
@@ -1451,7 +1498,145 @@ mod transactional_tests {
             reissued_leaves: Vec::new(),
             skipped_missing: Vec::new(),
             removes_at: None,
+            trusted: true,
         }
+    }
+
+    /// The setup the trust tests share: a home, an audit log, a test trust
+    /// store and an empty project index, and an active root the trust store
+    /// holds where `trusted`.
+    struct RotationFixture {
+        _home: tempfile::TempDir,
+        _guards: Vec<EnvGuard>,
+        operation: paths::CertificateOperation,
+        old_cert: String,
+    }
+
+    fn rotation_fixture(trusted: bool) -> RotationFixture {
+        let home = tempfile::tempdir().unwrap();
+        let guards = vec![
+            EnvGuard::set("LPM_HOME", home.path().join(".lpm")),
+            EnvGuard::set("LPM_CERT_AUDIT_DIR", home.path().join("audit")),
+            EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", home.path().join("trust")),
+            EnvGuard::set(
+                "LPM_CERT_PROJECTS_INDEX",
+                home.path().join("cert-projects.json"),
+            ),
+        ];
+        let operation = paths::CertificateOperation::begin().unwrap();
+        let (old_cert, old_key) = ca::generate_ca().unwrap();
+        operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                old_cert.as_bytes(),
+                old_key.as_bytes(),
+            )
+            .unwrap();
+        if trusted {
+            trust::install_ca_bytes(old_cert.as_bytes(), &operation.ca.path("rootCA.pem")).unwrap();
+        }
+        RotationFixture {
+            _home: home,
+            _guards: guards,
+            operation,
+            old_cert,
+        }
+    }
+
+    fn is_trusted(fixture: &RotationFixture, cert: &[u8]) -> bool {
+        trust::is_ca_installed_bytes(cert, &fixture.operation.ca.path("rootCA.pem")).unwrap()
+    }
+
+    /// Rotating a CA the trust store never held, as `lpm cert generate`
+    /// leaves one where trust is declined, puts neither it nor its successor
+    /// there, and says so; a trusted CA's successor is trusted in its place.
+    #[test]
+    fn rotation_keeps_the_trust_the_old_ca_had() {
+        let _serial = serial_lock();
+
+        let untrusted = rotation_fixture(false);
+        let result = rotate_locked(&untrusted.operation.ca, RotateOptions::default()).unwrap();
+        let new_cert = untrusted.operation.ca.read("rootCA.pem").unwrap();
+        assert_ne!(new_cert, untrusted.old_cert.as_bytes());
+        assert!(!result.new_ca_trusted);
+        assert!(!result.old_ca_uninstalled);
+        assert!(!is_trusted(&untrusted, &new_cert));
+        assert!(!is_trusted(&untrusted, untrusted.old_cert.as_bytes()));
+        assert_eq!(
+            audit_action_count("ca.trust_install", &result.new_fingerprint),
+            0
+        );
+        assert_eq!(
+            audit_action_count("ca.trust_uninstall", &result.old_fingerprint),
+            0
+        );
+        drop(untrusted);
+
+        let trusted = rotation_fixture(true);
+        let result = rotate_locked(&trusted.operation.ca, RotateOptions::default()).unwrap();
+        let new_cert = trusted.operation.ca.read("rootCA.pem").unwrap();
+        assert!(result.new_ca_trusted);
+        assert!(result.old_ca_uninstalled);
+        assert!(is_trusted(&trusted, &new_cert));
+        assert!(!is_trusted(&trusted, trusted.old_cert.as_bytes()));
+    }
+
+    /// A rotation of an untrusted CA that stops before promotion rolls back
+    /// without trusting the old CA, as earlier recovery did whatever it found.
+    #[test]
+    fn recovery_leaves_an_untrusted_root_untrusted() {
+        let _serial = serial_lock();
+        let fixture = rotation_fixture(false);
+        let (new_cert, new_key) = ca::generate_ca().unwrap();
+        let old_key = fixture.operation.ca.read("rootCA-key.pem").unwrap();
+        let mut journal = rotation_journal_for_test(
+            RotationPhase::Reissuing,
+            "hard_cutover",
+            &fixture.old_cert,
+            std::str::from_utf8(&old_key).unwrap(),
+            &new_cert,
+            &new_key,
+        );
+        journal.trusted = false;
+        write_rotation_journal(&fixture.operation.ca, &journal).unwrap();
+
+        recover_pending_rotation(&fixture.operation.ca).unwrap();
+
+        assert_eq!(
+            fixture.operation.ca.read("rootCA.pem").unwrap(),
+            fixture.old_cert.as_bytes()
+        );
+        assert!(!is_trusted(&fixture, fixture.old_cert.as_bytes()));
+        assert!(!is_trusted(&fixture, new_cert.as_bytes()));
+        assert!(!fixture.operation.ca.exists(ROTATION_JOURNAL).unwrap());
+    }
+
+    /// `--keep-old-trusted` has nothing to keep trusted for a CA the trust
+    /// store doesn't hold, so it is refused before anything changes.
+    #[test]
+    fn a_grace_window_for_an_untrusted_ca_is_refused_before_anything_changes() {
+        let _serial = serial_lock();
+        let fixture = rotation_fixture(false);
+
+        let error = rotate_locked(
+            &fixture.operation.ca,
+            RotateOptions {
+                keep_old_trusted_days: Some(7),
+                ..RotateOptions::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("isn't trusted"), "{error}");
+        assert_eq!(
+            fixture.operation.ca.read("rootCA.pem").unwrap(),
+            fixture.old_cert.as_bytes()
+        );
+        assert!(!fixture.operation.ca.exists("rootCA.pem.next").unwrap());
+        assert!(!fixture.operation.ca.exists(ROTATION_JOURNAL).unwrap());
     }
 
     #[test]
@@ -1614,6 +1799,7 @@ fn rollback_failed_promotion(
     old_key: &[u8],
     staged_cert: &[u8],
     previous_pair: Option<&CaPair>,
+    trusted: bool,
     original_error: LpmError,
 ) -> LpmError {
     let mut rollback_errors = Vec::new();
@@ -1621,11 +1807,15 @@ fn rollback_failed_promotion(
     if let Err(error) = ca_dir.write_ca_pair("rootCA.pem", "rootCA-key.pem", old_cert, old_key) {
         rollback_errors.push(format!("restore active root pair: {error}"));
     }
-    if let Err(error) = trust::uninstall_ca_bytes(staged_cert, &ca_dir.path("rootCA.pem.next")) {
-        rollback_errors.push(format!("untrust staged root: {error}"));
-    }
-    if let Err(error) = trust::install_ca_bytes(old_cert, &ca_dir.path("rootCA.pem")) {
-        rollback_errors.push(format!("restore previous root trust: {error}"));
+    // An untrusted old root's rotation trusted neither root.
+    if trusted {
+        if let Err(error) = trust::uninstall_ca_bytes(staged_cert, &ca_dir.path("rootCA.pem.next"))
+        {
+            rollback_errors.push(format!("untrust staged root: {error}"));
+        }
+        if let Err(error) = trust::install_ca_bytes(old_cert, &ca_dir.path("rootCA.pem")) {
+            rollback_errors.push(format!("restore previous root trust: {error}"));
+        }
     }
 
     match previous_pair {

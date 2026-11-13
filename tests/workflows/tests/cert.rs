@@ -467,6 +467,54 @@ fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
     assert_eq!(status["ca"]["trusted"], serde_json::json!(false));
 }
 
+/// `lpm cert rotate` replaces the CA without deciding whether to trust one:
+/// a CA `lpm cert generate` left out of the trust store gets a successor
+/// that stays out of it, and the JSON and text say so; after `lpm cert
+/// trust`, the successor is trusted in the old one's place.
+#[test]
+fn cert_rotate_keeps_the_trust_the_old_ca_had() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    let run = |args: &[&str]| {
+        let output = cert_command(&project).args(args).output().unwrap();
+        assert_success(&output, &format!("lpm {}", args.join(" ")));
+        output
+    };
+
+    run(&["cert", "generate", "--json"]);
+    assert!(!trust_store_entry(&project).exists());
+    let rotated = json_envelope(
+        &run(&["cert", "rotate", "--json"]),
+        "lpm cert rotate --json",
+    );
+    assert_eq!(rotated["new_ca_trusted"], serde_json::json!(false));
+    assert_eq!(rotated["old_ca_uninstalled"], serde_json::json!(false));
+    assert!(
+        !trust_store_entry(&project).exists(),
+        "rotate trusted a CA whose predecessor wasn't trusted"
+    );
+    assert!(!audit_actions(&project).contains(&"ca.trust_install".to_string()));
+    let human = String::from_utf8_lossy(&run(&["cert", "rotate"]).stdout).into_owned();
+    assert!(human.contains("new_ca_trusted false"), "{human}");
+    assert!(
+        human.contains("Run `lpm cert trust` to trust it"),
+        "{human}"
+    );
+    assert!(!trust_store_entry(&project).exists());
+
+    run(&["cert", "trust", "--json"]);
+    let rotated = json_envelope(
+        &run(&["cert", "rotate", "--json"]),
+        "lpm cert rotate --json",
+    );
+    assert_eq!(rotated["new_ca_trusted"], serde_json::json!(true));
+    assert_eq!(rotated["old_ca_uninstalled"], serde_json::json!(true));
+    assert_eq!(
+        std::fs::read(trust_store_entry(&project)).unwrap(),
+        std::fs::read(ca_cert_path(&project)).unwrap(),
+        "the trust store holds the new CA"
+    );
+}
+
 #[test]
 fn cert_generate_json_regenerates_when_requested_host_is_missing() {
     let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
