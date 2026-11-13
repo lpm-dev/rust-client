@@ -12,7 +12,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     GetLengthSid, GetSidIdentifierAuthority, GetSidSubAuthority, GetSidSubAuthorityCount,
@@ -64,6 +64,29 @@ fn read_record(path: &Path) -> Vec<PathBuf> {
             );
             Vec::new()
         }
+    }
+}
+
+/// The trees `path` records, as a cleanup must have them: a record it can't
+/// read, or that another release wrote, may name trees still granted, so it
+/// is an error rather than none. A record that doesn't exist names none.
+fn read_record_strictly(path: &Path) -> Result<Vec<PathBuf>, AppContainerError> {
+    let unreadable = |source: std::io::Error| AppContainerError::GrantRecord {
+        path: path.to_path_buf(),
+        source,
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(unreadable(error)),
+    };
+    match serde_json::from_slice::<TreeRecord>(&bytes) {
+        Ok(record) if record.version == TREE_RECORD_VERSION => Ok(record.trees),
+        Ok(record) => Err(unreadable(std::io::Error::other(format!(
+            "written by another release (version {})",
+            record.version
+        )))),
+        Err(error) => Err(unreadable(std::io::Error::other(error))),
     }
 }
 
@@ -128,7 +151,7 @@ pub(super) fn revoke_stale_grants(
     both.extend(stale.iter().cloned());
     write_record(record, &both)?;
     for tree in &stale {
-        if let Err(error) = revoke_tree(tree, sid) {
+        if let Err(error) = revoke_tree(tree, sid, false) {
             tracing::warn!(
                 target: "lpm_sandbox::helper_appcontainer",
                 "couldn't revoke this package's earlier access to {}: {error}",
@@ -148,8 +171,8 @@ pub(super) fn record_grants(record: &Path, granted: &[PathBuf]) -> Result<(), Ap
 /// as a cleanup run does once the package leaves the project.
 pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut failed = None;
-    for tree in read_record(record) {
-        if let Err(error) = revoke_tree(&tree, sid) {
+    for tree in read_record_strictly(record)? {
+        if let Err(error) = revoke_tree(&tree, sid, true) {
             failed.get_or_insert(error);
         }
     }
@@ -170,7 +193,13 @@ pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerErr
 /// it, as granting set them, without following links; a DACL without one
 /// isn't written. A root that is gone, or a link, which no grant went
 /// through, needs nothing.
-fn revoke_tree(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
+///
+/// With `every_entry`, an entry below the root that still grants `sid`
+/// fails the revoke as the root would, and so does one it can't list or
+/// inspect, which may: the profile must outlive them, as a new one for the
+/// same project and package gets the same SID. An entry that vanished or
+/// became a link meanwhile holds nothing of it.
+fn revoke_tree(root: &Path, sid: PSID, every_entry: bool) -> Result<(), AppContainerError> {
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -189,13 +218,42 @@ fn revoke_tree(root: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let granted = move |ace: PSID| unsafe { EqualSid(ace, sid_address as PSID) != 0 };
     setup::remove_allowed_aces_where(root, granted)?;
     if metadata.is_dir() {
-        visit_entries_below(root, &move |path| {
-            if let Err(error) = setup::remove_allowed_aces_where(path, granted) {
+        let failed = Mutex::new(None);
+        let unvisited = visit_entries_below(root, &|path| match setup::remove_allowed_aces_where(
+            path, granted,
+        ) {
+            Ok(_) => {}
+            Err(error) if every_entry && !left_the_tree(&error) => {
+                failed
+                    .lock()
+                    .expect("revoke failure lock")
+                    .get_or_insert(error);
+            }
+            Err(error) => {
                 tracing::debug!(path = %path.display(), "skip DACL revoke: {error}");
             }
         });
+        if let Some(error) = failed.into_inner().expect("revoke failure lock") {
+            return Err(error);
+        }
+        if every_entry && let Some((path, source)) = unvisited.into_iter().next() {
+            return Err(AppContainerError::InspectDaclPath { path, source });
+        }
     }
     Ok(())
+}
+
+/// Whether `error` says an entry is gone or became a link since it was
+/// listed, so it holds no grant of the identity.
+fn left_the_tree(error: &AppContainerError) -> bool {
+    match error {
+        AppContainerError::ReparsePointRoot { .. } => true,
+        AppContainerError::ReadDacl { win32_error, .. }
+        | AppContainerError::WriteDacl { win32_error, .. } => {
+            matches!(*win32_error, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+        }
+        _ => false,
+    }
 }
 
 /// Sweeps each of `trees` that `record` doesn't name yet of access
@@ -456,6 +514,272 @@ mod tests {
         assert!(!grants(&tree.join("inner").join("file.txt"), sid.0));
         assert!(!record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(false));
+    }
+
+    /// Disables every privilege of this process until it drops, for a check
+    /// the revoke's walker threads make as well as this one: hosted CI
+    /// administrators hold backup and restore privileges that open any
+    /// directory to change it. Nothing else in these tests uses one.
+    struct ProcessWithoutPrivileges {
+        token: HandleGuard,
+        previous: Vec<u64>,
+        // Held until the privileges are back: two tests that each took them
+        // away would otherwise give them back while the other still ran.
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static PROCESS_PRIVILEGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl ProcessWithoutPrivileges {
+        fn new() -> Self {
+            let serial = PROCESS_PRIVILEGES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            use windows_sys::Win32::Security::{
+                AdjustTokenPrivileges, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+            };
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+            let mut token = ptr::null_mut();
+            // SAFETY: the pseudo handle is valid and `token` is writable.
+            assert_ne!(
+                unsafe {
+                    OpenProcessToken(
+                        GetCurrentProcess(),
+                        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                        &mut token,
+                    )
+                },
+                0
+            );
+            let token = HandleGuard(token);
+            let mut previous = vec![0u64; 512];
+            let mut length = 0;
+            // SAFETY: disable-all ignores the new state; `previous` is
+            // writable for the size passed.
+            assert_ne!(
+                unsafe {
+                    AdjustTokenPrivileges(
+                        token.as_raw(),
+                        1,
+                        ptr::null(),
+                        (previous.len() * 8) as u32,
+                        previous.as_mut_ptr().cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            Self {
+                token,
+                previous,
+                _serial: serial,
+            }
+        }
+    }
+
+    impl Drop for ProcessWithoutPrivileges {
+        fn drop(&mut self) {
+            // SAFETY: `previous` holds the TOKEN_PRIVILEGES the disable
+            // returned, which this restores.
+            unsafe {
+                windows_sys::Win32::Security::AdjustTokenPrivileges(
+                    self.token.as_raw(),
+                    0,
+                    self.previous.as_ptr().cast(),
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+        }
+    }
+
+    /// Deletes the profile `0` names when a test ends, however it ends.
+    struct Profile(String);
+
+    impl Drop for Profile {
+        fn drop(&mut self) {
+            delete_profile(&self.0);
+        }
+    }
+
+    fn revoke_only_args(name: &str, record: &Path) -> HelperArgs {
+        crate::helper_protocol::parse_argv(
+            [
+                "--protocol-version",
+                &crate::helper_protocol::PROTOCOL_VERSION.to_string(),
+                "--appcontainer-name",
+                name,
+                "--grant-record",
+                record.to_str().unwrap(),
+                "--revoke-only",
+                "--delete-appcontainer-profile",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cleanup_run_passes_a_recorded_tree_it_never_granted_and_could_not_change() {
+        let name = unique_name("LpmIdentityUnchanged");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let tree = tree_with_a_file(root.path(), "granted");
+        grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        lock_directory_for_test(&locked);
+        let record = root.path().join("grants.json");
+        record_grants(&record, &[locked.clone(), tree.clone()]).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        assert_eq!(
+            without_privileges(|| run_revoke_only(&revoke_only_args(&name, &record))).unwrap(),
+            0
+        );
+
+        assert!(!grants(&tree.join("inner").join("file.txt"), sid.0));
+        assert!(!record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(false));
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_while_a_tree_it_cannot_change_holds_its_grant() {
+        let name = unique_name("LpmIdentityStuck");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        grant_dacl_ace_to_tree(&locked, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        lock_directory_for_test(&locked);
+        let record = root.path().join("grants.json");
+        record_grants(&record, std::slice::from_ref(&locked)).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let error =
+            without_privileges(|| run_revoke_only(&revoke_only_args(&name, &record))).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AppContainerError::WriteDacl { path, win32_error: 5 } if path == &locked
+            ),
+            "{error:?}"
+        );
+        assert!(grants(&locked, sid.0));
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    /// A grant left below a tree's root outlives the profile just as one on
+    /// the root would.
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_while_an_entry_below_a_tree_holds_its_grant() {
+        let name = unique_name("LpmIdentityStuckBelow");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        let locked = tree.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        lock_directory_for_test(&locked);
+        assert!(grants(&locked, sid.0));
+        let record = root.path().join("grants.json");
+        record_grants(&record, std::slice::from_ref(&tree)).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let unprivileged = ProcessWithoutPrivileges::new();
+        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+        drop(unprivileged);
+
+        assert!(
+            matches!(
+                &error,
+                AppContainerError::WriteDacl { path, win32_error: 5 } if path == &locked
+            ),
+            "{error:?}"
+        );
+        assert!(grants(&locked, sid.0));
+        assert!(!grants(&tree, sid.0));
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    /// A record that can't be read may name trees still granted; the
+    /// profile and the record stay until one that can be read is cleaned up.
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_when_its_record_can_t_be_read() {
+        let name = unique_name("LpmIdentityUnreadable");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("grants.json");
+        std::fs::write(&record, b"not json").unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+
+        assert!(
+            matches!(&error, AppContainerError::GrantRecord { path, .. } if path == &record),
+            "{error:?}"
+        );
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+    }
+
+    /// Part of a tree the cleanup can't list may hold the identity's grant,
+    /// as the directory below it here does.
+    #[test]
+    fn a_cleanup_run_keeps_the_profile_while_part_of_a_tree_can_t_be_listed() {
+        struct DeniedListing(PathBuf, String);
+        impl Drop for DeniedListing {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls.exe")
+                    .arg(&self.0)
+                    .args(["/remove:d", &format!("*{}", self.1)])
+                    .output();
+            }
+        }
+        let name = unique_name("LpmIdentityUnlisted");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        let hidden = tree.join("hidden");
+        std::fs::create_dir_all(hidden.join("inner")).unwrap();
+        grant_dacl_ace_to_tree(&tree, None, sid.0, FILE_GENERIC_READ, true).unwrap();
+        let user = setup::current_user_sid().unwrap();
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&hidden)
+            .args(["/deny", &format!("*{user}:(RD)")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let _denied = DeniedListing(hidden.clone(), user);
+        let record = root.path().join("grants.json");
+        record_grants(&record, std::slice::from_ref(&tree)).unwrap();
+        let profiles = profile_list().expect("the user's AppContainer profile list");
+
+        let unprivileged = ProcessWithoutPrivileges::new();
+        let error = run_revoke_only(&revoke_only_args(&name, &record)).unwrap_err();
+        drop(unprivileged);
+
+        assert!(
+            matches!(&error, AppContainerError::InspectDaclPath { path, .. } if path == &hidden),
+            "{error:?}"
+        );
+        assert!(grants(&hidden.join("inner"), sid.0));
+        assert!(record.exists());
+        assert_eq!(lists_profile(&profiles, sid.0), Some(true));
     }
 
     #[test]

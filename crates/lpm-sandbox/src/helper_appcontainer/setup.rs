@@ -6,6 +6,7 @@ mod walk;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Security::{
     CopySid, DeriveCapabilitySidsFromName, GetLengthSid, GetTokenInformation, TOKEN_ELEVATION,
     TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
@@ -593,12 +594,28 @@ pub(super) fn update_ace(
 
 /// Removes the access-allowed ACEs whose SID `drops` picks from `path`'s
 /// DACL, under the lock every DACL update here takes, and says how many
-/// it removed. A DACL it would leave as it is isn't written.
+/// it removed. A DACL it would leave as it is isn't written, nor is one
+/// this user can't change a failure when it holds none of them: a
+/// best-effort grant on a SYSTEM-owned PATH directory never landed there.
 pub(super) fn remove_allowed_aces_where(
     path: &Path,
     drops: impl Fn(PSID) -> bool,
 ) -> Result<usize, AppContainerError> {
-    let (handle, identity) = open_permissions(path, true)?;
+    let (handle, identity) = match open_permissions(path, true) {
+        Ok(opened) => opened,
+        Err(
+            error @ AppContainerError::WriteDacl {
+                win32_error: ERROR_ACCESS_DENIED,
+                ..
+            },
+        ) => {
+            let (handle, _) = open_permissions(path, false)?;
+            let (old, _descriptor) = read_dacl(&handle, path)?;
+            let (_, held) = super::dacl_without_allowed_aces_where(path, old, &drops)?;
+            return if held == 0 { Ok(0) } else { Err(error) };
+        }
+        Err(error) => return Err(error),
+    };
     let _lock = lock_object(identity)?;
     let (old, _descriptor) = read_dacl(&handle, path)?;
     let (mut filtered, removed) = super::dacl_without_allowed_aces_where(path, old, drops)?;

@@ -142,22 +142,26 @@ pub(crate) fn release_package_identity(
     Ok(true)
 }
 
-pub(crate) fn release_identities_of_removed_projects() -> Result<usize, SandboxError> {
+pub(crate) fn release_identities_of_removed_projects() -> (usize, Vec<SandboxError>) {
     let Some(records) = identity_records() else {
-        return Ok(0);
+        return (0, Vec::new());
     };
     let entries = match std::fs::read_dir(&records) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (0, Vec::new()),
         Err(error) => {
-            return Err(SandboxError::IdentityCleanupFailed {
-                project: records,
-                package: String::new(),
-                reason: error.to_string(),
-            });
+            return (
+                0,
+                vec![SandboxError::IdentityCleanupFailed {
+                    project: records,
+                    package: String::new(),
+                    reason: error.to_string(),
+                }],
+            );
         }
     };
     let mut released = 0;
+    let mut failed = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let Some(name) = file_name
@@ -176,10 +180,12 @@ pub(crate) fn release_identities_of_removed_projects() -> Result<usize, SandboxE
         if record.project.exists() {
             continue;
         }
-        release_identity(&records, name, &record.project, &record.package)?;
-        released += 1;
+        match release_identity(&records, name, &record.project, &record.package) {
+            Ok(()) => released += 1,
+            Err(error) => failed.push(error),
+        }
     }
-    Ok(released)
+    (released, failed)
 }
 
 /// Has the helper revoke what `name` was granted and delete its profile,

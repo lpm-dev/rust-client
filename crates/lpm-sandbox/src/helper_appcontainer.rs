@@ -1133,16 +1133,32 @@ fn outermost_writable_ancestor<'a>(root: &Path, writable: &'a [PathBuf]) -> Opti
 /// directories' entries at a time in parallel. The listing goes by path,
 /// so a name may lead elsewhere by the time `visit` sees it: `visit` must
 /// open what it changes without following links.
-fn visit_entries_below(root: &Path, visit: &(dyn Fn(&Path) + Sync)) {
+///
+/// Returns what it couldn't list or inspect, and so didn't visit; an entry
+/// gone since it was listed isn't among them.
+fn visit_entries_below(
+    root: &Path,
+    visit: &(dyn Fn(&Path) + Sync),
+) -> Vec<(PathBuf, std::io::Error)> {
     use rayon::prelude::*;
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
 
+    let unvisited = std::sync::Mutex::new(Vec::new());
+    let skip = |path: PathBuf, error: std::io::Error| {
+        tracing::debug!(path = %path.display(), "skip DACL walk: {error}");
+        if error.kind() != std::io::ErrorKind::NotFound {
+            unvisited
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((path, error));
+        }
+    };
     let step = |entry: std::fs::DirEntry| {
         let path = entry.path();
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
-                tracing::debug!(path = %path.display(), "skip DACL metadata: {error}");
+                skip(path, error);
                 return None;
             }
         };
@@ -1156,16 +1172,14 @@ fn visit_entries_below(root: &Path, visit: &(dyn Fn(&Path) + Sync)) {
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(it) => it,
-            Err(e) => {
-                tracing::debug!(
-                    target: "lpm_sandbox::helper_appcontainer",
-                    "skip DACL walk of {}: read_dir failed: {e}",
-                    dir.display(),
-                );
+            Err(error) => {
+                skip(dir, error);
                 continue;
             }
         };
-        let entries = entries.flatten().collect::<Vec<_>>();
+        let entries = entries
+            .filter_map(|entry| entry.map_err(|error| skip(dir.clone(), error)).ok())
+            .collect::<Vec<_>>();
         let children = if entries.len() > 1 {
             let pool = POOL.get_or_init(|| {
                 rayon::ThreadPoolBuilder::new()
@@ -1184,6 +1198,9 @@ fn visit_entries_below(root: &Path, visit: &(dyn Fn(&Path) + Sync)) {
         };
         stack.extend(children);
     }
+    unvisited
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {

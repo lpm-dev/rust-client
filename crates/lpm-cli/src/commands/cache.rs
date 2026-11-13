@@ -206,10 +206,11 @@ fn run_clean(
             // Windows keeps the sandbox access a package's scripts had in a
             // project with an AppContainer identity of the project's.
             let released_identities = if category.is_none() {
-                lpm_sandbox::release_identities_of_removed_projects().unwrap_or_else(|error| {
+                let (released, failed) = lpm_sandbox::release_identities_of_removed_projects();
+                for error in failed {
                     install_ui::warn_untrusted(&error.to_string());
-                    0
-                })
+                }
+                released
             } else {
                 0
             };
