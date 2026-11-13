@@ -71,7 +71,13 @@ mod windows_main {
     pub(crate) const EXIT_HELPER_FAILED: i32 = 66;
 
     pub fn run() -> ! {
-        let argv = std::env::args_os().skip(1);
+        let argv = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if let [flag] = argv.as_slice()
+            && flag == lpm_sandbox::helper_protocol::RELEASE_FLAG
+        {
+            println!("{}", lpm_sandbox::helper_protocol::HELPER_RELEASE);
+            std::process::exit(0);
+        }
         let args = match parse_argv(argv) {
             Ok(args) => args,
             Err(e) => {

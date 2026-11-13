@@ -43,6 +43,19 @@ use std::path::PathBuf;
 /// valid value is `3`.
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// The only argument with which `lpm-sandbox-helper.exe` prints
+/// [`HELPER_RELEASE`] and exits. A helper from before it knew this flag
+/// exits with an argument error instead.
+pub const RELEASE_FLAG: &str = "--version";
+
+/// The release the helper was built for, as lpm of the same release
+/// reports its own version, so that lpm can tell a helper an earlier
+/// release left beside it, which still speaks [`PROTOCOL_VERSION`].
+pub const HELPER_RELEASE: &str = match option_env!("LPM_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Prefix for production AppContainer profile names. Each project and
 /// package pair appends a digest of the two, so a package's scripts keep
 /// one identity in a project, and the trees it was granted are recorded

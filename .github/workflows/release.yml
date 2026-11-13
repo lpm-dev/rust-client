@@ -1123,6 +1123,13 @@ jobs:
             Write-Error "Release binary reported '$actual', expected 'lpm $version'."
             exit 1
           }
+          # Self-update replaces a helper that names another release, so one
+          # that misreports would be replaced on every update check.
+          $helper = (& ".\lpm-sandbox-helper-${{ matrix.platform }}.exe" --version | Out-String).Trim()
+          if ($helper -ne $version) {
+            Write-Error "Release sandbox helper reported '$helper', expected '$version'."
+            exit 1
+          }
 
   sign-windows:
     name: Sign Windows binaries

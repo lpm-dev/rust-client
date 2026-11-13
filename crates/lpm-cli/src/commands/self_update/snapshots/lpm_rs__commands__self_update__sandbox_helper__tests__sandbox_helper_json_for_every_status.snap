@@ -1,0 +1,30 @@
+---
+source: crates/lpm-cli/src/commands/self_update/sandbox_helper.rs
+expression: "reports.iter().map(SandboxHelperReport::to_json).collect::<Vec<_>>()"
+---
+[
+  {
+    "status": "current",
+    "path": "C:\\Users\\dev\\.lpm\\bin\\lpm-sandbox-helper.exe"
+  },
+  {
+    "status": "updated",
+    "path": "C:\\Users\\dev\\.lpm\\bin\\lpm-sandbox-helper.exe",
+    "backup_path": "C:\\Users\\dev\\.lpm\\bin\\lpm-sandbox-helper.exe.previous"
+  },
+  {
+    "status": "installed",
+    "path": "C:\\Users\\dev\\.lpm\\bin\\lpm-sandbox-helper.exe"
+  },
+  {
+    "status": "not_in_release",
+    "path": "C:\\Users\\dev\\.lpm\\bin\\lpm-sandbox-helper.exe"
+  },
+  {
+    "status": "failed",
+    "path": "C:\\Users\\dev\\.lpm\\bin\\lpm-sandbox-helper.exe",
+    "error": "the release ships a helper of v0.1.0",
+    "backup_error": "Access is denied. (os error 5)",
+    "lpm_sandbox_helper": "D:\\tools\\lpm-sandbox-helper.exe"
+  }
+]
