@@ -4344,7 +4344,8 @@ mod tests {
 
     /// The probe binds without listening, so it takes no connection while
     /// it holds the port, and Windows Firewall has no listener to ask the
-    /// user about.
+    /// user about. (Whether a second probe may bind beside it differs: Linux
+    /// lets two `SO_REUSEADDR` sockets share an address none listens on.)
     #[test]
     fn the_port_probe_binds_without_listening() {
         let probe = bind_without_listening("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -4354,7 +4355,6 @@ mod tests {
             std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2));
 
         assert!(connected.is_err(), "the probe accepted a connection");
-        assert!(!loopback_port_available(address.port()));
     }
 
     #[test]
