@@ -1183,6 +1183,9 @@ pub fn run_dev_script_with_envs_and_config(
         )?;
     }
 
+    // A stop that came while lpm loaded the environment ends the session
+    // before it starts what it would at once have to end.
+    let stopped = || endpoint_options.stop_requested.load(Ordering::Acquire);
     if let Some(pre_cmd) = pre_command {
         env_vars.apply_npm_context(&context, "predev", pre_cmd);
         dotenv::validate_child_env(
@@ -1192,6 +1195,9 @@ pub fn run_dev_script_with_envs_and_config(
             &path,
             validate_schema,
         )?;
+        if stopped() {
+            return Ok(());
+        }
         let status = shell::spawn_shell_cancellable(
             &ShellCommand {
                 command: pre_cmd,
@@ -1201,7 +1207,7 @@ pub fn run_dev_script_with_envs_and_config(
             },
             &endpoint_options.stop_requested,
         )?;
-        if endpoint_options.stop_requested.load(Ordering::Acquire) {
+        if stopped() {
             return Ok(());
         }
         if !status.success() {
@@ -1224,6 +1230,9 @@ pub fn run_dev_script_with_envs_and_config(
     )?;
     let full_cmd =
         assemble_shell_command(&script_cmd, extra_args, project_dir, &path, env_vars.vars())?;
+    if stopped() {
+        return Ok(());
+    }
     let status = shell::spawn_shell_with_endpoint(
         &ShellCommand {
             command: &full_cmd,
@@ -2967,6 +2976,67 @@ mod tests {
         fs::write(&bin_path, script).unwrap();
         make_executable(&bin_path);
         bin_path
+    }
+
+    fn dev_endpoint_options(
+        stop_requested: bool,
+        endpoint_reported: &Arc<AtomicBool>,
+    ) -> DevScriptEndpointOptions {
+        let endpoint_reported = Arc::clone(endpoint_reported);
+        DevScriptEndpointOptions {
+            requested_port: None,
+            discovery: shell::EndpointDiscovery::required(false),
+            stop_requested: Arc::new(AtomicBool::new(stop_requested)),
+            on_endpoint: Box::new(move |_| endpoint_reported.store(true, Ordering::Release)),
+            on_shutdown_started: None,
+        }
+    }
+
+    /// A stop that came while lpm loaded the environment ends the session
+    /// before the dev server starts, rather than starting it only to end it.
+    #[test]
+    fn a_dev_session_stopped_before_its_server_starts_never_starts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_scripts(dir.path(), &[("dev", &script_creating_file("started"))]);
+        let endpoint_reported = Arc::new(AtomicBool::new(false));
+
+        run_dev_script_with_envs_and_config(
+            dir.path(),
+            &[],
+            None,
+            &[],
+            &Unknown,
+            None,
+            dev_endpoint_options(true, &endpoint_reported),
+        )
+        .unwrap();
+
+        assert!(
+            !endpoint_reported.load(Ordering::Acquire),
+            "the dev server was started after the stop"
+        );
+        assert!(!dir.path().join("started").exists());
+    }
+
+    #[test]
+    fn a_dev_session_runs_its_server_when_nothing_stopped_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_scripts(dir.path(), &[("dev", &script_creating_file("started"))]);
+        let endpoint_reported = Arc::new(AtomicBool::new(false));
+
+        run_dev_script_with_envs_and_config(
+            dir.path(),
+            &[],
+            None,
+            &[],
+            &Unknown,
+            None,
+            dev_endpoint_options(false, &endpoint_reported),
+        )
+        .unwrap();
+
+        assert!(endpoint_reported.load(Ordering::Acquire));
+        assert!(dir.path().join("started").exists());
     }
 
     #[test]
