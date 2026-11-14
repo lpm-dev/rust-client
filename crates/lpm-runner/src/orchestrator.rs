@@ -2395,9 +2395,10 @@ fn shutdown_children_ordered(
         force_kill_children(children, true);
     } else {
         // A second Ctrl+C may have come since the shutdown read that it
-        // wasn't forced.
-        let to_stop = children
-            .lock()
+        // wasn't forced. Counted and said under the lock its force-kill
+        // takes, so that none comes between the two.
+        let locked = children.lock();
+        let to_stop = locked
             .iter()
             .filter(|(_, child)| !child.reported_force_killed)
             .count();
@@ -2405,6 +2406,7 @@ fn shutdown_children_ordered(
             terminal_eprintln!();
             ui_warn(&format!("Stopping {}...", services(to_stop)));
         }
+        drop(locked);
     }
 
     // Build the shutdown order: reverse topological levels (dependents first).
