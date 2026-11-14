@@ -86,6 +86,8 @@ pub struct UninstallCaResult {
     /// SHA-256 fingerprints of the certificates whose trust was removed: the
     /// on-disk root's, then that of a pending write's root that differs.
     pub fingerprints: Vec<String>,
+    /// Whether the trust store held any of them before the removal.
+    pub was_trusted: bool,
 }
 
 /// Remove the active LPM root from the OS trust store and record the exact
@@ -105,7 +107,11 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
         .as_ref()
         .filter(|pending| on_disk.as_ref() != Some(*pending));
     let mut fingerprints = Vec::with_capacity(2);
+    let mut was_trusted = false;
     for cert_pem in on_disk.iter().chain(pending) {
+        // Removal runs either way: it also clears what the check can't see,
+        // such as a Linux anchor whose bundle wasn't refreshed.
+        was_trusted |= trust::is_ca_installed_bytes(cert_pem, &ca_cert_path)?;
         fingerprints.push(uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?);
     }
     if pending_pair.is_some() {
@@ -117,7 +123,10 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
             ca_cert_path.display()
         )));
     }
-    Ok(UninstallCaResult { fingerprints })
+    Ok(UninstallCaResult {
+        fingerprints,
+        was_trusted,
+    })
 }
 
 /// Removes `cert_pem` from the OS trust store and records that in the

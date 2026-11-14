@@ -467,6 +467,48 @@ fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
     assert_eq!(status["ca"]["trusted"], serde_json::json!(false));
 }
 
+#[test]
+fn cert_uninstall_says_when_the_ca_was_not_trusted() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "generate", "--json"])
+            .output()
+            .expect("failed to run lpm cert generate --json"),
+        "lpm cert generate --json",
+    );
+
+    let untrusted = cert_command(&project)
+        .args(["cert", "uninstall"])
+        .output()
+        .expect("failed to run lpm cert uninstall");
+    assert_success(&untrusted, "lpm cert uninstall");
+    let stderr = String::from_utf8_lossy(&untrusted.stderr);
+    assert!(
+        stderr.contains("CA was not in the system trust store") && !stderr.contains("CA removed"),
+        "uninstalling a CA nobody trusted must not claim to remove it, got:\n{stderr}"
+    );
+
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust", "--json"])
+            .output()
+            .expect("failed to run lpm cert trust --json"),
+        "lpm cert trust --json",
+    );
+    let trusted = cert_command(&project)
+        .args(["cert", "uninstall"])
+        .output()
+        .expect("failed to run lpm cert uninstall");
+    assert_success(&trusted, "lpm cert uninstall");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("CA removed from system trust store"),
+        "uninstalling a trusted CA must say it was removed, got:\n{stderr}"
+    );
+    assert!(!trust_store_entry(&project).exists());
+}
+
 /// `lpm cert rotate` replaces the CA without deciding whether to trust one:
 /// a CA `lpm cert generate` left out of the trust store gets a successor
 /// that stays out of it, and the JSON and text say so; after `lpm cert
