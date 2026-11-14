@@ -1143,38 +1143,62 @@ mod windows {
                     // SAFETY: takes no arguments.
                     GetLogicalDrives()
                 };
-                let letter = (b'D'..=b'Z')
-                    .rev()
-                    .find(|letter| {
-                        present & (1 << (letter - b'A')) == 0 && dos_definitions(*letter).is_empty()
-                    })
-                    .expect("a free drive letter");
-                let mut local: Vec<u16> = format!("{}:", char::from(letter))
-                    .encode_utf16()
-                    .chain(Some(0))
-                    .collect();
-                let mut remote: Vec<u16> =
+                let mut wide_remote: Vec<u16> =
                     remote.as_os_str().encode_wide().chain(Some(0)).collect();
-                let information = USE_INFO_1 {
-                    ui1_local: local.as_mut_ptr(),
-                    ui1_remote: remote.as_mut_ptr(),
-                    ui1_password: std::ptr::null_mut(),
-                    ui1_status: 0,
-                    ui1_asg_type: USE_DISKDEV,
-                    ui1_refcount: 0,
-                    ui1_usecount: 0,
-                };
-                // SAFETY: `information` points at NUL-terminated names that outlive the call.
-                let status = unsafe {
-                    NetUseAdd(
-                        std::ptr::null(),
-                        1,
-                        std::ptr::from_ref(&information).cast(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                assert_eq!(status, NO_ERROR, "NetUseAdd failed");
-                Self(letter)
+                let mut tried = Vec::new();
+                // A network file system can answer for a letter of another
+                // sign-in, as Parallels' answers in an elevated session for
+                // the user's drives, and LPM rightly takes no such letter for
+                // the user's: the test needs one that reads back as mapped.
+                for letter in (b'D'..=b'Z').rev().filter(|letter| {
+                    present & (1 << (letter - b'A')) == 0 && dos_definitions(*letter).is_empty()
+                }) {
+                    let mut local: Vec<u16> = format!("{}:", char::from(letter))
+                        .encode_utf16()
+                        .chain(Some(0))
+                        .collect();
+                    let information = USE_INFO_1 {
+                        ui1_local: local.as_mut_ptr(),
+                        ui1_remote: wide_remote.as_mut_ptr(),
+                        ui1_password: std::ptr::null_mut(),
+                        ui1_status: 0,
+                        ui1_asg_type: USE_DISKDEV,
+                        ui1_refcount: 0,
+                        ui1_usecount: 0,
+                    };
+                    // SAFETY: `information` points at NUL-terminated names that outlive the call.
+                    let status = unsafe {
+                        NetUseAdd(
+                            std::ptr::null(),
+                            1,
+                            std::ptr::from_ref(&information).cast(),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if status != NO_ERROR {
+                        tried.push(format!(
+                            "{}: NetUseAdd failed with {status}",
+                            char::from(letter)
+                        ));
+                        continue;
+                    }
+                    let drive = Self(letter);
+                    let read_back = mapped_remote(letter);
+                    if read_back
+                        .as_deref()
+                        .is_some_and(|mapped| same_remote(mapped, remote.as_os_str()))
+                    {
+                        return drive;
+                    }
+                    tried.push(format!(
+                        "{}: reads back as {read_back:?}",
+                        char::from(letter)
+                    ));
+                }
+                panic!(
+                    "no free drive letter could be mapped to {} and read back as it: {tried:?}",
+                    remote.display()
+                );
             }
 
             /// What a removal that isn't forced reports.
@@ -1195,6 +1219,19 @@ mod windows {
             fn drop(&mut self) {
                 self.remove();
             }
+        }
+
+        /// Whether two network paths name one folder, as Windows compares
+        /// them: without regard to ASCII case or a trailing separator.
+        fn same_remote(one: &OsStr, other: &OsStr) -> bool {
+            let trimmed = |path: &OsStr| {
+                let mut units: Vec<u16> = path.encode_wide().collect();
+                while units.last() == Some(&u16::from(b'\\')) {
+                    units.pop();
+                }
+                OsString::from_wide(&units)
+            };
+            trimmed(one).eq_ignore_ascii_case(trimmed(other))
         }
 
         #[test]
