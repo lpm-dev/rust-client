@@ -668,23 +668,23 @@ fn rename_capability_handle(
     };
     let name = destination.encode_wide().collect::<Vec<_>>();
     let mut relative = RenameRecord::new(directory.as_raw_handle(), &name)?;
-    let mut full_path = None;
     let mut attempt = 0;
     for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        let status = loop {
+        let (status, target) = loop {
             let (target, class) = attempts[attempt];
+            // The path is read again for each attempt, from the handle, so
+            // that it follows the directory if it moves.
+            let mut by_full_path;
             let record = match target {
                 RenameTarget::Relative => &mut relative,
-                RenameTarget::FullPath => match &mut full_path {
-                    Some(record) => record,
-                    None => full_path.insert(RenameRecord::new(
-                        std::ptr::null_mut(),
-                        &nt_path_in(directory, &name)?,
-                    )?),
-                },
+                RenameTarget::FullPath => {
+                    by_full_path =
+                        RenameRecord::new(std::ptr::null_mut(), &nt_path_in(directory, &name)?)?;
+                    &mut by_full_path
+                }
             };
             let status = record.apply(temporary, class, replace, target);
             if attempt + 1 < attempts.len()
@@ -696,9 +696,18 @@ fn rename_capability_handle(
                 attempt += 1;
                 continue;
             }
-            break status;
+            break (status, target);
         };
         if status >= 0 {
+            // A directory that moved between reading its path and the
+            // rename leaves the file elsewhere on its volume.
+            if target == RenameTarget::FullPath
+                && !is_current_entry(directory, destination, temporary).unwrap_or(true)
+            {
+                return Err(io::Error::other(
+                    "the directory moved while a file was renamed into it",
+                ));
+            }
             return Ok(());
         }
         let code = unsafe {
