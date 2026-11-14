@@ -722,9 +722,13 @@ pub(crate) async fn run_start(
     } else {
         tokio::pin!(connect);
         if let Some(mut shutdown) = shutdown {
+            // `lpm dev`'s own handlers stop the session, and the tunnel with
+            // it. A Ctrl+C listener here would hide them on Windows: tokio's
+            // console handler, registered later, answers the event first.
+            let interrupted = std::future::pending();
             tokio::select! {
                 result = &mut connect => result,
-                control_result = wait_for_tunnel_controls(control_inspector_url, redraw_panel(control_panel)) => {
+                control_result = wait_for_tunnel_controls(control_inspector_url, redraw_panel(control_panel), interrupted) => {
                     tunnel_cancel.cancel();
                     compose_tunnel_control_and_connect(control_result, connect.await)
                 },
@@ -736,7 +740,7 @@ pub(crate) async fn run_start(
         } else {
             tokio::select! {
                 result = &mut connect => result,
-                control_result = wait_for_tunnel_controls(control_inspector_url, redraw_panel(control_panel)) => {
+                control_result = wait_for_tunnel_controls(control_inspector_url, redraw_panel(control_panel), tokio::signal::ctrl_c()) => {
                     tunnel_cancel.cancel();
                     compose_tunnel_control_and_connect(control_result, connect.await)
                 },
@@ -2401,19 +2405,21 @@ fn redraw_panel(panel: Option<Arc<panel::TunnelPanel>>) -> impl Fn() {
     }
 }
 
+/// Waits until the user quits the tunnel: `q` or Ctrl+C at a terminal, whose
+/// keys it reads, or `interrupted` otherwise.
 async fn wait_for_tunnel_controls(
     inspector_url: Option<String>,
     on_resize: impl Fn(),
+    interrupted: impl std::future::Future<Output = std::io::Result<()>>,
 ) -> Result<(), LpmError> {
     if !std::io::stdin().is_terminal() {
-        tokio::signal::ctrl_c()
+        interrupted
             .await
             .map_err(|e| LpmError::Tunnel(format!("signal error: {e}")))?;
         return Ok(());
     }
 
     let _key_mode = TunnelKeyModeGuard::enter()?;
-    let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
     loop {
         tokio::select! {
@@ -2945,6 +2951,29 @@ mod tests {
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// Without a terminal to read keys from, the tunnel ends on the interrupt
+    /// it is given, and on no other: inside `lpm dev` it is given none.
+    #[tokio::test]
+    async fn tunnel_controls_without_a_terminal_end_on_the_interrupt_they_are_given() {
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+
+        let interrupted = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_tunnel_controls(None, || {}, std::future::ready(Ok(()))),
+        )
+        .await;
+        let never_interrupted = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_tunnel_controls(None, || {}, std::future::pending()),
+        )
+        .await;
+
+        assert!(matches!(interrupted, Ok(Ok(()))), "{interrupted:?}");
+        assert!(never_interrupted.is_err(), "{never_interrupted:?}");
     }
 
     #[tokio::test]
