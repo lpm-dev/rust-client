@@ -721,12 +721,12 @@ fn rename_capability_handle(
             // A directory that moved between reading its path and the
             // rename may have left the file elsewhere, even in a directory
             // made at the old path since. Unless the handle's directory is
-            // still at the path renamed into, the file must be found in it.
-            // A file left elsewhere is deleted through its handle, wherever
-            // it is.
+            // still at the path renamed into, the file's own handle must put
+            // it in that directory. A file left elsewhere is deleted through
+            // its handle, wherever it is.
             if let Some(renamed_into) = renamed_into
                 && directory_final_path(directory).ok().as_ref() != Some(&renamed_into)
-                && !is_current_entry(directory, destination, temporary).unwrap_or(false)
+                && !file_is_in(temporary, directory)
             {
                 let _ = delete_on_close(temporary);
                 return Err(io::Error::other(
@@ -897,6 +897,29 @@ fn delete_on_close(file: &cap_std::fs::File) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Whether the open `file` is directly in the directory `directory` holds,
+/// as the final paths of both handles say.
+#[cfg(windows)]
+fn file_is_in(file: &cap_std::fs::File, directory: &cap_std::fs::Dir) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    let (Ok(directory_path), Ok(file_path)) = (
+        directory_final_path(directory),
+        crate::owner_only::final_path(file),
+    ) else {
+        return false;
+    };
+    let file_path = file_path.as_os_str().encode_wide().collect::<Vec<_>>();
+    // A volume's root, as in `\\?\C:\`, ends in its separator.
+    let separator = u16::from(b'\\');
+    let directory_path = directory_path
+        .strip_suffix(&[separator])
+        .unwrap_or(&directory_path);
+    file_path
+        .iter()
+        .rposition(|unit| *unit == separator)
+        .is_some_and(|at| file_path[..at] == *directory_path)
 }
 
 /// The path the handle `directory` has now, as Windows gives it, with its
