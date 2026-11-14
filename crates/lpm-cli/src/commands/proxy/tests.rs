@@ -946,7 +946,7 @@ fn a_detached_daemon_a_job_keeps_still_starts() {
     let mut command = std::process::Command::new("cmd");
     command.args(["/d", "/c", "exit", "0"]);
 
-    let mut child = spawn_detached_daemon_with(&mut command, |command| {
+    let mut daemon = spawn_detached_daemon_with(&mut command, |command| {
         attempts += 1;
         if attempts == 1 {
             Err(std::io::Error::from_raw_os_error(
@@ -959,7 +959,8 @@ fn a_detached_daemon_a_job_keeps_still_starts() {
     .unwrap();
 
     assert_eq!(attempts, 2, "a refused breakaway is retried inside the Job");
-    assert!(child.wait().unwrap().success());
+    assert!(daemon.kept_in_job, "lpm says the Job keeps the daemon");
+    assert!(daemon.child.wait().unwrap().success());
 }
 
 #[cfg(windows)]
@@ -972,7 +973,8 @@ fn a_detached_daemon_failing_for_another_reason_is_not_retried() {
         attempts += 1;
         Err(std::io::Error::from_raw_os_error(2))
     })
-    .unwrap_err();
+    .err()
+    .unwrap();
 
     assert_eq!(attempts, 1);
     assert_eq!(error.raw_os_error(), Some(2));

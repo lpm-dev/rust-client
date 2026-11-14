@@ -353,10 +353,17 @@ async fn ensure_detached_started_with_options(
             "failed to prepare detached proxy daemon handles: {err}"
         ))
     })?;
-    let mut child = spawn_detached_daemon(&mut command)
+    let mut daemon = spawn_detached_daemon(&mut command)
         .map_err(|err| LpmError::Proxy(format!("failed to start detached proxy daemon: {err}")))?;
 
-    let status = wait_for_detached_start(&mut child).await?;
+    let status = wait_for_detached_start(&mut daemon.child).await?;
+    if daemon.kept_in_job {
+        tracing::warn!(
+            "the proxy daemon could not leave the Windows Job lpm runs in, such as an \
+             `lpm dev` service's, so it may stop when that Job ends; run \
+             `lpm proxy start --detach` from outside it to keep it running"
+        );
+    }
     Ok(DetachedProxyStart {
         status,
         started: true,
@@ -491,21 +498,28 @@ fn detach_background_command(command: &mut std::process::Command) {
 const WINDOWS_DETACHED_FLAGS: u32 = windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
     | windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
+/// A spawned proxy daemon, and whether a Windows Job it couldn't leave
+/// keeps it.
+struct DetachedDaemon {
+    child: std::process::Child,
+    kept_in_job: bool,
+}
+
 /// Spawns the machine-wide proxy daemon, prepared by
 /// [`detach_background_command`], so that it outlives what started it.
 ///
 /// On Windows that means asking to start outside any Job lpm runs in, as
-/// `setsid` takes it out of lpm's process group on Unix. A Job that
-/// refuses, as an `lpm dev` service's does, keeps it, and then the daemon
-/// ends with that service; lpm says so.
-fn spawn_detached_daemon(command: &mut Command) -> std::io::Result<std::process::Child> {
+/// `setsid` takes it out of lpm's process group on Unix. A Job that refuses
+/// breakaway, as an `lpm dev` service's does, makes Windows answer
+/// ACCESS_DENIED; the daemon then starts inside it.
+fn spawn_detached_daemon(command: &mut Command) -> std::io::Result<DetachedDaemon> {
     spawn_detached_daemon_with(command, Command::spawn)
 }
 
 fn spawn_detached_daemon_with(
     command: &mut Command,
     mut spawn: impl FnMut(&mut Command) -> std::io::Result<std::process::Child>,
-) -> std::io::Result<std::process::Child> {
+) -> std::io::Result<DetachedDaemon> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -516,19 +530,22 @@ fn spawn_detached_daemon_with(
         match spawn(command) {
             Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
                 command.creation_flags(WINDOWS_DETACHED_FLAGS);
-                let child = spawn(command)?;
-                tracing::warn!(
-                    "the proxy daemon started inside a Windows Job that keeps what it starts, \
-                     such as an `lpm dev` service's, so it ends when that does; \
-                     run `lpm proxy start --detach` outside it to keep it running"
-                );
-                Ok(child)
+                Ok(DetachedDaemon {
+                    child: spawn(command)?,
+                    kept_in_job: true,
+                })
             }
-            result => result,
+            result => result.map(|child| DetachedDaemon {
+                child,
+                kept_in_job: false,
+            }),
         }
     }
     #[cfg(not(windows))]
-    spawn(command)
+    spawn(command).map(|child| DetachedDaemon {
+        child,
+        kept_in_job: false,
+    })
 }
 
 fn append_listener_args(command: &mut Command, options: lpm_proxy::ProxyDaemonOptions) {
