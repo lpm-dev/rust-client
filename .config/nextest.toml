@@ -29,5 +29,5 @@ filter = "package(lpm-workflows) & binary_id(/self_update/)"
 test-group = "self-update-processes"
 
 [[profile.default.overrides]]
-filter = "(package(lpm-common) & (test(=script_directory::windows::tests::a_drive_lpm_defines_lasts_as_long_as_anything_uses_it) | test(=script_directory::windows::tests::a_drive_the_user_mapped_is_reused_and_kept_while_a_script_uses_it))) | (package(lpm-runner) & test(=shell::tests::a_script_in_a_network_folder_runs_there_instead_of_the_windows_directory))"
+filter = "(package(lpm-common) & (test(=script_directory::windows::tests::a_drive_lpm_defines_lasts_as_long_as_anything_uses_it) | test(=script_directory::windows::tests::a_drive_the_user_mapped_is_reused_and_kept_while_a_script_uses_it))) | (package(lpm-runner) & (test(=shell::tests::a_script_in_a_network_folder_runs_there_instead_of_the_windows_directory) | test(=orchestrator::tests::a_service_in_a_network_folder_gives_back_its_drive_letter_once_lpm_dev_stops_it)))"
 test-group = "windows-drive-letters"
