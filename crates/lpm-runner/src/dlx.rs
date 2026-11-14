@@ -584,7 +584,13 @@ mod tests {
         )
         .unwrap();
         for bin in bins {
-            std::fs::write(bin_dir.join(bin), "").unwrap();
+            // The linker's shim on Windows is `<bin>.cmd`.
+            let shim = if cfg!(windows) {
+                format!("{bin}.cmd")
+            } else {
+                (*bin).to_string()
+            };
+            std::fs::write(bin_dir.join(shim), "").unwrap();
         }
     }
 
@@ -934,7 +940,10 @@ mod tests {
         seed_installed_package(&cache_dir, "foo", r#"{"serve":"./cli.js"}"#, &["serve"]);
 
         let expected_name = if cfg!(windows) { "serve.cmd" } else { "serve" };
-        let expected = cache_dir.join("node_modules/.bin").join(expected_name);
+        let expected = cache_dir
+            .join("node_modules")
+            .join(".bin")
+            .join(expected_name);
 
         let cmd = build_dlx_command(dir.path(), &cache_dir, "foo", &[]).unwrap();
         assert_eq!(cmd.get_program(), expected.as_os_str());
@@ -982,7 +991,10 @@ mod tests {
         );
 
         let expected_name = if cfg!(windows) { "foo.cmd" } else { "foo" };
-        let expected = cache_dir.join("node_modules/.bin").join(expected_name);
+        let expected = cache_dir
+            .join("node_modules")
+            .join(".bin")
+            .join(expected_name);
         let cmd = build_dlx_command(dir.path(), &cache_dir, "@scope/foo", &[]).unwrap();
         assert_eq!(cmd.get_program(), expected.as_os_str());
     }
