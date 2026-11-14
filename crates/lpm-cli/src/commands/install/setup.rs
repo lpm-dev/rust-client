@@ -83,7 +83,7 @@ fn refuse_a_project_without_links(project_dir: &Path) -> Result<(), LpmError> {
         return Ok(());
     };
     match lpm_common::volume::links_not_held(&project) {
-        Some(why) => Err(LpmError::Script(format!(
+        Some(why) => Err(LpmError::ProjectFile(format!(
             "LPM can't install into {}: {why}, and node_modules is made of links into LPM's package store. Move the project to a local NTFS drive",
             lpm_common::symlink::windows_plain_path(project_dir).display()
         ))),

@@ -235,7 +235,8 @@ fn keep_state_dir_owner_only_or_warn(
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(
                 "anyone using this computer can read and change {} and what LPM keeps in it: {why}",
-                state_display.parent().unwrap_or(state_display).display()
+                crate::symlink::windows_plain_path(state_display.parent().unwrap_or(state_display))
+                    .display()
             );
         }
         return;
@@ -356,7 +357,7 @@ pub fn keep_lpm_home_private_in(
     match crate::volume::files_not_private(directory) {
         Some(why) => Err(format!(
             "anyone using this computer could read what LPM saves in {}: {why}",
-            home_display.display()
+            crate::symlink::windows_plain_path(home_display).display()
         )),
         None => Ok(()),
     }
@@ -472,7 +473,7 @@ fn keep_lpm_home_owner_only_or_warn(directory: &cap_std::fs::Dir, root: &Path) {
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(
                 "anyone using this computer can change what LPM keeps in {}, its package store included: {why}",
-                root.display()
+                crate::symlink::windows_plain_path(root).display()
             );
         }
         return;
