@@ -362,6 +362,12 @@ fn ui_phase(msg: &str) {
 }
 
 fn ui_warn(msg: &str) {
+    #[cfg(test)]
+    WARNINGS.with(|warnings| {
+        if let Some(warnings) = warnings.borrow_mut().as_mut() {
+            warnings.push(msg.to_string());
+        }
+    });
     terminal_eprintln!("  {} {msg}", ui_paint(YELLOW, "!"));
 }
 
@@ -392,6 +398,9 @@ fn ui_service_note(color: &str, name: &str, msg: &str) {
 std::thread_local! {
     /// What was said of each service on this thread, while a test records it.
     static SERVICE_REPORTS: std::cell::RefCell<Option<Vec<(String, String)>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The warnings given on this thread, while a test records them.
+    static WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2340,6 +2349,14 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force
     shutdown_children_ordered(children, force, None, crate::execution::console_interrupted);
 }
 
+fn services(count: usize) -> String {
+    if count == 1 {
+        "1 service".to_string()
+    } else {
+        format!("{count} services")
+    }
+}
+
 /// Shutdown with optional reverse topological ordering.
 ///
 /// When `groups` is provided, services are stopped in reverse topological order
@@ -2365,10 +2382,19 @@ fn shutdown_children_ordered(
         return;
     }
 
-    terminal_eprintln!();
     if force {
-        ui_warn(&format!("Force-killing {count} services..."));
         let mut locked = children.lock();
+        // A second Ctrl+C force-kills each service as it comes, saying so,
+        // and may do that before the shutdown begins.
+        let to_force_kill = locked
+            .iter_mut()
+            .map(|(_, child)| !child.reported_force_killed && child.tree_running())
+            .filter(|left_to_force_kill| *left_to_force_kill)
+            .count();
+        if to_force_kill > 0 {
+            terminal_eprintln!();
+            ui_warn(&format!("Force-killing {}...", services(to_force_kill)));
+        }
         force_kill_and_report_all(
             locked
                 .iter_mut()
@@ -2376,7 +2402,8 @@ fn shutdown_children_ordered(
             cleanup_deadline(),
         );
     } else {
-        ui_warn(&format!("Stopping {count} services..."));
+        terminal_eprintln!();
+        ui_warn(&format!("Stopping {}...", services(count)));
     }
 
     // Build the shutdown order: reverse topological levels (dependents first).
@@ -3288,6 +3315,15 @@ mod tests {
         (name.to_string(), msg.to_string())
     }
 
+    /// The warnings given while `run` runs on this thread.
+    fn warnings(run: impl FnOnce()) -> Vec<String> {
+        WARNINGS.with(|warnings| *warnings.borrow_mut() = Some(Vec::new()));
+        run();
+        WARNINGS
+            .with(|warnings| warnings.borrow_mut().take())
+            .unwrap_or_default()
+    }
+
     /// A service, started as `lpm dev` starts one, that runs until stopped.
     fn running_service(project: &Path) -> ServiceProcess {
         #[cfg(unix)]
@@ -3391,6 +3427,61 @@ mod tests {
 
             assert_eq!(reports, [reported("web", "force-killed")], "force: {force}");
         }
+    }
+
+    /// A second Ctrl+C that comes before the shutdown begins has force-killed
+    /// each service, saying so, and the shutdown doesn't announce
+    /// force-killing them after the fact. One that stopped by itself before
+    /// isn't counted among those to force-kill either.
+    #[test]
+    fn a_shutdown_announces_force_killing_only_what_a_second_ctrl_c_left_running() {
+        let project = tempfile::tempdir().unwrap();
+        let children = Arc::new(Mutex::new(vec![
+            ("api".to_string(), exited_service(project.path(), 0)),
+            ("web".to_string(), running_service(project.path())),
+        ]));
+        let order = [vec!["api".to_string()], vec!["web".to_string()]];
+
+        let mut reports = Vec::new();
+        let said = warnings(|| {
+            reports = service_reports(|| {
+                force_kill_children(&children);
+                shutdown_children_ordered(&children, true, Some(&order), || false);
+            });
+        });
+
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(
+            reports,
+            [
+                reported("web", "force-killed"),
+                reported("api", "stopped (exit 0)")
+            ]
+        );
+
+        let children = Arc::new(Mutex::new(vec![
+            ("api".to_string(), exited_service(project.path(), 0)),
+            ("web".to_string(), running_service(project.path())),
+        ]));
+        let said = warnings(|| {
+            shutdown_children_ordered(&children, true, Some(&order), || false);
+        });
+        assert_eq!(said, ["Force-killing 1 service..."]);
+    }
+
+    #[test]
+    fn a_shutdown_of_one_service_names_it_in_the_singular() {
+        let project = tempfile::tempdir().unwrap();
+        let children = Arc::new(Mutex::new(vec![(
+            "api".to_string(),
+            exited_service(project.path(), 0),
+        )]));
+
+        let said = warnings(|| {
+            shutdown_children_ordered(&children, false, Some(&[vec!["api".to_string()]]), || false);
+        });
+
+        assert_eq!(said, ["Stopping 1 service..."]);
     }
 
     /// A service outside a Job, as where Windows refuses one, that starts a
