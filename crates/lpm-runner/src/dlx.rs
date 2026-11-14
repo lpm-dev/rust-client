@@ -946,7 +946,7 @@ mod tests {
             .join(expected_name);
 
         let cmd = build_dlx_command(dir.path(), &cache_dir, "foo", &[]).unwrap();
-        assert_eq!(Path::new(cmd.get_program()), expected);
+        assert_eq!(cmd.get_program(), expected.as_os_str());
     }
 
     #[test]
@@ -996,7 +996,7 @@ mod tests {
             .join(".bin")
             .join(expected_name);
         let cmd = build_dlx_command(dir.path(), &cache_dir, "@scope/foo", &[]).unwrap();
-        assert_eq!(Path::new(cmd.get_program()), expected);
+        assert_eq!(cmd.get_program(), expected.as_os_str());
     }
 
     #[test]

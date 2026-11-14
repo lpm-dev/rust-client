@@ -2309,8 +2309,11 @@ fn terminate_service_tree(child: &mut Child) {
         let _ = child.wait();
     }
     #[cfg(not(unix))]
-    {
-        let _ = ports::terminate_child_process_tree(child);
+    if let Err(error) = ports::terminate_child_process_tree(child) {
+        tracing::warn!(
+            "service process {} may have left processes running: {error}",
+            child.id()
+        );
     }
 }
 
@@ -2367,8 +2370,11 @@ fn force_kill_service_tree(child: &mut Child) {
         let _ = child.wait();
     }
     #[cfg(not(unix))]
-    {
-        let _ = ports::terminate_child_process_tree(child);
+    if let Err(error) = ports::terminate_child_process_tree(child) {
+        tracing::warn!(
+            "service process {} may have left processes running: {error}",
+            child.id()
+        );
     }
 }
 
@@ -2404,6 +2410,10 @@ mod tests {
             "the orchestrator stopped before {count} services started"
         );
     }
+
+    /// A service that runs until it is stopped, in either shell; `sleep` is
+    /// missing from Windows unless Git's tools are on PATH.
+    const IDLE_SERVICE: &str = r#"node -e "setInterval(() => {}, 1000)""#;
 
     fn simple_service(command: &str) -> ServiceConfig {
         ServiceConfig {
@@ -3305,9 +3315,9 @@ mod tests {
     #[test]
     fn spawn_output_readers_captures_stdout_and_stderr() {
         // Spawn a real process that writes to both stdout and stderr
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("echo STDOUT_LINE; echo STDERR_LINE >&2")
+        let mut child = Command::new("node")
+            .arg("-e")
+            .arg("console.log('STDOUT_LINE'); console.error('STDERR_LINE')")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -3694,7 +3704,7 @@ mod tests {
             (
                 "a-slow".to_string(),
                 ServiceConfig {
-                    command: "sleep 60".to_string(),
+                    command: IDLE_SERVICE.to_string(),
                     ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
                     ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                     ..Default::default()
@@ -3919,8 +3929,8 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
     #[test]
     fn stop_all_command_terminates_orchestrator() {
         let mut services = HashMap::new();
-        // Use "sleep 60" — a long-running service that needs to be stopped
-        services.insert("sleeper".to_string(), simple_service("sleep 60"));
+        // A long-running service that needs to be stopped.
+        services.insert("sleeper".to_string(), simple_service(IDLE_SERVICE));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let options = OrchestratorOptions {
@@ -3967,7 +3977,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
     #[test]
     fn channel_disconnect_triggers_shutdown() {
         let mut services = HashMap::new();
-        services.insert("sleeper".to_string(), simple_service("sleep 60"));
+        services.insert("sleeper".to_string(), simple_service(IDLE_SERVICE));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<OrchestratorCommand>();
         let options = OrchestratorOptions {
@@ -3998,7 +4008,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
         let services = HashMap::from([(
             "worker".to_string(),
             ServiceConfig {
-                command: "sleep 60".to_string(),
+                command: IDLE_SERVICE.to_string(),
                 ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
                 ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                 ..Default::default()
@@ -4037,7 +4047,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
         let services = HashMap::from([(
             "worker".to_string(),
             ServiceConfig {
-                command: "sleep 60".to_string(),
+                command: IDLE_SERVICE.to_string(),
                 ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
                 ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                 ..Default::default()
@@ -4119,7 +4129,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
         let pid_path = dir.path().join("a.pid");
         let controller = std::thread::spawn(move || {
             wait_for_starting_services(&event_rx, 2);
-            let pid_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let pid_deadline = std::time::Instant::now() + Duration::from_secs(10);
             let pid = loop {
                 if let Ok(content) = std::fs::read_to_string(&pid_path)
                     && let Ok(pid) = content.trim().parse::<u32>()
@@ -4135,7 +4145,9 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             command_tx
                 .send(OrchestratorCommand::StopService(0))
                 .unwrap();
-            let stop_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            // Well under the sibling's ten-second readiness timeout, which
+            // stopping this service must not wait for.
+            let stop_deadline = std::time::Instant::now() + Duration::from_secs(5);
             while ports::process_is_running(pid) && std::time::Instant::now() < stop_deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -4262,8 +4274,8 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
     #[test]
     fn stop_service_command_stops_single_service() {
         let mut services = HashMap::new();
-        services.insert("a".to_string(), simple_service("sleep 60"));
-        services.insert("b".to_string(), simple_service("sleep 60"));
+        services.insert("a".to_string(), simple_service(IDLE_SERVICE));
+        services.insert("b".to_string(), simple_service(IDLE_SERVICE));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
@@ -4382,7 +4394,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
     #[test]
     fn restart_service_command_restarts_service() {
         let mut services = HashMap::new();
-        services.insert("worker".to_string(), simple_service("sleep 60"));
+        services.insert("worker".to_string(), simple_service(IDLE_SERVICE));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
@@ -4429,7 +4441,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
     #[test]
     fn restart_service_command_emits_ready_again_after_restart() {
         let mut services = HashMap::new();
-        services.insert("worker".to_string(), simple_service("sleep 60"));
+        services.insert("worker".to_string(), simple_service(IDLE_SERVICE));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
@@ -4569,7 +4581,10 @@ setInterval(() => {{}}, 1000);
             }
         }
         cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        // The loop ends at the second `Starting`; the deadline only bounds a
+        // run where it never comes, and covers two Windows process-tree
+        // cleanups on a loaded runner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut restart_events = Vec::new();
         while std::time::Instant::now() < deadline {
             if let Ok(event) = event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -4888,7 +4903,7 @@ setInterval(() => {{}}, 1000);
         services.insert(
             "web".to_string(),
             ServiceConfig {
-                command: "sleep 5".to_string(),
+                command: r#"node -e "setTimeout(() => {}, 5000)""#.to_string(),
                 port: Some(occupied_port),
                 ready_timeout: 1,
                 ..Default::default()

@@ -374,6 +374,20 @@ test("Windows filesystem gate isolates file-count stress from lock timing tests"
   assert.match(stressStep, /--test-threads=1/);
 });
 
+test("Windows filesystem gate runs every lpm-runner and lpm-proxy unit test", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/windows-filesystem-gate.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const start = workflow.indexOf("      - name: Windows script runner and proxy crate tests\n");
+  assert.notEqual(start, -1, "missing the lpm-runner and lpm-proxy unit test step");
+  const end = workflow.indexOf("\n      - name: ", start + 1);
+  const step = workflow.slice(start, end === -1 ? undefined : end);
+
+  assert.match(step, /cargo nextest run --locked -p lpm-runner -p lpm-proxy\b/);
+  assert.doesNotMatch(step, /\s-E\s|--filterset|--skip|--run-ignored/);
+});
+
 test("release workflow grants write permissions only to jobs that use them", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs

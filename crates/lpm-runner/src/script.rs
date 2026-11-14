@@ -3109,7 +3109,7 @@ mod tests {
         write_package_scripts(
             dir.path(),
             &[
-                ("prebuild", &script_creating_file(&marker)),
+                ("prebuild", &script_creating_file("pre-ran")),
                 ("build", "echo building"),
             ],
         );
@@ -3127,7 +3127,7 @@ mod tests {
             dir.path(),
             &[
                 ("build", "echo building"),
-                ("postbuild", &script_creating_file(&marker)),
+                ("postbuild", &script_creating_file("post-ran")),
             ],
         );
 
@@ -3144,12 +3144,18 @@ mod tests {
             dir.path(),
             &[
                 ("prebuild", "exit 1"),
-                ("build", &script_creating_file(&marker)),
+                ("build", &script_creating_file("build-ran")),
             ],
         );
 
         let result = run_script(dir.path(), "build", &[], None, &Unknown);
-        assert!(result.is_err());
+        assert!(
+            matches!(
+                &result,
+                Err(LpmError::ScriptPhase { phase, code: 1, .. }) if phase == "prebuild"
+            ),
+            "the failed pre-hook must be the error: {result:?}"
+        );
         assert!(
             !marker.exists(),
             "build should NOT have run after pre-hook failure"
