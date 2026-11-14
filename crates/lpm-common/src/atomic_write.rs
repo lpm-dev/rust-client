@@ -720,18 +720,30 @@ fn rename_capability_handle(
         if status >= 0 {
             // A directory that moved between reading its path and the
             // rename may have left the file elsewhere, even in a directory
-            // made at the old path since. Unless the handle's directory is
-            // still at the path renamed into, the file's own handle must put
-            // it in that directory. A file left elsewhere is deleted through
-            // its handle, wherever it is.
-            if let Some(renamed_into) = renamed_into
-                && directory_final_path(directory).ok().as_ref() != Some(&renamed_into)
-                && !file_is_in(temporary, directory)
-            {
-                let _ = delete_on_close(temporary);
-                return Err(io::Error::other(
-                    "the directory moved while a file was renamed into it",
-                ));
+            // made at the old path since, on a file system that reports the
+            // move to the handle. A file found elsewhere is deleted through
+            // its handle where Windows lets it; one whose place can't be told
+            // is left, and the write fails.
+            if let Some(renamed_into) = renamed_into {
+                match landed_in(directory, temporary, &renamed_into) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(error) = delete_on_close(temporary) {
+                            tracing::debug!("could not delete a file renamed elsewhere: {error}");
+                        }
+                        return Err(io::Error::other(
+                            "the directory moved while a file was renamed into it",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "could not tell whether a file renamed by full path is in its directory: {error}"
+                            ),
+                        ));
+                    }
+                }
             }
             return Ok(());
         }
@@ -899,27 +911,31 @@ fn delete_on_close(file: &cap_std::fs::File) -> io::Result<()> {
     }
 }
 
-/// Whether the open `file` is directly in the directory `directory` holds,
-/// as the final paths of both handles say.
+/// Whether the open `file`, just renamed by full path into `renamed_into`,
+/// is directly in the directory `directory` holds: the directory is still
+/// at that path, or the file's own final path puts it there.
 #[cfg(windows)]
-fn file_is_in(file: &cap_std::fs::File, directory: &cap_std::fs::Dir) -> bool {
+fn landed_in(
+    directory: &cap_std::fs::Dir,
+    file: &cap_std::fs::File,
+    renamed_into: &[u16],
+) -> io::Result<bool> {
     use std::os::windows::ffi::OsStrExt as _;
-    let (Ok(directory_path), Ok(file_path)) = (
-        directory_final_path(directory),
-        crate::owner_only::final_path(file),
-    ) else {
-        return false;
-    };
+    let directory_path = directory_final_path(directory)?;
+    if directory_path == renamed_into {
+        return Ok(true);
+    }
+    let file_path = crate::owner_only::final_path(file)?;
     let file_path = file_path.as_os_str().encode_wide().collect::<Vec<_>>();
     // A volume's root, as in `\\?\C:\`, ends in its separator.
     let separator = u16::from(b'\\');
     let directory_path = directory_path
         .strip_suffix(&[separator])
         .unwrap_or(&directory_path);
-    file_path
+    Ok(file_path
         .iter()
         .rposition(|unit| *unit == separator)
-        .is_some_and(|at| file_path[..at] == *directory_path)
+        .is_some_and(|at| file_path[..at] == *directory_path))
 }
 
 /// The path the handle `directory` has now, as Windows gives it, with its
