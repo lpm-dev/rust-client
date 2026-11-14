@@ -324,7 +324,7 @@ struct Probe {
     child: Child,
     reaped: bool,
     #[cfg(windows)]
-    job: Option<std::os::windows::io::OwnedHandle>,
+    job: Option<crate::process_job::ProcessJob>,
 }
 
 impl Probe {
@@ -344,8 +344,7 @@ impl Probe {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-            command.creation_flags(CREATE_SUSPENDED);
+            command.creation_flags(crate::process_job::SUSPENDED);
         }
         let probe = Self {
             child: spawn(command)?,
@@ -356,8 +355,10 @@ impl Probe {
         #[cfg(windows)]
         let probe = {
             let mut probe = probe;
-            probe.job = Some(windows_job(&probe.child)?);
-            resume(&probe.child)?;
+            let job = crate::process_job::ProcessJob::new(false)?;
+            job.assign(&probe.child)?;
+            probe.job = Some(job);
+            crate::process_job::resume(&probe.child)?;
             probe
         };
         Ok(probe)
@@ -586,55 +587,4 @@ pub fn read_available<T>(_reader: &mut T, _buffer: &mut [u8]) -> io::Result<Opti
         io::ErrorKind::Unsupported,
         "bounded probes are unavailable",
     ))
-}
-
-#[cfg(windows)]
-fn windows_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
-    };
-    // SAFETY: null security/name pointers request a new anonymous Job.
-    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if raw.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: CreateJobObjectW returned a new handle owned by this scope.
-    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-    // SAFETY: a zeroed Job limit structure represents disabled limits.
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    // SAFETY: the Job, suspended child and structure remain valid throughout.
-    let configured = unsafe {
-        SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectExtendedLimitInformation,
-            std::ptr::from_ref(&info).cast(),
-            std::mem::size_of_val(&info) as u32,
-        ) != 0
-            && AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0
-    };
-    if !configured {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(job)
-}
-
-#[cfg(windows)]
-fn resume(child: &Child) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtResumeProcess(handle: windows_sys::Win32::Foundation::HANDLE) -> i32;
-    }
-    // SAFETY: Child owns this suspended process handle. Job assignment is complete.
-    let status = unsafe { NtResumeProcess(child.as_raw_handle()) };
-    if status < 0 {
-        return Err(io::Error::other(format!(
-            "probe resume failed: {status:#x}"
-        )));
-    }
-    Ok(())
 }

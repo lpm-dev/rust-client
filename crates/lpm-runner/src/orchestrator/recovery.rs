@@ -1,10 +1,10 @@
 use super::{
     AllReadyCallback, EndpointChangedCallback, InitialReadinessOptions, InitialServiceReadiness,
     MAX_RESTART_ATTEMPTS, OrchestratorCommand, OrchestratorCommandController, OrchestratorEvent,
-    OutputReaderOptions, RED, RESET, ServiceEndpointMap, ServicePortMap, ServiceStatus, YELLOW,
-    invoke_all_ready_callback, send_status, service_ready_port, spawn_output_readers,
-    terminate_service_tree, ui_readiness_timing, ui_service_note, ui_service_status,
-    wait_for_initial_service_readiness,
+    OutputReaderOptions, RED, RESET, ServiceEndpointMap, ServicePortMap, ServiceProcess,
+    ServiceStatus, YELLOW, invoke_all_ready_callback, send_status, service_ready_port,
+    spawn_output_readers, terminate_service_tree, ui_readiness_timing, ui_service_note,
+    ui_service_status, wait_for_initial_service_readiness,
 };
 use crate::dev_endpoint::DevEndpoint;
 use crate::lpm_json::ServiceConfig;
@@ -13,7 +13,7 @@ use lpm_common::{LpmError, sanitize_terminal_inline};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -157,7 +157,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) color_map: &'a HashMap<String, &'static str>,
     pub(super) service_names: &'a [String],
     pub(super) initial_ready: &'a HashMap<String, Instant>,
-    pub(super) children: &'a Arc<Mutex<Vec<(String, Child)>>>,
+    pub(super) children: &'a Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     pub(super) shutdown_state: &'a Arc<AtomicU8>,
     pub(super) event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     pub(super) command_controller: Option<&'a OrchestratorCommandController>,
@@ -268,7 +268,7 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
 }
 
 fn collect_exited_children(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
 ) -> Vec<(String, ExitStatus)> {
     let mut exited = Vec::new();
     let mut locked = children.lock();
@@ -277,7 +277,7 @@ fn collect_exited_children(
         match locked[index].1.try_wait() {
             Ok(Some(status)) => {
                 let (name, child) = locked.remove(index);
-                super::cleanup_exited_service_tree(child.id());
+                super::cleanup_exited_service_tree(&child);
                 exited.push((name, status));
             }
             Ok(None) | Err(_) => index += 1,
@@ -490,7 +490,7 @@ fn stop_dependents(
     }
 }
 
-fn terminate_service(children: &Arc<Mutex<Vec<(String, Child)>>>, name: &str) {
+fn terminate_service(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, name: &str) {
     let child = {
         let mut locked = children.lock();
         locked
@@ -721,7 +721,7 @@ fn restart_job_is_current(
 }
 
 fn restart_child_stopped(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     name: &str,
     pid: u32,
 ) -> bool {
@@ -1006,7 +1006,7 @@ fn settle_restart_job(
 }
 
 fn take_exited_service(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     name: &str,
     pid: u32,
 ) -> Option<ExitStatus> {
@@ -1016,7 +1016,7 @@ fn take_exited_service(
         .position(|(service_name, child)| service_name == name && child.id() == pid)?;
     let status = locked[position].1.try_wait().ok().flatten()?;
     let (_, child) = locked.remove(position);
-    super::cleanup_exited_service_tree(child.id());
+    super::cleanup_exited_service_tree(&child);
     Some(status)
 }
 
@@ -1252,7 +1252,10 @@ mod tests {
                 .unwrap();
             child.wait().unwrap();
             let pid = child.id();
-            let children = Arc::new(Mutex::new(vec![("worker".into(), child)]));
+            let children = Arc::new(Mutex::new(vec![(
+                "worker".into(),
+                ServiceProcess::from(child),
+            )]));
             let services = HashMap::from([(
                 "worker".into(),
                 ServiceConfig {
@@ -1339,7 +1342,10 @@ mod tests {
             .unwrap();
         current.wait().unwrap();
         let current_pid = current.id();
-        let children = Arc::new(Mutex::new(vec![("service".into(), current)]));
+        let children = Arc::new(Mutex::new(vec![(
+            "service".into(),
+            ServiceProcess::from(current),
+        )]));
         assert!(take_exited_service(&children, "service", old.id()).is_none());
         assert_eq!(children.lock().len(), 1);
         assert!(restart_child_stopped(&children, "service", old.id()));
@@ -1555,7 +1561,7 @@ mod tests {
         super::super::isolate_service_process_tree(&mut command);
         let child = command.spawn().unwrap();
         let root_pid = child.id();
-        children.lock().push(("worker".to_string(), child));
+        children.lock().push(("worker".to_string(), child.into()));
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {

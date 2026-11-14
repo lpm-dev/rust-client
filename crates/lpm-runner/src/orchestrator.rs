@@ -523,7 +523,7 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
 }
 
 fn service_exit_status(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     name: &str,
 ) -> Option<std::process::ExitStatus> {
     let mut locked = children.lock();
@@ -533,7 +533,10 @@ fn service_exit_status(
     child.try_wait().ok().flatten()
 }
 
-fn group_has_exited_service(children: &Arc<Mutex<Vec<(String, Child)>>>, names: &[String]) -> bool {
+fn group_has_exited_service(
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+    names: &[String],
+) -> bool {
     let mut locked = children.lock();
     locked
         .iter_mut()
@@ -1013,7 +1016,7 @@ fn spawn_service_command_with(
     cached_cwd: &Path,
     service_path: &ServicePath,
     before_spawn: impl FnMut() -> std::io::Result<()>,
-) -> std::io::Result<Child> {
+) -> std::io::Result<ServiceProcess> {
     spawn_service_command_with_hooks(
         command,
         project_dir,
@@ -1031,7 +1034,7 @@ fn spawn_service_command_with_hooks(
     service_path: &ServicePath,
     mut before_retain: impl FnMut() -> std::io::Result<()>,
     mut before_spawn: impl FnMut() -> std::io::Result<()>,
-) -> std::io::Result<Child> {
+) -> std::io::Result<ServiceProcess> {
     let cwd = revalidate_service_cwd(project_dir, cached_cwd).map_err(std::io::Error::other)?;
     #[cfg(windows)]
     let directory_expectations = {
@@ -1103,10 +1106,37 @@ fn spawn_service_command_with_hooks(
     #[cfg(not(any(unix, windows)))]
     command.current_dir(&cwd);
     before_spawn()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(lpm_common::process_job::SUSPENDED);
+    }
     let child = command.spawn();
     #[cfg(windows)]
     drop(directory_guards);
-    child
+    #[cfg(windows)]
+    return child.and_then(windows_service_in_job);
+    #[cfg(not(windows))]
+    child.map(ServiceProcess::from)
+}
+
+/// Puts a service started suspended in a Job of its own, then lets it run.
+/// Where Windows refuses the Job, the service runs outside one, as it did
+/// before lpm used them.
+#[cfg(windows)]
+fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
+    let job = lpm_common::process_job::ProcessJob::new(true)
+        .and_then(|job| job.assign(&child).map(|()| job))
+        .map_err(|error| {
+            tracing::debug!("service process {} runs outside a Job: {error}", child.id());
+        })
+        .ok();
+    if let Err(error) = lpm_common::process_job::resume(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(ServiceProcess { child, job })
 }
 
 fn service_command_port_planners(
@@ -1496,10 +1526,10 @@ pub fn run_services_with_config(
         Arc::clone(&shutdown_state),
         service_names.len(),
     );
-    // Vec<(String, Child)> with linear scan is fine for typical dev setups
+    // Vec<(String, ServiceProcess)> with linear scan is fine for typical dev setups
     // (<20 services). HashMap would be cleaner but Child doesn't implement Debug and
     // the vec allows ordered iteration useful for shutdown. O(n) cost negligible at this scale.
-    let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
+    let children: Arc<Mutex<Vec<(String, ServiceProcess)>>> = Arc::new(Mutex::new(Vec::new()));
 
     // RAII guard: ensures children are cleaned up even on panic
     let mut children_guard = ChildrenGuard {
@@ -2002,7 +2032,7 @@ fn drain_service_output<R: std::io::Read>(mut stream: R, mut on_line: impl FnMut
 
 /// RAII guard that kills child processes on drop (panic safety).
 struct ChildrenGuard {
-    children: Arc<Mutex<Vec<(String, Child)>>>,
+    children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     on_shutdown_started: Option<crate::ShutdownStartedCallback>,
 }
 
@@ -2050,7 +2080,7 @@ impl Drop for SignalHandler {
 #[cfg(unix)]
 fn ctrlc_handler(
     shutdown_state: Arc<AtomicU8>,
-    children: Arc<Mutex<Vec<(String, Child)>>>,
+    children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
 ) -> Option<SignalHandler> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
     use signal_hook::iterator::Signals;
@@ -2099,7 +2129,7 @@ fn ctrlc_handler(
 
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).
 #[cfg(unix)]
-fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
+fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
         force_kill_service_tree(child);
@@ -2115,7 +2145,7 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
 ///
 /// If `force` is true, skips SIGTERM and goes straight to SIGKILL (used when
 /// the user double-pressed Ctrl+C).
-fn shutdown_children(children: &Arc<Mutex<Vec<(String, Child)>>>, force: bool) {
+fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force: bool) {
     shutdown_children_ordered(children, force, None);
 }
 
@@ -2125,7 +2155,7 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, Child)>>>, force: bool) {
 /// (dependents first, then their dependencies). All groups share a 2s grace budget.
 /// When `groups` is None, all services are stopped simultaneously (legacy behavior).
 fn shutdown_children_ordered(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     force: bool,
     groups: Option<&[Vec<String>]>,
 ) {
@@ -2293,7 +2323,66 @@ fn service_process_group_exists(root_pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn terminate_service_tree(child: &mut Child) {
+/// A running service: its root process, and on Windows the Job that holds
+/// every process it starts, which a walk of parent IDs misses once their
+/// parent has exited.
+pub(crate) struct ServiceProcess {
+    child: Child,
+    #[cfg(windows)]
+    job: Option<lpm_common::process_job::ProcessJob>,
+}
+
+impl From<Child> for ServiceProcess {
+    fn from(child: Child) -> Self {
+        Self {
+            child,
+            #[cfg(windows)]
+            job: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ServiceProcess {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ServiceProcess {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl ServiceProcess {
+    #[cfg(all(test, unix))]
+    fn wait_with_output(self) -> std::io::Result<std::process::Output> {
+        self.child.wait_with_output()
+    }
+
+    /// Ends the service's Job, and so every process the service started.
+    /// `false` where it has none, or Windows refused.
+    #[cfg(windows)]
+    fn end_job(&self) -> bool {
+        let Some(job) = &self.job else {
+            return false;
+        };
+        match job.terminate() {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    "could not end the processes of service process {}: {error}",
+                    self.child.id()
+                );
+                false
+            }
+        }
+    }
+}
+
+fn terminate_service_tree(child: &mut ServiceProcess) {
     #[cfg(unix)]
     {
         let root_pid = child.id();
@@ -2308,6 +2397,11 @@ fn terminate_service_tree(child: &mut Child) {
         }
         let _ = child.wait();
     }
+    #[cfg(windows)]
+    if child.end_job() {
+        let _ = child.wait();
+        return;
+    }
     #[cfg(not(unix))]
     if let Err(error) = ports::terminate_child_process_tree(child) {
         tracing::warn!(
@@ -2317,7 +2411,7 @@ fn terminate_service_tree(child: &mut Child) {
     }
 }
 
-fn terminate_named_service(children: &Arc<Mutex<Vec<(String, Child)>>>, name: &str) {
+fn terminate_named_service(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, name: &str) {
     let child = {
         let mut locked = children.lock();
         locked
@@ -2330,15 +2424,24 @@ fn terminate_named_service(children: &Arc<Mutex<Vec<(String, Child)>>>, name: &s
     }
 }
 
-#[cfg(unix)]
-fn cleanup_exited_service_tree(root_pid: u32) {
-    if service_process_group_exists(root_pid) {
-        signal_service_process_group(root_pid, libc::SIGKILL);
+/// Ends what an exited service left running: its process group on Unix,
+/// its Job on Windows.
+fn cleanup_exited_service_tree(service: &ServiceProcess) {
+    #[cfg(unix)]
+    {
+        let root_pid = service.id();
+        if service_process_group_exists(root_pid) {
+            signal_service_process_group(root_pid, libc::SIGKILL);
+        }
     }
+    #[cfg(windows)]
+    service.end_job();
+    #[cfg(not(any(unix, windows)))]
+    let _ = service;
 }
 
 fn terminate_unready_initial_services(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     initial_ready: &HashMap<String, Instant>,
 ) {
     let mut unready = {
@@ -2360,14 +2463,16 @@ fn terminate_unready_initial_services(
     }
 }
 
-#[cfg(not(unix))]
-fn cleanup_exited_service_tree(_root_pid: u32) {}
-
-fn force_kill_service_tree(child: &mut Child) {
+fn force_kill_service_tree(child: &mut ServiceProcess) {
     #[cfg(unix)]
     {
         signal_service_process_group(child.id(), libc::SIGKILL);
         let _ = child.wait();
+    }
+    #[cfg(windows)]
+    if child.end_job() {
+        let _ = child.wait();
+        return;
     }
     #[cfg(not(unix))]
     if let Err(error) = ports::terminate_child_process_tree(child) {
@@ -3326,8 +3431,8 @@ mod tests {
         let child_stderr = child.stderr.take();
 
         let name = "test-svc".to_string();
-        let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
-        children.lock().push((name.clone(), child));
+        let children: Arc<Mutex<Vec<(String, ServiceProcess)>>> = Arc::new(Mutex::new(Vec::new()));
+        children.lock().push((name.clone(), child.into()));
 
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
 
@@ -4953,7 +5058,7 @@ setInterval(() => {{}}, 1000);
             isolate_service_process_tree(&mut command);
             children
                 .lock()
-                .push((name.to_string(), command.spawn().unwrap()));
+                .push((name.to_string(), command.spawn().unwrap().into()));
             groups.push(vec![name.to_string()]);
         }
 
@@ -4974,13 +5079,13 @@ setInterval(() => {{}}, 1000);
         let mut command = Command::new("sh");
         command.arg("-c").arg("trap '' TERM; sleep 60 & exit 1");
         isolate_service_process_tree(&mut command);
-        let mut child = command.spawn().unwrap();
+        let mut child = ServiceProcess::from(command.spawn().unwrap());
         let root_pid = child.id();
         let status = child.wait().unwrap();
         assert!(!status.success());
         assert!(service_process_group_exists(root_pid));
 
-        cleanup_exited_service_tree(root_pid);
+        cleanup_exited_service_tree(&child);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
@@ -5001,7 +5106,7 @@ setInterval(() => {{}}, 1000);
         let status = child.wait().unwrap();
         assert!(status.success());
         assert!(service_process_group_exists(root_pid));
-        children.lock().push(("worker".to_string(), child));
+        children.lock().push(("worker".to_string(), child.into()));
 
         force_kill_children(&children);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -5023,7 +5128,7 @@ setInterval(() => {{}}, 1000);
         isolate_service_process_tree(&mut command);
         let child = command.spawn().unwrap();
         let root_pid = child.id();
-        children.lock().push(("web".to_string(), child));
+        children.lock().push(("web".to_string(), child.into()));
         std::thread::sleep(Duration::from_millis(100));
 
         shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]));
@@ -5047,7 +5152,7 @@ setInterval(() => {{}}, 1000);
         isolate_service_process_tree(&mut web_command);
         let web = web_command.spawn().unwrap();
         let web_pid = web.id();
-        children.lock().push(("web".to_string(), web));
+        children.lock().push(("web".to_string(), web.into()));
 
         let mut db_command = Command::new("sh");
         db_command.arg("-c").arg(format!(
@@ -5058,7 +5163,7 @@ setInterval(() => {{}}, 1000);
         isolate_service_process_tree(&mut db_command);
         children
             .lock()
-            .push(("db".to_string(), db_command.spawn().unwrap()));
+            .push(("db".to_string(), db_command.spawn().unwrap().into()));
         std::thread::sleep(Duration::from_millis(100));
 
         shutdown_children_ordered(

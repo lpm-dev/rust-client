@@ -338,10 +338,31 @@ where
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(lpm_common::process_job::SUSPENDED);
+    }
 
     let mut child = crate::env_access::spawn(&mut command).map_err(|error| {
         LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
     })?;
+    // The Windows counterpart of the process group: what the server starts
+    // stays in the Job, which ends once the server has.
+    #[cfg(windows)]
+    let job = lpm_common::process_job::ProcessJob::new(true)
+        .and_then(|job| job.assign(&child).map(|()| job))
+        .map_err(|error| tracing::debug!("the dev server runs outside a Job: {error}"))
+        .ok();
+    #[cfg(windows)]
+    if let Err(error) = lpm_common::process_job::resume(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(LpmError::Script(format!(
+            "failed to start '{}': {error}",
+            cmd.command
+        )));
+    }
     let root_pid = child.id();
     let child_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (candidate_tx, candidate_rx) =
@@ -420,6 +441,12 @@ where
     child_exited.store(true, std::sync::atomic::Ordering::Release);
     #[cfg(unix)]
     cleanup_endpoint_process_group(root_pid);
+    #[cfg(windows)]
+    if let Some(job) = &job
+        && let Err(error) = job.terminate()
+    {
+        tracing::warn!("could not end the processes the dev server started: {error}");
+    }
     let _ = resolver_handle.join();
     let owner = resolved_owner.lock().ok().and_then(|owner| owner.clone());
     #[cfg(not(windows))]
@@ -1348,19 +1375,23 @@ mod tests {
         assert!(endpoint.is_err(), "{endpoint:?}");
     }
 
-    // Windows has no process group to clean up: a background child there
-    // keeps the endpoint pipes open until it exits.
-    #[cfg(unix)]
     #[test]
     fn endpoint_aware_shell_cleans_background_pipe_holders_after_the_shell_exits() {
         let dir = tempfile::tempdir().unwrap();
         let path = std::env::var("PATH").unwrap_or_default();
         let envs = empty_envs();
         let started = std::time::Instant::now();
+        // A background child that holds the shell's output pipes for five
+        // seconds after the shell exits.
+        let command = if cfg!(windows) {
+            "start /b ping -n 6 127.0.0.1 & exit 0"
+        } else {
+            "sleep 5 & exit 0"
+        };
 
         let status = spawn_shell_with_endpoint(
             &ShellCommand {
-                command: "sleep 2 & exit 0",
+                command,
                 cwd: dir.path(),
                 path: &path,
                 envs: &envs,
@@ -1376,7 +1407,7 @@ mod tests {
 
         assert!(status.success());
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
+            elapsed < std::time::Duration::from_secs(2),
             "background process retained endpoint output pipes for {elapsed:?}"
         );
     }
