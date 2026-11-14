@@ -228,8 +228,9 @@ enum StateDirectoryAccess {
     Open,
 }
 
-/// The path the open `file` has, as the system resolves it.
-fn final_path(
+/// The path the open `file` has, as the system resolves it, with its
+/// extended prefix: `\\?\C:\…` or `\\?\UNC\server\share\…`.
+pub(crate) fn final_path(
     file: &impl std::os::windows::io::AsRawHandle,
 ) -> std::io::Result<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt as _;
