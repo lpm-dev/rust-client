@@ -73,6 +73,24 @@ pub(crate) fn validate_dependency_free_dev_config(project_dir: &Path) -> Result<
     Ok(())
 }
 
+/// Fails where the project's `node_modules` can't be made: each package in
+/// it is a link into LPM's package store, which a drive without links, such
+/// as exFAT, and a network folder can't hold. It fails before anything is
+/// resolved or downloaded.
+fn refuse_a_project_without_links(project_dir: &Path) -> Result<(), LpmError> {
+    let Ok(project) = cap_std::fs::Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())
+    else {
+        return Ok(());
+    };
+    match lpm_common::volume::links_not_held(&project) {
+        Some(why) => Err(LpmError::Script(format!(
+            "LPM can't install into {}: {why}, and node_modules is made of links into LPM's package store. Move the project to a local NTFS drive",
+            lpm_common::symlink::windows_plain_path(project_dir).display()
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn prepare_install_setup_context(
     input: InstallSetupInput<'_>,
 ) -> Result<InstallSetupContext, LpmError> {
@@ -110,6 +128,7 @@ pub(super) fn prepare_install_setup_context(
                 .to_string(),
         ));
     }
+    refuse_a_project_without_links(input.project_dir)?;
 
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
@@ -278,4 +297,26 @@ pub(super) fn check_project_policy(
         json_output,
     )?;
     Ok(firewall_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_project_on_a_drive_without_links_is_refused_with_the_reason() {
+        let project = tempfile::tempdir().unwrap();
+        let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+        let refused = refuse_a_project_without_links(project.path());
+        drop(pretending);
+
+        let error = refused.unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "it is on an exFAT drive, which can't hold links, and node_modules is made of links into LPM's package store"
+            ),
+            "{error}"
+        );
+        refuse_a_project_without_links(project.path()).unwrap();
+    }
 }
