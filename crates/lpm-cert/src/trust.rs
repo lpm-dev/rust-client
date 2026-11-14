@@ -708,7 +708,7 @@ fn is_ca_installed_test(
 fn uninstall_ca_test(
     expected_fingerprint_hex: &str,
     trust_store_path: &Path,
-) -> Result<(), LpmError> {
+) -> Result<bool, LpmError> {
     let installed = is_ca_installed_test(expected_fingerprint_hex, trust_store_path)?;
     if !installed {
         if trust_store_path.exists() {
@@ -717,7 +717,7 @@ fn uninstall_ca_test(
                 trust_store_path.display()
             );
         }
-        return Ok(());
+        return Ok(false);
     }
     if trust_store_path.exists() {
         std::fs::remove_file(trust_store_path).map_err(|e| {
@@ -737,7 +737,7 @@ fn uninstall_ca_test(
             "injected trust uninstall failure after mutation".into(),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -870,23 +870,23 @@ pub fn uninstall_ca(ca_cert_path: &Path) -> Result<(), LpmError> {
     let expected_hex = cert::fingerprint_hex(&expected);
 
     if let Some(trust_store_path) = test_trust_store_path() {
-        return uninstall_ca_test(&expected_hex, &trust_store_path);
+        return uninstall_ca_test(&expected_hex, &trust_store_path).map(drop);
     }
 
     #[cfg(target_os = "macos")]
     {
-        uninstall_ca_macos(&expected_hex)
+        uninstall_ca_macos(&expected_hex).map(drop)
     }
 
     #[cfg(target_os = "linux")]
     {
-        uninstall_ca_linux(ca_cert_path)
+        uninstall_ca_linux(ca_cert_path).map(drop)
     }
 
     #[cfg(target_os = "windows")]
     {
         let sha1 = cert::fingerprint_sha1(ca_cert_path)?;
-        uninstall_ca_windows(&cert::fingerprint_hex(&sha1))
+        uninstall_ca_windows(&cert::fingerprint_hex(&sha1)).map(drop)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -898,32 +898,43 @@ pub fn uninstall_ca(ca_cert_path: &Path) -> Result<(), LpmError> {
     }
 }
 
-pub(crate) fn uninstall_ca_bytes(cert_pem: &[u8], display_path: &Path) -> Result<(), LpmError> {
+/// Removes `cert_pem` from the trust store; returns whether the store held
+/// anything of it to remove, trusted or not, as a macOS keychain item
+/// without trust settings or a Linux anchor whose bundle wasn't refreshed.
+pub(crate) fn uninstall_ca_bytes(cert_pem: &[u8], display_path: &Path) -> Result<bool, LpmError> {
     let expected_hex = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?);
-    if let Some(trust_store_path) = test_trust_store_path() {
-        uninstall_ca_test(&expected_hex, &trust_store_path)?;
+    let removed = if let Some(trust_store_path) = test_trust_store_path() {
+        uninstall_ca_test(&expected_hex, &trust_store_path)?
     } else {
         #[cfg(target_os = "macos")]
-        uninstall_ca_macos(&expected_hex)?;
+        {
+            uninstall_ca_macos(&expected_hex)?
+        }
         #[cfg(target_os = "linux")]
-        uninstall_ca_linux_bytes(cert_pem)?;
+        {
+            uninstall_ca_linux_bytes(cert_pem)?
+        }
         #[cfg(target_os = "windows")]
-        uninstall_ca_windows(&cert::fingerprint_hex(&cert::fingerprint_sha1_bytes(
-            cert_pem,
-        )?))?;
+        {
+            uninstall_ca_windows(&cert::fingerprint_hex(&cert::fingerprint_sha1_bytes(
+                cert_pem,
+            )?))?
+        }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        return Err(LpmError::Cert(format!(
-            "automatic trust store removal is not supported for {} on this platform",
-            display_path.display()
-        )));
-    }
+        {
+            return Err(LpmError::Cert(format!(
+                "automatic trust store removal is not supported for {} on this platform",
+                display_path.display()
+            )));
+        }
+    };
     if is_ca_installed_bytes(cert_pem, display_path)? {
         return Err(LpmError::Cert(format!(
             "trust store still contains the certificate from {} after removal",
             display_path.display()
         )));
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// Runs `operation` on a file holding `cert_pem`, staged beside
@@ -1191,7 +1202,7 @@ fn is_ca_trusted_macos(ca_cert_path: &Path) -> Result<bool, LpmError> {
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_ca_macos(expected_fingerprint_hex: &str) -> Result<(), LpmError> {
+fn uninstall_ca_macos(expected_fingerprint_hex: &str) -> Result<bool, LpmError> {
     let output = Command::new(SECURITY_EXECUTABLE)
         .args(["find-certificate", "-Z", "-a", "-c", CA_COMMON_NAME])
         .arg(login_keychain_path()?)
@@ -1199,7 +1210,7 @@ fn uninstall_ca_macos(expected_fingerprint_hex: &str) -> Result<(), LpmError> {
         .map_err(|e| LpmError::Cert(format!("failed to run `security`: {e}")))?;
 
     if !output.status.success() || output.stdout.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1239,7 +1250,7 @@ fn uninstall_ca_macos(expected_fingerprint_hex: &str) -> Result<(), LpmError> {
     } else {
         tracing::info!("CA removed from macOS login keychain");
     }
-    Ok(())
+    Ok(matched)
 }
 
 /// Parse the `SHA-256 hash: …` lines emitted by `security find-certificate -Z`.
@@ -1519,7 +1530,7 @@ fn linux_bundle_contains_fingerprint(
 }
 
 #[cfg(target_os = "linux")]
-fn uninstall_ca_linux(expected_ca_path: &Path) -> Result<(), LpmError> {
+fn uninstall_ca_linux(expected_ca_path: &Path) -> Result<bool, LpmError> {
     let expected = lpm_common::read_file_capped(
         expected_ca_path,
         lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
@@ -1529,7 +1540,7 @@ fn uninstall_ca_linux(expected_ca_path: &Path) -> Result<(), LpmError> {
 }
 
 #[cfg(target_os = "linux")]
-fn uninstall_ca_linux_bytes(expected_ca_pem: &[u8]) -> Result<(), LpmError> {
+fn uninstall_ca_linux_bytes(expected_ca_pem: &[u8]) -> Result<bool, LpmError> {
     let backend = detect_linux_trust_backend()?;
     validate_linux_trust_destination(backend)?;
     let dest_path = Path::new(backend.source_path);
@@ -1544,7 +1555,7 @@ fn uninstall_ca_linux_bytes(expected_ca_pem: &[u8]) -> Result<(), LpmError> {
     let remove_source = state.source == LinuxSourceState::Matching;
     let refresh = remove_source || state.bundle_contains;
     if !refresh {
-        return Ok(());
+        return Ok(false);
     }
 
     if remove_source {
@@ -1568,7 +1579,7 @@ fn uninstall_ca_linux_bytes(expected_ca_pem: &[u8]) -> Result<(), LpmError> {
     }
 
     tracing::info!("CA removed from Linux trust store");
-    Ok(())
+    Ok(true)
 }
 
 // ── Windows ────────────────────────────────────────────────────────────
@@ -1612,16 +1623,16 @@ fn is_ca_installed_windows(expected_sha1_hex: &str) -> Result<bool, LpmError> {
 }
 
 #[cfg(target_os = "windows")]
-fn uninstall_ca_windows(expected_sha1_hex: &str) -> Result<(), LpmError> {
+fn uninstall_ca_windows(expected_sha1_hex: &str) -> Result<bool, LpmError> {
     if !is_ca_installed_windows(expected_sha1_hex)? {
-        return Ok(());
+        return Ok(false);
     }
     change_windows_root_store_elevated(&WindowsRootStoreChange::Remove {
         sha1: expected_sha1_hex.replace(':', ""),
     })?;
 
     tracing::info!("CA removed from Windows Root store");
-    Ok(())
+    Ok(true)
 }
 
 /// Extract every SHA-1 thumbprint emitted by `certutil -store`, robustly across

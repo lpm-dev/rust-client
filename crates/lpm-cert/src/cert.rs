@@ -123,9 +123,12 @@ pub fn read_san_entries(path: &Path) -> Result<Vec<SanEntry>, LpmError> {
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
         .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+    Ok(san_entries_of(&cert))
+}
 
+fn san_entries_of(cert: &x509_parser::certificate::X509Certificate<'_>) -> Vec<SanEntry> {
     let Some(san_ext) = cert.subject_alternative_name().ok().flatten() else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
 
     let mut out: Vec<SanEntry> = Vec::with_capacity(san_ext.value.general_names.len());
@@ -151,7 +154,7 @@ pub fn read_san_entries(path: &Path) -> Result<Vec<SanEntry>, LpmError> {
             _ => {}
         }
     }
-    Ok(out)
+    out
 }
 
 /// Verify that the leaf at `leaf_path` was signed by the CA at `ca_path`. Returns
@@ -672,6 +675,8 @@ pub struct CertInfo {
     pub issuer: String,
     pub not_before: String,
     pub not_after: String,
+    /// The DNS names and IP addresses the certificate covers, each as a plain
+    /// host: `localhost`, `127.0.0.1`, `::1`.
     pub san_entries: Vec<String>,
     pub is_ca: bool,
 }
@@ -1004,19 +1009,10 @@ pub(crate) fn read_cert_info_bytes(cert_pem: &[u8]) -> Result<CertInfo, LpmError
     let not_before = format_asn1_time(&cert.validity().not_before);
     let not_after = format_asn1_time(&cert.validity().not_after);
 
-    // Extract SANs
-    let san_entries = cert
-        .subject_alternative_name()
-        .ok()
-        .flatten()
-        .map(|san| {
-            san.value
-                .general_names
-                .iter()
-                .map(|name| format!("{name}"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let san_entries = san_entries_of(&cert)
+        .iter()
+        .map(SanEntry::as_extra_hostname)
+        .collect();
 
     let is_ca = cert
         .basic_constraints()

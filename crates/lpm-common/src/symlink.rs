@@ -567,9 +567,12 @@ pub fn validate_cmd_path(path: &str) -> Result<(), String> {
 /// the plain path names the same file. A canonicalized path has the prefix,
 /// which Node can't run and which never shares a volume with a path built
 /// from a project's. Win32 reads a name with a trailing `.` or space
-/// otherwise, so such a path keeps it.
+/// otherwise, so such a path keeps it, as does one Unicode can't spell (a
+/// name holding an unpaired surrogate), whose lossy form names another file.
 pub fn windows_plain_path(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
     let plain = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{share}")
     } else if let Some(drive) = text
@@ -712,6 +715,18 @@ mod tests {
                 "{base} -> {target}"
             );
         }
+    }
+
+    #[test]
+    fn a_path_unicode_cannot_spell_keeps_its_verbatim_prefix() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let mut wide: Vec<u16> = r"\\?\C:\Users\dev\".encode_utf16().collect();
+        wide.push(0xD800);
+        wide.extend("\\cli.js".encode_utf16());
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+
+        assert_eq!(windows_plain_path(&path), path);
     }
 
     #[test]
