@@ -3630,11 +3630,11 @@ mod tests {
         );
     }
 
-    /// The drive letter a service in a network folder runs through goes
-    /// once `lpm dev` has stopped the service. Windows keeps a letter lpm
-    /// defined after lpm exits, so one kept past the shutdown stays behind.
-    /// The share is reached as `\\127.0.0.1\<drive>$`, which no other test
-    /// in this process reaches.
+    /// The drive letter a service in a network folder runs through, in
+    /// cmd.exe as `lpm dev` runs each, goes once `lpm dev` has stopped the
+    /// service. Windows keeps a letter lpm defined after lpm exits, so one
+    /// kept past the shutdown stays behind. The share is reached as
+    /// `\\127.0.0.1\<drive>$`, which no other test in this process reaches.
     #[cfg(windows)]
     #[test]
     fn a_service_in_a_network_folder_gives_back_its_drive_letter_once_lpm_dev_stops_it() {
@@ -3647,13 +3647,32 @@ mod tests {
         else {
             return;
         };
-        let service = spawn_node_service(&network, "setInterval(() => {}, 1000);");
+        let cached_cwd = network.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command =
+            crate::shell::shell_process("node -e \"setInterval(() => {}, 1000)\"").unwrap();
+        command.stdin(Stdio::null());
+        let service =
+            spawn_service_command_with(&mut command, &network, &cached_cwd, &service_path, || {
+                Ok(())
+            })
+            .unwrap();
         let drive = service
             ._directory
             .as_ref()
             .expect("a service in a network folder runs through a drive letter")
             .path()
             .to_path_buf();
+        assert!(
+            matches!(
+                drive.components().next(),
+                Some(std::path::Component::Prefix(prefix))
+                    if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+            ),
+            "{drive:?} isn't on a drive letter"
+        );
         assert!(drive.join("marker.txt").exists(), "{drive:?}");
         let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
 
