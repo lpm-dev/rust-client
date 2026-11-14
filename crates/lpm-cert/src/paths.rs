@@ -353,9 +353,30 @@ pub(crate) struct GlobalCaDirectory {
     /// Why git could commit what the LPM home holds, where LPM can't keep
     /// it out: no key is written there.
     exposed: Option<String>,
+    /// Why anyone using the computer could read what the LPM home holds:
+    /// no key is written or used there.
+    unprotected: Option<String>,
 }
 
 impl GlobalCaDirectory {
+    /// Fails where anyone using the computer could read the certificate
+    /// authority's private key, which signs what this computer trusts. An
+    /// authority already there may be trusted, and its key may have been
+    /// read, so the error says to remove its trust first.
+    pub(crate) fn refuse_unprotected_key(&self) -> Result<(), LpmError> {
+        let Some(reason) = &self.unprotected else {
+            return Ok(());
+        };
+        let existing = if self.exists("rootCA.pem").unwrap_or(true) {
+            " First remove the trust of the authority already there with `lpm cert uninstall`, as its key may have been read."
+        } else {
+            ""
+        };
+        Err(LpmError::Cert(format!(
+            "{reason}, so LPM won't keep or use the certificate authority's private key there: with it, anyone could sign certificates this computer trusts.{existing} Point LPM_HOME at a folder on an NTFS drive"
+        )))
+    }
+
     pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
@@ -423,6 +444,7 @@ impl GlobalCaDirectory {
                 "{reason}, so git could commit the certificate authority's private key saved there; point LPM_HOME at a directory of its own"
             )));
         }
+        self.refuse_unprotected_key()?;
         let cert_text = std::str::from_utf8(cert)
             .map_err(|error| LpmError::Cert(format!("invalid UTF-8 in CA certificate: {error}")))?;
         let key_text = std::str::from_utf8(key)
@@ -449,7 +471,15 @@ impl GlobalCaDirectory {
             &staged_cert.name,
             &staged_key.name,
         )?;
-        write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)?;
+        if let Err(error) = write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)
+        {
+            return Err(abandon_pair_transaction(
+                &self.dir,
+                GLOBAL_PAIR_TRANSACTION,
+                [&staged_cert.name, &staged_key.name],
+                error,
+            ));
+        }
 
         let result = (|| -> Result<(), LpmError> {
             replace_relative_file(&self.dir, &staged_cert.name, cert_name, staged_cert.file)
@@ -693,6 +723,7 @@ impl CertificateOperation {
             dir,
             read_only: true,
             exposed: None,
+            unprotected: None,
         };
         let lock = ca.acquire_operations_lock()?;
         Ok(Some(Self { ca, _lock: lock }))
@@ -709,7 +740,7 @@ impl CertificateOperation {
     pub(crate) fn begin() -> Result<Self, LpmError> {
         let ca = open_global_ca_directory(true)?;
         let lock = ca.acquire_operations_lock()?;
-        if ca.exposed.is_none() {
+        if ca.exposed.is_none() && ca.unprotected.is_none() {
             recover_global_pair_transaction(&ca)?;
         }
         Ok(Self { ca, _lock: lock })
@@ -719,7 +750,7 @@ impl CertificateOperation {
     fn begin_at(home_path: PathBuf) -> Result<Self, LpmError> {
         let ca = open_global_ca_directory_at(home_path, true)?;
         let lock = ca.acquire_operations_lock()?;
-        if ca.exposed.is_none() {
+        if ca.exposed.is_none() && ca.unprotected.is_none() {
             recover_global_pair_transaction(&ca)?;
         }
         Ok(Self { ca, _lock: lock })
@@ -871,10 +902,13 @@ fn open_global_ca_directory_at_lpm_root(
     else {
         return Err(LpmError::Cert("global LPM directory does not exist".into()));
     };
-    let exposed = if create {
-        lpm_common::keep_lpm_home_ignored_in(&lpm, &lpm_root_path).err()
+    let (exposed, unprotected) = if create {
+        (
+            lpm_common::keep_lpm_home_ignored_in(&lpm, &lpm_root_path).err(),
+            lpm_common::keep_lpm_home_private_in(&lpm, &lpm_root_path).err(),
+        )
     } else {
-        None
+        (None, None)
     };
     let Some(certs) = open_or_create_directory(
         &lpm,
@@ -893,6 +927,7 @@ fn open_global_ca_directory_at_lpm_root(
         dir: certs,
         read_only: false,
         exposed,
+        unprotected,
     })
 }
 
@@ -992,7 +1027,16 @@ impl ProjectCertDirectory {
             &staged_cert.name,
             &staged_key.name,
         )?;
-        write_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION, &transaction)?;
+        if let Err(error) =
+            write_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION, &transaction)
+        {
+            return Err(abandon_pair_transaction(
+                &self.dir,
+                PROJECT_PAIR_TRANSACTION,
+                [&staged_cert.name, &staged_key.name],
+                error,
+            ));
+        }
 
         let result = (|| -> std::io::Result<()> {
             replace_relative_file(&self.dir, &staged_cert.name, "cert.pem", staged_cert.file)?;
@@ -1107,8 +1151,9 @@ fn write_pair_transaction(
     let contents = serde_json::to_vec(transaction).map_err(|error| {
         LpmError::Cert(format!("failed to serialize pair transaction: {error}"))
     })?;
-    let staged = stage_relative_file(dir, &contents, 0o600)?;
-    replace_relative_file(dir, &staged.name, journal_name, staged.file).map_err(|error| {
+    let StagedRelativeFile { name, file } = stage_relative_file(dir, &contents, 0o600)?;
+    replace_relative_file(dir, &name, journal_name, file).map_err(|error| {
+        let _ = dir.remove_file(&name);
         LpmError::Cert(format!(
             "failed to publish certificate pair transaction: {error}"
         ))
@@ -1138,6 +1183,39 @@ fn read_pair_transaction(
     validate_temporary_filename(&transaction.staged_cert_name)?;
     validate_temporary_filename(&transaction.staged_key_name)?;
     Ok(Some(transaction))
+}
+
+/// Removes the journal of a pair whose journal failed to be written, with
+/// the staged files it names, and returns `error`. A journal published
+/// before the error would install the pair on the next run, which this one
+/// reports as not written, so one that can't be removed is said in the error.
+fn abandon_pair_transaction(
+    dir: &Dir,
+    journal_name: &str,
+    staged_names: [&str; 2],
+    error: LpmError,
+) -> LpmError {
+    let removed = remove_pair_transaction(dir, journal_name);
+    for name in staged_names {
+        let _ = dir.remove_file(name);
+    }
+    match removed {
+        Ok(()) => error,
+        Err(removal) => LpmError::Cert(format!(
+            "{}; the next run may install this pair all the same, as removing its recovery transaction failed: {}",
+            message_of(error),
+            message_of(removal)
+        )),
+    }
+}
+
+/// What `error` says, without the prefix a certificate error's display
+/// adds, for an error that goes on inside another.
+fn message_of(error: LpmError) -> String {
+    match error {
+        LpmError::Cert(message) => message,
+        other => other.to_string(),
+    }
 }
 
 fn remove_pair_transaction(dir: &Dir, journal_name: &str) -> Result<(), LpmError> {
@@ -1196,7 +1274,11 @@ fn sync_directory(dir: &Dir) -> Result<(), LpmError> {
 )]
 fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+    if FAILING_DIRECTORY_SYNCS.with(|failing| {
+        let count = failing.get();
+        failing.set(count.saturating_sub(1));
+        count > 0
+    }) {
         return Err(std::io::Error::other(
             "injected certificate directory sync failure",
         ));
@@ -1240,12 +1322,17 @@ fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
 
 #[cfg(test)]
 std::thread_local! {
-    static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAILING_DIRECTORY_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn fail_next_directory_sync() {
-    FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    fail_next_directory_syncs(1);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_directory_syncs(count: u32) {
+    FAILING_DIRECTORY_SYNCS.with(|failing| failing.set(count));
 }
 
 fn relative_file_exists(dir: &Dir, name: &str) -> Result<bool, LpmError> {
@@ -1496,6 +1583,12 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
+    if create && let Some(why) = lpm_common::volume::files_not_private(&certs) {
+        tracing::warn!(
+            "anyone using this computer can read the private key LPM keeps in {}: {why}. It only serves this project's local names",
+            shown_project.join(".lpm").join("certs").display()
+        );
+    }
     let mut path = project_path;
     path.push(".lpm");
     path.push("certs");
@@ -1846,77 +1939,14 @@ fn replace_relative_file(
         let _temporary = temporary;
         dir.rename(source, dir, destination)
     }
+    // The rename lpm-common's atomic writes end with: by name in the handle's
+    // directory, or by full path on a share that refuses that, as a Parallels
+    // shared folder does.
     #[cfg(windows)]
     {
-        use std::mem::{offset_of, size_of};
-        use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Wdk::Storage::FileSystem::{
-            FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
-        };
-        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
-        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
         let _ = source;
-        let destination: Vec<u16> = Path::new(destination).as_os_str().encode_wide().collect();
-        let file_name_bytes = destination
-            .len()
-            .checked_mul(size_of::<u16>())
-            .ok_or_else(|| std::io::Error::other("certificate filename is too long"))?;
-        let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
-            .checked_add(file_name_bytes)
-            .ok_or_else(|| std::io::Error::other("certificate rename data is too large"))?;
-        let info_words = info_bytes.div_ceil(size_of::<usize>());
-        let mut storage = vec![0usize; info_words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        let info_bytes = u32::try_from(info_bytes)
-            .map_err(|_| std::io::Error::other("certificate rename data is too large"))?;
-        let file_name_bytes = u32::try_from(file_name_bytes)
-            .map_err(|_| std::io::Error::other("certificate filename is too long"))?;
-        unsafe {
-            // SAFETY: storage is pointer-aligned and sized for FILE_RENAME_INFO plus
-            // the complete relative UTF-16 filename. Both handles stay open through
-            // every synchronous rename attempt.
-            (*info).Anonymous.ReplaceIfExists = true;
-            (*info).RootDirectory = dir.as_raw_handle();
-            (*info).FileNameLength = file_name_bytes;
-            std::ptr::copy_nonoverlapping(
-                destination.as_ptr(),
-                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-                destination.len(),
-            );
-        }
-        for (attempt, delay_ms) in WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.iter().enumerate() {
-            if *delay_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            }
-            let mut io_status = IO_STATUS_BLOCK::default();
-            let status = unsafe {
-                // SAFETY: `info` points to the initialized variable-sized buffer described above.
-                // Both retained handles remain valid for this synchronous native rename call.
-                NtSetInformationFile(
-                    temporary.as_raw_handle(),
-                    &mut io_status,
-                    info.cast(),
-                    info_bytes,
-                    FileRenameInformation,
-                )
-            };
-            if status >= 0 {
-                return temporary.sync_all();
-            }
-            // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
-            let error =
-                std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
-            if !is_transient_windows_file_operation_error(&error)
-                || attempt + 1 == WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.len()
-            {
-                return Err(error);
-            }
-        }
-        Err(std::io::Error::other(
-            "atomic project certificate replacement retry loop exhausted",
-        ))
+        lpm_common::rename_open_file_replacing(dir, std::ffi::OsStr::new(destination), &temporary)?;
+        temporary.sync_all()
     }
 }
 
@@ -2465,6 +2495,183 @@ mod tests {
 
         assert_eq!(contents, b"private-key-material");
         assert_no_extended_acl(&key_path);
+    }
+
+    #[test]
+    fn a_pair_whose_journal_fails_is_neither_written_nor_left_to_recover() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+        // The journal is published, then its directory fails to sync.
+        fail_next_directory_sync();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("injected certificate directory sync failure"),
+            "{error}"
+        );
+        let left: Vec<_> = std::fs::read_dir(project.path().join(".lpm/certs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_journal_left_behind_a_failed_pair_write_is_said_in_the_error() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+        // The journal's publication fails to sync, and so does its removal.
+        fail_next_directory_syncs(2);
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("injected certificate directory sync failure"),
+            "{error}"
+        );
+        assert!(
+            error.contains("the next run may install this pair all the same"),
+            "{error}"
+        );
+        assert_eq!(error.matches("certificate error:").count(), 1, "{error}");
+    }
+
+    #[test]
+    fn an_authority_pair_whose_journal_fails_is_neither_written_nor_left_to_recover() {
+        let home = tempfile::tempdir().unwrap();
+        let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        let certs = home.path().join(".lpm/certs");
+        let names_in = |path: &Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let before = names_in(&certs);
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+        // The journal is published, then its directory fails to sync.
+        fail_next_directory_sync();
+
+        let error = operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("injected certificate directory sync failure"),
+            "{error}"
+        );
+        assert_eq!(names_in(&certs), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_project_pair_is_written_where_renames_relative_to_a_directory_are_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let refusing = lpm_common::atomic_write::test_support::refuse_relative_renames();
+        let written = cert_dir.write_pair(cert.as_bytes(), key.as_bytes());
+        let refused = refusing.refused();
+        drop(refusing);
+
+        written.unwrap();
+        assert!(refused > 0, "the pair wasn't renamed through lpm-common");
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".lpm/certs/cert.pem")).unwrap(),
+            cert
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(project.path().join(".lpm/certs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".lpm-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn the_certificate_authority_s_key_is_not_written_where_anyone_could_read_it() {
+        let home = tempfile::tempdir().unwrap();
+        let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+        // Removing the authority's trust writes and uses no key, so an
+        // operation still starts.
+        let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+        let written = operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .map(drop);
+        drop(pretending);
+
+        let error = written.unwrap_err().to_string();
+        assert!(
+            error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't keep or use the certificate authority's private key there"),
+            "{error}"
+        );
+        assert!(!error.contains("lpm cert uninstall"), "{error}");
+        assert!(!home.path().join(".lpm/certs/rootCA-key.pem").exists());
+        assert!(!home.path().join(".lpm/certs/rootCA.pem").exists());
+    }
+
+    #[test]
+    fn an_authority_already_where_anyone_could_read_its_key_is_not_used_and_its_trust_is_to_go() {
+        let home = tempfile::tempdir().unwrap();
+        // An authority an earlier release wrote there.
+        let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+        operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .unwrap();
+        drop(operation);
+
+        let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+        let used = CertificateOperation::begin_at(home.path().to_path_buf())
+            .and_then(|operation| crate::ensure_root_ca_pair_locked(&operation.ca).map(drop));
+        drop(pretending);
+
+        let error = used.unwrap_err().to_string();
+        assert!(
+            error
+                .contains("so LPM won't keep or use the certificate authority's private key there")
+                && error.contains("lpm cert uninstall"),
+            "{error}"
+        );
     }
 
     #[test]

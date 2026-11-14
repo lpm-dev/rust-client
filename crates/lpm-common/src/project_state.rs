@@ -221,13 +221,26 @@ fn keep_state_dir_owner_only_or_warn(
 /// SYSTEM, letting sandboxed lifecycle scripts through to what they are
 /// granted inside, as
 /// [`crate::owner_only::protect_state_directory`] does; what an earlier
-/// release left inside stops inheriting the project directory's access.
+/// release left inside stops inheriting the project directory's access. On
+/// a volume that keeps no permissions, the project and its state stay open
+/// to everyone, which is said once.
 #[cfg(windows)]
 fn keep_state_dir_owner_only_or_warn(
     directory: &cap_std::fs::Dir,
     _metadata: &cap_std::fs::Metadata,
     state_display: &Path,
 ) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(why) = crate::volume::files_not_private(directory) {
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "anyone using this computer can read and change {} and what LPM keeps in it: {why}",
+                crate::symlink::windows_plain_path(state_display.parent().unwrap_or(state_display))
+                    .display()
+            );
+        }
+        return;
+    }
     if let Err(error) = crate::owner_only::protect_state_directory(directory, true) {
         tracing::warn!(
             "could not keep {} to its owner: {error}",
@@ -321,6 +334,33 @@ impl std::fmt::Display for LpmHomeExposed {
 /// secrets must not be written; elsewhere what it can't do is logged.
 pub fn keep_lpm_home_ignored(root: &Path) -> Result<(), String> {
     keep_lpm_home_out_of_git(root).map_err(|exposed| exposed.reason)
+}
+
+/// Fails, saying why, where anyone using the computer could read what LPM
+/// saves in `root`, an LPM home: on a volume that keeps no file permissions,
+/// such as an exFAT drive. Login state and the CA's private key must not be
+/// written there. A home that can't be opened passes, for its writer to
+/// report.
+pub fn keep_lpm_home_private(root: &Path) -> Result<(), String> {
+    match cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
+        Ok(directory) => keep_lpm_home_private_in(&directory, root),
+        Err(_) => Ok(()),
+    }
+}
+
+/// [`keep_lpm_home_private`] for an LPM home a caller opened itself, at
+/// `home_display`.
+pub fn keep_lpm_home_private_in(
+    directory: &cap_std::fs::Dir,
+    home_display: &Path,
+) -> Result<(), String> {
+    match crate::volume::files_not_private(directory) {
+        Some(why) => Err(format!(
+            "anyone using this computer could read what LPM saves in {}: {why}",
+            crate::symlink::windows_plain_path(home_display).display()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// [`keep_lpm_home_ignored`], failing with what keeps the home in git, for
@@ -428,6 +468,16 @@ pub fn keep_existing_lpm_home_ignored(root: &Path) {
 /// Administrators' and lets no one else read it.
 #[cfg(windows)]
 fn keep_lpm_home_owner_only_or_warn(directory: &cap_std::fs::Dir, root: &Path) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(why) = crate::volume::files_not_private(directory) {
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "anyone using this computer can change what LPM keeps in {}, its package store included: {why}",
+                crate::symlink::windows_plain_path(root).display()
+            );
+        }
+        return;
+    }
     match crate::owner_only::protect_state_directory(directory, false) {
         Ok(true) => rewrite_lpm_home_ignore(directory, root),
         Ok(false) => {}
@@ -660,6 +710,21 @@ mod tests {
         let ignore = std::fs::read_to_string(state.join(".gitignore")).unwrap();
         assert_eq!(ignore, PROJECT_STATE_IGNORE);
         assert!(ignores_everything(ignore.as_bytes()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_to_a_project_creates_its_state_inside_it() {
+        let project = tempfile::tempdir().unwrap();
+        let Some(network) = crate::test_network_path::through_network(project.path()) else {
+            return;
+        };
+
+        let state = ensure_project_state_dir(&network).unwrap();
+
+        assert_eq!(state, network.join(".lpm"));
+        let ignore = std::fs::read_to_string(project.path().join(".lpm").join(".gitignore"));
+        assert_eq!(ignore.unwrap(), PROJECT_STATE_IGNORE);
     }
 
     #[cfg(unix)]

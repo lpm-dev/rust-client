@@ -73,9 +73,28 @@ pub(crate) fn validate_dependency_free_dev_config(project_dir: &Path) -> Result<
     Ok(())
 }
 
+/// Fails where the project's `node_modules` can't be made: each package in
+/// it is a link into LPM's package store, which a drive without links, such
+/// as exFAT, and a network folder can't hold. It fails before anything is
+/// resolved or downloaded.
+fn refuse_a_project_without_links(project_dir: &Path) -> Result<(), LpmError> {
+    let Ok(project) = cap_std::fs::Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())
+    else {
+        return Ok(());
+    };
+    match lpm_common::volume::links_not_held(&project) {
+        Some(why) => Err(LpmError::ProjectFile(format!(
+            "LPM can't install into {}: {why}, and node_modules is made of links into LPM's package store. Move the project to a local NTFS drive",
+            lpm_common::symlink::windows_plain_path(project_dir).display()
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn prepare_install_setup_context(
     input: InstallSetupInput<'_>,
 ) -> Result<InstallSetupContext, LpmError> {
+    refuse_a_project_without_links(input.project_dir)?;
     lpm_registry::timing::reset_metadata_http_versions();
     lpm_registry::timing::reset_metadata_detail();
     crate::build_state::reset_write_timing();
@@ -278,4 +297,51 @@ pub(super) fn check_project_policy(
         json_output,
     )?;
     Ok(firewall_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_input(project_dir: &Path) -> InstallSetupInput<'_> {
+        InstallSetupInput {
+            project_dir,
+            policy_project_dir: project_dir,
+            json_output: false,
+            frozen_lockfile: FrozenLockfileMode::default(),
+            allow_new: false,
+            strict_peer_dependencies_override: None,
+            linker_override: None,
+            min_release_age_override: None,
+            min_release_age_exclude: &[],
+            timing: false,
+        }
+    }
+
+    #[test]
+    fn an_install_on_a_drive_without_links_is_refused_before_anything_else() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        // A home whose configuration can't be read, so that a setup that
+        // went past the check fails at once on it instead.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "= unreadable").unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().into())]);
+        let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+        let refused = prepare_install_setup_context(setup_input(project.path()));
+        drop(pretending);
+
+        let Err(error) = refused else {
+            panic!("an install on a drive without links was set up");
+        };
+        assert!(matches!(error, LpmError::ProjectFile(_)), "{error:?}");
+        let error = error.to_string();
+        assert!(
+            error.contains(
+                "it is on an exFAT drive, which can't hold links, and node_modules is made of links into LPM's package store"
+            ),
+            "{error}"
+        );
+        refuse_a_project_without_links(project.path()).unwrap();
+    }
 }

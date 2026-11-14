@@ -604,12 +604,15 @@ fn node_version_on_path(cwd: &Path, path: &OsStr, executable: Option<&Path>) -> 
 
 #[cfg(windows)]
 fn node_version_on_path(cwd: &Path, path: &OsStr, _executable: Option<&Path>) -> Option<String> {
-    parse_system_node_version(node_version_output(
-        Command::new("cmd")
-            .args(["/D", "/S", "/C", "node --version"])
-            .current_dir(cwd)
-            .env("PATH", path),
-    )?)
+    let mut command = Command::new("cmd");
+    command
+        .args(["/D", "/S", "/C", "node --version"])
+        .current_dir(cwd)
+        .env("PATH", path);
+    // Without a drive letter, cmd.exe starts in the Windows directory, and
+    // the absolute PATH still finds the same Node.
+    let _directory = lpm_common::script_directory::ScriptDirectory::reach_for(&mut command).ok();
+    parse_system_node_version(node_version_output(&mut command)?)
 }
 
 pub(crate) fn parse_system_node_version(output: std::process::Output) -> Option<String> {

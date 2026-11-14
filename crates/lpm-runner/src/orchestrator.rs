@@ -1121,7 +1121,7 @@ fn spawn_service_command_with_hooks(
     }
 
     #[cfg(windows)]
-    let directory_guards = {
+    let (directory_guards, directory) = {
         let guards = retain_windows_service_directories(&directory_expectations)?;
         if revalidate_service_cwd(project_dir, cached_cwd).as_deref() != Ok(cwd.as_path()) {
             return Err(std::io::Error::other(
@@ -1129,7 +1129,9 @@ fn spawn_service_command_with_hooks(
             ));
         }
         command.current_dir(&cwd);
-        guards
+        let directory =
+            crate::shell::reach_directory_through_drive(command).map_err(std::io::Error::other)?;
+        (guards, directory)
     };
 
     #[cfg(not(any(unix, windows)))]
@@ -1144,16 +1146,20 @@ fn spawn_service_command_with_hooks(
     #[cfg(windows)]
     drop(directory_guards);
     #[cfg(windows)]
-    return child.and_then(windows_service_in_job);
+    return child.and_then(|child| windows_service_in_job(child, directory));
     #[cfg(not(windows))]
     child.map(ServiceProcess::from)
 }
 
 /// Puts a service started suspended in a Job of its own, then lets it run.
 /// Where Windows refuses the Job, the service runs outside one, as it did
-/// before lpm used them.
+/// before lpm used them. `directory` keeps the drive letter a service in a
+/// network folder runs through.
 #[cfg(windows)]
-fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
+fn windows_service_in_job(
+    mut child: Child,
+    directory: Option<lpm_common::script_directory::ScriptDirectory>,
+) -> std::io::Result<ServiceProcess> {
     let job = lpm_common::process_job::ProcessJob::new()
         .and_then(|job| job.assign(&child).map(|()| job))
         .map_err(|error| {
@@ -1173,6 +1179,7 @@ fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
         job,
         tree_walked: false,
         reported_force_killed: false,
+        _directory: directory,
     })
 }
 
@@ -1420,6 +1427,17 @@ pub fn run_services_with_config(
     }
 
     let service_cwds = service_working_directories(project_dir, active_services.as_ref())?;
+    // A service in a network folder runs through a drive letter. Holding it
+    // for the whole session keeps a restart from removing and mapping it
+    // again, and a missing letter fails before any service starts.
+    #[cfg(windows)]
+    let _service_drives = service_cwds
+        .values()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|cwd| lpm_common::script_directory::ScriptDirectory::for_shell(cwd))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| LpmError::Script(error.to_string()))?;
 
     // Topological sort
     let groups = service_graph::topological_sort(&active_services).map_err(LpmError::Script)?;
@@ -1569,7 +1587,7 @@ pub fn run_services_with_config(
     let children: Arc<Mutex<Vec<(String, ServiceProcess)>>> = Arc::new(Mutex::new(Vec::new()));
 
     // RAII guard: ensures children are cleaned up even on panic
-    let mut children_guard = ChildrenGuard {
+    let children_guard = ChildrenGuard {
         children: children.clone(),
         on_shutdown_started: options.on_shutdown_started.take(),
     };
@@ -1891,14 +1909,8 @@ pub fn run_services_with_config(
     // Acquire: a console stop records which event began the shutdown before
     // it moves `shutdown_state` on, and the shutdown below reads that record.
     let force = shutdown_state.load(Ordering::Acquire) >= 2;
-    let shutdown_result = children_guard.begin_shutdown();
-    shutdown_children_ordered(
-        &children,
-        force,
-        Some(&groups),
-        crate::execution::console_interrupted,
-    );
-    std::mem::forget(children_guard);
+    let shutdown_result =
+        children_guard.stop_services(force, &groups, crate::execution::console_interrupted);
     match runtime_result {
         Ok(()) => shutdown_result,
         Err(primary) => Err(compose_runtime_and_shutdown_error(primary, shutdown_result)),
@@ -2080,7 +2092,8 @@ fn drain_service_output<R: std::io::Read>(mut stream: R, mut on_line: impl FnMut
     }
 }
 
-/// RAII guard that kills child processes on drop (panic safety).
+/// RAII guard that stops the services on drop, as on a panic, and lets go
+/// of them.
 struct ChildrenGuard {
     children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     on_shutdown_started: Option<crate::ShutdownStartedCallback>,
@@ -2090,6 +2103,30 @@ impl ChildrenGuard {
     fn begin_shutdown(&mut self) -> Result<(), LpmError> {
         crate::invoke_shutdown_started(&mut self.on_shutdown_started)
     }
+
+    /// Begins the shutdown and stops the services in reverse dependency
+    /// order, as [`shutdown_children_ordered`] does, then lets go of them,
+    /// and of what each holds: Windows keeps the drive letter a service in a
+    /// network folder runs through after lpm exits. The guard is then left
+    /// with nothing to stop.
+    fn stop_services(
+        mut self,
+        force: bool,
+        groups: &[Vec<String>],
+        services_interrupted: impl Fn() -> bool,
+    ) -> Result<(), LpmError> {
+        let shutdown_started = self.begin_shutdown();
+        shutdown_children_ordered(&self.children, force, Some(groups), services_interrupted);
+        self.let_go();
+        shutdown_started
+    }
+
+    /// Drops the stopped services, outside the lock, though something else,
+    /// such as a readiness thread, may still hold the list.
+    fn let_go(&self) {
+        let stopped = std::mem::take(&mut *self.children.lock());
+        drop(stopped);
+    }
 }
 
 impl Drop for ChildrenGuard {
@@ -2098,6 +2135,7 @@ impl Drop for ChildrenGuard {
             tracing::error!(%error, "shutdown boundary failed during child cleanup");
         }
         shutdown_children(&self.children, false);
+        self.let_go();
     }
 }
 
@@ -2722,6 +2760,9 @@ pub(crate) struct ServiceProcess {
     tree_walked: bool,
     /// Whether the shutdown has said this service was force-killed.
     reported_force_killed: bool,
+    /// Dropped after the Job has ended what the service started.
+    #[cfg(windows)]
+    _directory: Option<lpm_common::script_directory::ScriptDirectory>,
 }
 
 impl From<Child> for ServiceProcess {
@@ -2732,6 +2773,8 @@ impl From<Child> for ServiceProcess {
             job: None,
             tree_walked: false,
             reported_force_killed: false,
+            #[cfg(windows)]
+            _directory: None,
         }
     }
 }
@@ -3537,6 +3580,113 @@ mod tests {
 
         assert!(said.is_empty(), "{said:?}");
         assert_eq!(reports, [reported("web", "force-killed")]);
+    }
+
+    /// Once `lpm dev` has stopped its services, it lets go of each, and of
+    /// what each holds.
+    #[test]
+    fn the_services_lpm_dev_stopped_are_let_go_of() {
+        let project = tempfile::tempdir().unwrap();
+        let children = Arc::new(Mutex::new(vec![(
+            "web".to_string(),
+            running_service(project.path()),
+        )]));
+        let guard = ChildrenGuard {
+            children: Arc::clone(&children),
+            on_shutdown_started: None,
+        };
+
+        guard
+            .stop_services(false, &[vec!["web".to_string()]], || false)
+            .unwrap();
+
+        assert!(children.lock().is_empty(), "the services were kept");
+        assert_eq!(
+            Arc::strong_count(&children),
+            1,
+            "the services' list outlives lpm dev"
+        );
+    }
+
+    /// A panic in `lpm dev` stops its services as the guard drops, and lets
+    /// go of them too, though a readiness thread may still hold the list.
+    #[test]
+    fn the_services_a_panic_stopped_are_let_go_of() {
+        let project = tempfile::tempdir().unwrap();
+        let children = Arc::new(Mutex::new(vec![(
+            "web".to_string(),
+            running_service(project.path()),
+        )]));
+        let readiness_children = Arc::clone(&children);
+
+        drop(ChildrenGuard {
+            children: Arc::clone(&children),
+            on_shutdown_started: None,
+        });
+
+        assert!(
+            readiness_children.lock().is_empty(),
+            "the services were kept"
+        );
+    }
+
+    /// The drive letter a service in a network folder runs through, in
+    /// cmd.exe as `lpm dev` runs each, goes once `lpm dev` has stopped the
+    /// service. Windows keeps a letter lpm defined after lpm exits, so one
+    /// kept past the shutdown stays behind. The share is reached as
+    /// `\\127.0.0.1\<drive>$`, which no other test in this process reaches.
+    #[cfg(windows)]
+    #[test]
+    fn a_service_in_a_network_folder_gives_back_its_drive_letter_once_lpm_dev_stops_it() {
+        let local = tempfile::tempdir().unwrap();
+        let project = local.path().join("app");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("marker.txt"), b"here").unwrap();
+        let Some(network) =
+            lpm_common::test_network_path::through_network_as(&project, "127.0.0.1")
+        else {
+            return;
+        };
+        let cached_cwd = network.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command =
+            crate::shell::shell_process("node -e \"setInterval(() => {}, 1000)\"").unwrap();
+        command.stdin(Stdio::null());
+        let service =
+            spawn_service_command_with(&mut command, &network, &cached_cwd, &service_path, || {
+                Ok(())
+            })
+            .unwrap();
+        let drive = service
+            ._directory
+            .as_ref()
+            .expect("a service in a network folder runs through a drive letter")
+            .path()
+            .to_path_buf();
+        assert!(
+            matches!(
+                drive.components().next(),
+                Some(std::path::Component::Prefix(prefix))
+                    if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+            ),
+            "{drive:?} isn't on a drive letter"
+        );
+        assert!(drive.join("marker.txt").exists(), "{drive:?}");
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        ChildrenGuard {
+            children: Arc::clone(&children),
+            on_shutdown_started: None,
+        }
+        .stop_services(false, &[vec!["web".to_string()]], || false)
+        .unwrap();
+
+        // The test still holds the list, as a readiness thread may.
+        assert!(
+            !drive.join("marker.txt").exists(),
+            "lpm dev left {drive:?} behind"
+        );
     }
 
     #[test]

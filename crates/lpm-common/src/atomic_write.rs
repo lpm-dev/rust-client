@@ -301,8 +301,39 @@ fn copy_into_new_file(
     Ok(true)
 }
 
-/// What [`create_file_atomic_in_dir_with_options`] can do on a filesystem:
-/// everything, except where a test takes an ability away.
+/// Filesystems as tests want them seen.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    /// Has every rename relative to a directory handle on this thread
+    /// refused, as a Parallels shared folder refuses one, until what this
+    /// returns is dropped.
+    #[must_use]
+    pub fn refuse_relative_renames() -> Refusing {
+        super::simulated::NO_RELATIVE_RENAME.set(true);
+        super::simulated::RELATIVE_RENAMES_REFUSED.set(0);
+        Refusing(())
+    }
+
+    /// See [`refuse_relative_renames`].
+    pub struct Refusing(());
+
+    impl Refusing {
+        /// How many renames were refused since.
+        #[must_use]
+        pub fn refused(&self) -> usize {
+            super::simulated::RELATIVE_RENAMES_REFUSED.get()
+        }
+    }
+
+    impl Drop for Refusing {
+        fn drop(&mut self) {
+            super::simulated::NO_RELATIVE_RENAME.set(false);
+        }
+    }
+}
+
+/// What the atomic writes can do on a filesystem: everything, except where a
+/// test takes an ability away.
 mod simulated {
     use std::ffi::OsStr;
     use std::io;
@@ -312,6 +343,44 @@ mod simulated {
         pub(super) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static NO_RENAME_WITHOUT_REPLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static FAILING_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static RENAME_INTO_ANOTHER_DIRECTORY: std::cell::Cell<Option<std::path::PathBuf>> = const { std::cell::Cell::new(None) };
+        pub(super) static PLACE_UNREADABLE_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The path a rename by full path names `directory` by: the handle's,
+    /// or in a test, another directory's, as when the directory moved
+    /// after its path was read.
+    #[cfg(windows)]
+    pub(super) fn directory_path_for_rename(directory: &cap_std::fs::Dir) -> io::Result<Vec<u16>> {
+        #[cfg(test)]
+        if let Some(elsewhere) = RENAME_INTO_ANOTHER_DIRECTORY.take() {
+            use std::os::windows::ffi::OsStrExt as _;
+            return Ok(elsewhere.as_os_str().encode_wide().collect());
+        }
+        super::directory_final_path(directory)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    thread_local! {
+        pub(super) static NO_RELATIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static RELATIVE_RENAMES_REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Whether the filesystem refuses a rename to `target`, as a Parallels
+    /// shared folder refuses one relative to a directory handle.
+    #[cfg(all(windows, any(test, feature = "test-support")))]
+    pub(super) fn refuses_rename(target: super::RenameTarget) -> bool {
+        let refused = target == super::RenameTarget::Relative
+            && NO_RELATIVE_RENAME.with(std::cell::Cell::get);
+        if refused {
+            RELATIVE_RENAMES_REFUSED.set(RELATIVE_RENAMES_REFUSED.get() + 1);
+        }
+        refused
+    }
+
+    #[cfg(all(windows, not(any(test, feature = "test-support"))))]
+    pub(super) const fn refuses_rename(_target: super::RenameTarget) -> bool {
+        false
     }
 
     pub(super) fn hard_link(
@@ -615,6 +684,19 @@ pub fn rename_open_file_noreplace(
     rename_capability_handle(directory, destination, file, false)
 }
 
+/// Renames the open `file`, which needs `DELETE` access, to `destination`
+/// in `directory`, replacing an entry there, as an atomic write's last step
+/// does: with POSIX semantics where the volume has them, and by full path on
+/// a share that takes no rename relative to a directory handle.
+#[cfg(windows)]
+pub fn rename_open_file_replacing(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    file: &cap_std::fs::File,
+) -> io::Result<()> {
+    rename_capability_handle(directory, destination, file, true)
+}
+
 /// Renames the open `temporary` to `destination` in `directory`, replacing
 /// an entry there only when `replace` is set; an entry that stays is an
 /// `AlreadyExists` error.
@@ -625,95 +707,101 @@ fn rename_capability_handle(
     temporary: &cap_std::fs::File,
     replace: bool,
 ) -> io::Result<()> {
-    use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
-        FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
-    };
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError,
         STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
     };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    let destination_name = destination;
-    let destination = destination.encode_wide().collect::<Vec<_>>();
-    let file_name_bytes = destination
-        .len()
-        .checked_mul(size_of::<u16>())
-        .ok_or_else(|| io::Error::other("atomic destination file name is too long"))?;
-    // Windows rejects a record shorter than the structure, whose one-unit
-    // `FileName` and padding outlast a one-character name.
-    let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
-        .checked_add(file_name_bytes)
-        .ok_or_else(|| io::Error::other("atomic rename data is too large"))?
-        .max(size_of::<FILE_RENAME_INFORMATION>());
-    let mut storage = vec![0usize; info_bytes.div_ceil(size_of::<usize>())];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-    let info_bytes = u32::try_from(info_bytes)
-        .map_err(|_| io::Error::other("atomic rename data is too large"))?;
-    let file_name_bytes = u32::try_from(file_name_bytes)
-        .map_err(|_| io::Error::other("atomic destination file name is too long"))?;
-    unsafe {
-        // SAFETY: storage is aligned and sized for the variable-length rename record. Both
-        // handles remain open for each synchronous call, and the UTF-16 filename is copied in full.
-        (*info).Anonymous.ReplaceIfExists = replace;
-        (*info).RootDirectory = directory.as_raw_handle();
-        (*info).FileNameLength = file_name_bytes;
-        std::ptr::copy_nonoverlapping(
-            destination.as_ptr(),
-            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-            destination.len(),
-        );
-    }
-    let rename = move |class| {
-        let mut io_status = IO_STATUS_BLOCK::default();
-        unsafe {
-            // SAFETY: `info` describes the initialized buffer above and both handles remain valid.
-            NtSetInformationFile(
-                temporary.as_raw_handle(),
-                &mut io_status,
-                info.cast(),
-                info_bytes,
-                class,
-            )
-        }
-    };
     // POSIX semantics replace a destination that is still open elsewhere, as
     // a Unix rename does, and handles open on it keep reading the old file.
     // The classic rename refuses such a destination with ACCESS_DENIED.
     // Volumes and Windows releases without them reject the request, and the
-    // classic rename follows.
-    let mut class = FileRenameInformation;
-    if replace {
-        unsafe {
-            // SAFETY: `Flags` shares the union with `ReplaceIfExists` in the buffer above.
-            (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
-        }
-        class = FileRenameInformationEx;
-    }
+    // classic rename follows. Some network file systems, such as Parallels
+    // shared folders, take no rename relative to a directory handle at all,
+    // and get the destination's full path: the directory the handle holds,
+    // unless something renames it in between.
+    let attempts: &[(RenameTarget, RenameClass)] = if replace {
+        &[
+            (RenameTarget::Relative, RenameClass::Posix),
+            (RenameTarget::Relative, RenameClass::Classic),
+            (RenameTarget::FullPath, RenameClass::Posix),
+            (RenameTarget::FullPath, RenameClass::Classic),
+        ]
+    } else {
+        &[
+            (RenameTarget::Relative, RenameClass::Classic),
+            (RenameTarget::FullPath, RenameClass::Classic),
+        ]
+    };
+    let name = destination.encode_wide().collect::<Vec<_>>();
+    let mut relative = RenameRecord::new(directory.as_raw_handle(), &name)?;
+    let mut attempt = 0;
     for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        let mut status = rename(class);
-        if class == FileRenameInformationEx
-            && matches!(
-                status,
-                STATUS_INVALID_PARAMETER | STATUS_INVALID_INFO_CLASS | STATUS_NOT_SUPPORTED
-            )
-        {
-            unsafe {
-                // SAFETY: as above; the classic record reads only `ReplaceIfExists`.
-                (*info).Anonymous.Flags = 0;
-                (*info).Anonymous.ReplaceIfExists = true;
+        let (status, renamed_into) = loop {
+            let (target, class) = attempts[attempt];
+            // The path is read again for each attempt, from the handle, so
+            // that it follows the directory if it moves.
+            let mut by_full_path;
+            let mut renamed_into = None;
+            let record = match target {
+                RenameTarget::Relative => &mut relative,
+                RenameTarget::FullPath => {
+                    let directory_path = simulated::directory_path_for_rename(directory)?;
+                    by_full_path = RenameRecord::new(
+                        std::ptr::null_mut(),
+                        &nt_path_in(&directory_path, &name)?,
+                    )?;
+                    renamed_into = Some(directory_path);
+                    &mut by_full_path
+                }
+            };
+            let status = record.apply(temporary, class, replace, target);
+            if attempt + 1 < attempts.len()
+                && matches!(
+                    status,
+                    STATUS_INVALID_PARAMETER | STATUS_INVALID_INFO_CLASS | STATUS_NOT_SUPPORTED
+                )
+            {
+                attempt += 1;
+                continue;
             }
-            class = FileRenameInformation;
-            status = rename(class);
-        }
+            break (status, renamed_into);
+        };
         if status >= 0 {
+            // A directory that moved between reading its path and the
+            // rename may have left the file elsewhere, even in a directory
+            // made at the old path since, on a file system that reports the
+            // move to the handle. A file found elsewhere is deleted through
+            // its handle where Windows lets it; one whose place can't be told
+            // is left, and the write fails. Parallels shared folders, which
+            // take renames by full path only, report no move to the handle,
+            // so the file goes where the path leads, as any write by path.
+            if let Some(renamed_into) = renamed_into {
+                match landed_in(directory, temporary, &renamed_into) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(error) = delete_on_close(temporary) {
+                            tracing::debug!("could not delete a file renamed elsewhere: {error}");
+                        }
+                        return Err(io::Error::other(
+                            "the directory moved while a file was renamed into it",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "could not tell whether a file renamed by full path is in its directory: {error}"
+                            ),
+                        ));
+                    }
+                }
+            }
             return Ok(());
         }
         let code = unsafe {
@@ -726,13 +814,220 @@ fn rename_capability_handle(
             // A directory never gives way; see `is_directory_entry`.
             || (code == ERROR_ACCESS_DENIED
                 && directory
-                    .symlink_metadata(Path::new(destination_name))
+                    .symlink_metadata(Path::new(destination))
                     .is_ok_and(|metadata| metadata.is_dir()))
         {
             return Err(error);
         }
     }
     Err(io::Error::other("atomic replacement retry loop exhausted"))
+}
+
+/// Where a rename record names its destination: by name in the directory
+/// handle it holds, or by the destination's full path.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameTarget {
+    Relative,
+    FullPath,
+}
+
+/// The rename asked for: with POSIX semantics, which only replace, or the
+/// classic one.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameClass {
+    Posix,
+    Classic,
+}
+
+/// A `FILE_RENAME_INFORMATION` record, which holds its destination name.
+#[cfg(windows)]
+struct RenameRecord {
+    storage: Vec<usize>,
+    bytes: u32,
+}
+
+#[cfg(windows)]
+impl RenameRecord {
+    /// The record of a rename to `name`, relative to the directory `root`,
+    /// or with a null `root`, a full NT path.
+    fn new(root: windows_sys::Win32::Foundation::HANDLE, name: &[u16]) -> io::Result<Self> {
+        use std::mem::{offset_of, size_of};
+        use windows_sys::Wdk::Storage::FileSystem::FILE_RENAME_INFORMATION;
+
+        let name_bytes = name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(|| io::Error::other("atomic destination file name is too long"))?;
+        // Windows rejects a record shorter than the structure, whose one-unit
+        // `FileName` and padding outlast a one-character name.
+        let bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
+            .checked_add(name_bytes)
+            .ok_or_else(|| io::Error::other("atomic rename data is too large"))?
+            .max(size_of::<FILE_RENAME_INFORMATION>());
+        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+        let bytes = u32::try_from(bytes)
+            .map_err(|_| io::Error::other("atomic rename data is too large"))?;
+        let name_bytes = u32::try_from(name_bytes)
+            .map_err(|_| io::Error::other("atomic destination file name is too long"))?;
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        unsafe {
+            // SAFETY: `storage` is aligned and sized for the variable-length record, and the
+            // UTF-16 name is copied in full.
+            (*info).RootDirectory = root;
+            (*info).FileNameLength = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                name.len(),
+            );
+        }
+        Ok(Self { storage, bytes })
+    }
+
+    /// Renames `file` as `class` asks, replacing the destination when
+    /// `replace` is set, and returns the NTSTATUS.
+    fn apply(
+        &mut self,
+        file: &cap_std::fs::File,
+        class: RenameClass,
+        replace: bool,
+        target: RenameTarget,
+    ) -> windows_sys::Win32::Foundation::NTSTATUS {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+            FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        if simulated::refuses_rename(target) {
+            return windows_sys::Win32::Foundation::STATUS_INVALID_PARAMETER;
+        }
+        let info = self.storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let information_class = unsafe {
+            // SAFETY: `Flags` and `ReplaceIfExists` share the union at the start of the record
+            // `new` initialized; the classic record reads only `ReplaceIfExists`.
+            (*info).Anonymous.Flags = 0;
+            match class {
+                RenameClass::Posix => {
+                    let mut flags = FILE_RENAME_POSIX_SEMANTICS;
+                    if replace {
+                        flags |= FILE_RENAME_REPLACE_IF_EXISTS;
+                    }
+                    (*info).Anonymous.Flags = flags;
+                    FileRenameInformationEx
+                }
+                RenameClass::Classic => {
+                    (*info).Anonymous.ReplaceIfExists = replace;
+                    FileRenameInformation
+                }
+            }
+        };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        unsafe {
+            // SAFETY: `info` describes the initialized record of `self.bytes` bytes, and the
+            // file and any root directory handle stay open for this synchronous call.
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                &mut io_status,
+                info.cast(),
+                self.bytes,
+                information_class,
+            )
+        }
+    }
+}
+
+/// Has the open `file`, which needs `DELETE` access, deleted once its last
+/// handle closes.
+#[cfg(windows)]
+fn delete_on_close(file: &cap_std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let size =
+        u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).map_err(io::Error::other)?;
+    // SAFETY: the handle stays open for the call, and `information` is a
+    // complete record of `size` bytes.
+    let set = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&information).cast(),
+            size,
+        )
+    };
+    if set == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the open `file`, just renamed by full path into `renamed_into`,
+/// is directly in the directory `directory` holds: the directory is still
+/// at that path, or the file's own final path puts it there.
+#[cfg(windows)]
+fn landed_in(
+    directory: &cap_std::fs::Dir,
+    file: &cap_std::fs::File,
+    renamed_into: &[u16],
+) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[cfg(test)]
+    if simulated::PLACE_UNREADABLE_AFTER_RENAME.take() {
+        return Err(io::Error::other(
+            "injected: the directory's path can't be read",
+        ));
+    }
+    let directory_path = directory_final_path(directory)?;
+    if directory_path == renamed_into {
+        return Ok(true);
+    }
+    let file_path = crate::owner_only::final_path(file)?;
+    let file_path = file_path.as_os_str().encode_wide().collect::<Vec<_>>();
+    // A volume's root, as in `\\?\C:\`, ends in its separator.
+    let separator = u16::from(b'\\');
+    let directory_path = directory_path
+        .strip_suffix(&[separator])
+        .unwrap_or(&directory_path);
+    Ok(file_path
+        .iter()
+        .rposition(|unit| *unit == separator)
+        .is_some_and(|at| file_path[..at] == *directory_path))
+}
+
+/// The path the handle `directory` has now, as Windows gives it, with its
+/// extended prefix.
+#[cfg(windows)]
+fn directory_final_path(directory: &cap_std::fs::Dir) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let final_path = crate::owner_only::final_path(directory)?;
+    Ok(final_path.as_os_str().encode_wide().collect())
+}
+
+/// The NT path of `name` in the directory at `directory_path`, a final path,
+/// as a rename with no root directory takes it: `\??\C:\dir\name`, or
+/// `\??\UNC\server\share\dir\name`.
+#[cfg(windows)]
+fn nt_path_in(directory_path: &[u16], name: &[u16]) -> io::Result<Vec<u16>> {
+    const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const NT: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+    let rest = directory_path
+        .strip_prefix(&VERBATIM)
+        .ok_or_else(|| io::Error::other("a directory's final path has no extended prefix"))?;
+    let mut path = Vec::with_capacity(NT.len() + rest.len() + 1 + name.len());
+    path.extend_from_slice(&NT);
+    path.extend_from_slice(rest);
+    if path.last() != Some(&(b'\\' as u16)) {
+        path.push(b'\\' as u16);
+    }
+    path.extend_from_slice(name);
+    Ok(path)
 }
 
 /// Atomically replace a Unix symlink path without a predictable staging name.
@@ -1508,6 +1803,125 @@ mod tests {
             started.elapsed()
         );
         assert!(dir.path().join("cert.pem").is_dir());
+    }
+
+    #[cfg(windows)]
+    fn write_twice_and_read(dir: &std::path::Path) -> Vec<Vec<u8>> {
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority()).unwrap();
+        [b"first".as_slice(), b"again".as_slice()]
+            .iter()
+            .map(|contents| {
+                write_file_atomic_in_dir_with(&directory, ".gitignore".as_ref(), |file| {
+                    file.write_all(contents)
+                })
+                .unwrap();
+                fs::read(dir.join(".gitignore")).unwrap()
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_that_refuses_renames_relative_to_a_directory_still_gets_the_file() {
+        simulated::NO_RELATIVE_RENAME.set(true);
+        let dir = tempfile::tempdir().unwrap();
+
+        let written = std::panic::catch_unwind(|| write_twice_and_read(dir.path()));
+        simulated::NO_RELATIVE_RENAME.set(false);
+
+        assert_eq!(written.unwrap(), [b"first".to_vec(), b"again".to_vec()]);
+        assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_without_hard_links_or_relative_renames_creates_a_file_only_once() {
+        simulated::NO_HARD_LINKS.set(true);
+        simulated::NO_RELATIVE_RENAME.set(true);
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = create(dir.path(), b"TOKEN=first\n");
+        let second = create(dir.path(), b"TOKEN=second\n");
+        simulated::NO_HARD_LINKS.set(false);
+        simulated::NO_RELATIVE_RENAME.set(false);
+
+        assert_eq!(first.unwrap(), Some(()));
+        assert_eq!(second.unwrap(), None);
+        assert_eq!(fs::read(dir.path().join(".env")).unwrap(), b"TOKEN=first\n");
+        assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_by_full_path_that_lands_in_another_directory_fails_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&held).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let open = |path: &std::path::Path| {
+            cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap()
+        };
+        let elsewhere_path = crate::owner_only::final_path(&open(&elsewhere)).unwrap();
+        let directory = open(&held);
+        // As on a share whose directory moved, and another took its path,
+        // between reading the path and the rename.
+        simulated::NO_RELATIVE_RENAME.set(true);
+        simulated::RENAME_INTO_ANOTHER_DIRECTORY.set(Some(elsewhere_path));
+
+        let written = write_file_atomic_in_dir_with(&directory, ".gitignore".as_ref(), |file| {
+            file.write_all(b"state")
+        });
+        simulated::NO_RELATIVE_RENAME.set(false);
+        simulated::RENAME_INTO_ANOTHER_DIRECTORY.set(None);
+
+        let error = written.unwrap_err();
+        assert!(error.to_string().contains("the directory moved"), "{error}");
+        assert!(!held.join(".gitignore").exists());
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "the stray file stayed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_by_full_path_whose_place_can_t_be_read_fails_without_deleting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), b"old").unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        simulated::NO_RELATIVE_RENAME.set(true);
+        simulated::PLACE_UNREADABLE_AFTER_RENAME.set(true);
+
+        let written = write_file_atomic_in_dir_with(&directory, ".gitignore".as_ref(), |file| {
+            file.write_all(b"new")
+        });
+        simulated::NO_RELATIVE_RENAME.set(false);
+        simulated::PLACE_UNREADABLE_AFTER_RENAME.set(false);
+
+        let error = written.unwrap_err();
+        assert!(error.to_string().contains("could not tell"), "{error}");
+        // The file replaced the old one before the check, and stays.
+        assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_a_network_folder_is_written_and_replaced_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(network) = crate::test_network_path::through_network(dir.path()) else {
+            return;
+        };
+
+        assert_eq!(
+            write_twice_and_read(&network),
+            [b"first".to_vec(), b"again".to_vec()]
+        );
+        assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), b"again");
+        assert!(leftover_temporaries(dir.path()).is_empty());
     }
 
     #[cfg(windows)]

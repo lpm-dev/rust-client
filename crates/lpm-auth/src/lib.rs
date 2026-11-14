@@ -419,6 +419,7 @@ fn set_credential_with_keychain_writer_unlocked(
     keychain_write: impl FnOnce() -> Result<(), String>,
 ) -> Result<AuthStorageBackend, String> {
     let file_key = kind.file_key(registry);
+    let previous = credential_authority::read(registry, kind);
     // Readers hold the same lock and require this digest to match, so a crash
     // before the backend write hides the predecessor instead of reviving it.
     credential_authority::set(
@@ -449,17 +450,62 @@ fn set_credential_with_keychain_writer_unlocked(
         }
         Err(keychain_error) => {
             tracing::warn!("system keychain unavailable — using encrypted file storage");
-            credential_authority::set(
-                registry,
-                kind,
-                CredentialAuthority::active(CredentialBackend::EncryptedFileFallback, token),
-            )
-            .map_err(|error| format!("failed to record intended fallback authority: {error}"))?;
-            set_token_in_file(&file_key, token).map_err(|file_error| {
+            // A fallback that fails before the credential file is replaced
+            // stores nothing, as the keychain didn't either, so the
+            // predecessor's record stands again, rather than one that hides
+            // it.
+            let failed = |file_error: String| {
+                if let Ok(previous) = previous {
+                    let restored = match previous {
+                        Some(authority) => credential_authority::set(registry, kind, authority),
+                        None => credential_authority::clear(registry, kind),
+                    };
+                    if let Err(error) = restored {
+                        tracing::debug!(
+                            "could not restore the credential's earlier record: {error}"
+                        );
+                    }
+                }
                 format!(
                     "keychain write failed ({keychain_error}); encrypted fallback failed: {file_error}"
                 )
-            })?;
+            };
+            // Refused before the fallback is recorded at all.
+            if let Err(file_error) = prepare_lpm_home_for_secrets(&lpm_dir()?) {
+                return Err(failed(file_error));
+            }
+            let recorded = credential_authority::set(
+                registry,
+                kind,
+                CredentialAuthority::active(CredentialBackend::EncryptedFileFallback, token),
+            );
+            #[cfg(test)]
+            let recorded = recorded.and_then(|()| {
+                inject_fallback_failure(InjectedFallbackFailure::RecordingTheFallback)
+            });
+            if let Err(error) = recorded {
+                return Err(failed(format!(
+                    "failed to record intended fallback authority: {error}"
+                )));
+            }
+            let written = set_token_in_file(&file_key, token);
+            #[cfg(test)]
+            let written = written
+                .and_then(|()| inject_fallback_failure(InjectedFallbackFailure::AfterTheFileWrite));
+            if let Err(file_error) = written {
+                // The file is replaced before its directory is synced, so a
+                // write can fail with the new token already in place, which
+                // the fallback's record then rightly names.
+                if matches!(
+                    probe_token_from_file(&file_key),
+                    EncryptedFileCredentialProbe::Found(stored) if stored == token
+                ) {
+                    return Err(format!(
+                        "keychain write failed ({keychain_error}); the encrypted fallback holds the credential, but may not have been saved durably: {file_error}"
+                    ));
+                }
+                return Err(failed(file_error));
+            }
             Ok(AuthStorageBackend::EncryptedFileFallback)
         }
     }
@@ -2498,6 +2544,18 @@ fn prepare_lpm_home(directory: &Path) -> Result<(), String> {
     prepare_lpm_home_for(directory, HomeWrite::Adds)
 }
 
+/// [`prepare_lpm_home`] for a credential or the key that encrypts the
+/// credential file, which must not go where anyone using the computer could
+/// read them, as on a drive that keeps no file permissions.
+fn prepare_lpm_home_for_secrets(directory: &Path) -> Result<(), String> {
+    prepare_lpm_home(directory)?;
+    lpm_common::keep_lpm_home_private(directory).map_err(|reason| {
+        format!(
+            "{reason}, so LPM won't save login credentials there; point LPM_HOME at a folder on an NTFS drive"
+        )
+    })
+}
+
 /// [`prepare_lpm_home`] for a write that may add nothing: that goes ahead in
 /// a home git could commit, so logging out still removes what the home
 /// holds.
@@ -2642,7 +2700,7 @@ fn write_file_auth_key(key_path: &Path, value: &str) -> Result<(), String> {
     let directory = key_path
         .parent()
         .ok_or_else(|| "auth data-key path has no parent".to_owned())?;
-    prepare_lpm_home(directory)?;
+    prepare_lpm_home_for_secrets(directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2896,6 +2954,32 @@ fn probe_token_from_file(registry_url: &str) -> EncryptedFileCredentialProbe {
     }
 }
 
+/// Where a test has a file fallback fail once.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectedFallbackFailure {
+    /// Recording the fallback as where the credential is.
+    RecordingTheFallback,
+    /// After the credential file is replaced, as a failed directory sync.
+    AfterTheFileWrite,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_FALLBACK_FAILURE: std::cell::Cell<Option<InjectedFallbackFailure>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Fails once at `point` when a test asked for it there.
+#[cfg(test)]
+fn inject_fallback_failure(point: InjectedFallbackFailure) -> Result<(), String> {
+    if INJECTED_FALLBACK_FAILURE.get() == Some(point) {
+        INJECTED_FALLBACK_FAILURE.set(None);
+        return Err(format!("injected failure: {point:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn get_token_from_file(registry_url: &str) -> Option<String> {
     match probe_token_from_file(registry_url) {
@@ -2939,7 +3023,7 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
     let json_str = serde_json::to_string(&store).map_err(|e| format!("json error: {e}"))?;
     let encrypted = encrypt(&json_str)?;
 
-    prepare_lpm_home(&lpm_dir()?)?;
+    prepare_lpm_home_for_secrets(&lpm_dir()?)?;
     lpm_common::write_file_atomic_with_options(
         &path,
         encrypted,
@@ -4146,6 +4230,158 @@ mod tests {
 
         assert!(error.contains("LPM_HOME"), "{error}");
         assert!(!repository.join(".credentials").exists());
+    }
+
+    #[test]
+    fn file_backed_credentials_are_refused_where_anyone_using_the_computer_could_read_them() {
+        with_temp_home(|home| {
+            let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+            let saved = set_token_in_file("https://registry.example", "token");
+            let recorded = prepare_lpm_home(&home.join(".lpm"));
+            drop(pretending);
+
+            let error = saved.unwrap_err();
+            assert!(
+                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't save login credentials there"),
+                "{error}"
+            );
+            assert!(!home.join(".lpm").join(".credentials").exists());
+            assert!(!home.join(".lpm").join(".key").exists());
+            // Records that hold no secret, such as a token's expiry, go ahead.
+            recorded.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_fallback_login_refused_on_a_drive_without_permissions_leaves_the_earlier_record() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let earlier = CredentialAuthority::committed_keychain("keychain-token");
+            credential_authority::set(registry, CredentialKind::Access, earlier.clone()).unwrap();
+
+            let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+            let stored = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-token",
+                || Err("keychain unavailable".to_owned()),
+            );
+            drop(pretending);
+
+            let error = stored.unwrap_err();
+            assert!(
+                error.contains("so LPM won't save login credentials there"),
+                "{error}"
+            );
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(earlier)
+            );
+        });
+    }
+
+    #[test]
+    fn a_fallback_login_whose_file_write_fails_leaves_the_earlier_record() {
+        with_temp_home(|home| {
+            let registry = "https://registry.example";
+            let earlier = CredentialAuthority::committed_keychain("keychain-token");
+            credential_authority::set(registry, CredentialKind::Access, earlier.clone()).unwrap();
+            // A directory where the credential file goes fails the file
+            // fallback, which reads the store there before it writes.
+            std::fs::create_dir_all(home.join(".lpm").join(".credentials")).unwrap();
+
+            let stored = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-token",
+                || Err("keychain unavailable".to_owned()),
+            );
+
+            assert!(stored.unwrap_err().contains("encrypted fallback failed"));
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(earlier)
+            );
+        });
+    }
+
+    #[test]
+    fn a_fallback_login_whose_record_fails_leaves_the_earlier_record() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let earlier = CredentialAuthority::committed_keychain("keychain-token");
+            credential_authority::set(registry, CredentialKind::Access, earlier.clone()).unwrap();
+            INJECTED_FALLBACK_FAILURE.set(Some(InjectedFallbackFailure::RecordingTheFallback));
+
+            let stored = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-token",
+                || Err("keychain unavailable".to_owned()),
+            );
+            INJECTED_FALLBACK_FAILURE.set(None);
+
+            assert!(
+                stored
+                    .unwrap_err()
+                    .contains("failed to record intended fallback authority")
+            );
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(earlier)
+            );
+        });
+    }
+
+    #[test]
+    fn a_fallback_that_fails_after_its_file_is_in_place_keeps_naming_it() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let earlier = CredentialAuthority::committed_keychain("keychain-token");
+            credential_authority::set(registry, CredentialKind::Access, earlier).unwrap();
+            INJECTED_FALLBACK_FAILURE.set(Some(InjectedFallbackFailure::AfterTheFileWrite));
+
+            let stored = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-token",
+                || Err("keychain unavailable".to_owned()),
+            );
+            INJECTED_FALLBACK_FAILURE.set(None);
+
+            assert!(
+                stored
+                    .unwrap_err()
+                    .contains("may not have been saved durably")
+            );
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(CredentialAuthority::active(
+                    CredentialBackend::EncryptedFileFallback,
+                    "new-token"
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn a_credential_file_already_there_is_not_rewritten_where_anyone_could_read_it() {
+        with_temp_home(|home| {
+            set_token_in_file("https://registry.example", "first").unwrap();
+            let credentials = home.join(".lpm").join(".credentials");
+            let before = std::fs::read(&credentials).unwrap();
+
+            let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+            let saved = set_token_in_file("https://registry.example", "second");
+            drop(pretending);
+
+            let error = saved.unwrap_err();
+            assert!(
+                error.contains("so LPM won't save login credentials there"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&credentials).unwrap(), before);
+        });
     }
 
     #[test]

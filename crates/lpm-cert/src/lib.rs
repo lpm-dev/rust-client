@@ -197,6 +197,7 @@ struct RootCaPair {
 }
 
 fn ensure_root_ca_pair_locked(ca_dir: &paths::GlobalCaDirectory) -> Result<RootCaPair, LpmError> {
+    ca_dir.refuse_unprotected_key()?;
     let cert_path = ca_dir.path("rootCA.pem");
     let key_path = ca_dir.path("rootCA-key.pem");
     let generated = match (
