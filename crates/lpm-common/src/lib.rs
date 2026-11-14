@@ -43,24 +43,28 @@ pub mod project_secret;
 pub mod project_state;
 pub mod provenance;
 pub mod registry_http;
+pub mod script_directory;
 pub mod stored_env;
 pub mod symlink;
 pub mod terminal;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub mod test_disk_image;
+#[cfg(all(windows, any(test, feature = "test-support")))]
+pub mod test_network_path;
 // The 64-bit system call's groups are 32-bit; 32-bit systems have two calls.
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub mod thread_identity;
 mod utf8_bom;
+pub mod volume;
 
-#[cfg(windows)]
-pub use atomic_write::rename_open_file_noreplace;
 #[cfg(unix)]
 pub use atomic_write::replace_symlink_atomic;
 pub use atomic_write::{
     AtomicWriteOptions, write_file_atomic, write_file_atomic_in_dir_with,
     write_file_atomic_in_dir_with_options, write_file_atomic_with, write_file_atomic_with_options,
 };
+#[cfg(windows)]
+pub use atomic_write::{rename_open_file_noreplace, rename_open_file_replacing};
 #[cfg(unix)]
 pub use bounded_read::current_uid;
 #[cfg(unix)]
@@ -119,8 +123,9 @@ pub use project_glob::{rooted_project_glob, validate_project_glob};
 pub use project_state::{
     PROJECT_STATE_DIR, ensure_project_state_dir, ensure_project_state_dir_in,
     is_project_state_name, keep_existing_lpm_home_ignored, keep_existing_project_state_ignored,
-    keep_lpm_home_ignored, keep_lpm_home_ignored_in, keep_state_dir_ignored_or_warn,
-    project_package_dirs, project_state_dir,
+    keep_lpm_home_ignored, keep_lpm_home_ignored_in, keep_lpm_home_private,
+    keep_lpm_home_private_in, keep_state_dir_ignored_or_warn, project_package_dirs,
+    project_state_dir,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use registry_http::{

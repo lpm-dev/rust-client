@@ -46,5 +46,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+lpm-common = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

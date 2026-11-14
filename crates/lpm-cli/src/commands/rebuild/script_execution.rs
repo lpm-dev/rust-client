@@ -55,7 +55,7 @@ pub(super) fn execute_script(
     if cancelled.load(Ordering::Acquire) {
         return Err("Lifecycle script interrupted".to_string());
     }
-    let mut child = spawn_lifecycle_child(
+    let (mut child, _directory) = spawn_lifecycle_child(
         cmd,
         pkg_name,
         pkg_version,
@@ -204,7 +204,13 @@ pub(super) fn spawn_lifecycle_child(
     tmpdir: &Path,
     stdin: lpm_sandbox::SandboxStdio,
     retained_directory: Option<&cap_std::fs::Dir>,
-) -> Result<std::process::Child, String> {
+) -> Result<
+    (
+        std::process::Child,
+        Option<lpm_common::script_directory::ScriptDirectory>,
+    ),
+    String,
+> {
     use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform_with_options};
 
     if let Some(directory) = retained_directory {
@@ -239,12 +245,23 @@ pub(super) fn spawn_lifecycle_child(
     }
 
     let (shell_program, shell_args) = platform_shell_invocation(cmd)?;
+    // Without the sandbox, cmd.exe reaches a package in a network folder
+    // through a drive letter, which the caller keeps until the script has
+    // exited. A sandboxed script is left to the sandbox, which refuses a
+    // network folder: the access rules it sets name the network path.
+    let directory = matches!(sandbox_mode, SandboxMode::Disabled)
+        .then(|| lpm_common::script_directory::ScriptDirectory::for_shell(package_dir))
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let mut sbcmd = SandboxedCommand::new(shell_program);
     for arg in shell_args {
         sbcmd = sbcmd.arg(arg);
     }
     sbcmd = sbcmd
-        .current_dir(package_dir)
+        .current_dir(directory.as_ref().map_or(
+            package_dir,
+            lpm_common::script_directory::ScriptDirectory::path,
+        ))
         .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
     #[cfg(unix)]
     if let Some(directory) = retained_directory {
@@ -261,9 +278,10 @@ pub(super) fn spawn_lifecycle_child(
     sbcmd.stderr = SandboxStdio::Piped;
     sbcmd.stdin = stdin;
 
-    sandbox
+    let child = sandbox
         .spawn(sbcmd)
-        .map_err(|e| format!("failed to spawn: {e}"))
+        .map_err(|e| format!("failed to spawn: {e}"))?;
+    Ok((child, directory))
 }
 
 fn validate_retained_lifecycle_directory(
@@ -348,7 +366,7 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
         #[cfg(target_os = "macos")]
         apple_developer_dir: None,
     };
-    let mut child = spawn_lifecycle_child(
+    let (mut child, _directory) = spawn_lifecycle_child(
         cmd,
         package_name,
         package_version,

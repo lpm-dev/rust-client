@@ -41,6 +41,8 @@ windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WNet",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -54,7 +56,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-# Test helpers other crates' tests use: macOS disk images.
+# Test helpers other crates' tests use: macOS disk images and Windows
+# network paths.
 test-support = []
 
 [dev-dependencies]

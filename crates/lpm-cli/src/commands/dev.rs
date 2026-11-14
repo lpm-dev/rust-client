@@ -3859,6 +3859,11 @@ async fn auto_install_if_stale(
             let elapsed = start.elapsed();
             Ok(format!("installed in {}", format_duration(elapsed)))
         }
+        // A project the install refuses, as on a drive that can't hold
+        // node_modules, keeps the error's own kind, which names no script.
+        Err(LpmError::ProjectFile(message)) => Err(LpmError::ProjectFile(format!(
+            "auto-install failed: {message}\n    Use --no-install to skip dependency installation."
+        ))),
         Err(e) => Err(LpmError::Script(format!(
             "auto-install failed: {e}\n    Use --no-install to skip dependency installation."
         ))),

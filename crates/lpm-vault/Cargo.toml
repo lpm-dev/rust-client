@@ -61,6 +61,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+lpm-common = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }

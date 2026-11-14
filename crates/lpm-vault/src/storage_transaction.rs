@@ -40,6 +40,9 @@ pub(crate) struct VaultStorageDirectory {
     display: PathBuf,
     /// Why git could commit what is written here, which refuses writes.
     exposed: Option<std::sync::Arc<str>>,
+    /// Why anyone using the computer could read what is written here, which
+    /// refuses writes.
+    unprotected: Option<std::sync::Arc<str>>,
 }
 
 impl VaultStorageDirectory {
@@ -71,6 +74,9 @@ impl VaultStorageDirectory {
         home.exposed = lpm_common::keep_lpm_home_ignored_in(&home.directory, &home.display)
             .err()
             .map(std::sync::Arc::from);
+        home.unprotected = lpm_common::keep_lpm_home_private_in(&home.directory, &home.display)
+            .err()
+            .map(std::sync::Arc::from);
         Ok(home)
     }
 
@@ -79,13 +85,19 @@ impl VaultStorageDirectory {
         let mut child =
             Self::open_or_create_child(&self.directory, &self.display, OsStr::new(name))?;
         child.exposed.clone_from(&self.exposed);
+        child.unprotected.clone_from(&self.unprotected);
         Ok(child)
     }
 
     fn refuse_if_exposed(&self) -> Result<(), String> {
-        match &self.exposed {
-            Some(reason) => Err(format!(
+        if let Some(reason) = &self.exposed {
+            return Err(format!(
                 "{reason}, so git could commit the local env secrets saved there; point LPM_HOME at a directory of its own"
+            ));
+        }
+        match &self.unprotected {
+            Some(reason) => Err(format!(
+                "{reason}, so LPM won't save local env secrets there; point LPM_HOME at a folder on an NTFS drive"
             )),
             None => Ok(()),
         }
@@ -173,6 +185,7 @@ impl VaultStorageDirectory {
             directory,
             display,
             exposed: None,
+            unprotected: None,
         })
     }
 
@@ -1235,6 +1248,24 @@ mod tests {
                 directory.read_owner_only_file("vault.enc", "vault")
             })
             .unwrap();
+        });
+    }
+
+    #[test]
+    fn env_secrets_are_not_written_where_anyone_using_the_computer_could_read_them() {
+        with_temp_home(|home| {
+            let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+            let written = with_vault_transaction(|directory| {
+                directory.write_owner_only_file("vault.enc", b"ciphertext", "vault")
+            });
+            drop(pretending);
+
+            let error = written.unwrap_err();
+            assert!(
+                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't save local env secrets there"),
+                "{error}"
+            );
+            assert!(!home.join(".lpm/vault.enc").exists());
         });
     }
 
