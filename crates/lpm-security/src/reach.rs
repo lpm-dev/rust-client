@@ -75,6 +75,12 @@ pub enum ReachFinding {
     /// `npm run`, a line of a shell script, or a `binding.gyp` command
     /// expansion. `source` names where the command came from.
     RunsRedCommand { source: String, command: String },
+    /// A lifecycle command names a tool of the green allowlist, and a
+    /// dependency that is not one of the tool's publishers declares a
+    /// command of that name. `provider` is that dependency. Recorded by the
+    /// caller that knows the package's installed dependencies; [`analyze`]
+    /// reads only the package itself.
+    RunsToolFromOtherPackage { command: String, provider: String },
 }
 
 /// Package managers whose nested installs can still run dependency
@@ -187,6 +193,13 @@ impl std::fmt::Display for ReachFinding {
                     "runs a command the static gate marks Red ({source}): {command}"
                 )
             }
+            Self::RunsToolFromOtherPackage { command, provider } => {
+                write!(f, "runs `{command}` from {provider}")?;
+                match crate::static_gate::green_tool(command) {
+                    Some(tool) => write!(f, ", which is not {}", tool.providers.join(" or ")),
+                    None => Ok(()),
+                }
+            }
             Self::ApprovesOtherPackages { field, packages } => {
                 write!(f, "approves scripts for other packages in {field}: ")?;
                 let shown = packages.len().min(DISPLAYED_PACKAGES);
@@ -210,6 +223,7 @@ impl ReachFinding {
             Self::ChangesScriptPolicy { marker, .. } => marker,
             Self::EditsScriptApprovals { key, .. } => key,
             Self::ApprovesOtherPackages { field, .. } => field,
+            Self::RunsToolFromOtherPackage { command, .. } => command,
         }
     }
 }
@@ -1584,5 +1598,26 @@ mod tests {
         assert_eq!(package_name("@swc/core"), "@swc/core");
         assert_eq!(package_name("sqlite@1.0.0#sha512-x"), "sqlite");
         assert_eq!(package_name("a>b>@scope/c"), "@scope/c");
+    }
+
+    #[test]
+    fn a_tool_from_another_package_needs_individual_review_and_names_both_packages() {
+        let finding = ReachFinding::RunsToolFromOtherPackage {
+            command: "electron-rebuild".into(),
+            provider: "attacker@1.0.0".into(),
+        };
+        assert!(finding.requires_individual_review());
+        assert_eq!(
+            finding.to_string(),
+            "runs `electron-rebuild` from attacker@1.0.0, which is not @electron/rebuild or electron-rebuild"
+        );
+        assert_eq!(
+            serde_json::to_value(&finding).unwrap(),
+            serde_json::json!({
+                "kind": "runs-tool-from-other-package",
+                "command": "electron-rebuild",
+                "provider": "attacker@1.0.0",
+            })
+        );
     }
 }

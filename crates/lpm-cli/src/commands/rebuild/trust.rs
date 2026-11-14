@@ -398,7 +398,8 @@ pub(super) fn evaluate_trust_unsuspended(
 
 /// Green auto-run never runs a package that needs individual review: a
 /// `node-gyp rebuild` whose `binding.gyp` expands `<!(bun install)` is
-/// Green by its command alone.
+/// Green by its command alone, and so is a `tsc` that a dependency other
+/// than `typescript` would supply.
 fn green_package_reaches_beyond_itself(
     package_dir: &Path,
     scripts: &HashMap<String, String>,
@@ -407,7 +408,7 @@ fn green_package_reaches_beyond_itself(
         .iter()
         .filter_map(|phase| Some(((*phase).to_string(), scripts.get(*phase)?.clone())))
         .collect();
-    lpm_security::reach::analyze(package_dir, &phase_bodies).requires_individual_review()
+    super::lifecycle_tools::script_reach(package_dir, &phase_bodies).requires_individual_review()
 }
 
 /// Worst execution tier across the active lifecycle phases.

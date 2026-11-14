@@ -594,6 +594,7 @@ fn lifecycle_environment_disables_nested_install_scripts_over_inherited_values()
         Path::new("/project"),
         Path::new("/tmp"),
         None,
+        true,
     );
     let policy: Vec<(String, String)> = envs
         .iter()

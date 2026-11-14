@@ -962,7 +962,10 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             // populates `static_tier` from the
             // worst-wins reduction above.
             static_tier,
-            reach: Some(lpm_security::reach::analyze(pkg_dir, &phase_bodies)),
+            reach: Some(crate::commands::rebuild::script_reach(
+                pkg_dir,
+                &phase_bodies,
+            )),
             // forwarded from the install
             // pipeline's per-package provenance fetch. Populated
             // for EVERY blocked package that went through the

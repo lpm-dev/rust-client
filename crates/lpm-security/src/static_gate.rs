@@ -1677,6 +1677,85 @@ fn tokens_are_compound(tokens: &[String]) -> bool {
 // Step 5 — green allowlist
 // ─────────────────────────────────────────────────────────────────────
 
+/// A command the green allowlist names that a package supplies, with the
+/// registry packages that publish it.
+///
+/// The allowlist reads a command's text. Which executable the shell then
+/// finds under that name depends on the lifecycle `PATH`, where a package's
+/// dependencies and the project put the commands their `bin` fields declare,
+/// under any name they choose. A green command is therefore the reviewed
+/// tool only when one of `providers` supplies it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GreenTool {
+    pub command: &'static str,
+    pub providers: &'static [&'static str],
+}
+
+/// Every package-supplied command of the green allowlist. `exit`, `:` and
+/// `echo` are shell builtins, and a green `node` command needs review before
+/// it runs (see [`classify_for_execution`]).
+pub const GREEN_TOOLS: &[GreenTool] = &[
+    GreenTool {
+        command: "node-gyp",
+        providers: &["node-gyp"],
+    },
+    GreenTool {
+        command: "node-gyp-build",
+        providers: &["node-gyp-build"],
+    },
+    GreenTool {
+        command: "node-gyp-build-optional-packages",
+        providers: &["node-gyp-build-optional-packages"],
+    },
+    GreenTool {
+        command: "electron-rebuild",
+        providers: &["@electron/rebuild", "electron-rebuild"],
+    },
+    GreenTool {
+        command: "tsc",
+        providers: &["typescript"],
+    },
+    GreenTool {
+        command: "prisma",
+        providers: &["prisma"],
+    },
+    GreenTool {
+        command: "husky",
+        providers: &["husky"],
+    },
+];
+
+/// The [`GreenTool`] a command name refers to, if it is one.
+pub fn green_tool(command: &str) -> Option<&'static GreenTool> {
+    GREEN_TOOLS.iter().find(|tool| tool.command == command)
+}
+
+/// The green tools a lifecycle command can start: each one named where the
+/// shell reads a command, at the start of the script or after an operator.
+/// A script that cannot be tokenized names none.
+pub fn green_tools_in(script: &str) -> Vec<&'static GreenTool> {
+    let Some(tokens) = shlex::split(&normalize_operators(script)) else {
+        return Vec::new();
+    };
+    let mut tools: Vec<&'static GreenTool> = Vec::new();
+    let mut at_command = true;
+    for token in &tokens {
+        if is_compound_op(token) {
+            at_command = true;
+        } else if at_command && !is_environment_assignment(token) {
+            at_command = false;
+            // A token with a path separator names a file, not a `PATH` lookup.
+            if !token.contains(['/', '\\'])
+                && let Some(tool) = green_tool(&command_name(token))
+                && !tools.contains(&tool)
+            {
+                tools.push(tool);
+            }
+        }
+    }
+    tools
+}
+
 fn tokens_match_green(tokens: &[String], script: &str) -> bool {
     match tokens.first().map(String::as_str) {
         Some("node-gyp") => matches_node_gyp(tokens),
@@ -3669,5 +3748,64 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    fn green_commands_in(script: &str) -> Vec<&'static str> {
+        green_tools_in(script)
+            .into_iter()
+            .map(|tool| tool.command)
+            .collect()
+    }
+
+    #[test]
+    fn every_green_tool_command_is_on_the_green_allowlist() {
+        for tool in GREEN_TOOLS {
+            let script = match tool.command {
+                "node-gyp" => "node-gyp rebuild".to_string(),
+                "prisma" => "prisma generate".to_string(),
+                command => command.to_string(),
+            };
+            assert_eq!(
+                classify_for_execution(&script),
+                StaticTier::Green,
+                "{script}"
+            );
+            assert!(!tool.providers.is_empty(), "{script}");
+        }
+    }
+
+    #[test]
+    fn green_scripts_name_a_listed_tool_or_no_package_command() {
+        for script in ["exit 0", ":", "echo done"] {
+            assert_eq!(
+                classify_for_execution(script),
+                StaticTier::Green,
+                "{script}"
+            );
+            assert!(green_tools_in(script).is_empty(), "{script}");
+        }
+    }
+
+    #[test]
+    fn green_tools_are_found_wherever_the_shell_reads_a_command() {
+        assert_eq!(green_commands_in("tsc -p ."), ["tsc"]);
+        assert_eq!(
+            green_commands_in("prebuild-install || node-gyp rebuild"),
+            ["node-gyp"]
+        );
+        assert_eq!(
+            green_commands_in("CI=1 husky install && tsc; tsc"),
+            ["husky", "tsc"]
+        );
+        assert_eq!(green_commands_in("TSC.CMD"), ["tsc"]);
+    }
+
+    #[test]
+    fn a_tool_name_that_is_an_argument_or_a_path_is_not_a_command_lookup() {
+        assert!(green_tools_in("echo tsc").is_empty());
+        assert!(green_tools_in("./tsc").is_empty());
+        assert!(green_tools_in("node_modules/.bin/tsc").is_empty());
+        assert!(green_tools_in("node tsc").is_empty());
+        assert!(green_tools_in("tsc 'unterminated").is_empty());
     }
 }

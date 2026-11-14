@@ -50,6 +50,7 @@ use self::build_cache::{
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
 pub use self::hints::{all_scripted_packages_trusted_in_context, show_install_build_hint};
+pub(crate) use self::lifecycle_tools::script_reach;
 use self::package_dir::prepare_live_package_dir;
 #[cfg(test)]
 use self::sandbox_env::build_sanitized_env;
@@ -354,6 +355,8 @@ async fn run_under_store_lock(
         &baseline_index,
         &lockfile,
     );
+
+    let registry_packages = lifecycle_tools::RegistryPackages::of(&lockfile);
 
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
@@ -1267,7 +1270,12 @@ async fn run_under_store_lock(
         };
         let script_tmpdir = scratch_path.join("tmp");
         let tools = match std::fs::create_dir(&script_tmpdir).map_err(|e| e.to_string()).and_then(|()| {
-            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path)
+            let scope = if pkg.trust_reason == TrustReason::GreenTierUnderTriage {
+                lifecycle_tools::ToolScope::GreenTools { registry_packages: &registry_packages, project_dir }
+            } else {
+                lifecycle_tools::ToolScope::Dependencies
+            };
+            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path, scope)
         }) {
             Ok(tools) => tools,
             Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }

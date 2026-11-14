@@ -37,10 +37,15 @@ pub(super) fn execute_script(
     if cancelled.load(Ordering::Acquire) {
         return Err("Lifecycle script interrupted".to_string());
     }
-    let mut envs: HashMap<_, _> =
-        build_lifecycle_environment(env, project_dir, tmpdir, Some(&tools.bin_dir))
-            .into_iter()
-            .collect();
+    let mut envs: HashMap<_, _> = build_lifecycle_environment(
+        env,
+        project_dir,
+        tmpdir,
+        Some(&tools.bin_dir),
+        tools.project_bins,
+    )
+    .into_iter()
+    .collect();
     lpm_runner::npm_context::NpmScriptContext::new(
         Some(pkg_name),
         Some(pkg_version),
@@ -113,14 +118,21 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
     ("YARN_ENABLE_SCRIPTS", "false"),
 ];
 
+/// `project_bins` puts the project's `node_modules/.bin` on the `PATH`,
+/// after `bin_dir` and ahead of the caller's own entries.
 pub(super) fn build_lifecycle_environment(
     env: &super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
     tmpdir: &Path,
     bin_dir: Option<&Path>,
+    project_bins: bool,
 ) -> Vec<(OsString, OsString)> {
     let parent_path = find_env_case_insensitive(env, "PATH");
-    let mut path_value = build_lifecycle_path(project_dir, parent_path);
+    let mut path_value = if project_bins {
+        build_lifecycle_path(project_dir, parent_path)
+    } else {
+        inherited_path(parent_path).to_owned()
+    };
     if let Some(bin_dir) = bin_dir {
         let mut prefixed = bin_dir.as_os_str().to_owned();
         prefixed.push(if cfg!(windows) { ";" } else { ":" });
@@ -748,20 +760,22 @@ pub(in crate::commands) fn build_lifecycle_path(
     project_dir: &Path,
     parent_path: Option<&OsStr>,
 ) -> OsString {
-    #[cfg(windows)]
-    let (separator, fallback) = (
-        ";",
-        r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem",
-    );
-    #[cfg(not(windows))]
-    let (separator, fallback) = (":", "/usr/bin:/bin");
     let mut path = project_dir
         .join("node_modules")
         .join(".bin")
         .into_os_string();
-    path.push(separator);
-    path.push(parent_path.unwrap_or(OsStr::new(fallback)));
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(inherited_path(parent_path));
     path
+}
+
+/// The caller's `PATH`, or the system directories when it has none.
+fn inherited_path(parent_path: Option<&OsStr>) -> &OsStr {
+    #[cfg(windows)]
+    let fallback = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
+    #[cfg(not(windows))]
+    let fallback = "/usr/bin:/bin";
+    parent_path.unwrap_or(OsStr::new(fallback))
 }
 
 /// Returns an absolute system shell path so package-local PATH entries cannot
@@ -814,6 +828,7 @@ mod cancellation_tests {
                 None,
                 root.path(),
                 root.path(),
+                super::super::lifecycle_tools::ToolScope::Dependencies,
             )
             .unwrap(),
             "cancel-probe",
