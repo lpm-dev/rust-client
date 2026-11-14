@@ -3,8 +3,8 @@
 //! cmd.exe can't run in a network folder: started in
 //! `\\server\share\project`, it warns that UNC paths are not supported and
 //! runs the script in the Windows directory instead. A script in a network
-//! folder therefore runs through a drive letter: one already mapped to the
-//! folder's share, or a free one LPM maps while its scripts run there.
+//! folder therefore runs through a drive letter: one the user mapped to the
+//! folder's share, or one LPM gives the share while its scripts run there.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,14 +21,15 @@ pub struct ScriptDirectory {
 
 impl ScriptDirectory {
     /// `directory` as the system shell can use it: itself, or on Windows,
-    /// for a network folder, the same folder through a drive letter. LPM
-    /// maps a free letter, from `Z:` down, only when no letter reaches the
-    /// folder already, and removes it once nothing it runs uses it.
+    /// for a network folder, the same folder through a drive letter. Without
+    /// a letter the user mapped there, LPM defines one for this sign-in, as
+    /// `subst` does, from `Z:` down, and removes its definition once nothing
+    /// it runs uses it.
     ///
     /// # Errors
     ///
-    /// On Windows, when a letter already mapped to the share can't open the
-    /// folder, or no letter is free for it, or the share can't be mapped.
+    /// On Windows, when no letter is free for a network folder, or Windows
+    /// refuses to define one.
     #[cfg(windows)]
     pub fn for_shell(directory: &Path) -> io::Result<Self> {
         match windows::network_folder(directory) {
@@ -109,15 +110,12 @@ mod windows {
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::sync::Mutex;
 
-    use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_ASSIGNED, ERROR_BAD_DEVICE, ERROR_DEVICE_ALREADY_REMEMBERED,
-        ERROR_DEVICE_IN_USE, ERROR_MORE_DATA, ERROR_NOT_CONNECTED, ERROR_OPEN_FILES, NO_ERROR,
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DDD_EXACT_MATCH_ON_REMOVE, DDD_NO_BROADCAST_SYSTEM, DDD_RAW_TARGET_PATH,
+        DDD_REMOVE_DEFINITION, DefineDosDeviceW, GetLogicalDrives, QueryDosDeviceW,
     };
-    use windows_sys::Win32::NetworkManagement::WNet::{
-        CONNECT_TEMPORARY, NETRESOURCEW, RESOURCETYPE_DISK, WNetAddConnection2W,
-        WNetCancelConnection2W, WNetGetConnectionW,
-    };
-    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
     /// Whether `program` runs in cmd.exe: cmd.exe itself, named with or
     /// without its extension, or a batch file.
@@ -171,16 +169,27 @@ mod windows {
         })
     }
 
-    /// The drive letters LPM mapped, by share, with how many
+    /// What LPM defines a letter as for `share`, `\\server\share`: the NT
+    /// path `\??\UNC\server\share`, which Windows hands to whichever network
+    /// file system serves the share.
+    fn definition_of(share: &OsStr) -> OsString {
+        // `\\server\share` gives one of its leading separators to the prefix.
+        let share: Vec<u16> = share.encode_wide().collect();
+        let mut target: Vec<u16> = r"\??\UNC".encode_utf16().collect();
+        target.extend_from_slice(share.get(1..).unwrap_or(&share));
+        OsString::from_wide(&target)
+    }
+
+    /// The letters this process defined, by share, with how many
     /// [`super::ScriptDirectory`] values use each.
-    static MAPPED: Mutex<Option<HashMap<OsString, Mapped>>> = Mutex::new(None);
+    static DEFINED: Mutex<Option<HashMap<OsString, Defined>>> = Mutex::new(None);
 
     #[derive(Debug)]
-    struct Mapped {
-        share: OsString,
+    struct Defined {
         letter: u8,
+        definition: OsString,
         users: usize,
-        /// Which mapping of the share this is, so that the holders of one
+        /// Which definition of the share this is, so that the holders of one
         /// found gone count nothing against the next.
         generation: u64,
     }
@@ -190,48 +199,47 @@ mod windows {
     /// Keeps the drive letter a script reaches a network folder by.
     #[derive(Debug)]
     pub(super) enum DriveHold {
-        /// A letter LPM mapped, removed when its last user is done.
-        Mapped { _hold: MappedHold },
-        /// A letter someone else mapped, which may be another LPM process.
-        /// The folder is kept open: Windows doesn't remove a letter that
-        /// something still has open, unless it's forced to.
+        /// A letter this process defined, whose definition goes with its
+        /// last user.
+        Defined { _hold: DefinedHold },
+        /// A letter the user mapped, left as it is. The folder is kept open
+        /// through it, which keeps Windows from removing the mapping without
+        /// being forced to.
         Borrowed { _folder: std::fs::File },
     }
 
     #[derive(Debug)]
-    pub(super) struct MappedHold {
+    pub(super) struct DefinedHold {
         share_key: OsString,
         generation: u64,
     }
 
-    impl Drop for MappedHold {
+    impl Drop for DefinedHold {
         fn drop(&mut self) {
-            // Under the lock, so that no other thread borrows the letter
-            // between the entry's removal and the letter's, which would leave
-            // it mapped with nothing tracking it.
-            let mut mapped = MAPPED
+            let mut defined = DEFINED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(drives) = mapped.as_mut() else {
+            let Some(letters) = defined.as_mut() else {
                 return;
             };
-            let last = match drives.get_mut(&self.share_key) {
-                Some(drive) if drive.generation == self.generation => {
-                    drive.users -= 1;
-                    if drive.users == 0 {
-                        drives.remove(&self.share_key)
+            let last = match letters.get_mut(&self.share_key) {
+                Some(entry) if entry.generation == self.generation => {
+                    entry.users -= 1;
+                    if entry.users == 0 {
+                        letters.remove(&self.share_key)
                     } else {
                         None
                     }
                 }
                 _ => None,
             };
-            // Someone may have removed the letter, or mapped it to something
-            // else, since.
-            if let Some(drive) = last
-                && matches!(connection_of(drive.letter), Connection::Remote(remote) if remote.eq_ignore_ascii_case(&drive.share))
+            if let Some(entry) = last
+                && let Err(error) = undefine(entry.letter, &entry.definition)
             {
-                remove_mapping_unless_used(drive.letter);
+                tracing::debug!(
+                    "could not remove the drive {}: LPM defined for scripts: {error}",
+                    char::from(entry.letter)
+                );
             }
         }
     }
@@ -239,106 +247,74 @@ mod windows {
     /// `folder` through a drive letter, and what keeps that letter.
     pub(super) fn through_drive(folder: &NetworkFolder) -> io::Result<(PathBuf, DriveHold)> {
         let share_key = folder.share.to_ascii_lowercase();
-        let mut mapped = MAPPED
+        let definition = definition_of(&folder.share);
+        let mut defined = DEFINED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let drives = mapped.get_or_insert_with(HashMap::new);
-        if let Some(drive) = drives.get_mut(&share_key) {
-            // Someone may have removed the letter since, as `net use /delete`
-            // does, or mapped it to something else. A letter Windows can't
-            // tell about counts as still there.
-            let gone = match connection_of(drive.letter) {
-                Connection::Remote(remote) => !remote.eq_ignore_ascii_case(&drive.share),
-                Connection::NotConnected => true,
-                Connection::Unknown => false,
-            };
-            if !gone {
-                drive.users += 1;
-                let hold = MappedHold {
+        let letters = defined.get_or_insert_with(HashMap::new);
+        if let Some(entry) = letters.get_mut(&share_key) {
+            // Someone may have removed the definition since.
+            if defines(entry.letter, &entry.definition) {
+                entry.users += 1;
+                let hold = DefinedHold {
                     share_key,
-                    generation: drive.generation,
+                    generation: entry.generation,
                 };
                 return Ok((
-                    on_drive(drive.letter, &folder.below),
-                    DriveHold::Mapped { _hold: hold },
+                    on_drive(entry.letter, &folder.below),
+                    DriveHold::Defined { _hold: hold },
                 ));
             }
-            drives.remove(&share_key);
+            letters.remove(&share_key);
         }
-        let unusable = match through_existing_drive(folder) {
-            Ok((path, folder_handle)) => {
-                return Ok((
-                    path,
-                    DriveHold::Borrowed {
-                        _folder: folder_handle,
-                    },
-                ));
+        // Another LPM process's letter for the share, or one a crash left:
+        // this process adds its own definition, which Windows stacks on the
+        // same one, so the letter stays while either uses it.
+        let letter = match (b'A'..=b'Z').find(|letter| {
+            dos_definitions(*letter)
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(&definition))
+        }) {
+            Some(letter) => {
+                define(letter, &definition)?;
+                letter
             }
-            // A folder a letter already reaches but can't open, missing or
-            // closed to the user, won't open through another letter either.
-            Err(Some((letter, error)))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{} can't be opened through the drive {}: mapped to it: {error}",
-                        on_share(folder).display(),
-                        char::from(letter)
-                    ),
-                ));
-            }
-            Err(unusable) => unusable,
-        };
-        let letter = map_free_letter(&folder.share).map_err(|failure| {
-            let (kind, failed) = match failure {
-                MapFailure::NoneFree if unusable.is_some() => {
-                    (io::ErrorKind::Other, "no other drive letter is free".to_owned())
+            None => {
+                if let Some((path, folder_handle)) = through_users_drive(folder) {
+                    return Ok((
+                        path,
+                        DriveHold::Borrowed {
+                            _folder: folder_handle,
+                        },
+                    ));
                 }
-                MapFailure::NoneFree => (
-                    io::ErrorKind::Other,
-                    "no drive letter is free: free one, or map one to the share yourself"
-                        .to_owned(),
-                ),
-                MapFailure::Refused(letter, error) => (
-                    error.kind(),
-                    format!("mapping it to {}: failed: {error}", char::from(letter)),
-                ),
-            };
-            let reason = match unusable {
-                Some((letter, open_error)) => format!(
-                    "the drive {}: mapped to it couldn't open {} ({open_error}), and {failed}",
-                    char::from(letter),
-                    on_share(folder).display()
-                ),
-                None => failed,
-            };
-            io::Error::new(
-                kind,
-                format!(
-                    "cmd.exe can't run scripts in a network folder, so LPM reaches {} through a drive letter, but {reason}",
-                    folder.share.to_string_lossy()
-                ),
-            )
-        })?;
-        say_mapped(&folder.share, letter);
+                let letter = define_free_letter(&definition).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cmd.exe can't run scripts in a network folder, so LPM reaches {} through a drive letter, but {error}",
+                            folder.share.to_string_lossy()
+                        ),
+                    )
+                })?;
+                say_defined(&folder.share, letter);
+                letter
+            }
+        };
         let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        drives.insert(
+        letters.insert(
             share_key.clone(),
-            Mapped {
-                share: folder.share.clone(),
+            Defined {
                 letter,
+                definition,
                 users: 1,
                 generation,
             },
         );
         Ok((
             on_drive(letter, &folder.below),
-            DriveHold::Mapped {
-                _hold: MappedHold {
+            DriveHold::Defined {
+                _hold: DefinedHold {
                     share_key,
                     generation,
                 },
@@ -347,8 +323,8 @@ mod windows {
     }
 
     /// Says once in this process for each share and letter which letter LPM
-    /// mapped.
-    fn say_mapped(share: &OsStr, letter: u8) {
+    /// defined.
+    fn say_defined(share: &OsStr, letter: u8) {
         static SAID: Mutex<Option<HashSet<(OsString, u8)>>> = Mutex::new(None);
         let mut said = SAID
             .lock()
@@ -365,19 +341,18 @@ mod windows {
         }
     }
 
-    /// `folder` through a drive letter already mapped to its share, or to a
+    /// `folder` through a drive letter the user mapped to its share, or to a
     /// folder of the share above it, with the folder held open through it.
-    /// The letter mapped closest to `folder` wins, then the first. Without
-    /// one, the first letter that reached it but couldn't open it, and why.
-    fn through_existing_drive(
-        folder: &NetworkFolder,
-    ) -> Result<(PathBuf, std::fs::File), Option<(u8, io::Error)>> {
-        let used = unsafe {
+    /// The letter mapped closest to `folder` wins, then the first. A letter
+    /// counts only where the folder opened through it is `folder` itself:
+    /// some network file systems answer for letters of another sign-in.
+    fn through_users_drive(folder: &NetworkFolder) -> Option<(PathBuf, std::fs::File)> {
+        let present = unsafe {
             // SAFETY: takes no arguments.
             GetLogicalDrives()
         };
         let mut reaching: Vec<(usize, u8, PathBuf)> = (b'A'..=b'Z')
-            .filter(|letter| used & (1 << (letter - b'A')) != 0)
+            .filter(|letter| present & (1 << (letter - b'A')) != 0)
             .filter_map(|letter| {
                 let remote = mapped_remote(letter)?;
                 let remote = network_folder(Path::new(&remote))?;
@@ -388,16 +363,30 @@ mod windows {
             })
             .collect();
         reaching.sort_by_key(|(depth, letter, _)| (std::cmp::Reverse(*depth), *letter));
-        let mut unusable = None;
-        for (_, letter, path) in reaching {
-            match open_folder(&path) {
-                Ok(handle) => return Ok((path, handle)),
-                Err(error) => {
-                    unusable.get_or_insert((letter, error));
-                }
-            }
+        reaching.into_iter().find_map(|(_, _, path)| {
+            let handle = open_folder(&path).ok()?;
+            is_folder(&handle, folder).then_some((path, handle))
+        })
+    }
+
+    /// Whether the open `handle` is `folder`: whether both final paths, as
+    /// the network file system resolves them, are one.
+    fn is_folder(handle: &std::fs::File, folder: &NetworkFolder) -> bool {
+        let Ok(reached) = crate::owner_only::final_path(handle) else {
+            return false;
+        };
+        open_folder(&on_share(folder))
+            .and_then(|direct| crate::owner_only::final_path(&direct))
+            .is_ok_and(|direct| direct.as_os_str().eq_ignore_ascii_case(reached.as_os_str()))
+    }
+
+    /// `folder` as a network path, as in `\\server\share\app`.
+    fn on_share(folder: &NetworkFolder) -> PathBuf {
+        let mut path = PathBuf::from(&folder.share);
+        for name in &folder.below {
+            path.push(name);
         }
-        Err(unusable)
+        path
     }
 
     /// Opens the folder at `path` for nothing but holding it open.
@@ -442,144 +431,136 @@ mod windows {
         }
     }
 
-    /// What a drive letter is, as far as network drives go.
-    enum Connection {
-        /// A network drive mapped to this, as in `\\server\share`.
-        Remote(OsString),
-        /// Not a network drive.
-        NotConnected,
-        /// Windows couldn't tell.
-        Unknown,
-    }
-
-    fn connection_of(letter: u8) -> Connection {
+    /// What the network drive `letter` is mapped to, as in `\\server\share`;
+    /// `None` when it isn't one, or Windows can't tell.
+    fn mapped_remote(letter: u8) -> Option<OsString> {
         let local = [u16::from(letter), u16::from(b':'), 0];
         let mut buffer = vec![0_u16; 260];
         loop {
-            let Ok(mut length) = u32::try_from(buffer.len()) else {
-                return Connection::Unknown;
-            };
+            let mut length = u32::try_from(buffer.len()).ok()?;
             let status = unsafe {
                 // SAFETY: `local` is NUL-terminated, and `buffer` holds `length` writable units.
                 WNetGetConnectionW(local.as_ptr(), buffer.as_mut_ptr(), &mut length)
             };
             match status {
                 NO_ERROR => {
-                    let Some(end) = buffer.iter().position(|unit| *unit == 0) else {
-                        return Connection::Unknown;
-                    };
-                    return Connection::Remote(OsString::from_wide(&buffer[..end]));
+                    let end = buffer.iter().position(|unit| *unit == 0)?;
+                    return Some(OsString::from_wide(&buffer[..end]));
                 }
                 ERROR_MORE_DATA if length as usize > buffer.len() => {
                     buffer.resize(length as usize, 0);
                 }
-                ERROR_NOT_CONNECTED | ERROR_BAD_DEVICE => return Connection::NotConnected,
-                _ => return Connection::Unknown,
+                _ => return None,
             }
         }
     }
 
-    /// What the drive `letter` is mapped to, as in `\\server\share`; `None`
-    /// when it isn't a network drive, or Windows can't tell.
-    fn mapped_remote(letter: u8) -> Option<OsString> {
-        match connection_of(letter) {
-            Connection::Remote(remote) => Some(remote),
-            Connection::NotConnected | Connection::Unknown => None,
+    /// What the drive `letter` is defined as for this sign-in, the most
+    /// recent definition first; empty when it isn't defined.
+    fn dos_definitions(letter: u8) -> Vec<OsString> {
+        let local = [u16::from(letter), u16::from(b':'), 0];
+        let mut buffer = vec![0_u16; 1024];
+        loop {
+            let Ok(capacity) = u32::try_from(buffer.len()) else {
+                return Vec::new();
+            };
+            let written = unsafe {
+                // SAFETY: `local` is NUL-terminated, and `buffer` holds `capacity` units.
+                QueryDosDeviceW(local.as_ptr(), buffer.as_mut_ptr(), capacity)
+            } as usize;
+            if written != 0 {
+                return buffer[..written]
+                    .split(|unit| *unit == 0)
+                    .filter(|definition| !definition.is_empty())
+                    .map(OsString::from_wide)
+                    .collect();
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as i32)
+                && buffer.len() < 65_536
+            {
+                buffer.resize(buffer.len() * 4, 0);
+                continue;
+            }
+            return Vec::new();
         }
     }
 
-    /// Maps the first free drive letter from `Z:` down to `share`, for this
-    /// sign-in only.
-    fn map_free_letter(share: &OsStr) -> Result<u8, MapFailure> {
-        let used = unsafe {
+    /// Whether `definition` is among the drive `letter`'s definitions.
+    fn defines(letter: u8, definition: &OsStr) -> bool {
+        dos_definitions(letter)
+            .iter()
+            .any(|present| present.eq_ignore_ascii_case(definition))
+    }
+
+    fn define(letter: u8, definition: &OsStr) -> io::Result<()> {
+        let local = [u16::from(letter), u16::from(b':'), 0];
+        let target: Vec<u16> = definition.encode_wide().chain(Some(0)).collect();
+        let defined = unsafe {
+            // SAFETY: both names are NUL-terminated. Without a broadcast, no window hears of
+            // a letter that exists only for LPM's scripts.
+            DefineDosDeviceW(
+                DDD_RAW_TARGET_PATH | DDD_NO_BROADCAST_SYSTEM,
+                local.as_ptr(),
+                target.as_ptr(),
+            )
+        };
+        if defined == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Removes one definition of the drive `letter` as `definition`, this
+    /// process's own; a definition stacked on it by another process stays.
+    fn undefine(letter: u8, definition: &OsStr) -> io::Result<()> {
+        let local = [u16::from(letter), u16::from(b':'), 0];
+        let target: Vec<u16> = definition.encode_wide().chain(Some(0)).collect();
+        let removed = unsafe {
+            // SAFETY: both names are NUL-terminated.
+            DefineDosDeviceW(
+                DDD_RAW_TARGET_PATH
+                    | DDD_REMOVE_DEFINITION
+                    | DDD_EXACT_MATCH_ON_REMOVE
+                    | DDD_NO_BROADCAST_SYSTEM,
+                local.as_ptr(),
+                target.as_ptr(),
+            )
+        };
+        if removed == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Defines the first free drive letter from `Z:` down as `definition`.
+    /// A letter something else defined in the meantime is given back.
+    fn define_free_letter(definition: &OsStr) -> io::Result<u8> {
+        let present = unsafe {
             // SAFETY: takes no arguments.
             GetLogicalDrives()
         };
-        let mut remote: Vec<u16> = share.encode_wide().chain(Some(0)).collect();
         for letter in (b'D'..=b'Z').rev() {
-            if used & (1 << (letter - b'A')) != 0 {
+            if present & (1 << (letter - b'A')) != 0 || !dos_definitions(letter).is_empty() {
                 continue;
             }
-            let mut local = [u16::from(letter), u16::from(b':'), 0];
-            let resource = NETRESOURCEW {
-                dwType: RESOURCETYPE_DISK,
-                lpLocalName: local.as_mut_ptr(),
-                lpRemoteName: remote.as_mut_ptr(),
-                ..NETRESOURCEW::default()
-            };
-            let status = unsafe {
-                // SAFETY: `resource` points at NUL-terminated names that outlive the call, and
-                // a null password and user name ask for the signed-in user's credentials.
-                WNetAddConnection2W(
-                    &resource,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    CONNECT_TEMPORARY,
+            define(letter, definition).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("defining {}: failed: {error}", char::from(letter)),
                 )
-            };
-            match status {
-                NO_ERROR => return Ok(letter),
-                ERROR_ALREADY_ASSIGNED | ERROR_DEVICE_ALREADY_REMEMBERED => {}
-                error => {
-                    return Err(MapFailure::Refused(
-                        letter,
-                        io::Error::from_raw_os_error(error as i32),
-                    ));
-                }
+            })?;
+            if dos_definitions(letter).len() == 1 {
+                return Ok(letter);
             }
+            let _ = undefine(letter, definition);
         }
-        Err(MapFailure::NoneFree)
-    }
-
-    /// Why a share couldn't be mapped to a drive letter.
-    #[derive(Debug)]
-    enum MapFailure {
-        NoneFree,
-        Refused(u8, io::Error),
-    }
-
-    /// Removes the drive `letter` LPM mapped, unless something still has a
-    /// file or folder open through it, as another LPM process running a
-    /// script there does. A letter left so is reused the next time.
-    fn remove_mapping_unless_used(letter: u8) {
-        let local = [u16::from(letter), u16::from(b':'), 0];
-        for delay_ms in [0, 50, 150] {
-            if delay_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            let status = unsafe {
-                // SAFETY: `local` is NUL-terminated. Without CONNECT_UPDATE_PROFILE the user's
-                // remembered connections stay as they are, and without forcing, a letter in use
-                // stays.
-                WNetCancelConnection2W(local.as_ptr(), 0, 0)
-            };
-            match status {
-                NO_ERROR => return,
-                // What a script started may still be closing its handles.
-                ERROR_OPEN_FILES | ERROR_DEVICE_IN_USE => {}
-                error => {
-                    tracing::debug!(
-                        "could not remove the drive {}: LPM mapped for scripts: {}",
-                        char::from(letter),
-                        io::Error::from_raw_os_error(error as i32)
-                    );
-                    return;
-                }
-            }
-        }
-        tracing::debug!(
-            "left the drive {}: LPM mapped for scripts, which something still uses",
-            char::from(letter)
-        );
-    }
-
-    /// `folder` as a network path, as in `\\server\share\app`.
-    fn on_share(folder: &NetworkFolder) -> PathBuf {
-        let mut path = PathBuf::from(&folder.share);
-        for name in &folder.below {
-            path.push(name);
-        }
-        path
+        Err(io::Error::other(
+            "no drive letter is free: free one, or map one to the share yourself",
+        ))
     }
 
     fn on_drive(letter: u8, below: &[OsString]) -> PathBuf {
@@ -648,6 +629,14 @@ mod windows {
         }
 
         #[test]
+        fn a_share_is_defined_as_its_unc_device_path() {
+            assert_eq!(
+                definition_of(OsStr::new(r"\\Mac\Home")),
+                OsString::from(r"\??\UNC\Mac\Home")
+            );
+        }
+
+        #[test]
         fn a_drive_mapped_to_the_share_or_a_folder_above_reaches_the_folder() {
             let folder = network_folder(Path::new(r"\\Mac\Home\Work\App")).unwrap();
             let share = network_folder(Path::new(r"\\mac\home")).unwrap();
@@ -669,25 +658,8 @@ mod windows {
         }
 
         /// The live drive tests run one at a time in a process: they share
-        /// the registry of the letters this process mapped.
+        /// the registry of the letters this process defined.
         static LIVE_DRIVES: Mutex<()> = Mutex::new(());
-
-        /// A letter a test mapped, removed when dropped unless something
-        /// still uses it.
-        struct TestLetter(u8);
-
-        impl Drop for TestLetter {
-            fn drop(&mut self) {
-                try_removing(self.0);
-            }
-        }
-
-        /// What a non-forced removal of `letter` reports.
-        fn try_removing(letter: u8) -> u32 {
-            let local = [u16::from(letter), u16::from(b':'), 0];
-            // SAFETY: `local` is NUL-terminated.
-            unsafe { WNetCancelConnection2W(local.as_ptr(), 0, 0) }
-        }
 
         fn letter_of(path: &Path) -> u8 {
             let Some(Component::Prefix(prefix)) = path.components().next() else {
@@ -699,15 +671,14 @@ mod windows {
             letter
         }
 
-        fn lpm_mapped(directory: &super::super::ScriptDirectory) -> bool {
-            matches!(directory._drive, Some(DriveHold::Mapped { .. }))
+        fn lpm_defined(directory: &super::super::ScriptDirectory) -> bool {
+            matches!(directory._drive, Some(DriveHold::Defined { .. }))
         }
 
-        /// The life of a letter LPM maps, in one test that reaches the
-        /// share as `\\127.0.0.1\<drive>$`, which no other test maps or
-        /// borrows, so no other process can hold its letters.
+        /// The life of a letter LPM defines, in one test that reaches the
+        /// share as `\\127.0.0.1\<drive>$`, which no other test reaches.
         #[test]
-        fn a_drive_lpm_maps_lasts_as_long_as_anything_uses_it() {
+        fn a_drive_lpm_defines_lasts_as_long_as_anything_uses_it() {
             let _one_at_a_time = LIVE_DRIVES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -718,13 +689,14 @@ mod windows {
             else {
                 return;
             };
+            let definition = definition_of(&network_folder(&network).unwrap().share);
 
-            // Two users share one letter, and it goes with the last.
+            // Two users share one letter, and its definition goes with the
+            // last.
             let first = super::super::ScriptDirectory::for_shell(&network).unwrap();
             let second = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            assert!(lpm_mapped(&first), "{:?} was mapped already", first.path());
+            assert!(lpm_defined(&first), "{:?}", first.path());
             assert_eq!(first.path(), second.path());
-            assert!(network_folder(first.path()).is_none(), "{:?}", first.path());
             std::fs::write(first.path().join("written"), b"through the drive").unwrap();
             assert_eq!(
                 std::fs::read(project.join("written")).unwrap(),
@@ -732,62 +704,121 @@ mod windows {
             );
             let letter = letter_of(first.path());
             drop(first);
-            assert!(
-                mapped_remote(letter).is_some(),
-                "the drive went while in use"
-            );
+            assert!(defines(letter, &definition), "the drive went while in use");
             drop(second);
-            assert_eq!(mapped_remote(letter), None, "the drive outlived its use");
+            assert!(
+                dos_definitions(letter).is_empty(),
+                "the drive outlived its use"
+            );
 
-            // A file still open through the letter, as another process's
-            // script would have one, keeps it.
+            // Another process's definition of the same letter, stacked on
+            // this one's, outlives it.
             let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            let letter = TestLetter(letter_of(reached.path()));
-            let held_open = std::fs::File::open(reached.path().join("written")).unwrap();
+            let letter = letter_of(reached.path());
+            define(letter, &definition).unwrap();
             drop(reached);
-            let while_open = mapped_remote(letter.0);
-            drop(held_open);
+            let left_for_the_other = defines(letter, &definition);
+            undefine(letter, &definition).unwrap();
             assert!(
-                while_open.is_some(),
-                "LPM removed a drive something still had a file open through"
+                left_for_the_other,
+                "LPM removed another process's definition"
             );
-            assert_eq!(
-                try_removing(letter.0),
-                NO_ERROR,
-                "the drive was still in use"
-            );
+            assert!(dos_definitions(letter).is_empty());
 
-            // A letter removed while held, as `net use /delete` would, is
-            // mapped again. The earlier holder counts nothing against the new
-            // mapping, which goes with its own last user.
+            // A definition removed while held, by someone else, is made
+            // again. The earlier holder counts nothing against the new one,
+            // which goes with its own last user.
             let earlier = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            assert!(
-                lpm_mapped(&earlier),
-                "{:?} was mapped already",
-                earlier.path()
-            );
-            assert_eq!(try_removing(letter_of(earlier.path())), NO_ERROR);
+            assert!(lpm_defined(&earlier), "{:?}", earlier.path());
+            undefine(letter_of(earlier.path()), &definition).unwrap();
             let again = super::super::ScriptDirectory::for_shell(&network).unwrap();
             let still = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            let again_letter = TestLetter(letter_of(again.path()));
+            let again_letter = letter_of(again.path());
             std::fs::write(again.path().join("written"), b"again").unwrap();
             assert_eq!(std::fs::read(project.join("written")).unwrap(), b"again");
             drop(earlier);
             drop(again);
             assert!(
-                mapped_remote(again_letter.0).is_some(),
-                "the earlier holder's drop counted against the new mapping"
+                defines(again_letter, &definition),
+                "the earlier holder's drop counted against the new definition"
             );
             drop(still);
-            assert_eq!(
-                mapped_remote(again_letter.0),
-                None,
-                "the new mapping outlived its last user"
+            assert!(
+                dos_definitions(again_letter).is_empty(),
+                "the new definition outlived its last user"
             );
         }
 
+        /// A drive mapped the way `net use` maps one, through the SMB
+        /// redirector alone, so that its removal can't reach another
+        /// network file system's drives.
+        struct UsersDrive(u8);
+
+        impl UsersDrive {
+            fn map(remote: &Path) -> Self {
+                use windows_sys::Win32::NetworkManagement::NetManagement::{
+                    NetUseAdd, USE_DISKDEV, USE_INFO_1,
+                };
+                let present = unsafe {
+                    // SAFETY: takes no arguments.
+                    GetLogicalDrives()
+                };
+                let letter = (b'D'..=b'Z')
+                    .rev()
+                    .find(|letter| {
+                        present & (1 << (letter - b'A')) == 0 && dos_definitions(*letter).is_empty()
+                    })
+                    .expect("a free drive letter");
+                let mut local: Vec<u16> = format!("{}:", char::from(letter))
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                let mut remote: Vec<u16> =
+                    remote.as_os_str().encode_wide().chain(Some(0)).collect();
+                let information = USE_INFO_1 {
+                    ui1_local: local.as_mut_ptr(),
+                    ui1_remote: remote.as_mut_ptr(),
+                    ui1_password: std::ptr::null_mut(),
+                    ui1_status: 0,
+                    ui1_asg_type: USE_DISKDEV,
+                    ui1_refcount: 0,
+                    ui1_usecount: 0,
+                };
+                // SAFETY: `information` points at NUL-terminated names that outlive the call.
+                let status = unsafe {
+                    NetUseAdd(
+                        std::ptr::null(),
+                        1,
+                        std::ptr::from_ref(&information).cast(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(status, NO_ERROR, "NetUseAdd failed");
+                Self(letter)
+            }
+
+            /// What a removal that isn't forced reports.
+            fn remove(&self) -> u32 {
+                use windows_sys::Win32::NetworkManagement::NetManagement::{
+                    NetUseDel, USE_NOFORCE,
+                };
+                let local: Vec<u16> = format!("{}:", char::from(self.0))
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                // SAFETY: `local` is NUL-terminated.
+                unsafe { NetUseDel(std::ptr::null(), local.as_ptr(), USE_NOFORCE) }
+            }
+        }
+
+        impl Drop for UsersDrive {
+            fn drop(&mut self) {
+                self.remove();
+            }
+        }
+
         #[test]
-        fn a_drive_someone_else_mapped_is_reused_and_kept_while_a_script_uses_it() {
+        fn a_drive_the_user_mapped_is_reused_and_kept_while_a_script_uses_it() {
             let _one_at_a_time = LIVE_DRIVES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -797,25 +828,25 @@ mod windows {
             let Some(network) = crate::test_network_path::through_network(&project) else {
                 return;
             };
-            // Another process's mapping, as the user's or another LPM's, of
-            // a folder no other test maps.
-            let theirs =
-                TestLetter(map_free_letter(network.parent().unwrap().as_os_str()).unwrap());
-            let theirs_letter = theirs.0;
+            // Of a folder no other test maps.
+            let users = UsersDrive::map(network.parent().unwrap());
 
             let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            let removed_while_used = try_removing(theirs_letter);
+            let removed_while_used = users.remove();
             let path = reached.path().to_path_buf();
             drop(reached);
-            let still_theirs = mapped_remote(theirs_letter);
-            drop(theirs);
+            let still_mapped = mapped_remote(users.0);
 
-            assert_eq!(letter_of(&path), theirs_letter, "{path:?}");
-            assert!(
-                matches!(removed_while_used, ERROR_OPEN_FILES | ERROR_DEVICE_IN_USE),
-                "a script's drive could be removed under it: {removed_while_used}"
+            assert_eq!(letter_of(&path), users.0, "{path:?}");
+            assert_eq!(
+                removed_while_used,
+                windows_sys::Win32::Foundation::ERROR_OPEN_FILES,
+                "a script's drive could be removed under it"
             );
-            assert!(still_theirs.is_some(), "LPM removed a drive it didn't map");
+            assert!(
+                still_mapped.is_some(),
+                "LPM removed a drive the user mapped"
+            );
         }
     }
 }
