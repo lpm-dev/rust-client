@@ -27,8 +27,8 @@ impl ScriptDirectory {
     ///
     /// # Errors
     ///
-    /// On Windows, when no drive letter is free for a network folder, or the
-    /// share can't be mapped.
+    /// On Windows, when a letter already mapped to the share can't open the
+    /// folder, or no letter is free for it, or the share can't be mapped.
     #[cfg(windows)]
     pub fn for_shell(directory: &Path) -> io::Result<Self> {
         match windows::network_folder(directory) {
@@ -293,17 +293,31 @@ mod windows {
             }
             Err(unusable) => unusable,
         };
-        let letter = map_free_letter(&folder.share).map_err(|error| {
+        let letter = map_free_letter(&folder.share).map_err(|failure| {
+            let (kind, failed) = match failure {
+                MapFailure::NoneFree if unusable.is_some() => {
+                    (io::ErrorKind::Other, "no other drive letter is free".to_owned())
+                }
+                MapFailure::NoneFree => (
+                    io::ErrorKind::Other,
+                    "no drive letter is free: free one, or map one to the share yourself"
+                        .to_owned(),
+                ),
+                MapFailure::Refused(letter, error) => (
+                    error.kind(),
+                    format!("mapping it to {}: failed: {error}", char::from(letter)),
+                ),
+            };
             let reason = match unusable {
                 Some((letter, open_error)) => format!(
-                    "the drive {}: mapped to it couldn't open {} ({open_error}), and {error}",
+                    "the drive {}: mapped to it couldn't open {} ({open_error}), and {failed}",
                     char::from(letter),
                     on_share(folder).display()
                 ),
-                None => error.to_string(),
+                None => failed,
             };
             io::Error::new(
-                error.kind(),
+                kind,
                 format!(
                     "cmd.exe can't run scripts in a network folder, so LPM reaches {} through a drive letter, but {reason}",
                     folder.share.to_string_lossy()
@@ -475,8 +489,8 @@ mod windows {
     }
 
     /// Maps the first free drive letter from `Z:` down to `share`, for this
-    /// sign-in only. Its errors say what failed, for a message about `share`.
-    fn map_free_letter(share: &OsStr) -> io::Result<u8> {
+    /// sign-in only.
+    fn map_free_letter(share: &OsStr) -> Result<u8, MapFailure> {
         let used = unsafe {
             // SAFETY: takes no arguments.
             GetLogicalDrives()
@@ -507,17 +521,21 @@ mod windows {
                 NO_ERROR => return Ok(letter),
                 ERROR_ALREADY_ASSIGNED | ERROR_DEVICE_ALREADY_REMEMBERED => {}
                 error => {
-                    let error = io::Error::from_raw_os_error(error as i32);
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!("mapping it to {}: failed: {error}", char::from(letter)),
+                    return Err(MapFailure::Refused(
+                        letter,
+                        io::Error::from_raw_os_error(error as i32),
                     ));
                 }
             }
         }
-        Err(io::Error::other(
-            "no drive letter is free: free one, or map one to the share yourself",
-        ))
+        Err(MapFailure::NoneFree)
+    }
+
+    /// Why a share couldn't be mapped to a drive letter.
+    #[derive(Debug)]
+    enum MapFailure {
+        NoneFree,
+        Refused(u8, io::Error),
     }
 
     /// Removes the drive `letter` LPM mapped, unless something still has a
@@ -729,27 +747,42 @@ mod windows {
             drop(reached);
             let while_open = mapped_remote(letter.0);
             drop(held_open);
-            drop(letter);
             assert!(
                 while_open.is_some(),
                 "LPM removed a drive something still had a file open through"
+            );
+            assert_eq!(
+                try_removing(letter.0),
+                NO_ERROR,
+                "the drive was still in use"
             );
 
             // A letter removed while held, as `net use /delete` would, is
             // mapped again. The earlier holder counts nothing against the new
             // mapping, which goes with its own last user.
             let earlier = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            assert!(
+                lpm_mapped(&earlier),
+                "{:?} was mapped already",
+                earlier.path()
+            );
             assert_eq!(try_removing(letter_of(earlier.path())), NO_ERROR);
             let again = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            let still = super::super::ScriptDirectory::for_shell(&network).unwrap();
             let again_letter = TestLetter(letter_of(again.path()));
             std::fs::write(again.path().join("written"), b"again").unwrap();
             assert_eq!(std::fs::read(project.join("written")).unwrap(), b"again");
-            drop(again);
-            let after_its_user = mapped_remote(again_letter.0);
             drop(earlier);
+            drop(again);
+            assert!(
+                mapped_remote(again_letter.0).is_some(),
+                "the earlier holder's drop counted against the new mapping"
+            );
+            drop(still);
             assert_eq!(
-                after_its_user, None,
-                "the earlier holder kept the new mapping alive"
+                mapped_remote(again_letter.0),
+                None,
+                "the new mapping outlived its last user"
             );
         }
 

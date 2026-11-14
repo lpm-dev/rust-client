@@ -450,10 +450,10 @@ fn set_credential_with_keychain_writer_unlocked(
         }
         Err(keychain_error) => {
             tracing::warn!("system keychain unavailable — using encrypted file storage");
-            // A fallback that fails stores nothing, as the keychain didn't
-            // either: the credential file is replaced whole or not at all.
-            // So the predecessor's record stands again, rather than one that
-            // hides it.
+            // A fallback that fails before the credential file is replaced
+            // stores nothing, as the keychain didn't either, so the
+            // predecessor's record stands again, rather than one that hides
+            // it.
             let failed = |file_error: String| {
                 if let Ok(previous) = previous {
                     let restored = match previous {
@@ -474,13 +474,38 @@ fn set_credential_with_keychain_writer_unlocked(
             if let Err(file_error) = prepare_lpm_home_for_secrets(&lpm_dir()?) {
                 return Err(failed(file_error));
             }
-            credential_authority::set(
+            let recorded = credential_authority::set(
                 registry,
                 kind,
                 CredentialAuthority::active(CredentialBackend::EncryptedFileFallback, token),
-            )
-            .map_err(|error| format!("failed to record intended fallback authority: {error}"))?;
-            set_token_in_file(&file_key, token).map_err(failed)?;
+            );
+            #[cfg(test)]
+            let recorded = recorded.and_then(|()| {
+                inject_fallback_failure(InjectedFallbackFailure::RecordingTheFallback)
+            });
+            if let Err(error) = recorded {
+                return Err(failed(format!(
+                    "failed to record intended fallback authority: {error}"
+                )));
+            }
+            let written = set_token_in_file(&file_key, token);
+            #[cfg(test)]
+            let written = written
+                .and_then(|()| inject_fallback_failure(InjectedFallbackFailure::AfterTheFileWrite));
+            if let Err(file_error) = written {
+                // The file is replaced before its directory is synced, so a
+                // write can fail with the new token already in place, which
+                // the fallback's record then rightly names.
+                if matches!(
+                    probe_token_from_file(&file_key),
+                    EncryptedFileCredentialProbe::Found(stored) if stored == token
+                ) {
+                    return Err(format!(
+                        "keychain write failed ({keychain_error}); the encrypted fallback holds the credential, but may not have been saved durably: {file_error}"
+                    ));
+                }
+                return Err(failed(file_error));
+            }
             Ok(AuthStorageBackend::EncryptedFileFallback)
         }
     }
@@ -2929,6 +2954,32 @@ fn probe_token_from_file(registry_url: &str) -> EncryptedFileCredentialProbe {
     }
 }
 
+/// Where a test has a file fallback fail once.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectedFallbackFailure {
+    /// Recording the fallback as where the credential is.
+    RecordingTheFallback,
+    /// After the credential file is replaced, as a failed directory sync.
+    AfterTheFileWrite,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_FALLBACK_FAILURE: std::cell::Cell<Option<InjectedFallbackFailure>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Fails once at `point` when a test asked for it there.
+#[cfg(test)]
+fn inject_fallback_failure(point: InjectedFallbackFailure) -> Result<(), String> {
+    if INJECTED_FALLBACK_FAILURE.get() == Some(point) {
+        INJECTED_FALLBACK_FAILURE.set(None);
+        return Err(format!("injected failure: {point:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn get_token_from_file(registry_url: &str) -> Option<String> {
     match probe_token_from_file(registry_url) {
@@ -4249,6 +4300,65 @@ mod tests {
             assert_eq!(
                 credential_authority::read(registry, CredentialKind::Access).unwrap(),
                 Some(earlier)
+            );
+        });
+    }
+
+    #[test]
+    fn a_fallback_login_whose_record_fails_leaves_the_earlier_record() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let earlier = CredentialAuthority::committed_keychain("keychain-token");
+            credential_authority::set(registry, CredentialKind::Access, earlier.clone()).unwrap();
+            INJECTED_FALLBACK_FAILURE.set(Some(InjectedFallbackFailure::RecordingTheFallback));
+
+            let stored = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-token",
+                || Err("keychain unavailable".to_owned()),
+            );
+            INJECTED_FALLBACK_FAILURE.set(None);
+
+            assert!(
+                stored
+                    .unwrap_err()
+                    .contains("failed to record intended fallback authority")
+            );
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(earlier)
+            );
+        });
+    }
+
+    #[test]
+    fn a_fallback_that_fails_after_its_file_is_in_place_keeps_naming_it() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let earlier = CredentialAuthority::committed_keychain("keychain-token");
+            credential_authority::set(registry, CredentialKind::Access, earlier).unwrap();
+            INJECTED_FALLBACK_FAILURE.set(Some(InjectedFallbackFailure::AfterTheFileWrite));
+
+            let stored = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-token",
+                || Err("keychain unavailable".to_owned()),
+            );
+            INJECTED_FALLBACK_FAILURE.set(None);
+
+            assert!(
+                stored
+                    .unwrap_err()
+                    .contains("may not have been saved durably")
+            );
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(CredentialAuthority::active(
+                    CredentialBackend::EncryptedFileFallback,
+                    "new-token"
+                ))
             );
         });
     }

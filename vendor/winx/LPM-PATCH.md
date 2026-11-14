@@ -22,11 +22,13 @@ holds the link.
 `lpm-read-link-unc.patch` is the whole change against the published crate:
 
 - After `\??\`, `UNC\server\share\…` becomes `\\server\share\…` and
-  `C:\…` stays `C:\…`, where Win32 reads that back unchanged
-  (`GetFullPathNameW`), as std's `read_link` asks. Any other path, or one
-  Win32 would change, such as a name ending in a dot or a space, gets the
-  extended prefix `\\?\`, so each stays absolute and names what the link
-  names. Relative targets are unchanged.
+  `C:\…` stays `C:\…`, where that is shorter than 260 characters and Win32
+  reads it back unchanged (`GetFullPathNameW`, compared as strings), as
+  std's `read_link` asks. Any other path gets the extended prefix `\\?\`,
+  so each stays absolute and names what the link names: one Win32 would
+  change, such as a name ending in a dot or a space, or holding `.` or a
+  doubled separator; a long one; and one whose server reads as `?` or `.`.
+  Relative targets are unchanged.
 - `read_link_tests` cover these forms. They are Windows-only, as the
   crate is, and CI's Windows filesystem gate runs them with
   `cargo test --locked --manifest-path vendor/winx/Cargo.toml --lib read_link_tests`.

@@ -402,12 +402,15 @@ pub fn read_link(file: &File) -> io::Result<PathBuf> {
 }
 
 /// The Win32 path of an NT path that followed `\??\`: `C:\dir` stays as it
-/// is, and `UNC\server\share\dir` becomes `\\server\share\dir`, where Win32
-/// reads that back unchanged, as std's `read_link` asks. Any other path, or
-/// one Win32 would change, such as a name ending in a dot, gets the extended
-/// prefix `\\?\`. Each stays absolute.
+/// is, and `UNC\server\share\dir` becomes `\\server\share\dir`, where that
+/// is shorter than the classic path limit and Win32 reads it back unchanged,
+/// as std's `read_link` asks. Any other path gets the extended prefix
+/// `\\?\`: one Win32 would change, such as a name ending in a dot, a long
+/// one, and one whose server reads as `?` or `.`, which would turn it into a
+/// local or device path. Each stays absolute.
 fn win32_path(rest: &[u16]) -> PathBuf {
     const BACKSLASH: u16 = b'\\' as u16;
+    const MAX_PATH: usize = 260;
     let ascii_upper = |unit: u16| match u8::try_from(unit) {
         Ok(byte) => u16::from(byte.to_ascii_uppercase()),
         Err(_) => unit,
@@ -422,7 +425,8 @@ fn win32_path(rest: &[u16]) -> PathBuf {
         [u, n, c, BACKSLASH, share @ ..]
             if ascii_upper(*u) == u16::from(b'U')
                 && ascii_upper(*n) == u16::from(b'N')
-                && ascii_upper(*c) == u16::from(b'C') =>
+                && ascii_upper(*c) == u16::from(b'C')
+                && !matches!(share, [server, BACKSLASH, ..] if *server == u16::from(b'?') || *server == u16::from(b'.')) =>
         {
             let mut unc = Vec::with_capacity(share.len() + 2);
             unc.extend_from_slice(&[BACKSLASH, BACKSLASH]);
@@ -431,9 +435,12 @@ fn win32_path(rest: &[u16]) -> PathBuf {
         }
         _ => None,
     };
-    if let Some(candidate) = candidate {
+    if let Some(candidate) = candidate.filter(|candidate| candidate.len() < MAX_PATH) {
         let candidate = PathBuf::from(OsString::from_wide(&candidate));
-        if get_full_path(&candidate).map_or(false, |full| full == candidate) {
+        // Compared as strings: paths compare by components, which pass over
+        // the `.` and doubled separators Win32 would remove.
+        if get_full_path(&candidate).map_or(false, |full| full.as_os_str() == candidate.as_os_str())
+        {
             return candidate;
         }
     }
@@ -501,12 +508,25 @@ mod read_link_tests {
             r"UNC\server\share\pkg.",
             r"UNC\server\share\pkg ",
             r"C:\Users\dev\pkg.",
+            r"C:\Users\.\pkg",
+            r"C:\Users\\pkg",
             r"C:",
+            r"UNC\?\C:\pkg",
+            r"UNC\.\C:\pkg",
         ] {
             let path = after_nt_prefix(target);
             assert_eq!(path, PathBuf::from(format!(r"\\?\{target}")), "{target}");
             assert!(path.is_absolute(), "{target}");
         }
+    }
+
+    #[test]
+    fn a_long_target_stays_extended() {
+        let target = format!(r"C:\{}\pkg", "d".repeat(300));
+        assert_eq!(
+            after_nt_prefix(&target),
+            PathBuf::from(format!(r"\\?\{target}"))
+        );
     }
 
     #[test]
