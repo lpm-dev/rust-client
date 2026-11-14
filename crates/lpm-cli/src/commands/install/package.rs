@@ -406,12 +406,13 @@ impl InstallPackage {
         lpm_lockfile::Source::parse(&self.source)
     }
 
-    /// source-
-    /// aware existence check. For `Source::Tarball` packages,
-    /// checks the integrity-keyed CAS layout
-    /// ([`PackageStore::has_tarball`]); everything else falls back
-    /// to the legacy `(name, version)`-keyed
-    /// [`PackageStore::has_package`].
+    /// Source-aware existence check. `Source::Tarball` and `Source::Git`
+    /// packages are looked up in the integrity-keyed CAS layout
+    /// ([`PackageStore::has_tarball`]). A registry package is looked up by
+    /// its `(name, version)` coordinate and counts only when the entry there
+    /// holds the archive this package's integrity names
+    /// ([`PackageStore::has_package_matching_integrity`]); without a recorded
+    /// integrity it never counts, and the fetch verifies what it downloads.
     ///
     /// Trust-on-first-use `Source::Tarball` (integrity = None)
     /// returns `false` even when a coincidentally-named registry
@@ -445,7 +446,14 @@ impl InstallPackage {
                 let abs = project_dir.join(&path);
                 abs.is_dir() && abs.join("package.json").is_file()
             }
-            _ => store.has_package(&self.name, &self.version),
+            // A registry coordinate names no bytes: a different registry route
+            // or a republished version can put another archive under it.
+            Ok(lpm_lockfile::Source::Registry { .. }) => {
+                self.integrity.as_deref().is_some_and(|sri| {
+                    store.has_package_matching_integrity(&self.name, &self.version, sri)
+                })
+            }
+            Err(_) => false,
         }
     }
 

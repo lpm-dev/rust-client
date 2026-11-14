@@ -4403,6 +4403,7 @@ async fn store_downloaded_registry_tarball(
                 &version,
                 downloaded.file.path(),
                 &computed_sri,
+                integrity.as_deref(),
             )?;
             Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
         })

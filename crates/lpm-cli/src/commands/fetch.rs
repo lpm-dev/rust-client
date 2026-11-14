@@ -388,7 +388,7 @@ async fn fetch_artifact(
                         if !stored.insert((&target.name, &target.version)) {
                             continue;
                         }
-                        store.store_package_from_file_matching_integrity(
+                        store.store_package_from_file(
                             &target.name,
                             &target.version,
                             downloaded.file.path(),

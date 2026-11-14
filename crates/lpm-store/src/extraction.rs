@@ -10,7 +10,9 @@ use crate::{PackageStore, StageTimings, compute_sri_hash, is_complete_package_di
 impl PackageStore {
     /// Extract a tarball into the store. Returns the store path.
     ///
-    /// If the package already exists in the store, skips extraction (cache hit).
+    /// If the store already holds this archive at the coordinate, skips
+    /// extraction (cache hit). A coordinate that holds a different archive is
+    /// an integrity conflict.
     ///
     /// Uses a unique temp directory per process+thread to prevent TOCTOU races
     /// when multiple parallel downloads extract the same package simultaneously.
@@ -24,7 +26,7 @@ impl PackageStore {
     ) -> Result<PathBuf, LpmError> {
         let dir = self.package_dir(name, version);
         let label = format!("{name}@{version}");
-        self.store_at_dir(dir, &label, tarball_data)
+        self.store_at_dir(dir, &label, tarball_data, EntryKey::Coordinate)
     }
 
     /// Shared inner extraction logic used by [`Self::store_package`]
@@ -39,10 +41,20 @@ impl PackageStore {
         dir: PathBuf,
         label: &str,
         tarball_data: &[u8],
+        key: EntryKey,
     ) -> Result<PathBuf, LpmError> {
         // Fast path: already stored
         if dir.exists() {
             if is_complete_package_dir(&dir) {
+                if key == EntryKey::Coordinate {
+                    bind_entry_to_archive(
+                        self.root(),
+                        &dir,
+                        label,
+                        &ArchiveProof::Bytes(tarball_data),
+                        &[],
+                    )?;
+                }
                 self.backfill_security_cache_if_enabled(&dir, label);
                 tracing::debug!("store hit: {label}");
                 return Ok(dir);
@@ -117,6 +129,15 @@ impl PackageStore {
             Err(_) if dir.exists() => {
                 // Another thread/process beat us — clean up our temp dir and use theirs
                 let _ = std::fs::remove_dir_all(&tmp_dir);
+                if key == EntryKey::Coordinate {
+                    bind_entry_to_archive(
+                        self.root(),
+                        &dir,
+                        label,
+                        &ArchiveProof::Bytes(tarball_data),
+                        &[],
+                    )?;
+                }
                 Ok(dir)
             }
             Err(e) => {
@@ -129,11 +150,13 @@ impl PackageStore {
     /// Extract a tarball from a file into the store. Returns the store path.
     ///
     /// Bounded-memory variant of `store_package()` — reads the tarball from disk
-    /// in chunks rather than requiring it in memory. The SRI hash is provided by
-    /// the caller (computed during download).
+    /// in chunks rather than requiring it in memory. The caller has verified
+    /// the file against `sri` (computed during download).
     ///
     /// Same atomicity guarantees as `store_package()`: unique temp dir per
-    /// process+thread, atomic rename into final location.
+    /// process+thread, atomic rename into final location. A coordinate that
+    /// already holds a different archive, or that a concurrent publication of
+    /// a different archive wins, is an integrity conflict.
     ///
     /// Timing-agnostic wrapper around [`PackageStore::store_package_from_file_timed`].
     /// Prefer the timed variant on the install hot path so `lpm install --json`
@@ -145,7 +168,7 @@ impl PackageStore {
         tarball_path: &std::path::Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
-        self.store_package_from_file_timed(name, version, tarball_path, sri)
+        self.store_package_from_file_timed(name, version, tarball_path, sri, None)
             .map(|(path, _)| path)
     }
 
@@ -157,7 +180,7 @@ impl PackageStore {
         tarball_path: &std::path::Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
-        self.store_from_file_at_timed(dir, label, tarball_path, sri, false)
+        self.store_from_file_at_timed(dir, label, tarball_path, sri, None, EntryKey::Content)
             .map(|(path, _)| path)
     }
 
@@ -193,10 +216,18 @@ impl PackageStore {
     /// SHA-1 are computed in the same pass so older registry declarations can
     /// be verified without re-reading or buffering the stream.
     ///
+    /// ## An entry that already exists
+    /// A coordinate names no bytes, so a complete entry is returned only when
+    /// it holds this archive. An entry whose recorded integrity is
+    /// `expected_integrity`, or a hash already verified to name the same
+    /// archive, is returned without reading the stream. Otherwise the stream
+    /// is hashed without extracting: an entry recorded under one of the
+    /// stream's digests is returned, and any other is an integrity conflict.
+    /// The winner of a concurrent publication is checked the same way.
+    ///
     /// ## Failure semantics
     /// Any error after staging-dir creation cleans up the staging dir
-    /// before returning. Same atomic rename fallback as the legacy paths:
-    /// a concurrent winner is accepted silently.
+    /// before returning.
     ///
     /// Returns `(store_path, computed_sri, timings)` where `timings`
     /// measures the in-blocking-thread portion only — `download_ms` and
@@ -210,22 +241,32 @@ impl PackageStore {
         max_compressed_size: u64,
     ) -> Result<(PathBuf, String, StageTimings), LpmError> {
         let dir = self.package_dir(name, version);
+        let label = format!("{name}@{version}");
         let mut timings = StageTimings::default();
 
-        // Fast path: already stored.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
-                self.backfill_security_cache_if_enabled(&dir, &format!("{name}@{version}"));
-                tracing::debug!("store hit: {name}@{version}");
-                // We didn't actually touch the stream — caller must have
-                // pre-checked via `has_package()` to avoid wasted network.
-                // Return the existing on-disk SRI so the caller can still
-                // write a lockfile.
-                let sri = std::fs::read_to_string(dir.join(".integrity"))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                return Ok((dir, sri, timings));
+                let stored = if let Some(expected) = expected_integrity
+                    && crate::integrity::stored_integrity_matches(self.root(), &dir, expected)
+                {
+                    read_integrity_marker(&dir).ok_or_else(|| integrity_conflict(&label))?
+                } else {
+                    let mut hashing_reader =
+                        HashingReader::new(SizeLimitedReader::new(reader, max_compressed_size));
+                    std::io::copy(&mut hashing_reader, &mut std::io::sink())?;
+                    let digests = ArchiveDigests::from(hashing_reader.finalize());
+                    digests.verify_declared(&label, expected_integrity)?;
+                    bind_entry_to_archive(
+                        self.root(),
+                        &dir,
+                        &label,
+                        &ArchiveProof::Digests(&digests),
+                        expected_integrity.as_slice(),
+                    )?
+                };
+                self.backfill_security_cache_if_enabled(&dir, &label);
+                tracing::debug!("store hit: {label}");
+                return Ok((dir, stored, timings));
             }
             std::fs::remove_dir_all(&dir).map_err(|e| {
                 LpmError::Store(format!(
@@ -345,42 +386,14 @@ impl PackageStore {
             return Err(LpmError::Io(e));
         }
 
-        let (computed_sri, computed_sha256, computed_sha1, _compressed_size) =
-            hashing_reader.finalize();
+        let digests = ArchiveDigests::from(hashing_reader.finalize());
         timings.extract_ms = extract_start.elapsed().as_millis();
 
-        // Verify against the algorithm declared in `expected`. A
-        // non-sha512 expected value must be checked against the matching
-        // digest instead of being silently compared to sha512.
-        //
-        // Use constant-time `ct_eq` instead of `!=` so a future
-        // attacker-influenced caller (server-side verifier, observable
-        // timing channel) doesn't see per-byte digest information leak
-        // through `String::eq`'s early exit.
-        if let Some(expected) = expected_integrity {
-            use subtle::ConstantTimeEq;
-            let candidate = if expected.starts_with("sha512-") {
-                &computed_sri
-            } else if expected.starts_with("sha256-") {
-                &computed_sha256
-            } else if expected.starts_with("sha1-") {
-                &computed_sha1
-            } else {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(LpmError::Registry(format!(
-                    "unsupported integrity algorithm for {name}@{version}: {expected} — \
-                     expected sha512-… (preferred), sha256-…, or sha1-…"
-                )));
-            };
-            let matches_expected = expected.len() == candidate.len()
-                && expected.as_bytes().ct_eq(candidate.as_bytes()).into();
-            if !matches_expected {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(LpmError::Registry(format!(
-                    "integrity mismatch for {name}@{version}: expected {expected}, got {candidate}"
-                )));
-            }
+        if let Err(error) = digests.verify_declared(&label, expected_integrity) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(error);
         }
+        let computed_sri = digests.sha512.clone();
 
         // Security analysis was fused into the tar walk above. What
         // remains is finalize — read `package.json` from staging (one
@@ -414,21 +427,34 @@ impl PackageStore {
         timings.finalize_ms = finalize_start.elapsed().as_millis();
 
         match rename_result {
-            Ok(()) => Ok((dir, computed_sri, timings)),
+            Ok(()) => {}
             Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok((dir, computed_sri, timings))
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Err(LpmError::Store(format!("failed to store package: {e}")))
+                return Err(LpmError::Store(format!("failed to store package: {e}")));
             }
         }
+        // Covers the entry this call published and the winner of a concurrent
+        // publication alike: either is returned only as this archive.
+        bind_entry_to_archive(
+            self.root(),
+            &dir,
+            &label,
+            &ArchiveProof::Digests(&digests),
+            expected_integrity.as_slice(),
+        )?;
+        Ok((dir, computed_sri, timings))
     }
 
     /// Same contract as [`PackageStore::store_package_from_file`], plus a
     /// [`StageTimings`] breakdown (extract / security / finalize) for the
     /// caller. On the store-hit fast path every field is zero.
+    ///
+    /// `declared` is a second hash the caller verified the file against, such
+    /// as the lockfile's pin in another algorithm. It is recorded as naming
+    /// the stored archive, so a later lookup under it is a hit.
     ///
     /// `extract_ms` covers `extract_tarball_from_file`; when analysis is
     /// enabled, `security_ms` covers `analyze_package` plus the cache write;
@@ -441,29 +467,18 @@ impl PackageStore {
         version: &str,
         tarball_path: &std::path::Path,
         sri: &str,
+        declared: Option<&str>,
     ) -> Result<(PathBuf, StageTimings), LpmError> {
         let dir = self.package_dir(name, version);
         let label = format!("{name}@{version}");
-        self.store_from_file_at_timed(dir, &label, tarball_path, sri, false)
-    }
-
-    /// Store a verified archive, rejecting a complete existing coordinate whose
-    /// recorded integrity differs. Also validates a concurrent publication winner.
-    pub fn store_package_from_file_matching_integrity(
-        &self,
-        name: &str,
-        version: &str,
-        tarball_path: &std::path::Path,
-        sri: &str,
-    ) -> Result<PathBuf, LpmError> {
         self.store_from_file_at_timed(
-            self.package_dir(name, version),
-            &format!("{name}@{version}"),
+            dir,
+            &label,
             tarball_path,
             sri,
-            true,
+            declared,
+            EntryKey::Coordinate,
         )
-        .map(|(path, _)| path)
     }
 
     fn store_from_file_at_timed(
@@ -472,18 +487,34 @@ impl PackageStore {
         label: &str,
         tarball_path: &std::path::Path,
         sri: &str,
-        require_matching_integrity: bool,
+        declared: Option<&str>,
+        key: EntryKey,
     ) -> Result<(PathBuf, StageTimings), LpmError> {
         let mut timings = StageTimings::default();
+        let verified = [sri, declared.unwrap_or(sri)];
+        let verified = if verified[0] == verified[1] {
+            &verified[..1]
+        } else {
+            &verified[..]
+        };
+        let bind = |dir: &std::path::Path| match key {
+            EntryKey::Content => Ok(()),
+            EntryKey::Coordinate => bind_entry_to_archive(
+                self.root(),
+                dir,
+                label,
+                &ArchiveProof::File(tarball_path),
+                verified,
+            )
+            .map(drop),
+        };
 
         // Fast path: already stored. Callers on the install hot path pre-filter
-        // against `has_package()` so this should never hit; we keep it for the
+        // against the store so this should rarely hit; we keep it for the
         // general-purpose API contract.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
-                if require_matching_integrity {
-                    ensure_matching_stored_integrity(self.root(), &dir, label, sri, tarball_path)?;
-                }
+                bind(&dir)?;
                 self.backfill_security_cache_if_enabled(&dir, label);
                 tracing::debug!("store hit: {label}");
                 return Ok((dir, timings));
@@ -559,46 +590,142 @@ impl PackageStore {
         timings.finalize_ms = timings.finalize_integrity_write_ms + timings.finalize_rename_ms;
 
         match rename_result {
-            Ok(()) => Ok((dir, timings)),
+            Ok(()) => {}
             Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                if require_matching_integrity {
-                    ensure_matching_stored_integrity(self.root(), &dir, label, sri, tarball_path)?;
-                }
-                Ok((dir, timings))
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                Err(LpmError::Store(format!("failed to store package: {e}")))
+                return Err(LpmError::Store(format!("failed to store package: {e}")));
             }
+        }
+        bind(&dir)?;
+        Ok((dir, timings))
+    }
+}
+
+/// What names a store directory. A coordinate names no bytes, so an entry
+/// under one is used only once it is bound to the archive being published. A
+/// content-keyed directory is named by the archive's own hash.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryKey {
+    Coordinate,
+    Content,
+}
+
+/// The archive a publication holds, in the form it can be checked against a
+/// recorded integrity.
+enum ArchiveProof<'a> {
+    Bytes(&'a [u8]),
+    File(&'a std::path::Path),
+    Digests(&'a ArchiveDigests),
+}
+
+impl ArchiveProof<'_> {
+    fn is_named_by(&self, recorded: &str) -> bool {
+        match self {
+            Self::Bytes(bytes) => {
+                Integrity::parse(recorded).is_ok_and(|integrity| integrity.verify(bytes).is_ok())
+            }
+            Self::File(path) => Integrity::parse(recorded)
+                .is_ok_and(|integrity| integrity.verify_file(path).is_ok()),
+            Self::Digests(digests) => digests.contains(recorded),
         }
     }
 }
 
-fn ensure_matching_stored_integrity(
+/// Every digest of one archive stream, as SRI strings.
+struct ArchiveDigests {
+    sha512: String,
+    sha256: String,
+    sha1: String,
+}
+
+impl From<(String, String, String, u64)> for ArchiveDigests {
+    fn from((sha512, sha256, sha1, _bytes): (String, String, String, u64)) -> Self {
+        Self {
+            sha512,
+            sha256,
+            sha1,
+        }
+    }
+}
+
+impl ArchiveDigests {
+    fn contains(&self, sri: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        [&self.sha512, &self.sha256, &self.sha1]
+            .into_iter()
+            .any(|digest| {
+                digest.len() == sri.len() && digest.as_bytes().ct_eq(sri.as_bytes()).into()
+            })
+    }
+
+    /// Check the stream against the algorithm `declared` names. A non-sha512
+    /// declaration is compared with the matching digest, never with sha512.
+    fn verify_declared(&self, label: &str, declared: Option<&str>) -> Result<(), LpmError> {
+        let Some(declared) = declared else {
+            return Ok(());
+        };
+        let computed = if declared.starts_with("sha512-") {
+            &self.sha512
+        } else if declared.starts_with("sha256-") {
+            &self.sha256
+        } else if declared.starts_with("sha1-") {
+            &self.sha1
+        } else {
+            return Err(LpmError::Registry(format!(
+                "unsupported integrity algorithm for {label}: {declared} — \
+                 expected sha512-… (preferred), sha256-…, or sha1-…"
+            )));
+        };
+        if self.contains(declared) {
+            Ok(())
+        } else {
+            Err(LpmError::Registry(format!(
+                "integrity mismatch for {label}: expected {declared}, got {computed}"
+            )))
+        }
+    }
+}
+
+fn read_integrity_marker(dir: &std::path::Path) -> Option<String> {
+    lpm_common::read_text_file_capped_nofollow(&dir.join(".integrity"), 4096).ok()
+}
+
+fn integrity_conflict(label: &str) -> LpmError {
+    LpmError::Store(format!(
+        "v1 store integrity conflict for {label}; use the default v2 store or a separate LPM_HOME"
+    ))
+}
+
+/// Accept the complete entry at `dir` only as the archive `proof` holds, and
+/// return its recorded integrity.
+///
+/// `verified` are hashes the caller verified that archive against. An entry
+/// recorded under one of them, or under any hash that names the archive, is
+/// the same archive; each other member of `verified` is then recorded as an
+/// alias of the entry, so a later lookup under it is a hit. Any other entry
+/// holds different bytes at the same coordinate.
+fn bind_entry_to_archive(
     store_root: &std::path::Path,
     dir: &std::path::Path,
     label: &str,
-    sri: &str,
-    tarball_path: &std::path::Path,
-) -> Result<(), LpmError> {
-    if is_complete_package_dir(dir)
-        && let Ok(stored) =
-            lpm_common::read_text_file_capped_nofollow(&dir.join(".integrity"), 4096)
-    {
-        if stored == sri {
-            return Ok(());
-        }
-        if Integrity::parse(&stored)
-            .is_ok_and(|integrity| integrity.verify_file(tarball_path).is_ok())
-        {
-            crate::integrity::record_verified_integrity_alias(store_root, &stored, sri)?;
-            return Ok(());
+    proof: &ArchiveProof<'_>,
+    verified: &[&str],
+) -> Result<String, LpmError> {
+    let recorded = read_integrity_marker(dir)
+        .filter(|_| is_complete_package_dir(dir))
+        .ok_or_else(|| integrity_conflict(label))?;
+    if !verified.contains(&recorded.as_str()) && !proof.is_named_by(&recorded) {
+        return Err(integrity_conflict(label));
+    }
+    for sri in verified {
+        if *sri != recorded {
+            crate::integrity::record_verified_integrity_alias(store_root, &recorded, sri)?;
         }
     }
-    Err(LpmError::Store(format!(
-        "v1 store integrity conflict for {label}; use the default v2 store or a separate LPM_HOME"
-    )))
+    Ok(recorded)
 }
 
 #[derive(Clone)]
@@ -1281,7 +1408,7 @@ mod tests {
         let mut temp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut temp, &tgz).unwrap();
         let path = store
-            .store_package_from_file("cached", "1.0.0", temp.path(), "sha512-x")
+            .store_package_from_file("cached", "1.0.0", temp.path(), &compute_sri_hash(&tgz))
             .unwrap();
 
         assert!(path.join("package.json").exists());
@@ -1307,12 +1434,7 @@ mod tests {
                         let mut archive = tempfile::NamedTempFile::new().unwrap();
                         std::io::Write::write_all(&mut archive, &bytes).unwrap();
                         barrier.wait();
-                        store.store_package_from_file_matching_integrity(
-                            "race",
-                            "1.0.0",
-                            archive.path(),
-                            &sri,
-                        )
+                        store.store_package_from_file("race", "1.0.0", archive.path(), &sri)
                     })
                 })
                 .collect();
@@ -1394,7 +1516,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut temp = tempfile::NamedTempFile::new().unwrap();
                     std::io::Write::write_all(&mut temp, &data).unwrap();
-                    s.store_package_from_file_matching_integrity(
+                    s.store_package_from_file(
                         "race",
                         "1.0.0",
                         temp.path(),
@@ -1480,5 +1602,286 @@ mod tests {
             "integrity write failure should not leave a stale temp dir: {}",
             tmp_dir.display()
         );
+    }
+
+    const STREAM_LIMIT: u64 = 1024 * 1024;
+
+    fn marked_archive(marker: &[u8]) -> Vec<u8> {
+        create_test_tarball(&[
+            ("package.json", br#"{"name":"same","version":"1.0.0"}"#),
+            ("marker.txt", marker),
+        ])
+    }
+
+    fn stored_marker(store: &PackageStore) -> Vec<u8> {
+        std::fs::read(store.package_dir("same", "1.0.0").join("marker.txt")).unwrap()
+    }
+
+    struct UnreadableStream;
+
+    impl std::io::Read for UnreadableStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the stream must not be read"))
+        }
+    }
+
+    #[test]
+    fn stream_rejects_a_complete_coordinate_that_holds_a_different_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let original = marked_archive(b"original");
+        let replacement = marked_archive(b"replacement");
+        store.store_package("same", "1.0.0", &original).unwrap();
+
+        let error = store
+            .stream_and_store_package(
+                "same",
+                "1.0.0",
+                std::io::Cursor::new(&replacement),
+                Some(&compute_sri_hash(&replacement)),
+                STREAM_LIMIT,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("integrity conflict"), "{error}");
+        assert_eq!(stored_marker(&store), b"original");
+        assert_eq!(
+            read_stored_integrity(&store.package_dir("same", "1.0.0")).unwrap(),
+            compute_sri_hash(&original)
+        );
+    }
+
+    #[test]
+    fn stream_without_a_declared_integrity_rejects_a_different_archive_at_the_coordinate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        store
+            .store_package("same", "1.0.0", &marked_archive(b"original"))
+            .unwrap();
+
+        let error = store
+            .stream_and_store_package(
+                "same",
+                "1.0.0",
+                std::io::Cursor::new(marked_archive(b"replacement")),
+                None,
+                STREAM_LIMIT,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("integrity conflict"), "{error}");
+        assert_eq!(stored_marker(&store), b"original");
+    }
+
+    #[test]
+    fn stream_hit_under_the_recorded_integrity_does_not_read_the_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let archive = marked_archive(b"original");
+        let sri = compute_sri_hash(&archive);
+        let dir = store.store_package("same", "1.0.0", &archive).unwrap();
+
+        let (path, returned, _) = store
+            .stream_and_store_package("same", "1.0.0", UnreadableStream, Some(&sri), STREAM_LIMIT)
+            .unwrap();
+
+        assert_eq!(path, dir);
+        assert_eq!(returned, sri);
+    }
+
+    #[test]
+    fn stream_accepts_an_alternate_hash_only_after_the_archive_proves_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let archive = marked_archive(b"original");
+        let sha256 = compute_sri_hash_sha256(&archive);
+        store.store_package("same", "1.0.0", &archive).unwrap();
+        assert!(!store.has_package_matching_integrity("same", "1.0.0", &sha256));
+
+        let unproven = store
+            .stream_and_store_package(
+                "same",
+                "1.0.0",
+                std::io::Cursor::new(Vec::new()),
+                Some(&sha256),
+                STREAM_LIMIT,
+            )
+            .unwrap_err();
+        assert!(
+            unproven.to_string().contains("integrity mismatch"),
+            "{unproven}"
+        );
+        assert!(!store.has_package_matching_integrity("same", "1.0.0", &sha256));
+
+        let (_, returned, _) = store
+            .stream_and_store_package(
+                "same",
+                "1.0.0",
+                std::io::Cursor::new(&archive),
+                Some(&sha256),
+                STREAM_LIMIT,
+            )
+            .unwrap();
+        assert_eq!(returned, compute_sri_hash(&archive));
+        assert!(store.has_package_matching_integrity("same", "1.0.0", &sha256));
+        store
+            .stream_and_store_package(
+                "same",
+                "1.0.0",
+                UnreadableStream,
+                Some(&sha256),
+                STREAM_LIMIT,
+            )
+            .expect("a proven alternate hash is a hit without the archive");
+    }
+
+    #[test]
+    fn stream_publication_records_the_declared_hash_for_later_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let archive = marked_archive(b"original");
+        let sha1 = compute_sri_hash_sha1(&archive);
+
+        let (dir, returned, _) = store
+            .stream_and_store_package(
+                "same",
+                "1.0.0",
+                std::io::Cursor::new(&archive),
+                Some(&sha1),
+                STREAM_LIMIT,
+            )
+            .unwrap();
+
+        assert_eq!(returned, compute_sri_hash(&archive));
+        assert_eq!(read_stored_integrity(&dir).unwrap(), returned);
+        assert!(store.has_package_matching_integrity("same", "1.0.0", &sha1));
+        assert!(!store.has_package_matching_integrity(
+            "same",
+            "1.0.0",
+            &compute_sri_hash_sha1(&marked_archive(b"replacement"))
+        ));
+    }
+
+    #[test]
+    fn streamed_insertions_reject_a_different_concurrent_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+                .into_iter()
+                .map(|marker| {
+                    let store = &store;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let bytes = marked_archive(marker);
+                        let sri = compute_sri_hash(&bytes);
+                        barrier.wait();
+                        store
+                            .stream_and_store_package(
+                                "same",
+                                "1.0.0",
+                                std::io::Cursor::new(bytes),
+                                Some(&sri),
+                                STREAM_LIMIT,
+                            )
+                            .map(|(_, sri, _)| sri)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let error = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(error.to_string().contains("integrity conflict"), "{error}");
+        let winner = results.iter().position(Result::is_ok).unwrap();
+        assert_eq!(
+            stored_marker(&store),
+            if winner == 0 {
+                b"first".as_slice()
+            } else {
+                b"second".as_slice()
+            }
+        );
+        assert_eq!(
+            read_stored_integrity(&store.package_dir("same", "1.0.0")).unwrap(),
+            *results[winner].as_ref().unwrap()
+        );
+    }
+
+    #[test]
+    fn in_memory_insertion_rejects_a_different_archive_at_a_complete_coordinate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        store
+            .store_package("same", "1.0.0", &marked_archive(b"original"))
+            .unwrap();
+
+        let error = store
+            .store_package("same", "1.0.0", &marked_archive(b"replacement"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("integrity conflict"), "{error}");
+        assert_eq!(stored_marker(&store), b"original");
+    }
+
+    #[test]
+    fn file_insertion_rejects_a_different_archive_at_a_complete_coordinate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        store
+            .store_package("same", "1.0.0", &marked_archive(b"original"))
+            .unwrap();
+        let replacement = marked_archive(b"replacement");
+        let mut archive = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut archive, &replacement).unwrap();
+
+        let error = store
+            .store_package_from_file_timed(
+                "same",
+                "1.0.0",
+                archive.path(),
+                &compute_sri_hash(&replacement),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("integrity conflict"), "{error}");
+        assert_eq!(stored_marker(&store), b"original");
+    }
+
+    #[test]
+    fn file_insertion_records_the_declared_hash_for_later_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let bytes = marked_archive(b"original");
+        let sha512 = compute_sri_hash(&bytes);
+        let sha1 = compute_sri_hash_sha1(&bytes);
+        let mut archive = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut archive, &bytes).unwrap();
+
+        let (dir, _) = store
+            .store_package_from_file_timed("same", "1.0.0", archive.path(), &sha512, Some(&sha1))
+            .unwrap();
+
+        assert_eq!(read_stored_integrity(&dir).unwrap(), sha512);
+        assert!(store.has_package_matching_integrity("same", "1.0.0", &sha1));
+
+        let sha256 = compute_sri_hash_sha256(&bytes);
+        store
+            .store_package_from_file_timed("same", "1.0.0", archive.path(), &sha512, Some(&sha256))
+            .unwrap();
+        assert!(store.has_package_matching_integrity("same", "1.0.0", &sha256));
     }
 }
