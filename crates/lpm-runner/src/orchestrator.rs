@@ -2239,6 +2239,11 @@ enum ForceKill {
     Again,
     /// Force-killed it, and said so: to be waited for.
     Now,
+    /// Ended the Job of a tree lpm walked as Windows wouldn't end it, saying
+    /// it was force-killed if that wasn't said yet: what the Job held is to
+    /// be waited for, within a deadline of its own, as no earlier one
+    /// covered it.
+    JobEnded,
     /// Said it was force-killed, where its tree has no Job to end it by:
     /// to be walked.
     ToWalk,
@@ -2251,17 +2256,14 @@ fn start_force_kill(name: &str, child: &mut ServiceProcess) -> ForceKill {
     if !child.tree_running() {
         return ForceKill::Stopped;
     }
-    // A tree lpm walked was waited for by the walk, and walking it again
-    // would end no more of it. One walked as Windows wouldn't end its Job,
-    // whose Job ends now, holds processes the walk didn't wait for.
-    if child.reported_force_killed || child.tree_walked {
-        let ended_job = kill_dying_service_tree(child);
+    if child.waited_for() {
+        let to_wait_for = kill_again(child);
         if !child.reported_force_killed {
             child.reported_force_killed = true;
             ui_service_status(RESET, name, RED, "✗", "force-killed");
         }
-        return if ended_job && child.tree_walked {
-            ForceKill::Now
+        return if to_wait_for {
+            ForceKill::JobEnded
         } else {
             ForceKill::Again
         };
@@ -2282,7 +2284,7 @@ fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
     match start_force_kill(name, child) {
         ForceKill::Stopped => false,
         ForceKill::Again => true,
-        ForceKill::Now => {
+        ForceKill::Now | ForceKill::JobEnded => {
             wait_for_killed_service_tree(child, cleanup_deadline());
             true
         }
@@ -2303,17 +2305,23 @@ fn force_kill_and_report_all<'a>(
     deadline: Instant,
 ) {
     let mut killed = Vec::new();
+    let mut jobs_ended = Vec::new();
     let mut to_walk = Vec::new();
     for (name, child) in services {
         match start_force_kill(name, child) {
             ForceKill::Now => killed.push(child),
+            ForceKill::JobEnded => jobs_ended.push(child),
             ForceKill::ToWalk => to_walk.push(child),
             ForceKill::Stopped | ForceKill::Again => {}
         }
     }
+    let jobs_ended_deadline = cleanup_deadline();
     walk_service_trees_while(to_walk, || {
         for child in killed {
             wait_for_killed_service_tree(child, deadline);
+        }
+        for child in jobs_ended {
+            wait_for_killed_service_tree(child, jobs_ended_deadline);
         }
     });
 }
@@ -2394,6 +2402,10 @@ fn shutdown_children_ordered(
         // gone, all at once, before it counts as force-killed.
         #[cfg(windows)]
         let mut ended_by = None;
+        // Trees lpm ended and waited for before whose Job this level ended,
+        // which hold processes still to wait for.
+        #[cfg(windows)]
+        let mut jobs_to_wait_for = std::collections::HashSet::new();
         {
             let mut locked = children.lock();
             #[cfg(windows)]
@@ -2421,9 +2433,10 @@ fn shutdown_children_ordered(
                     if matches!(child.try_wait(), Ok(None)) {
                         ended_by_lpm.insert(name.clone());
                     }
-                    if child.tree_walked {
-                        if kill_dying_service_tree(child) {
+                    if child.waited_for() {
+                        if kill_again(child) {
                             ended_by.get_or_insert_with(cleanup_deadline);
+                            jobs_to_wait_for.insert(name.clone());
                         }
                     } else if kill_service_tree(child) {
                         ended_by.get_or_insert_with(cleanup_deadline);
@@ -2455,7 +2468,12 @@ fn shutdown_children_ordered(
                         .iter_mut()
                         .find(|(child_name, _)| child_name == name)
                         .is_some_and(|(_, child)| {
-                            !(child.tree_walked && !child.has_job()) && child.tree_running()
+                            #[cfg(windows)]
+                            let to_wait_for =
+                                !child.waited_for() || jobs_to_wait_for.contains(name);
+                            #[cfg(not(windows))]
+                            let to_wait_for = !child.waited_for();
+                            to_wait_for && child.tree_running()
                         })
                 })
             };
@@ -2494,10 +2512,23 @@ fn shutdown_children_ordered(
     }
 }
 
-/// Kills again what is left of a tree lpm ended earlier, by force-killing it
-/// or by walking it, which may still be dying, without waiting for it as the
-/// first end did or walking it a second time: `true` where this ended the
-/// service's Job, whose processes are then to be waited for.
+/// Kills again what is left of a tree lpm ended and waited for before, by
+/// force-killing it or by walking it, without walking it a second time:
+/// `true` where what is left is still to be waited for. A tree lpm walked as
+/// Windows wouldn't end its Job holds processes the walk couldn't follow,
+/// which the Job's end, once it takes, leaves to wait for, once.
+fn kill_again(child: &mut ServiceProcess) -> bool {
+    let ended_job = kill_dying_service_tree(child);
+    let to_wait_for = ended_job && child.tree_walked;
+    if to_wait_for {
+        child.tree_walked = false;
+    }
+    to_wait_for
+}
+
+/// Kills what is left of a tree, which may still be dying, without waiting
+/// for it: by its Job where it has one, else by its process group on Unix,
+/// or by its own process: `true` where the service's Job took the end.
 fn kill_dying_service_tree(child: &mut ServiceProcess) -> bool {
     #[cfg(unix)]
     {
@@ -2536,7 +2567,9 @@ fn report_last(
     match final_report(stopped, child.reported_force_killed, ended) {
         // A tree force-killed earlier may still be dying.
         FinalReport::AlreadyReported if stopped.is_none() => {
-            kill_dying_service_tree(child);
+            if kill_again(child) {
+                wait_for_killed_service_tree(child, cleanup_deadline());
+            }
         }
         FinalReport::AlreadyReported => {}
         FinalReport::Stopped(note) => ui_service_note(RESET, name, &note),
@@ -2644,7 +2677,8 @@ pub(crate) struct ServiceProcess {
     #[cfg(windows)]
     job: Option<lpm_common::process_job::ProcessJob>,
     /// Whether lpm walked the service's tree, which walking it again could
-    /// end no more of.
+    /// end no more of; cleared once killing it again ends a Job Windows
+    /// wouldn't end before, leaving what that Job held to wait for.
     tree_walked: bool,
     /// Whether the shutdown has said this service was force-killed.
     reported_force_killed: bool,
@@ -2709,16 +2743,11 @@ impl ServiceProcess {
         }
     }
 
-    /// Whether a Job holds what the service started.
-    fn has_job(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.job.is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+    /// Whether lpm ended the service's tree and waited for it already, by
+    /// force-killing it or by walking it, so that killing it again is all
+    /// that is left: see [`kill_again`].
+    fn waited_for(&self) -> bool {
+        self.reported_force_killed || self.tree_walked
     }
 
     /// Whether the service's root, or anything it started, still runs.
@@ -3505,6 +3534,47 @@ mod tests {
             .status();
 
         assert!(!walked_again, "lpm walked the tree a second time");
+        assert!(!children.lock()[0].1.tree_running(), "web still runs");
+        assert_eq!(reports, [], "web was reported again");
+    }
+
+    /// A service a second Ctrl+C force-killed and waited for, which still
+    /// runs, is killed again when the shutdown reaches its level, which
+    /// doesn't wait for it a second time.
+    #[cfg(unix)]
+    #[test]
+    fn a_level_doesn_t_wait_again_for_a_service_force_killed_before() {
+        let project = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; touch ready; while :; do sleep 0.05; done")
+            .current_dir(project.path());
+        isolate_service_process_tree(&mut command);
+        let mut service = ServiceProcess::from(command.spawn().unwrap());
+        let ready_by = Instant::now() + Duration::from_secs(10);
+        while !project.path().join("ready").exists() {
+            assert!(Instant::now() < ready_by, "the service never got ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // As the force-kill left it, here with its tree still running.
+        service.reported_force_killed = true;
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        let started = Instant::now();
+
+        let reports = service_reports(|| {
+            shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || false);
+        });
+        let took = started.elapsed();
+        let killed_by = Instant::now() + Duration::from_secs(2);
+        while children.lock()[0].1.tree_running() && Instant::now() < killed_by {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            took < Duration::from_millis(1500),
+            "the level waited {took:?} for a service force-killed before"
+        );
         assert!(!children.lock()[0].1.tree_running(), "web still runs");
         assert_eq!(reports, [], "web was reported again");
     }
