@@ -778,7 +778,9 @@ fn rename_capability_handle(
             // made at the old path since, on a file system that reports the
             // move to the handle. A file found elsewhere is deleted through
             // its handle where Windows lets it; one whose place can't be told
-            // is left, and the write fails.
+            // is left, and the write fails. Parallels shared folders, which
+            // take renames by full path only, report no move to the handle,
+            // so the file goes where the path leads, as any write by path.
             if let Some(renamed_into) = renamed_into {
                 match landed_in(directory, temporary, &renamed_into) {
                     Ok(true) => {}
