@@ -313,6 +313,20 @@ mod simulated {
         pub(super) static NO_RENAME_WITHOUT_REPLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static FAILING_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static NO_RELATIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static RENAME_INTO_ANOTHER_DIRECTORY: std::cell::Cell<Option<std::path::PathBuf>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The path a rename by full path names `directory` by: the handle's,
+    /// or in a test, another directory's, as when the directory moved
+    /// after its path was read.
+    #[cfg(windows)]
+    pub(super) fn directory_path_for_rename(directory: &cap_std::fs::Dir) -> io::Result<Vec<u16>> {
+        #[cfg(test)]
+        if let Some(elsewhere) = RENAME_INTO_ANOTHER_DIRECTORY.take() {
+            use std::os::windows::ffi::OsStrExt as _;
+            return Ok(elsewhere.as_os_str().encode_wide().collect());
+        }
+        super::directory_final_path(directory)
     }
 
     /// Whether the filesystem refuses a rename to `target`, as a Parallels
@@ -673,16 +687,21 @@ fn rename_capability_handle(
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-        let (status, target) = loop {
+        let (status, renamed_into) = loop {
             let (target, class) = attempts[attempt];
             // The path is read again for each attempt, from the handle, so
             // that it follows the directory if it moves.
             let mut by_full_path;
+            let mut renamed_into = None;
             let record = match target {
                 RenameTarget::Relative => &mut relative,
                 RenameTarget::FullPath => {
-                    by_full_path =
-                        RenameRecord::new(std::ptr::null_mut(), &nt_path_in(directory, &name)?)?;
+                    let directory_path = simulated::directory_path_for_rename(directory)?;
+                    by_full_path = RenameRecord::new(
+                        std::ptr::null_mut(),
+                        &nt_path_in(&directory_path, &name)?,
+                    )?;
+                    renamed_into = Some(directory_path);
                     &mut by_full_path
                 }
             };
@@ -696,14 +715,20 @@ fn rename_capability_handle(
                 attempt += 1;
                 continue;
             }
-            break (status, target);
+            break (status, renamed_into);
         };
         if status >= 0 {
             // A directory that moved between reading its path and the
-            // rename leaves the file elsewhere on its volume.
-            if target == RenameTarget::FullPath
-                && !is_current_entry(directory, destination, temporary).unwrap_or(true)
+            // rename may have left the file elsewhere, even in a directory
+            // made at the old path since. Unless the handle's directory is
+            // still at the path renamed into, the file must be found in it.
+            // A file left elsewhere is deleted through its handle, wherever
+            // it is.
+            if let Some(renamed_into) = renamed_into
+                && directory_final_path(directory).ok().as_ref() != Some(&renamed_into)
+                && !is_current_entry(directory, destination, temporary).unwrap_or(false)
             {
+                let _ = delete_on_close(temporary);
                 return Err(io::Error::other(
                     "the directory moved while a file was renamed into it",
                 ));
@@ -846,17 +871,51 @@ impl RenameRecord {
     }
 }
 
-/// The NT path of `name` in `directory`, as a rename with no root directory
-/// takes it: `\??\C:\dir\name`, or `\??\UNC\server\share\dir\name`.
+/// Has the open `file`, which needs `DELETE` access, deleted once its last
+/// handle closes.
 #[cfg(windows)]
-fn nt_path_in(directory: &cap_std::fs::Dir, name: &[u16]) -> io::Result<Vec<u16>> {
-    use std::os::windows::ffi::OsStrExt as _;
+fn delete_on_close(file: &cap_std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let size =
+        u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).map_err(io::Error::other)?;
+    // SAFETY: the handle stays open for the call, and `information` is a
+    // complete record of `size` bytes.
+    let set = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&information).cast(),
+            size,
+        )
+    };
+    if set == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
+/// The path the handle `directory` has now, as Windows gives it, with its
+/// extended prefix.
+#[cfg(windows)]
+fn directory_final_path(directory: &cap_std::fs::Dir) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let final_path = crate::owner_only::final_path(directory)?;
+    Ok(final_path.as_os_str().encode_wide().collect())
+}
+
+/// The NT path of `name` in the directory at `directory_path`, a final path,
+/// as a rename with no root directory takes it: `\??\C:\dir\name`, or
+/// `\??\UNC\server\share\dir\name`.
+#[cfg(windows)]
+fn nt_path_in(directory_path: &[u16], name: &[u16]) -> io::Result<Vec<u16>> {
     const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
     const NT: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
-    let final_path = crate::owner_only::final_path(directory)?;
-    let final_path = final_path.as_os_str().encode_wide().collect::<Vec<_>>();
-    let rest = final_path
+    let rest = directory_path
         .strip_prefix(&VERBATIM)
         .ok_or_else(|| io::Error::other("a directory's final path has no extended prefix"))?;
     let mut path = Vec::with_capacity(NT.len() + rest.len() + 1 + name.len());
@@ -1689,6 +1748,40 @@ mod tests {
         assert_eq!(second.unwrap(), None);
         assert_eq!(fs::read(dir.path().join(".env")).unwrap(), b"TOKEN=first\n");
         assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_by_full_path_that_lands_in_another_directory_fails_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&held).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let open = |path: &std::path::Path| {
+            cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap()
+        };
+        let elsewhere_path = crate::owner_only::final_path(&open(&elsewhere)).unwrap();
+        let directory = open(&held);
+        // As on a share whose directory moved, and another took its path,
+        // between reading the path and the rename.
+        simulated::NO_RELATIVE_RENAME.set(true);
+        simulated::RENAME_INTO_ANOTHER_DIRECTORY.set(Some(elsewhere_path));
+
+        let written = write_file_atomic_in_dir_with(&directory, ".gitignore".as_ref(), |file| {
+            file.write_all(b"state")
+        });
+        simulated::NO_RELATIVE_RENAME.set(false);
+        simulated::RENAME_INTO_ANOTHER_DIRECTORY.set(None);
+
+        let error = written.unwrap_err();
+        assert!(error.to_string().contains("the directory moved"), "{error}");
+        assert!(!held.join(".gitignore").exists());
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "the stray file stayed"
+        );
     }
 
     #[cfg(windows)]
