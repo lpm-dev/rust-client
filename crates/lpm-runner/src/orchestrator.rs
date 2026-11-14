@@ -372,6 +372,8 @@ fn ui_service_prefix(color: &str, name: &str) -> String {
 
 fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, msg: &str) {
     let msg = sanitize_terminal_inline(msg);
+    #[cfg(test)]
+    record_service_report(name, &msg);
     terminal_eprintln!(
         "  {} {} {msg}",
         ui_paint(status_color, glyph),
@@ -381,7 +383,25 @@ fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, m
 
 fn ui_service_note(color: &str, name: &str, msg: &str) {
     let msg = sanitize_terminal_inline(msg);
+    #[cfg(test)]
+    record_service_report(name, &msg);
     terminal_eprintln!("  {} {msg}", ui_service_prefix(color, name));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// What was said of each service on this thread, while a test records it.
+    static SERVICE_REPORTS: std::cell::RefCell<Option<Vec<(String, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_service_report(name: &str, msg: &str) {
+    SERVICE_REPORTS.with(|reports| {
+        if let Some(reports) = reports.borrow_mut().as_mut() {
+            reports.push((name.to_string(), msg.to_string()));
+        }
+    });
 }
 
 fn ui_format_duration(duration: Duration) -> String {
@@ -2206,8 +2226,12 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
 
 /// Force-kills `child`'s tree, saying so the first time only: a second
 /// Ctrl+C, a level's deadline and the shutdown's last pass can each reach
-/// the same service.
+/// the same service. One that has stopped, tree and all, is left to the
+/// shutdown's last pass, which says how it stopped.
 fn force_kill_and_report(name: &str, child: &mut ServiceProcess) {
+    if !child.tree_running() {
+        return;
+    }
     force_kill_service_tree(child);
     if !child.reported_force_killed {
         child.reported_force_killed = true;
@@ -2249,21 +2273,23 @@ fn shutdown_children_ordered(
         return;
     }
 
+    terminal_eprintln!();
     if force {
-        let mut locked = children.lock();
-        terminal_eprintln!();
         ui_warn(&format!("Force-killing {count} services..."));
+        let mut locked = children.lock();
         for (name, child) in locked.iter_mut() {
             force_kill_and_report(name, child);
         }
-        return;
+    } else {
+        ui_warn(&format!("Stopping {count} services..."));
     }
 
-    terminal_eprintln!();
-    ui_warn(&format!("Stopping {count} services..."));
-
-    // Build the shutdown order: reverse topological levels (dependents first)
-    let shutdown_order: Vec<Vec<String>> = if let Some(groups) = groups {
+    // Build the shutdown order: reverse topological levels (dependents first).
+    // A forced shutdown has none, leaving the last pass to say how each
+    // service it didn't force-kill stopped.
+    let shutdown_order: Vec<Vec<String>> = if force {
+        Vec::new()
+    } else if let Some(groups) = groups {
         groups.iter().rev().cloned().collect()
     } else {
         // No graph available — shutdown all at once
@@ -2969,6 +2995,143 @@ mod tests {
         let failed = std::process::ExitStatus::from_raw(3);
 
         assert_eq!(stopped_note(failed), "stopped (exit 3)");
+    }
+
+    /// What is said of each service while `run` runs on this thread.
+    fn service_reports(run: impl FnOnce()) -> Vec<(String, String)> {
+        SERVICE_REPORTS.with(|reports| *reports.borrow_mut() = Some(Vec::new()));
+        run();
+        SERVICE_REPORTS
+            .with(|reports| reports.borrow_mut().take())
+            .unwrap_or_default()
+    }
+
+    fn reported(name: &str, msg: &str) -> (String, String) {
+        (name.to_string(), msg.to_string())
+    }
+
+    /// A service, started as `lpm dev` starts one, that runs until stopped.
+    fn running_service(project: &Path) -> ServiceProcess {
+        #[cfg(unix)]
+        {
+            let _ = project;
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("while :; do sleep 0.05; done");
+            isolate_service_process_tree(&mut command);
+            ServiceProcess::from(command.spawn().unwrap())
+        }
+        #[cfg(windows)]
+        {
+            spawn_node_service(project, "setInterval(() => {}, 1000);")
+        }
+    }
+
+    /// A service, started as `lpm dev` starts one, that has exited with
+    /// `code` by itself, leaving nothing running.
+    fn exited_service(project: &Path, code: i32) -> ServiceProcess {
+        #[cfg(unix)]
+        let mut service = {
+            let _ = project;
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(format!("exit {code}"));
+            isolate_service_process_tree(&mut command);
+            ServiceProcess::from(command.spawn().unwrap())
+        };
+        #[cfg(windows)]
+        let mut service = spawn_node_service(project, &format!("process.exit({code});"));
+        assert_eq!(service.wait().unwrap().code(), Some(code));
+        service
+    }
+
+    /// A second Ctrl+C force-kills each service, while the shutdown runs or
+    /// before it begins, and the shutdown then force-kills what still runs.
+    #[test]
+    fn a_service_a_second_ctrl_c_force_killed_is_reported_once() {
+        for force in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let children = Arc::new(Mutex::new(vec![(
+                "web".to_string(),
+                running_service(project.path()),
+            )]));
+
+            let reports = service_reports(|| {
+                force_kill_children(&children);
+                shutdown_children_ordered(
+                    &children,
+                    force,
+                    Some(&[vec!["web".to_string()]]),
+                    || false,
+                );
+            });
+
+            assert_eq!(reports, [reported("web", "force-killed")], "force: {force}");
+        }
+    }
+
+    /// A service that stopped by itself before the second Ctrl+C wasn't
+    /// force-killed, so the shutdown says how it stopped.
+    #[test]
+    fn a_service_that_stopped_before_a_second_ctrl_c_is_reported_as_stopped() {
+        for force in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let children = Arc::new(Mutex::new(vec![(
+                "api".to_string(),
+                exited_service(project.path(), 0),
+            )]));
+
+            let reports = service_reports(|| {
+                force_kill_children(&children);
+                shutdown_children_ordered(
+                    &children,
+                    force,
+                    Some(&[vec!["api".to_string()]]),
+                    || false,
+                );
+            });
+
+            assert_eq!(
+                reports,
+                [reported("api", "stopped (exit 0)")],
+                "force: {force}"
+            );
+        }
+    }
+
+    /// A service whose Job lpm ended while it ran has no exit code of its
+    /// own; one that had exited first, leaving what it started running, has.
+    #[cfg(windows)]
+    #[test]
+    fn a_service_lpm_ended_is_reported_without_an_exit_code_and_one_that_had_exited_with_its_own() {
+        let project = tempfile::tempdir().unwrap();
+        let running = running_service(project.path());
+        let (mut exited, grandchild) =
+            spawn_service_with_a_detached_grandchild(project.path(), Some(3));
+        assert_eq!(exited.wait().unwrap().code(), Some(3));
+        let children = Arc::new(Mutex::new(vec![
+            ("web".to_string(), running),
+            ("worker".to_string(), exited),
+        ]));
+
+        let reports = service_reports(|| {
+            shutdown_children_ordered(
+                &children,
+                false,
+                Some(&[vec!["web".to_string(), "worker".to_string()]]),
+                || false,
+            );
+        });
+
+        assert_eq!(
+            reports,
+            [
+                reported("web", "stopped"),
+                reported("worker", "stopped (exit 3)")
+            ]
+        );
+        assert!(
+            grandchild.exits_within(Duration::from_secs(5)),
+            "what the worker left outlived the shutdown"
+        );
     }
 
     #[test]
