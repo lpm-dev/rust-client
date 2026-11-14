@@ -1162,6 +1162,7 @@ fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
     Ok(ServiceProcess {
         child,
         job,
+        tree_walked: false,
         reported_force_killed: false,
     })
 }
@@ -2253,7 +2254,14 @@ fn start_force_kill(name: &str, child: &mut ServiceProcess) -> ForceKill {
         kill_dying_service_tree(child);
         return ForceKill::Again;
     }
-    let killed = kill_service_tree(child);
+    // A tree lpm walked, whose own process is still exiting, is ended no
+    // further by walking it again.
+    let killed = if child.tree_walked {
+        kill_dying_service_tree(child);
+        true
+    } else {
+        kill_service_tree(child)
+    };
     child.reported_force_killed = true;
     ui_service_status(RESET, name, RED, "✗", "force-killed");
     if killed {
@@ -2321,8 +2329,8 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force
 ///
 /// When `groups` is provided, services are stopped in reverse topological order
 /// (dependents first, then their dependencies). All groups share a 2s grace
-/// budget, except that on Windows what lpm ended by its Job in a group has
-/// until the cleanup deadline to be gone.
+/// budget, except that on Windows what lpm ended in a group, by its Job or by
+/// walking its tree, has until the cleanup deadline to be gone.
 /// When `groups` is None, all services are stopped simultaneously (legacy behavior).
 /// While `services_interrupted` holds, the console interrupt that began the
 /// shutdown has reached the services, which then only get the grace period to
@@ -2370,16 +2378,17 @@ fn shutdown_children_ordered(
 
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(2);
     // Each service is reported once: one force-killed isn't reported again
-    // as stopped, and one whose Job lpm ended while it ran has no exit code
-    // of its own to report.
+    // as stopped, and one lpm ended while its own process ran, by its Job or
+    // by walking its tree, has no exit code of its own to report.
     #[cfg(windows)]
     let mut ended_by_lpm = std::collections::HashSet::new();
     for (group_index, group) in shutdown_order.iter().enumerate() {
         let interrupted = services_interrupted();
-        // Processes whose Job lpm ended have until the cleanup deadline to
-        // be gone, all at once, before they count as force-killed.
+        // What lpm ended, by its Job or by walking its tree, has until the
+        // cleanup deadline to be gone, all at once, before it counts as
+        // force-killed.
         #[cfg(windows)]
-        let mut jobs_gone_by = None;
+        let mut ended_by = None;
         {
             let mut locked = children.lock();
             #[cfg(windows)]
@@ -2406,9 +2415,8 @@ fn shutdown_children_ordered(
                     if matches!(child.try_wait(), Ok(None)) {
                         ended_by_lpm.insert(name.clone());
                     }
-                    if kill_service_tree(child) {
-                        jobs_gone_by.get_or_insert_with(cleanup_deadline);
-                    } else {
+                    ended_by.get_or_insert_with(cleanup_deadline);
+                    if !kill_service_tree(child) {
                         to_walk.push(child);
                     }
                 }
@@ -2427,7 +2435,7 @@ fn shutdown_children_ordered(
             + shutdown_deadline.saturating_duration_since(std::time::Instant::now())
                 / groups_remaining;
         #[cfg(windows)]
-        let group_deadline = jobs_gone_by.map_or(group_deadline, |by| group_deadline.max(by));
+        let group_deadline = ended_by.map_or(group_deadline, |by| group_deadline.max(by));
         loop {
             let group_still_running = {
                 let mut locked = children.lock();
@@ -2449,7 +2457,7 @@ fn shutdown_children_ordered(
 
         // What lpm ended in this level has had until its deadline to go.
         #[cfg(windows)]
-        let force_kill_deadline = jobs_gone_by.unwrap_or_else(cleanup_deadline);
+        let force_kill_deadline = ended_by.unwrap_or_else(cleanup_deadline);
         #[cfg(not(windows))]
         let force_kill_deadline = cleanup_deadline();
         let mut locked = children.lock();
@@ -2491,8 +2499,8 @@ fn kill_dying_service_tree(child: &mut ServiceProcess) {
 }
 
 /// Says in the shutdown's last pass how `child` stopped, or force-kills it
-/// with `force_kill` where it still runs. `ended` is whether lpm ended its
-/// Job while its own process still ran.
+/// with `force_kill` where it still runs. `ended` is whether lpm ended it,
+/// by its Job or by walking its tree, while its own process still ran.
 fn report_last(
     name: &str,
     child: &mut ServiceProcess,
@@ -2544,9 +2552,9 @@ fn final_report(
     }
 }
 
-/// How the shutdown reports a service that stopped with `status`, or whose
-/// Job lpm `ended` while its own process still ran, which leaves it no exit
-/// code of its own.
+/// How the shutdown reports a service that stopped with `status`, or that
+/// lpm `ended`, by its Job or by walking its tree, while its own process
+/// still ran, which leaves it no exit code of its own.
 fn stopped_report(status: std::process::ExitStatus, ended: bool) -> String {
     if ended {
         "stopped".to_string()
@@ -2609,6 +2617,9 @@ pub(crate) struct ServiceProcess {
     child: Child,
     #[cfg(windows)]
     job: Option<lpm_common::process_job::ProcessJob>,
+    /// Whether lpm walked the service's tree, which walking it again could
+    /// end no more of.
+    tree_walked: bool,
     /// Whether the shutdown has said this service was force-killed.
     reported_force_killed: bool,
 }
@@ -2619,6 +2630,7 @@ impl From<Child> for ServiceProcess {
             child,
             #[cfg(windows)]
             job: None,
+            tree_walked: false,
             reported_force_killed: false,
         }
     }
@@ -2842,6 +2854,7 @@ fn walk_service_trees_while(services: Vec<&mut ServiceProcess>, meanwhile: impl 
 /// Ends `child`'s tree by walking it, which ends what it can within a
 /// deadline of its own.
 fn walk_service_tree(child: &mut ServiceProcess) {
+    child.tree_walked = true;
     if let Err(error) = ports::terminate_child_process_tree(child) {
         tracing::warn!(
             "service process {} may have left processes running: {error}",
@@ -3304,7 +3317,10 @@ mod tests {
     }
 
     /// A service outside a Job, as where Windows refuses one, that starts a
-    /// child, which it names in `<name>.pid` in `project`, then idles.
+    /// child, which it names in `<name>.pid` in `project`, then idles. The
+    /// child is detached: node puts a child it doesn't detach in a Job of its
+    /// own that ends with node, which would end it however lpm stopped the
+    /// service.
     #[cfg(windows)]
     fn service_outside_a_job_with_a_child(
         project: &Path,
@@ -3316,9 +3332,10 @@ mod tests {
                 "-e",
                 &format!(
                     "const child = require('child_process').spawn(process.execPath, \
-                     ['-e', 'setInterval(() => {{}}, 1000)'], {{ stdio: 'ignore' }}); \
+                     ['-e', 'setInterval(() => {{}}, 1000)'], \
+                     {{ detached: true, stdio: 'ignore' }}); \
                      require('fs').writeFileSync('{name}.pid', String(child.pid)); \
-                     setInterval(() => {{}}, 1000);"
+                     child.unref(); setInterval(() => {{}}, 1000);"
                 ),
             ])
             .current_dir(project)
@@ -3358,6 +3375,9 @@ mod tests {
             web_child.exits_within(Duration::from_secs(5)),
             "web's child outlived it"
         );
+        for (name, child) in children.lock().iter_mut() {
+            assert!(!child.tree_running(), "{name} still runs");
+        }
     }
 
     /// A Windows service without a Job that lpm stops itself has its tree
@@ -3377,6 +3397,7 @@ mod tests {
             web_child.exits_within(Duration::from_secs(5)),
             "web's child outlived it"
         );
+        assert!(!children.lock()[0].1.tree_running(), "web still runs");
         assert_eq!(reports, [reported("web", "stopped")]);
     }
 
