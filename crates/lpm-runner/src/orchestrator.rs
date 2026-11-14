@@ -2402,8 +2402,17 @@ fn shutdown_children_ordered(
             cleanup_deadline(),
         );
     } else {
-        terminal_eprintln!();
-        ui_warn(&format!("Stopping {}...", services(count)));
+        // A second Ctrl+C may have come since the shutdown read that it
+        // wasn't forced.
+        let to_stop = children
+            .lock()
+            .iter()
+            .filter(|(_, child)| !child.reported_force_killed)
+            .count();
+        if to_stop > 0 {
+            terminal_eprintln!();
+            ui_warn(&format!("Stopping {}...", services(to_stop)));
+        }
     }
 
     // Build the shutdown order: reverse topological levels (dependents first).
@@ -3467,6 +3476,34 @@ mod tests {
             shutdown_children_ordered(&children, true, Some(&order), || false);
         });
         assert_eq!(said, ["Force-killing 1 service..."]);
+    }
+
+    /// A second Ctrl+C can force-kill every service after the shutdown
+    /// read that it wasn't forced, and the shutdown then doesn't announce
+    /// stopping them.
+    #[test]
+    fn a_shutdown_announces_no_stop_of_services_a_second_ctrl_c_force_killed() {
+        let project = tempfile::tempdir().unwrap();
+        let children = Arc::new(Mutex::new(vec![(
+            "web".to_string(),
+            running_service(project.path()),
+        )]));
+
+        let mut reports = Vec::new();
+        let said = warnings(|| {
+            reports = service_reports(|| {
+                force_kill_children(&children);
+                shutdown_children_ordered(
+                    &children,
+                    false,
+                    Some(&[vec!["web".to_string()]]),
+                    || false,
+                );
+            });
+        });
+
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(reports, [reported("web", "force-killed")]);
     }
 
     #[test]
