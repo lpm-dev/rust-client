@@ -1056,11 +1056,10 @@ fn assert_proxy_cert_covers_host(project: &TempProject, host: &str) {
     let hostnames = status["project"]["hostnames"]
         .as_array()
         .expect("cert status hostnames should be an array");
-    let typed_host = format!("DNSName({host})");
     assert!(
-        hostnames.iter().any(|hostname| hostname
-            .as_str()
-            .is_some_and(|value| value == host || value == typed_host)),
+        hostnames
+            .iter()
+            .any(|hostname| hostname.as_str() == Some(host)),
         "project cert hostnames did not include {host}: {hostnames:?}"
     );
     let cert_pem = std::fs::read_to_string(project.path().join(".lpm/certs/cert.pem"))

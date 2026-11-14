@@ -592,13 +592,10 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
     );
     assert_eq!(status["project"]["exists"], serde_json::json!(true));
     assert_eq!(status["project"]["needs_renewal"], serde_json::json!(false));
-    assert!(
-        hostnames.iter().any(|hostname| {
-            hostname
-                .as_str()
-                .is_some_and(|hostname| hostname.contains("myapp.local"))
-        }),
-        "generate --host must regenerate the cert so the requested SAN is present, got: {hostnames:?}"
+    assert_eq!(
+        hostnames,
+        &["localhost", "127.0.0.1", "::1", "myapp.local"],
+        "generate --host must regenerate the cert so the requested SAN is present, each name as a plain host"
     );
 }
 

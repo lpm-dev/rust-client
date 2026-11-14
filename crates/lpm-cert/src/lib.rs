@@ -1178,18 +1178,9 @@ mod tests {
         let result = status(project_dir.path()).unwrap();
         assert!(result.project_cert_exists);
         assert!(!result.project_cert_needs_renewal);
-        // Default SANs: localhost, 127.0.0.1, ::1 (shown in x509-parser format)
-        assert!(
-            !result.project_cert_hostnames.is_empty(),
-            "expected SANs, got empty list"
-        );
-        assert!(
-            result
-                .project_cert_hostnames
-                .iter()
-                .any(|s| s.contains("localhost")),
-            "expected localhost in SANs, got {:?}",
-            result.project_cert_hostnames
+        assert_eq!(
+            result.project_cert_hostnames,
+            ["localhost", "127.0.0.1", "::1"]
         );
     }
 
@@ -1209,21 +1200,15 @@ mod tests {
         std::fs::write(&cert_path, &cert_pem).unwrap();
 
         let info = cert::read_cert_info(&cert_path).unwrap();
-        // SAN entries from x509-parser use format like "DNS:localhost", "IP:..." or hex
-        assert!(
-            info.san_entries.iter().any(|s| s.contains("localhost")),
-            "missing localhost in SANs: {:?}",
-            info.san_entries
-        );
-        assert!(
-            info.san_entries.iter().any(|s| s.contains("myapp.local")),
-            "missing myapp.local in SANs: {:?}",
-            info.san_entries
-        );
-        assert!(
-            info.san_entries.len() >= 5,
-            "expected at least 5 SANs (3 default + 2 extra), got {:?}",
-            info.san_entries
+        assert_eq!(
+            info.san_entries,
+            [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "myapp.local",
+                "192.168.1.42"
+            ]
         );
         assert!(!cert::needs_renewal(&cert_path).unwrap());
     }
