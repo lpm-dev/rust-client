@@ -903,6 +903,7 @@ pub fn project_cert_dir(project_dir: &Path) -> Result<PathBuf, LpmError> {
 
 pub(crate) struct ProjectCertDirectory {
     path: PathBuf,
+    display_path: PathBuf,
     dir: Dir,
 }
 
@@ -914,6 +915,14 @@ pub(crate) struct ProjectCertMaterial {
 impl ProjectCertDirectory {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directory as a user would type it, for what lpm prints and hands
+    /// dev servers as `SSL_CERT_FILE`: on Windows the plain `C:\…` where it
+    /// names the same directory as the canonical `\\?\C:\…` that `path`
+    /// keeps for every check lpm makes.
+    pub(crate) fn display_path(&self) -> &Path {
+        &self.display_path
     }
 
     pub(crate) fn read_pair(&self) -> Result<(Vec<u8>, Vec<u8>), LpmError> {
@@ -1486,12 +1495,17 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
-    // The path is what lpm prints and hands dev servers as `SSL_CERT_FILE`,
-    // so it is the one a user would type, not the canonical `\\?\C:\…`.
-    let mut path = lpm_common::symlink::windows_plain_path(&project_path);
+    let mut path = project_path.clone();
     path.push(".lpm");
     path.push("certs");
-    let directory = ProjectCertDirectory { path, dir: certs };
+    let mut display_path = lpm_common::symlink::windows_plain_path(&project_path);
+    display_path.push(".lpm");
+    display_path.push("certs");
+    let directory = ProjectCertDirectory {
+        path,
+        display_path,
+        dir: certs,
+    };
     recover_project_pair_transaction(&directory)?;
     Ok(Some(directory))
 }
@@ -2184,18 +2198,22 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn the_project_cert_directory_is_named_by_a_plain_windows_path() {
+    fn the_project_cert_directory_is_shown_by_a_plain_windows_path() {
         let project = tempfile::tempdir().unwrap();
 
         let cert_dir = open_project_cert_directory(project.path(), true)
             .unwrap()
             .unwrap();
 
-        let path = cert_dir.path().to_string_lossy().into_owned();
-        assert!(!path.starts_with(r"\\?\"), "{path}");
-        assert!(!path.contains('/'), "{path}");
-        assert!(path.ends_with(r"\.lpm\certs"), "{path}");
-        assert!(cert_dir.path().is_dir(), "{path}");
+        let shown = cert_dir.display_path().to_string_lossy().into_owned();
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+        assert!(!shown.contains('/'), "{shown}");
+        assert!(shown.ends_with(r"\.lpm\certs"), "{shown}");
+        assert_eq!(
+            std::fs::canonicalize(cert_dir.display_path()).unwrap(),
+            cert_dir.path(),
+            "the shown path must name the directory lpm checks"
+        );
     }
 
     #[cfg(windows)]

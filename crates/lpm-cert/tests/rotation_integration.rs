@@ -261,7 +261,7 @@ fn uninstall_active_ca_records_the_removed_fingerprint_inside_the_operation() {
     let result = lpm_cert::uninstall_active_ca().unwrap();
 
     assert_eq!(result.fingerprints, std::slice::from_ref(&fingerprint));
-    assert!(result.was_trusted, "the seeded root is trusted");
+    assert_eq!(result.was_trusted, Some(true), "the seeded root is trusted");
     let audit_log = std::fs::read_to_string(tmp.path().join("audit/cert.jsonl")).unwrap();
     let event = audit_log
         .lines()

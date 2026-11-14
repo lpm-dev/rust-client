@@ -639,6 +639,12 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         &["localhost", "127.0.0.1", "::1", "myapp.local"],
         "generate --host must regenerate the cert so the requested SAN is present, each name as a plain host"
     );
+
+    let mut status = status;
+    status["ca"]["expires"] = serde_json::json!("[DATE]");
+    status["ca"]["days_until_expiry"] = serde_json::json!("[DAYS]");
+    status["project"]["expires"] = serde_json::json!("[DATE]");
+    insta::assert_json_snapshot!("cert_status_json_after_generate_for_a_host", status);
 }
 
 #[test]

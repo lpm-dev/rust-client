@@ -86,8 +86,9 @@ pub struct UninstallCaResult {
     /// SHA-256 fingerprints of the certificates whose trust was removed: the
     /// on-disk root's, then that of a pending write's root that differs.
     pub fingerprints: Vec<String>,
-    /// Whether the trust store held any of them before the removal.
-    pub was_trusted: bool,
+    /// Whether the trust store held any of them before the removal; `None`
+    /// where it couldn't be read then.
+    pub was_trusted: Option<bool>,
 }
 
 /// Remove the active LPM root from the OS trust store and record the exact
@@ -107,11 +108,21 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
         .as_ref()
         .filter(|pending| on_disk.as_ref() != Some(*pending));
     let mut fingerprints = Vec::with_capacity(2);
-    let mut was_trusted = false;
+    let mut was_trusted = Some(false);
     for cert_pem in on_disk.iter().chain(pending) {
-        // Removal runs either way: it also clears what the check can't see,
-        // such as a Linux anchor whose bundle wasn't refreshed.
-        was_trusted |= trust::is_ca_installed_bytes(cert_pem, &ca_cert_path)?;
+        // Only what lpm says depends on this check, so one that fails doesn't
+        // stop the removal, which also clears what it can't see, such as a
+        // Linux anchor whose bundle wasn't refreshed.
+        match trust::is_ca_installed_bytes(cert_pem, &ca_cert_path) {
+            Ok(true) => was_trusted = Some(true),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!("could not read the trust store before the removal: {error}");
+                if was_trusted == Some(false) {
+                    was_trusted = None;
+                }
+            }
+        }
         fingerprints.push(uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?);
     }
     if pending_pair.is_some() {
@@ -907,8 +918,16 @@ fn ensure_https_locked(
 
     // Step 3: Build env vars for the dev server
     let ca_cert_path_str = root.cert_path.to_string_lossy().to_string();
-    let proj_cert_str = proj_cert_path.to_string_lossy().to_string();
-    let proj_key_str = proj_key_path.to_string_lossy().to_string();
+    let proj_cert_str = project_cert_dir
+        .display_path()
+        .join("cert.pem")
+        .to_string_lossy()
+        .into_owned();
+    let proj_key_str = project_cert_dir
+        .display_path()
+        .join("key.pem")
+        .to_string_lossy()
+        .into_owned();
 
     let mut env_vars = vec![
         ("NODE_EXTRA_CA_CERTS".to_string(), ca_cert_path_str),
@@ -1012,6 +1031,48 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uninstall_removes_trust_even_when_the_store_cannot_be_read_beforehand() {
+        let _serial = test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
+        let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", home.path().join("audit"));
+        let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", home.path().join("trust"));
+        let root = trust_ca().unwrap();
+        let cert_pem = std::fs::read(&root.cert_path).unwrap();
+        assert!(trust::is_ca_installed_bytes(&cert_pem, &root.cert_path).unwrap());
+
+        trust::fail_next_trust_check();
+        let result = uninstall_active_ca().unwrap();
+
+        assert_eq!(result.was_trusted, None);
+        assert!(!trust::is_ca_installed_bytes(&cert_pem, &root.cert_path).unwrap());
+    }
 
     #[test]
     fn https_setup_debug_output_redacts_private_key_material() {

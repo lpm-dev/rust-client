@@ -749,6 +749,15 @@ static FAIL_UNINSTALL_AFTER_MUTATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+static FAIL_NEXT_TRUST_CHECK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_trust_check() {
+    FAIL_NEXT_TRUST_CHECK.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
 pub(crate) fn fail_next_install_after_mutation() {
     FAIL_INSTALL_AFTER_MUTATION.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -845,6 +854,10 @@ pub(crate) fn is_ca_installed_bytes(
     cert_pem: &[u8],
     _display_path: &Path,
 ) -> Result<bool, LpmError> {
+    #[cfg(test)]
+    if FAIL_NEXT_TRUST_CHECK.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(LpmError::Cert("injected trust-store check failure".into()));
+    }
     let expected_hex = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?);
     if let Some(trust_store_path) = test_trust_store_path() {
         return is_ca_installed_test(&expected_hex, &trust_store_path);
