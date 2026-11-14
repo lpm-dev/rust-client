@@ -151,6 +151,8 @@ The CLI looks up the immutable ID for a public GitHub repository. For a private 
 
 All projects require --allow-server-decryption. Personal projects share an independent project key. Run `lpm env oidc disable` to rotate that key and revoke CI access. For organization projects, add --org=<slug>. An owner or admin must first share or pull the project. The server receives only this project's current content key. Key rotation disables CI access until you enable it again. Use `lpm env oidc disable --org=<slug>` to disable decryption and revoke CI credentials.
 
+Adding or changing an organization project's policy asks you to confirm it's you, so run it in an interactive terminal. Running it again with the policy the project already has asks for nothing.
+
 This command replaces the policy's complete allowlists. Run `lpm env oidc list` first, then supply every branch, environment, workflow, and event that should remain allowed."#
     );
 }
@@ -367,9 +369,11 @@ pub(super) async fn vars_oidc_allow(
     if let Some(repository_id) = &repository_id {
         policy_body["repositoryId"] = serde_json::Value::String(repository_id.clone());
     }
-    let result =
-        super::auth::execute_lpm_with_bearer(registry_client, |registry_url, auth_token| {
+    let write_policy = |step_up_proof: Option<String>| {
+        let policy_body = policy_body.clone();
+        super::auth::execute_lpm_with_bearer(registry_client, move |registry_url, auth_token| {
             let policy_body = policy_body.clone();
+            let step_up_proof = step_up_proof.clone();
             async move {
                 if let Some(org) = org {
                     super::sync_payload::fresh_org_mutation_manifest(
@@ -382,7 +386,13 @@ pub(super) async fn vars_oidc_allow(
                     .map_err(LpmError::Env)?;
                 }
                 if org.is_some() {
-                    create_oidc_policy(&registry_url, &auth_token, &policy_body).await
+                    create_oidc_policy(
+                        &registry_url,
+                        &auth_token,
+                        &policy_body,
+                        step_up_proof.as_deref(),
+                    )
+                    .await
                 } else {
                     let vault_id = policy_body["vaultId"].as_str().unwrap_or_default();
                     let principal = policy_body["expectedPrincipalId"]
@@ -407,6 +417,7 @@ pub(super) async fn vars_oidc_allow(
                         &policy,
                     )
                     .await
+                    .map(PolicyWrite::Written)
                     .map_err(|error| {
                         if error.is_unauthorized() {
                             LpmError::AuthRequired
@@ -417,7 +428,17 @@ pub(super) async fn vars_oidc_allow(
                 }
             }
         })
-        .await?;
+    };
+    let result = match write_policy(None).await? {
+        PolicyWrite::Written(result) => result,
+        PolicyWrite::NeedsStepUp { scope, .. } => {
+            let proof = confirm_ci_access(registry_client, &scope).await?;
+            match write_policy(Some(proof)).await? {
+                PolicyWrite::Written(result) => result,
+                PolicyWrite::NeedsStepUp { message, .. } => return Err(LpmError::Env(message)),
+            }
+        }
+    };
     let policy_id = policy_id_from_response(&result)?;
 
     if let Some(org) = org {
@@ -572,28 +593,108 @@ async fn parse_authenticated_oidc_response(
     super::response::parse_capped_platform_json(response).await
 }
 
+/// The server's answer to a policy write.
+#[derive(Debug)]
+enum PolicyWrite {
+    Written(serde_json::Value),
+    /// The policy isn't written until the user confirms `scope`, which
+    /// names the env project and this exact policy. `message` is the
+    /// server's wording of the refusal.
+    NeedsStepUp {
+        scope: String,
+        message: String,
+    },
+}
+
+/// Whether `scope` is the confirmation of one CI access policy for one env
+/// project: `vault:oidc-policy:<project UUID>:<SHA-256 of the policy>`. The
+/// server names the scope, so the prompt that follows is held to this
+/// command's own kind of confirmation.
+fn is_oidc_policy_step_up_scope(scope: &str) -> bool {
+    let Some((project, digest)) = scope
+        .strip_prefix("vault:oidc-policy:")
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    let is_lower_hex = |value: &str| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let groups: Vec<&str> = project.split('-').collect();
+    groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups.iter().all(|group| is_lower_hex(group))
+        && digest.len() == 64
+        && is_lower_hex(digest)
+}
+
+/// Has the user confirm that it's them before CI is given access to an env
+/// project, and returns the proof the policy write carries.
+async fn confirm_ci_access(
+    registry_client: &lpm_registry::RegistryClient,
+    scope: &str,
+) -> Result<String, LpmError> {
+    use std::io::IsTerminal as _;
+
+    if !std::io::stdin().is_terminal() {
+        return Err(LpmError::Env(
+            "Giving CI access to this env project needs a confirmation that it's you, which \
+             needs an interactive terminal. Run this command in one, or add the policy on the \
+             env project's page on lpm.dev and then run this command again."
+                .into(),
+        ));
+    }
+    output::info("Giving CI access to this env project needs a confirmation that it's you.");
+    crate::step_up::request_cli_step_up_proof(registry_client, scope).await
+}
+
 async fn create_oidc_policy(
     registry_url: &str,
     auth_token: &str,
     policy_body: &serde_json::Value,
-) -> Result<serde_json::Value, LpmError> {
+    step_up_proof: Option<&str>,
+) -> Result<PolicyWrite, LpmError> {
     let client = lpm_http::client_builder()
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
-    let response = client
+    let mut request = client
         .post(format!("{registry_url}/api/vault/oidc/policies"))
         .bearer_auth(auth_token)
         .json(policy_body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|error| {
-            LpmError::Network(format!(
-                "failed to reach server: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-    parse_authenticated_oidc_response(response).await
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(proof) = step_up_proof {
+        request = request.header(lpm_vault::sync::CLI_STEP_UP_HEADER_NAME, proof);
+    }
+    let response = request.send().await.map_err(|error| {
+        LpmError::Network(format!(
+            "failed to reach server: {}",
+            lpm_http::display_error(&error)
+        ))
+    })?;
+    if response.status() != reqwest::StatusCode::FORBIDDEN {
+        return parse_authenticated_oidc_response(response)
+            .await
+            .map(PolicyWrite::Written);
+    }
+    let body: serde_json::Value =
+        super::response::parse_capped_platform_json_or_unknown(response).await;
+    let message = body["error"].as_str().unwrap_or("failed").to_string();
+    if body["code"].as_str() != Some("step_up_required") {
+        return Err(LpmError::Env(message));
+    }
+    match body["requiredScope"].as_str() {
+        Some(scope) if is_oidc_policy_step_up_scope(scope) => Ok(PolicyWrite::NeedsStepUp {
+            scope: scope.to_string(),
+            message,
+        }),
+        _ => Err(LpmError::Env(
+            "the server asked for a confirmation this LPM CLI doesn't recognize. Update it \
+             with `lpm self-update`, or add the policy on the env project's page on lpm.dev \
+             and then run this command again."
+                .into(),
+        )),
+    }
 }
 
 async fn list_oidc_policies(
@@ -1180,5 +1281,133 @@ mod oidc_error_hint_tests {
     fn no_code_no_hint_yields_raw_error() {
         let msg = build_oidc_pull_error_message("Boom", "", "");
         assert_eq!(msg, "Boom");
+    }
+}
+
+#[cfg(test)]
+mod policy_step_up_tests {
+    use super::{PolicyWrite, create_oidc_policy, is_oidc_policy_step_up_scope};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCOPE: &str = "vault:oidc-policy:3f2b8c1e-9a4d-4c6b-8e21-5d7f0a9b1c23:\
+        9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    fn policy() -> serde_json::Value {
+        serde_json::json!({ "vaultId": "vault", "provider": "github", "subject": "o/r" })
+    }
+
+    async fn server_answering(status: u16, body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[test]
+    fn only_an_oidc_policy_scope_for_one_project_and_policy_is_recognized() {
+        assert!(is_oidc_policy_step_up_scope(SCOPE));
+        let project = "3f2b8c1e-9a4d-4c6b-8e21-5d7f0a9b1c23";
+        let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        for scope in [
+            format!("vault:oidc-policy:{project}"),
+            format!("vault:oidc-policy:{project}:{}", &digest[1..]),
+            format!("vault:oidc-policy:{project}:{}", digest.to_uppercase()),
+            format!("vault:oidc-policy:{}:{digest}", project.replace('-', "")),
+            format!("vault:oidc-policy:{project}:{digest}:extra"),
+            format!("vault:public-key:rotate:{project}:{digest}"),
+            format!("vault:oidc-policy:{project}:{digest}\n"),
+            String::new(),
+        ] {
+            assert!(!is_oidc_policy_step_up_scope(&scope), "{scope}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_up_refusal_names_the_scope_to_confirm() {
+        let server = server_answering(
+            403,
+            serde_json::json!({
+                "error": "confirm it's you",
+                "code": "step_up_required",
+                "requiredScope": SCOPE,
+            }),
+        )
+        .await;
+
+        let answer = create_oidc_policy(&server.uri(), "token", &policy(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                &answer,
+                PolicyWrite::NeedsStepUp { scope, message }
+                    if scope == SCOPE && message == "confirm it's you"
+            ),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_up_refusal_for_another_kind_of_scope_is_not_confirmed() {
+        for scope in [
+            serde_json::json!("vault:public-key:set:abc"),
+            serde_json::Value::Null,
+        ] {
+            let server = server_answering(
+                403,
+                serde_json::json!({
+                    "error": "confirm it's you",
+                    "code": "step_up_required",
+                    "requiredScope": scope,
+                }),
+            )
+            .await;
+
+            let error = create_oidc_policy(&server.uri(), "token", &policy(), None)
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("doesn't recognize"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn another_refusal_is_reported_in_the_servers_words() {
+        let server = server_answering(403, serde_json::json!({ "error": "Not an admin" })).await;
+
+        let error = create_oidc_policy(&server.uri(), "token", &policy(), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Not an admin"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_proof_travels_in_the_step_up_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .and(header("X-LPM-Step-Up-Proof", "proof-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "ok", "policyId": "id" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let answer = create_oidc_policy(&server.uri(), "token", &policy(), Some("proof-token"))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&answer, PolicyWrite::Written(body) if body["policyId"] == "id"),
+            "{answer:?}"
+        );
     }
 }
