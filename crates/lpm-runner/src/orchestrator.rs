@@ -2236,6 +2236,9 @@ enum ForceKill {
     Again,
     /// Force-killed it, and said so: to be waited for.
     Now,
+    /// Said it was force-killed, where its tree has no Job to end it by:
+    /// to be walked.
+    ToWalk,
 }
 
 /// Starts force-killing `child`'s tree, saying so the first time only: a
@@ -2249,10 +2252,14 @@ fn start_force_kill(name: &str, child: &mut ServiceProcess) -> ForceKill {
         kill_dying_service_tree(child);
         return ForceKill::Again;
     }
-    kill_service_tree(child);
+    let killed = kill_service_tree(child);
     child.reported_force_killed = true;
     ui_service_status(RESET, name, RED, "✗", "force-killed");
-    ForceKill::Now
+    if killed {
+        ForceKill::Now
+    } else {
+        ForceKill::ToWalk
+    }
 }
 
 /// Force-kills `child`'s tree and waits for it, as [`start_force_kill`]
@@ -2265,24 +2272,39 @@ fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
             wait_for_killed_service_tree(child, cleanup_deadline());
             true
         }
+        ForceKill::ToWalk => {
+            walk_service_tree(child);
+            true
+        }
     }
 }
 
 /// Force-kills the trees of `services`, as [`start_force_kill`] does, then
 /// waits for them together until one deadline, so that processes stuck
 /// exiting cost the shutdown that deadline once, however many there are.
+/// Each walk of a tree without a Job waits within a deadline of its own, so
+/// the walks run side by side.
 fn force_kill_and_report_all<'a>(
     services: impl Iterator<Item = (&'a str, &'a mut ServiceProcess)>,
 ) {
-    let killed: Vec<&mut ServiceProcess> = services
-        .filter_map(|(name, child)| {
-            matches!(start_force_kill(name, child), ForceKill::Now).then_some(child)
-        })
-        .collect();
     let deadline = cleanup_deadline();
-    for child in killed {
-        wait_for_killed_service_tree(child, deadline);
+    let mut killed = Vec::new();
+    let mut to_walk = Vec::new();
+    for (name, child) in services {
+        match start_force_kill(name, child) {
+            ForceKill::Now => killed.push(child),
+            ForceKill::ToWalk => to_walk.push(child),
+            ForceKill::Stopped | ForceKill::Again => {}
+        }
     }
+    std::thread::scope(|walks| {
+        for child in to_walk {
+            walks.spawn(move || walk_service_tree(child));
+        }
+        for child in killed {
+            wait_for_killed_service_tree(child, deadline);
+        }
+    });
 }
 
 /// Gracefully stop all child processes: SIGTERM first, wait, then SIGKILL.
@@ -2758,23 +2780,34 @@ fn terminate_unready_initial_services(
 }
 
 /// Kills `child`'s tree without waiting for it to be gone: its process
-/// group on Unix, its Job on Windows. Where a Windows service has no Job, or
-/// Windows won't end it, the walk of its tree ends what it can, within a
-/// deadline of its own.
-fn kill_service_tree(child: &mut ServiceProcess) {
+/// group on Unix, its Job on Windows. `false` where a Windows service has no
+/// Job, or Windows won't end it, which leaves its tree to
+/// [`walk_service_tree`].
+fn kill_service_tree(child: &mut ServiceProcess) -> bool {
     #[cfg(unix)]
-    signal_service_process_group(child.id(), libc::SIGKILL);
-    #[cfg(windows)]
-    if let Some(job) = &child.job {
-        match job.end(Duration::ZERO) {
-            Ok(_) => return,
-            Err(error) => tracing::warn!(
-                "could not end the processes of service process {}: {error}",
-                child.id()
-            ),
-        }
+    {
+        signal_service_process_group(child.id(), libc::SIGKILL);
+        true
     }
     #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        if let Some(job) = &child.job {
+            match job.end(Duration::ZERO) {
+                Ok(_) => return true,
+                Err(error) => tracing::warn!(
+                    "could not end the processes of service process {}: {error}",
+                    child.id()
+                ),
+            }
+        }
+        false
+    }
+}
+
+/// Ends `child`'s tree by walking it, which ends what it can within a
+/// deadline of its own.
+fn walk_service_tree(child: &mut ServiceProcess) {
     if let Err(error) = ports::terminate_child_process_tree(child) {
         tracing::warn!(
             "service process {} may have left processes running: {error}",
@@ -3233,6 +3266,37 @@ mod tests {
             });
 
             assert_eq!(reports, [reported("web", "force-killed")], "force: {force}");
+        }
+    }
+
+    /// Windows services without a Job, as where Windows refuses one, have
+    /// their trees walked, side by side, when force-killed.
+    #[cfg(windows)]
+    #[test]
+    fn services_without_a_job_are_walked_when_force_killed() {
+        let outside_a_job = || {
+            let mut command = Command::new("node");
+            command
+                .args(["-e", "setInterval(() => {}, 1000)"])
+                .stdin(Stdio::null());
+            ServiceProcess::from(command.spawn().unwrap())
+        };
+        let children = Arc::new(Mutex::new(vec![
+            ("api".to_string(), outside_a_job()),
+            ("web".to_string(), outside_a_job()),
+        ]));
+
+        let reports = service_reports(|| force_kill_children(&children));
+
+        assert_eq!(
+            reports,
+            [
+                reported("api", "force-killed"),
+                reported("web", "force-killed")
+            ]
+        );
+        for (name, child) in children.lock().iter_mut() {
+            assert!(!child.tree_running(), "{name} still runs");
         }
     }
 
