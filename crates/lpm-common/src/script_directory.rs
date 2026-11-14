@@ -253,8 +253,12 @@ mod windows {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let letters = defined.get_or_insert_with(HashMap::new);
         if let Some(entry) = letters.get_mut(&share_key) {
-            // Someone may have removed the definition since.
-            if defines(entry.letter, &entry.definition) {
+            // Someone may have removed the definition since, or stacked one
+            // of another share on it, which the letter then resolves to.
+            if dos_definitions(entry.letter)
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(&entry.definition))
+            {
                 entry.users += 1;
                 let hold = DefinedHold {
                     share_key,
@@ -265,7 +269,13 @@ mod windows {
                     DriveHold::Defined { _hold: hold },
                 ));
             }
-            letters.remove(&share_key);
+            // Its holders count nothing against what comes next, and this
+            // process's definition, if it is still there, goes now.
+            if let Some(gone) = letters.remove(&share_key)
+                && defines(gone.letter, &gone.definition)
+            {
+                let _ = undefine(gone.letter, &gone.definition);
+            }
         }
         // Another LPM process's letter for the share, or one a crash left:
         // this process adds its own definition, which Windows stacks on the
@@ -748,6 +758,25 @@ mod windows {
                 dos_definitions(again_letter).is_empty(),
                 "the new definition outlived its last user"
             );
+
+            // A definition of another share stacked on the letter takes it
+            // over, so the next script reaches the folder by another letter.
+            let held = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            assert!(lpm_defined(&held), "{:?}", held.path());
+            let taken = letter_of(held.path());
+            let other = definition_of(OsStr::new(r"\\127.0.0.1\IPC$"));
+            define(taken, &other).unwrap();
+            let next = super::super::ScriptDirectory::for_shell(&network);
+            undefine(taken, &other).unwrap();
+            let next = next.unwrap();
+            assert_ne!(letter_of(next.path()), taken, "{:?}", next.path());
+            std::fs::write(next.path().join("written"), b"elsewhere").unwrap();
+            assert_eq!(
+                std::fs::read(project.join("written")).unwrap(),
+                b"elsewhere"
+            );
+            drop(held);
+            drop(next);
         }
 
         /// A drive mapped the way `net use` maps one, through the SMB
