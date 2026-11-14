@@ -527,12 +527,12 @@ mod tests {
     #[test]
     fn build_path_prepends_bins() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("node_modules/.bin");
+        let bin = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin).unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
         let path = build_path_with_bins(dir.path()).unwrap();
-        assert!(path.starts_with(&bin.to_string_lossy().to_string()));
+        assert_eq!(std::env::split_paths(&path).next(), Some(bin), "{path}");
     }
 
     #[test]
@@ -554,22 +554,13 @@ mod tests {
         ));
     }
 
-    /// Split the inherited `PATH` env var into the same segment list the
-    /// builder would produce. Test-only helper.
-    fn inherited_path_segments() -> Vec<String> {
-        let separator = if cfg!(windows) { ";" } else { ":" };
-        std::env::var("PATH")
+    /// The entries of the inherited `PATH`, which the builder keeps after the
+    /// ones it adds.
+    fn inherited_path_entries() -> Vec<PathBuf> {
+        std::env::var_os("PATH")
+            .filter(|path| !path.is_empty())
+            .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default()
-            .split(separator)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    }
-
-    /// Split the produced `PATH` string into segments using the same rules.
-    fn path_segments(path: &str) -> Vec<&str> {
-        let separator = if cfg!(windows) { ";" } else { ":" };
-        path.split(separator).collect()
     }
 
     #[test]
@@ -580,7 +571,7 @@ mod tests {
         // consumed verbatim with no re-stat / re-detect, and nothing else
         // gets prepended.
         let dir = tempfile::tempdir().unwrap();
-        let nm_bin = dir.path().join("node_modules/.bin");
+        let nm_bin = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&nm_bin).unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
@@ -597,31 +588,24 @@ mod tests {
         )
         .unwrap();
 
-        let parts = path_segments(&path);
-        let inherited = inherited_path_segments();
-
         // Exact prefix: nm_bin, then the hinted runtime bin, then the inherited
-        // PATH verbatim. Testing the full structure (not just `parts[0]`/`[1]`)
-        // catches accidental extra segments and is robust to whatever the
-        // developer's PATH happens to contain.
-        let mut expected: Vec<String> = vec![
-            nm_bin.to_string_lossy().to_string(),
-            fake_runtime_bin.to_string_lossy().to_string(),
-        ];
-        expected.extend(inherited);
-        let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
-        assert_eq!(parts_owned, expected);
+        // PATH verbatim. Testing the full structure (not just the first two
+        // entries) catches accidental extra entries and is robust to whatever
+        // the developer's PATH happens to contain.
+        let mut expected = vec![nm_bin, fake_runtime_bin];
+        expected.extend(inherited_path_entries());
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), expected);
     }
 
     #[test]
     fn build_path_with_bins_pre_resolved_preserves_multiple_runtime_order() {
         let dir = tempfile::tempdir().unwrap();
-        let nm_bin = dir.path().join("node_modules/.bin");
+        let nm_bin = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&nm_bin).unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
-        let node_bin = dir.path().join("node/bin");
-        let bun_bin = dir.path().join("bun/bin");
+        let node_bin = dir.path().join("node").join("bin");
+        let bun_bin = dir.path().join("bun").join("bin");
 
         let path = build_path_with_bins_pre_resolved(
             dir.path(),
@@ -640,14 +624,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut expected: Vec<String> = vec![
-            nm_bin.to_string_lossy().to_string(),
-            node_bin.to_string_lossy().to_string(),
-            bun_bin.to_string_lossy().to_string(),
-        ];
-        expected.extend(inherited_path_segments());
-        let parts_owned: Vec<String> = path_segments(&path).iter().map(|s| s.to_string()).collect();
-        assert_eq!(parts_owned, expected);
+        let mut expected = vec![nm_bin, node_bin, bun_bin];
+        expected.extend(inherited_path_entries());
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), expected);
     }
 
     #[test]
@@ -658,19 +637,15 @@ mod tests {
         // ".lpm/runtimes/" — the inherited PATH may well contain that fragment
         // on a developer machine that has used `lpm use node@X`.
         let dir = tempfile::tempdir().unwrap();
-        let nm_bin = dir.path().join("node_modules/.bin");
+        let nm_bin = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&nm_bin).unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
         let path =
             build_path_with_bins_pre_resolved(dir.path(), &ManagedRuntimeHint::Absent).unwrap();
 
-        let parts = path_segments(&path);
-        let inherited = inherited_path_segments();
-
-        let mut expected: Vec<String> = vec![nm_bin.to_string_lossy().to_string()];
-        expected.extend(inherited);
-        let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
-        assert_eq!(parts_owned, expected);
+        let mut expected = vec![nm_bin];
+        expected.extend(inherited_path_entries());
+        assert_eq!(std::env::split_paths(&path).collect::<Vec<_>>(), expected);
     }
 }

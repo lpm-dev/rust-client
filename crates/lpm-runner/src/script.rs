@@ -2924,7 +2924,20 @@ mod tests {
 
     use super::*;
     use crate::bin_path::ManagedRuntimeHint::Unknown;
+    use crate::test_support::{script_creating_file, script_expecting_env};
     use std::fs;
+
+    fn write_package_scripts(project_dir: &Path, scripts: &[(&str, &str)]) {
+        let scripts: serde_json::Map<String, serde_json::Value> = scripts
+            .iter()
+            .map(|(name, command)| ((*name).to_string(), (*command).into()))
+            .collect();
+        fs::write(
+            project_dir.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({ "scripts": scripts })).unwrap(),
+        )
+        .unwrap();
+    }
 
     #[cfg(unix)]
     fn make_executable(path: &Path) {
@@ -3093,15 +3106,13 @@ mod tests {
     fn run_pre_hook() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("pre-ran");
-
-        fs::write(
-            dir.path().join("package.json"),
-            format!(
-                r#"{{"scripts": {{"prebuild": "touch {}", "build": "echo building"}}}}"#,
-                marker.display()
-            ),
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[
+                ("prebuild", &script_creating_file(&marker)),
+                ("build", "echo building"),
+            ],
+        );
 
         let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_ok());
@@ -3112,15 +3123,13 @@ mod tests {
     fn run_post_hook() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("post-ran");
-
-        fs::write(
-            dir.path().join("package.json"),
-            format!(
-                r#"{{"scripts": {{"build": "echo building", "postbuild": "touch {}"}}}}"#,
-                marker.display()
-            ),
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[
+                ("build", "echo building"),
+                ("postbuild", &script_creating_file(&marker)),
+            ],
+        );
 
         let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_ok());
@@ -3131,15 +3140,13 @@ mod tests {
     fn pre_hook_failure_aborts() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("build-ran");
-
-        fs::write(
-            dir.path().join("package.json"),
-            format!(
-                r#"{{"scripts": {{"prebuild": "exit 1", "build": "touch {}"}}}}"#,
-                marker.display()
-            ),
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[
+                ("prebuild", "exit 1"),
+                ("build", &script_creating_file(&marker)),
+            ],
+        );
 
         let result = run_script(dir.path(), "build", &[], None, &Unknown);
         assert!(result.is_err());
@@ -3201,11 +3208,10 @@ mod tests {
     #[test]
     fn script_children_receive_hidden_script_marker() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"check": "test \"$LPM_SCRIPT_CHILD\" = \"1\" "}}"#,
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[("check", &script_expecting_env(&[("LPM_SCRIPT_CHILD", "1")]))],
+        );
 
         let result = run_script(dir.path(), "check", &[], None, &Unknown);
         assert!(result.is_ok());
@@ -3214,23 +3220,8 @@ mod tests {
     #[test]
     fn path_injection_makes_bin_available() {
         let dir = tempfile::tempdir().unwrap();
-        let bin_dir = dir.path().join("node_modules/.bin");
-        fs::create_dir_all(&bin_dir).unwrap();
-
-        let fake_bin = bin_dir.join("my-tool");
-        fs::write(&fake_bin, "#!/bin/sh\necho my-tool-ran").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"check": "my-tool"}}"#,
-        )
-        .unwrap();
+        write_local_bin(dir.path(), "my-tool");
+        write_package_scripts(dir.path(), &[("check", "my-tool")]);
 
         let result = run_script(dir.path(), "check", &[], None, &Unknown);
         assert!(result.is_ok(), "should find my-tool via PATH injection");
@@ -3241,11 +3232,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         fs::write(dir.path().join(".env"), "MY_TEST_VAR=hello_from_env").unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"check-env": "test \"$MY_TEST_VAR\" = \"hello_from_env\""}}"#,
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[(
+                "check-env",
+                &script_expecting_env(&[("MY_TEST_VAR", "hello_from_env")]),
+            )],
+        );
 
         let result = run_script(dir.path(), "check-env", &[], None, &Unknown);
         assert!(result.is_ok(), ".env var should be available in script");
@@ -3257,11 +3250,13 @@ mod tests {
 
         fs::write(dir.path().join(".env"), "VAR=default").unwrap();
         fs::write(dir.path().join(".env.staging"), "VAR=staging_value").unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"check-env": "test \"$VAR\" = \"staging_value\""}}"#,
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[(
+                "check-env",
+                &script_expecting_env(&[("VAR", "staging_value")]),
+            )],
+        );
 
         let result = run_script(dir.path(), "check-env", &[], Some("staging"), &Unknown);
         assert!(result.is_ok(), "--env=staging should load .env.staging");
@@ -3334,11 +3329,10 @@ mod tests {
             r#"{"env": {"dev": ".env.development"}}"#,
         )
         .unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts": {"dev": "test \"$API\" = \"dev_api\""}}"#,
-        )
-        .unwrap();
+        write_package_scripts(
+            dir.path(),
+            &[("dev", &script_expecting_env(&[("API", "dev_api")]))],
+        );
 
         let result = run_script(dir.path(), "dev", &[], None, &Unknown);
         assert!(

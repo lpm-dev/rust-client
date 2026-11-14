@@ -2859,8 +2859,15 @@ async fn tls_frontend_caps_concurrent_handshakes_and_recovers_capacity() {
         );
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+    // The frontend listens on 127.0.0.1 alone. Windows takes a second or two
+    // to refuse a loopback connection, so letting `localhost` try `::1` first
+    // would spend each 250 ms attempt there.
     let client = reqwest::Client::builder()
         .tls_danger_accept_invalid_certs(true)
+        .resolve(
+            "localhost",
+            std::net::SocketAddr::from(([127, 0, 0, 1], frontend.port())),
+        )
         .timeout(Duration::from_millis(250))
         .build()
         .unwrap();

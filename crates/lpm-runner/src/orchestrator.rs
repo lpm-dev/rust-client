@@ -4081,11 +4081,18 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
         let second_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let second_port = second_listener.local_addr().unwrap().port();
         drop(second_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("a.js"),
+            "require('fs').writeFileSync('a.pid', String(process.pid));\nsetInterval(() => {}, 1000);\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.js"), "setInterval(() => {}, 1000);\n").unwrap();
         let services = HashMap::from([
             (
                 "a".to_string(),
                 ServiceConfig {
-                    command: "echo $$ > a.pid; sleep 60".to_string(),
+                    command: "node a.js".to_string(),
                     ready_url: Some(format!("http://127.0.0.1:{first_port}/health")),
                     ready_timeout: 10,
                     ..Default::default()
@@ -4094,7 +4101,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             (
                 "b".to_string(),
                 ServiceConfig {
-                    command: "sleep 60".to_string(),
+                    command: "node b.js".to_string(),
                     ready_url: Some(format!("http://127.0.0.1:{second_port}/health")),
                     ready_timeout: 10,
                     ..Default::default()
@@ -4109,7 +4116,6 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             event_tx: Some(event_tx),
             ..Default::default()
         };
-        let dir = tempfile::TempDir::new().unwrap();
         let pid_path = dir.path().join("a.pid");
         let controller = std::thread::spawn(move || {
             wait_for_starting_services(&event_rx, 2);
