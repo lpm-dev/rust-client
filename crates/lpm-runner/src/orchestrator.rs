@@ -2332,7 +2332,7 @@ fn shutdown_children_ordered(
                         if matches!(child.try_wait(), Ok(None)) {
                             ended_by_lpm.insert(name.clone());
                         }
-                        if !child.end_job() {
+                        if !child.end_job(cleanup_deadline()) {
                             let _ = child.kill();
                         }
                     }
@@ -2392,6 +2392,23 @@ fn shutdown_children_ordered(
     }
 }
 
+/// Kills again what is left of a tree force-killed earlier, which may still
+/// be dying, without waiting for it a second time.
+fn kill_dying_service_tree(child: &mut ServiceProcess) {
+    #[cfg(unix)]
+    signal_service_process_group(child.id(), libc::SIGKILL);
+    #[cfg(windows)]
+    if !child
+        .job
+        .as_ref()
+        .is_some_and(|job| job.end(Duration::ZERO).is_ok())
+    {
+        let _ = child.kill();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = child.kill();
+}
+
 /// Says in the shutdown's last pass how `child` stopped, or force-kills it
 /// with `force_kill` where it still runs. `ended` is whether lpm ended its
 /// Job while its own process still ran.
@@ -2405,7 +2422,7 @@ fn report_last(
     let stopped = status.filter(|_| !child.tree_running());
     match final_report(stopped, child.reported_force_killed, ended) {
         // A tree force-killed earlier may still be dying.
-        FinalReport::AlreadyReported if stopped.is_none() => force_kill_service_tree(child),
+        FinalReport::AlreadyReported if stopped.is_none() => kill_dying_service_tree(child),
         FinalReport::AlreadyReported => {}
         FinalReport::Stopped(note) => ui_service_note(RESET, name, &note),
         FinalReport::StillRunning => {
@@ -2547,14 +2564,14 @@ impl ServiceProcess {
     }
 
     /// Ends the service's Job, and so every process the service started,
-    /// and waits for them to be gone, as a restart needs their ports.
-    /// `false` where it has none, or Windows refused.
+    /// and waits until `deadline` for them to be gone, as a restart needs
+    /// their ports. `false` where it has none, or Windows refused.
     #[cfg(windows)]
-    fn end_job(&self) -> bool {
+    fn end_job(&self, deadline: Instant) -> bool {
         let Some(job) = &self.job else {
             return false;
         };
-        match job.end(crate::shell::SERVICE_TREE_EXIT_TIMEOUT) {
+        match job.end(deadline.saturating_duration_since(Instant::now())) {
             Ok(true) => true,
             Ok(false) => {
                 tracing::warn!(
@@ -2608,12 +2625,15 @@ fn terminate_service_tree(child: &mut ServiceProcess) {
         if service_process_group_exists(root_pid) {
             signal_service_process_group(root_pid, libc::SIGKILL);
         }
-        wait_for_ended_service(child);
+        wait_for_ended_service(child, cleanup_deadline());
     }
     #[cfg(windows)]
-    if child.end_job() {
-        wait_for_ended_service(child);
-        return;
+    {
+        let deadline = cleanup_deadline();
+        if child.end_job(deadline) {
+            wait_for_ended_service(child, deadline);
+            return;
+        }
     }
     #[cfg(not(unix))]
     if let Err(error) = ports::terminate_child_process_tree(child) {
@@ -2624,13 +2644,16 @@ fn terminate_service_tree(child: &mut ServiceProcess) {
     }
 }
 
-/// Waits, up to the cleanup deadline, for a service lpm has ended to exit.
+/// When the processes lpm ends now are to be gone by: ending a Job, and
+/// waiting for the service's own process, share one deadline.
+fn cleanup_deadline() -> Instant {
+    Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT
+}
+
+/// Waits, up to `deadline`, for a service lpm has ended to exit.
 #[cfg(any(unix, windows))]
-fn wait_for_ended_service(child: &mut ServiceProcess) {
-    if let Err(error) = ports::wait_for_ended_child(
-        child,
-        std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT,
-    ) {
+fn wait_for_ended_service(child: &mut ServiceProcess, deadline: Instant) {
+    if let Err(error) = ports::wait_for_ended_child(child, deadline) {
         tracing::warn!("service process {}: {error}", child.id());
     }
 }
@@ -2659,7 +2682,7 @@ fn cleanup_exited_service_tree(service: &ServiceProcess) {
         }
     }
     #[cfg(windows)]
-    service.end_job();
+    service.end_job(cleanup_deadline());
     #[cfg(not(any(unix, windows)))]
     let _ = service;
 }
@@ -2688,14 +2711,15 @@ fn terminate_unready_initial_services(
 }
 
 fn force_kill_service_tree(child: &mut ServiceProcess) {
+    let deadline = cleanup_deadline();
     #[cfg(unix)]
     {
         signal_service_process_group(child.id(), libc::SIGKILL);
-        wait_for_ended_service(child);
+        wait_for_ended_service(child, deadline);
     }
     #[cfg(windows)]
-    if child.end_job() {
-        wait_for_ended_service(child);
+    if child.end_job(deadline) {
+        wait_for_ended_service(child, deadline);
         return;
     }
     #[cfg(not(unix))]

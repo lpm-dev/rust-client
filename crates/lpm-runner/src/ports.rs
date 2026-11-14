@@ -1374,7 +1374,9 @@ fn terminate_child_process_tree_windows(
     let deadline = std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT;
     let _ = child.kill();
     let status = wait_for_child_exit_until(child, deadline)?;
-    terminate_descendants_until_stable_with(
+    // A root still exiting at the deadline leaves its descendants one pass,
+    // and is what the error names: they were just ended too.
+    let descendants = terminate_descendants_until_stable_with(
         root_pid,
         deadline,
         || {
@@ -1397,8 +1399,10 @@ fn terminate_child_process_tree_windows(
         std::io::Error::other(format!(
             "could not terminate {remaining} verified descendant process(es) of PID {root_pid} before the cleanup deadline"
         ))
-    })?;
-    status.ok_or_else(|| still_exiting(root_pid))
+    });
+    let status = status.ok_or_else(|| still_exiting(root_pid))?;
+    descendants?;
+    Ok(status)
 }
 
 #[cfg(windows)]
