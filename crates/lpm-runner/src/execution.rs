@@ -61,6 +61,19 @@ impl ExecutionSignals {
         self.presses.load(Ordering::Acquire) > 1
     }
 
+    /// How many console interrupts (Ctrl+C or Ctrl+Break) this has seen.
+    #[cfg(windows)]
+    pub(crate) fn console_presses(&self) -> usize {
+        self.presses.load(Ordering::Acquire)
+    }
+
+    /// Records one Ctrl+C in this listener alone, as the console handler
+    /// would, without raising one that every test in the process would get.
+    #[cfg(all(test, windows))]
+    pub(crate) fn interrupt_for_test(&self) {
+        console_interrupts::notify(&self.signal, &self.presses, console_interrupts::SIGINT);
+    }
+
     /// Windows runs lpm's console handler on a thread it starts for the
     /// interrupt, so a child the same interrupt ended can exit before lpm
     /// has recorded it. For a child that exited that way, waits briefly for

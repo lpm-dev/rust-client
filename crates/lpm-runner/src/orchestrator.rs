@@ -1541,7 +1541,7 @@ pub fn run_services_with_config(
     };
 
     // Set up Ctrl+C handler with double-press escalation
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _signal_handler = ctrlc_handler(shutdown_state.clone(), children.clone());
 
     let runtime_result = (|| -> Result<(), LpmError> {
@@ -2059,9 +2059,8 @@ impl Drop for ChildrenGuard {
 /// - First Ctrl+C: sets shutdown state to 1 (SIGTERM graceful shutdown)
 /// - Second Ctrl+C within 3 seconds: sets state to 2 (SIGKILL force kill)
 ///
-/// Uses `signal-hook` on Unix for safe, non-`unsafe` signal handling.
-/// Falls back to a no-op on non-Unix (Windows child process cleanup
-/// is handled by the `ChildrenGuard` RAII guard on drop).
+/// Uses `signal-hook` on Unix for safe, non-`unsafe` signal handling, and
+/// the console control handler on Windows.
 #[cfg(unix)]
 struct SignalHandler {
     handle: signal_hook::iterator::Handle,
@@ -2130,8 +2129,74 @@ fn ctrlc_handler(
     })
 }
 
+/// Stops on Windows what the Unix handler stops: lpm's console handler
+/// keeps Ctrl+C and Ctrl+Break from ending lpm while this lives, which
+/// otherwise exits at once with the services' cleanup skipped, and each
+/// press moves the shutdown on as a signal does on Unix.
+#[cfg(windows)]
+struct SignalHandler {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for SignalHandler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn ctrlc_handler(
+    shutdown_state: Arc<AtomicU8>,
+    children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+) -> Option<SignalHandler> {
+    let signals = crate::execution::ExecutionSignals::new()
+        .map_err(|error| tracing::warn!("Ctrl+C will end lpm without stopping services: {error}"))
+        .ok()?;
+    Some(ctrlc_handler_with(
+        Arc::new(signals),
+        shutdown_state,
+        children,
+    ))
+}
+
+#[cfg(windows)]
+fn ctrlc_handler_with(
+    signals: Arc<crate::execution::ExecutionSignals>,
+    shutdown_state: Arc<AtomicU8>,
+    children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+) -> SignalHandler {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        let mut handled = 0;
+        while !thread_stop.load(Ordering::Acquire) {
+            while handled < signals.console_presses() {
+                handled += 1;
+                if shutdown_state.fetch_add(1, Ordering::Relaxed) == 0 {
+                    terminal_eprintln!();
+                    ui_warn("Stopping services...");
+                } else {
+                    terminal_eprintln!();
+                    ui_warn("Force-killing services...");
+                    force_kill_children(&children);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    });
+    SignalHandler {
+        stop,
+        thread: Some(thread),
+    }
+}
+
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).
-#[cfg(unix)]
 fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
@@ -4493,6 +4558,35 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             "unrelated service should keep its initial process"
         );
         assert!(ready.iter().all(|is_ready| *is_ready));
+    }
+
+    /// Ctrl+C on Windows stops the services through the ordered shutdown,
+    /// and a second press force-kills them, as on Unix.
+    #[cfg(windows)]
+    #[test]
+    fn console_interrupts_drive_the_shutdown_on_windows() {
+        let signals = Arc::new(crate::execution::ExecutionSignals::new().unwrap());
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let handler =
+            ctrlc_handler_with(Arc::clone(&signals), Arc::clone(&shutdown_state), children);
+        let reaches = |state: u8| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while shutdown_state.load(Ordering::Relaxed) < state && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            shutdown_state.load(Ordering::Relaxed)
+        };
+
+        signals.interrupt_for_test();
+        assert_eq!(
+            reaches(1),
+            1,
+            "the first Ctrl+C starts the ordered shutdown"
+        );
+        signals.interrupt_for_test();
+        assert_eq!(reaches(2), 2, "the second Ctrl+C force-kills");
+        drop(handler);
     }
 
     #[cfg(unix)]
