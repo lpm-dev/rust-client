@@ -2035,23 +2035,22 @@ mod tests {
         let holder_pid = dir.path().join("holder.pid");
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let controller_stop = std::sync::Arc::clone(&stop_requested);
-        let controller_holder = holder_pid.clone();
+        // Once the script that started the holder has exited, the holder is
+        // no longer in the server's tree, so only the stop's deadline ends
+        // the wait for it.
+        let left = dir.path().join("left");
         let controller = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !controller_holder.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the holder never started"
-                );
+            while !left.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             controller_stop.store(true, std::sync::atomic::Ordering::Release);
-            std::time::Instant::now()
+            left.exists().then(std::time::Instant::now)
         });
 
         let result = spawn_shell_with_endpoint_using(
             &ShellCommand {
-                command: "node leave-a-holder.js; while :; do sleep 1; done",
+                command: "node leave-a-holder.js && touch left; while :; do sleep 1; done",
                 cwd: dir.path(),
                 path: &path,
                 envs: &envs,
@@ -2066,7 +2065,6 @@ mod tests {
             },
         );
         let stopped_at = controller.join().unwrap();
-        let stop_took = stopped_at.elapsed();
         if let Some(pid) = std::fs::read_to_string(&holder_pid)
             .ok()
             .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
@@ -2078,6 +2076,7 @@ mod tests {
             }
         }
 
+        let stop_took = stopped_at.expect("the holder was never left").elapsed();
         result.unwrap();
         assert!(
             stop_took < std::time::Duration::from_secs(20),
