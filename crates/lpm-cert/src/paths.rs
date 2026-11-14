@@ -473,12 +473,12 @@ impl GlobalCaDirectory {
         )?;
         if let Err(error) = write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)
         {
-            // A journal published before the error would install the pair on
-            // the next run, which this one reports as not written.
-            let _ = remove_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION);
-            let _ = self.dir.remove_file(&staged_cert.name);
-            let _ = self.dir.remove_file(&staged_key.name);
-            return Err(error);
+            return Err(abandon_pair_transaction(
+                &self.dir,
+                GLOBAL_PAIR_TRANSACTION,
+                [&staged_cert.name, &staged_key.name],
+                error,
+            ));
         }
 
         let result = (|| -> Result<(), LpmError> {
@@ -1030,12 +1030,12 @@ impl ProjectCertDirectory {
         if let Err(error) =
             write_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION, &transaction)
         {
-            // A journal published before the error would install the pair on
-            // the next run, which this one reports as not written.
-            let _ = remove_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION);
-            let _ = self.dir.remove_file(&staged_cert.name);
-            let _ = self.dir.remove_file(&staged_key.name);
-            return Err(error);
+            return Err(abandon_pair_transaction(
+                &self.dir,
+                PROJECT_PAIR_TRANSACTION,
+                [&staged_cert.name, &staged_key.name],
+                error,
+            ));
         }
 
         let result = (|| -> std::io::Result<()> {
@@ -1185,6 +1185,28 @@ fn read_pair_transaction(
     Ok(Some(transaction))
 }
 
+/// Removes the journal of a pair whose journal failed to be written, with
+/// the staged files it names, and returns `error`. A journal published
+/// before the error would install the pair on the next run, which this one
+/// reports as not written, so one that can't be removed is said in the error.
+fn abandon_pair_transaction(
+    dir: &Dir,
+    journal_name: &str,
+    staged_names: [&str; 2],
+    error: LpmError,
+) -> LpmError {
+    let removed = remove_pair_transaction(dir, journal_name);
+    for name in staged_names {
+        let _ = dir.remove_file(name);
+    }
+    match removed {
+        Ok(()) => error,
+        Err(removal) => LpmError::Cert(format!(
+            "{error}; the next run may install this pair all the same, as removing its recovery transaction failed: {removal}"
+        )),
+    }
+}
+
 fn remove_pair_transaction(dir: &Dir, journal_name: &str) -> Result<(), LpmError> {
     match remove_relative_file(dir, journal_name) {
         Ok(true) => sync_directory(dir),
@@ -1241,7 +1263,11 @@ fn sync_directory(dir: &Dir) -> Result<(), LpmError> {
 )]
 fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+    if FAILING_DIRECTORY_SYNCS.with(|failing| {
+        let count = failing.get();
+        failing.set(count.saturating_sub(1));
+        count > 0
+    }) {
         return Err(std::io::Error::other(
             "injected certificate directory sync failure",
         ));
@@ -1285,12 +1311,17 @@ fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
 
 #[cfg(test)]
 std::thread_local! {
-    static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAILING_DIRECTORY_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn fail_next_directory_sync() {
-    FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    fail_next_directory_syncs(1);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_directory_syncs(count: u32) {
+    FAILING_DIRECTORY_SYNCS.with(|failing| failing.set(count));
 }
 
 fn relative_file_exists(dir: &Dir, name: &str) -> Result<bool, LpmError> {
@@ -2480,6 +2511,66 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_journal_left_behind_a_failed_pair_write_is_said_in_the_error() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+        // The journal's publication fails to sync, and so does its removal.
+        fail_next_directory_syncs(2);
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("injected certificate directory sync failure"),
+            "{error}"
+        );
+        assert!(
+            error.contains("the next run may install this pair all the same"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_authority_pair_whose_journal_fails_is_neither_written_nor_left_to_recover() {
+        let home = tempfile::tempdir().unwrap();
+        let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        let certs = home.path().join(".lpm/certs");
+        let names_in = |path: &Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let before = names_in(&certs);
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+        // The journal is published, then its directory fails to sync.
+        fail_next_directory_sync();
+
+        let error = operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("injected certificate directory sync failure"),
+            "{error}"
+        );
+        assert_eq!(names_in(&certs), before);
     }
 
     #[cfg(windows)]
