@@ -3675,15 +3675,14 @@ mod tests {
         );
         assert!(drive.join("marker.txt").exists(), "{drive:?}");
         let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
-
         ChildrenGuard {
             children: Arc::clone(&children),
             on_shutdown_started: None,
         }
         .stop_services(false, &[vec!["web".to_string()]], || false)
         .unwrap();
-        drop(children);
 
+        // The test still holds the list, as a readiness thread may.
         assert!(
             !drive.join("marker.txt").exists(),
             "lpm dev left {drive:?} behind"
