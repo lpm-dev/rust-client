@@ -1125,10 +1125,13 @@ fn spawn_service_command_with_hooks(
 /// before lpm used them.
 #[cfg(windows)]
 fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
-    let job = lpm_common::process_job::ProcessJob::new(true)
+    let job = lpm_common::process_job::ProcessJob::new()
         .and_then(|job| job.assign(&child).map(|()| job))
         .map_err(|error| {
-            tracing::debug!("service process {} runs outside a Job: {error}", child.id());
+            tracing::warn!(
+                "service process {} runs outside a Job, so what it starts may outlive it: {error}",
+                child.id()
+            );
         })
         .ok();
     if let Err(error) = lpm_common::process_job::resume(&child) {
@@ -2205,11 +2208,14 @@ fn shutdown_children_ordered(
                         signal_service_process_group(pid, libc::SIGTERM);
                         tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
                     }
-                    #[cfg(not(unix))]
-                    {
+                    #[cfg(windows)]
+                    if !child.end_job() {
                         let _ = child.kill();
-                        tracing::debug!("sent kill to service '{name}'");
                     }
+                    #[cfg(not(any(unix, windows)))]
+                    let _ = child.kill();
+                    #[cfg(not(unix))]
+                    tracing::debug!("stopped service '{name}'");
                 }
             }
         }
@@ -2225,17 +2231,7 @@ fn shutdown_children_ordered(
                     locked
                         .iter_mut()
                         .find(|(child_name, _)| child_name == name)
-                        .is_some_and(|(_, child)| {
-                            let root_running = !matches!(child.try_wait(), Ok(Some(_)));
-                            #[cfg(unix)]
-                            {
-                                root_running || service_process_group_exists(child.id())
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                root_running
-                            }
-                        })
+                        .is_some_and(|(_, child)| child.tree_running())
                 })
             };
             if !group_still_running || std::time::Instant::now() >= group_deadline {
@@ -2250,12 +2246,7 @@ fn shutdown_children_ordered(
             else {
                 continue;
             };
-            let root_running = !matches!(child.try_wait(), Ok(Some(_)));
-            #[cfg(unix)]
-            let tree_running = root_running || service_process_group_exists(child.id());
-            #[cfg(not(unix))]
-            let tree_running = root_running;
-            if tree_running {
+            if child.tree_running() {
                 tracing::debug!("force-killing service '{name}' before the next dependency level");
                 force_kill_service_tree(child);
                 ui_service_status(RESET, name, RED, "✗", "force-killed");
@@ -2267,12 +2258,8 @@ fn shutdown_children_ordered(
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
         let status = child.try_wait().ok().flatten();
-        #[cfg(unix)]
-        let descendants_remain = service_process_group_exists(child.id());
-        #[cfg(not(unix))]
-        let descendants_remain = false;
         if let Some(status) = status
-            && !descendants_remain
+            && !child.tree_running()
         {
             ui_service_note(
                 RESET,
@@ -2362,15 +2349,23 @@ impl ServiceProcess {
         self.child.wait_with_output()
     }
 
-    /// Ends the service's Job, and so every process the service started.
+    /// Ends the service's Job, and so every process the service started,
+    /// and waits for them to be gone, as a restart needs their ports.
     /// `false` where it has none, or Windows refused.
     #[cfg(windows)]
     fn end_job(&self) -> bool {
         let Some(job) = &self.job else {
             return false;
         };
-        match job.terminate() {
-            Ok(()) => true,
+        match job.end(crate::shell::SERVICE_TREE_EXIT_TIMEOUT) {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    "processes of service process {} are still exiting",
+                    self.child.id()
+                );
+                true
+            }
             Err(error) => {
                 tracing::warn!(
                     "could not end the processes of service process {}: {error}",
@@ -2378,6 +2373,27 @@ impl ServiceProcess {
                 );
                 false
             }
+        }
+    }
+
+    /// Whether the service's root, or anything it started, still runs.
+    fn tree_running(&mut self) -> bool {
+        let root_running = !matches!(self.child.try_wait(), Ok(Some(_)));
+        #[cfg(unix)]
+        {
+            root_running || service_process_group_exists(self.child.id())
+        }
+        #[cfg(windows)]
+        {
+            root_running
+                || self
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.active_processes().is_ok_and(|count| count > 0))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            root_running
         }
     }
 }
@@ -2525,6 +2541,127 @@ mod tests {
             command: command.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A process found by the ID it wrote to `pid_file`, held open so its
+    /// ID can't name another process later.
+    #[cfg(windows)]
+    struct WatchedProcess(std::os::windows::io::OwnedHandle);
+
+    #[cfg(windows)]
+    impl WatchedProcess {
+        fn from_pid_file(pid_file: &Path) -> Self {
+            use std::os::windows::io::FromRawHandle as _;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "the process never wrote its ID");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            // SAFETY: OpenProcess returns a new handle owned below, or null.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    pid,
+                )
+            };
+            assert!(!handle.is_null(), "process {pid} is already gone");
+            // SAFETY: the handle is new and owned by nothing else.
+            Self(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+        }
+
+        fn exits_within(&self, timeout: Duration) -> bool {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            // SAFETY: the handle stays open for the call.
+            let waited = unsafe { WaitForSingleObject(self.0.as_raw_handle(), millis) };
+            waited == WAIT_OBJECT_0
+        }
+    }
+
+    /// A service, started as `lpm dev` starts one, that starts a detached
+    /// grandchild, then idles or exits with `exit_code`.
+    #[cfg(windows)]
+    fn spawn_service_with_a_detached_grandchild(
+        project: &Path,
+        exit_code: Option<i32>,
+    ) -> (ServiceProcess, WatchedProcess) {
+        let cached_cwd = project.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let then = exit_code.map_or_else(
+            || "setInterval(() => {}, 1000);".to_string(),
+            |code| format!("process.exit({code});"),
+        );
+        let script = format!(
+            "const grandchild = require('child_process').spawn(process.execPath, \
+             ['-e', 'setInterval(() => {{}}, 1000)'], {{ detached: true, stdio: 'ignore' }}); \
+             require('fs').writeFileSync('grandchild.pid', String(grandchild.pid)); \
+             grandchild.unref(); {then}"
+        );
+        let mut command = Command::new("node");
+        command.args(["-e", &script]).stdin(Stdio::null());
+        let service = spawn_service_command_with(
+            &mut command,
+            project,
+            &cached_cwd,
+            &service_path,
+            || Ok(()),
+        )
+        .unwrap();
+        let grandchild = WatchedProcess::from_pid_file(&project.join("grandchild.pid"));
+        (service, grandchild)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_windows_service_ends_what_it_started_in_the_background() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut service, grandchild) =
+            spawn_service_with_a_detached_grandchild(project.path(), None);
+        assert!(
+            !grandchild.exits_within(Duration::ZERO),
+            "the grandchild never ran"
+        );
+
+        terminate_service_tree(&mut service);
+
+        assert!(
+            grandchild.exits_within(Duration::from_secs(5)),
+            "the service's detached grandchild outlived it"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_service_that_exits_leaves_nothing_it_started_running() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut service, grandchild) =
+            spawn_service_with_a_detached_grandchild(project.path(), Some(1));
+        assert!(!service.wait().unwrap().success());
+        assert!(
+            !grandchild.exits_within(Duration::ZERO),
+            "the grandchild never ran"
+        );
+
+        cleanup_exited_service_tree(&service);
+
+        assert!(
+            grandchild.exits_within(Duration::from_secs(5)),
+            "an exited service's detached grandchild outlived it"
+        );
     }
 
     fn service_with_dep(command: &str, dep: &str) -> ServiceConfig {

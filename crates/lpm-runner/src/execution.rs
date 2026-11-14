@@ -18,6 +18,10 @@ pub struct ExecutionSignals {
     /// Console interrupts seen while this lived.
     #[cfg(windows)]
     presses: Arc<AtomicUsize>,
+    /// Runs once lpm waits for the interrupt behind a child's exit, so a
+    /// test can record one exactly then.
+    #[cfg(all(test, windows))]
+    on_await_interrupt: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ExecutionSignals {
@@ -28,6 +32,8 @@ impl ExecutionSignals {
             registrations: Vec::with_capacity(2),
             #[cfg(windows)]
             presses: Arc::new(AtomicUsize::new(0)),
+            #[cfg(all(test, windows))]
+            on_await_interrupt: std::sync::Mutex::new(None),
         };
         #[cfg(unix)]
         let signals = {
@@ -64,6 +70,15 @@ impl ExecutionSignals {
     fn await_the_interrupt_behind(&self, status: ExitStatus) {
         if status.code() != Some(STATUS_CONTROL_C_EXIT as i32) {
             return;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .on_await_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hook();
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while !self.is_stopped() && std::time::Instant::now() < deadline {
@@ -566,19 +581,21 @@ mod windows_tests {
     /// Windows runs lpm's handler on a thread it starts for the interrupt,
     /// which can come after the child the same interrupt ended has exited:
     /// lpm still reports the interruption, not the child's status.
+    /// Records Ctrl+C only once lpm has seen the child's exit and waits for
+    /// the interrupt behind it, as when Windows runs lpm's handler late.
+    fn interrupt_once_lpm_waits_for_it(signals: &ExecutionSignals) {
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
+        *signals.on_await_interrupt.lock().unwrap() = Some(Box::new(move || {
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
+        }));
+    }
+
     #[test]
     fn a_child_the_console_interrupt_ended_first_reports_the_interruption() {
         let signals = ExecutionSignals::new().unwrap();
-        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
-        let mut child = ended_by_the_console().spawn().unwrap();
-        child.wait().unwrap();
-        let interrupter = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
-        });
+        interrupt_once_lpm_waits_for_it(&signals);
 
-        let result = signals.prepare_wait().unwrap().wait(&mut child);
-        interrupter.join().unwrap();
+        let result = signals.run(&mut ended_by_the_console());
 
         assert!(matches!(result, Err(LpmError::ExitCode(130))), "{result:?}");
     }
@@ -586,14 +603,9 @@ mod windows_tests {
     #[test]
     fn a_captured_child_the_console_interrupt_ended_first_reports_the_interruption() {
         let signals = ExecutionSignals::new().unwrap();
-        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
-        let interrupter = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
-        });
+        interrupt_once_lpm_waits_for_it(&signals);
 
         let output = signals.capture(&mut ended_by_the_console()).unwrap();
-        interrupter.join().unwrap();
 
         assert_eq!(output.status.code(), Some(130));
     }

@@ -3609,7 +3609,7 @@ impl WindowsTcpEntry {
         self.address.as_deref().is_none_or(|address| {
             address
                 .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
+                .is_ok_and(|address| address.to_canonical().is_loopback())
         })
     }
 }
@@ -3739,6 +3739,7 @@ fn windows_tcp_table_buffer(address_family: u32) -> Vec<u8> {
         )
     };
     if size == 0 && status != NO_ERROR {
+        tracing::debug!("could not read the Windows TCP listener table: error {status}");
         return Vec::new();
     }
 
@@ -3760,6 +3761,7 @@ fn windows_tcp_table_buffer(address_family: u32) -> Vec<u8> {
             return buffer;
         }
         if status != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+            tracing::debug!("could not read the Windows TCP listener table: error {status}");
             return Vec::new();
         }
     }

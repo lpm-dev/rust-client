@@ -44,6 +44,9 @@ const MAX_CAPTURED_STREAM_BYTES: usize = lpm_common::TASK_OUTPUT_CAPTURE_BYTES;
 const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_ENDPOINT_OUTPUT_LINE_BYTES: usize = 64 * 1024;
 const MAX_PENDING_ENDPOINT_CANDIDATES: usize = 64;
+/// How long ending a Windows Job waits for its processes to be gone.
+#[cfg(windows)]
+pub(crate) const SERVICE_TREE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Append `line` (plus a newline) to `buf` unless that would push
 /// `buf.len()` past the cap; when the cap is first crossed, push a
@@ -350,9 +353,13 @@ where
     // The Windows counterpart of the process group: what the server starts
     // stays in the Job, which ends once the server has.
     #[cfg(windows)]
-    let job = lpm_common::process_job::ProcessJob::new(true)
+    let job = lpm_common::process_job::ProcessJob::new()
         .and_then(|job| job.assign(&child).map(|()| job))
-        .map_err(|error| tracing::debug!("the dev server runs outside a Job: {error}"))
+        .map_err(|error| {
+            tracing::warn!(
+                "the dev server runs outside a Job, so what it starts may outlive it: {error}"
+            );
+        })
         .ok();
     #[cfg(windows)]
     if let Err(error) = lpm_common::process_job::resume(&child) {
@@ -442,10 +449,14 @@ where
     #[cfg(unix)]
     cleanup_endpoint_process_group(root_pid);
     #[cfg(windows)]
-    if let Some(job) = &job
-        && let Err(error) = job.terminate()
-    {
-        tracing::warn!("could not end the processes the dev server started: {error}");
+    if let Some(job) = &job {
+        match job.end(SERVICE_TREE_EXIT_TIMEOUT) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("processes the dev server started are still exiting"),
+            Err(error) => {
+                tracing::warn!("could not end the processes the dev server started: {error}");
+            }
+        }
     }
     let _ = resolver_handle.join();
     let owner = resolved_owner.lock().ok().and_then(|owner| owner.clone());
@@ -1381,12 +1392,16 @@ mod tests {
         let path = std::env::var("PATH").unwrap_or_default();
         let envs = empty_envs();
         let started = std::time::Instant::now();
-        // A background child that holds the shell's output pipes for five
-        // seconds after the shell exits.
-        let command = if cfg!(windows) {
-            "start /b ping -n 6 127.0.0.1 & exit 0"
+        // A background child that holds the shell's output pipes after the
+        // shell exits, longer than the run may take. Starting processes on a
+        // loaded Windows runner takes longer, so it has a longer allowance.
+        let (command, allowance) = if cfg!(windows) {
+            (
+                "start /b ping -n 11 127.0.0.1 & exit 0",
+                std::time::Duration::from_secs(4),
+            )
         } else {
-            "sleep 5 & exit 0"
+            ("sleep 2 & exit 0", std::time::Duration::from_millis(500))
         };
 
         let status = spawn_shell_with_endpoint(
@@ -1407,7 +1422,7 @@ mod tests {
 
         assert!(status.success());
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < allowance,
             "background process retained endpoint output pipes for {elapsed:?}"
         );
     }

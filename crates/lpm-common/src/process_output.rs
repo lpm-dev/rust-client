@@ -355,7 +355,7 @@ impl Probe {
         #[cfg(windows)]
         let probe = {
             let mut probe = probe;
-            let job = crate::process_job::ProcessJob::new(false)?;
+            let job = crate::process_job::ProcessJob::new()?;
             job.assign(&probe.child)?;
             probe.job = Some(job);
             crate::process_job::resume(&probe.child)?;
