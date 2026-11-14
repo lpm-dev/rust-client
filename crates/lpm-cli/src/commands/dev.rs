@@ -3255,11 +3255,29 @@ async fn stop_multi_service_tunnel(
     tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
     shutdown_boundary: Option<&TunnelShutdownBoundary>,
 ) -> Result<(), LpmError> {
+    stop_tunnel_while(
+        tunnel_handle,
+        shutdown_boundary,
+        lpm_runner::execution::console_closing(),
+    )
+    .await
+}
+
+/// Asks the tunnel to stop and waits for its task, up to five seconds. While
+/// the console window is `closing`, it doesn't wait: Windows ends lpm within
+/// about five seconds, which releasing the proxy routes and hosts-file
+/// entries after this needs, and the task, asked to stop, ends with lpm.
+async fn stop_tunnel_while(
+    tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
+    shutdown_boundary: Option<&TunnelShutdownBoundary>,
+    closing: bool,
+) -> Result<(), LpmError> {
     let request_result = match shutdown_boundary {
         Some(boundary) => boundary.request(),
         None => Ok(()),
     };
     let task_result = match tunnel_handle {
+        Some(_) if closing => Ok(()),
         Some(mut handle) => {
             match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
                 Ok(Ok(Ok(()))) => Ok(()),
@@ -4812,6 +4830,24 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("relay rejected token"));
+    }
+
+    /// As the console window closes, the tunnel is asked to stop but not
+    /// waited for: Windows ends lpm within about five seconds, which
+    /// releasing the proxy routes and hosts-file entries after it needs.
+    #[tokio::test]
+    async fn a_closing_window_does_not_wait_for_the_tunnel_to_stop() {
+        let tunnel_handle = tokio::spawn(std::future::pending::<Result<(), LpmError>>());
+
+        let began = std::time::Instant::now();
+        let result = stop_tunnel_while(Some(tunnel_handle), None, true).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(2),
+            "waited {:?}",
+            began.elapsed()
+        );
     }
 
     #[tokio::test]
