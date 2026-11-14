@@ -431,13 +431,6 @@ pub(crate) fn console_closing() -> bool {
     console_interrupts::closing()
 }
 
-/// Whether a closing console window gives lpm only seconds to stop: only on
-/// Windows.
-#[cfg(not(windows))]
-pub(crate) const fn console_closing() -> bool {
-    false
-}
-
 /// What made a [`ConsoleStop`] call its stop.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

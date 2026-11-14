@@ -51,34 +51,60 @@ pub type ShutdownStartedCallback =
 pub(crate) fn invoke_shutdown_started(
     callback: &mut Option<ShutdownStartedCallback>,
 ) -> Result<(), lpm_common::LpmError> {
-    invoke_shutdown_started_while(callback, crate::execution::console_closing())
+    #[cfg(windows)]
+    {
+        invoke_shutdown_started_while(callback, crate::execution::console_closing)
+    }
+    #[cfg(not(windows))]
+    {
+        callback.take().map_or(Ok(()), |callback| callback())
+    }
 }
 
-/// Runs `callback` once. While the console window is `closing`, it runs on a
-/// thread of its own, which lpm doesn't wait for: Windows ends lpm within
-/// about five seconds, which stopping the services and releasing what the
+/// Runs `callback` once, on a thread of its own, and returns what it
+/// returns, unless the console window is or starts `closing` first: lpm then
+/// stops waiting for it. Windows ends lpm within about five seconds of the
+/// window's closing, which stopping the services and releasing what the
 /// session holds need more than, say, a tunnel's acknowledgement of a stop.
+#[cfg(any(windows, test))]
 fn invoke_shutdown_started_while(
     callback: &mut Option<ShutdownStartedCallback>,
-    closing: bool,
+    closing: impl Fn() -> bool,
 ) -> Result<(), lpm_common::LpmError> {
+    use std::sync::mpsc::RecvTimeoutError;
+
     let Some(callback) = callback.take() else {
         return Ok(());
     };
-    if !closing {
-        return callback();
-    }
+    // Kept here as well, so that lpm runs it itself where no thread starts.
+    let slot = std::sync::Arc::new(parking_lot::Mutex::new(Some(callback)));
+    let on_thread = std::sync::Arc::clone(&slot);
+    // Dropped as the callback returns or panics, which ends the wait.
+    let (running, finished) = std::sync::mpsc::channel::<()>();
     let started = std::thread::Builder::new()
         .name("lpm-shutdown-started".to_string())
         .spawn(move || {
-            if let Err(error) = callback() {
-                tracing::debug!(%error, "the shutdown's first step failed as the window closed");
-            }
+            let _running = running;
+            let callback = on_thread.lock().take();
+            callback.map_or(Ok(()), |callback| callback())
         });
-    if let Err(error) = started {
-        tracing::debug!(%error, "could not begin the shutdown's first step as the window closed");
+    let Ok(thread) = started else {
+        let callback = slot.lock().take();
+        return callback.map_or(Ok(()), |callback| callback());
+    };
+    loop {
+        if closing() {
+            return Ok(());
+        }
+        match finished.recv_timeout(std::time::Duration::from_millis(50)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                return thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            }
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -101,7 +127,7 @@ mod tests {
             Err(lpm_common::LpmError::Tunnel("acknowledged late".into()))
         }));
 
-        let result = invoke_shutdown_started_while(&mut callback, true);
+        let result = invoke_shutdown_started_while(&mut callback, || true);
         let ran = started_rx.recv_timeout(Duration::from_secs(10));
         let _ = release.send(());
 
@@ -110,13 +136,55 @@ mod tests {
         assert!(ran.is_ok(), "the shutdown began without it");
     }
 
+    /// A window that closes while lpm waits for what its shutdown began
+    /// with, as after a Ctrl+C, ends the wait too.
+    #[test]
+    fn a_window_closing_during_the_wait_ends_it() {
+        let (started, started_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let mut callback: Option<ShutdownStartedCallback> = Some(Box::new(move || {
+            started.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(3));
+            Err(lpm_common::LpmError::Tunnel("acknowledged late".into()))
+        }));
+        let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closes = std::sync::Arc::clone(&closing);
+        let closer = std::thread::spawn(move || {
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            closes.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        let began = std::time::Instant::now();
+        let result = invoke_shutdown_started_while(&mut callback, || {
+            closing.load(std::sync::atomic::Ordering::Acquire)
+        });
+        let waited = began.elapsed();
+        let _ = release.send(());
+        closer.join().unwrap();
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+    }
+
+    #[test]
+    fn a_panic_in_what_the_shutdown_begins_with_reaches_the_shutdown() {
+        let mut callback: Option<ShutdownStartedCallback> =
+            Some(Box::new(|| panic!("the tunnel's stop panicked")));
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            invoke_shutdown_started_while(&mut callback, || false)
+        }));
+
+        assert!(outcome.is_err());
+    }
+
     #[test]
     fn an_open_console_waits_for_what_the_shutdown_begins_with() {
         let mut callback: Option<ShutdownStartedCallback> = Some(Box::new(|| {
             Err(lpm_common::LpmError::Tunnel("acknowledged late".into()))
         }));
 
-        let result = invoke_shutdown_started_while(&mut callback, false);
+        let result = invoke_shutdown_started_while(&mut callback, || false);
 
         assert!(result.is_err());
         assert!(callback.is_none());
