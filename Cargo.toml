@@ -46,7 +46,7 @@ members = [
     "tests/workflows",
 ]
 # Patched crates, see each one's LPM-PATCH.md.
-exclude = ["vendor/cap-primitives", "vendor/oxc_parser", "vendor/zxcvbn"]
+exclude = ["vendor/cap-primitives", "vendor/oxc_parser", "vendor/winx", "vendor/zxcvbn"]
 # Root `cargo build/check/clippy` should target the shipped CLI by default.
 # CI uses explicit `--workspace` when it wants full coverage, but local root
 # commands should not pay for test-only workspace members.
@@ -267,9 +267,11 @@ opt-level = 3
 # deeply nested source. See vendor/oxc_parser/LPM-PATCH.md.
 # zxcvbn's factorial saturates instead of overflowing. See
 # vendor/zxcvbn/LPM-PATCH.md.
-# cap-primitives keeps a Windows network path absolute instead of joining it
-# to the current directory. See vendor/cap-primitives/LPM-PATCH.md.
+# cap-primitives and winx keep a Windows network path absolute instead of
+# joining it to the current directory. See vendor/cap-primitives/LPM-PATCH.md
+# and vendor/winx/LPM-PATCH.md.
 [patch.crates-io]
 cap-primitives = { path = "vendor/cap-primitives" }
 oxc_parser = { path = "vendor/oxc_parser" }
+winx = { path = "vendor/winx" }
 zxcvbn = { path = "vendor/zxcvbn" }

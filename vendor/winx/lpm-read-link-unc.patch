@@ -1,0 +1,114 @@
+--- a/src/file.rs
++++ b/src/file.rs
+@@ -389,16 +389,58 @@
+             }
+         };
+         let subst_ptr = path_buffer.offset(subst_off as isize);
+-        let mut subst = slice::from_raw_parts(subst_ptr, subst_len as usize);
++        let subst = slice::from_raw_parts(subst_ptr, subst_len as usize);
+         // Absolute paths start with an NT internal namespace prefix `\??\`
+         // We should not let it leak through.
+-        if !relative && subst.starts_with(&[92u16, 63u16, 63u16, 92u16]) {
+-            subst = &subst[4..];
++        if !relative {
++            if let Some(rest) = subst.strip_prefix(&[92u16, 63u16, 63u16, 92u16]) {
++                return Ok(win32_path(rest));
++            }
+         }
+         Ok(PathBuf::from(OsString::from_wide(subst)))
+     }
+ }
+ 
++/// The Win32 path of an NT path that followed `\??\`: `C:\dir` stays as it
++/// is, `UNC\server\share\dir` becomes `\\server\share\dir`, and any other
++/// path, such as `Volume{…}\dir`, gets the extended prefix `\\?\`. Each
++/// stays absolute.
++fn win32_path(rest: &[u16]) -> PathBuf {
++    const BACKSLASH: u16 = b'\\' as u16;
++    let ascii_upper = |unit: u16| match u8::try_from(unit) {
++        Ok(byte) => u16::from(byte.to_ascii_uppercase()),
++        Err(_) => unit,
++    };
++    let is_drive = match rest {
++        [letter, colon, after @ ..] => {
++            u8::try_from(*letter).map_or(false, |letter| letter.is_ascii_alphabetic())
++                && *colon == u16::from(b':')
++                && after.first().map_or(true, |unit| *unit == BACKSLASH)
++        }
++        _ => false,
++    };
++    if is_drive {
++        return PathBuf::from(OsString::from_wide(rest));
++    }
++    let mut path = Vec::with_capacity(rest.len() + 4);
++    match rest {
++        [u, n, c, separator, share @ ..]
++            if ascii_upper(*u) == u16::from(b'U')
++                && ascii_upper(*n) == u16::from(b'N')
++                && ascii_upper(*c) == u16::from(b'C')
++                && *separator == BACKSLASH =>
++        {
++            path.extend_from_slice(&[BACKSLASH, BACKSLASH]);
++            path.extend_from_slice(share);
++        }
++        _ => {
++            path.extend_from_slice(&[BACKSLASH, BACKSLASH, u16::from(b'?'), BACKSLASH]);
++            path.extend_from_slice(rest);
++        }
++    }
++    PathBuf::from(OsString::from_wide(&path))
++}
++
+ fn reparse_point<'a>(
+     file: &File,
+     space: &'a mut [u8; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE],
+@@ -418,5 +460,49 @@
+             )
+         })?;
+         Ok((bytes, &*(space.as_ptr() as *const c::REPARSE_DATA_BUFFER)))
++    }
++}
++
++#[cfg(test)]
++mod read_link_tests {
++    use super::win32_path;
++    use std::ffi::OsStr;
++    use std::os::windows::ffi::OsStrExt;
++    use std::path::PathBuf;
++
++    fn after_nt_prefix(path: &str) -> PathBuf {
++        let wide: Vec<u16> = OsStr::new(path).encode_wide().collect();
++        win32_path(&wide)
++    }
++
++    #[test]
++    fn a_drive_target_keeps_its_drive() {
++        assert_eq!(
++            after_nt_prefix(r"C:\Users\dev\pkg"),
++            PathBuf::from(r"C:\Users\dev\pkg")
++        );
++        assert_eq!(after_nt_prefix(r"C:\"), PathBuf::from(r"C:\"));
++    }
++
++    #[test]
++    fn a_network_target_keeps_its_server_and_share() {
++        for target in [r"UNC\server\share\pkg", r"unc\server\share\pkg"] {
++            let path = after_nt_prefix(target);
++            assert_eq!(path, PathBuf::from(r"\\server\share\pkg"), "{target}");
++            assert!(path.is_absolute(), "{target}");
++        }
++    }
++
++    #[test]
++    fn any_other_target_stays_extended_and_absolute() {
++        for target in [
++            r"Volume{01234567-89ab-cdef-0123-456789abcdef}\pkg",
++            r"UNCserver\share",
++            r"GLOBALROOT\Device\HarddiskVolume3\pkg",
++        ] {
++            let path = after_nt_prefix(target);
++            assert_eq!(path, PathBuf::from(format!(r"\\?\{target}")), "{target}");
++            assert!(path.is_absolute(), "{target}");
++        }
+     }
+ }

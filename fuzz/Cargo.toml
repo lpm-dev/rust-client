@@ -18,9 +18,11 @@ serde_json = "1"
 
 [workspace]
 
-# See vendor/cap-primitives/LPM-PATCH.md and vendor/zxcvbn/LPM-PATCH.md.
+# See vendor/cap-primitives/LPM-PATCH.md, vendor/winx/LPM-PATCH.md and
+# vendor/zxcvbn/LPM-PATCH.md.
 [patch.crates-io]
 cap-primitives = { path = "../vendor/cap-primitives" }
+winx = { path = "../vendor/winx" }
 zxcvbn = { path = "../vendor/zxcvbn" }
 
 [[bin]]

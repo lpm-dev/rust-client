@@ -77,12 +77,16 @@ jobs:
           test(extract_rejects_more_than_max_file_count))'
           --no-fail-fast --status-level slow --final-status-level fail
 
-      # vendor/cap-primitives is outside the workspace, so the tests of LPM's
-      # patch run here. See vendor/cap-primitives/LPM-PATCH.md.
+      # vendor/cap-primitives and vendor/winx are outside the workspace, so
+      # the tests of LPM's patches run here. See their LPM-PATCH.md.
       - name: Vendored cap-primitives network path tests
         run: >-
           cargo test --locked --manifest-path vendor/cap-primitives/Cargo.toml
           --target-dir target/vendor-cap-primitives --lib get_path
+      - name: Vendored winx network link tests
+        run: >-
+          cargo test --locked --manifest-path vendor/winx/Cargo.toml
+          --target-dir target/vendor-winx --lib read_link_tests
       - name: Windows script runner and proxy crate tests
         run: >-
           cargo nextest run --locked -p lpm-runner -p lpm-proxy

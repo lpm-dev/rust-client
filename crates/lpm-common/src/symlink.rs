@@ -918,6 +918,30 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(link.symlink_metadata().is_err());
     }
+
+    #[test]
+    fn a_link_to_a_network_folder_reads_as_that_folder() {
+        let target = tempfile::tempdir().unwrap();
+        let Some(network) = crate::test_network_path::through_network(target.path()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_dir(&network, dir.path().join("link")) {
+            assert!(
+                std::env::var_os("LPM_TEST_REQUIRE_ADMIN_SHARES").is_none(),
+                "an administrator could not create a symbolic link: {error}"
+            );
+            eprintln!("skipped: no symbolic link without administrator rights ({error})");
+            return;
+        }
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        let read = directory.read_link_contents("link").unwrap();
+
+        assert_eq!(read, network);
+        assert!(read.is_absolute(), "{read:?}");
+    }
 }
 
 #[cfg(all(test, unix))]
