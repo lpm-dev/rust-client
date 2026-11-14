@@ -2375,6 +2375,10 @@ fn shutdown_children_ordered(
     let mut ended_by_lpm = std::collections::HashSet::new();
     for (group_index, group) in shutdown_order.iter().enumerate() {
         let interrupted = services_interrupted();
+        // Processes whose Job lpm ended have until the cleanup deadline to
+        // be gone, all at once, before they count as force-killed.
+        #[cfg(windows)]
+        let mut jobs_gone_by = None;
         {
             let mut locked = children.lock();
             for name in group {
@@ -2395,15 +2399,17 @@ fn shutdown_children_ordered(
                     }
                     // Windows can't send a Ctrl+C to one service, so a
                     // shutdown no interrupt reached them in, one lpm began
-                    // itself or the window's closing, ends their Jobs.
+                    // itself or the window's closing, ends their Jobs. The
+                    // wait for the level below waits for them all at once.
                     #[cfg(windows)]
                     {
                         if matches!(child.try_wait(), Ok(None)) {
                             ended_by_lpm.insert(name.clone());
                         }
-                        if !child.end_job(cleanup_deadline()) {
+                        if !kill_service_tree(child) {
                             let _ = child.kill();
                         }
+                        jobs_gone_by.get_or_insert_with(cleanup_deadline);
                     }
                     #[cfg(not(any(unix, windows)))]
                     {
@@ -2418,6 +2424,8 @@ fn shutdown_children_ordered(
         let group_deadline = std::time::Instant::now()
             + shutdown_deadline.saturating_duration_since(std::time::Instant::now())
                 / groups_remaining;
+        #[cfg(windows)]
+        let group_deadline = jobs_gone_by.map_or(group_deadline, |by| group_deadline.max(by));
         loop {
             let group_still_running = {
                 let mut locked = children.lock();
@@ -2816,8 +2824,8 @@ fn walk_service_tree(child: &mut ServiceProcess) {
     }
 }
 
-/// Waits until `deadline` for `child`'s tree, killed before, to be gone:
-/// on Windows, what its Job holds, then its own process.
+/// Waits until `deadline` for `child`, killed before, to be gone: on Unix,
+/// its own process; on Windows, what its Job holds, then its own process.
 fn wait_for_killed_service_tree(child: &mut ServiceProcess, deadline: Instant) {
     #[cfg(windows)]
     if let Some(job) = &child.job
