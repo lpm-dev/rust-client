@@ -473,6 +473,9 @@ impl GlobalCaDirectory {
         )?;
         if let Err(error) = write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)
         {
+            // A journal published before the error would install the pair on
+            // the next run, which this one reports as not written.
+            let _ = remove_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION);
             let _ = self.dir.remove_file(&staged_cert.name);
             let _ = self.dir.remove_file(&staged_key.name);
             return Err(error);
@@ -1027,6 +1030,9 @@ impl ProjectCertDirectory {
         if let Err(error) =
             write_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION, &transaction)
         {
+            // A journal published before the error would install the pair on
+            // the next run, which this one reports as not written.
+            let _ = remove_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION);
             let _ = self.dir.remove_file(&staged_cert.name);
             let _ = self.dir.remove_file(&staged_key.name);
             return Err(error);
@@ -2449,6 +2455,33 @@ mod tests {
         assert_no_extended_acl(&key_path);
     }
 
+    #[test]
+    fn a_pair_whose_journal_fails_is_neither_written_nor_left_to_recover() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+        // The journal is published, then its directory fails to sync.
+        fail_next_directory_sync();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("injected certificate directory sync failure"),
+            "{error}"
+        );
+        let left: Vec<_> = std::fs::read_dir(project.path().join(".lpm/certs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_project_pair_is_written_where_renames_relative_to_a_directory_are_refused() {
@@ -2461,9 +2494,11 @@ mod tests {
 
         let refusing = lpm_common::atomic_write::test_support::refuse_relative_renames();
         let written = cert_dir.write_pair(cert.as_bytes(), key.as_bytes());
+        let refused = refusing.refused();
         drop(refusing);
 
         written.unwrap();
+        assert!(refused > 0, "the pair wasn't renamed through lpm-common");
         assert_eq!(
             std::fs::read_to_string(project.path().join(".lpm/certs/cert.pem")).unwrap(),
             cert

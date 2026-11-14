@@ -310,11 +310,20 @@ pub mod test_support {
     #[must_use]
     pub fn refuse_relative_renames() -> Refusing {
         super::simulated::NO_RELATIVE_RENAME.set(true);
+        super::simulated::RELATIVE_RENAMES_REFUSED.set(0);
         Refusing(())
     }
 
     /// See [`refuse_relative_renames`].
     pub struct Refusing(());
+
+    impl Refusing {
+        /// How many renames were refused since.
+        #[must_use]
+        pub fn refused(&self) -> usize {
+            super::simulated::RELATIVE_RENAMES_REFUSED.get()
+        }
+    }
 
     impl Drop for Refusing {
         fn drop(&mut self) {
@@ -354,13 +363,19 @@ mod simulated {
     #[cfg(any(test, feature = "test-support"))]
     thread_local! {
         pub(super) static NO_RELATIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static RELATIVE_RENAMES_REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Whether the filesystem refuses a rename to `target`, as a Parallels
     /// shared folder refuses one relative to a directory handle.
     #[cfg(all(windows, any(test, feature = "test-support")))]
     pub(super) fn refuses_rename(target: super::RenameTarget) -> bool {
-        target == super::RenameTarget::Relative && NO_RELATIVE_RENAME.with(std::cell::Cell::get)
+        let refused = target == super::RenameTarget::Relative
+            && NO_RELATIVE_RENAME.with(std::cell::Cell::get);
+        if refused {
+            RELATIVE_RENAMES_REFUSED.set(RELATIVE_RENAMES_REFUSED.get() + 1);
+        }
+        refused
     }
 
     #[cfg(all(windows, not(any(test, feature = "test-support"))))]
