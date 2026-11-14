@@ -471,7 +471,12 @@ impl GlobalCaDirectory {
             &staged_cert.name,
             &staged_key.name,
         )?;
-        write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)?;
+        if let Err(error) = write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)
+        {
+            let _ = self.dir.remove_file(&staged_cert.name);
+            let _ = self.dir.remove_file(&staged_key.name);
+            return Err(error);
+        }
 
         let result = (|| -> Result<(), LpmError> {
             replace_relative_file(&self.dir, &staged_cert.name, cert_name, staged_cert.file)
@@ -1019,7 +1024,13 @@ impl ProjectCertDirectory {
             &staged_cert.name,
             &staged_key.name,
         )?;
-        write_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION, &transaction)?;
+        if let Err(error) =
+            write_pair_transaction(&self.dir, PROJECT_PAIR_TRANSACTION, &transaction)
+        {
+            let _ = self.dir.remove_file(&staged_cert.name);
+            let _ = self.dir.remove_file(&staged_key.name);
+            return Err(error);
+        }
 
         let result = (|| -> std::io::Result<()> {
             replace_relative_file(&self.dir, &staged_cert.name, "cert.pem", staged_cert.file)?;
@@ -1134,8 +1145,9 @@ fn write_pair_transaction(
     let contents = serde_json::to_vec(transaction).map_err(|error| {
         LpmError::Cert(format!("failed to serialize pair transaction: {error}"))
     })?;
-    let staged = stage_relative_file(dir, &contents, 0o600)?;
-    replace_relative_file(dir, &staged.name, journal_name, staged.file).map_err(|error| {
+    let StagedRelativeFile { name, file } = stage_relative_file(dir, &contents, 0o600)?;
+    replace_relative_file(dir, &name, journal_name, file).map_err(|error| {
+        let _ = dir.remove_file(&name);
         LpmError::Cert(format!(
             "failed to publish certificate pair transaction: {error}"
         ))
@@ -1879,77 +1891,14 @@ fn replace_relative_file(
         let _temporary = temporary;
         dir.rename(source, dir, destination)
     }
+    // The rename lpm-common's atomic writes end with: by name in the handle's
+    // directory, or by full path on a share that refuses that, as a Parallels
+    // shared folder does.
     #[cfg(windows)]
     {
-        use std::mem::{offset_of, size_of};
-        use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Wdk::Storage::FileSystem::{
-            FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
-        };
-        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
-        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
         let _ = source;
-        let destination: Vec<u16> = Path::new(destination).as_os_str().encode_wide().collect();
-        let file_name_bytes = destination
-            .len()
-            .checked_mul(size_of::<u16>())
-            .ok_or_else(|| std::io::Error::other("certificate filename is too long"))?;
-        let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
-            .checked_add(file_name_bytes)
-            .ok_or_else(|| std::io::Error::other("certificate rename data is too large"))?;
-        let info_words = info_bytes.div_ceil(size_of::<usize>());
-        let mut storage = vec![0usize; info_words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        let info_bytes = u32::try_from(info_bytes)
-            .map_err(|_| std::io::Error::other("certificate rename data is too large"))?;
-        let file_name_bytes = u32::try_from(file_name_bytes)
-            .map_err(|_| std::io::Error::other("certificate filename is too long"))?;
-        unsafe {
-            // SAFETY: storage is pointer-aligned and sized for FILE_RENAME_INFO plus
-            // the complete relative UTF-16 filename. Both handles stay open through
-            // every synchronous rename attempt.
-            (*info).Anonymous.ReplaceIfExists = true;
-            (*info).RootDirectory = dir.as_raw_handle();
-            (*info).FileNameLength = file_name_bytes;
-            std::ptr::copy_nonoverlapping(
-                destination.as_ptr(),
-                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-                destination.len(),
-            );
-        }
-        for (attempt, delay_ms) in WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.iter().enumerate() {
-            if *delay_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            }
-            let mut io_status = IO_STATUS_BLOCK::default();
-            let status = unsafe {
-                // SAFETY: `info` points to the initialized variable-sized buffer described above.
-                // Both retained handles remain valid for this synchronous native rename call.
-                NtSetInformationFile(
-                    temporary.as_raw_handle(),
-                    &mut io_status,
-                    info.cast(),
-                    info_bytes,
-                    FileRenameInformation,
-                )
-            };
-            if status >= 0 {
-                return temporary.sync_all();
-            }
-            // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
-            let error =
-                std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
-            if !is_transient_windows_file_operation_error(&error)
-                || attempt + 1 == WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.len()
-            {
-                return Err(error);
-            }
-        }
-        Err(std::io::Error::other(
-            "atomic project certificate replacement retry loop exhausted",
-        ))
+        lpm_common::rename_open_file_replacing(dir, std::ffi::OsStr::new(destination), &temporary)?;
+        temporary.sync_all()
     }
 }
 
@@ -2498,6 +2447,33 @@ mod tests {
 
         assert_eq!(contents, b"private-key-material");
         assert_no_extended_acl(&key_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_project_pair_is_written_where_renames_relative_to_a_directory_are_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let refusing = lpm_common::atomic_write::test_support::refuse_relative_renames();
+        let written = cert_dir.write_pair(cert.as_bytes(), key.as_bytes());
+        drop(refusing);
+
+        written.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".lpm/certs/cert.pem")).unwrap(),
+            cert
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(project.path().join(".lpm/certs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".lpm-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

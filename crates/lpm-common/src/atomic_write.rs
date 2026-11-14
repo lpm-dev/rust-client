@@ -301,6 +301,28 @@ fn copy_into_new_file(
     Ok(true)
 }
 
+/// Filesystems as tests want them seen.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    /// Has every rename relative to a directory handle on this thread
+    /// refused, as a Parallels shared folder refuses one, until what this
+    /// returns is dropped.
+    #[must_use]
+    pub fn refuse_relative_renames() -> Refusing {
+        super::simulated::NO_RELATIVE_RENAME.set(true);
+        Refusing(())
+    }
+
+    /// See [`refuse_relative_renames`].
+    pub struct Refusing(());
+
+    impl Drop for Refusing {
+        fn drop(&mut self) {
+            super::simulated::NO_RELATIVE_RENAME.set(false);
+        }
+    }
+}
+
 /// What the atomic writes can do on a filesystem: everything, except where a
 /// test takes an ability away.
 mod simulated {
@@ -312,7 +334,6 @@ mod simulated {
         pub(super) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static NO_RENAME_WITHOUT_REPLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static FAILING_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        pub(super) static NO_RELATIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static RENAME_INTO_ANOTHER_DIRECTORY: std::cell::Cell<Option<std::path::PathBuf>> = const { std::cell::Cell::new(None) };
     }
 
@@ -329,14 +350,19 @@ mod simulated {
         super::directory_final_path(directory)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    thread_local! {
+        pub(super) static NO_RELATIVE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// Whether the filesystem refuses a rename to `target`, as a Parallels
     /// shared folder refuses one relative to a directory handle.
-    #[cfg(all(windows, test))]
+    #[cfg(all(windows, any(test, feature = "test-support")))]
     pub(super) fn refuses_rename(target: super::RenameTarget) -> bool {
         target == super::RenameTarget::Relative && NO_RELATIVE_RENAME.with(std::cell::Cell::get)
     }
 
-    #[cfg(all(windows, not(test)))]
+    #[cfg(all(windows, not(any(test, feature = "test-support"))))]
     pub(super) const fn refuses_rename(_target: super::RenameTarget) -> bool {
         false
     }
@@ -640,6 +666,19 @@ pub fn rename_open_file_noreplace(
     file: &cap_std::fs::File,
 ) -> io::Result<()> {
     rename_capability_handle(directory, destination, file, false)
+}
+
+/// Renames the open `file`, which needs `DELETE` access, to `destination`
+/// in `directory`, replacing an entry there, as an atomic write's last step
+/// does: with POSIX semantics where the volume has them, and by full path on
+/// a share that takes no rename relative to a directory handle.
+#[cfg(windows)]
+pub fn rename_open_file_replacing(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    file: &cap_std::fs::File,
+) -> io::Result<()> {
+    rename_capability_handle(directory, destination, file, true)
 }
 
 /// Renames the open `temporary` to `destination` in `directory`, replacing

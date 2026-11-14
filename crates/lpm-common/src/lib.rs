@@ -57,14 +57,14 @@ pub mod thread_identity;
 mod utf8_bom;
 pub mod volume;
 
-#[cfg(windows)]
-pub use atomic_write::rename_open_file_noreplace;
 #[cfg(unix)]
 pub use atomic_write::replace_symlink_atomic;
 pub use atomic_write::{
     AtomicWriteOptions, write_file_atomic, write_file_atomic_in_dir_with,
     write_file_atomic_in_dir_with_options, write_file_atomic_with, write_file_atomic_with_options,
 };
+#[cfg(windows)]
+pub use atomic_write::{rename_open_file_noreplace, rename_open_file_replacing};
 #[cfg(unix)]
 pub use bounded_read::current_uid;
 #[cfg(unix)]
