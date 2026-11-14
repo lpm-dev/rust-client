@@ -2227,16 +2227,17 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
 /// Force-kills `child`'s tree, saying so the first time only: a second
 /// Ctrl+C, a level's deadline and the shutdown's last pass can each reach
 /// the same service. One that has stopped, tree and all, is left to the
-/// shutdown's last pass, which says how it stopped.
-fn force_kill_and_report(name: &str, child: &mut ServiceProcess) {
+/// shutdown's last pass, which says how it stopped; `false` for it.
+fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
     if !child.tree_running() {
-        return;
+        return false;
     }
     force_kill_service_tree(child);
     if !child.reported_force_killed {
         child.reported_force_killed = true;
         ui_service_status(RESET, name, RED, "✗", "force-killed");
     }
+    true
 }
 
 /// Gracefully stop all child processes: SIGTERM first, wait, then SIGKILL.
@@ -2383,20 +2384,37 @@ fn shutdown_children_ordered(
     // Final pass: force-kill any stragglers and reap zombies
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
-        let status = child.try_wait().ok().flatten();
-        let stopped = status.filter(|_| !child.tree_running());
         #[cfg(windows)]
         let ended = ended_by_lpm.contains(name);
         #[cfg(not(windows))]
         let ended = false;
-        match final_report(stopped, child.reported_force_killed, ended) {
-            // A tree force-killed earlier may still be dying.
-            FinalReport::AlreadyReported if stopped.is_none() => force_kill_service_tree(child),
-            FinalReport::AlreadyReported => {}
-            FinalReport::Stopped(note) => ui_service_note(RESET, name, &note),
-            FinalReport::StillRunning => {
-                tracing::debug!("force-killing service '{name}'");
-                force_kill_and_report(name, child);
+        report_last(name, child, ended, force_kill_and_report);
+    }
+}
+
+/// Says in the shutdown's last pass how `child` stopped, or force-kills it
+/// with `force_kill` where it still runs. `ended` is whether lpm ended its
+/// Job while its own process still ran.
+fn report_last(
+    name: &str,
+    child: &mut ServiceProcess,
+    ended: bool,
+    force_kill: impl FnOnce(&str, &mut ServiceProcess) -> bool,
+) {
+    let status = child.try_wait().ok().flatten();
+    let stopped = status.filter(|_| !child.tree_running());
+    match final_report(stopped, child.reported_force_killed, ended) {
+        // A tree force-killed earlier may still be dying.
+        FinalReport::AlreadyReported if stopped.is_none() => force_kill_service_tree(child),
+        FinalReport::AlreadyReported => {}
+        FinalReport::Stopped(note) => ui_service_note(RESET, name, &note),
+        FinalReport::StillRunning => {
+            tracing::debug!("force-killing service '{name}'");
+            // It may have stopped, tree and all, since it was checked above.
+            if !force_kill(name, child)
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                ui_service_note(RESET, name, &stopped_report(status, ended));
             }
         }
     }
@@ -2423,9 +2441,19 @@ fn final_report(
 ) -> FinalReport {
     match stopped {
         _ if force_killed => FinalReport::AlreadyReported,
-        Some(_) if ended => FinalReport::Stopped("stopped".to_string()),
-        Some(status) => FinalReport::Stopped(stopped_note(status)),
+        Some(status) => FinalReport::Stopped(stopped_report(status, ended)),
         None => FinalReport::StillRunning,
+    }
+}
+
+/// How the shutdown reports a service that stopped with `status`, or whose
+/// Job lpm `ended` while its own process still ran, which leaves it no exit
+/// code of its own.
+fn stopped_report(status: std::process::ExitStatus, ended: bool) -> String {
+    if ended {
+        "stopped".to_string()
+    } else {
+        stopped_note(status)
     }
 }
 
@@ -3041,6 +3069,53 @@ mod tests {
         let mut service = spawn_node_service(project, &format!("process.exit({code});"));
         assert_eq!(service.wait().unwrap().code(), Some(code));
         service
+    }
+
+    /// A service, started as `lpm dev` starts one, that exits with 4 once a
+    /// `stop` file appears in `project`.
+    fn service_exiting_when_told(project: &Path) -> ServiceProcess {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("while [ ! -e stop ]; do sleep 0.02; done; exit 4")
+                .current_dir(project);
+            isolate_service_process_tree(&mut command);
+            ServiceProcess::from(command.spawn().unwrap())
+        }
+        #[cfg(windows)]
+        {
+            spawn_node_service(
+                project,
+                "const fs = require('fs'); \
+                 setInterval(() => { if (fs.existsSync('stop')) process.exit(4); }, 20);",
+            )
+        }
+    }
+
+    /// A service the last pass finds running can stop, tree and all, before
+    /// it is force-killed, and the pass is the last word on it.
+    #[test]
+    fn a_service_that_stops_as_the_last_pass_reaches_it_is_reported_as_stopped() {
+        let project = tempfile::tempdir().unwrap();
+        let mut service = service_exiting_when_told(project.path());
+        let mut reached_force_kill = false;
+
+        let reports = service_reports(|| {
+            report_last("web", &mut service, false, |name, child| {
+                reached_force_kill = true;
+                std::fs::write(project.path().join("stop"), b"").unwrap();
+                let _ = child.wait();
+                force_kill_and_report(name, child)
+            });
+        });
+
+        assert!(
+            reached_force_kill,
+            "the service had stopped before the pass"
+        );
+        assert_eq!(reports, [reported("web", "stopped (exit 4)")]);
     }
 
     /// A second Ctrl+C force-kills each service, while the shutdown runs or
