@@ -427,15 +427,33 @@ mod windows {
             // SAFETY: takes no arguments.
             GetLogicalDrives()
         };
+        users_drives_reaching(folder, present, dos_definitions, mapped_remote)
+            .into_iter()
+            .find_map(|path| {
+                let handle = open_folder(&path).ok()?;
+                is_folder(&handle, folder).then_some((path, handle))
+            })
+    }
+
+    /// `folder` through each letter the user mapped to its share or a folder
+    /// above it, closest first, then by letter: among the `present` letters,
+    /// as `definitions` says each is defined and `mapped_to` what each is
+    /// mapped to.
+    fn users_drives_reaching(
+        folder: &NetworkFolder,
+        present: u32,
+        definitions: impl Fn(u8) -> Vec<OsString>,
+        mapped_to: impl Fn(u8) -> Option<OsString>,
+    ) -> Vec<PathBuf> {
         let mut reaching: Vec<(usize, u8, PathBuf)> = (b'A'..=b'Z')
             .filter(|letter| present & (1 << (letter - b'A')) != 0)
             .filter(|letter| {
-                !dos_definitions(*letter)
+                !definitions(*letter)
                     .first()
                     .is_some_and(|definition| names_a_network_path(definition))
             })
             .filter_map(|letter| {
-                let remote = mapped_remote(letter)?;
+                let remote = mapped_to(letter)?;
                 let remote = network_folder(Path::new(&remote))?;
                 let below = folder
                     .below
@@ -444,10 +462,7 @@ mod windows {
             })
             .collect();
         reaching.sort_by_key(|(depth, letter, _)| (std::cmp::Reverse(*depth), *letter));
-        reaching.into_iter().find_map(|(_, _, path)| {
-            let handle = open_folder(&path).ok()?;
-            is_folder(&handle, folder).then_some((path, handle))
-        })
+        reaching.into_iter().map(|(_, _, path)| path).collect()
     }
 
     /// Whether the open `handle` is `folder`: whether both final paths, as
@@ -655,24 +670,8 @@ mod windows {
     impl LetterLock {
         fn acquire() -> Option<Self> {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
-            use windows_sys::Win32::System::Threading::{
-                CreateMutexExW, MUTEX_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
-                WaitForSingleObject,
-            };
-            let name = letter_lock_name()?;
-            // SAFETY: `name` is NUL-terminated; default security and no initial owner, with
-            // only the rights to wait on the mutex and release it.
-            let handle = unsafe {
-                CreateMutexExW(
-                    std::ptr::null(),
-                    name.as_ptr(),
-                    0,
-                    SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
-                )
-            };
-            if handle.is_null() {
-                return None;
-            }
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            let handle = open_letter_lock()?;
             // SAFETY: `handle` is the mutex just opened. An abandoned mutex, left by a
             // process that ended while holding it, is owned all the same.
             let waited = unsafe { WaitForSingleObject(handle, 2_000) };
@@ -698,9 +697,28 @@ mod windows {
         }
     }
 
-    /// The name of the mutex of this sign-in's letters. Letters defined
-    /// without a broadcast belong to the sign-in, which an elevated process
-    /// has apart from the unelevated ones of the same session.
+    /// Opens the mutex of this sign-in's letters, with only the rights to
+    /// wait on it and release it.
+    fn open_letter_lock() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        use windows_sys::Win32::System::Threading::{
+            CreateMutexExW, MUTEX_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
+        };
+        let name = letter_lock_name()?;
+        // SAFETY: `name` is NUL-terminated; default security and no initial owner.
+        let handle = unsafe {
+            CreateMutexExW(
+                std::ptr::null(),
+                name.as_ptr(),
+                0,
+                SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+            )
+        };
+        (!handle.is_null()).then_some(handle)
+    }
+
+    /// The name of the mutex of this sign-in's letters. Letters a process
+    /// defines belong to its sign-in, which an elevated process has apart
+    /// from the unelevated ones of the same session.
     fn letter_lock_name() -> Option<&'static [u16]> {
         static NAME: std::sync::OnceLock<Option<Vec<u16>>> = std::sync::OnceLock::new();
         NAME.get_or_init(|| {
@@ -885,7 +903,43 @@ mod windows {
                 name,
                 format!("Local\\lpm-script-drive-letters-{sign_in:016x}\0")
             );
-            assert!(LetterLock::acquire().is_some(), "the lock couldn't be had");
+            // Opened, not owned: a live drive test may own it meanwhile.
+            let opened = open_letter_lock().expect("the letters' lock couldn't be opened");
+            // SAFETY: `opened` is the mutex just opened, closed once here.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(opened) };
+        }
+
+        #[test]
+        fn a_letter_another_process_defined_is_not_taken_for_one_the_user_mapped() {
+            let folder = network_folder(Path::new(r"\\Mac\Home\work\app")).unwrap();
+            let present = b"WXY"
+                .iter()
+                .fold(0_u32, |present, letter| present | (1 << (letter - b'A')));
+
+            let reaching = users_drives_reaching(
+                &folder,
+                present,
+                |letter| match letter {
+                    b'X' => vec![definition_of(OsStr::new(r"\\Mac\Home"))],
+                    b'W' | b'Y' => vec![OsString::from(format!(
+                        r"\Device\LanmanRedirector\;{}:000000000001e3a2\Mac\Home",
+                        char::from(letter)
+                    ))],
+                    _ => Vec::new(),
+                },
+                // Some network file systems answer for a letter LPM defined
+                // as for one the user mapped.
+                |letter| match letter {
+                    b'W' | b'X' => Some(OsString::from(r"\\Mac\Home")),
+                    b'Y' => Some(OsString::from(r"\\Mac\Home\work")),
+                    _ => None,
+                },
+            );
+
+            assert_eq!(
+                reaching,
+                [PathBuf::from(r"Y:\app"), PathBuf::from(r"W:\work\app")]
+            );
         }
 
         #[test]
