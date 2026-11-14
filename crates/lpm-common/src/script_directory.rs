@@ -326,20 +326,17 @@ mod windows {
         }
         let letter = match stacked {
             Some(letter) => letter,
-            None => {
-                let letter = define_free_letter(&definition).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "cmd.exe can't run scripts in a network folder, so LPM reaches {} through a drive letter, but {error}",
-                            folder.share.to_string_lossy()
-                        ),
-                    )
-                })?;
-                say_defined(&folder.share, letter);
-                letter
-            }
+            None => define_free_letter(&definition).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cmd.exe can't run scripts in a network folder, so LPM reaches {} through a drive letter, but {error}",
+                        folder.share.to_string_lossy()
+                    ),
+                )
+            })?,
         };
+        say_defined(&folder.share, letter);
         let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         defined.get_or_insert_with(Letters::default).current.insert(
             share_key.clone(),
@@ -396,8 +393,11 @@ mod windows {
     }
 
     /// Says once in this process for each share and letter which letter LPM
-    /// defined.
+    /// defined for the share, whether that letter is new or another LPM
+    /// process's, which the scripts reach their folder by all the same.
     fn say_defined(share: &OsStr, letter: u8) {
+        #[cfg(test)]
+        tests::SAID_DEFINED.with_borrow_mut(|said| said.push((share.to_ascii_lowercase(), letter)));
         static SAID: Mutex<Option<HashSet<(OsString, u8)>>> = Mutex::new(None);
         let mut said = SAID
             .lock()
@@ -810,6 +810,13 @@ mod windows {
     mod tests {
         use super::*;
 
+        std::thread_local! {
+            /// Each share and letter LPM said it defined on this thread,
+            /// before telling apart what was said before.
+            pub(super) static SAID_DEFINED: std::cell::RefCell<Vec<(OsString, u8)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
         #[test]
         fn a_network_path_names_its_share_and_folders() {
             for path in [
@@ -1056,10 +1063,13 @@ mod windows {
             );
 
             // A letter another process defined for the share is used, with a
-            // definition of this process's own stacked on it, and keeps the
-            // other's after this one is done.
+            // definition of this process's own stacked on it, and is said as
+            // a letter LPM defines is. It keeps the other's definition after
+            // this one is done.
             let theirs = define_as_another_process_would(&definition);
+            SAID_DEFINED.take();
             let joined = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            let said = SAID_DEFINED.take();
             let joined_letter = letter_of(joined.path());
             let stacked_on_theirs = dos_definitions(theirs).len();
             drop(joined);
@@ -1068,6 +1078,14 @@ mod windows {
             assert_eq!(joined_letter, theirs, "{joined_letter}");
             assert_eq!(stacked_on_theirs, 2);
             assert!(theirs_left, "LPM removed the other process's definition");
+            assert_eq!(
+                said,
+                [(
+                    network_folder(&network).unwrap().share.to_ascii_lowercase(),
+                    theirs
+                )],
+                "LPM didn't say which letter it reached the share by"
+            );
 
             // A definition of another share stacked on the letter takes it
             // over, so the next script reaches the folder by another letter.
