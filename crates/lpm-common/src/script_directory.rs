@@ -281,9 +281,21 @@ mod windows {
                 let _ = undefine(gone.letter, &gone.definition);
             }
         }
-        // Another LPM process's letter for the share, or one a crash left:
-        // this process adds its own definition, which Windows stacks on the
-        // same one, so the letter stays while either uses it. Something
+        // A letter the user mapped comes first.
+        //
+        // This opens network folders under the locks, so a slow share delays
+        // other scripts' letters until it answers.
+        if let Some((path, folder_handle)) = through_users_drive(folder) {
+            return Ok((
+                path,
+                DriveHold::Borrowed {
+                    _folder: folder_handle,
+                },
+            ));
+        }
+        // Then another LPM process's letter for the share, or one a crash
+        // left: this process adds its own definition, which Windows stacks on
+        // the same one, so the letter stays while either uses it. Something
         // outside LPM may have taken the letter in between, which the
         // definitions then show.
         let mut stacked = None;
@@ -305,16 +317,6 @@ mod windows {
         let letter = match stacked {
             Some(letter) => letter,
             None => {
-                // This opens network folders under the locks, so a slow share
-                // delays other scripts' letters until it answers.
-                if let Some((path, folder_handle)) = through_users_drive(folder) {
-                    return Ok((
-                        path,
-                        DriveHold::Borrowed {
-                            _folder: folder_handle,
-                        },
-                    ));
-                }
                 let letter = define_free_letter(&definition).map_err(|error| {
                     io::Error::new(
                         error.kind(),
@@ -840,6 +842,32 @@ mod windows {
                 dos_definitions(again_letter).is_empty(),
                 "the new definition outlived its last user"
             );
+
+            // A letter another process defined for the share is used, with a
+            // definition of this process's own stacked on it, and keeps the
+            // other's after this one is done.
+            let theirs = {
+                let present = unsafe {
+                    // SAFETY: takes no arguments.
+                    GetLogicalDrives()
+                };
+                (b'D'..=b'Z')
+                    .rev()
+                    .find(|letter| {
+                        present & (1 << (letter - b'A')) == 0 && dos_definitions(*letter).is_empty()
+                    })
+                    .expect("a free drive letter")
+            };
+            define(theirs, &definition).unwrap();
+            let joined = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            let joined_letter = letter_of(joined.path());
+            let stacked_on_theirs = dos_definitions(theirs).len();
+            drop(joined);
+            let theirs_left = defines(theirs, &definition);
+            undefine(theirs, &definition).unwrap();
+            assert_eq!(joined_letter, theirs, "{joined_letter}");
+            assert_eq!(stacked_on_theirs, 2);
+            assert!(theirs_left, "LPM removed the other process's definition");
 
             // A definition of another share stacked on the letter takes it
             // over, so the next script reaches the folder by another letter.

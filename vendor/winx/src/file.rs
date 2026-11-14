@@ -401,9 +401,9 @@ pub fn read_link(file: &File) -> io::Result<PathBuf> {
     }
 }
 
-/// Whether `rest`, what follows `UNC\`, names a server and a share, neither
-/// of which reads as `?` or `.`, which would turn its Win32 path into a local
-/// or device path.
+/// Whether `rest`, what follows `UNC\`, names a server and a share, with a
+/// server that doesn't read as `?` or `.`, which would turn its Win32 path
+/// into a local or device path.
 fn names_a_share(rest: &[u16]) -> bool {
     const BACKSLASH: u16 = b'\\' as u16;
     let mut names = rest.split(|unit| *unit == BACKSLASH);
