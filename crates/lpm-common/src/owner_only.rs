@@ -89,9 +89,18 @@ impl Drop for LocalSecurityDescriptor {
 }
 
 /// Limits `file` to its owner, the user LPM runs as and SYSTEM. The handle
-/// needs `WRITE_DAC`.
+/// needs `WRITE_DAC`. On a volume that keeps no permissions, which would
+/// take the access list and keep none of it, nothing is set.
 pub fn protect_file(file: &impl std::os::windows::io::AsRawHandle) -> std::io::Result<()> {
+    if keeps_no_permissions(file) {
+        return Ok(());
+    }
     set_protected_dacl(file, &owner_only_file_dacl()?)
+}
+
+/// Whether `file` is on a volume that keeps no permissions, such as exFAT.
+fn keeps_no_permissions(file: &impl std::os::windows::io::AsRawHandle) -> bool {
+    crate::volume::Volume::of(file).is_ok_and(|volume| !volume.keeps_permissions())
 }
 
 /// Whether `file` is kept from everyone but its owner, the user running
@@ -185,6 +194,8 @@ pub fn keeps_others_out(file: &impl std::os::windows::io::AsRawHandle) -> std::i
 /// inherits nothing, or anything the user can't change the DACL of, such
 /// as what the Administrators own, which Windows passes over without an
 /// error; once pushed, the directory reads as kept, so neither is retried.
+/// On a volume that keeps no permissions nothing is set, and nothing
+/// reports a change.
 pub fn protect_state_directory(
     directory: &cap_std::fs::Dir,
     push_to_contents: bool,
@@ -203,6 +214,9 @@ pub fn protect_state_directory(
         .follow(FollowSymlinks::No)
         .maybe_dir(true);
     let handle = directory.open_with(".", &options)?;
+    if keeps_no_permissions(&handle) {
+        return Ok(false);
+    }
     let dacl = state_directory_dacl()?;
     match state_directory_access(&handle)? {
         StateDirectoryAccess::Kept => return Ok(false),

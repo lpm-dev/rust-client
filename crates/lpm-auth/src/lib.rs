@@ -2503,6 +2503,13 @@ fn prepare_lpm_home(directory: &Path) -> Result<(), String> {
 /// holds.
 fn prepare_lpm_home_for(directory: &Path, write: HomeWrite) -> Result<(), String> {
     std::fs::create_dir_all(directory).map_err(|error| format!("mkdir error: {error}"))?;
+    if write == HomeWrite::Adds
+        && let Err(reason) = lpm_common::keep_lpm_home_private(directory)
+    {
+        return Err(format!(
+            "{reason}, so LPM won't save login state there; point LPM_HOME at a folder on an NTFS drive"
+        ));
+    }
     match lpm_common::keep_lpm_home_ignored(directory) {
         Ok(()) => Ok(()),
         Err(reason) if write == HomeWrite::AddsNothing => {
@@ -4146,6 +4153,24 @@ mod tests {
 
         assert!(error.contains("LPM_HOME"), "{error}");
         assert!(!repository.join(".credentials").exists());
+    }
+
+    #[test]
+    fn file_backed_login_state_is_refused_where_anyone_using_the_computer_could_read_it() {
+        with_temp_home(|home| {
+            let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+            let saved = set_token_in_file("https://registry.example", "token");
+            let cleared = prepare_lpm_home_for(&home.join(".lpm"), HomeWrite::AddsNothing);
+            drop(pretending);
+
+            let error = saved.unwrap_err();
+            assert!(
+                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't save login state there"),
+                "{error}"
+            );
+            assert!(!home.join(".lpm").join(".credentials").exists());
+            cleared.unwrap();
+        });
     }
 
     #[test]

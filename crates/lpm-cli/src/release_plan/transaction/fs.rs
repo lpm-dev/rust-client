@@ -322,7 +322,19 @@ pub(in crate::release_plan) fn protect_private_windows_directory(
             display.display()
         )));
     }
+    if keeps_no_permissions(&control) {
+        return Ok(());
+    }
     apply_owner_only_windows_dacl(control.as_raw_handle().cast(), true).map_err(LpmError::Io)
+}
+
+/// Whether `file` is on a volume that keeps no permissions, such as exFAT,
+/// where every file has Everyone as its owner and any access list is
+/// dropped: the state there can't be kept to the user, and is no more open
+/// than the project around it.
+#[cfg(windows)]
+fn keeps_no_permissions(file: &impl std::os::windows::io::AsRawHandle) -> bool {
+    lpm_common::volume::Volume::of(file).is_ok_and(|volume| !volume.keeps_permissions())
 }
 
 #[cfg(windows)]
@@ -340,6 +352,9 @@ pub(in crate::release_plan) fn protect_private_windows_file(
             "release transaction state is linked or has the wrong file type: {}",
             display.display()
         )));
+    }
+    if keeps_no_permissions(file) {
+        return Ok(());
     }
     apply_owner_only_windows_dacl(file.as_raw_handle().cast(), false).map_err(LpmError::Io)
 }

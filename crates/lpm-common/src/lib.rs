@@ -55,6 +55,7 @@ pub mod test_network_path;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub mod thread_identity;
 mod utf8_bom;
+pub mod volume;
 
 #[cfg(windows)]
 pub use atomic_write::rename_open_file_noreplace;
@@ -122,8 +123,9 @@ pub use project_glob::{rooted_project_glob, validate_project_glob};
 pub use project_state::{
     PROJECT_STATE_DIR, ensure_project_state_dir, ensure_project_state_dir_in,
     is_project_state_name, keep_existing_lpm_home_ignored, keep_existing_project_state_ignored,
-    keep_lpm_home_ignored, keep_lpm_home_ignored_in, keep_state_dir_ignored_or_warn,
-    project_package_dirs, project_state_dir,
+    keep_lpm_home_ignored, keep_lpm_home_ignored_in, keep_lpm_home_private,
+    keep_lpm_home_private_in, keep_state_dir_ignored_or_warn, project_package_dirs,
+    project_state_dir,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use registry_http::{

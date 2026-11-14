@@ -353,9 +353,23 @@ pub(crate) struct GlobalCaDirectory {
     /// Why git could commit what the LPM home holds, where LPM can't keep
     /// it out: no key is written there.
     exposed: Option<String>,
+    /// Why anyone using the computer could read what the LPM home holds:
+    /// no key is written or used there.
+    unprotected: Option<String>,
 }
 
 impl GlobalCaDirectory {
+    /// Fails where anyone using the computer could read the certificate
+    /// authority's private key, which signs what this computer trusts.
+    pub(crate) fn refuse_unprotected_key(&self) -> Result<(), LpmError> {
+        match &self.unprotected {
+            Some(reason) => Err(LpmError::Cert(format!(
+                "{reason}, so LPM won't keep or use the certificate authority's private key there: with it, anyone could sign certificates this computer trusts. Point LPM_HOME at a folder on an NTFS drive"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
@@ -423,6 +437,7 @@ impl GlobalCaDirectory {
                 "{reason}, so git could commit the certificate authority's private key saved there; point LPM_HOME at a directory of its own"
             )));
         }
+        self.refuse_unprotected_key()?;
         let cert_text = std::str::from_utf8(cert)
             .map_err(|error| LpmError::Cert(format!("invalid UTF-8 in CA certificate: {error}")))?;
         let key_text = std::str::from_utf8(key)
@@ -693,6 +708,7 @@ impl CertificateOperation {
             dir,
             read_only: true,
             exposed: None,
+            unprotected: None,
         };
         let lock = ca.acquire_operations_lock()?;
         Ok(Some(Self { ca, _lock: lock }))
@@ -709,7 +725,7 @@ impl CertificateOperation {
     pub(crate) fn begin() -> Result<Self, LpmError> {
         let ca = open_global_ca_directory(true)?;
         let lock = ca.acquire_operations_lock()?;
-        if ca.exposed.is_none() {
+        if ca.exposed.is_none() && ca.unprotected.is_none() {
             recover_global_pair_transaction(&ca)?;
         }
         Ok(Self { ca, _lock: lock })
@@ -871,10 +887,13 @@ fn open_global_ca_directory_at_lpm_root(
     else {
         return Err(LpmError::Cert("global LPM directory does not exist".into()));
     };
-    let exposed = if create {
-        lpm_common::keep_lpm_home_ignored_in(&lpm, &lpm_root_path).err()
+    let (exposed, unprotected) = if create {
+        (
+            lpm_common::keep_lpm_home_ignored_in(&lpm, &lpm_root_path).err(),
+            lpm_common::keep_lpm_home_private_in(&lpm, &lpm_root_path).err(),
+        )
     } else {
-        None
+        (None, None)
     };
     let Some(certs) = open_or_create_directory(
         &lpm,
@@ -893,6 +912,7 @@ fn open_global_ca_directory_at_lpm_root(
         dir: certs,
         read_only: false,
         exposed,
+        unprotected,
     })
 }
 
@@ -1496,6 +1516,12 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
+    if create && let Some(why) = lpm_common::volume::files_not_private(&certs) {
+        tracing::warn!(
+            "anyone using this computer can read the private key LPM keeps in {}: {why}. It only serves this project's local names",
+            shown_project.join(".lpm").join("certs").display()
+        );
+    }
     let mut path = project_path;
     path.push(".lpm");
     path.push("certs");
@@ -2465,6 +2491,38 @@ mod tests {
 
         assert_eq!(contents, b"private-key-material");
         assert_no_extended_acl(&key_path);
+    }
+
+    #[test]
+    fn the_certificate_authority_s_key_is_neither_written_nor_used_where_anyone_could_read_it() {
+        let home = tempfile::tempdir().unwrap();
+        let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+        // Removing the authority's trust writes and uses no key, so an
+        // operation still starts.
+        let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+
+        let written = operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .map(drop);
+        let used = crate::ensure_root_ca_pair_locked(&operation.ca).map(drop);
+        drop(pretending);
+
+        for refused in [written, used] {
+            let error = refused.unwrap_err().to_string();
+            assert!(
+                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't keep or use the certificate authority's private key there"),
+                "{error}"
+            );
+        }
+        assert!(!home.path().join(".lpm/certs/rootCA-key.pem").exists());
+        assert!(!home.path().join(".lpm/certs/rootCA.pem").exists());
     }
 
     #[test]
