@@ -1202,8 +1202,19 @@ fn abandon_pair_transaction(
     match removed {
         Ok(()) => error,
         Err(removal) => LpmError::Cert(format!(
-            "{error}; the next run may install this pair all the same, as removing its recovery transaction failed: {removal}"
+            "{}; the next run may install this pair all the same, as removing its recovery transaction failed: {}",
+            message_of(error),
+            message_of(removal)
         )),
+    }
+}
+
+/// What `error` says, without the prefix a certificate error's display
+/// adds, for an error that goes on inside another.
+fn message_of(error: LpmError) -> String {
+    match error {
+        LpmError::Cert(message) => message,
+        other => other.to_string(),
     }
 }
 
@@ -2537,6 +2548,7 @@ mod tests {
             error.contains("the next run may install this pair all the same"),
             "{error}"
         );
+        assert_eq!(error.matches("certificate error:").count(), 1, "{error}");
     }
 
     #[test]
