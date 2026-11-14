@@ -357,7 +357,7 @@ async fn ensure_detached_started_with_options(
         .map_err(|err| LpmError::Proxy(format!("failed to start detached proxy daemon: {err}")))?;
 
     let status = wait_for_detached_start(&mut daemon.child).await?;
-    if daemon.runs_in_job() {
+    if daemon.runs_in_job(&status) {
         tracing::warn!(
             "the proxy daemon could not leave the Windows Job lpm runs in, such as an \
              `lpm dev` service's, so it may stop when that Job ends; run \
@@ -506,11 +506,11 @@ struct DetachedDaemon {
 }
 
 impl DetachedDaemon {
-    /// Whether the proxy that is up runs in a Job it couldn't leave: this
-    /// daemon is still running, rather than having exited because another
-    /// session's daemon took the socket first.
-    fn runs_in_job(&mut self) -> bool {
-        self.kept_in_job && matches!(self.child.try_wait(), Ok(None))
+    /// Whether the proxy `status` reports runs in a Job it couldn't leave:
+    /// it is this daemon, rather than another session's that took the socket
+    /// first. lpm holds this daemon's process, so its ID can't name another.
+    fn runs_in_job(&self, status: &ProxyStatus) -> bool {
+        self.kept_in_job && status.pid == Some(self.child.id())
     }
 }
 
