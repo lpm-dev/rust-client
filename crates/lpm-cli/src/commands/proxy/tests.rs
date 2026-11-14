@@ -935,3 +935,97 @@ pub(super) fn fake_privileged_runner(directory: &Path, prelude: &str) -> PathBuf
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
+
+/// A Job that refuses breakaway, as an `lpm dev` service's does, makes
+/// CreateProcess fail with ACCESS_DENIED: the daemon then starts inside it
+/// rather than not at all.
+#[cfg(windows)]
+#[test]
+fn a_detached_daemon_a_job_keeps_still_starts() {
+    let mut attempts = 0;
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/d", "/c", "exit", "0"]);
+
+    let mut daemon = spawn_detached_daemon_with(&mut command, |command| {
+        attempts += 1;
+        if attempts == 1 {
+            Err(std::io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32,
+            ))
+        } else {
+            command.spawn()
+        }
+    })
+    .unwrap();
+
+    assert_eq!(attempts, 2, "a refused breakaway is retried inside the Job");
+    assert!(daemon.kept_in_job, "lpm says the Job keeps the daemon");
+    assert!(daemon.child.wait().unwrap().success());
+}
+
+fn proxy_status_from(pid: u32) -> ProxyStatus {
+    ProxyStatus {
+        running: true,
+        pid: Some(pid),
+        http_addr: None,
+        http_redirect_addr: None,
+        tls_addr: None,
+        public_tls_addr: None,
+        routes: Vec::new(),
+        stale: false,
+        state_error: None,
+    }
+}
+
+/// Another session's daemon may have taken the socket first, while lpm's
+/// own is still on its way out: the proxy that is up is then that one,
+/// which no Job of lpm's keeps.
+#[test]
+fn only_the_detached_daemon_that_is_up_is_said_to_run_in_the_job() {
+    let mut idle = if cfg!(windows) {
+        let mut idle = std::process::Command::new("ping");
+        idle.args(["-n", "30", "127.0.0.1"]);
+        idle
+    } else {
+        let mut idle = std::process::Command::new("sleep");
+        idle.arg("30");
+        idle
+    };
+    let mut daemon = DetachedDaemon {
+        child: idle.stdout(Stdio::null()).spawn().unwrap(),
+        kept_in_job: true,
+    };
+    let own = proxy_status_from(daemon.child.id());
+    let another_session_s = proxy_status_from(std::process::id());
+
+    let own_in_job = daemon.runs_in_job(&own);
+    let another_in_job = daemon.runs_in_job(&another_session_s);
+    daemon.kept_in_job = false;
+    let own_outside_any_job = daemon.runs_in_job(&own);
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
+
+    assert!(own_in_job);
+    assert!(
+        !another_in_job,
+        "another session's daemon was said to be ours"
+    );
+    assert!(!own_outside_any_job);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_detached_daemon_failing_for_another_reason_is_not_retried() {
+    let mut attempts = 0;
+    let mut command = std::process::Command::new("cmd");
+
+    let error = spawn_detached_daemon_with(&mut command, |_| {
+        attempts += 1;
+        Err(std::io::Error::from_raw_os_error(2))
+    })
+    .err()
+    .unwrap();
+
+    assert_eq!(attempts, 1);
+    assert_eq!(error.raw_os_error(), Some(2));
+}

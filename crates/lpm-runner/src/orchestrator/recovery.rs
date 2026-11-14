@@ -1,10 +1,10 @@
 use super::{
     AllReadyCallback, EndpointChangedCallback, InitialReadinessOptions, InitialServiceReadiness,
     MAX_RESTART_ATTEMPTS, OrchestratorCommand, OrchestratorCommandController, OrchestratorEvent,
-    OutputReaderOptions, RED, RESET, ServiceEndpointMap, ServicePortMap, ServiceStatus, YELLOW,
-    invoke_all_ready_callback, send_status, service_ready_port, spawn_output_readers,
-    terminate_service_tree, ui_readiness_timing, ui_service_note, ui_service_status,
-    wait_for_initial_service_readiness,
+    OutputReaderOptions, RED, RESET, ServiceEndpointMap, ServicePortMap, ServiceProcess,
+    ServiceStatus, YELLOW, invoke_all_ready_callback, send_status, service_ready_port,
+    spawn_output_readers, terminate_service_tree, ui_readiness_timing, ui_service_note,
+    ui_service_status, wait_for_initial_service_readiness,
 };
 use crate::dev_endpoint::DevEndpoint;
 use crate::lpm_json::ServiceConfig;
@@ -13,7 +13,7 @@ use lpm_common::{LpmError, sanitize_terminal_inline};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -157,7 +157,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) color_map: &'a HashMap<String, &'static str>,
     pub(super) service_names: &'a [String],
     pub(super) initial_ready: &'a HashMap<String, Instant>,
-    pub(super) children: &'a Arc<Mutex<Vec<(String, Child)>>>,
+    pub(super) children: &'a Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     pub(super) shutdown_state: &'a Arc<AtomicU8>,
     pub(super) event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     pub(super) command_controller: Option<&'a OrchestratorCommandController>,
@@ -202,8 +202,14 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
             break;
         }
 
-        for (name, status) in collect_exited_children(context.children) {
+        // Exits taken out came before the shutdown, even if it began while
+        // lpm collected them, so they're reported as the services' own.
+        let exited = collect_exited_children(context.children, context.shutdown_state);
+        for (name, status) in exited {
             handle_service_exit(&context, &mut states, &name, status);
+        }
+        if context.shutdown_state.load(Ordering::Relaxed) > 0 {
+            break;
         }
 
         process_commands(&context, &mut states);
@@ -267,23 +273,29 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
     }
 }
 
-fn collect_exited_children(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+/// Takes the services that exited out of `children`, ending what they left
+/// running, with their statuses. A service whose exit lies behind the
+/// shutdown stays, for the shutdown to stop with the rest.
+pub(super) fn collect_exited_children(
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+    shutdown_state: &AtomicU8,
 ) -> Vec<(String, ExitStatus)> {
-    let mut exited = Vec::new();
-    let mut locked = children.lock();
-    let mut index = 0;
-    while index < locked.len() {
-        match locked[index].1.try_wait() {
-            Ok(Some(status)) => {
-                let (name, child) = locked.remove(index);
-                super::cleanup_exited_service_tree(child.id());
-                exited.push((name, status));
-            }
-            Ok(None) | Err(_) => index += 1,
-        }
-    }
+    let exited: Vec<(String, u32)> = children
+        .lock()
+        .iter_mut()
+        .filter_map(|(name, child)| {
+            matches!(child.try_wait(), Ok(Some(_))).then(|| (name.clone(), child.id()))
+        })
+        .collect();
     exited
+        .into_iter()
+        .filter_map(
+            |(name, pid)| match take_exited_service(children, shutdown_state, &name, pid) {
+                ServiceExit::Taken(status) => Some((name, status)),
+                ServiceExit::Running | ServiceExit::KeptForShutdown => None,
+            },
+        )
+        .collect()
 }
 
 fn handle_service_exit(
@@ -490,7 +502,7 @@ fn stop_dependents(
     }
 }
 
-fn terminate_service(children: &Arc<Mutex<Vec<(String, Child)>>>, name: &str) {
+fn terminate_service(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, name: &str) {
     let child = {
         let mut locked = children.lock();
         locked
@@ -720,8 +732,15 @@ fn restart_job_is_current(
             .any(|(name, child)| name == &job.name && child.id() == job.child_pid)
 }
 
+/// Whether a service's exit lies behind the shutdown, which then stops it
+/// with what it started, as it does the rest, rather than taking it for a
+/// service that crashed or finished.
+pub(super) fn exit_behind_shutdown(status: ExitStatus, shutdown_state: &AtomicU8) -> bool {
+    crate::execution::exit_follows_stop(status, || shutdown_state.load(Ordering::Relaxed) > 0)
+}
+
 fn restart_child_stopped(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     name: &str,
     pid: u32,
 ) -> bool {
@@ -953,16 +972,27 @@ fn settle_restart_job(
         return Ok(());
     }
     let name = std::mem::take(&mut job.name);
-    if let Some(status) = take_exited_service(context.children, &name, job.child_pid) {
-        handle_service_exit(context, states, &name, status);
-        return Ok(());
+    match take_exited_service(
+        context.children,
+        context.shutdown_state,
+        &name,
+        job.child_pid,
+    ) {
+        ServiceExit::Taken(status) => {
+            handle_service_exit(context, states, &name, status);
+            return Ok(());
+        }
+        ServiceExit::KeptForShutdown => return Ok(()),
+        ServiceExit::Running => {}
     }
 
     match readiness {
         Ok(mut readiness) => {
-            if !states.get(&name).is_some_and(|state| {
-                state.goal == ServiceGoal::Running && state.phase == ServicePhase::Starting
-            }) {
+            if context.shutdown_state.load(Ordering::Relaxed) > 0
+                || !states.get(&name).is_some_and(|state| {
+                    state.goal == ServiceGoal::Running && state.phase == ServicePhase::Starting
+                })
+            {
                 return Ok(());
             }
             if let Some(endpoint) = &mut readiness.endpoint {
@@ -1005,19 +1035,53 @@ fn settle_restart_job(
     Ok(())
 }
 
+/// What became of a service that may have exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceExit {
+    /// It still runs, or `children` no longer holds it.
+    Running,
+    /// It exited, and was taken out of `children`, with what it left running
+    /// ended.
+    Taken(ExitStatus),
+    /// Its exit lies behind the shutdown, which stops it with what it left.
+    KeptForShutdown,
+}
+
+/// Takes the service `name`, started as `pid`, out of `children` if it has
+/// exited, unless its exit lies behind the shutdown, ending what it left
+/// running.
 fn take_exited_service(
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+    shutdown_state: &AtomicU8,
     name: &str,
     pid: u32,
-) -> Option<ExitStatus> {
-    let mut locked = children.lock();
-    let position = locked
-        .iter()
-        .position(|(service_name, child)| service_name == name && child.id() == pid)?;
-    let status = locked[position].1.try_wait().ok().flatten()?;
-    let (_, child) = locked.remove(position);
-    super::cleanup_exited_service_tree(child.id());
-    Some(status)
+) -> ServiceExit {
+    let is_it = |(service_name, child): &(String, ServiceProcess)| {
+        service_name == name && child.id() == pid
+    };
+    let status = children
+        .lock()
+        .iter_mut()
+        .find(|service| is_it(service))
+        .and_then(|(_, child)| child.try_wait().ok().flatten());
+    let Some(status) = status else {
+        return ServiceExit::Running;
+    };
+    // Unlocked: this may wait for lpm's console handler, whose second press
+    // takes the lock to force-kill.
+    if exit_behind_shutdown(status, shutdown_state) {
+        return ServiceExit::KeptForShutdown;
+    }
+    let child = {
+        let mut locked = children.lock();
+        let Some(position) = locked.iter().position(is_it) else {
+            return ServiceExit::Running;
+        };
+        locked.remove(position).1
+    };
+    // Unlocked as well: ending a Job waits for its processes to be gone.
+    super::cleanup_exited_service_tree(&child);
+    ServiceExit::Taken(status)
 }
 
 fn report_restart_failure(
@@ -1241,6 +1305,194 @@ mod tests {
         assert!(rx.recv().unwrap());
     }
 
+    /// A service that crashed before the shutdown began is reported as
+    /// crashed, even when the shutdown begins while lpm takes the services
+    /// that exited; one whose exit lies behind it is left to it.
+    #[test]
+    fn an_exit_before_the_shutdown_is_reported_when_the_shutdown_begins_while_lpm_collects() {
+        let project = tempfile::tempdir().unwrap();
+        let exited_with = |code: u8| {
+            let mut command = if cfg!(windows) {
+                let mut command = std::process::Command::new("cmd");
+                command.args(["/d", "/c", &format!("exit {code}")]);
+                command
+            } else {
+                let mut command = std::process::Command::new("sh");
+                command.args(["-c", &format!("exit {code}")]);
+                command
+            };
+            let mut child = command.spawn().unwrap();
+            child.wait().unwrap();
+            ServiceProcess::from(child)
+        };
+        let children = Arc::new(Mutex::new(vec![
+            ("crashed".into(), exited_with(7)),
+            ("stopping".into(), exited_with(1)),
+        ]));
+        let services = HashMap::from([
+            ("crashed".into(), ServiceConfig::default()),
+            ("stopping".into(), ServiceConfig::default()),
+        ]);
+        let service_names: Vec<String> = vec!["crashed".into(), "stopping".into()];
+        let groups = vec![service_names.clone()];
+        let initial_ready = HashMap::from([
+            ("crashed".to_string(), Instant::now()),
+            ("stopping".to_string(), Instant::now()),
+        ]);
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let context = RecoveryContext {
+            project_dir: project.path(),
+            active_services: &services,
+            service_cwds: &HashMap::new(),
+            groups: &groups,
+            service_runtime_hints: &HashMap::new(),
+            service_envs: &HashMap::new(),
+            env_validator: None,
+            env_name: "default",
+            validate_env_schema: false,
+            port_map: &ServicePortMap::new(),
+            color_map: &HashMap::new(),
+            service_names: &service_names,
+            initial_ready: &initial_ready,
+            children: &children,
+            shutdown_state: &shutdown_state,
+            event_tx: &Some(tx),
+            command_controller: None,
+            initial_publication_complete: true,
+            initial_endpoints: ServiceEndpointMap::new(),
+            on_all_ready: None,
+            on_endpoint_changed: None,
+        };
+        // `crashed` is checked first, before the shutdown; it begins as lpm
+        // checks `stopping`.
+        let handler = Arc::clone(&shutdown_state);
+        crate::execution::on_next_stop_check(move || {
+            crate::execution::on_next_stop_check(move || handler.store(1, Ordering::Release));
+        });
+
+        let result = supervise_services(context);
+        let events: Vec<_> = rx.try_iter().collect();
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Crashed(7),
+                    ..
+                }
+            )),
+            "the crash before the shutdown went unreported: {events:?}"
+        );
+        assert!(result.is_err(), "the crash didn't fail the session");
+        let kept: Vec<String> = children
+            .lock()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(kept, ["stopping"]);
+    }
+
+    /// A restarted service whose readiness succeeded, found exited as the
+    /// shutdown begins, is the shutdown's: it isn't reported or published as
+    /// restarted while the session stops.
+    #[test]
+    fn a_restart_found_exited_behind_the_shutdown_is_not_reported_as_restarted() {
+        let project = tempfile::tempdir().unwrap();
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/d", "/c", "exit 7"]);
+            command
+        } else {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "exit 7"]);
+            command
+        };
+        let mut child = command.spawn().unwrap();
+        child.wait().unwrap();
+        let pid = child.id();
+        let children = Arc::new(Mutex::new(vec![(
+            "worker".into(),
+            ServiceProcess::from(child),
+        )]));
+        let services = HashMap::from([(
+            "worker".into(),
+            ServiceConfig {
+                restart: true,
+                ..Default::default()
+            },
+        )]);
+        let service_names = vec!["worker".into()];
+        let groups = vec![service_names.clone()];
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let context = RecoveryContext {
+            project_dir: project.path(),
+            active_services: &services,
+            service_cwds: &HashMap::new(),
+            groups: &groups,
+            service_runtime_hints: &HashMap::new(),
+            service_envs: &HashMap::new(),
+            env_validator: None,
+            env_name: "default",
+            validate_env_schema: false,
+            port_map: &ServicePortMap::new(),
+            color_map: &HashMap::new(),
+            service_names: &service_names,
+            initial_ready: &HashMap::new(),
+            children: &children,
+            shutdown_state: &shutdown_state,
+            event_tx: &Some(tx),
+            command_controller: None,
+            initial_publication_complete: true,
+            initial_endpoints: ServiceEndpointMap::new(),
+            on_all_ready: None,
+            on_endpoint_changed: None,
+        };
+        let mut states = HashMap::from([(
+            "worker".into(),
+            ServiceRuntimeState::initial(None, true, Instant::now()),
+        )]);
+        let mut publication = EndpointPublication {
+            initial_complete: true,
+            initial_endpoints: ServiceEndpointMap::new(),
+            on_all_ready: None,
+            on_endpoint_changed: None,
+        };
+        let job = RestartJob {
+            name: "worker".into(),
+            child_pid: pid,
+            cancel: Arc::new(AtomicBool::new(false)),
+            readiness: Some(std::thread::spawn(|| {
+                Ok(super::super::InitialServiceReadiness {
+                    ready_at: Instant::now(),
+                    duration: None,
+                    endpoint: None,
+                })
+            })),
+        };
+        while !job.readiness.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        let handler = Arc::clone(&shutdown_state);
+        crate::execution::on_next_stop_check(move || handler.store(1, Ordering::Release));
+
+        settle_restart_job(&context, &mut states, &mut publication, job).unwrap();
+
+        assert_eq!(states["worker"].phase, ServicePhase::Starting);
+        assert!(
+            !rx.try_iter().any(|event| matches!(
+                event,
+                OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                }
+            )),
+            "the stopped service was reported as restarted"
+        );
+        assert_eq!(children.lock().len(), 1, "the service was taken out");
+    }
+
     #[cfg(unix)]
     #[test]
     fn exited_restart_reports_the_exit_status_instead_of_cancelled_readiness() {
@@ -1252,7 +1504,10 @@ mod tests {
                 .unwrap();
             child.wait().unwrap();
             let pid = child.id();
-            let children = Arc::new(Mutex::new(vec![("worker".into(), child)]));
+            let children = Arc::new(Mutex::new(vec![(
+                "worker".into(),
+                ServiceProcess::from(child),
+            )]));
             let services = HashMap::from([(
                 "worker".into(),
                 ServiceConfig {
@@ -1339,15 +1594,21 @@ mod tests {
             .unwrap();
         current.wait().unwrap();
         let current_pid = current.id();
-        let children = Arc::new(Mutex::new(vec![("service".into(), current)]));
-        assert!(take_exited_service(&children, "service", old.id()).is_none());
+        let children = Arc::new(Mutex::new(vec![(
+            "service".into(),
+            ServiceProcess::from(current),
+        )]));
+        let running = AtomicU8::new(0);
+        assert_eq!(
+            take_exited_service(&children, &running, "service", old.id()),
+            ServiceExit::Running
+        );
         assert_eq!(children.lock().len(), 1);
         assert!(restart_child_stopped(&children, "service", old.id()));
-        assert!(
-            take_exited_service(&children, "service", current_pid)
-                .unwrap()
-                .success()
-        );
+        assert!(matches!(
+            take_exited_service(&children, &running, "service", current_pid),
+            ServiceExit::Taken(status) if status.success()
+        ));
     }
 
     #[test]
@@ -1546,6 +1807,69 @@ mod tests {
         assert_eq!(dependency.as_deref(), Some("db"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_service_the_console_interrupt_ended_waits_for_the_shutdown_it_began() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let handler = Arc::clone(&shutdown_state);
+        crate::execution::on_next_stop_check(move || handler.store(1, Ordering::Relaxed));
+
+        assert!(exit_behind_shutdown(
+            ExitStatus::from_raw(crate::execution::STATUS_CONTROL_C_EXIT),
+            &shutdown_state
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_exits_are_not_taken_for_a_console_interrupt() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let shutdown_state = AtomicU8::new(0);
+        let started = Instant::now();
+
+        assert!(!exit_behind_shutdown(
+            ExitStatus::from_raw(1),
+            &shutdown_state
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an ordinary exit waited"
+        );
+        assert!(!exit_behind_shutdown(
+            ExitStatus::from_raw(crate::execution::STATUS_CONTROL_C_EXIT),
+            &shutdown_state
+        ));
+    }
+
+    /// Once the shutdown has begun, an exited service stays for it, with
+    /// what it started, rather than being taken out and its tree ended.
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_service_is_left_to_a_shutdown_under_way_with_what_it_started() {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60 & exit 1");
+        super::super::isolate_service_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let root_pid = child.id();
+        assert!(!child.wait().unwrap().success());
+        children.lock().push(("worker".to_string(), child.into()));
+        let shutting_down = AtomicU8::new(1);
+
+        let exited = collect_exited_children(&children, &shutting_down);
+
+        assert!(exited.is_empty());
+        assert_eq!(children.lock().len(), 1, "the service was taken out");
+        assert!(
+            super::super::service_process_group_exists(root_pid),
+            "what the service started was ended before the shutdown's grace"
+        );
+        let running = AtomicU8::new(0);
+        assert_eq!(collect_exited_children(&children, &running).len(), 1);
+        assert!(children.lock().is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn taking_an_exited_service_cleans_its_surviving_process_group() {
@@ -1555,11 +1879,13 @@ mod tests {
         super::super::isolate_service_process_tree(&mut command);
         let child = command.spawn().unwrap();
         let root_pid = child.id();
-        children.lock().push(("worker".to_string(), child));
+        children.lock().push(("worker".to_string(), child.into()));
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
-            if let Some(status) = take_exited_service(&children, "worker", root_pid) {
+            if let ServiceExit::Taken(status) =
+                take_exited_service(&children, &AtomicU8::new(0), "worker", root_pid)
+            {
                 break status;
             }
             assert!(Instant::now() < deadline, "root process did not exit");

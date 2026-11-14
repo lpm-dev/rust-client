@@ -310,6 +310,10 @@ pub struct ChildEnv {
     origins: OverrideOrigins,
     /// How many of the overrides changed the environment at layer 4.
     applied: usize,
+    /// The names the last [`validate`](Self::validate) inserted, `PATH`
+    /// and the trusted values: lpm's own, which validating again replaces
+    /// rather than ignoring as a project's.
+    validated: Vec<String>,
 }
 
 impl ChildEnv {
@@ -396,11 +400,17 @@ impl ChildEnv {
         path: &str,
         trusted: &[(String, String)],
     ) -> Result<(), LpmError> {
+        for key in std::mem::take(&mut self.validated) {
+            remove_project_env(&mut self.vars, &key);
+        }
         remove_dangerous_env_vars(&mut self.vars, "child env");
+        self.validated.reserve(trusted.len() + 1);
         for (key, value) in trusted {
             self.insert_runtime(key.clone(), value.clone());
+            self.validated.push(key.clone());
         }
         self.insert_runtime("PATH".into(), path.into());
+        self.validated.push("PATH".into());
         let errors = self.evaluate(validator, context)?;
         validation_result(errors, self)
     }
@@ -540,6 +550,7 @@ fn apply_layer_four(mut vars: HashMap<String, String>, overrides: &PersonalOverr
         overrides: overrides.clone(),
         origins,
         applied,
+        validated: Vec::new(),
     }
 }
 
@@ -1181,6 +1192,16 @@ pub(crate) fn insert_project_env(target: &mut HashMap<String, String>, key: Stri
     insert_env_with_case_policy(target, key, value, cfg!(windows));
 }
 
+/// Removes `key`, under any spelling the platform treats as the same name.
+fn remove_project_env(target: &mut HashMap<String, String>, key: &str) {
+    if cfg!(windows) {
+        let name = EnvName::new(key);
+        target.retain(|existing, _| EnvName::new(existing) != name);
+    } else {
+        target.remove(key);
+    }
+}
+
 fn insert_env_with_case_policy(
     target: &mut HashMap<String, String>,
     key: String,
@@ -1457,6 +1478,65 @@ fn merge_env_file(target: &mut HashMap<String, String>, path: &Path) -> Result<(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A pre-hook and its script, or a restarted service, validate one
+    /// environment again: the `PATH` and trusted values lpm put there are
+    /// its own, not a project's to ignore.
+    #[test]
+    fn validating_a_child_env_again_keeps_lpm_s_own_values_without_ignoring_them() {
+        let mut child = ChildEnv::plain(HashMap::from([("APP".to_string(), "1".to_string())]));
+        let trusted = [("NODE_OPTIONS".to_string(), "--trusted".to_string())];
+
+        let ((), ignored) = collect_ignored_env_names(|| {
+            for path in ["/first", "/second"] {
+                validate_child_env_with_trusted(
+                    &mut child,
+                    None,
+                    lpm_env::EvalContext::default(),
+                    path,
+                    false,
+                    &trusted,
+                )
+                .unwrap();
+            }
+        });
+
+        assert!(
+            ignored.is_empty(),
+            "lpm's own values were ignored: {ignored:?}"
+        );
+        assert_eq!(
+            child.vars().get("PATH").map(String::as_str),
+            Some("/second")
+        );
+        assert_eq!(
+            child.vars().get("NODE_OPTIONS").map(String::as_str),
+            Some("--trusted")
+        );
+        assert_eq!(child.vars().get("APP").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn a_project_path_is_still_ignored_when_lpm_validates() {
+        let mut child = ChildEnv::plain(HashMap::from([(
+            "PATH".to_string(),
+            "/project".to_string(),
+        )]));
+
+        let ((), ignored) = collect_ignored_env_names(|| {
+            validate_child_env(
+                &mut child,
+                None,
+                lpm_env::EvalContext::default(),
+                "/lpm",
+                false,
+            )
+            .unwrap();
+        });
+
+        assert_eq!(ignored, ["PATH"]);
+        assert_eq!(child.vars().get("PATH").map(String::as_str), Some("/lpm"));
+    }
 
     mod overrides;
 

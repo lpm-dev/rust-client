@@ -2288,7 +2288,7 @@ pub async fn run(
             } else {
                 Ok(())
             };
-            let tunnel_shutdown_result =
+            let (tunnel_shutdown_result, tunnel_task_left) =
                 stop_multi_service_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
             shutdown_controller.send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
             let orchestrator_result = orch_handle.join().unwrap_or_else(|_| {
@@ -2302,6 +2302,7 @@ pub async fn run(
             let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
             let result = release_proxy_lease_after(result, &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
+            let result = combine_tunnel_cleanup_results(result, tunnel_task_left.wait().await);
 
             return finalize_multi_service_tunnel_after(
                 result,
@@ -2318,12 +2319,13 @@ pub async fn run(
             Some(config.as_ref()),
             options,
         );
-        let tunnel_shutdown_result =
+        let (tunnel_shutdown_result, tunnel_task_left) =
             stop_multi_service_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
         let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
         let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
         let result = release_proxy_lease_after(result, &proxy_lease).await;
         let result = release_hosts_file_after(result, hosts_file_lease);
+        let result = combine_tunnel_cleanup_results(result, tunnel_task_left.wait().await);
         return finalize_multi_service_tunnel_after(
             result,
             capture_consumer_handle,
@@ -2560,7 +2562,7 @@ pub async fn run(
     let (frontends, dev_session_lease) = match setup_result {
         Ok(runtime) => runtime,
         Err(error) => {
-            let tunnel_shutdown_result =
+            let (tunnel_shutdown_result, tunnel_task_left) =
                 shutdown_spawned_tunnel(tunnel_handle.take(), tunnel_shutdown_boundary.as_ref())
                     .await;
             script_stop_requested.store(true, Ordering::Release);
@@ -2568,6 +2570,7 @@ pub async fn run(
             let result = release_proxy_lease_after(Err(error), &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
             let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
+            let result = combine_tunnel_cleanup_results(result, tunnel_task_left.wait().await);
             let inspector_result = match inspector_handle.take() {
                 Some(handle) => handle.shutdown().await,
                 None => Ok(()),
@@ -2576,19 +2579,19 @@ pub async fn run(
         }
     };
 
-    let (script_result, tunnel_shutdown_result) =
+    let (script_result, tunnel_shutdown_result, tunnel_task_left) =
         if let Some(mut active_tunnel_handle) = tunnel_handle.take() {
             tokio::select! {
                 script_join = &mut script_handle => {
                     let script_result = script_join.map_err(|error| {
                         LpmError::Script(format!("dev script task panicked: {error}"))
                     })?;
-                    let tunnel_result = shutdown_spawned_tunnel(
+                    let (tunnel_result, tunnel_task_left) = shutdown_spawned_tunnel(
                         Some(active_tunnel_handle),
                         tunnel_shutdown_boundary.as_ref(),
                     )
                     .await;
-                    (script_result, tunnel_result)
+                    (script_result, tunnel_result, tunnel_task_left)
                 }
                 tunnel_join = &mut active_tunnel_handle => {
                     let tunnel_result = match tunnel_join {
@@ -2602,20 +2605,21 @@ pub async fn run(
                     let script_result = script_handle.await.map_err(|error| {
                         LpmError::Script(format!("dev script task panicked: {error}"))
                     })?;
-                    (script_result, tunnel_result)
+                    (script_result, tunnel_result, TunnelTaskLeft(None))
                 }
             }
         } else {
             let script_result = script_handle
                 .await
                 .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
-            (script_result, Ok(()))
+            (script_result, Ok(()), TunnelTaskLeft(None))
         };
     drop(frontends);
     drop(dev_session_lease);
     let result = release_proxy_lease_after(script_result, &proxy_lease).await;
     let result = release_hosts_file_after(result, hosts_file_lease);
     let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
+    let result = combine_tunnel_cleanup_results(result, tunnel_task_left.wait().await);
     let inspector_result = match inspector_handle {
         Some(handle) => handle.shutdown().await,
         None => Ok(()),
@@ -3229,7 +3233,7 @@ async fn release_proxy_lease_after(
 async fn shutdown_spawned_tunnel(
     tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
     shutdown_boundary: Option<&TunnelShutdownBoundary>,
-) -> Result<(), LpmError> {
+) -> (Result<(), LpmError>, TunnelTaskLeft) {
     stop_multi_service_tunnel(tunnel_handle, shutdown_boundary).await
 }
 
@@ -3251,44 +3255,112 @@ async fn wait_for_tunnel_readiness<T>(
     }
 }
 
+const TUNNEL_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What stopping a tunnel left to wait for: nothing, or, where the console
+/// window started closing, its task, which lpm waits for only after releasing
+/// its proxy routes and hosts-file entries.
+#[must_use]
+struct TunnelTaskLeft(Option<tokio::task::JoinHandle<Result<(), LpmError>>>);
+
+impl TunnelTaskLeft {
+    /// Waits, up to five seconds, for what the tunnel task has left to do,
+    /// such as storing the last requests it captured.
+    async fn wait(self) -> Result<(), LpmError> {
+        match self.0 {
+            Some(handle) => wait_for_tunnel_task(handle).await,
+            None => Ok(()),
+        }
+    }
+}
+
 async fn stop_multi_service_tunnel(
     tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
     shutdown_boundary: Option<&TunnelShutdownBoundary>,
-) -> Result<(), LpmError> {
+) -> (Result<(), LpmError>, TunnelTaskLeft) {
+    stop_tunnel_while(
+        tunnel_handle,
+        shutdown_boundary,
+        lpm_runner::execution::console_closing,
+    )
+    .await
+}
+
+/// Asks the tunnel to stop and waits for its task, up to five seconds. Once
+/// the console window is `closing`, before the wait or during it, it leaves
+/// the task to wait for later: Windows ends lpm within about five seconds of
+/// the close, which releasing the proxy routes and hosts-file entries needs
+/// first.
+async fn stop_tunnel_while(
+    tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
+    shutdown_boundary: Option<&TunnelShutdownBoundary>,
+    closing: impl Fn() -> bool,
+) -> (Result<(), LpmError>, TunnelTaskLeft) {
     let request_result = match shutdown_boundary {
         Some(boundary) => boundary.request(),
         None => Ok(()),
     };
-    let task_result = match tunnel_handle {
-        Some(mut handle) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
-                Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(error))) => Err(error),
-                Ok(Err(error)) if error.is_cancelled() => Ok(()),
-                Ok(Err(error)) => Err(LpmError::Tunnel(format!(
-                    "tunnel task failed during shutdown: {error}"
-                ))),
-                Err(_) => {
-                    handle.abort();
-                    let join_result = handle.await;
-                    let timeout_error =
-                        LpmError::Tunnel("tunnel did not stop within 5 seconds".to_string());
-                    match join_result {
-                        Ok(Ok(())) => Err(timeout_error),
-                        Ok(Err(error)) => Err(LpmError::Tunnel(format!(
-                            "{timeout_error}; tunnel task also failed: {error}"
-                        ))),
-                        Err(error) if error.is_cancelled() => Err(timeout_error),
-                        Err(error) => Err(LpmError::Tunnel(format!(
-                            "{timeout_error}; aborting the tunnel task also failed: {error}"
-                        ))),
-                    }
-                }
-            }
-        }
-        None => Ok(()),
+    let Some(mut handle) = tunnel_handle else {
+        return (request_result, TunnelTaskLeft(None));
     };
-    combine_tunnel_cleanup_results(request_result, task_result)
+    let deadline = tokio::time::Instant::now() + TUNNEL_STOP_TIMEOUT;
+    loop {
+        if closing() {
+            return (request_result, TunnelTaskLeft(Some(handle)));
+        }
+        let slice_end =
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        let task_result = match tokio::time::timeout_at(slice_end, &mut handle).await {
+            Ok(joined) => tunnel_task_outcome(joined),
+            Err(_) if tokio::time::Instant::now() >= deadline => abort_tunnel_task(handle).await,
+            Err(_) => continue,
+        };
+        return (
+            combine_tunnel_cleanup_results(request_result, task_result),
+            TunnelTaskLeft(None),
+        );
+    }
+}
+
+async fn wait_for_tunnel_task(
+    mut handle: tokio::task::JoinHandle<Result<(), LpmError>>,
+) -> Result<(), LpmError> {
+    match tokio::time::timeout(TUNNEL_STOP_TIMEOUT, &mut handle).await {
+        Ok(joined) => tunnel_task_outcome(joined),
+        Err(_) => abort_tunnel_task(handle).await,
+    }
+}
+
+fn tunnel_task_outcome(
+    joined: Result<Result<(), LpmError>, tokio::task::JoinError>,
+) -> Result<(), LpmError> {
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(LpmError::Tunnel(format!(
+            "tunnel task failed during shutdown: {error}"
+        ))),
+    }
+}
+
+/// Aborts a tunnel task that didn't stop in time.
+async fn abort_tunnel_task(
+    handle: tokio::task::JoinHandle<Result<(), LpmError>>,
+) -> Result<(), LpmError> {
+    handle.abort();
+    let join_result = handle.await;
+    let timeout_error = LpmError::Tunnel("tunnel did not stop within 5 seconds".to_string());
+    match join_result {
+        Ok(Ok(())) => Err(timeout_error),
+        Ok(Err(error)) => Err(LpmError::Tunnel(format!(
+            "{timeout_error}; tunnel task also failed: {error}"
+        ))),
+        Err(error) if error.is_cancelled() => Err(timeout_error),
+        Err(error) => Err(LpmError::Tunnel(format!(
+            "{timeout_error}; aborting the tunnel task also failed: {error}"
+        ))),
+    }
 }
 
 async fn cleanup_failed_multi_service_preparation(
@@ -3299,7 +3371,10 @@ async fn cleanup_failed_multi_service_preparation(
     inspector_state: Option<lpm_inspect::state::InspectorState>,
     inspector_handle: Option<lpm_inspect::InspectorHandle>,
 ) -> Result<(), LpmError> {
-    let tunnel_result = stop_multi_service_tunnel(tunnel_handle, shutdown_boundary).await;
+    let (tunnel_result, tunnel_task_left) =
+        stop_multi_service_tunnel(tunnel_handle, shutdown_boundary).await;
+    let tunnel_result =
+        combine_tunnel_cleanup_results(tunnel_result, tunnel_task_left.wait().await);
     let result = combine_tunnel_cleanup_results(Err(error), tunnel_result);
     finalize_multi_service_tunnel_after(
         result,
@@ -4814,15 +4889,72 @@ mod tests {
         assert!(error.to_string().contains("relay rejected token"));
     }
 
+    /// As the console window closes, the tunnel is asked to stop, and its
+    /// task is left to wait for until lpm has released what the session
+    /// holds: Windows ends lpm within about five seconds of the close. The
+    /// task then still gets to finish, as by storing what it captured.
+    #[tokio::test]
+    async fn a_closing_window_asks_the_tunnel_to_stop_and_waits_for_it_last() {
+        let (boundary, stop_requested, _completion) = TunnelShutdownBoundary::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = Arc::clone(&finished);
+        let tunnel_handle = tokio::spawn(async move {
+            let _ = stop_requested.await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            task_finished.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        let began = std::time::Instant::now();
+        let (result, left) = stop_tunnel_while(Some(tunnel_handle), Some(&boundary), || true).await;
+        let returned_after = began.elapsed();
+        let finished_before_the_releases = finished.load(Ordering::Acquire);
+        let waited = left.wait().await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            returned_after < std::time::Duration::from_millis(100),
+            "waited {returned_after:?} before the releases"
+        );
+        assert!(!finished_before_the_releases);
+        assert!(waited.is_ok(), "{waited:?}");
+        assert!(
+            finished.load(Ordering::Acquire),
+            "the tunnel task was cut short"
+        );
+    }
+
+    /// A window that closes while lpm waits for the tunnel, as after a
+    /// Ctrl+C, ends the wait too.
+    #[tokio::test]
+    async fn a_window_closing_during_the_tunnel_wait_ends_it() {
+        let tunnel_handle = tokio::spawn(std::future::pending::<Result<(), LpmError>>());
+        let began = std::time::Instant::now();
+
+        let (result, left) = stop_tunnel_while(Some(tunnel_handle), None, || {
+            began.elapsed() > std::time::Duration::from_millis(200)
+        })
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(2),
+            "waited {:?}",
+            began.elapsed()
+        );
+        assert!(left.0.is_some());
+        left.0.unwrap().abort();
+    }
+
     #[tokio::test]
     async fn tunnel_shutdown_reports_a_panicked_task() {
         let tunnel_handle = tokio::spawn(async {
             panic!("injected tunnel task panic");
         });
 
-        let error = shutdown_spawned_tunnel(Some(tunnel_handle), None)
-            .await
-            .unwrap_err();
+        let (result, left) = shutdown_spawned_tunnel(Some(tunnel_handle), None).await;
+        assert!(left.0.is_none());
+        let error = result.unwrap_err();
 
         assert!(
             error
