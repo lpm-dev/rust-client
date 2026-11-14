@@ -91,22 +91,26 @@ test("the required macOS check fails unless every macOS job passes", {
   );
   const needs = gate.match(/^    needs: \[([^\]]+)\]$/m)?.[1].split(",").map((job) => job.trim());
   assert.deepEqual(needs, ["macos-workspace-tests", "macos-build-checks"]);
-  for (const job of needs) {
-    assert.match(ciJob(workflow, job) ?? "", /^    runs-on: macos-latest$/m, `${job} must run on macOS`);
-  }
+  assert.match(macosWorkspaceTests(), /^    runs-on: macos-latest$/m, "macos-workspace-tests must run on macOS");
+  assert.match(ciJob(workflow, "macos-build-checks") ?? "", /^    runs-on: macos-latest$/m, "macos-build-checks must run on macOS");
 
   const step = ciStep(gate, "Require every macOS job to pass");
   assert.ok(step, "missing macOS gate step");
   assert.match(step, /^          NEEDS: \$\{\{ toJSON\(needs\) \}\}$/m);
+  assert.match(
+    step,
+    /^          DEFERRED: \$\{\{ github\.event_name == 'pull_request' && 'macos-workspace-tests' \|\| '' \}\}$/m,
+    "only a pull request leaves the workspace tests to Full CI",
+  );
   const script = step
     .match(/^        run: \|\n((?:          .*\n|\n)+)/m)?.[1]
     .replace(/^ {10}/gm, "");
   assert.ok(script, "missing macOS gate script");
 
-  const gateStatus = (results) => {
+  const gateStatus = (results, deferred = "") => {
     const reported = Object.fromEntries(needs.map((job, index) => [job, { result: results[index], outputs: {} }]));
     return spawnSync("bash", ["-e", "-c", script], {
-      env: { ...process.env, NEEDS: JSON.stringify(reported) },
+      env: { ...process.env, NEEDS: JSON.stringify(reported), DEFERRED: deferred },
       encoding: "utf8",
     }).status;
   };
@@ -115,11 +119,26 @@ test("the required macOS check fails unless every macOS job passes", {
     assert.notEqual(gateStatus([result, "success"]), 0, `gate passed with ${needs[0]} ${result}`);
     assert.notEqual(gateStatus(["success", result]), 0, `gate passed with ${needs[1]} ${result}`);
   }
+
+  const onPullRequest = (results) => gateStatus(results, "macos-workspace-tests");
+  assert.equal(onPullRequest(["skipped", "success"]), 0, "a pull request's gate must pass without the workspace tests");
+  assert.equal(onPullRequest(["success", "success"]), 0);
+  for (const result of ["failure", "cancelled"]) {
+    assert.notEqual(onPullRequest([result, "success"]), 0, `a pull request's gate passed with ${needs[0]} ${result}`);
+  }
+  for (const result of ["failure", "cancelled", "skipped"]) {
+    assert.notEqual(onPullRequest(["skipped", result]), 0, `a pull request's gate passed with ${needs[1]} ${result}`);
+  }
 });
 
+function macosWorkspaceTests() {
+  const job = ciJob(readWorkflow("macos-workspace-tests.yml"), "verify");
+  assert.ok(job, "missing macOS workspace tests job");
+  return job;
+}
+
 test("macOS workspace tests compile lpm-rs once, with the hermetic test feature", () => {
-  const job = ciJob(readCiWorkflow(), "macos-workspace-tests");
-  assert.ok(job, "missing macos-workspace-tests job");
+  const job = macosWorkspaceTests();
   assert.match(job, /^    name: macOS workspace tests$/m);
   assert.doesNotMatch(job, /^    needs:/m);
   assert.doesNotMatch(job, /cargo (?:build|check|clippy)\b/);
@@ -196,7 +215,7 @@ test("draft pull requests run no CI jobs, and marking one ready runs them all", 
     .filter(([, workflow]) => /^  pull_request:$|^on:.*\bpull_request\b/m.test(workflowTriggers(workflow)));
   assert.ok(pullRequestWorkflows.some(([name]) => name === "ci.yml"), "CI no longer runs on pull requests");
 
-  for (const [name, workflow] of pullRequestWorkflows) {
+  for (const [name, workflow] of pullRequestWorkflows.filter(([name]) => name !== "full-ci.yml")) {
     // Branch protection counts a skipped check as passing, so a draft's skipped
     // checks must be replaced by a full run the moment the PR is marked ready.
     const trigger = workflow.match(/^  pull_request:\n((?:    .*\n)*)/m)?.[1] ?? "";
@@ -238,3 +257,74 @@ function skipsPullRequests(condition) {
     .split(" || ")
     .every((clause) => /^github\.event_name == '(?:push|schedule|workflow_dispatch)'$/.test(clause));
 }
+
+const FULL_TIER = ["windows-filesystem", "windows-filesystem-arm64", "macos-workspace-tests"];
+const FULL_CI_EVENTS = "(github.event.action != 'labeled' || github.event.label.name == 'full-ci')";
+
+function reusableCall(job) {
+  return job.match(/^    uses: .*\n(?:    with:\n(?:      .*\n)+)?/m)?.[0];
+}
+
+test("pull request CI leaves the Windows filesystem gates and macOS workspace tests to Full CI", () => {
+  const ci = readCiWorkflow();
+  const fullCi = readWorkflow("full-ci.yml");
+  for (const id of FULL_TIER) {
+    const inCi = ciJob(ci, id);
+    const inFullCi = ciJob(fullCi, id);
+    assert.ok(inCi, `ci.yml is missing ${id}, which pushes to main run`);
+    assert.ok(inFullCi, `full-ci.yml is missing ${id}`);
+    assert.match(inCi, /^    if: github\.event_name != 'pull_request'$/m, `${id} must not run in pull request CI`);
+    assert.ok(reusableCall(inCi), `${id} must call a reusable workflow`);
+    assert.equal(reusableCall(inFullCi), reusableCall(inCi), `${id} must be the same job in both workflows`);
+  }
+  assert.match(ciJob(ci, "windows-filesystem-arm64"), /^      runner: windows-11-arm$/m);
+});
+
+test("Full CI runs its tier where the plan says, and never for a draft or an unrelated label", () => {
+  const workflow = readWorkflow("full-ci.yml");
+  const trigger = workflow.match(/^  pull_request:\n((?:    .*\n)*)/m)?.[1] ?? "";
+  assert.match(trigger, /^    branches: \[main, "codex\/\*\*"\]$/m);
+  assert.match(
+    trigger,
+    /^    types: \[opened, synchronize, reopened, ready_for_review, labeled\]$/m,
+    "Full CI must run again when a draft is marked ready, and when its label is added",
+  );
+  assert.match(workflow, /^  workflow_dispatch:$/m);
+  assert.match(workflow, /^permissions:\n  contents: read\n/m);
+
+  assert.ok(
+    workflow.includes(
+      "  group: full-ci-${{ github.event_name == 'pull_request' && " + FULL_CI_EVENTS +
+        " && format('pr-{0}', github.event.pull_request.number) || github.run_id }}\n  cancel-in-progress: true\n",
+    ),
+    "an unrelated label must not cancel the pull request's run",
+  );
+
+  const jobs = Object.fromEntries(workflowJobs(workflow));
+  assert.deepEqual(Object.keys(jobs), ["plan", ...FULL_TIER, "report"]);
+  assert.ok(
+    jobs.plan.includes(`    if: \${{ !github.event.pull_request.draft && ${FULL_CI_EVENTS} }}\n`),
+    "the plan must skip drafts and labels other than full-ci",
+  );
+  assert.match(jobs.plan, /^      run: \$\{\{ steps\.plan\.outputs\.run \}\}$/m);
+  assert.match(
+    jobs.plan,
+    /^          LABELED: \$\{\{ contains\(github\.event\.pull_request\.labels\.\*\.name, 'full-ci'\) && 'yes' \|\| '' \}\}$/m,
+  );
+  for (const id of FULL_TIER) {
+    assert.match(jobs[id], /^    needs: plan$/m, `${id} must wait for the plan`);
+    assert.match(jobs[id], /^    if: \$\{\{ needs\.plan\.outputs\.run == 'true' \}\}$/m, `${id} must follow the plan`);
+  }
+
+  assert.match(jobs.report, new RegExp(`^    needs: \\[plan, ${FULL_TIER.join(", ")}\\]$`, "m"));
+  assert.match(
+    jobs.report,
+    /^    if: \$\{\{ !cancelled\(\) && needs\.plan\.outputs\.run == 'true' \}\}$/m,
+    "the result must be reported when a tier job fails, and not when the run is replaced",
+  );
+  assert.match(jobs.report, /^    permissions:\n      contents: read\n      pull-requests: read\n      statuses: write\n/m);
+  assert.match(jobs.report, /^          NEEDS: \$\{\{ toJSON\(needs\) \}\}$/m);
+  for (const [id, job] of Object.entries(jobs)) {
+    if (id !== "report") assert.doesNotMatch(job, /^    permissions:/m, `${id} must not widen the workflow token`);
+  }
+});

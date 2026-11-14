@@ -1,0 +1,74 @@
+name: macOS workspace tests
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  verify:
+    name: macOS workspace tests
+    runs-on: macos-latest
+    # From a cold cache, the 3-core runner can spend 35 minutes compiling the
+    # workspace tests before running them for 15.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install nextest
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: nextest
+
+      - name: Install Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Cache npm (Verdaccio test harness)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-verdaccio-${{ hashFiles('tests/workflows/tests/support/verdaccio.rs') }}
+          restore-keys: ${{ runner.os }}-npm-verdaccio-
+
+      - name: Pre-warm Verdaccio in npm cache
+        run: |
+          set -e
+          VERDACCIO_VERSION=$(grep -oE 'VERDACCIO_VERSION: &str = "[^"]+"' tests/workflows/tests/support/verdaccio.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VERDACCIO_VERSION" ]; then
+            echo "::error::Could not extract VERDACCIO_VERSION from verdaccio.rs"
+            exit 1
+          fi
+          echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
+          npx --yes "verdaccio@$VERDACCIO_VERSION" --version
+
+      # The workflow tests need lpm-rs built with the Sigstore mock feature, so
+      # every test is built with it and one lpm-rs serves them all.
+      - name: Build workspace tests
+        run: cargo nextest run --locked --workspace --features lpm-cli/internal-test-sigstore-mock --no-run
+
+      - name: Workspace tests
+        run: scripts/ci/with-hermetic-workflow-cli.sh --prebuilt cargo nextest run --locked --workspace --features lpm-cli/internal-test-sigstore-mock --no-fail-fast --status-level slow --final-status-level fail

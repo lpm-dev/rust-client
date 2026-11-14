@@ -69,6 +69,17 @@ The **Windows clippy** CI job checks `x86_64-pc-windows-msvc`. Its lint results 
 
 List the exact commands and results in the pull request. The current [CI workflow](.github/workflows/ci.yml) is authoritative for additional platform, shell, npm, audit, and release checks.
 
+### Full CI
+
+The Windows filesystem gates and the macOS workspace tests, which run every workflow test, take most of a run's runner time. A pull request's CI leaves them to the [Full CI workflow](.github/workflows/full-ci.yml), which runs them once for a whole stack:
+
+- They run on the pull request no other branch builds on: a pull request on its own, or the top of a stack. That head holds every commit of the members below it.
+- When they pass, the workflow sets the `Full CI` status, which `main` requires, on that head and on each stack member the head contains. A member pushed on its own afterward loses the status until the top is rebased onto it and passes again.
+- A draft pull request doesn't run them, so a stack with a draft on top gets no status until the draft is marked ready.
+- To merge only the lower part of a stack, add the `full-ci` label to the highest pull request you are merging, so the tier runs on the tree that lands. `gh workflow run full-ci.yml --ref <branch>` does the same for any branch.
+
+Pushes to `main` still run both, with the rest of CI.
+
 ## Contracts and documentation
 
 - Public product language uses **env**. `vault` is reserved for internal crate and module names.
