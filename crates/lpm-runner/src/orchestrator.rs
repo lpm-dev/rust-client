@@ -2234,7 +2234,7 @@ enum ForceKill {
     /// pass says how.
     Stopped,
     /// Killed again what is left of a tree force-killed and waited for
-    /// before.
+    /// before, without waiting for it again.
     Again,
     /// Force-killed it, and said so: to be waited for.
     Now,
@@ -2416,7 +2416,9 @@ fn shutdown_children_ordered(
                         ended_by_lpm.insert(name.clone());
                     }
                     ended_by.get_or_insert_with(cleanup_deadline);
-                    if !kill_service_tree(child) {
+                    if child.tree_walked {
+                        kill_dying_service_tree(child);
+                    } else if !kill_service_tree(child) {
                         to_walk.push(child);
                     }
                 }
@@ -2481,8 +2483,9 @@ fn shutdown_children_ordered(
     }
 }
 
-/// Kills again what is left of a tree force-killed earlier, which may still
-/// be dying, without waiting for it a second time.
+/// Kills again what is left of a tree lpm ended earlier, by force-killing it
+/// or by walking it, which may still be dying, without waiting for it as the
+/// first end did or walking it a second time.
 fn kill_dying_service_tree(child: &mut ServiceProcess) {
     #[cfg(unix)]
     signal_service_process_group(child.id(), libc::SIGKILL);
@@ -2538,8 +2541,8 @@ enum FinalReport {
 }
 
 /// [`FinalReport`] for a service whose process and tree have `stopped` with
-/// that status, if so, that was `force_killed` earlier, or whose Job lpm
-/// `ended` while its own process still ran.
+/// that status, if so, that was `force_killed` earlier, or that lpm `ended`,
+/// by its Job or by walking its tree, while its own process still ran.
 fn final_report(
     stopped: Option<std::process::ExitStatus>,
     force_killed: bool,
@@ -3397,6 +3400,62 @@ mod tests {
             web_child.exits_within(Duration::from_secs(5)),
             "web's child outlived it"
         );
+        assert!(!children.lock()[0].1.tree_running(), "web still runs");
+        assert_eq!(reports, [reported("web", "stopped")]);
+    }
+
+    /// A service whose tree lpm walked, and whose own process still runs,
+    /// is force-killed without a second walk: said once, and waited for.
+    #[test]
+    fn a_walked_service_still_running_is_force_killed_without_walking_it_again() {
+        let project = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let mut service = running_service(project.path());
+        #[cfg(windows)]
+        let mut service = {
+            let mut command = Command::new("node");
+            command
+                .args(["-e", "setInterval(() => {}, 1000)"])
+                .current_dir(project.path())
+                .stdin(Stdio::null());
+            ServiceProcess::from(command.spawn().unwrap())
+        };
+        service.tree_walked = true;
+        let mut started = None;
+
+        let reports = service_reports(|| started = Some(start_force_kill("web", &mut service)));
+        wait_for_killed_service_tree(&mut service, cleanup_deadline());
+
+        assert!(
+            matches!(started, Some(ForceKill::Now)),
+            "the walked tree was not killed to be waited for"
+        );
+        assert!(!service.tree_running(), "web still runs");
+        assert_eq!(reports, [reported("web", "force-killed")]);
+    }
+
+    /// A service whose tree lpm already walked, as a second Ctrl+C or a
+    /// closing window walks it, isn't walked again when lpm stops it.
+    #[cfg(windows)]
+    #[test]
+    fn a_service_whose_tree_lpm_walked_is_not_walked_again_when_lpm_stops_it() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut web, web_child) = service_outside_a_job_with_a_child(project.path(), "web");
+        web.tree_walked = true;
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), web)]));
+
+        let reports = service_reports(|| {
+            shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || false);
+        });
+        let walked_again = web_child.exits_within(Duration::from_millis(500));
+        let child_pid = std::fs::read_to_string(project.path().join("web.pid")).unwrap();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", child_pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        assert!(!walked_again, "lpm walked the tree a second time");
         assert!(!children.lock()[0].1.tree_running(), "web still runs");
         assert_eq!(reports, [reported("web", "stopped")]);
     }

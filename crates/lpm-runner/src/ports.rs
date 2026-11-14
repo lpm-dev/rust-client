@@ -1355,11 +1355,14 @@ fn terminate_child_process_tree_windows(
     child: &mut Child,
 ) -> std::io::Result<std::process::ExitStatus> {
     let root_pid = child.id();
-    let root_identity = windows_root_process_identity_from_child(child).ok_or_else(|| {
-        std::io::Error::other(format!(
-            "could not capture the identity of child PID {root_pid} before process-tree cleanup"
-        ))
-    })?;
+    let Some(root_identity) = windows_root_process_identity_from_child(child) else {
+        // The root's own handle still ends it safely; only its descendants
+        // can't be told apart from processes that reused their IDs.
+        let _ = child.kill();
+        return Err(std::io::Error::other(format!(
+            "could not capture the identity of child PID {root_pid} before process-tree cleanup, so only it was ended"
+        )));
+    };
     let mut trusted = HashMap::from([(root_pid, root_identity)]);
     let mut trusted_parents = HashMap::new();
     let initial =
