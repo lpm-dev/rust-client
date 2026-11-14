@@ -2223,6 +2223,7 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
         locked
             .iter_mut()
             .map(|(name, child)| (name.as_str(), child)),
+        cleanup_deadline(),
     );
 }
 
@@ -2280,14 +2281,14 @@ fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
 }
 
 /// Force-kills the trees of `services`, as [`start_force_kill`] does, then
-/// waits for them together until one deadline, so that processes stuck
-/// exiting cost the shutdown that deadline once, however many there are.
-/// Each walk of a tree without a Job waits within a deadline of its own, so
-/// the walks run side by side.
+/// waits for them together until `deadline`, so that processes stuck exiting
+/// cost the shutdown that deadline once, however many there are. Each walk
+/// of a tree without a Job waits within a deadline of its own, so the walks
+/// run side by side.
 fn force_kill_and_report_all<'a>(
     services: impl Iterator<Item = (&'a str, &'a mut ServiceProcess)>,
+    deadline: Instant,
 ) {
-    let deadline = cleanup_deadline();
     let mut killed = Vec::new();
     let mut to_walk = Vec::new();
     for (name, child) in services {
@@ -2297,10 +2298,7 @@ fn force_kill_and_report_all<'a>(
             ForceKill::Stopped | ForceKill::Again => {}
         }
     }
-    std::thread::scope(|walks| {
-        for child in to_walk {
-            walks.spawn(move || walk_service_tree(child));
-        }
+    walk_service_trees_while(to_walk, || {
         for child in killed {
             wait_for_killed_service_tree(child, deadline);
         }
@@ -2322,7 +2320,9 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force
 /// Shutdown with optional reverse topological ordering.
 ///
 /// When `groups` is provided, services are stopped in reverse topological order
-/// (dependents first, then their dependencies). All groups share a 2s grace budget.
+/// (dependents first, then their dependencies). All groups share a 2s grace
+/// budget, except that on Windows what lpm ended by its Job in a group has
+/// until the cleanup deadline to be gone.
 /// When `groups` is None, all services are stopped simultaneously (legacy behavior).
 /// While `services_interrupted` holds, the console interrupt that began the
 /// shutdown has reached the services, which then only get the grace period to
@@ -2349,6 +2349,7 @@ fn shutdown_children_ordered(
             locked
                 .iter_mut()
                 .map(|(name, child)| (name.as_str(), child)),
+            cleanup_deadline(),
         );
     } else {
         ui_warn(&format!("Stopping {count} services..."));
@@ -2381,43 +2382,44 @@ fn shutdown_children_ordered(
         let mut jobs_gone_by = None;
         {
             let mut locked = children.lock();
-            for name in group {
-                if let Some((_, child)) = locked.iter_mut().find(|(n, _)| n == name) {
-                    // A service kept for the shutdown may have exited while
-                    // what it started still runs.
-                    if !child.tree_running() {
-                        continue;
+            #[cfg(windows)]
+            let mut to_walk = Vec::new();
+            for (name, child) in locked.iter_mut().filter(|(name, _)| group.contains(name)) {
+                // A service kept for the shutdown may have exited while what
+                // it started still runs.
+                if !child.tree_running() || interrupted {
+                    continue;
+                }
+                #[cfg(unix)]
+                {
+                    let pid = child.id();
+                    signal_service_process_group(pid, libc::SIGTERM);
+                    tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
+                }
+                // Windows can't send a Ctrl+C to one service, so a shutdown
+                // no interrupt reached them in, one lpm began itself or the
+                // window's closing, ends their Jobs, and walks the trees of
+                // those without one. This level's wait, further on, waits for
+                // the Jobs all at once.
+                #[cfg(windows)]
+                {
+                    if matches!(child.try_wait(), Ok(None)) {
+                        ended_by_lpm.insert(name.clone());
                     }
-                    if interrupted {
-                        continue;
-                    }
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        signal_service_process_group(pid, libc::SIGTERM);
-                        tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
-                    }
-                    // Windows can't send a Ctrl+C to one service, so a
-                    // shutdown no interrupt reached them in, one lpm began
-                    // itself or the window's closing, ends their Jobs. The
-                    // wait for the level below waits for them all at once.
-                    #[cfg(windows)]
-                    {
-                        if matches!(child.try_wait(), Ok(None)) {
-                            ended_by_lpm.insert(name.clone());
-                        }
-                        if !kill_service_tree(child) {
-                            let _ = child.kill();
-                        }
+                    if kill_service_tree(child) {
                         jobs_gone_by.get_or_insert_with(cleanup_deadline);
-                    }
-                    #[cfg(not(any(unix, windows)))]
-                    {
-                        let _ = child.kill();
-                        tracing::debug!("stopped service '{name}'");
+                    } else {
+                        to_walk.push(child);
                     }
                 }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = child.kill();
+                    tracing::debug!("stopped service '{name}'");
+                }
             }
+            #[cfg(windows)]
+            walk_service_trees_while(to_walk, || {});
         }
 
         let groups_remaining = u32::try_from(shutdown_order.len() - group_index).unwrap_or(1);
@@ -2445,12 +2447,18 @@ fn shutdown_children_ordered(
             std::thread::sleep(Duration::from_millis(25));
         }
 
+        // What lpm ended in this level has had until its deadline to go.
+        #[cfg(windows)]
+        let force_kill_deadline = jobs_gone_by.unwrap_or_else(cleanup_deadline);
+        #[cfg(not(windows))]
+        let force_kill_deadline = cleanup_deadline();
         let mut locked = children.lock();
         force_kill_and_report_all(
             locked
                 .iter_mut()
                 .filter(|(name, _)| group.contains(name))
                 .map(|(name, child)| (name.as_str(), child)),
+            force_kill_deadline,
         );
     }
 
@@ -2811,6 +2819,24 @@ fn kill_service_tree(child: &mut ServiceProcess) -> bool {
         }
         false
     }
+}
+
+/// Walks the trees of `services` side by side, as each walk waits within a
+/// deadline of its own, while `meanwhile` runs. A walk Windows can't start a
+/// thread for runs on this one.
+fn walk_service_trees_while(services: Vec<&mut ServiceProcess>, meanwhile: impl FnOnce()) {
+    let services: Vec<Mutex<&mut ServiceProcess>> = services.into_iter().map(Mutex::new).collect();
+    std::thread::scope(|walks| {
+        for service in &services {
+            if std::thread::Builder::new()
+                .spawn_scoped(walks, || walk_service_tree(&mut service.lock()))
+                .is_err()
+            {
+                walk_service_tree(&mut service.lock());
+            }
+        }
+        meanwhile();
+    });
 }
 
 /// Ends `child`'s tree by walking it, which ends what it can within a
@@ -3277,21 +3303,42 @@ mod tests {
         }
     }
 
-    /// Windows services without a Job, as where Windows refuses one, have
-    /// their trees walked, side by side, when force-killed.
+    /// A service outside a Job, as where Windows refuses one, that starts a
+    /// child, which it names in `<name>.pid` in `project`, then idles.
+    #[cfg(windows)]
+    fn service_outside_a_job_with_a_child(
+        project: &Path,
+        name: &str,
+    ) -> (ServiceProcess, WatchedProcess) {
+        let mut command = Command::new("node");
+        command
+            .args([
+                "-e",
+                &format!(
+                    "const child = require('child_process').spawn(process.execPath, \
+                     ['-e', 'setInterval(() => {{}}, 1000)'], {{ stdio: 'ignore' }}); \
+                     require('fs').writeFileSync('{name}.pid', String(child.pid)); \
+                     setInterval(() => {{}}, 1000);"
+                ),
+            ])
+            .current_dir(project)
+            .stdin(Stdio::null());
+        let service = ServiceProcess::from(command.spawn().unwrap());
+        let child = WatchedProcess::from_pid_file(&project.join(format!("{name}.pid")));
+        (service, child)
+    }
+
+    /// Windows services without a Job have their trees walked, side by
+    /// side, when force-killed.
     #[cfg(windows)]
     #[test]
     fn services_without_a_job_are_walked_when_force_killed() {
-        let outside_a_job = || {
-            let mut command = Command::new("node");
-            command
-                .args(["-e", "setInterval(() => {}, 1000)"])
-                .stdin(Stdio::null());
-            ServiceProcess::from(command.spawn().unwrap())
-        };
+        let project = tempfile::tempdir().unwrap();
+        let (api, api_child) = service_outside_a_job_with_a_child(project.path(), "api");
+        let (web, web_child) = service_outside_a_job_with_a_child(project.path(), "web");
         let children = Arc::new(Mutex::new(vec![
-            ("api".to_string(), outside_a_job()),
-            ("web".to_string(), outside_a_job()),
+            ("api".to_string(), api),
+            ("web".to_string(), web),
         ]));
 
         let reports = service_reports(|| force_kill_children(&children));
@@ -3303,9 +3350,34 @@ mod tests {
                 reported("web", "force-killed")
             ]
         );
-        for (name, child) in children.lock().iter_mut() {
-            assert!(!child.tree_running(), "{name} still runs");
-        }
+        assert!(
+            api_child.exits_within(Duration::from_secs(5)),
+            "api's child outlived it"
+        );
+        assert!(
+            web_child.exits_within(Duration::from_secs(5)),
+            "web's child outlived it"
+        );
+    }
+
+    /// A Windows service without a Job that lpm stops itself has its tree
+    /// walked too, not only its own process ended.
+    #[cfg(windows)]
+    #[test]
+    fn a_service_without_a_job_lpm_stops_itself_has_its_tree_walked() {
+        let project = tempfile::tempdir().unwrap();
+        let (web, web_child) = service_outside_a_job_with_a_child(project.path(), "web");
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), web)]));
+
+        let reports = service_reports(|| {
+            shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || false);
+        });
+
+        assert!(
+            web_child.exits_within(Duration::from_secs(5)),
+            "web's child outlived it"
+        );
+        assert_eq!(reports, [reported("web", "stopped")]);
     }
 
     /// A service that stopped by itself before the second Ctrl+C wasn't
