@@ -362,7 +362,8 @@ pub fn spawn_shell_with_endpoint(
 
 /// How lpm stops the dev server's processes, which tests replace.
 struct DevServerStopping<T> {
-    /// Ends the server's whole process tree.
+    /// Ends the server's whole process tree by walking it: on Windows, only
+    /// for a server outside a Job, or one whose Job couldn't be ended.
     terminate: T,
     /// Whether the console interrupt that began the stop reached the
     /// server's processes, which then get a grace period to stop themselves,
@@ -519,14 +520,25 @@ where
             // The Job holds the server's whole tree, so ending it needs no
             // walk of the tree, which fails once it meets a process it can't
             // verify, as on a runner without a console.
+            // A Job that couldn't be ended, or whose processes outlived its
+            // deadline, leaves the walk to try.
             #[cfg(windows)]
             if let Some(job) = &job {
-                if let Err(error) = job.end(SERVICE_TREE_EXIT_TIMEOUT) {
-                    tracing::warn!("could not end the processes the dev server started: {error}");
+                match job.end(SERVICE_TREE_EXIT_TIMEOUT) {
+                    Ok(true) => {
+                        break child.wait().map_err(|error| {
+                            LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
+                        });
+                    }
+                    Ok(false) => {
+                        tracing::warn!("processes the dev server started are still exiting");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "could not end the processes the dev server started: {error}"
+                        );
+                    }
                 }
-                break child.wait().map_err(|error| {
-                    LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
-                });
             }
             break (stopping.terminate)(&mut child).map_err(|error| {
                 LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))

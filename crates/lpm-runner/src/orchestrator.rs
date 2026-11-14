@@ -1139,7 +1139,11 @@ fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
         let _ = child.wait();
         return Err(error);
     }
-    Ok(ServiceProcess { child, job })
+    Ok(ServiceProcess {
+        child,
+        job,
+        reported_force_killed: false,
+    })
 }
 
 fn service_command_port_planners(
@@ -2196,7 +2200,17 @@ fn ctrlc_handler(
 fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
-        force_kill_service_tree(child);
+        force_kill_and_report(name, child);
+    }
+}
+
+/// Force-kills `child`'s tree, saying so the first time only: a second
+/// Ctrl+C, a level's deadline and the shutdown's last pass can each reach
+/// the same service.
+fn force_kill_and_report(name: &str, child: &mut ServiceProcess) {
+    force_kill_service_tree(child);
+    if !child.reported_force_killed {
+        child.reported_force_killed = true;
         ui_service_status(RESET, name, RED, "✗", "force-killed");
     }
 }
@@ -2240,8 +2254,7 @@ fn shutdown_children_ordered(
         terminal_eprintln!();
         ui_warn(&format!("Force-killing {count} services..."));
         for (name, child) in locked.iter_mut() {
-            force_kill_service_tree(child);
-            ui_service_status(RESET, name, RED, "✗", "force-killed");
+            force_kill_and_report(name, child);
         }
         return;
     }
@@ -2259,10 +2272,9 @@ fn shutdown_children_ordered(
     };
 
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    // Each service is reported once: one force-killed at a level's deadline
-    // isn't reported again as stopped, and one whose Job lpm ended has no
-    // exit code of its own to report.
-    let mut force_killed = std::collections::HashSet::new();
+    // Each service is reported once: one force-killed isn't reported again
+    // as stopped, and one whose Job lpm ended while it ran has no exit code
+    // of its own to report.
     #[cfg(windows)]
     let mut ended_by_lpm = std::collections::HashSet::new();
     for (group_index, group) in shutdown_order.iter().enumerate() {
@@ -2290,10 +2302,12 @@ fn shutdown_children_ordered(
                     // itself or the window's closing, ends their Jobs.
                     #[cfg(windows)]
                     {
+                        if matches!(child.try_wait(), Ok(None)) {
+                            ended_by_lpm.insert(name.clone());
+                        }
                         if !child.end_job() {
                             let _ = child.kill();
                         }
-                        ended_by_lpm.insert(name.clone());
                     }
                     #[cfg(not(any(unix, windows)))]
                     {
@@ -2335,9 +2349,7 @@ fn shutdown_children_ordered(
             };
             if child.tree_running() {
                 tracing::debug!("force-killing service '{name}' before the next dependency level");
-                force_kill_service_tree(child);
-                ui_service_status(RESET, name, RED, "✗", "force-killed");
-                force_killed.insert(name.clone());
+                force_kill_and_report(name, child);
             }
         }
     }
@@ -2351,15 +2363,14 @@ fn shutdown_children_ordered(
         let ended = ended_by_lpm.contains(name);
         #[cfg(not(windows))]
         let ended = false;
-        match final_report(stopped, force_killed.contains(name), ended) {
-            // A tree force-killed at its deadline may still be dying.
+        match final_report(stopped, child.reported_force_killed, ended) {
+            // A tree force-killed earlier may still be dying.
             FinalReport::AlreadyReported if stopped.is_none() => force_kill_service_tree(child),
             FinalReport::AlreadyReported => {}
             FinalReport::Stopped(note) => ui_service_note(RESET, name, &note),
             FinalReport::StillRunning => {
                 tracing::debug!("force-killing service '{name}'");
-                force_kill_service_tree(child);
-                ui_service_status(RESET, name, RED, "✗", "force-killed");
+                force_kill_and_report(name, child);
             }
         }
     }
@@ -2368,8 +2379,8 @@ fn shutdown_children_ordered(
 /// What the shutdown's last pass says of a service.
 #[derive(Debug, PartialEq, Eq)]
 enum FinalReport {
-    /// Force-killed at its level's deadline, and said so then, whether or
-    /// not its tree has finished dying.
+    /// Force-killed earlier, by a second Ctrl+C or at its level's deadline,
+    /// and said so then, whether or not its tree has finished dying.
     AlreadyReported,
     Stopped(String),
     /// Still running, or not yet reaped: force-killed now.
@@ -2377,8 +2388,8 @@ enum FinalReport {
 }
 
 /// [`FinalReport`] for a service whose process and tree have `stopped` with
-/// that status, if so, that was `force_killed` at its level's deadline, or
-/// whose Job lpm `ended` without a console interrupt.
+/// that status, if so, that was `force_killed` earlier, or whose Job lpm
+/// `ended` while its own process still ran.
 fn final_report(
     stopped: Option<std::process::ExitStatus>,
     force_killed: bool,
@@ -2446,6 +2457,8 @@ pub(crate) struct ServiceProcess {
     child: Child,
     #[cfg(windows)]
     job: Option<lpm_common::process_job::ProcessJob>,
+    /// Whether the shutdown has said this service was force-killed.
+    reported_force_killed: bool,
 }
 
 impl From<Child> for ServiceProcess {
@@ -2454,6 +2467,7 @@ impl From<Child> for ServiceProcess {
             child,
             #[cfg(windows)]
             job: None,
+            reported_force_killed: false,
         }
     }
 }
