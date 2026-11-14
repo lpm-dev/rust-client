@@ -2092,7 +2092,8 @@ fn drain_service_output<R: std::io::Read>(mut stream: R, mut on_line: impl FnMut
     }
 }
 
-/// RAII guard that kills child processes on drop (panic safety).
+/// RAII guard that stops the services on drop, as on a panic, and lets go
+/// of them.
 struct ChildrenGuard {
     children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     on_shutdown_started: Option<crate::ShutdownStartedCallback>,
@@ -2116,9 +2117,15 @@ impl ChildrenGuard {
     ) -> Result<(), LpmError> {
         let shutdown_started = self.begin_shutdown();
         shutdown_children_ordered(&self.children, force, Some(groups), services_interrupted);
+        self.let_go();
+        shutdown_started
+    }
+
+    /// Drops the stopped services, outside the lock, though something else,
+    /// such as a readiness thread, may still hold the list.
+    fn let_go(&self) {
         let stopped = std::mem::take(&mut *self.children.lock());
         drop(stopped);
-        shutdown_started
     }
 }
 
@@ -2128,6 +2135,7 @@ impl Drop for ChildrenGuard {
             tracing::error!(%error, "shutdown boundary failed during child cleanup");
         }
         shutdown_children(&self.children, false);
+        self.let_go();
     }
 }
 
@@ -3597,6 +3605,28 @@ mod tests {
             Arc::strong_count(&children),
             1,
             "the services' list outlives lpm dev"
+        );
+    }
+
+    /// A panic in `lpm dev` stops its services as the guard drops, and lets
+    /// go of them too, though a readiness thread may still hold the list.
+    #[test]
+    fn the_services_a_panic_stopped_are_let_go_of() {
+        let project = tempfile::tempdir().unwrap();
+        let children = Arc::new(Mutex::new(vec![(
+            "web".to_string(),
+            running_service(project.path()),
+        )]));
+        let readiness_children = Arc::clone(&children);
+
+        drop(ChildrenGuard {
+            children: Arc::clone(&children),
+            on_shutdown_started: None,
+        });
+
+        assert!(
+            readiness_children.lock().is_empty(),
+            "the services were kept"
         );
     }
 
