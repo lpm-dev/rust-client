@@ -206,27 +206,28 @@ mod windows {
 
     impl Drop for MappedHold {
         fn drop(&mut self) {
-            let last = {
-                let mut mapped = MAPPED
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(drives) = mapped.as_mut() else {
-                    return;
-                };
-                match drives.get_mut(&self.share_key) {
-                    Some(drive) if drive.generation == self.generation => {
-                        drive.users -= 1;
-                        if drive.users == 0 {
-                            drives.remove(&self.share_key)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
+            // Under the lock, so that no other thread borrows the letter
+            // between the entry's removal and the letter's, which would leave
+            // it mapped with nothing tracking it.
+            let mut mapped = MAPPED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(drives) = mapped.as_mut() else {
+                return;
             };
-            // Outside the lock: the calls go over the network. Someone may
-            // have removed the letter, or mapped it to something else, since.
+            let last = match drives.get_mut(&self.share_key) {
+                Some(drive) if drive.generation == self.generation => {
+                    drive.users -= 1;
+                    if drive.users == 0 {
+                        drives.remove(&self.share_key)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            // Someone may have removed the letter, or mapped it to something
+            // else, since.
             if let Some(drive) = last
                 && matches!(connection_of(drive.letter), Connection::Remote(remote) if remote.eq_ignore_ascii_case(&drive.share))
             {
@@ -273,17 +274,41 @@ mod windows {
                     },
                 ));
             }
+            // A folder a letter already reaches but can't open, missing or
+            // closed to the user, won't open through another letter either.
+            Err(Some((letter, error)))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{} can't be opened through the drive {}: mapped to it: {error}",
+                        on_share(folder).display(),
+                        char::from(letter)
+                    ),
+                ));
+            }
             Err(unusable) => unusable,
         };
-        let letter = map_free_letter(&folder.share).map_err(|error| match unusable {
-            Some((letter, open_error)) => io::Error::new(
+        let letter = map_free_letter(&folder.share).map_err(|error| {
+            let reason = match unusable {
+                Some((letter, open_error)) => format!(
+                    "the drive {}: mapped to it couldn't open {} ({open_error}), and {error}",
+                    char::from(letter),
+                    on_share(folder).display()
+                ),
+                None => error.to_string(),
+            };
+            io::Error::new(
                 error.kind(),
                 format!(
-                    "{error}; the drive {}: already mapped there couldn't be used: {open_error}",
-                    char::from(letter)
+                    "cmd.exe can't run scripts in a network folder, so LPM reaches {} through a drive letter, but {reason}",
+                    folder.share.to_string_lossy()
                 ),
-            ),
-            None => error,
+            )
         })?;
         say_mapped(&folder.share, letter);
         let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -450,7 +475,7 @@ mod windows {
     }
 
     /// Maps the first free drive letter from `Z:` down to `share`, for this
-    /// sign-in only.
+    /// sign-in only. Its errors say what failed, for a message about `share`.
     fn map_free_letter(share: &OsStr) -> io::Result<u8> {
         let used = unsafe {
             // SAFETY: takes no arguments.
@@ -482,21 +507,17 @@ mod windows {
                 NO_ERROR => return Ok(letter),
                 ERROR_ALREADY_ASSIGNED | ERROR_DEVICE_ALREADY_REMEMBERED => {}
                 error => {
+                    let error = io::Error::from_raw_os_error(error as i32);
                     return Err(io::Error::new(
-                        io::Error::from_raw_os_error(error as i32).kind(),
-                        format!(
-                            "cmd.exe can't run scripts in a network folder, and LPM could not map {} to a drive letter: {}",
-                            share.to_string_lossy(),
-                            io::Error::from_raw_os_error(error as i32)
-                        ),
+                        error.kind(),
+                        format!("mapping it to {}: failed: {error}", char::from(letter)),
                     ));
                 }
             }
         }
-        Err(io::Error::other(format!(
-            "cmd.exe can't run scripts in a network folder, and no drive letter is free to reach {} by: free one, or map one to the share yourself",
-            share.to_string_lossy()
-        )))
+        Err(io::Error::other(
+            "no drive letter is free: free one, or map one to the share yourself",
+        ))
     }
 
     /// Removes the drive `letter` LPM mapped, unless something still has a
@@ -532,6 +553,15 @@ mod windows {
             "left the drive {}: LPM mapped for scripts, which something still uses",
             char::from(letter)
         );
+    }
+
+    /// `folder` as a network path, as in `\\server\share\app`.
+    fn on_share(folder: &NetworkFolder) -> PathBuf {
+        let mut path = PathBuf::from(&folder.share);
+        for name in &folder.below {
+            path.push(name);
+        }
+        path
     }
 
     fn on_drive(letter: u8, below: &[OsString]) -> PathBuf {
@@ -624,14 +654,13 @@ mod windows {
         /// the registry of the letters this process mapped.
         static LIVE_DRIVES: Mutex<()> = Mutex::new(());
 
-        /// A letter a test mapped as someone else, removed when dropped.
-        struct TheirLetter(u8);
+        /// A letter a test mapped, removed when dropped unless something
+        /// still uses it.
+        struct TestLetter(u8);
 
-        impl Drop for TheirLetter {
+        impl Drop for TestLetter {
             fn drop(&mut self) {
-                let local = [u16::from(self.0), u16::from(b':'), 0];
-                // SAFETY: `local` is NUL-terminated.
-                unsafe { WNetCancelConnection2W(local.as_ptr(), 0, 1) };
+                try_removing(self.0);
             }
         }
 
@@ -652,21 +681,30 @@ mod windows {
             letter
         }
 
+        fn lpm_mapped(directory: &super::super::ScriptDirectory) -> bool {
+            matches!(directory._drive, Some(DriveHold::Mapped { .. }))
+        }
+
+        /// The life of a letter LPM maps, in one test that reaches the
+        /// share as `\\127.0.0.1\<drive>$`, which no other test maps or
+        /// borrows, so no other process can hold its letters.
         #[test]
-        fn a_network_folder_is_reached_through_a_drive_mapped_while_it_is_used() {
+        fn a_drive_lpm_maps_lasts_as_long_as_anything_uses_it() {
             let _one_at_a_time = LIVE_DRIVES
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let local = tempfile::tempdir().unwrap();
             let project = local.path().join("app");
             std::fs::create_dir(&project).unwrap();
-            let Some(network) = crate::test_network_path::through_network(&project) else {
+            let Some(network) = crate::test_network_path::through_network_as(&project, "127.0.0.1")
+            else {
                 return;
             };
 
+            // Two users share one letter, and it goes with the last.
             let first = super::super::ScriptDirectory::for_shell(&network).unwrap();
             let second = super::super::ScriptDirectory::for_shell(&network).unwrap();
-
+            assert!(lpm_mapped(&first), "{:?} was mapped already", first.path());
             assert_eq!(first.path(), second.path());
             assert!(network_folder(first.path()).is_none(), "{:?}", first.path());
             std::fs::write(first.path().join("written"), b"through the drive").unwrap();
@@ -675,89 +713,43 @@ mod windows {
                 b"through the drive"
             );
             let letter = letter_of(first.path());
-            let mapped_by_lpm = matches!(first._drive, Some(DriveHold::Mapped { .. }));
             drop(first);
             assert!(
                 mapped_remote(letter).is_some(),
                 "the drive went while in use"
             );
             drop(second);
-            if mapped_by_lpm {
-                // Another process may have reused the letter since, and keep
-                // it; only a letter nothing uses must be gone.
-                let removed_after = try_removing(letter);
-                assert!(
-                    matches!(
-                        removed_after,
-                        ERROR_NOT_CONNECTED
-                            | ERROR_BAD_DEVICE
-                            | ERROR_OPEN_FILES
-                            | ERROR_DEVICE_IN_USE
-                    ),
-                    "LPM left the drive mapped though nothing used it: {removed_after}"
-                );
-            }
-        }
+            assert_eq!(mapped_remote(letter), None, "the drive outlived its use");
 
-        #[test]
-        fn a_drive_lpm_mapped_stays_while_anything_still_has_a_file_open_through_it() {
-            let _one_at_a_time = LIVE_DRIVES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let local = tempfile::tempdir().unwrap();
-            let project = local.path().join("app");
-            std::fs::create_dir(&project).unwrap();
-            std::fs::write(project.join("open"), b"held").unwrap();
-            let Some(network) = crate::test_network_path::through_network(&project) else {
-                return;
-            };
+            // A file still open through the letter, as another process's
+            // script would have one, keeps it.
             let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            if !matches!(reached._drive, Some(DriveHold::Mapped { .. })) {
-                eprintln!("skipped: another process had the share mapped already");
-                return;
-            }
-            let letter = TheirLetter(letter_of(reached.path()));
-
-            // As another process's script would, through the same letter.
-            let held_open = std::fs::File::open(reached.path().join("open")).unwrap();
+            let letter = TestLetter(letter_of(reached.path()));
+            let held_open = std::fs::File::open(reached.path().join("written")).unwrap();
             drop(reached);
             let while_open = mapped_remote(letter.0);
             drop(held_open);
-
+            drop(letter);
             assert!(
                 while_open.is_some(),
                 "LPM removed a drive something still had a file open through"
             );
-        }
 
-        #[test]
-        fn a_drive_removed_while_lpm_held_it_is_mapped_again() {
-            let _one_at_a_time = LIVE_DRIVES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let local = tempfile::tempdir().unwrap();
-            let project = local.path().join("app");
-            std::fs::create_dir(&project).unwrap();
-            let Some(network) = crate::test_network_path::through_network(&project) else {
-                return;
-            };
-            let first = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            if !matches!(first._drive, Some(DriveHold::Mapped { .. })) {
-                eprintln!("skipped: another process had the share mapped already");
-                return;
-            }
-            // As `net use Z: /delete` would.
-            drop(TheirLetter(letter_of(first.path())));
-
+            // A letter removed while held, as `net use /delete` would, is
+            // mapped again. The earlier holder counts nothing against the new
+            // mapping, which goes with its own last user.
+            let earlier = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            assert_eq!(try_removing(letter_of(earlier.path())), NO_ERROR);
             let again = super::super::ScriptDirectory::for_shell(&network).unwrap();
-            let _cleanup = TheirLetter(letter_of(again.path()));
+            let again_letter = TestLetter(letter_of(again.path()));
             std::fs::write(again.path().join("written"), b"again").unwrap();
-            drop(first);
-
             assert_eq!(std::fs::read(project.join("written")).unwrap(), b"again");
-            assert!(
-                mapped_remote(letter_of(again.path())).is_some(),
-                "the earlier mapping's holder removed the new one"
+            drop(again);
+            let after_its_user = mapped_remote(again_letter.0);
+            drop(earlier);
+            assert_eq!(
+                after_its_user, None,
+                "the earlier holder kept the new mapping alive"
             );
         }
 
@@ -775,7 +767,7 @@ mod windows {
             // Another process's mapping, as the user's or another LPM's, of
             // a folder no other test maps.
             let theirs =
-                TheirLetter(map_free_letter(network.parent().unwrap().as_os_str()).unwrap());
+                TestLetter(map_free_letter(network.parent().unwrap().as_os_str()).unwrap());
             let theirs_letter = theirs.0;
 
             let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();

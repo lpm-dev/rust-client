@@ -7,6 +7,9 @@
 # because `security add-generic-password` delete+add is not atomic.
 # Run these tests serially to avoid the race.
 keychain-serial = { max-threads = 1 }
+# Tests that map Windows drive letters share the sign-in's letters, which
+# one process's lock can't guard from another's.
+windows-drive-letters = { max-threads = 1 }
 verdaccio = { max-threads = 4 }
 self-update-processes = { max-threads = 4 }
 
@@ -24,3 +27,7 @@ test-group = "verdaccio"
 [[profile.default.overrides]]
 filter = "package(lpm-workflows) & binary_id(/self_update/)"
 test-group = "self-update-processes"
+
+[[profile.default.overrides]]
+filter = "(package(lpm-common) & test(/^script_directory::windows::tests::a_drive/)) | (package(lpm-runner) & test(=shell::tests::a_script_in_a_network_folder_runs_there_instead_of_the_windows_directory))"
+test-group = "windows-drive-letters"

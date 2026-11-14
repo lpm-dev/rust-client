@@ -18,6 +18,19 @@ use std::path::{Component, Path, PathBuf, Prefix};
 /// `LPM_TEST_REQUIRE_ADMIN_SHARES` set, when the share can't be reached.
 #[must_use]
 pub fn through_network(local: &Path) -> Option<PathBuf> {
+    through_network_as(local, "localhost")
+}
+
+/// [`through_network`] with `server` naming this machine, as `127.0.0.1`
+/// or its computer name does, so that a test's network folder is on a share
+/// no other test reaches: Windows tells shares apart by the name they are
+/// reached by.
+///
+/// # Panics
+///
+/// As [`through_network`].
+#[must_use]
+pub fn through_network_as(local: &Path, server: &str) -> Option<PathBuf> {
     let mut components = local.components();
     let letter = match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
@@ -26,7 +39,7 @@ pub fn through_network(local: &Path) -> Option<PathBuf> {
         },
         _ => panic!("{} is not on a drive with a letter", local.display()),
     };
-    let mut network = PathBuf::from(format!(r"\\localhost\{letter}$\"));
+    let mut network = PathBuf::from(format!(r"\\{server}\{letter}$\"));
     if let Err(error) = std::fs::metadata(&network) {
         assert!(
             std::env::var_os("LPM_TEST_REQUIRE_ADMIN_SHARES").is_none(),
