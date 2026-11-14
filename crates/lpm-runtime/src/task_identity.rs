@@ -114,6 +114,8 @@ impl TaskRuntimeVersions {
                 command.current_dir(cwd).env("PATH", path);
                 lpm_common::child_env::strip_inherited_env_hooks(&mut command);
                 command.envs(variables.iter().map(|(name, value)| (name, value)));
+                let _directory =
+                    lpm_common::script_directory::ScriptDirectory::reach_for(&mut command).ok()?;
                 let output = lpm_common::process_output::output_capped(
                     &mut command,
                     std::time::Duration::from_secs(2),

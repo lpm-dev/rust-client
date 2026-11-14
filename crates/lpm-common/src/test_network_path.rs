@@ -8,14 +8,14 @@ use std::path::{Component, Path, PathBuf, Prefix};
 /// which Windows handles as it handles any network folder.
 ///
 /// `None` when the share can't be reached, as without administrator rights,
-/// after saying so on stderr. CI runs Windows tests as an administrator, so
-/// there it panics instead, and a test that needs the share never passes
-/// without running.
+/// after saying so on stderr. Where `LPM_TEST_REQUIRE_ADMIN_SHARES` is set,
+/// as CI's Windows filesystem gate sets it, it panics instead, so a test that
+/// needs the share never passes there without running.
 ///
 /// # Panics
 ///
-/// When `local` isn't on a drive with a letter, or holds `..`; and under CI
-/// when the share can't be reached.
+/// When `local` isn't on a drive with a letter, or holds `..`; and with
+/// `LPM_TEST_REQUIRE_ADMIN_SHARES` set, when the share can't be reached.
 #[must_use]
 pub fn through_network(local: &Path) -> Option<PathBuf> {
     let mut components = local.components();
@@ -29,8 +29,8 @@ pub fn through_network(local: &Path) -> Option<PathBuf> {
     let mut network = PathBuf::from(format!(r"\\localhost\{letter}$\"));
     if let Err(error) = std::fs::metadata(&network) {
         assert!(
-            std::env::var_os("CI").is_none(),
-            "CI runs Windows tests as an administrator, but {} can't be reached: {error}",
+            std::env::var_os("LPM_TEST_REQUIRE_ADMIN_SHARES").is_none(),
+            "LPM_TEST_REQUIRE_ADMIN_SHARES is set, but {} can't be reached: {error}",
             network.display()
         );
         eprintln!(

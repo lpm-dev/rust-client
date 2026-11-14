@@ -1427,6 +1427,17 @@ pub fn run_services_with_config(
     }
 
     let service_cwds = service_working_directories(project_dir, active_services.as_ref())?;
+    // A service in a network folder runs through a drive letter. Holding it
+    // for the whole session keeps a restart from removing and mapping it
+    // again, and a missing letter fails before any service starts.
+    #[cfg(windows)]
+    let _service_drives = service_cwds
+        .values()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|cwd| lpm_common::script_directory::ScriptDirectory::for_shell(cwd))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| LpmError::Script(error.to_string()))?;
 
     // Topological sort
     let groups = service_graph::topological_sort(&active_services).map_err(LpmError::Script)?;

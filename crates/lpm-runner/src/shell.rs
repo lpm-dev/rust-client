@@ -991,42 +991,15 @@ pub fn spawn_shell_prefixed(
     })
 }
 
-/// Moves `command` to its directory as Windows can start it there. cmd.exe,
-/// which also runs every batch file, can't start in a network folder: it
-/// warns and runs in the Windows directory instead. Such a command starts in
-/// the same folder through a drive letter, which what this returns keeps
-/// mapped. Call it just before the spawn, and keep what it returns until the
-/// process has exited.
+/// [`ScriptDirectory::reach_for`](lpm_common::script_directory::ScriptDirectory::reach_for):
+/// on Windows, a command that runs in cmd.exe starts in a network folder
+/// through a drive letter, which what this returns keeps until the process
+/// has exited.
 pub fn reach_directory_through_drive(
     command: &mut Command,
 ) -> Result<Option<lpm_common::script_directory::ScriptDirectory>, LpmError> {
-    #[cfg(windows)]
-    {
-        let program = Path::new(command.get_program());
-        let runs_in_cmd = program.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-        }) || program
-            .file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"));
-        if !runs_in_cmd {
-            return Ok(None);
-        }
-        let directory = match command.get_current_dir() {
-            Some(directory) => directory.to_path_buf(),
-            None => std::env::current_dir()?,
-        };
-        let reached = lpm_common::script_directory::ScriptDirectory::for_shell(&directory)
-            .map_err(|error| LpmError::Script(error.to_string()))?;
-        if reached.path() != directory {
-            command.current_dir(reached.path());
-        }
-        Ok(Some(reached))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = command;
-        Ok(None)
-    }
+    lpm_common::script_directory::ScriptDirectory::reach_for(command)
+        .map_err(|error| LpmError::Script(error.to_string()))
 }
 
 #[cfg(not(windows))]
