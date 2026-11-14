@@ -2804,27 +2804,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("test.lock");
 
-        let lock_path_inner = lock_path.clone();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
         let body = async move {
-            // Sleep across an await to confirm the lock is held the
-            // whole time (not just at acquire).
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            // The lock_path used by the helper is `lock_path` (cloned
-            // into the spawn_blocking closure) — at this point the
-            // exclusive try below must observe the lock held.
-            let _ = lock_path_inner;
+            entered.send(()).unwrap();
+            // Suspends inside the body, so the lock must be held across an
+            // await, not just when it was taken.
+            released.await.unwrap();
             Ok::<_, LpmError>(())
         };
 
         let lock_path_for_async = lock_path.clone();
         let async_handle =
             tokio::spawn(async move { with_shared_lock_async(lock_path_for_async, body).await });
+        entered_rx.await.unwrap();
 
-        // Give the async task a moment to acquire.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // While the async body is sleeping inside the lock, an
-        // exclusive try-acquire from a sync context should fail.
         let lock_path_check = lock_path.clone();
         let attempt = tokio::task::spawn_blocking(move || {
             try_with_exclusive_lock(&lock_path_check, || Ok::<_, LpmError>(()))
@@ -2837,6 +2831,7 @@ mod tests {
             "exclusive must be blocked while async shared lock is held across await",
         );
 
+        release.send(()).unwrap();
         async_handle.await.unwrap().unwrap();
 
         // After the async body completes, exclusive can acquire again.

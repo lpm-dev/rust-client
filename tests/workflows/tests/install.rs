@@ -5237,14 +5237,11 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
         json["up_to_date"], true,
         "a warm install with a direct bin dep must fast-exit; got {json:#}"
     );
+    let shim = project_bin_path(&project, "tool");
     assert!(
-        project
-            .path()
-            .join("node_modules")
-            .join(".bin")
-            .join("tool")
-            .exists(),
-        "tool's bin shim must exist after a plain install"
+        shim.exists(),
+        "tool's bin shim must exist after a plain install: {}",
+        shim.display()
     );
 }
 

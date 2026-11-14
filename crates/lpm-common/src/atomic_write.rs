@@ -638,6 +638,7 @@ fn rename_capability_handle(
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+    let destination_name = destination;
     let destination = destination.encode_wide().collect::<Vec<_>>();
     let file_name_bytes = destination
         .len()
@@ -720,7 +721,14 @@ fn rename_capability_handle(
             RtlNtStatusToDosError(status)
         };
         let error = io::Error::from_raw_os_error(code as i32);
-        if !matches!(code, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED) || delay_ms == 4_050 {
+        if !matches!(code, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
+            || delay_ms == 4_050
+            // A directory never gives way; see `is_directory_entry`.
+            || (code == ERROR_ACCESS_DENIED
+                && directory
+                    .symlink_metadata(Path::new(destination_name))
+                    .is_ok_and(|metadata| metadata.is_dir()))
+        {
             return Err(error);
         }
     }
@@ -1058,6 +1066,7 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
         Ok(path.as_os_str().encode_wide().chain(Some(0)).collect())
     }
 
+    let destination = to;
     let from = wide(from)?;
     let to = wide(to)?;
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
@@ -1077,11 +1086,25 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
             raw,
             Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
         ) || delay_ms == 4_050
+            || (raw == Some(ERROR_ACCESS_DENIED) && is_directory_entry(destination))
         {
             return Err(error);
         }
     }
     Err(io::Error::other("atomic replacement retry loop exhausted"))
+}
+
+/// Whether `path` is a directory, or a link to one, which a renamed file can
+/// never replace: Windows reports that as ACCESS_DENIED, as it does a file a
+/// scanner holds for a moment, so the retries against the latter would only
+/// delay the error.
+#[cfg(windows)]
+fn is_directory_entry(path: &Path) -> bool {
+    use std::os::windows::fs::FileTypeExt as _;
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_dir() || file_type.is_symlink_dir()
+    })
 }
 
 /// A file's device and number, which no other file shares while it
@@ -1443,6 +1466,48 @@ mod tests {
             fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o751
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_in_the_way_fails_the_write_without_the_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("proxy.json");
+        fs::create_dir(&destination).unwrap();
+        let started = std::time::Instant::now();
+
+        let error = write_file_atomic(&destination, b"state").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the write retried a directory for {:?}",
+            started.elapsed()
+        );
+        assert!(destination.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_in_the_way_fails_a_write_through_a_directory_handle_without_the_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("cert.pem")).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        let started = std::time::Instant::now();
+
+        let error = write_file_atomic_in_dir_with(&directory, "cert.pem".as_ref(), |file| {
+            file.write_all(b"certificate")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the write retried a directory for {:?}",
+            started.elapsed()
+        );
+        assert!(dir.path().join("cert.pem").is_dir());
     }
 
     #[cfg(windows)]

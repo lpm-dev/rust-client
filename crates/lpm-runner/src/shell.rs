@@ -990,7 +990,10 @@ mod tests {
 
         // The shell can see the injected env var
         let status = spawn_shell(&ShellCommand {
-            command: "test \"$LPM_TEST_VAR\" = \"injected_value\"",
+            command: &crate::test_support::script_expecting_env(&[(
+                "LPM_TEST_VAR",
+                "injected_value",
+            )]),
             cwd: dir.path(),
             path: &path,
             envs: &envs,
@@ -1204,7 +1207,11 @@ mod tests {
         envs.insert("LPM_C".into(), "gamma".into());
 
         let status = spawn_shell(&ShellCommand {
-            command: r#"test "$LPM_A" = "alpha" && test "$LPM_B" = "beta" && test "$LPM_C" = "gamma""#,
+            command: &crate::test_support::script_expecting_env(&[
+                ("LPM_A", "alpha"),
+                ("LPM_B", "beta"),
+                ("LPM_C", "gamma"),
+            ]),
             cwd: dir.path(),
             path: &path,
             envs: &envs,
@@ -1341,6 +1348,9 @@ mod tests {
         assert!(endpoint.is_err(), "{endpoint:?}");
     }
 
+    // Windows has no process group to clean up: a background child there
+    // keeps the endpoint pipes open until it exits.
+    #[cfg(unix)]
     #[test]
     fn endpoint_aware_shell_cleans_background_pipe_holders_after_the_shell_exits() {
         let dir = tempfile::tempdir().unwrap();

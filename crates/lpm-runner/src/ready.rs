@@ -405,6 +405,20 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    /// Reads the client's request head before a test server answers. Windows
+    /// closes a socket that still holds unread data with a reset, which can
+    /// discard the answer before the client reads it.
+    fn read_request_head(stream: &mut TcpStream) {
+        let mut head = Vec::with_capacity(256);
+        let mut chunk = [0; 256];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
+
     #[test]
     fn wait_for_port_rejects_a_timeout_that_cannot_fit_in_an_instant() {
         let (result_tx, result_rx) = mpsc::channel();
@@ -637,6 +651,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            read_request_head(&mut stream);
             stream.write_all(b"HTTP/1.0 204 No Content\r\n").unwrap();
             let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
@@ -661,6 +676,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            read_request_head(&mut stream);
             stream.write_all(b"HTTP/1.0 200 OK\r\n").unwrap();
         });
 
@@ -750,6 +766,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            read_request_head(&mut stream);
             stream.write_all(b"NOT-HTTP 200 OK\r\n").unwrap();
         });
 
