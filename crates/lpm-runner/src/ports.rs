@@ -287,10 +287,24 @@ pub(crate) fn loopback_port_available(port: u16) -> bool {
 /// the wildcard address of that port, so the loopback probes miss the common
 /// `listen(port)` server. Linux refuses that bind, so its loopback probes
 /// already see wildcard listeners.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn no_wildcard_listener(port: u16) -> bool {
     bind_probe_available(Ipv4Addr::UNSPECIFIED.into(), port)
         && bind_probe_available(Ipv6Addr::UNSPECIFIED.into(), port)
+}
+
+/// Windows lets a socket bind each of these addresses, `[::]` included,
+/// while a dual-stack socket listens on `[::]` of the port, as node's
+/// `listen(port)` does, so only the system's table of listeners shows that
+/// server.
+#[cfg(windows)]
+fn no_wildcard_listener(port: u16) -> bool {
+    bind_probe_available(Ipv4Addr::UNSPECIFIED.into(), port)
+        && bind_probe_available(Ipv6Addr::UNSPECIFIED.into(), port)
+        && !windows_tcp4_listeners()
+            .into_iter()
+            .chain(windows_tcp6_listeners())
+            .any(|listener| listener.port == port && listener.serves_loopback())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1115,7 +1129,10 @@ fn stop_child_process_tree_within(
         }
     }
     let _ = child.kill();
-    child.wait()?;
+    wait_for_ended_child(
+        child,
+        std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT,
+    )?;
     if failures == 0 {
         Ok(())
     } else {
@@ -1161,15 +1178,56 @@ fn shares_our_process_group(pid: u32) -> bool {
 #[cfg(unix)]
 /// Waits up to `grace` for the child to exit, returning as soon as it does.
 fn wait_for_child_exit(child: &mut Child, grace: std::time::Duration) -> std::io::Result<bool> {
-    let deadline = std::time::Instant::now() + grace;
+    Ok(wait_for_child_exit_until(child, std::time::Instant::now() + grace)?.is_some())
+}
+
+/// Waits until `deadline` for the child to exit: its status as soon as it
+/// does, or `None` while it still runs then.
+pub(crate) fn wait_for_child_exit_until(
+    child: &mut Child,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    wait_for_exit_until_with(
+        || child.try_wait(),
+        deadline,
+        std::time::Instant::now,
+        std::thread::sleep,
+    )
+}
+
+/// Waits until `deadline` for a child lpm has ended to exit. Ending a process
+/// doesn't bound how long it takes to go: one stuck in the kernel, such as on
+/// a network drive that stopped answering, goes on exiting for as long as
+/// that lasts.
+pub(crate) fn wait_for_ended_child(
+    child: &mut Child,
+    deadline: std::time::Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    let root_pid = child.id();
+    wait_for_child_exit_until(child, deadline)?.ok_or_else(|| still_exiting(root_pid))
+}
+
+fn still_exiting(pid: u32) -> std::io::Error {
+    std::io::Error::other(format!(
+        "PID {pid} was ended but was still exiting at the cleanup deadline"
+    ))
+}
+
+fn wait_for_exit_until_with(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    deadline: std::time::Instant,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(true);
+        if let Some(status) = try_wait()? {
+            return Ok(Some(status));
         }
-        if std::time::Instant::now() >= deadline {
-            return Ok(false);
+        let current = now();
+        if current >= deadline {
+            return Ok(None);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        sleep(std::time::Duration::from_millis(10).min(deadline.duration_since(current)));
     }
 }
 
@@ -1202,7 +1260,10 @@ fn terminate_child_process_tree_non_windows_with(
     let failures = kill_snapshot_descendants_with(snapshot, root_pid, terminate_if_identity)
         .max(usize::from(snapshot.uncertain_descendants));
     let _ = child.kill();
-    let status = child.wait()?;
+    let status = wait_for_ended_child(
+        child,
+        std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT,
+    )?;
     if failures == 0 {
         Ok(status)
     } else {
@@ -1294,11 +1355,18 @@ fn terminate_child_process_tree_windows(
     child: &mut Child,
 ) -> std::io::Result<std::process::ExitStatus> {
     let root_pid = child.id();
-    let root_identity = windows_root_process_identity_from_child(child).ok_or_else(|| {
-        std::io::Error::other(format!(
-            "could not capture the identity of child PID {root_pid} before process-tree cleanup"
-        ))
-    })?;
+    let Some(root_identity) = windows_root_process_identity_from_child(child) else {
+        // The root's own handle still ends it safely; only its descendants
+        // can't be told apart from processes that reused their IDs.
+        let _ = child.kill();
+        let _ = wait_for_child_exit_until(
+            child,
+            std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT,
+        );
+        return Err(std::io::Error::other(format!(
+            "could not capture the identity of child PID {root_pid} before process-tree cleanup, so lpm ended only it"
+        )));
+    };
     let mut trusted = HashMap::from([(root_pid, root_identity)]);
     let mut trusted_parents = HashMap::new();
     let initial =
@@ -1310,12 +1378,14 @@ fn terminate_child_process_tree_windows(
     }
     trusted_parents.extend(initial.parents);
 
+    let deadline = std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT;
     let _ = child.kill();
-    let status = child.wait()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    terminate_descendants_until_stable_with(
+    let status = wait_for_child_exit_until(child, deadline)?;
+    // A root slow to exit leaves its descendants at least a few retries, and
+    // one still exiting at the deadline is what the error names.
+    let descendants = terminate_descendants_until_stable_with(
         root_pid,
-        deadline,
+        deadline.max(std::time::Instant::now() + std::time::Duration::from_secs(1)),
         || {
             let snapshot = descendant_process_snapshot_windows_with_trusted(
                 root_pid,
@@ -1336,7 +1406,9 @@ fn terminate_child_process_tree_windows(
         std::io::Error::other(format!(
             "could not terminate {remaining} verified descendant process(es) of PID {root_pid} before the cleanup deadline"
         ))
-    })?;
+    });
+    let status = status.ok_or_else(|| still_exiting(root_pid))?;
+    descendants?;
     Ok(status)
 }
 
@@ -3588,6 +3660,19 @@ struct WindowsTcpEntry {
 }
 
 #[cfg(windows)]
+impl WindowsTcpEntry {
+    /// Whether a client connecting to a loopback address can reach this
+    /// listener: it listens on every address (`None`) or on a loopback one.
+    fn serves_loopback(&self) -> bool {
+        self.address.as_deref().is_none_or(|address| {
+            address
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.to_canonical().is_loopback())
+        })
+    }
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 struct WindowsPortOwnerSnapshot {
     pid: u32,
@@ -3712,6 +3797,7 @@ fn windows_tcp_table_buffer(address_family: u32) -> Vec<u8> {
         )
     };
     if size == 0 && status != NO_ERROR {
+        tracing::debug!("could not read the Windows TCP listener table: error {status}");
         return Vec::new();
     }
 
@@ -3733,6 +3819,7 @@ fn windows_tcp_table_buffer(address_family: u32) -> Vec<u8> {
             return buffer;
         }
         if status != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+            tracing::debug!("could not read the Windows TCP listener table: error {status}");
             return Vec::new();
         }
     }
@@ -4367,14 +4454,30 @@ mod tests {
         assert_ne!(find_available_port(port), Some(port));
     }
 
+    /// A dual-stack listener, as node's `listen(port)` makes: `[::]` with
+    /// `IPV6_V6ONLY` off. `TcpListener::bind("[::]:0")` leaves the system's
+    /// default, which on Windows is IPv6 only.
     #[test]
     fn check_port_reports_a_dual_stack_wildcard_listener_as_in_use() {
-        let Ok(listener) = TcpListener::bind("[::]:0") else {
+        let listener = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        if listener.set_only_v6(false).is_err()
+            || listener
+                .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+                .is_err()
+        {
             return;
-        };
-        let port = listener.local_addr().unwrap().port();
+        }
+        listener.listen(16).unwrap();
+        let port = listener.local_addr().unwrap().as_socket().unwrap().port();
 
         assert!(!loopback_port_available(port));
+        assert!(matches!(check_port(port), PortStatus::InUse { .. }));
+        assert_ne!(find_available_port(port), Some(port));
     }
 
     #[test]
@@ -5217,6 +5320,61 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(terminated.borrow().as_slice(), [20, 30]);
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::os::windows::process::ExitStatusExt::from_raw(code as u32)
+    }
+
+    #[test]
+    fn a_child_that_never_exits_is_waited_for_only_until_the_deadline() {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(5);
+        let clock = std::cell::Cell::new(started);
+        let polls = std::cell::Cell::new(0usize);
+
+        let status = wait_for_exit_until_with(
+            || {
+                polls.set(polls.get() + 1);
+                Ok(None)
+            },
+            deadline,
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        )
+        .unwrap();
+
+        assert_eq!(status, None);
+        assert_eq!(clock.get(), deadline, "the wait ran past its deadline");
+        assert!(polls.get() > 1, "the child was checked only once");
+    }
+
+    #[test]
+    fn a_child_is_waited_for_until_it_exits_and_no_longer() {
+        let started = std::time::Instant::now();
+        let clock = std::cell::Cell::new(started);
+        let polls = std::cell::Cell::new(0usize);
+
+        let status = wait_for_exit_until_with(
+            || {
+                polls.set(polls.get() + 1);
+                Ok((polls.get() == 3).then(|| exit_status(7)))
+            },
+            started + std::time::Duration::from_secs(5),
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        )
+        .unwrap();
+
+        assert_eq!(status.and_then(|status| status.code()), Some(7));
+        assert_eq!(polls.get(), 3);
+        assert_eq!(clock.get(), started + std::time::Duration::from_millis(20));
     }
 
     #[test]

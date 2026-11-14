@@ -34,6 +34,8 @@ pub mod path_trust;
 pub mod paths;
 pub mod peer;
 pub mod platform;
+#[cfg(windows)]
+pub mod process_job;
 pub mod process_output;
 pub mod project_git;
 pub mod project_glob;
