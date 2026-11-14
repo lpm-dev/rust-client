@@ -963,6 +963,39 @@ fn a_detached_daemon_a_job_keeps_still_starts() {
     assert!(daemon.child.wait().unwrap().success());
 }
 
+/// Another session's daemon may have taken the socket first: the proxy that
+/// is up is then that one, which no Job of ours keeps.
+#[test]
+fn only_a_detached_daemon_still_running_is_said_to_run_in_the_job() {
+    let (mut idle, mut done) = if cfg!(windows) {
+        let mut idle = std::process::Command::new("ping");
+        idle.args(["-n", "30", "127.0.0.1"]);
+        let mut done = std::process::Command::new("cmd");
+        done.args(["/d", "/c", "exit", "0"]);
+        (idle, done)
+    } else {
+        let mut idle = std::process::Command::new("sleep");
+        idle.arg("30");
+        (idle, std::process::Command::new("true"))
+    };
+    let mut running = DetachedDaemon {
+        child: idle.stdout(Stdio::null()).spawn().unwrap(),
+        kept_in_job: true,
+    };
+    let mut exited = DetachedDaemon {
+        child: done.spawn().unwrap(),
+        kept_in_job: true,
+    };
+    exited.child.wait().unwrap();
+
+    let running_in_job = running.runs_in_job();
+    let _ = running.child.kill();
+    let _ = running.child.wait();
+
+    assert!(running_in_job);
+    assert!(!exited.runs_in_job());
+}
+
 #[cfg(windows)]
 #[test]
 fn a_detached_daemon_failing_for_another_reason_is_not_retried() {

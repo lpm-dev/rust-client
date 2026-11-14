@@ -357,7 +357,7 @@ async fn ensure_detached_started_with_options(
         .map_err(|err| LpmError::Proxy(format!("failed to start detached proxy daemon: {err}")))?;
 
     let status = wait_for_detached_start(&mut daemon.child).await?;
-    if daemon.kept_in_job {
+    if daemon.runs_in_job() {
         tracing::warn!(
             "the proxy daemon could not leave the Windows Job lpm runs in, such as an \
              `lpm dev` service's, so it may stop when that Job ends; run \
@@ -503,6 +503,15 @@ const WINDOWS_DETACHED_FLAGS: u32 = windows_sys::Win32::System::Threading::CREAT
 struct DetachedDaemon {
     child: std::process::Child,
     kept_in_job: bool,
+}
+
+impl DetachedDaemon {
+    /// Whether the proxy that is up runs in a Job it couldn't leave: this
+    /// daemon is still running, rather than having exited because another
+    /// session's daemon took the socket first.
+    fn runs_in_job(&mut self) -> bool {
+        self.kept_in_job && matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
 /// Spawns the machine-wide proxy daemon, prepared by
