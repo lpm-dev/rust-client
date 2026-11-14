@@ -516,6 +516,18 @@ where
                 #[cfg(windows)]
                 await_dev_server_stop(&mut child, job.as_ref(), &*stopping.console_interrupted);
             }
+            // The Job holds the server's whole tree, so ending it needs no
+            // walk of the tree, which fails once it meets a process it can't
+            // verify, as on a runner without a console.
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                if let Err(error) = job.end(SERVICE_TREE_EXIT_TIMEOUT) {
+                    tracing::warn!("could not end the processes the dev server started: {error}");
+                }
+                break child.wait().map_err(|error| {
+                    LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
+                });
+            }
             break (stopping.terminate)(&mut child).map_err(|error| {
                 LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
             });
