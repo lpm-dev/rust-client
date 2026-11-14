@@ -48,6 +48,8 @@ pub mod symlink;
 pub mod terminal;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub mod test_disk_image;
+#[cfg(all(windows, any(test, feature = "test-support")))]
+pub mod test_network_path;
 // The 64-bit system call's groups are 32-bit; 32-bit systems have two calls.
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub mod thread_identity;

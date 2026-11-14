@@ -662,6 +662,21 @@ mod tests {
         assert!(ignores_everything(ignore.as_bytes()));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_to_a_project_creates_its_state_inside_it() {
+        let project = tempfile::tempdir().unwrap();
+        let Some(network) = crate::test_network_path::through_network(project.path()) else {
+            return;
+        };
+
+        let state = ensure_project_state_dir(&network).unwrap();
+
+        assert_eq!(state, network.join(".lpm"));
+        let ignore = std::fs::read_to_string(project.path().join(".lpm").join(".gitignore"));
+        assert_eq!(ignore.unwrap(), PROJECT_STATE_IGNORE);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_created_state_directory_is_owner_only() {
