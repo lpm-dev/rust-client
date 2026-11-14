@@ -640,7 +640,8 @@ pub enum LpmError {
     Store(String),
 
     /// LPM CLI refused to touch a project file, such as a secret file git
-    /// tracks. The message names the fix.
+    /// tracks, or the project where it is, as on a drive that can't hold
+    /// `node_modules`. The message names the fix.
     #[error("project file error: {0}")]
     #[diagnostic(code(lpm::project_file))]
     ProjectFile(String),

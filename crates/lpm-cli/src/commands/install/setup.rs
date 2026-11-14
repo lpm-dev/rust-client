@@ -334,6 +334,7 @@ mod tests {
         let Err(error) = refused else {
             panic!("an install on a drive without links was set up");
         };
+        assert!(matches!(error, LpmError::ProjectFile(_)), "{error:?}");
         let error = error.to_string();
         assert!(
             error.contains(
