@@ -423,6 +423,21 @@ pub(crate) const fn console_interrupted() -> bool {
     false
 }
 
+/// Whether the console window's closing began the shutdown under way, or
+/// came during it, through a [`ConsoleStop`]: Windows then ends lpm within
+/// about five seconds.
+#[cfg(windows)]
+pub(crate) fn console_closing() -> bool {
+    console_interrupts::closing()
+}
+
+/// Whether a closing console window gives lpm only seconds to stop: only on
+/// Windows.
+#[cfg(not(windows))]
+pub(crate) const fn console_closing() -> bool {
+    false
+}
+
 /// What made a [`ConsoleStop`] call its stop.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,6 +690,10 @@ mod console_interrupts {
 
     pub(super) fn interrupted() -> bool {
         STOPPING.load(Ordering::Acquire) == INTERRUPTED
+    }
+
+    pub(super) fn closing() -> bool {
+        STOPPING.load(Ordering::Acquire) == CLOSING
     }
 
     #[cfg(test)]
