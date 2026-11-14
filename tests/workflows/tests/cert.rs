@@ -467,6 +467,48 @@ fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
     assert_eq!(status["ca"]["trusted"], serde_json::json!(false));
 }
 
+#[test]
+fn cert_uninstall_says_when_the_ca_was_not_trusted() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "generate", "--json"])
+            .output()
+            .expect("failed to run lpm cert generate --json"),
+        "lpm cert generate --json",
+    );
+
+    let untrusted = cert_command(&project)
+        .args(["cert", "uninstall"])
+        .output()
+        .expect("failed to run lpm cert uninstall");
+    assert_success(&untrusted, "lpm cert uninstall");
+    let stderr = String::from_utf8_lossy(&untrusted.stderr);
+    assert!(
+        stderr.contains("CA was not in the system trust store") && !stderr.contains("CA removed"),
+        "uninstalling a CA nobody trusted must not claim to remove it, got:\n{stderr}"
+    );
+
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust", "--json"])
+            .output()
+            .expect("failed to run lpm cert trust --json"),
+        "lpm cert trust --json",
+    );
+    let trusted = cert_command(&project)
+        .args(["cert", "uninstall"])
+        .output()
+        .expect("failed to run lpm cert uninstall");
+    assert_success(&trusted, "lpm cert uninstall");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("CA removed from system trust store"),
+        "uninstalling a trusted CA must say it was removed, got:\n{stderr}"
+    );
+    assert!(!trust_store_entry(&project).exists());
+}
+
 /// `lpm cert rotate` replaces the CA without deciding whether to trust one:
 /// a CA `lpm cert generate` left out of the trust store gets a successor
 /// that stays out of it, and the JSON and text say so; after `lpm cert
@@ -565,6 +607,25 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         "generate must NOT install the CA into the trust store (use `lpm cert trust` for that)"
     );
 
+    for (field, file) in [
+        ("cert_path", project_cert_path(&project)),
+        ("key_path", project_key_path(&project)),
+    ] {
+        let shown = envelope[field].as_str().expect("path fields are strings");
+        assert_eq!(
+            std::fs::canonicalize(shown).unwrap(),
+            std::fs::canonicalize(&file).unwrap(),
+            "{field} names the project's file"
+        );
+        // A path a user would type, which tools that can't read a verbatim
+        // `\\?\` path, or a mixed separator, can open.
+        if cfg!(windows) {
+            assert!(
+                !shown.starts_with(r"\\?\") && !shown.contains('/'),
+                "{field}: {shown}"
+            );
+        }
+    }
     envelope["cert_path"] = serde_json::json!("[CERT_PATH]");
     envelope["key_path"] = serde_json::json!("[KEY_PATH]");
     insta::assert_json_snapshot!(
@@ -592,14 +653,17 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
     );
     assert_eq!(status["project"]["exists"], serde_json::json!(true));
     assert_eq!(status["project"]["needs_renewal"], serde_json::json!(false));
-    assert!(
-        hostnames.iter().any(|hostname| {
-            hostname
-                .as_str()
-                .is_some_and(|hostname| hostname.contains("myapp.local"))
-        }),
-        "generate --host must regenerate the cert so the requested SAN is present, got: {hostnames:?}"
+    assert_eq!(
+        hostnames,
+        &["localhost", "127.0.0.1", "::1", "myapp.local"],
+        "generate --host must regenerate the cert so the requested SAN is present, each name as a plain host"
     );
+
+    let mut status = status;
+    status["ca"]["expires"] = serde_json::json!("[DATE]");
+    status["ca"]["days_until_expiry"] = serde_json::json!("[DAYS]");
+    status["project"]["expires"] = serde_json::json!("[DATE]");
+    insta::assert_json_snapshot!("cert_status_json_after_generate_for_a_host", status);
 }
 
 #[test]

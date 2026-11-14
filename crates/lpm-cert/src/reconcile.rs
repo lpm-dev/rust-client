@@ -153,7 +153,7 @@ fn reconcile_locked(
             continue;
         };
         match trust::uninstall_ca_bytes(previous_cert_bytes, &prev_cert) {
-            Ok(()) => {
+            Ok(_) => {
                 audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
                     fingerprint: entry.fingerprint.clone(),
                     store: crate::trust_store_label(),
@@ -223,7 +223,7 @@ fn reconcile_locked(
             continue;
         };
         match trust::uninstall_ca_bytes(previous_cert_bytes, &prev_cert) {
-            Ok(()) => {
+            Ok(_) => {
                 audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
                     fingerprint: old_fp.clone(),
                     store: crate::trust_store_label(),

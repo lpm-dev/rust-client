@@ -1,0 +1,47 @@
+---
+source: tests/workflows/tests/cert.rs
+expression: status
+---
+{
+  "success": true,
+  "ca": {
+    "exists": true,
+    "trusted": false,
+    "expires": "[DATE]",
+    "subject": "LPM Local Development CA",
+    "days_until_expiry": "[DAYS]",
+    "name_constraints": [
+      "localhost",
+      "*.localhost",
+      "*.local",
+      "*.lpm.test",
+      "*.test",
+      "*.internal",
+      "*.home.arpa",
+      "127.0.0.0/8",
+      "::1/128",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16",
+      "169.254.0.0/16",
+      "100.64.0.0/10",
+      "198.18.0.0/15",
+      "fc00::/7",
+      "fe80::/10"
+    ]
+  },
+  "project": {
+    "exists": true,
+    "expires": "[DATE]",
+    "hostnames": [
+      "localhost",
+      "127.0.0.1",
+      "::1",
+      "myapp.local"
+    ],
+    "needs_renewal": false,
+    "valid": true,
+    "error": null
+  },
+  "permission_drifts": []
+}

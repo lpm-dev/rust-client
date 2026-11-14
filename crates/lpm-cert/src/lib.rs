@@ -86,6 +86,9 @@ pub struct UninstallCaResult {
     /// SHA-256 fingerprints of the certificates whose trust was removed: the
     /// on-disk root's, then that of a pending write's root that differs.
     pub fingerprints: Vec<String>,
+    /// Whether the trust store held anything of them to remove, trusted or
+    /// not.
+    pub removed: bool,
 }
 
 /// Remove the active LPM root from the OS trust store and record the exact
@@ -105,8 +108,11 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
         .as_ref()
         .filter(|pending| on_disk.as_ref() != Some(*pending));
     let mut fingerprints = Vec::with_capacity(2);
+    let mut removed = false;
     for cert_pem in on_disk.iter().chain(pending) {
-        fingerprints.push(uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?);
+        let (fingerprint, removed_this) = uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?;
+        fingerprints.push(fingerprint);
+        removed |= removed_this;
     }
     if pending_pair.is_some() {
         operation.retire_pending_pair()?;
@@ -117,25 +123,32 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
             ca_cert_path.display()
         )));
     }
-    Ok(UninstallCaResult { fingerprints })
+    Ok(UninstallCaResult {
+        fingerprints,
+        removed,
+    })
 }
 
 /// Removes `cert_pem` from the OS trust store and records that in the
-/// audit log; returns the certificate's fingerprint.
+/// audit log; returns the certificate's fingerprint, and whether the store
+/// held anything of it to remove.
 fn uninstall_ca_locked(
     operation: &paths::CertificateOperation,
     cert_pem: &[u8],
     ca_cert_path: &std::path::Path,
-) -> Result<String, LpmError> {
+) -> Result<(String, bool), LpmError> {
     let _generation_guard = operation.acquire_destructive_generation(cert_pem)?;
     let fingerprint = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?);
-    match trust::uninstall_ca_bytes(cert_pem, ca_cert_path) {
-        Ok(()) => audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
-            fingerprint: fingerprint.clone(),
-            store: trust_store_label(),
-            status: audit::AuditStatus::Ok,
-            error: None,
-        }),
+    let removed = match trust::uninstall_ca_bytes(cert_pem, ca_cert_path) {
+        Ok(removed) => {
+            audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
+                fingerprint: fingerprint.clone(),
+                store: trust_store_label(),
+                status: audit::AuditStatus::Ok,
+                error: None,
+            });
+            removed
+        }
         Err(error) => {
             audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
                 fingerprint,
@@ -145,8 +158,8 @@ fn uninstall_ca_locked(
             });
             return Err(error);
         }
-    }
-    Ok(fingerprint)
+    };
+    Ok((fingerprint, removed))
 }
 
 fn trust_ca_locked(ca_dir: &paths::GlobalCaDirectory) -> Result<TrustCaResult, LpmError> {
@@ -898,8 +911,16 @@ fn ensure_https_locked(
 
     // Step 3: Build env vars for the dev server
     let ca_cert_path_str = root.cert_path.to_string_lossy().to_string();
-    let proj_cert_str = proj_cert_path.to_string_lossy().to_string();
-    let proj_key_str = proj_key_path.to_string_lossy().to_string();
+    let proj_cert_str = project_cert_dir
+        .display_path()
+        .join("cert.pem")
+        .to_string_lossy()
+        .into_owned();
+    let proj_key_str = project_cert_dir
+        .display_path()
+        .join("key.pem")
+        .to_string_lossy()
+        .into_owned();
 
     let mut env_vars = vec![
         ("NODE_EXTRA_CA_CERTS".to_string(), ca_cert_path_str),
@@ -1178,18 +1199,9 @@ mod tests {
         let result = status(project_dir.path()).unwrap();
         assert!(result.project_cert_exists);
         assert!(!result.project_cert_needs_renewal);
-        // Default SANs: localhost, 127.0.0.1, ::1 (shown in x509-parser format)
-        assert!(
-            !result.project_cert_hostnames.is_empty(),
-            "expected SANs, got empty list"
-        );
-        assert!(
-            result
-                .project_cert_hostnames
-                .iter()
-                .any(|s| s.contains("localhost")),
-            "expected localhost in SANs, got {:?}",
-            result.project_cert_hostnames
+        assert_eq!(
+            result.project_cert_hostnames,
+            ["localhost", "127.0.0.1", "::1"]
         );
     }
 
@@ -1209,21 +1221,15 @@ mod tests {
         std::fs::write(&cert_path, &cert_pem).unwrap();
 
         let info = cert::read_cert_info(&cert_path).unwrap();
-        // SAN entries from x509-parser use format like "DNS:localhost", "IP:..." or hex
-        assert!(
-            info.san_entries.iter().any(|s| s.contains("localhost")),
-            "missing localhost in SANs: {:?}",
-            info.san_entries
-        );
-        assert!(
-            info.san_entries.iter().any(|s| s.contains("myapp.local")),
-            "missing myapp.local in SANs: {:?}",
-            info.san_entries
-        );
-        assert!(
-            info.san_entries.len() >= 5,
-            "expected at least 5 SANs (3 default + 2 extra), got {:?}",
-            info.san_entries
+        assert_eq!(
+            info.san_entries,
+            [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "myapp.local",
+                "192.168.1.42"
+            ]
         );
         assert!(!cert::needs_renewal(&cert_path).unwrap());
     }

@@ -903,6 +903,7 @@ pub fn project_cert_dir(project_dir: &Path) -> Result<PathBuf, LpmError> {
 
 pub(crate) struct ProjectCertDirectory {
     path: PathBuf,
+    display_path: PathBuf,
     dir: Dir,
 }
 
@@ -914,6 +915,14 @@ pub(crate) struct ProjectCertMaterial {
 impl ProjectCertDirectory {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directory as a user would type it, for what lpm prints and hands
+    /// dev servers as `SSL_CERT_FILE`: on Windows the plain `C:\…` where it
+    /// names the same directory as the canonical `\\?\C:\…` that `path`
+    /// keeps for every check lpm makes.
+    pub(crate) fn display_path(&self) -> &Path {
+        &self.display_path
     }
 
     pub(crate) fn read_pair(&self) -> Result<(Vec<u8>, Vec<u8>), LpmError> {
@@ -1458,11 +1467,12 @@ pub(crate) fn open_project_cert_directory(
             project_dir.display()
         ))
     })?;
+    let shown_project = lpm_common::symlink::windows_plain_path(&project_path);
     let project =
         Dir::open_ambient_dir(&project_path, cap_std::ambient_authority()).map_err(|error| {
             LpmError::Cert(format!(
                 "failed to open project directory {}: {error}",
-                project_path.display()
+                shown_project.display()
             ))
         })?;
     let Some(state) = open_or_create_directory(
@@ -1475,7 +1485,7 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
-    lpm_common::keep_state_dir_ignored_or_warn(&state, &project_path.join(".lpm"));
+    lpm_common::keep_state_dir_ignored_or_warn(&state, &shown_project.join(".lpm"));
     let Some(certs) = open_or_create_directory(
         &state,
         "certs",
@@ -1486,8 +1496,15 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
+    let mut path = project_path;
+    path.push(".lpm");
+    path.push("certs");
+    let mut display_path = shown_project;
+    display_path.push(".lpm");
+    display_path.push("certs");
     let directory = ProjectCertDirectory {
-        path: project_path.join(".lpm/certs"),
+        path,
+        display_path,
         dir: certs,
     };
     recover_project_pair_transaction(&directory)?;
@@ -2178,6 +2195,26 @@ mod tests {
 
         assert!(error.to_string().contains("refusing linked"));
         assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_project_cert_directory_is_shown_by_a_plain_windows_path() {
+        let project = tempfile::tempdir().unwrap();
+
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+
+        let shown = cert_dir.display_path().to_string_lossy().into_owned();
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+        assert!(!shown.contains('/'), "{shown}");
+        assert!(shown.ends_with(r"\.lpm\certs"), "{shown}");
+        assert_eq!(
+            std::fs::canonicalize(cert_dir.display_path()).unwrap(),
+            cert_dir.path(),
+            "the shown path must name the directory lpm checks"
+        );
     }
 
     #[cfg(windows)]
