@@ -1486,10 +1486,12 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
-    let directory = ProjectCertDirectory {
-        path: project_path.join(".lpm/certs"),
-        dir: certs,
-    };
+    // The path is what lpm prints and hands dev servers as `SSL_CERT_FILE`,
+    // so it is the one a user would type, not the canonical `\\?\C:\…`.
+    let mut path = lpm_common::symlink::windows_plain_path(&project_path);
+    path.push(".lpm");
+    path.push("certs");
+    let directory = ProjectCertDirectory { path, dir: certs };
     recover_project_pair_transaction(&directory)?;
     Ok(Some(directory))
 }
@@ -2178,6 +2180,22 @@ mod tests {
 
         assert!(error.to_string().contains("refusing linked"));
         assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_project_cert_directory_is_named_by_a_plain_windows_path() {
+        let project = tempfile::tempdir().unwrap();
+
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+
+        let path = cert_dir.path().to_string_lossy().into_owned();
+        assert!(!path.starts_with(r"\\?\"), "{path}");
+        assert!(!path.contains('/'), "{path}");
+        assert!(path.ends_with(r"\.lpm\certs"), "{path}");
+        assert!(cert_dir.path().is_dir(), "{path}");
     }
 
     #[cfg(windows)]
