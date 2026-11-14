@@ -70,10 +70,10 @@ pub mod test_support {
         static EXFAT: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Has [`super::files_not_private`] and [`super::links_not_held`] find,
-    /// on this thread, that every directory is on an exFAT drive, which keeps
-    /// no file permissions and holds no links, until what this returns is
-    /// dropped.
+    /// Has [`super::files_not_private`], [`super::links_not_held`] and, on
+    /// Windows, `keeps_no_permissions` find, on this thread, that every
+    /// directory is on an exFAT drive, which keeps no file permissions and
+    /// holds no links, until what this returns is dropped.
     #[must_use]
     pub fn pretend_every_volume_is_exfat() -> Pretending {
         EXFAT.set(true);

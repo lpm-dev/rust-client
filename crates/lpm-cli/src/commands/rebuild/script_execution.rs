@@ -207,7 +207,7 @@ pub(super) fn spawn_lifecycle_child(
 ) -> Result<
     (
         std::process::Child,
-        lpm_common::script_directory::ScriptDirectory,
+        Option<lpm_common::script_directory::ScriptDirectory>,
     ),
     String,
 > {
@@ -245,16 +245,23 @@ pub(super) fn spawn_lifecycle_child(
     }
 
     let (shell_program, shell_args) = platform_shell_invocation(cmd)?;
-    // cmd.exe reaches a package in a network folder through a drive letter,
-    // which the caller keeps until the script has exited.
-    let directory = lpm_common::script_directory::ScriptDirectory::for_shell(package_dir)
+    // Without the sandbox, cmd.exe reaches a package in a network folder
+    // through a drive letter, which the caller keeps until the script has
+    // exited. A sandboxed script is left to the sandbox, which refuses a
+    // network folder: the access rules it sets name the network path.
+    let directory = matches!(sandbox_mode, SandboxMode::Disabled)
+        .then(|| lpm_common::script_directory::ScriptDirectory::for_shell(package_dir))
+        .transpose()
         .map_err(|error| error.to_string())?;
     let mut sbcmd = SandboxedCommand::new(shell_program);
     for arg in shell_args {
         sbcmd = sbcmd.arg(arg);
     }
     sbcmd = sbcmd
-        .current_dir(directory.path())
+        .current_dir(directory.as_ref().map_or(
+            package_dir,
+            lpm_common::script_directory::ScriptDirectory::path,
+        ))
         .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
     #[cfg(unix)]
     if let Some(directory) = retained_directory {

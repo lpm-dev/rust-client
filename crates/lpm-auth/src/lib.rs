@@ -4174,6 +4174,7 @@ mod tests {
                 "{error}"
             );
             assert!(!home.join(".lpm").join(".credentials").exists());
+            assert!(!home.join(".lpm").join(".key").exists());
             // Records that hold no secret, such as a token's expiry, go ahead.
             recorded.unwrap();
         });
