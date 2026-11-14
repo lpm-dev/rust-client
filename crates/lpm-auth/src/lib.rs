@@ -2498,18 +2498,23 @@ fn prepare_lpm_home(directory: &Path) -> Result<(), String> {
     prepare_lpm_home_for(directory, HomeWrite::Adds)
 }
 
+/// [`prepare_lpm_home`] for a credential or the key that encrypts the
+/// credential file, which must not go where anyone using the computer could
+/// read them, as on a drive that keeps no file permissions.
+fn prepare_lpm_home_for_secrets(directory: &Path) -> Result<(), String> {
+    prepare_lpm_home(directory)?;
+    lpm_common::keep_lpm_home_private(directory).map_err(|reason| {
+        format!(
+            "{reason}, so LPM won't save login credentials there; point LPM_HOME at a folder on an NTFS drive"
+        )
+    })
+}
+
 /// [`prepare_lpm_home`] for a write that may add nothing: that goes ahead in
 /// a home git could commit, so logging out still removes what the home
 /// holds.
 fn prepare_lpm_home_for(directory: &Path, write: HomeWrite) -> Result<(), String> {
     std::fs::create_dir_all(directory).map_err(|error| format!("mkdir error: {error}"))?;
-    if write == HomeWrite::Adds
-        && let Err(reason) = lpm_common::keep_lpm_home_private(directory)
-    {
-        return Err(format!(
-            "{reason}, so LPM won't save login state there; point LPM_HOME at a folder on an NTFS drive"
-        ));
-    }
     match lpm_common::keep_lpm_home_ignored(directory) {
         Ok(()) => Ok(()),
         Err(reason) if write == HomeWrite::AddsNothing => {
@@ -2649,7 +2654,7 @@ fn write_file_auth_key(key_path: &Path, value: &str) -> Result<(), String> {
     let directory = key_path
         .parent()
         .ok_or_else(|| "auth data-key path has no parent".to_owned())?;
-    prepare_lpm_home(directory)?;
+    prepare_lpm_home_for_secrets(directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2946,7 +2951,7 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
     let json_str = serde_json::to_string(&store).map_err(|e| format!("json error: {e}"))?;
     let encrypted = encrypt(&json_str)?;
 
-    prepare_lpm_home(&lpm_dir()?)?;
+    prepare_lpm_home_for_secrets(&lpm_dir()?)?;
     lpm_common::write_file_atomic_with_options(
         &path,
         encrypted,
@@ -4156,20 +4161,21 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_login_state_is_refused_where_anyone_using_the_computer_could_read_it() {
+    fn file_backed_credentials_are_refused_where_anyone_using_the_computer_could_read_them() {
         with_temp_home(|home| {
             let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
             let saved = set_token_in_file("https://registry.example", "token");
-            let cleared = prepare_lpm_home_for(&home.join(".lpm"), HomeWrite::AddsNothing);
+            let recorded = prepare_lpm_home(&home.join(".lpm"));
             drop(pretending);
 
             let error = saved.unwrap_err();
             assert!(
-                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't save login state there"),
+                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't save login credentials there"),
                 "{error}"
             );
             assert!(!home.join(".lpm").join(".credentials").exists());
-            cleared.unwrap();
+            // Records that hold no secret, such as a token's expiry, go ahead.
+            recorded.unwrap();
         });
     }
 

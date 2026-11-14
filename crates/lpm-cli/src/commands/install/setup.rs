@@ -94,6 +94,7 @@ fn refuse_a_project_without_links(project_dir: &Path) -> Result<(), LpmError> {
 pub(super) fn prepare_install_setup_context(
     input: InstallSetupInput<'_>,
 ) -> Result<InstallSetupContext, LpmError> {
+    refuse_a_project_without_links(input.project_dir)?;
     lpm_registry::timing::reset_metadata_http_versions();
     lpm_registry::timing::reset_metadata_detail();
     crate::build_state::reset_write_timing();
@@ -128,7 +129,6 @@ pub(super) fn prepare_install_setup_context(
                 .to_string(),
         ));
     }
-    refuse_a_project_without_links(input.project_dir)?;
 
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
@@ -303,14 +303,38 @@ pub(super) fn check_project_policy(
 mod tests {
     use super::*;
 
+    fn setup_input(project_dir: &Path) -> InstallSetupInput<'_> {
+        InstallSetupInput {
+            project_dir,
+            policy_project_dir: project_dir,
+            json_output: false,
+            frozen_lockfile: FrozenLockfileMode::default(),
+            allow_new: false,
+            strict_peer_dependencies_override: None,
+            linker_override: None,
+            min_release_age_override: None,
+            min_release_age_exclude: &[],
+            timing: false,
+        }
+    }
+
     #[test]
-    fn a_project_on_a_drive_without_links_is_refused_with_the_reason() {
+    fn an_install_on_a_drive_without_links_is_refused_before_anything_else() {
         let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        // A home whose configuration can't be read, so that a setup that
+        // went past the check fails at once on it instead.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "= unreadable").unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().into())]);
         let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
-        let refused = refuse_a_project_without_links(project.path());
+        let refused = prepare_install_setup_context(setup_input(project.path()));
         drop(pretending);
 
-        let error = refused.unwrap_err().to_string();
+        let Err(error) = refused else {
+            panic!("an install on a drive without links was set up");
+        };
+        let error = error.to_string();
         assert!(
             error.contains(
                 "it is on an exFAT drive, which can't hold links, and node_modules is made of links into LPM's package store"

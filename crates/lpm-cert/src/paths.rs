@@ -360,14 +360,21 @@ pub(crate) struct GlobalCaDirectory {
 
 impl GlobalCaDirectory {
     /// Fails where anyone using the computer could read the certificate
-    /// authority's private key, which signs what this computer trusts.
+    /// authority's private key, which signs what this computer trusts. An
+    /// authority already there may be trusted, and its key may have been
+    /// read, so the error says to remove its trust first.
     pub(crate) fn refuse_unprotected_key(&self) -> Result<(), LpmError> {
-        match &self.unprotected {
-            Some(reason) => Err(LpmError::Cert(format!(
-                "{reason}, so LPM won't keep or use the certificate authority's private key there: with it, anyone could sign certificates this computer trusts. Point LPM_HOME at a folder on an NTFS drive"
-            ))),
-            None => Ok(()),
-        }
+        let Some(reason) = &self.unprotected else {
+            return Ok(());
+        };
+        let existing = if self.exists("rootCA.pem").unwrap_or(true) {
+            " First remove the trust of the authority already there with `lpm cert uninstall`, as its key may have been read."
+        } else {
+            ""
+        };
+        Err(LpmError::Cert(format!(
+            "{reason}, so LPM won't keep or use the certificate authority's private key there: with it, anyone could sign certificates this computer trusts.{existing} Point LPM_HOME at a folder on an NTFS drive"
+        )))
     }
 
     pub(crate) fn path(&self, name: &str) -> PathBuf {
@@ -735,7 +742,7 @@ impl CertificateOperation {
     fn begin_at(home_path: PathBuf) -> Result<Self, LpmError> {
         let ca = open_global_ca_directory_at(home_path, true)?;
         let lock = ca.acquire_operations_lock()?;
-        if ca.exposed.is_none() {
+        if ca.exposed.is_none() && ca.unprotected.is_none() {
             recover_global_pair_transaction(&ca)?;
         }
         Ok(Self { ca, _lock: lock })
@@ -2494,14 +2501,13 @@ mod tests {
     }
 
     #[test]
-    fn the_certificate_authority_s_key_is_neither_written_nor_used_where_anyone_could_read_it() {
+    fn the_certificate_authority_s_key_is_not_written_where_anyone_could_read_it() {
         let home = tempfile::tempdir().unwrap();
         let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
         // Removing the authority's trust writes and uses no key, so an
         // operation still starts.
         let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
         let (cert, key) = crate::ca::generate_ca().unwrap();
-
         let written = operation
             .ca
             .write_ca_pair(
@@ -2511,18 +2517,47 @@ mod tests {
                 key.as_bytes(),
             )
             .map(drop);
-        let used = crate::ensure_root_ca_pair_locked(&operation.ca).map(drop);
         drop(pretending);
 
-        for refused in [written, used] {
-            let error = refused.unwrap_err().to_string();
-            assert!(
-                error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't keep or use the certificate authority's private key there"),
-                "{error}"
-            );
-        }
+        let error = written.unwrap_err().to_string();
+        assert!(
+            error.contains("it is on an exFAT drive, which keeps no file permissions, so LPM won't keep or use the certificate authority's private key there"),
+            "{error}"
+        );
+        assert!(!error.contains("lpm cert uninstall"), "{error}");
         assert!(!home.path().join(".lpm/certs/rootCA-key.pem").exists());
         assert!(!home.path().join(".lpm/certs/rootCA.pem").exists());
+    }
+
+    #[test]
+    fn an_authority_already_where_anyone_could_read_its_key_is_not_used_and_its_trust_is_to_go() {
+        let home = tempfile::tempdir().unwrap();
+        // An authority an earlier release wrote there.
+        let operation = CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+        operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .unwrap();
+        drop(operation);
+
+        let pretending = lpm_common::volume::test_support::pretend_every_volume_is_exfat();
+        let used = CertificateOperation::begin_at(home.path().to_path_buf())
+            .and_then(|operation| crate::ensure_root_ca_pair_locked(&operation.ca).map(drop));
+        drop(pretending);
+
+        let error = used.unwrap_err().to_string();
+        assert!(
+            error
+                .contains("so LPM won't keep or use the certificate authority's private key there")
+                && error.contains("lpm cert uninstall"),
+            "{error}"
+        );
     }
 
     #[test]

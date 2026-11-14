@@ -38,6 +38,15 @@ happened to exist below the current directory, was created there instead.
   Elsewhere the crate's tests don't build: one needs a crate from
   upstream's workspace that the published crate leaves out.
 
+One related flaw is left as it is. `read_link` takes a link's target from
+winx, which strips `\??\` from an absolute target, so a symbolic link to
+`\\server\share\pkg` reads as the relative `UNC\server\share\pkg`. Fixing
+it here would mean reading the reparse point without winx. LPM never makes
+a link to a network folder: a junction can't point at one, and a project
+whose links would need one can't be installed. A link someone else made to
+a network folder reads instead as a path inside the project, where nothing
+is found.
+
 `lpm-common`'s `a_network_path_to_a_project_creates_its_state_inside_it`
 creates a project's `.lpm` through `\\localhost\<drive>$` and fails on the
 published crate.

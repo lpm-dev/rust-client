@@ -46,6 +46,21 @@ pub fn links_not_held(directory: &cap_std::fs::Dir) -> Option<String> {
 #[cfg(windows)]
 pub use windows::Volume;
 
+/// Whether `file` is on a volume that keeps no file permissions, such as
+/// exFAT: one that takes an access list and keeps none of it. A volume
+/// Windows can't tell counts as keeping them.
+#[cfg(windows)]
+#[must_use]
+pub fn keeps_no_permissions(file: &impl std::os::windows::io::AsRawHandle) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::pretending() {
+        return true;
+    }
+    windows::flags_of(file).is_ok_and(|flags| {
+        flags & windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS == 0
+    })
+}
+
 /// Volumes as tests want them seen.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
@@ -97,12 +112,38 @@ mod windows {
         network: bool,
     }
 
+    /// The file system flags of the volume `file` is on, alone.
+    pub(super) fn flags_of(file: &impl AsRawHandle) -> io::Result<u32> {
+        let mut flags = 0_u32;
+        let read = unsafe {
+            // SAFETY: the handle stays open for the call, and Windows skips the outputs passed
+            // as null.
+            GetVolumeInformationByHandleW(
+                file.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut flags,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(flags)
+        }
+    }
+
     impl Volume {
-        /// The volume `file` is on.
+        /// The volume `file` is on. A volume Windows gives no path for, as
+        /// one with neither a drive letter nor a folder it is mounted in,
+        /// counts as local.
         ///
         /// # Errors
         ///
-        /// When Windows can't tell the volume or the file's path.
+        /// When Windows can't tell the volume.
         pub fn of(file: &impl AsRawHandle) -> io::Result<Self> {
             let mut flags = 0_u32;
             let mut file_system = [0_u16; 64];
@@ -128,7 +169,8 @@ mod windows {
                 .iter()
                 .position(|unit| *unit == 0)
                 .unwrap_or(file_system.len());
-            let network = is_network_path(&crate::owner_only::final_path(file)?);
+            let network =
+                crate::owner_only::final_path(file).is_ok_and(|path| is_network_path(&path));
             Ok(Self {
                 flags,
                 file_system: String::from_utf16_lossy(&file_system[..end]),

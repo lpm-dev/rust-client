@@ -11,6 +11,8 @@
 
 use std::ptr::null_mut;
 
+use crate::volume::keeps_no_permissions;
+
 use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree, RtlNtStatusToDosError,
@@ -96,11 +98,6 @@ pub fn protect_file(file: &impl std::os::windows::io::AsRawHandle) -> std::io::R
         return Ok(());
     }
     set_protected_dacl(file, &owner_only_file_dacl()?)
-}
-
-/// Whether `file` is on a volume that keeps no permissions, such as exFAT.
-fn keeps_no_permissions(file: &impl std::os::windows::io::AsRawHandle) -> bool {
-    crate::volume::Volume::of(file).is_ok_and(|volume| !volume.keeps_permissions())
 }
 
 /// Whether `file` is kept from everyone but its owner, the user running

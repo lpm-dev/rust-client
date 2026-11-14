@@ -334,7 +334,7 @@ pub(in crate::release_plan) fn protect_private_windows_directory(
 /// than the project around it.
 #[cfg(windows)]
 fn keeps_no_permissions(file: &impl std::os::windows::io::AsRawHandle) -> bool {
-    lpm_common::volume::Volume::of(file).is_ok_and(|volume| !volume.keeps_permissions())
+    lpm_common::volume::keeps_no_permissions(file)
 }
 
 #[cfg(windows)]
