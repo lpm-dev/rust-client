@@ -264,15 +264,27 @@ mod windows {
             }
             drives.remove(&share_key);
         }
-        if let Some((path, folder_handle)) = through_existing_drive(folder) {
-            return Ok((
-                path,
-                DriveHold::Borrowed {
-                    _folder: folder_handle,
-                },
-            ));
-        }
-        let letter = map_free_letter(&folder.share)?;
+        let unusable = match through_existing_drive(folder) {
+            Ok((path, folder_handle)) => {
+                return Ok((
+                    path,
+                    DriveHold::Borrowed {
+                        _folder: folder_handle,
+                    },
+                ));
+            }
+            Err(unusable) => unusable,
+        };
+        let letter = map_free_letter(&folder.share).map_err(|error| match unusable {
+            Some((letter, open_error)) => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; the drive {}: already mapped there couldn't be used: {open_error}",
+                    char::from(letter)
+                ),
+            ),
+            None => error,
+        })?;
         say_mapped(&folder.share, letter);
         let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drives.insert(
@@ -316,8 +328,11 @@ mod windows {
 
     /// `folder` through a drive letter already mapped to its share, or to a
     /// folder of the share above it, with the folder held open through it.
-    /// The letter mapped closest to `folder` wins, then the first.
-    fn through_existing_drive(folder: &NetworkFolder) -> Option<(PathBuf, std::fs::File)> {
+    /// The letter mapped closest to `folder` wins, then the first. Without
+    /// one, the first letter that reached it but couldn't open it, and why.
+    fn through_existing_drive(
+        folder: &NetworkFolder,
+    ) -> Result<(PathBuf, std::fs::File), Option<(u8, io::Error)>> {
         let used = unsafe {
             // SAFETY: takes no arguments.
             GetLogicalDrives()
@@ -334,10 +349,16 @@ mod windows {
             })
             .collect();
         reaching.sort_by_key(|(depth, letter, _)| (std::cmp::Reverse(*depth), *letter));
-        reaching.into_iter().find_map(|(_, _, path)| {
-            let handle = open_folder(&path).ok()?;
-            Some((path, handle))
-        })
+        let mut unusable = None;
+        for (_, letter, path) in reaching {
+            match open_folder(&path) {
+                Ok(handle) => return Ok((path, handle)),
+                Err(error) => {
+                    unusable.get_or_insert((letter, error));
+                }
+            }
+        }
+        Err(unusable)
     }
 
     /// Opens the folder at `path` for nothing but holding it open.
@@ -676,6 +697,68 @@ mod windows {
                     "LPM left the drive mapped though nothing used it: {removed_after}"
                 );
             }
+        }
+
+        #[test]
+        fn a_drive_lpm_mapped_stays_while_anything_still_has_a_file_open_through_it() {
+            let _one_at_a_time = LIVE_DRIVES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let local = tempfile::tempdir().unwrap();
+            let project = local.path().join("app");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::write(project.join("open"), b"held").unwrap();
+            let Some(network) = crate::test_network_path::through_network(&project) else {
+                return;
+            };
+            let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            if !matches!(reached._drive, Some(DriveHold::Mapped { .. })) {
+                eprintln!("skipped: another process had the share mapped already");
+                return;
+            }
+            let letter = TheirLetter(letter_of(reached.path()));
+
+            // As another process's script would, through the same letter.
+            let held_open = std::fs::File::open(reached.path().join("open")).unwrap();
+            drop(reached);
+            let while_open = mapped_remote(letter.0);
+            drop(held_open);
+
+            assert!(
+                while_open.is_some(),
+                "LPM removed a drive something still had a file open through"
+            );
+        }
+
+        #[test]
+        fn a_drive_removed_while_lpm_held_it_is_mapped_again() {
+            let _one_at_a_time = LIVE_DRIVES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let local = tempfile::tempdir().unwrap();
+            let project = local.path().join("app");
+            std::fs::create_dir(&project).unwrap();
+            let Some(network) = crate::test_network_path::through_network(&project) else {
+                return;
+            };
+            let first = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            if !matches!(first._drive, Some(DriveHold::Mapped { .. })) {
+                eprintln!("skipped: another process had the share mapped already");
+                return;
+            }
+            // As `net use Z: /delete` would.
+            drop(TheirLetter(letter_of(first.path())));
+
+            let again = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            let _cleanup = TheirLetter(letter_of(again.path()));
+            std::fs::write(again.path().join("written"), b"again").unwrap();
+            drop(first);
+
+            assert_eq!(std::fs::read(project.join("written")).unwrap(), b"again");
+            assert!(
+                mapped_remote(letter_of(again.path())).is_some(),
+                "the earlier mapping's holder removed the new one"
+            );
         }
 
         #[test]
