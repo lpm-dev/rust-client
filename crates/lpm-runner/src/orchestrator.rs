@@ -1739,6 +1739,14 @@ pub fn run_services_with_config(
                             continue;
                         }
                         if let Some(status) = service_exit_status(&children, &name) {
+                            #[cfg(windows)]
+                            if recovery::console_interrupt_behind(
+                                &[(name.clone(), status)],
+                                &shutdown_state,
+                            ) {
+                                startup_interrupted = true;
+                                continue;
+                            }
                             let code = status.code().unwrap_or(-1);
                             ui_service_status(
                                 RESET,
@@ -2129,71 +2137,52 @@ fn ctrlc_handler(
     })
 }
 
-/// Stops on Windows what the Unix handler stops: lpm's console handler
-/// keeps Ctrl+C and Ctrl+Break from ending lpm while this lives, which
-/// otherwise exits at once with the services' cleanup skipped, and each
-/// press moves the shutdown on as a signal does on Unix.
+/// Stops on Windows what the Unix handler stops. While this lives, Ctrl+C,
+/// Ctrl+Break and the console window's closing move the shutdown on as
+/// SIGINT and SIGHUP do on Unix, rather than ending lpm with the services'
+/// cleanup skipped. Services share lpm's console, so the same event reaches
+/// them and runs their own Ctrl+C handlers; lpm then ends what still runs,
+/// in reverse dependency order.
 #[cfg(windows)]
 struct SignalHandler {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Held for its `Drop`, which stops listening.
+    _listener: crate::execution::ConsoleStop,
 }
 
 #[cfg(windows)]
-impl Drop for SignalHandler {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-#[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix handler, whose installation can fail"
+)]
 fn ctrlc_handler(
     shutdown_state: Arc<AtomicU8>,
     children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
 ) -> Option<SignalHandler> {
-    let signals = crate::execution::ExecutionSignals::new()
-        .map_err(|error| tracing::warn!("Ctrl+C will end lpm without stopping services: {error}"))
-        .ok()?;
-    Some(ctrlc_handler_with(
-        Arc::new(signals),
-        shutdown_state,
-        children,
-    ))
-}
-
-#[cfg(windows)]
-fn ctrlc_handler_with(
-    signals: Arc<crate::execution::ExecutionSignals>,
-    shutdown_state: Arc<AtomicU8>,
-    children: Arc<Mutex<Vec<(String, ServiceProcess)>>>,
-) -> SignalHandler {
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let thread = std::thread::spawn(move || {
-        let mut handled = 0;
-        while !thread_stop.load(Ordering::Acquire) {
-            while handled < signals.console_presses() {
-                handled += 1;
-                if shutdown_state.fetch_add(1, Ordering::Relaxed) == 0 {
-                    terminal_eprintln!();
-                    ui_warn("Stopping services...");
-                } else {
-                    terminal_eprintln!();
-                    ui_warn("Force-killing services...");
-                    force_kill_children(&children);
-                    return;
+    use crate::execution::ConsoleStopEvent;
+    Some(SignalHandler {
+        _listener: crate::execution::ConsoleStop::new(move |event| {
+            let previous = shutdown_state.update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                state.saturating_add(1)
+            });
+            match previous {
+                0 => {
+                    // A closing window can't take more output.
+                    if event == ConsoleStopEvent::Interrupt {
+                        terminal_eprintln!();
+                        ui_warn("Stopping services...");
+                    }
                 }
+                1 => {
+                    if event == ConsoleStopEvent::Interrupt {
+                        terminal_eprintln!();
+                        ui_warn("Force-killing services...");
+                    }
+                    force_kill_children(&children);
+                }
+                _ => {}
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    });
-    SignalHandler {
-        stop,
-        thread: Some(thread),
-    }
+        }),
+    })
 }
 
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).
@@ -2273,14 +2262,21 @@ fn shutdown_children_ordered(
                         signal_service_process_group(pid, libc::SIGTERM);
                         tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
                     }
+                    // Services share lpm's console, so a console event that
+                    // began the shutdown reached them too: they get this
+                    // level's share of the grace period to stop themselves,
+                    // with their own Ctrl+C handlers. Windows can't send a
+                    // Ctrl+C to one service, so a shutdown lpm began itself
+                    // ends them through their Jobs.
                     #[cfg(windows)]
-                    if !child.end_job() {
+                    if !crate::execution::console_stopping() && !child.end_job() {
                         let _ = child.kill();
                     }
                     #[cfg(not(any(unix, windows)))]
-                    let _ = child.kill();
-                    #[cfg(not(unix))]
-                    tracing::debug!("stopped service '{name}'");
+                    {
+                        let _ = child.kill();
+                        tracing::debug!("stopped service '{name}'");
+                    }
                 }
             }
         }
@@ -4561,32 +4557,30 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
     }
 
     /// Ctrl+C on Windows stops the services through the ordered shutdown,
-    /// and a second press force-kills them, as on Unix.
+    /// a second press force-kills them, as on Unix, and later presses leave
+    /// lpm running until the shutdown is done.
     #[cfg(windows)]
     #[test]
     fn console_interrupts_drive_the_shutdown_on_windows() {
-        let signals = Arc::new(crate::execution::ExecutionSignals::new().unwrap());
+        use crate::execution::ConsoleStopEvent;
         let shutdown_state = Arc::new(AtomicU8::new(0));
         let children = Arc::new(Mutex::new(Vec::new()));
-        let handler =
-            ctrlc_handler_with(Arc::clone(&signals), Arc::clone(&shutdown_state), children);
-        let reaches = |state: u8| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while shutdown_state.load(Ordering::Relaxed) < state && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            shutdown_state.load(Ordering::Relaxed)
-        };
+        let handler = ctrlc_handler(Arc::clone(&shutdown_state), children).unwrap();
 
-        signals.interrupt_for_test();
+        handler._listener.fire_for_test(ConsoleStopEvent::Interrupt);
         assert_eq!(
-            reaches(1),
+            shutdown_state.load(Ordering::Relaxed),
             1,
             "the first Ctrl+C starts the ordered shutdown"
         );
-        signals.interrupt_for_test();
-        assert_eq!(reaches(2), 2, "the second Ctrl+C force-kills");
-        drop(handler);
+        handler._listener.fire_for_test(ConsoleStopEvent::Interrupt);
+        assert_eq!(
+            shutdown_state.load(Ordering::Relaxed),
+            2,
+            "the second Ctrl+C force-kills"
+        );
+        handler._listener.fire_for_test(ConsoleStopEvent::Close);
+        assert_eq!(shutdown_state.load(Ordering::Relaxed), 3);
     }
 
     #[cfg(unix)]

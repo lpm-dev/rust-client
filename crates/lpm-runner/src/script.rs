@@ -1134,7 +1134,7 @@ pub fn run_dev_script_with_envs_and_config(
     config: Option<&lpm_json::LpmJsonConfig>,
     endpoint_options: DevScriptEndpointOptions,
 ) -> Result<(), LpmError> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _stop_signals = shell::register_stop_signals(&endpoint_options.stop_requested)?;
     let ResolvedScript {
         command: script_cmd,

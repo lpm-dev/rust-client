@@ -204,6 +204,48 @@ pub(crate) fn register_stop_signals(
     Ok(registrations)
 }
 
+/// Ctrl+C, Ctrl+Break and the console window's closing set `stop_requested`
+/// while the result lives, as SIGINT, SIGTERM and SIGHUP do on Unix, rather
+/// than ending lpm before it stops the dev server and releases what the
+/// session holds.
+#[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix registration, which can fail"
+)]
+pub(crate) fn register_stop_signals(
+    stop_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<crate::execution::ConsoleStop, LpmError> {
+    let stop_requested = std::sync::Arc::clone(stop_requested);
+    Ok(crate::execution::ConsoleStop::new(move |_| {
+        stop_requested.store(true, std::sync::atomic::Ordering::Release);
+    }))
+}
+
+/// How long a dev server a console event reached has to stop itself before
+/// lpm ends its whole tree.
+#[cfg(windows)]
+const DEV_SERVER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stops the dev server. It shares lpm's console, so a Ctrl+C or a closing
+/// window that began the stop reached it too: it gets a grace period to stop
+/// itself, with its own handlers, before lpm ends its whole tree. Windows
+/// can't send a Ctrl+C to the server alone, so a stop lpm began itself ends
+/// the tree at once.
+#[cfg(windows)]
+fn stop_dev_server(child: &mut std::process::Child) -> std::io::Result<ExitStatus> {
+    if crate::execution::console_stopping() {
+        let deadline = std::time::Instant::now() + DEV_SERVER_STOP_GRACE;
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    crate::ports::terminate_child_process_tree(child)
+}
+
 /// Spawn a shell command and wait for it to complete.
 ///
 /// Returns the exit status. Stdio is inherited so the child process
@@ -303,6 +345,9 @@ pub fn spawn_shell_with_endpoint(
         stop_requested,
         on_endpoint,
         on_shutdown_started,
+        #[cfg(windows)]
+        stop_dev_server,
+        #[cfg(not(windows))]
         crate::ports::terminate_child_process_tree,
     )
 }
@@ -319,7 +364,7 @@ fn spawn_shell_with_endpoint_using<T>(
 where
     T: FnMut(&mut std::process::Child) -> std::io::Result<ExitStatus>,
 {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _stop_signal_registrations = register_stop_signals(&stop_requested)?;
     let mut command = shell_process(cmd.command)?;
     // The server runs in its own process group, outside the terminal's
@@ -424,7 +469,18 @@ where
     let mut shutdown_result = Ok(());
     let status_result = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => {
+                #[cfg(windows)]
+                let stopping = crate::execution::exit_follows_console_stop(status, || {
+                    stop_requested.load(std::sync::atomic::Ordering::Acquire)
+                });
+                #[cfg(not(windows))]
+                let stopping = stop_requested.load(std::sync::atomic::Ordering::Acquire);
+                if stopping {
+                    shutdown_result = crate::invoke_shutdown_started(&mut on_shutdown_started);
+                }
+                break Ok(status);
+            }
             Ok(None) => {}
             Err(error) => {
                 break Err(LpmError::Script(format!(
@@ -1481,6 +1537,64 @@ mod tests {
         assert!(
             shutdown_boundary_ran.load(std::sync::atomic::Ordering::Acquire),
             "child cleanup started without acknowledging the shutdown boundary"
+        );
+    }
+
+    /// The dev server shares lpm's console, so the Ctrl+C that stops the
+    /// session can end it before lpm's handler, which Windows runs on a
+    /// thread of its own, has recorded the stop.
+    #[cfg(windows)]
+    #[test]
+    fn a_dev_server_the_console_interrupt_ended_first_still_begins_the_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let exiting_path = dir.path().join("exiting");
+        let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let controller_stop = std::sync::Arc::clone(&stop_requested);
+        let controller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !exiting_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(exiting_path.exists(), "the dev server did not run");
+            // Past lpm's 50 ms poll, so lpm has seen the exit first.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            controller_stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_state = std::sync::Arc::clone(&shutdown_started);
+
+        let status = spawn_shell_with_endpoint(
+            &ShellCommand {
+                command: &format!(
+                    "{} & exit {}",
+                    crate::test_support::script_creating_file("exiting"),
+                    crate::execution::STATUS_CONTROL_C_EXIT as i32
+                ),
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            EndpointDiscovery::required(false),
+            stop_requested,
+            Box::new(|_| {}),
+            Some(Box::new(move || {
+                callback_state.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })),
+        )
+        .unwrap();
+        controller.join().unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(crate::execution::STATUS_CONTROL_C_EXIT as i32)
+        );
+        assert!(
+            shutdown_started.load(std::sync::atomic::Ordering::Acquire),
+            "the session's shutdown did not begin"
         );
     }
 

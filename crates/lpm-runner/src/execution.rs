@@ -8,7 +8,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// The exit status of a process that Ctrl+C's or Ctrl+Break's default
 /// handler ended.
 #[cfg(windows)]
-const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+pub(crate) const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+
+/// Whether a child that exited did so in a stop lpm has recorded, as
+/// `recorded` reports. Windows runs lpm's console handler on a thread it
+/// starts for the event, so a child the same Ctrl+C or Ctrl+Break ended,
+/// with [`STATUS_CONTROL_C_EXIT`], can exit before lpm has recorded it; for
+/// such a child this waits briefly for the record.
+#[cfg(windows)]
+pub(crate) fn exit_follows_console_stop(status: ExitStatus, recorded: impl Fn() -> bool) -> bool {
+    if status.code() == Some(STATUS_CONTROL_C_EXIT as i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !recorded() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    recorded()
+}
 
 /// Keep stop handlers active for a command or an entire file-watch session.
 pub struct ExecutionSignals {
@@ -18,6 +34,8 @@ pub struct ExecutionSignals {
     /// Console interrupts seen while this lived.
     #[cfg(windows)]
     presses: Arc<AtomicUsize>,
+    #[cfg(windows)]
+    listener: u64,
     /// Runs once lpm waits for the interrupt behind a child's exit, so a
     /// test can record one exactly then.
     #[cfg(all(test, windows))]
@@ -32,6 +50,8 @@ impl ExecutionSignals {
             registrations: Vec::with_capacity(2),
             #[cfg(windows)]
             presses: Arc::new(AtomicUsize::new(0)),
+            #[cfg(windows)]
+            listener: 0,
             #[cfg(all(test, windows))]
             on_await_interrupt: std::sync::Mutex::new(None),
         };
@@ -50,7 +70,14 @@ impl ExecutionSignals {
             signals
         };
         #[cfg(windows)]
-        console_interrupts::listen(&signals.signal, &signals.presses);
+        let signals = {
+            let mut signals = signals;
+            signals.listener = console_interrupts::listen(console_interrupts::Reaction::Record {
+                signal: Arc::clone(&signals.signal),
+                presses: Arc::clone(&signals.presses),
+            });
+            signals
+        };
         Ok(signals)
     }
 
@@ -61,42 +88,21 @@ impl ExecutionSignals {
         self.presses.load(Ordering::Acquire) > 1
     }
 
-    /// How many console interrupts (Ctrl+C or Ctrl+Break) this has seen.
-    #[cfg(windows)]
-    pub(crate) fn console_presses(&self) -> usize {
-        self.presses.load(Ordering::Acquire)
-    }
-
-    /// Records one Ctrl+C in this listener alone, as the console handler
-    /// would, without raising one that every test in the process would get.
-    #[cfg(all(test, windows))]
-    pub(crate) fn interrupt_for_test(&self) {
-        console_interrupts::notify(&self.signal, &self.presses, console_interrupts::SIGINT);
-    }
-
-    /// Windows runs lpm's console handler on a thread it starts for the
-    /// interrupt, so a child the same interrupt ended can exit before lpm
-    /// has recorded it. For a child that exited that way, waits briefly for
-    /// the record, so lpm reports which interrupt it was rather than the
-    /// child's status.
+    /// Waits for the interrupt behind a child's `STATUS_CONTROL_C_EXIT`, so
+    /// lpm reports which interrupt it was rather than the child's status.
     #[cfg(windows)]
     fn await_the_interrupt_behind(&self, status: ExitStatus) {
-        if status.code() != Some(STATUS_CONTROL_C_EXIT as i32) {
-            return;
-        }
         #[cfg(test)]
-        if let Some(hook) = self
-            .on_await_interrupt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        if status.code() == Some(STATUS_CONTROL_C_EXIT as i32)
+            && let Some(hook) = self
+                .on_await_interrupt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
         {
             hook();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while !self.is_stopped() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        exit_follows_console_stop(status, || self.is_stopped());
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -353,36 +359,137 @@ impl Drop for ChildOrStopWake {
 #[cfg(windows)]
 impl Drop for ExecutionSignals {
     fn drop(&mut self) {
-        console_interrupts::stop_listening(&self.signal);
+        console_interrupts::stop_listening(self.listener);
     }
 }
 
-/// Ctrl+C and Ctrl+Break at the console, while an [`ExecutionSignals`]
-/// lives: recorded in it as SIGINT or SIGBREAK, without ending lpm. The
-/// foreground child shares the console, so it gets the event too and
-/// decides for itself, as under cmd.exe; ending lpm at once left a batch
-/// file it ran asking "Terminate batch job (Y/N)?" while the shell read the
-/// keyboard too. A second press stops the child.
+/// Whether a console event has started a shutdown, through a
+/// [`ConsoleStop`]: the processes that share lpm's console got the event
+/// too, and are stopping themselves.
+#[cfg(windows)]
+pub(crate) fn console_stopping() -> bool {
+    console_interrupts::stopping()
+}
+
+/// What made a [`ConsoleStop`] call its stop.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsoleStopEvent {
+    /// Ctrl+C or Ctrl+Break.
+    Interrupt,
+    /// The console window is closing; writing to it may fail.
+    Close,
+}
+
+/// While it lives, the console's Ctrl+C and Ctrl+Break, and the closing of
+/// its window, call a stop instead of ending lpm, as SIGINT, SIGTERM and
+/// SIGHUP stop `lpm dev` on Unix. Closing the window still ends lpm, about
+/// five seconds after the call at most, so the stop starts the shutdown and
+/// lpm finishes it in that time.
+#[cfg(windows)]
+pub(crate) struct ConsoleStop {
+    listener: u64,
+}
+
+#[cfg(windows)]
+impl ConsoleStop {
+    pub(crate) fn new(on_stop: impl Fn(ConsoleStopEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            listener: console_interrupts::listen(console_interrupts::Reaction::Stop(Arc::new(
+                on_stop,
+            ))),
+        }
+    }
+
+    /// Calls this stop alone, as the console handler would, without raising
+    /// an event that every test in the process would get.
+    #[cfg(test)]
+    pub(crate) fn fire_for_test(&self, event: ConsoleStopEvent) {
+        if let Some(stop) = console_interrupts::stop_of(self.listener) {
+            stop(event);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleStop {
+    fn drop(&mut self) {
+        console_interrupts::stop_listening(self.listener);
+    }
+}
+
+/// Ctrl+C, Ctrl+Break and the window's closing at the console, while a
+/// listener lives, without ending lpm.
+///
+/// An [`ExecutionSignals`] records Ctrl+C and Ctrl+Break as SIGINT or
+/// SIGBREAK. The foreground child shares the console, so it gets the event
+/// too and decides for itself, as under cmd.exe; ending lpm at once left a
+/// batch file it ran asking "Terminate batch job (Y/N)?" while the shell
+/// read the keyboard too. A second press stops the child.
+///
+/// A [`ConsoleStop`] is called for each, and for the window's closing.
 #[cfg(windows)]
 mod console_interrupts {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::ConsoleStopEvent;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Once, PoisonError};
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
     use windows_sys::Win32::System::Console::{
-        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
     };
     use windows_sys::core::BOOL;
 
     pub(super) const SIGINT: usize = 2;
     const SIGBREAK: usize = 21;
 
-    /// A live `ExecutionSignals`: the signal it records and its presses.
+    /// How long the handler keeps lpm alive for its shutdown once the window
+    /// closes. Windows ends the process sooner, five seconds after the event
+    /// by default, and lpm ends itself as soon as its shutdown is done.
+    const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    pub(super) type Stop = Arc<dyn Fn(ConsoleStopEvent) + Send + Sync>;
+
+    /// What a listener does with an event.
+    pub(super) enum Reaction {
+        /// A live `ExecutionSignals`: records Ctrl+C and Ctrl+Break as the
+        /// signal they stand for, and counts the presses.
+        Record {
+            signal: Arc<AtomicUsize>,
+            presses: Arc<AtomicUsize>,
+        },
+        /// A live `ConsoleStop`: called for Ctrl+C, Ctrl+Break and the
+        /// window's closing.
+        Stop(Stop),
+    }
+
     struct Listener {
-        signal: Arc<AtomicUsize>,
-        presses: Arc<AtomicUsize>,
+        id: u64,
+        reaction: Reaction,
+    }
+
+    /// A listener's reaction, copied out of the lock for one event.
+    pub(super) enum ReactionHandle {
+        Record {
+            signal: Arc<AtomicUsize>,
+            presses: Arc<AtomicUsize>,
+        },
+        Stop(Stop),
+    }
+
+    impl Listener {
+        fn reaction_handle(&self) -> ReactionHandle {
+            match &self.reaction {
+                Reaction::Record { signal, presses } => ReactionHandle::Record {
+                    signal: Arc::clone(signal),
+                    presses: Arc::clone(presses),
+                },
+                Reaction::Stop(stop) => ReactionHandle::Stop(Arc::clone(stop)),
+            }
+        }
     }
 
     static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     static HANDLER: Once = Once::new();
 
     pub(super) fn signal_for(event: u32) -> Option<usize> {
@@ -399,43 +506,133 @@ mod console_interrupts {
         presses.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Set once a `ConsoleStop` has been called: lpm has a shutdown under
+    /// way, which outlives the listeners, as `lpm dev` releases its tunnel,
+    /// proxy routes and hosts-file entries after its services stop. Later
+    /// events then leave lpm running, as a signal does on Unix once its
+    /// handler's actions are gone.
+    static STOPPING: AtomicBool = AtomicBool::new(false);
+
     /// Runs on a thread of its own that Windows starts for the event.
     unsafe extern "system" fn on_console_event(event: u32) -> BOOL {
-        let Some(signal) = signal_for(event) else {
-            return FALSE;
-        };
-        let listeners = LISTENERS.lock().unwrap_or_else(PoisonError::into_inner);
-        if listeners.is_empty() {
-            // Nothing runs in the foreground: end lpm, as before.
-            return FALSE;
+        // Copied out under the lock: a stop may take time, and the shutdown
+        // it starts drops listeners.
+        let listeners = LISTENERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(Listener::reaction_handle)
+            .collect::<Vec<_>>();
+        if dispatch(event, &listeners, &STOPPING, CLOSE_GRACE) {
+            TRUE
+        } else {
+            FALSE
         }
-        for listener in listeners.iter() {
-            notify(&listener.signal, &listener.presses, signal);
-        }
-        TRUE
     }
 
-    pub(super) fn listen(signal: &Arc<AtomicUsize>, presses: &Arc<AtomicUsize>) {
+    /// What lpm does with console `event` for `listeners`; whether it
+    /// handled the event rather than leaving Windows to end lpm. On the
+    /// window's closing it waits `close_grace` before returning, as Windows
+    /// ends lpm when it returns.
+    pub(super) fn dispatch(
+        event: u32,
+        listeners: &[ReactionHandle],
+        stopping: &AtomicBool,
+        close_grace: std::time::Duration,
+    ) -> bool {
+        let signal = signal_for(event);
+        let closing = event == CTRL_CLOSE_EVENT;
+        if signal.is_none() && !closing {
+            return false;
+        }
+        if let Some(signal) = signal {
+            for listener in listeners {
+                if let ReactionHandle::Record {
+                    signal: record,
+                    presses,
+                } = listener
+                {
+                    notify(record, presses, signal);
+                }
+            }
+        }
+        let stops: Vec<&Stop> = listeners
+            .iter()
+            .filter_map(|listener| match listener {
+                ReactionHandle::Stop(stop) => Some(stop),
+                ReactionHandle::Record { .. } => None,
+            })
+            .collect();
+        let stop_event = if closing {
+            ConsoleStopEvent::Close
+        } else {
+            ConsoleStopEvent::Interrupt
+        };
+        for stop in &stops {
+            stopping.store(true, Ordering::Release);
+            // A panic can't unwind out of the console handler, so one here
+            // would abort lpm before its cleanup.
+            let stop = std::panic::AssertUnwindSafe(|| stop(stop_event));
+            if std::panic::catch_unwind(stop).is_err() {
+                tracing::debug!("a console stop panicked");
+            }
+        }
+        let shutting_down = !stops.is_empty() || stopping.load(Ordering::Acquire);
+        if closing {
+            // Only a shutdown has anything to finish; otherwise the closing
+            // window ends lpm, as before.
+            if !shutting_down {
+                return false;
+            }
+            std::thread::sleep(close_grace);
+            return true;
+        }
+        // Without a listener or a shutdown, nothing runs in the foreground:
+        // end lpm, as before.
+        !listeners.is_empty() || shutting_down
+    }
+
+    pub(super) fn listen(reaction: Reaction) -> u64 {
         HANDLER.call_once(|| {
             // SAFETY: the handler is a plain function that lives for the
-            // whole process. Should Windows refuse it, Ctrl+C ends lpm, as
-            // it did before there was one.
-            unsafe { SetConsoleCtrlHandler(Some(on_console_event), TRUE) };
+            // whole process.
+            if unsafe { SetConsoleCtrlHandler(Some(on_console_event), TRUE) } == 0 {
+                tracing::debug!(
+                    "Windows refused lpm's console handler, so Ctrl+C ends lpm at once: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         });
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         LISTENERS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(Listener {
-                signal: Arc::clone(signal),
-                presses: Arc::clone(presses),
-            });
+            .push(Listener { id, reaction });
+        id
     }
 
-    pub(super) fn stop_listening(signal: &Arc<AtomicUsize>) {
+    pub(super) fn stopping() -> bool {
+        STOPPING.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn stop_of(id: u64) -> Option<Stop> {
         LISTENERS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|listener| !Arc::ptr_eq(&listener.signal, signal));
+            .iter()
+            .find(|listener| listener.id == id)
+            .and_then(|listener| match &listener.reaction {
+                Reaction::Stop(stop) => Some(Arc::clone(stop)),
+                Reaction::Record { .. } => None,
+            })
+    }
+
+    pub(super) fn stop_listening(id: u64) {
+        LISTENERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|listener| listener.id != id);
     }
 }
 
@@ -631,6 +828,137 @@ mod windows_tests {
         let status = signals.run(&mut ended_by_the_console()).unwrap();
 
         assert_eq!(status.code(), Some(STATUS_CONTROL_C_EXIT as i32));
+    }
+
+    #[test]
+    fn a_console_stop_is_called_while_it_lives_and_released_when_dropped() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let stop = ConsoleStop::new(move |event| recorded.lock().unwrap().push(event));
+        let listener = stop.listener;
+
+        stop.fire_for_test(ConsoleStopEvent::Interrupt);
+        stop.fire_for_test(ConsoleStopEvent::Close);
+        drop(stop);
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [ConsoleStopEvent::Interrupt, ConsoleStopEvent::Close]
+        );
+        assert!(console_interrupts::stop_of(listener).is_none());
+    }
+
+    fn stop_recording(
+        calls: &Arc<std::sync::Mutex<Vec<ConsoleStopEvent>>>,
+    ) -> console_interrupts::ReactionHandle {
+        let calls = Arc::clone(calls);
+        console_interrupts::ReactionHandle::Stop(Arc::new(move |event| {
+            calls.lock().unwrap().push(event);
+        }))
+    }
+
+    #[test]
+    fn a_console_event_reaches_each_listener_as_its_kind_takes_it() {
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        let (signal, presses) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listeners = [
+            console_interrupts::ReactionHandle::Record {
+                signal: Arc::clone(&signal),
+                presses: Arc::clone(&presses),
+            },
+            stop_recording(&calls),
+        ];
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+
+        let handled = console_interrupts::dispatch(
+            CTRL_C_EVENT,
+            &listeners,
+            &stopping,
+            std::time::Duration::ZERO,
+        );
+
+        assert!(handled, "lpm keeps running");
+        assert_eq!(signal.load(Ordering::Acquire), console_interrupts::SIGINT);
+        assert_eq!(presses.load(Ordering::Acquire), 1);
+        assert_eq!(*calls.lock().unwrap(), [ConsoleStopEvent::Interrupt]);
+        assert!(stopping.load(Ordering::Acquire), "a shutdown is under way");
+    }
+
+    #[test]
+    fn a_closing_window_is_a_stop_s_to_handle_and_ends_lpm_run_as_before() {
+        use windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT;
+        let record = console_interrupts::ReactionHandle::Record {
+            signal: Arc::new(AtomicUsize::new(0)),
+            presses: Arc::new(AtomicUsize::new(0)),
+        };
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            !console_interrupts::dispatch(
+                CTRL_CLOSE_EVENT,
+                &[record],
+                &stopping,
+                std::time::Duration::ZERO
+            ),
+            "`lpm run` lets the closing window end it"
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(console_interrupts::dispatch(
+            CTRL_CLOSE_EVENT,
+            &[stop_recording(&calls)],
+            &stopping,
+            std::time::Duration::ZERO
+        ));
+        assert_eq!(*calls.lock().unwrap(), [ConsoleStopEvent::Close]);
+    }
+
+    /// Once a stop has run, lpm finishes its shutdown after the listeners
+    /// are gone, rather than letting a later press or the window's closing
+    /// end it with its cleanup half done.
+    #[test]
+    fn a_shutdown_under_way_keeps_lpm_running_with_no_listener_left() {
+        use windows_sys::Win32::System::Console::{CTRL_C_EVENT, CTRL_CLOSE_EVENT};
+        let idle = std::sync::atomic::AtomicBool::new(false);
+        assert!(!console_interrupts::dispatch(
+            CTRL_C_EVENT,
+            &[],
+            &idle,
+            std::time::Duration::ZERO
+        ));
+
+        let stopping = std::sync::atomic::AtomicBool::new(true);
+        assert!(console_interrupts::dispatch(
+            CTRL_C_EVENT,
+            &[],
+            &stopping,
+            std::time::Duration::ZERO
+        ));
+        assert!(console_interrupts::dispatch(
+            CTRL_CLOSE_EVENT,
+            &[],
+            &stopping,
+            std::time::Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn a_stop_that_panics_leaves_the_others_and_lpm_running() {
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listeners = [
+            console_interrupts::ReactionHandle::Stop(Arc::new(|_| panic!("a stop that panics"))),
+            stop_recording(&calls),
+        ];
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(console_interrupts::dispatch(
+            CTRL_C_EVENT,
+            &listeners,
+            &stopping,
+            std::time::Duration::ZERO
+        ));
+        assert_eq!(*calls.lock().unwrap(), [ConsoleStopEvent::Interrupt]);
     }
 
     #[test]

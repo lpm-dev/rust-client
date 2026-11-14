@@ -202,7 +202,12 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
             break;
         }
 
-        for (name, status) in collect_exited_children(context.children) {
+        let exited = collect_exited_children(context.children);
+        #[cfg(windows)]
+        if console_interrupt_behind(&exited, context.shutdown_state) {
+            break;
+        }
+        for (name, status) in exited {
             handle_service_exit(&context, &mut states, &name, status);
         }
 
@@ -718,6 +723,21 @@ fn restart_job_is_current(
             .lock()
             .iter()
             .any(|(name, child)| name == &job.name && child.id() == job.child_pid)
+}
+
+/// Whether services exited because the shutdown began, rather than crashing:
+/// one the console Ctrl+C that began it ended can exit before lpm's handler
+/// has run.
+#[cfg(windows)]
+pub(super) fn console_interrupt_behind(
+    exited: &[(String, ExitStatus)],
+    shutdown_state: &std::sync::atomic::AtomicU8,
+) -> bool {
+    exited.iter().any(|(_, status)| {
+        crate::execution::exit_follows_console_stop(*status, || {
+            shutdown_state.load(Ordering::Relaxed) > 0
+        })
+    })
 }
 
 fn restart_child_stopped(
@@ -1550,6 +1570,43 @@ mod tests {
         let dependency = first_unready_dependency_for(&config, &states);
 
         assert_eq!(dependency.as_deref(), Some("db"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_service_the_console_interrupt_ended_waits_for_the_shutdown_it_began() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let shutdown_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let starter = Arc::clone(&shutdown_state);
+        let handler = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            starter.store(1, Ordering::Relaxed);
+        });
+        let exited = [("web".to_string(), ExitStatus::from_raw(0xC000_013A))];
+
+        assert!(console_interrupt_behind(&exited, &shutdown_state));
+        handler.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_exits_are_not_taken_for_a_console_interrupt() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let shutdown_state = std::sync::atomic::AtomicU8::new(0);
+        let started = Instant::now();
+
+        assert!(!console_interrupt_behind(
+            &[("web".to_string(), ExitStatus::from_raw(1))],
+            &shutdown_state
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an ordinary exit waited"
+        );
+        assert!(!console_interrupt_behind(
+            &[("web".to_string(), ExitStatus::from_raw(0xC000_013A))],
+            &shutdown_state
+        ));
     }
 
     #[cfg(unix)]
