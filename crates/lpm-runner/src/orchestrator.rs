@@ -2159,9 +2159,7 @@ fn ctrlc_handler(
                     ui_warn("Stopping services...");
                 }
             } else {
-                terminal_eprintln!();
-                ui_warn("Force-killing services...");
-                force_kill_children(&kids);
+                force_kill_children(&kids, signal != SIGHUP);
                 break;
             }
         }
@@ -2214,11 +2212,8 @@ fn ctrlc_handler(
                     }
                 }
                 1 => {
-                    if event == ConsoleStopEvent::Interrupt {
-                        terminal_eprintln!();
-                        ui_warn("Force-killing services...");
-                    }
-                    force_kill_children(&children);
+                    // A closing window can't take more output.
+                    force_kill_children(&children, event == ConsoleStopEvent::Interrupt);
                 }
                 _ => {}
             }
@@ -2226,9 +2221,23 @@ fn ctrlc_handler(
     })
 }
 
-/// Immediately SIGKILL all children (used for double Ctrl+C escalation).
-fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
+/// Force-kills each service still running, as a second Ctrl+C and a forced
+/// shutdown do, and when `announce` holds, says how many it force-kills
+/// first. The count is taken under the lock both hold while they kill, so
+/// whichever comes second, finding nothing left, says nothing.
+fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, announce: bool) {
     let mut locked = children.lock();
+    if announce {
+        let to_force_kill = locked
+            .iter_mut()
+            .map(|(_, child)| !child.reported_force_killed && child.tree_running())
+            .filter(|left_to_force_kill| *left_to_force_kill)
+            .count();
+        if to_force_kill > 0 {
+            terminal_eprintln!();
+            ui_warn(&format!("Force-killing {}...", services(to_force_kill)));
+        }
+    }
     force_kill_and_report_all(
         locked
             .iter_mut()
@@ -2383,24 +2392,7 @@ fn shutdown_children_ordered(
     }
 
     if force {
-        let mut locked = children.lock();
-        // A second Ctrl+C force-kills each service as it comes, saying so,
-        // and may do that before the shutdown begins.
-        let to_force_kill = locked
-            .iter_mut()
-            .map(|(_, child)| !child.reported_force_killed && child.tree_running())
-            .filter(|left_to_force_kill| *left_to_force_kill)
-            .count();
-        if to_force_kill > 0 {
-            terminal_eprintln!();
-            ui_warn(&format!("Force-killing {}...", services(to_force_kill)));
-        }
-        force_kill_and_report_all(
-            locked
-                .iter_mut()
-                .map(|(name, child)| (name.as_str(), child)),
-            cleanup_deadline(),
-        );
+        force_kill_children(children, true);
     } else {
         // A second Ctrl+C may have come since the shutdown read that it
         // wasn't forced.
@@ -3425,7 +3417,7 @@ mod tests {
             )]));
 
             let reports = service_reports(|| {
-                force_kill_children(&children);
+                force_kill_children(&children, false);
                 shutdown_children_ordered(
                     &children,
                     force,
@@ -3454,7 +3446,7 @@ mod tests {
         let mut reports = Vec::new();
         let said = warnings(|| {
             reports = service_reports(|| {
-                force_kill_children(&children);
+                force_kill_children(&children, false);
                 shutdown_children_ordered(&children, true, Some(&order), || false);
             });
         });
@@ -3478,6 +3470,45 @@ mod tests {
         assert_eq!(said, ["Force-killing 1 service..."]);
     }
 
+    /// A second Ctrl+C and a forced shutdown each force-kill what the other
+    /// left running, whichever comes first, and only the first announces
+    /// force-killing it.
+    #[test]
+    fn force_killing_is_announced_once_whether_the_shutdown_or_a_second_ctrl_c_comes_first() {
+        let order = [vec!["web".to_string()]];
+        for ctrl_c_first in [true, false] {
+            let project = tempfile::tempdir().unwrap();
+            let children = Arc::new(Mutex::new(vec![(
+                "web".to_string(),
+                running_service(project.path()),
+            )]));
+
+            let mut reports = Vec::new();
+            let said = warnings(|| {
+                reports = service_reports(|| {
+                    if ctrl_c_first {
+                        force_kill_children(&children, true);
+                    }
+                    shutdown_children_ordered(&children, true, Some(&order), || false);
+                    if !ctrl_c_first {
+                        force_kill_children(&children, true);
+                    }
+                });
+            });
+
+            assert_eq!(
+                said,
+                ["Force-killing 1 service..."],
+                "Ctrl+C first: {ctrl_c_first}"
+            );
+            assert_eq!(
+                reports,
+                [reported("web", "force-killed")],
+                "Ctrl+C first: {ctrl_c_first}"
+            );
+        }
+    }
+
     /// A second Ctrl+C can force-kill every service after the shutdown
     /// read that it wasn't forced, and the shutdown then doesn't announce
     /// stopping them.
@@ -3492,7 +3523,7 @@ mod tests {
         let mut reports = Vec::new();
         let said = warnings(|| {
             reports = service_reports(|| {
-                force_kill_children(&children);
+                force_kill_children(&children, false);
                 shutdown_children_ordered(
                     &children,
                     false,
@@ -3563,7 +3594,7 @@ mod tests {
             ("web".to_string(), web),
         ]));
 
-        let reports = service_reports(|| force_kill_children(&children));
+        let reports = service_reports(|| force_kill_children(&children, false));
 
         assert_eq!(
             reports,
@@ -3729,7 +3760,7 @@ mod tests {
             )]));
 
             let reports = service_reports(|| {
-                force_kill_children(&children);
+                force_kill_children(&children, false);
                 shutdown_children_ordered(
                     &children,
                     force,
@@ -6520,7 +6551,7 @@ setInterval(() => {{}}, 1000);
         assert!(service_process_group_exists(root_pid));
         children.lock().push(("worker".to_string(), child.into()));
 
-        force_kill_children(&children);
+        force_kill_children(&children, false);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
