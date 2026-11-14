@@ -53,6 +53,18 @@ pub(crate) fn on_next_stop_check(hook: impl FnOnce() + 'static) {
     ON_STOP_CHECK.set(Some(Box::new(hook)));
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_TREE_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the next stop of a stopped command's tree on this thread fail,
+/// after stopping it.
+#[cfg(test)]
+pub(crate) fn fail_next_tree_stop() {
+    FAIL_NEXT_TREE_STOP.set(true);
+}
+
 /// Keep stop handlers active for a command or an entire file-watch session.
 pub struct ExecutionSignals {
     signal: Arc<AtomicUsize>,
@@ -245,6 +257,27 @@ pub struct ChildWait<'a> {
 }
 
 impl ChildWait<'_> {
+    /// Stops the child's tree on the stop lpm received. The interruption is
+    /// what lpm reports, so what it couldn't stop is only said.
+    fn stop_tree(&self, child: &mut std::process::Child) {
+        #[cfg(unix)]
+        let stopped = crate::ports::stop_child_process_tree(
+            child,
+            self.signals.signal.load(Ordering::Acquire) as i32,
+        );
+        #[cfg(not(unix))]
+        let stopped = crate::ports::terminate_child_process_tree(child).map(drop);
+        #[cfg(test)]
+        let stopped = if FAIL_NEXT_TREE_STOP.replace(false) {
+            stopped.and(Err(std::io::Error::other("injected tree stop failure")))
+        } else {
+            stopped
+        };
+        if let Err(error) = stopped {
+            tracing::warn!("the stopped command's processes didn't all stop: {error}");
+        }
+    }
+
     pub fn wait(self, child: &mut std::process::Child) -> Result<ExitStatus, LpmError> {
         #[cfg(not(unix))]
         let started = std::time::Instant::now();
@@ -254,22 +287,19 @@ impl ChildWait<'_> {
             self.wake.clear();
             #[cfg(unix)]
             if self.signals.is_stopped() {
-                crate::ports::stop_child_process_tree(
-                    child,
-                    self.signals.signal.load(Ordering::Acquire) as i32,
-                )?;
+                self.stop_tree(child);
                 self.signals.check()?;
             }
             // The child shares the console, so it got the interrupt too and
             // ends as it sees fit; a second one stops it.
             #[cfg(windows)]
             if self.signals.is_stopped() && self.signals.pressed_again() {
-                crate::ports::terminate_child_process_tree(child)?;
+                self.stop_tree(child);
                 self.signals.check()?;
             }
             #[cfg(not(any(unix, windows)))]
             if self.signals.is_stopped() {
-                crate::ports::terminate_child_process_tree(child)?;
+                self.stop_tree(child);
                 self.signals.check()?;
             }
             match child.try_wait() {
@@ -707,6 +737,25 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
+    /// lpm reports the interruption of a command whose processes didn't all
+    /// stop, such as one stuck exiting, and says what it couldn't stop.
+    #[test]
+    fn a_stopped_command_whose_processes_did_not_all_stop_reports_the_stop() {
+        let signals = ExecutionSignals::new().unwrap();
+        let flag = Arc::clone(&signals.signal);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(libc::SIGTERM as usize, Ordering::Release);
+            signal_hook::low_level::raise(signal_hook::consts::SIGCHLD).unwrap();
+        });
+        fail_next_tree_stop();
+
+        let result = signals.run(&mut shell("sleep 30"));
+        stopper.join().unwrap();
+
+        assert!(matches!(result, Err(LpmError::ExitCode(143))), "{result:?}");
+    }
+
     #[test]
     fn run_stops_the_child_when_a_stop_signal_arrives() {
         let signals = ExecutionSignals::new().unwrap();
@@ -789,6 +838,26 @@ mod windows_tests {
 
         assert!(matches!(result, Err(LpmError::ExitCode(130))), "{result:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// lpm reports the interruption of a command whose processes didn't all
+    /// stop on the second Ctrl+C, such as one stuck exiting.
+    #[test]
+    fn a_command_whose_processes_did_not_all_stop_on_a_second_interrupt_reports_it() {
+        let signals = ExecutionSignals::new().unwrap();
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
+        });
+        fail_next_tree_stop();
+
+        let result = signals.run(&mut ping(30));
+        interrupter.join().unwrap();
+
+        assert!(matches!(result, Err(LpmError::ExitCode(130))), "{result:?}");
     }
 
     /// A captured child that ends well on Ctrl+C still reports the
