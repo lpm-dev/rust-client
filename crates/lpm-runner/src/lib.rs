@@ -89,8 +89,7 @@ fn invoke_shutdown_started_while(
             callback.map_or(Ok(()), |callback| callback())
         });
     let Ok(thread) = started else {
-        let callback = slot.lock().take();
-        return callback.map_or(Ok(()), |callback| callback());
+        return run_unless_closing(&slot, &closing);
     };
     loop {
         if closing() {
@@ -105,6 +104,21 @@ fn invoke_shutdown_started_while(
             }
         }
     }
+}
+
+/// Runs the callback left in `slot` on this thread, as where no thread
+/// starts for it, unless the window is `closing`, which leaves no time to
+/// wait for it.
+#[cfg(any(windows, test))]
+fn run_unless_closing(
+    slot: &parking_lot::Mutex<Option<ShutdownStartedCallback>>,
+    closing: impl Fn() -> bool,
+) -> Result<(), lpm_common::LpmError> {
+    if closing() {
+        return Ok(());
+    }
+    let callback = slot.lock().take();
+    callback.map_or(Ok(()), |callback| callback())
 }
 
 #[cfg(test)]
@@ -176,6 +190,30 @@ mod tests {
         }));
 
         assert!(outcome.is_err());
+    }
+
+    /// Where no thread starts for it, what the shutdown begins with runs on
+    /// lpm's own, unless the window is closing.
+    #[test]
+    fn without_a_thread_what_the_shutdown_begins_with_runs_only_on_an_open_console() {
+        for closing in [false, true] {
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let runs = std::sync::Arc::clone(&ran);
+            let slot: parking_lot::Mutex<Option<ShutdownStartedCallback>> =
+                parking_lot::Mutex::new(Some(Box::new(move || {
+                    runs.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                })));
+
+            let result = run_unless_closing(&slot, || closing);
+
+            assert!(result.is_ok(), "closing: {closing}");
+            assert_eq!(
+                ran.load(std::sync::atomic::Ordering::Acquire),
+                !closing,
+                "closing: {closing}"
+            );
+        }
     }
 
     #[test]
