@@ -1467,11 +1467,12 @@ pub(crate) fn open_project_cert_directory(
             project_dir.display()
         ))
     })?;
+    let shown_project = lpm_common::symlink::windows_plain_path(&project_path);
     let project =
         Dir::open_ambient_dir(&project_path, cap_std::ambient_authority()).map_err(|error| {
             LpmError::Cert(format!(
                 "failed to open project directory {}: {error}",
-                project_path.display()
+                shown_project.display()
             ))
         })?;
     let Some(state) = open_or_create_directory(
@@ -1484,7 +1485,7 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
-    lpm_common::keep_state_dir_ignored_or_warn(&state, &project_path.join(".lpm"));
+    lpm_common::keep_state_dir_ignored_or_warn(&state, &shown_project.join(".lpm"));
     let Some(certs) = open_or_create_directory(
         &state,
         "certs",
@@ -1495,10 +1496,10 @@ pub(crate) fn open_project_cert_directory(
     else {
         return Ok(None);
     };
-    let mut path = project_path.clone();
+    let mut path = project_path;
     path.push(".lpm");
     path.push("certs");
-    let mut display_path = lpm_common::symlink::windows_plain_path(&project_path);
+    let mut display_path = shown_project;
     display_path.push(".lpm");
     display_path.push("certs");
     let directory = ProjectCertDirectory {

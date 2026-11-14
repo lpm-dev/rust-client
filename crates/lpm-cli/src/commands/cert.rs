@@ -242,12 +242,10 @@ fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
             "{}",
             serde_json::json!({ "success": true, "ca_uninstalled": true })
         );
+    } else if result.removed {
+        install_ui::done("CA removed from system trust store");
     } else {
-        install_ui::done(match result.was_trusted {
-            Some(true) => "CA removed from system trust store",
-            Some(false) => "CA was not in the system trust store; nothing to remove",
-            None => "CA is no longer in the system trust store",
-        });
+        install_ui::done("CA was not in the system trust store; nothing to remove");
     }
 
     Ok(())

@@ -86,9 +86,9 @@ pub struct UninstallCaResult {
     /// SHA-256 fingerprints of the certificates whose trust was removed: the
     /// on-disk root's, then that of a pending write's root that differs.
     pub fingerprints: Vec<String>,
-    /// Whether the trust store held any of them before the removal; `None`
-    /// where it couldn't be read then.
-    pub was_trusted: Option<bool>,
+    /// Whether the trust store held anything of them to remove, trusted or
+    /// not.
+    pub removed: bool,
 }
 
 /// Remove the active LPM root from the OS trust store and record the exact
@@ -108,22 +108,11 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
         .as_ref()
         .filter(|pending| on_disk.as_ref() != Some(*pending));
     let mut fingerprints = Vec::with_capacity(2);
-    let mut was_trusted = Some(false);
+    let mut removed = false;
     for cert_pem in on_disk.iter().chain(pending) {
-        // Only what lpm says depends on this check, so one that fails doesn't
-        // stop the removal, which also clears what it can't see, such as a
-        // Linux anchor whose bundle wasn't refreshed.
-        match trust::is_ca_installed_bytes(cert_pem, &ca_cert_path) {
-            Ok(true) => was_trusted = Some(true),
-            Ok(false) => {}
-            Err(error) => {
-                tracing::debug!("could not read the trust store before the removal: {error}");
-                if was_trusted == Some(false) {
-                    was_trusted = None;
-                }
-            }
-        }
-        fingerprints.push(uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?);
+        let (fingerprint, removed_this) = uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?;
+        fingerprints.push(fingerprint);
+        removed |= removed_this;
     }
     if pending_pair.is_some() {
         operation.retire_pending_pair()?;
@@ -136,26 +125,30 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
     }
     Ok(UninstallCaResult {
         fingerprints,
-        was_trusted,
+        removed,
     })
 }
 
 /// Removes `cert_pem` from the OS trust store and records that in the
-/// audit log; returns the certificate's fingerprint.
+/// audit log; returns the certificate's fingerprint, and whether the store
+/// held anything of it to remove.
 fn uninstall_ca_locked(
     operation: &paths::CertificateOperation,
     cert_pem: &[u8],
     ca_cert_path: &std::path::Path,
-) -> Result<String, LpmError> {
+) -> Result<(String, bool), LpmError> {
     let _generation_guard = operation.acquire_destructive_generation(cert_pem)?;
     let fingerprint = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?);
-    match trust::uninstall_ca_bytes(cert_pem, ca_cert_path) {
-        Ok(()) => audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
-            fingerprint: fingerprint.clone(),
-            store: trust_store_label(),
-            status: audit::AuditStatus::Ok,
-            error: None,
-        }),
+    let removed = match trust::uninstall_ca_bytes(cert_pem, ca_cert_path) {
+        Ok(removed) => {
+            audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
+                fingerprint: fingerprint.clone(),
+                store: trust_store_label(),
+                status: audit::AuditStatus::Ok,
+                error: None,
+            });
+            removed
+        }
         Err(error) => {
             audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
                 fingerprint,
@@ -165,8 +158,8 @@ fn uninstall_ca_locked(
             });
             return Err(error);
         }
-    }
-    Ok(fingerprint)
+    };
+    Ok((fingerprint, removed))
 }
 
 fn trust_ca_locked(ca_dir: &paths::GlobalCaDirectory) -> Result<TrustCaResult, LpmError> {
@@ -1031,48 +1024,6 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn uninstall_removes_trust_even_when_the_store_cannot_be_read_beforehand() {
-        let _serial = test_env_lock();
-        let home = tempfile::tempdir().unwrap();
-        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
-        let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", home.path().join("audit"));
-        let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", home.path().join("trust"));
-        let root = trust_ca().unwrap();
-        let cert_pem = std::fs::read(&root.cert_path).unwrap();
-        assert!(trust::is_ca_installed_bytes(&cert_pem, &root.cert_path).unwrap());
-
-        trust::fail_next_trust_check();
-        let result = uninstall_active_ca().unwrap();
-
-        assert_eq!(result.was_trusted, None);
-        assert!(!trust::is_ca_installed_bytes(&cert_pem, &root.cert_path).unwrap());
-    }
 
     #[test]
     fn https_setup_debug_output_redacts_private_key_material() {

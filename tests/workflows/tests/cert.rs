@@ -607,6 +607,25 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         "generate must NOT install the CA into the trust store (use `lpm cert trust` for that)"
     );
 
+    for (field, file) in [
+        ("cert_path", project_cert_path(&project)),
+        ("key_path", project_key_path(&project)),
+    ] {
+        let shown = envelope[field].as_str().expect("path fields are strings");
+        assert_eq!(
+            std::fs::canonicalize(shown).unwrap(),
+            std::fs::canonicalize(&file).unwrap(),
+            "{field} names the project's file"
+        );
+        // A path a user would type, which tools that can't read a verbatim
+        // `\\?\` path, or a mixed separator, can open.
+        if cfg!(windows) {
+            assert!(
+                !shown.starts_with(r"\\?\") && !shown.contains('/'),
+                "{field}: {shown}"
+            );
+        }
+    }
     envelope["cert_path"] = serde_json::json!("[CERT_PATH]");
     envelope["key_path"] = serde_json::json!("[KEY_PATH]");
     insta::assert_json_snapshot!(

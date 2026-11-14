@@ -101,6 +101,9 @@ jobs:
       - name: Windows CLI unit tests (serial libtest)
         run: cargo test --locked -p lpm-cli --bin lpm-rs -- --test-threads=1
 
+      - name: Windows certificate contracts
+        run: cargo nextest run --locked -p lpm-workflows --test cert --no-fail-fast --status-level slow --final-status-level fail
+
       - name: Windows uninstall cleanup contracts
         run: cargo nextest run --locked -p lpm-workflows --test uninstall_contract --no-fail-fast --status-level slow --final-status-level fail
 
