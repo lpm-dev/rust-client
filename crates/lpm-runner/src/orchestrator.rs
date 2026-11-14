@@ -2554,11 +2554,11 @@ fn terminate_service_tree(child: &mut ServiceProcess) {
         if service_process_group_exists(root_pid) {
             signal_service_process_group(root_pid, libc::SIGKILL);
         }
-        let _ = child.wait();
+        wait_for_ended_service(child);
     }
     #[cfg(windows)]
     if child.end_job() {
-        let _ = child.wait();
+        wait_for_ended_service(child);
         return;
     }
     #[cfg(not(unix))]
@@ -2567,6 +2567,17 @@ fn terminate_service_tree(child: &mut ServiceProcess) {
             "service process {} may have left processes running: {error}",
             child.id()
         );
+    }
+}
+
+/// Waits, up to the cleanup deadline, for a service lpm has ended to exit.
+#[cfg(any(unix, windows))]
+fn wait_for_ended_service(child: &mut ServiceProcess) {
+    if let Err(error) = ports::wait_for_ended_child(
+        child,
+        std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT,
+    ) {
+        tracing::warn!("service process {}: {error}", child.id());
     }
 }
 
@@ -2626,11 +2637,11 @@ fn force_kill_service_tree(child: &mut ServiceProcess) {
     #[cfg(unix)]
     {
         signal_service_process_group(child.id(), libc::SIGKILL);
-        let _ = child.wait();
+        wait_for_ended_service(child);
     }
     #[cfg(windows)]
     if child.end_job() {
-        let _ = child.wait();
+        wait_for_ended_service(child);
         return;
     }
     #[cfg(not(unix))]

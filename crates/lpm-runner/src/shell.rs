@@ -44,8 +44,8 @@ const MAX_CAPTURED_STREAM_BYTES: usize = lpm_common::TASK_OUTPUT_CAPTURE_BYTES;
 const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_ENDPOINT_OUTPUT_LINE_BYTES: usize = 64 * 1024;
 const MAX_PENDING_ENDPOINT_CANDIDATES: usize = 64;
-/// How long ending a Windows Job waits for its processes to be gone.
-#[cfg(windows)]
+/// How long lpm waits for processes it ended to be gone, and for the threads
+/// forwarding their output to reach its end.
 pub(crate) const SERVICE_TREE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Append `line` (plus a newline) to `buf` unless that would push
@@ -355,6 +355,8 @@ pub fn spawn_shell_with_endpoint(
         DevServerStopping {
             terminate: crate::ports::terminate_child_process_tree,
             #[cfg(windows)]
+            end_job: lpm_common::process_job::ProcessJob::end,
+            #[cfg(windows)]
             console_interrupted: Box::new(crate::execution::console_interrupted),
         },
     )
@@ -365,6 +367,10 @@ struct DevServerStopping<T> {
     /// Ends the server's whole process tree by walking it: on Windows, only
     /// for a server outside a Job, or one whose Job couldn't be ended.
     terminate: T,
+    /// Ends the server's Job, waiting up to the timeout for its processes to
+    /// be gone: whether they were.
+    #[cfg(windows)]
+    end_job: fn(&lpm_common::process_job::ProcessJob, std::time::Duration) -> std::io::Result<bool>,
     /// Whether the console interrupt that began the stop reached the
     /// server's processes, which then get a grace period to stop themselves,
     /// until the window closes.
@@ -487,6 +493,8 @@ where
     });
 
     let mut shutdown_result = Ok(());
+    #[cfg(windows)]
+    let mut job_ended = false;
     let status_result = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -519,19 +527,26 @@ where
             }
             // The Job holds the server's whole tree, so ending it needs no
             // walk of the tree, which fails once it meets a process it can't
-            // verify, as on a runner without a console.
-            // A Job that couldn't be ended, or whose processes outlived its
-            // deadline, leaves the walk to try.
+            // verify, as on a runner without a console. Once the Job is ended,
+            // a walk could end nothing more, even where processes are still
+            // exiting; only a Job that couldn't be ended leaves it to try.
             #[cfg(windows)]
             if let Some(job) = &job {
-                match job.end(SERVICE_TREE_EXIT_TIMEOUT) {
-                    Ok(true) => {
-                        break child.wait().map_err(|error| {
-                            LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
-                        });
-                    }
-                    Ok(false) => {
-                        tracing::warn!("processes the dev server started are still exiting");
+                job_ended = true;
+                let deadline = std::time::Instant::now() + SERVICE_TREE_EXIT_TIMEOUT;
+                match (stopping.end_job)(job, SERVICE_TREE_EXIT_TIMEOUT) {
+                    Ok(gone) => {
+                        if !gone {
+                            tracing::warn!("processes the dev server started are still exiting");
+                        }
+                        break crate::ports::wait_for_ended_child(&mut child, deadline).map_err(
+                            |error| {
+                                LpmError::Script(format!(
+                                    "failed to stop '{}': {error}",
+                                    cmd.command
+                                ))
+                            },
+                        );
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -550,8 +565,8 @@ where
     #[cfg(unix)]
     cleanup_endpoint_process_group(root_pid);
     #[cfg(windows)]
-    if let Some(job) = &job {
-        match job.end(SERVICE_TREE_EXIT_TIMEOUT) {
+    if let Some(job) = job.as_ref().filter(|_| !job_ended) {
+        match (stopping.end_job)(job, SERVICE_TREE_EXIT_TIMEOUT) {
             Ok(true) => {}
             Ok(false) => tracing::warn!("processes the dev server started are still exiting"),
             Err(error) => {
@@ -579,9 +594,39 @@ where
                 .map(|_| ())
         },
     );
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
+    if !join_output_readers(
+        [stdout_handle, stderr_handle],
+        std::time::Instant::now() + SERVICE_TREE_EXIT_TIMEOUT,
+    ) {
+        tracing::warn!(
+            "a process the dev server started still holds its output open, so lpm stopped waiting for it"
+        );
+    }
     compose_shell_and_shutdown_result(status_result, shutdown_result, owner_cleanup_result)
+}
+
+/// Joins the threads forwarding the dev server's output once they reach its
+/// end, waiting no longer than `deadline`: whether they all did. A process
+/// the server started that lpm couldn't end, such as one that left its
+/// process group, holds the output open for as long as it runs, so a reader
+/// still waiting for it then is left to finish on its own.
+fn join_output_readers<const N: usize>(
+    readers: [std::thread::JoinHandle<()>; N],
+    deadline: std::time::Instant,
+) -> bool {
+    while readers.iter().any(|reader| !reader.is_finished()) && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut all_finished = true;
+    for reader in readers {
+        if reader.is_finished() {
+            let _ = reader.join();
+        } else {
+            all_finished = false;
+        }
+    }
+    all_finished
 }
 
 fn cleanup_verified_endpoint_owner_with(
@@ -1664,6 +1709,7 @@ mod tests {
             })),
             DevServerStopping {
                 terminate: crate::ports::terminate_child_process_tree,
+                end_job: lpm_common::process_job::ProcessJob::end,
                 console_interrupted: Box::new(console_interrupted),
             },
         )
@@ -1804,6 +1850,57 @@ mod tests {
         );
     }
 
+    /// Once the Job is ended, every process in it was, so a walk of the
+    /// tree could end nothing more, even where some are still exiting, and
+    /// ending the Job again would only wait for them once more.
+    #[cfg(windows)]
+    #[test]
+    fn a_dev_server_whose_ended_job_is_still_exiting_is_neither_walked_nor_ended_again() {
+        static JOB_ENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn end_leaving_processes_exiting(
+            job: &lpm_common::process_job::ProcessJob,
+            timeout: std::time::Duration,
+        ) -> std::io::Result<bool> {
+            JOB_ENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            job.end(timeout)?;
+            Ok(false)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let walked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let walk_record = std::sync::Arc::clone(&walked);
+
+        let result = spawn_shell_with_endpoint_using(
+            &ShellCommand {
+                command: "ping -n 30 127.0.0.1 >nul",
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            EndpointDiscovery::required(false),
+            stop_flag(true),
+            Box::new(|_| {}),
+            None,
+            DevServerStopping {
+                terminate: move |child: &mut std::process::Child| {
+                    walk_record.store(true, std::sync::atomic::Ordering::SeqCst);
+                    crate::ports::terminate_child_process_tree(child)
+                },
+                end_job: end_leaving_processes_exiting,
+                console_interrupted: Box::new(|| false),
+            },
+        );
+
+        result.unwrap();
+        assert!(
+            !walked.load(std::sync::atomic::Ordering::SeqCst),
+            "lpm walked the tree of a server whose Job it had ended"
+        );
+        assert_eq!(JOB_ENDS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// The window closing during the grace period an interrupt began ends
     /// it: Windows allows lpm only a few seconds after a close.
     #[cfg(windows)]
@@ -1879,6 +1976,113 @@ mod tests {
 
         assert!(message.contains("injected endpoint process-tree termination failure"));
         assert!(message.contains("injected shutdown boundary failure"));
+    }
+
+    #[test]
+    fn output_readers_that_reach_the_end_of_the_output_are_joined() {
+        let readers = [
+            std::thread::spawn(|| {}),
+            std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(20))),
+        ];
+
+        assert!(join_output_readers(
+            readers,
+            std::time::Instant::now() + std::time::Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn an_output_reader_still_waiting_at_the_deadline_is_left_to_finish_on_its_own() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let readers = [
+            std::thread::spawn(|| {}),
+            std::thread::spawn(move || {
+                let _ = released.recv();
+            }),
+        ];
+        let started = std::time::Instant::now();
+
+        let all_finished =
+            join_output_readers(readers, started + std::time::Duration::from_millis(100));
+        let waited = started.elapsed();
+        release.send(()).unwrap();
+
+        assert!(!all_finished);
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "waited {waited:?} for a reader past its deadline"
+        );
+    }
+
+    /// A process the dev server started can leave the server's session and
+    /// outlive it, out of reach of its process group and of the walk of its
+    /// tree, still holding its output open.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_holding_the_dev_server_s_output_after_it_exits_does_not_hold_up_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("leave-a-holder.js"),
+            "const { spawn } = require('child_process');\n\
+             const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 40000)'], \
+             { detached: true, stdio: 'inherit' });\n\
+             require('fs').writeFileSync('holder.pid', String(holder.pid));\n\
+             holder.unref();\n",
+        )
+        .unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let holder_pid = dir.path().join("holder.pid");
+        let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let controller_stop = std::sync::Arc::clone(&stop_requested);
+        let controller_holder = holder_pid.clone();
+        let controller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !controller_holder.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the holder never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            controller_stop.store(true, std::sync::atomic::Ordering::Release);
+            std::time::Instant::now()
+        });
+
+        let result = spawn_shell_with_endpoint_using(
+            &ShellCommand {
+                command: "node leave-a-holder.js; while :; do sleep 1; done",
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            EndpointDiscovery::required(false),
+            stop_requested,
+            Box::new(|_| {}),
+            None,
+            DevServerStopping {
+                terminate: crate::ports::terminate_child_process_tree,
+            },
+        );
+        let stopped_at = controller.join().unwrap();
+        let stop_took = stopped_at.elapsed();
+        if let Some(pid) = std::fs::read_to_string(&holder_pid)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: the PID is the holder this test started, which runs for
+            // seconds after the stop; SIGKILL dereferences no memory.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+
+        result.unwrap();
+        assert!(
+            stop_took < std::time::Duration::from_secs(20),
+            "the stop waited {stop_took:?} for a process holding the server's output"
+        );
     }
 
     #[cfg(unix)]
