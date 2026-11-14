@@ -2297,7 +2297,9 @@ fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
 
 /// Force-kills the trees of `services`, as [`start_force_kill`] does, then
 /// waits for them together until `deadline`, so that processes stuck exiting
-/// cost the shutdown that deadline once, however many there are. Each walk
+/// cost the shutdown that deadline once, however many there are. What the
+/// Jobs that killing a walked tree again ended held, which no earlier
+/// deadline covered, is waited for until a deadline of its own, and each walk
 /// of a tree without a Job waits within a deadline of its own, so the walks
 /// run side by side.
 fn force_kill_and_report_all<'a>(
@@ -2425,9 +2427,11 @@ fn shutdown_children_ordered(
                 // Windows can't send a Ctrl+C to one service, so a shutdown
                 // no interrupt reached them in, one lpm began itself or the
                 // window's closing, ends their Jobs, walks the trees of those
-                // without one, and kills again a tree it walked before. This
-                // level's wait, further on, waits for the Jobs all at once;
-                // each walk waits for its own tree.
+                // without one, and kills again a tree lpm ended and waited
+                // for before, by force-killing it or by walking it. This
+                // level's wait, further on, waits for the Jobs it ended all
+                // at once, a Job such a kill retried among them; each walk
+                // waits for its own tree.
                 #[cfg(windows)]
                 {
                     if matches!(child.try_wait(), Ok(None)) {
@@ -2503,12 +2507,19 @@ fn shutdown_children_ordered(
 
     // Final pass: force-kill any stragglers and reap zombies
     let mut locked = children.lock();
+    let mut jobs_ended = Vec::new();
     for (name, child) in locked.iter_mut() {
         #[cfg(windows)]
         let ended = ended_by_lpm.contains(name);
         #[cfg(not(windows))]
         let ended = false;
-        report_last(name, child, ended, force_kill_and_report);
+        if report_last(name, child, ended, force_kill_and_report) {
+            jobs_ended.push(child);
+        }
+    }
+    let deadline = cleanup_deadline();
+    for child in jobs_ended {
+        wait_for_killed_service_tree(child, deadline);
     }
 }
 
@@ -2556,21 +2567,19 @@ fn kill_dying_service_tree(child: &mut ServiceProcess) -> bool {
 /// Says in the shutdown's last pass how `child` stopped, or force-kills it
 /// with `force_kill` where it still runs. `ended` is whether lpm ended it,
 /// by its Job or by walking its tree, while its own process still ran.
+/// `true` where killing it again ended a Job whose processes are still to be
+/// waited for, which the last pass does for all of them at once.
 fn report_last(
     name: &str,
     child: &mut ServiceProcess,
     ended: bool,
     force_kill: impl FnOnce(&str, &mut ServiceProcess) -> bool,
-) {
+) -> bool {
     let status = child.try_wait().ok().flatten();
     let stopped = status.filter(|_| !child.tree_running());
     match final_report(stopped, child.reported_force_killed, ended) {
         // A tree force-killed earlier may still be dying.
-        FinalReport::AlreadyReported if stopped.is_none() => {
-            if kill_again(child) {
-                wait_for_killed_service_tree(child, cleanup_deadline());
-            }
-        }
+        FinalReport::AlreadyReported if stopped.is_none() => return kill_again(child),
         FinalReport::AlreadyReported => {}
         FinalReport::Stopped(note) => ui_service_note(RESET, name, &note),
         FinalReport::StillRunning => {
@@ -2583,6 +2592,7 @@ fn report_last(
             }
         }
     }
+    false
 }
 
 /// What the shutdown's last pass says of a service.
