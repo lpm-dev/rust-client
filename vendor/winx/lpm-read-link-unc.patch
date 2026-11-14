@@ -1,6 +1,6 @@
 --- a/src/file.rs
 +++ b/src/file.rs
-@@ -389,16 +389,58 @@
+@@ -389,16 +389,60 @@
              }
          };
          let subst_ptr = path_buffer.offset(subst_off as isize);
@@ -20,49 +20,51 @@
  }
  
 +/// The Win32 path of an NT path that followed `\??\`: `C:\dir` stays as it
-+/// is, `UNC\server\share\dir` becomes `\\server\share\dir`, and any other
-+/// path, such as `Volume{…}\dir`, gets the extended prefix `\\?\`. Each
-+/// stays absolute.
++/// is, and `UNC\server\share\dir` becomes `\\server\share\dir`, where Win32
++/// reads that back unchanged, as std's `read_link` asks. Any other path, or
++/// one Win32 would change, such as a name ending in a dot, gets the extended
++/// prefix `\\?\`. Each stays absolute.
 +fn win32_path(rest: &[u16]) -> PathBuf {
 +    const BACKSLASH: u16 = b'\\' as u16;
 +    let ascii_upper = |unit: u16| match u8::try_from(unit) {
 +        Ok(byte) => u16::from(byte.to_ascii_uppercase()),
 +        Err(_) => unit,
 +    };
-+    let is_drive = match rest {
-+        [letter, colon, after @ ..] => {
-+            u8::try_from(*letter).map_or(false, |letter| letter.is_ascii_alphabetic())
-+                && *colon == u16::from(b':')
-+                && after.first().map_or(true, |unit| *unit == BACKSLASH)
++    let candidate = match rest {
++        [letter, colon, BACKSLASH, ..]
++            if u8::try_from(*letter).map_or(false, |letter| letter.is_ascii_alphabetic())
++                && *colon == u16::from(b':') =>
++        {
++            Some(rest.to_vec())
 +        }
-+        _ => false,
-+    };
-+    if is_drive {
-+        return PathBuf::from(OsString::from_wide(rest));
-+    }
-+    let mut path = Vec::with_capacity(rest.len() + 4);
-+    match rest {
-+        [u, n, c, separator, share @ ..]
++        [u, n, c, BACKSLASH, share @ ..]
 +            if ascii_upper(*u) == u16::from(b'U')
 +                && ascii_upper(*n) == u16::from(b'N')
-+                && ascii_upper(*c) == u16::from(b'C')
-+                && *separator == BACKSLASH =>
++                && ascii_upper(*c) == u16::from(b'C') =>
 +        {
-+            path.extend_from_slice(&[BACKSLASH, BACKSLASH]);
-+            path.extend_from_slice(share);
++            let mut unc = Vec::with_capacity(share.len() + 2);
++            unc.extend_from_slice(&[BACKSLASH, BACKSLASH]);
++            unc.extend_from_slice(share);
++            Some(unc)
 +        }
-+        _ => {
-+            path.extend_from_slice(&[BACKSLASH, BACKSLASH, u16::from(b'?'), BACKSLASH]);
-+            path.extend_from_slice(rest);
++        _ => None,
++    };
++    if let Some(candidate) = candidate {
++        let candidate = PathBuf::from(OsString::from_wide(&candidate));
++        if get_full_path(&candidate).map_or(false, |full| full == candidate) {
++            return candidate;
 +        }
 +    }
++    let mut path = Vec::with_capacity(rest.len() + 4);
++    path.extend_from_slice(&[BACKSLASH, BACKSLASH, u16::from(b'?'), BACKSLASH]);
++    path.extend_from_slice(rest);
 +    PathBuf::from(OsString::from_wide(&path))
 +}
 +
  fn reparse_point<'a>(
      file: &File,
      space: &'a mut [u8; c::MAXIMUM_REPARSE_DATA_BUFFER_SIZE],
-@@ -418,5 +460,49 @@
+@@ -418,5 +462,63 @@
              )
          })?;
          Ok((bytes, &*(space.as_ptr() as *const c::REPARSE_DATA_BUFFER)))
@@ -95,6 +97,20 @@
 +        for target in [r"UNC\server\share\pkg", r"unc\server\share\pkg"] {
 +            let path = after_nt_prefix(target);
 +            assert_eq!(path, PathBuf::from(r"\\server\share\pkg"), "{target}");
++            assert!(path.is_absolute(), "{target}");
++        }
++    }
++
++    #[test]
++    fn a_target_win32_would_change_stays_extended() {
++        for target in [
++            r"UNC\server\share\pkg.",
++            r"UNC\server\share\pkg ",
++            r"C:\Users\dev\pkg.",
++            r"C:",
++        ] {
++            let path = after_nt_prefix(target);
++            assert_eq!(path, PathBuf::from(format!(r"\\?\{target}")), "{target}");
 +            assert!(path.is_absolute(), "{target}");
 +        }
 +    }
