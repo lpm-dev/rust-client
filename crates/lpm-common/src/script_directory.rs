@@ -182,17 +182,60 @@ mod windows {
         OsString::from_wide(&target)
     }
 
-    /// The letters this process defined, by share, with how many
+    /// The letters this process defined, with how many
     /// [`super::ScriptDirectory`] values use each.
-    static DEFINED: Mutex<Option<HashMap<OsString, Defined>>> = Mutex::new(None);
+    static DEFINED: Mutex<Option<Letters>> = Mutex::new(None);
+
+    fn lock_defined() -> std::sync::MutexGuard<'static, Option<Letters>> {
+        DEFINED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[derive(Debug, Default)]
+    struct Letters {
+        /// The letter each share is reached by, by share.
+        current: HashMap<OsString, Defined>,
+        /// Letters another share's definition took over, by generation. Each
+        /// keeps this process's definition while scripts started through it
+        /// run, so that it reaches their share again once the other goes.
+        set_aside: HashMap<u64, Defined>,
+    }
+
+    impl Letters {
+        /// One user fewer of the definition `generation` of the share
+        /// `share_key`: the definition, once none is left.
+        fn release(&mut self, share_key: &OsStr, generation: u64) -> Option<Defined> {
+            if self
+                .current
+                .get(share_key)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                let entry = self.current.get_mut(share_key)?;
+                entry.users -= 1;
+                return if entry.users == 0 {
+                    self.current.remove(share_key)
+                } else {
+                    None
+                };
+            }
+            let entry = self.set_aside.get_mut(&generation)?;
+            entry.users -= 1;
+            if entry.users == 0 {
+                self.set_aside.remove(&generation)
+            } else {
+                None
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct Defined {
         letter: u8,
         definition: OsString,
         users: usize,
-        /// Which definition of the share this is, so that the holders of one
-        /// found gone count nothing against the next.
+        /// Which definition of the share this is, so that each holder counts
+        /// against its own, whether current or set aside.
         generation: u64,
     }
 
@@ -218,30 +261,18 @@ mod windows {
 
     impl Drop for DefinedHold {
         fn drop(&mut self) {
-            let mut defined = DEFINED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(letters) = defined.as_mut() else {
+            let mut defined = lock_defined();
+            let Some(last) = defined
+                .as_mut()
+                .and_then(|letters| letters.release(&self.share_key, self.generation))
+            else {
                 return;
             };
-            let last = match letters.get_mut(&self.share_key) {
-                Some(entry) if entry.generation == self.generation => {
-                    entry.users -= 1;
-                    if entry.users == 0 {
-                        letters.remove(&self.share_key)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            let _letters_of_the_session = LetterLock::acquire();
-            if let Some(entry) = last
-                && let Err(error) = undefine(entry.letter, &entry.definition)
-            {
+            let _letters_of_the_sign_in = LetterLock::acquire();
+            if let Err(error) = undefine(last.letter, &last.definition) {
                 tracing::debug!(
                     "could not remove the drive {}: LPM defined for scripts: {error}",
-                    char::from(entry.letter)
+                    char::from(last.letter)
                 );
             }
         }
@@ -250,41 +281,13 @@ mod windows {
     /// `folder` through a drive letter, and what keeps that letter.
     pub(super) fn through_drive(folder: &NetworkFolder) -> io::Result<(PathBuf, DriveHold)> {
         let share_key = folder.share.to_ascii_lowercase();
-        let definition = definition_of(&folder.share);
-        let mut defined = DEFINED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let letters = defined.get_or_insert_with(HashMap::new);
-        let _letters_of_the_session = LetterLock::acquire();
-        if let Some(entry) = letters.get_mut(&share_key) {
-            // Someone may have removed the definition since, or stacked one
-            // of another share on it, which the letter then resolves to.
-            if dos_definitions(entry.letter)
-                .first()
-                .is_some_and(|first| first.eq_ignore_ascii_case(&entry.definition))
-            {
-                entry.users += 1;
-                let hold = DefinedHold {
-                    share_key,
-                    generation: entry.generation,
-                };
-                return Ok((
-                    on_drive(entry.letter, &folder.below),
-                    DriveHold::Defined { _hold: hold },
-                ));
-            }
-            // Its holders count nothing against what comes next, and this
-            // process's definition, if it is still there, goes now.
-            if let Some(gone) = letters.remove(&share_key)
-                && defines(gone.letter, &gone.definition)
-            {
-                let _ = undefine(gone.letter, &gone.definition);
-            }
+        let reached = through_defined_letter(&mut lock_defined(), &share_key, folder);
+        if let Some(reached) = reached {
+            return Ok(reached);
         }
-        // A letter the user mapped comes first.
-        //
-        // This opens network folders under the locks, so a slow share delays
-        // other scripts' letters until it answers.
+        // Then a letter the user mapped. Looking for one opens network
+        // folders, so it holds no lock: a share slow to answer delays only
+        // the scripts in it.
         if let Some((path, folder_handle)) = through_users_drive(folder) {
             return Ok((
                 path,
@@ -293,6 +296,13 @@ mod windows {
                 },
             ));
         }
+        let mut defined = lock_defined();
+        // Another thread may have defined one meanwhile.
+        if let Some(reached) = through_defined_letter(&mut defined, &share_key, folder) {
+            return Ok(reached);
+        }
+        let _letters_of_the_sign_in = LetterLock::acquire();
+        let definition = definition_of(&folder.share);
         // Then another LPM process's letter for the share, or one a crash
         // left: this process adds its own definition, which Windows stacks on
         // the same one, so the letter stays while either uses it. Something
@@ -331,7 +341,7 @@ mod windows {
             }
         };
         let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        letters.insert(
+        defined.get_or_insert_with(Letters::default).current.insert(
             share_key.clone(),
             Defined {
                 letter,
@@ -349,6 +359,40 @@ mod windows {
                 },
             },
         ))
+    }
+
+    /// `folder` through the letter this process defined for its share, while
+    /// that definition is the one in effect. Someone may have removed it
+    /// since, or stacked another share's definition on it, which the letter
+    /// then resolves to: such a letter is set aside for the scripts started
+    /// through it, and the share is to be reached by another.
+    fn through_defined_letter(
+        defined: &mut Option<Letters>,
+        share_key: &OsStr,
+        folder: &NetworkFolder,
+    ) -> Option<(PathBuf, DriveHold)> {
+        let letters = defined.get_or_insert_with(Letters::default);
+        let entry = letters.current.get_mut(share_key)?;
+        if dos_definitions(entry.letter)
+            .first()
+            .is_some_and(|first| first.eq_ignore_ascii_case(&entry.definition))
+        {
+            entry.users += 1;
+            return Some((
+                on_drive(entry.letter, &folder.below),
+                DriveHold::Defined {
+                    _hold: DefinedHold {
+                        share_key: share_key.to_os_string(),
+                        generation: entry.generation,
+                    },
+                },
+            ));
+        }
+        let taken_over = letters.current.remove(share_key)?;
+        if defines(taken_over.letter, &taken_over.definition) {
+            letters.set_aside.insert(taken_over.generation, taken_over);
+        }
+        None
     }
 
     /// Says once in this process for each share and letter which letter LPM
@@ -374,7 +418,10 @@ mod windows {
     /// folder of the share above it, with the folder held open through it.
     /// The letter mapped closest to `folder` wins, then the first. A letter
     /// counts only where the folder opened through it is `folder` itself:
-    /// some network file systems answer for letters of another sign-in.
+    /// some network file systems answer for letters of another sign-in. A
+    /// letter defined straight to a network path, as LPM defines one, is no
+    /// drive the user mapped: borrowed, it would go with the last script of
+    /// whoever defined it, while stacking on it keeps it.
     fn through_users_drive(folder: &NetworkFolder) -> Option<(PathBuf, std::fs::File)> {
         let present = unsafe {
             // SAFETY: takes no arguments.
@@ -382,6 +429,11 @@ mod windows {
         };
         let mut reaching: Vec<(usize, u8, PathBuf)> = (b'A'..=b'Z')
             .filter(|letter| present & (1 << (letter - b'A')) != 0)
+            .filter(|letter| {
+                !dos_definitions(*letter)
+                    .first()
+                    .is_some_and(|definition| names_a_network_path(definition))
+            })
             .filter_map(|letter| {
                 let remote = mapped_remote(letter)?;
                 let remote = network_folder(Path::new(&remote))?;
@@ -516,6 +568,16 @@ mod windows {
         }
     }
 
+    /// Whether a drive's `definition` names a network path straight, as
+    /// LPM's do, rather than a network file system's own device, as a mapped
+    /// drive's does.
+    fn names_a_network_path(definition: &OsStr) -> bool {
+        definition
+            .as_encoded_bytes()
+            .get(..8)
+            .is_some_and(|head| head.eq_ignore_ascii_case(br"\??\UNC\"))
+    }
+
     /// Whether `definition` is among the drive `letter`'s definitions.
     fn defines(letter: u8, definition: &OsStr) -> bool {
         dos_definitions(letter)
@@ -583,28 +645,37 @@ mod windows {
         )
     }
 
-    /// Serializes choosing and defining letters among the LPM processes of
-    /// this session, so that two never take one letter for different shares
-    /// at once. Without it, as when the mutex can't be had, the checks after
-    /// each definition still apply.
+    /// Serializes choosing, defining and removing letters among the LPM
+    /// processes of this sign-in, so that two never take one letter for
+    /// different shares at once. Without it, as when the mutex can't be had
+    /// in time, the checks after each definition still apply, so the wait for
+    /// it is short.
     struct LetterLock(windows_sys::Win32::Foundation::HANDLE);
 
     impl LetterLock {
         fn acquire() -> Option<Self> {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
-            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
-            let name: Vec<u16> = r"Local\lpm-script-drive-letters"
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            // SAFETY: `name` is NUL-terminated; default security and no initial owner.
-            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            use windows_sys::Win32::System::Threading::{
+                CreateMutexExW, MUTEX_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
+                WaitForSingleObject,
+            };
+            let name = letter_lock_name()?;
+            // SAFETY: `name` is NUL-terminated; default security and no initial owner, with
+            // only the rights to wait on the mutex and release it.
+            let handle = unsafe {
+                CreateMutexExW(
+                    std::ptr::null(),
+                    name.as_ptr(),
+                    0,
+                    SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+                )
+            };
             if handle.is_null() {
                 return None;
             }
             // SAFETY: `handle` is the mutex just opened. An abandoned mutex, left by a
             // process that ended while holding it, is owned all the same.
-            let waited = unsafe { WaitForSingleObject(handle, 10_000) };
+            let waited = unsafe { WaitForSingleObject(handle, 2_000) };
             if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
                 Some(Self(handle))
             } else {
@@ -625,6 +696,58 @@ mod windows {
                 CloseHandle(self.0);
             }
         }
+    }
+
+    /// The name of the mutex of this sign-in's letters. Letters defined
+    /// without a broadcast belong to the sign-in, which an elevated process
+    /// has apart from the unelevated ones of the same session.
+    fn letter_lock_name() -> Option<&'static [u16]> {
+        static NAME: std::sync::OnceLock<Option<Vec<u16>>> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| {
+            let sign_in = sign_in_id().ok()?;
+            Some(
+                format!(r"Local\lpm-script-drive-letters-{sign_in:016x}")
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect(),
+            )
+        })
+        .as_deref()
+    }
+
+    /// The sign-in this process runs in: its token's authentication ID.
+    fn sign_in_id() -> io::Result<u64> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-handle is valid; `token` receives a handle closed below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a zeroed TOKEN_STATISTICS is a valid output buffer.
+        let mut statistics: TOKEN_STATISTICS = unsafe { std::mem::zeroed() };
+        let mut length = 0;
+        // SAFETY: `statistics` holds as many writable bytes as the length passed.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenStatistics,
+                std::ptr::from_mut(&mut statistics).cast(),
+                std::mem::size_of_val(&statistics) as u32,
+                &mut length,
+            )
+        };
+        let error = io::Error::last_os_error();
+        // SAFETY: `token` is open and closed once here.
+        unsafe { CloseHandle(token) };
+        if read == 0 {
+            return Err(error);
+        }
+        let id = statistics.AuthenticationId;
+        Ok((u64::from(id.HighPart.cast_unsigned()) << 32) | u64::from(id.LowPart))
     }
 
     /// Defines the first free drive letter from `Z:` down as `definition`.
@@ -728,6 +851,41 @@ mod windows {
                 definition_of(OsStr::new(r"\\Mac\Home")),
                 OsString::from(r"\??\UNC\Mac\Home")
             );
+        }
+
+        #[test]
+        fn a_letter_defined_as_lpm_defines_one_names_a_network_path_and_a_mapped_drive_does_not() {
+            for definition in [
+                definition_of(OsStr::new(r"\\Mac\Home")),
+                OsString::from(r"\??\unc\server\share"),
+            ] {
+                assert!(names_a_network_path(&definition), "{definition:?}");
+            }
+            for definition in [
+                r"\Device\LanmanRedirector\;Z:000000000001e3a2\server\share",
+                r"\Device\Mup\;LanmanRedirector\;Z:000000000001e3a2\server\share",
+                r"\??\C:\work",
+                r"\??\UN",
+                "",
+            ] {
+                assert!(
+                    !names_a_network_path(OsStr::new(definition)),
+                    "{definition:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_letters_lock_is_named_for_this_sign_in() {
+            let sign_in = sign_in_id().unwrap();
+            let name = String::from_utf16(letter_lock_name().unwrap()).unwrap();
+
+            assert_ne!(sign_in, 0);
+            assert_eq!(
+                name,
+                format!("Local\\lpm-script-drive-letters-{sign_in:016x}\0")
+            );
+            assert!(LetterLock::acquire().is_some(), "the lock couldn't be had");
         }
 
         #[test]
@@ -846,19 +1004,7 @@ mod windows {
             // A letter another process defined for the share is used, with a
             // definition of this process's own stacked on it, and keeps the
             // other's after this one is done.
-            let theirs = {
-                let present = unsafe {
-                    // SAFETY: takes no arguments.
-                    GetLogicalDrives()
-                };
-                (b'D'..=b'Z')
-                    .rev()
-                    .find(|letter| {
-                        present & (1 << (letter - b'A')) == 0 && dos_definitions(*letter).is_empty()
-                    })
-                    .expect("a free drive letter")
-            };
-            define(theirs, &definition).unwrap();
+            let theirs = define_as_another_process_would(&definition);
             let joined = super::super::ScriptDirectory::for_shell(&network).unwrap();
             let joined_letter = letter_of(joined.path());
             let stacked_on_theirs = dos_definitions(theirs).len();
@@ -871,6 +1017,9 @@ mod windows {
 
             // A definition of another share stacked on the letter takes it
             // over, so the next script reaches the folder by another letter.
+            // The letter keeps this process's definition for the script still
+            // using it, which reaches its folder again once the other's goes,
+            // and loses it with that script.
             let held = super::super::ScriptDirectory::for_shell(&network).unwrap();
             assert!(lpm_defined(&held), "{:?}", held.path());
             let taken = letter_of(held.path());
@@ -879,14 +1028,32 @@ mod windows {
             let next = super::super::ScriptDirectory::for_shell(&network);
             undefine(taken, &other).unwrap();
             let next = next.unwrap();
-            assert_ne!(letter_of(next.path()), taken, "{:?}", next.path());
-            std::fs::write(next.path().join("written"), b"elsewhere").unwrap();
-            assert_eq!(
-                std::fs::read(project.join("written")).unwrap(),
-                b"elsewhere"
-            );
+            let next_letter = letter_of(next.path());
+            let written_elsewhere = std::fs::write(next.path().join("written"), b"elsewhere")
+                .and_then(|()| std::fs::read(project.join("written")));
+            let back_for_the_holder = dos_definitions(taken);
             drop(held);
+            let left_by_the_holder = dos_definitions(taken);
             drop(next);
+            assert_ne!(next_letter, taken);
+            assert_eq!(written_elsewhere.unwrap(), b"elsewhere");
+            assert!(
+                back_for_the_holder.len() == 1
+                    && back_for_the_holder[0].eq_ignore_ascii_case(&definition),
+                "the letter was taken from the script still using it: {back_for_the_holder:?}"
+            );
+            assert!(
+                left_by_the_holder.is_empty(),
+                "the letter outlived its last user: {left_by_the_holder:?}"
+            );
+            assert!(dos_definitions(next_letter).is_empty());
+        }
+
+        /// Defines a free letter as `definition`, as another LPM process
+        /// would, under the lock LPM processes choose letters under.
+        fn define_as_another_process_would(definition: &OsStr) -> u8 {
+            let _letters_of_the_sign_in = LetterLock::acquire();
+            define_free_letter(definition).unwrap()
         }
 
         /// A drive mapped the way `net use` maps one, through the SMB
@@ -899,6 +1066,7 @@ mod windows {
                 use windows_sys::Win32::NetworkManagement::NetManagement::{
                     NetUseAdd, USE_DISKDEV, USE_INFO_1,
                 };
+                let _letters_of_the_sign_in = LetterLock::acquire();
                 let present = unsafe {
                     // SAFETY: takes no arguments.
                     GetLogicalDrives()
@@ -970,14 +1138,22 @@ mod windows {
             };
             // Of a folder no other test maps.
             let users = UsersDrive::map(network.parent().unwrap());
+            // It comes before a letter another LPM process defined for the
+            // share.
+            let definition = definition_of(&network_folder(&network).unwrap().share);
+            let theirs = define_as_another_process_would(&definition);
 
-            let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            let reached = super::super::ScriptDirectory::for_shell(&network);
+            let theirs_left = dos_definitions(theirs);
+            undefine(theirs, &definition).unwrap();
+            let reached = reached.unwrap();
             let removed_while_used = users.remove();
             let path = reached.path().to_path_buf();
             drop(reached);
             let still_mapped = mapped_remote(users.0);
 
             assert_eq!(letter_of(&path), users.0, "{path:?}");
+            assert_eq!(theirs_left.len(), 1, "{theirs_left:?}");
             assert_eq!(
                 removed_while_used,
                 windows_sys::Win32::Foundation::ERROR_OPEN_FILES,
