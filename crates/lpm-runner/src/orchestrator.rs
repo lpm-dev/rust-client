@@ -1121,7 +1121,7 @@ fn spawn_service_command_with_hooks(
     }
 
     #[cfg(windows)]
-    let directory_guards = {
+    let (directory_guards, directory) = {
         let guards = retain_windows_service_directories(&directory_expectations)?;
         if revalidate_service_cwd(project_dir, cached_cwd).as_deref() != Ok(cwd.as_path()) {
             return Err(std::io::Error::other(
@@ -1129,7 +1129,9 @@ fn spawn_service_command_with_hooks(
             ));
         }
         command.current_dir(&cwd);
-        guards
+        let directory =
+            crate::shell::reach_directory_through_drive(command).map_err(std::io::Error::other)?;
+        (guards, directory)
     };
 
     #[cfg(not(any(unix, windows)))]
@@ -1144,16 +1146,20 @@ fn spawn_service_command_with_hooks(
     #[cfg(windows)]
     drop(directory_guards);
     #[cfg(windows)]
-    return child.and_then(windows_service_in_job);
+    return child.and_then(|child| windows_service_in_job(child, directory));
     #[cfg(not(windows))]
     child.map(ServiceProcess::from)
 }
 
 /// Puts a service started suspended in a Job of its own, then lets it run.
 /// Where Windows refuses the Job, the service runs outside one, as it did
-/// before lpm used them.
+/// before lpm used them. `directory` keeps the drive letter a service in a
+/// network folder runs through.
 #[cfg(windows)]
-fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
+fn windows_service_in_job(
+    mut child: Child,
+    directory: Option<lpm_common::script_directory::ScriptDirectory>,
+) -> std::io::Result<ServiceProcess> {
     let job = lpm_common::process_job::ProcessJob::new()
         .and_then(|job| job.assign(&child).map(|()| job))
         .map_err(|error| {
@@ -1173,6 +1179,7 @@ fn windows_service_in_job(mut child: Child) -> std::io::Result<ServiceProcess> {
         job,
         tree_walked: false,
         reported_force_killed: false,
+        _directory: directory,
     })
 }
 
@@ -2722,6 +2729,9 @@ pub(crate) struct ServiceProcess {
     tree_walked: bool,
     /// Whether the shutdown has said this service was force-killed.
     reported_force_killed: bool,
+    /// Dropped after the Job has ended what the service started.
+    #[cfg(windows)]
+    _directory: Option<lpm_common::script_directory::ScriptDirectory>,
 }
 
 impl From<Child> for ServiceProcess {
@@ -2732,6 +2742,8 @@ impl From<Child> for ServiceProcess {
             job: None,
             tree_walked: false,
             reported_force_killed: false,
+            #[cfg(windows)]
+            _directory: None,
         }
     }
 }

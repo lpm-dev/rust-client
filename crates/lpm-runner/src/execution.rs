@@ -154,6 +154,7 @@ impl ExecutionSignals {
         session: &mut lpm_common::process_output::CaptureSession,
     ) -> Result<crate::shell::CapturedOutput, LpmError> {
         self.check()?;
+        let _directory = crate::shell::reach_directory_through_drive(command)?;
         #[cfg(unix)]
         let mut stopped_descendants = None;
 
@@ -232,6 +233,7 @@ impl ExecutionSignals {
     /// Preserve the foreground group so interactive children can read stdin.
     pub fn run(&self, command: &mut Command) -> Result<ExitStatus, LpmError> {
         let wait = self.prepare_wait()?;
+        let _directory = crate::shell::reach_directory_through_drive(command)?;
         let mut child = crate::env_access::spawn(command)?;
         wait.wait(&mut child)
     }

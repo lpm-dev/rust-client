@@ -281,6 +281,7 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
     // under an IDE's stop button, LPM is the only process that receives them.
     let signals = crate::execution::ExecutionSignals::new()?;
     let wait = signals.prepare_wait()?;
+    let _directory = reach_directory_through_drive(&mut command)?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
     wait.wait(&mut child)
@@ -298,6 +299,7 @@ pub(crate) fn spawn_shell_cancellable(
         .stderr(Stdio::inherit());
     strip_inherited_env_hooks(&mut command);
     command.envs(cmd.envs).env("PATH", cmd.path);
+    let _directory = reach_directory_through_drive(&mut command)?;
     let mut child = crate::env_access::spawn(&mut command).map_err(|error| {
         LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
     })?;
@@ -418,6 +420,7 @@ where
         command.creation_flags(lpm_common::process_job::SUSPENDED);
     }
 
+    let _directory = reach_directory_through_drive(&mut command)?;
     let mut child = crate::env_access::spawn(&mut command).map_err(|error| {
         LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
     })?;
@@ -790,6 +793,7 @@ pub fn spawn_shell_tee_with_reserved_stdout(
 
     let signals = crate::execution::ExecutionSignals::new()?;
     let wait = signals.prepare_wait()?;
+    let _directory = reach_directory_through_drive(&mut command)?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
@@ -873,6 +877,7 @@ pub fn spawn_command_capture(
 
     let signals = crate::execution::ExecutionSignals::new()?;
     let wait = signals.prepare_wait()?;
+    let _directory = reach_directory_through_drive(&mut command)?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{display_name}': {e}")))?;
 
@@ -944,6 +949,7 @@ pub fn spawn_shell_prefixed(
 
     let signals = crate::execution::ExecutionSignals::new()?;
     let wait = signals.prepare_wait()?;
+    let _directory = reach_directory_through_drive(&mut command)?;
     let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
@@ -983,6 +989,44 @@ pub fn spawn_shell_prefixed(
         stdout,
         stderr,
     })
+}
+
+/// Moves `command` to its directory as Windows can start it there. cmd.exe,
+/// which also runs every batch file, can't start in a network folder: it
+/// warns and runs in the Windows directory instead. Such a command starts in
+/// the same folder through a drive letter, which what this returns keeps
+/// mapped. Call it just before the spawn, and keep what it returns until the
+/// process has exited.
+pub fn reach_directory_through_drive(
+    command: &mut Command,
+) -> Result<Option<lpm_common::script_directory::ScriptDirectory>, LpmError> {
+    #[cfg(windows)]
+    {
+        let program = Path::new(command.get_program());
+        let runs_in_cmd = program.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        }) || program
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"));
+        if !runs_in_cmd {
+            return Ok(None);
+        }
+        let directory = match command.get_current_dir() {
+            Some(directory) => directory.to_path_buf(),
+            None => std::env::current_dir()?,
+        };
+        let reached = lpm_common::script_directory::ScriptDirectory::for_shell(&directory)
+            .map_err(|error| LpmError::Script(error.to_string()))?;
+        if reached.path() != directory {
+            command.current_dir(reached.path());
+        }
+        Ok(Some(reached))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+        Ok(None)
+    }
 }
 
 #[cfg(not(windows))]
@@ -1669,6 +1713,35 @@ mod tests {
             shutdown_started.load(std::sync::atomic::Ordering::Acquire),
             "the tunnel was left out of the stop"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_script_in_a_network_folder_runs_there_instead_of_the_windows_directory() {
+        let local = tempfile::tempdir().unwrap();
+        std::fs::write(local.path().join("marker.txt"), b"here").unwrap();
+        let Some(network) = lpm_common::test_network_path::through_network(local.path()) else {
+            return;
+        };
+        let path = std::env::var("PATH").unwrap();
+
+        let output = spawn_shell_capture(&ShellCommand {
+            command: "type marker.txt",
+            cwd: &network,
+            path: &path,
+            envs: &empty_envs(),
+        })
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{:?}: {} {}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert_eq!(output.stdout.trim(), "here");
+        assert!(!output.stderr.contains("UNC"), "{}", output.stderr);
     }
 
     /// Runs `command` as single-script `lpm dev` runs its dev server on
