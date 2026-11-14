@@ -287,10 +287,24 @@ pub(crate) fn loopback_port_available(port: u16) -> bool {
 /// the wildcard address of that port, so the loopback probes miss the common
 /// `listen(port)` server. Linux refuses that bind, so its loopback probes
 /// already see wildcard listeners.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn no_wildcard_listener(port: u16) -> bool {
     bind_probe_available(Ipv4Addr::UNSPECIFIED.into(), port)
         && bind_probe_available(Ipv6Addr::UNSPECIFIED.into(), port)
+}
+
+/// Windows lets a socket bind each of these addresses, `[::]` included,
+/// while a dual-stack socket listens on `[::]` of the port, as node's
+/// `listen(port)` does, so only the system's table of listeners shows that
+/// server.
+#[cfg(windows)]
+fn no_wildcard_listener(port: u16) -> bool {
+    bind_probe_available(Ipv4Addr::UNSPECIFIED.into(), port)
+        && bind_probe_available(Ipv6Addr::UNSPECIFIED.into(), port)
+        && !windows_tcp4_listeners()
+            .into_iter()
+            .chain(windows_tcp6_listeners())
+            .any(|listener| listener.port == port && listener.serves_loopback())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3588,6 +3602,19 @@ struct WindowsTcpEntry {
 }
 
 #[cfg(windows)]
+impl WindowsTcpEntry {
+    /// Whether a client connecting to a loopback address can reach this
+    /// listener: it listens on every address (`None`) or on a loopback one.
+    fn serves_loopback(&self) -> bool {
+        self.address.as_deref().is_none_or(|address| {
+            address
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        })
+    }
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 struct WindowsPortOwnerSnapshot {
     pid: u32,
@@ -4367,14 +4394,30 @@ mod tests {
         assert_ne!(find_available_port(port), Some(port));
     }
 
+    /// A dual-stack listener, as node's `listen(port)` makes: `[::]` with
+    /// `IPV6_V6ONLY` off. `TcpListener::bind("[::]:0")` leaves the system's
+    /// default, which on Windows is IPv6 only.
     #[test]
     fn check_port_reports_a_dual_stack_wildcard_listener_as_in_use() {
-        let Ok(listener) = TcpListener::bind("[::]:0") else {
+        let listener = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        if listener.set_only_v6(false).is_err()
+            || listener
+                .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+                .is_err()
+        {
             return;
-        };
-        let port = listener.local_addr().unwrap().port();
+        }
+        listener.listen(16).unwrap();
+        let port = listener.local_addr().unwrap().as_socket().unwrap().port();
 
         assert!(!loopback_port_available(port));
+        assert!(matches!(check_port(port), PortStatus::InUse { .. }));
+        assert_ne!(find_available_port(port), Some(port));
     }
 
     #[test]
