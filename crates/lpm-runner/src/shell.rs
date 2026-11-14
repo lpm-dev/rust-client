@@ -222,28 +222,33 @@ pub(crate) fn register_stop_signals(
     }))
 }
 
-/// How long a dev server a console event reached has to stop itself before
-/// lpm ends its whole tree.
+/// How long the dev server's processes have to stop themselves once a
+/// console event has reached them, before lpm ends what still runs.
 #[cfg(windows)]
 const DEV_SERVER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Stops the dev server. It shares lpm's console, so a Ctrl+C or a closing
-/// window that began the stop reached it too: it gets a grace period to stop
-/// itself, with its own handlers, before lpm ends its whole tree. Windows
-/// can't send a Ctrl+C to the server alone, so a stop lpm began itself ends
-/// the tree at once.
+/// Waits up to [`DEV_SERVER_STOP_GRACE`] for the dev server's processes to
+/// stop themselves. They share lpm's console, so the Ctrl+C or closing
+/// window that began the stop reached each of them, and what the server
+/// started, such as the server behind `npm run dev`, may still be cleaning
+/// up after the server itself has exited. Windows can't send a Ctrl+C to the
+/// server alone, so a stop lpm began itself doesn't wait.
 #[cfg(windows)]
-fn stop_dev_server(child: &mut std::process::Child) -> std::io::Result<ExitStatus> {
-    if crate::execution::console_stopping() {
-        let deadline = std::time::Instant::now() + DEV_SERVER_STOP_GRACE;
-        while std::time::Instant::now() < deadline {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+fn await_dev_server_stop(
+    child: &mut std::process::Child,
+    job: Option<&lpm_common::process_job::ProcessJob>,
+) {
+    let deadline = std::time::Instant::now() + DEV_SERVER_STOP_GRACE;
+    if let Some(job) = job
+        && job
+            .wait_until_empty(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
+    {
+        return;
     }
-    crate::ports::terminate_child_process_tree(child)
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// Spawn a shell command and wait for it to complete.
@@ -345,11 +350,22 @@ pub fn spawn_shell_with_endpoint(
         stop_requested,
         on_endpoint,
         on_shutdown_started,
-        #[cfg(windows)]
-        stop_dev_server,
-        #[cfg(not(windows))]
-        crate::ports::terminate_child_process_tree,
+        DevServerStopping {
+            terminate: crate::ports::terminate_child_process_tree,
+            #[cfg(windows)]
+            console_interrupted: crate::execution::console_interrupted,
+        },
     )
+}
+
+/// How lpm stops the dev server's processes, which tests replace.
+struct DevServerStopping<T> {
+    /// Ends the server's whole process tree.
+    terminate: T,
+    /// Whether the console interrupt that began the stop reached the
+    /// server's processes, which then get a grace period to stop themselves.
+    #[cfg(windows)]
+    console_interrupted: fn() -> bool,
 }
 
 fn spawn_shell_with_endpoint_using<T>(
@@ -359,7 +375,7 @@ fn spawn_shell_with_endpoint_using<T>(
     stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_endpoint: EndpointResultCallback,
     mut on_shutdown_started: Option<crate::ShutdownStartedCallback>,
-    mut terminate_child: T,
+    mut stopping: DevServerStopping<T>,
 ) -> Result<ExitStatus, LpmError>
 where
     T: FnMut(&mut std::process::Child) -> std::io::Result<ExitStatus>,
@@ -470,14 +486,16 @@ where
     let status_result = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                #[cfg(windows)]
-                let stopping = crate::execution::exit_follows_console_stop(status, || {
+                // The tunnel acknowledges a stop before lpm ends what the
+                // server left running, as it does when lpm stops the server.
+                if crate::execution::exit_follows_stop(status, || {
                     stop_requested.load(std::sync::atomic::Ordering::Acquire)
-                });
-                #[cfg(not(windows))]
-                let stopping = stop_requested.load(std::sync::atomic::Ordering::Acquire);
-                if stopping {
+                }) {
                     shutdown_result = crate::invoke_shutdown_started(&mut on_shutdown_started);
+                    #[cfg(windows)]
+                    if (stopping.console_interrupted)() {
+                        await_dev_server_stop(&mut child, job.as_ref());
+                    }
                 }
                 break Ok(status);
             }
@@ -494,8 +512,12 @@ where
         if resolution_failed || stop_requested {
             if stop_requested {
                 shutdown_result = crate::invoke_shutdown_started(&mut on_shutdown_started);
+                #[cfg(windows)]
+                if (stopping.console_interrupted)() {
+                    await_dev_server_stop(&mut child, job.as_ref());
+                }
             }
-            break terminate_child(&mut child).map_err(|error| {
+            break (stopping.terminate)(&mut child).map_err(|error| {
                 LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
             });
         }
@@ -1540,38 +1562,25 @@ mod tests {
         );
     }
 
-    /// The dev server shares lpm's console, so the Ctrl+C that stops the
-    /// session can end it before lpm's handler, which Windows runs on a
-    /// thread of its own, has recorded the stop.
-    #[cfg(windows)]
+    /// A server that exits as the session stops leaves the tunnel to
+    /// acknowledge the stop before lpm ends what the server left running, as
+    /// when lpm stops the server itself.
     #[test]
-    fn a_dev_server_the_console_interrupt_ended_first_still_begins_the_shutdown() {
+    fn a_dev_server_exiting_as_the_session_stops_lets_the_tunnel_stop_first() {
         let dir = tempfile::tempdir().unwrap();
         let path = std::env::var("PATH").unwrap_or_default();
         let envs = empty_envs();
-        let exiting_path = dir.path().join("exiting");
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let controller_stop = std::sync::Arc::clone(&stop_requested);
-        let controller = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !exiting_path.exists() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert!(exiting_path.exists(), "the dev server did not run");
-            // Past lpm's 50 ms poll, so lpm has seen the exit first.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            controller_stop.store(true, std::sync::atomic::Ordering::Release);
+        let late_stop = std::sync::Arc::clone(&stop_requested);
+        crate::execution::on_next_stop_check(move || {
+            late_stop.store(true, std::sync::atomic::Ordering::Release);
         });
         let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_state = std::sync::Arc::clone(&shutdown_started);
 
         let status = spawn_shell_with_endpoint(
             &ShellCommand {
-                command: &format!(
-                    "{} & exit {}",
-                    crate::test_support::script_creating_file("exiting"),
-                    crate::execution::STATUS_CONTROL_C_EXIT as i32
-                ),
+                command: "exit 3",
                 cwd: dir.path(),
                 path: &path,
                 envs: &envs,
@@ -1586,15 +1595,163 @@ mod tests {
             })),
         )
         .unwrap();
-        controller.join().unwrap();
+
+        assert_eq!(status.code(), Some(3));
+        assert!(
+            shutdown_started.load(std::sync::atomic::Ordering::Acquire),
+            "the tunnel was left out of the stop"
+        );
+    }
+
+    /// Runs `command` as single-script `lpm dev` runs its dev server on
+    /// Windows, after a console interrupt that reached the server when
+    /// `console_interrupted`, with `stop_requested` set once lpm checks for a
+    /// stop behind the server's exit, or from the start. Returns the server's
+    /// status and whether the session's shutdown began.
+    #[cfg(windows)]
+    fn run_dev_server_through_a_console_stop(
+        command: &str,
+        dir: &std::path::Path,
+        stop_from_the_start: bool,
+        console_interrupted: bool,
+    ) -> (ExitStatus, bool) {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let stop_requested =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(stop_from_the_start));
+        let late_stop = std::sync::Arc::clone(&stop_requested);
+        crate::execution::on_next_stop_check(move || {
+            late_stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_state = std::sync::Arc::clone(&shutdown_started);
+
+        let status = spawn_shell_with_endpoint_using(
+            &ShellCommand {
+                command,
+                cwd: dir,
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            EndpointDiscovery::required(false),
+            stop_requested,
+            Box::new(|_| {}),
+            Some(Box::new(move || {
+                callback_state.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })),
+            DevServerStopping {
+                terminate: crate::ports::terminate_child_process_tree,
+                console_interrupted: if console_interrupted {
+                    || true
+                } else {
+                    || false
+                },
+            },
+        )
+        .unwrap();
+        (
+            status,
+            shutdown_started.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// A command that starts `worker.js` in the background, sharing the
+    /// console, then exits as a console Ctrl+C ends a process.
+    #[cfg(windows)]
+    fn starting_a_worker_then_ended_by_the_console(dir: &std::path::Path) -> String {
+        std::fs::write(
+            dir.join("worker.js"),
+            "setTimeout(() => require('fs').writeFileSync('cleaned-up', ''), 500);\n",
+        )
+        .unwrap();
+        format!(
+            "start /b node worker.js & exit {}",
+            crate::execution::STATUS_CONTROL_C_EXIT as i32
+        )
+    }
+
+    /// The dev server shares lpm's console, so the Ctrl+C that stops the
+    /// session can end it before lpm's handler, which Windows runs on a
+    /// thread of its own, has recorded the stop.
+    #[cfg(windows)]
+    #[test]
+    fn a_dev_server_the_console_interrupt_ended_first_still_begins_the_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (status, shutdown_started) = run_dev_server_through_a_console_stop(
+            &format!("exit {}", crate::execution::STATUS_CONTROL_C_EXIT as i32),
+            dir.path(),
+            false,
+            false,
+        );
 
         assert_eq!(
             status.code(),
             Some(crate::execution::STATUS_CONTROL_C_EXIT as i32)
         );
+        assert!(shutdown_started, "the session's shutdown did not begin");
+    }
+
+    /// What the dev server started, such as the server behind `npm run dev`,
+    /// got the console event too, and may still be cleaning up after the
+    /// server itself has exited.
+    #[cfg(windows)]
+    #[test]
+    fn what_a_dev_server_started_finishes_stopping_after_the_server_exits_on_a_console_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = starting_a_worker_then_ended_by_the_console(dir.path());
+
+        let (_, shutdown_started) =
+            run_dev_server_through_a_console_stop(&command, dir.path(), false, true);
+
+        assert!(shutdown_started);
         assert!(
-            shutdown_started.load(std::sync::atomic::Ordering::Acquire),
-            "the session's shutdown did not begin"
+            dir.path().join("cleaned-up").exists(),
+            "lpm ended the worker before it had stopped itself"
+        );
+    }
+
+    /// The server is still running when the stop begins, and exits before
+    /// what it started has stopped itself.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_dev_server_s_processes_stop_themselves_on_a_console_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("worker.js"),
+            "setTimeout(() => require('fs').writeFileSync('cleaned-up', ''), 500);\n",
+        )
+        .unwrap();
+
+        run_dev_server_through_a_console_stop(
+            "start /b node worker.js & node -e \"setTimeout(() => {}, 200)\"",
+            dir.path(),
+            true,
+            true,
+        );
+
+        assert!(
+            dir.path().join("cleaned-up").exists(),
+            "lpm ended the worker before it had stopped itself"
+        );
+    }
+
+    /// A stop lpm began itself reached none of the dev server's processes,
+    /// so lpm ends them at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_dev_server_lpm_stops_itself_is_ended_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = starting_a_worker_then_ended_by_the_console(dir.path());
+
+        run_dev_server_through_a_console_stop(&command, dir.path(), true, false);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        assert!(
+            !dir.path().join("cleaned-up").exists(),
+            "lpm waited for a dev server no console event had reached"
         );
     }
 
@@ -1636,11 +1793,13 @@ mod tests {
                     "injected shutdown boundary failure".to_string(),
                 ))
             })),
-            |child| {
-                let _ = crate::ports::terminate_child_process_tree(child);
-                Err(std::io::Error::other(
-                    "injected endpoint process-tree termination failure",
-                ))
+            DevServerStopping {
+                terminate: |child: &mut std::process::Child| {
+                    let _ = crate::ports::terminate_child_process_tree(child);
+                    Err(std::io::Error::other(
+                        "injected endpoint process-tree termination failure",
+                    ))
+                },
             },
         )
         .unwrap_err();

@@ -11,12 +11,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
 
 /// Whether a child that exited did so in a stop lpm has recorded, as
-/// `recorded` reports. Windows runs lpm's console handler on a thread it
-/// starts for the event, so a child the same Ctrl+C or Ctrl+Break ended,
-/// with [`STATUS_CONTROL_C_EXIT`], can exit before lpm has recorded it; for
-/// such a child this waits briefly for the record.
-#[cfg(windows)]
-pub(crate) fn exit_follows_console_stop(status: ExitStatus, recorded: impl Fn() -> bool) -> bool {
+/// `recorded` reports. On Windows the child shares lpm's console, and lpm's
+/// handler runs on a thread Windows starts for the event, so a child the
+/// same Ctrl+C or Ctrl+Break ended, with [`STATUS_CONTROL_C_EXIT`], can exit
+/// before lpm has recorded the stop; for such a child this waits briefly
+/// for the record.
+#[cfg_attr(
+    not(windows),
+    expect(
+        unused_variables,
+        reason = "only a Windows child can exit from lpm's own console event"
+    )
+)]
+pub(crate) fn exit_follows_stop(status: ExitStatus, recorded: impl Fn() -> bool) -> bool {
+    #[cfg(test)]
+    if let Some(hook) = ON_STOP_CHECK.take() {
+        hook();
+    }
+    #[cfg(windows)]
     if status.code() == Some(STATUS_CONTROL_C_EXIT as i32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while !recorded() && std::time::Instant::now() < deadline {
@@ -24,6 +36,21 @@ pub(crate) fn exit_follows_console_stop(status: ExitStatus, recorded: impl Fn() 
         }
     }
     recorded()
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_STOP_CHECK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `hook` once this thread next checks, in [`exit_follows_stop`], for a
+/// stop behind a child's exit, so a test can record the stop exactly then,
+/// as when Windows runs lpm's handler after the child the same event ended
+/// has exited.
+#[cfg(test)]
+pub(crate) fn on_next_stop_check(hook: impl FnOnce() + 'static) {
+    ON_STOP_CHECK.set(Some(Box::new(hook)));
 }
 
 /// Keep stop handlers active for a command or an entire file-watch session.
@@ -36,10 +63,6 @@ pub struct ExecutionSignals {
     presses: Arc<AtomicUsize>,
     #[cfg(windows)]
     listener: u64,
-    /// Runs once lpm waits for the interrupt behind a child's exit, so a
-    /// test can record one exactly then.
-    #[cfg(all(test, windows))]
-    on_await_interrupt: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ExecutionSignals {
@@ -52,8 +75,6 @@ impl ExecutionSignals {
             presses: Arc::new(AtomicUsize::new(0)),
             #[cfg(windows)]
             listener: 0,
-            #[cfg(all(test, windows))]
-            on_await_interrupt: std::sync::Mutex::new(None),
         };
         #[cfg(unix)]
         let signals = {
@@ -92,17 +113,7 @@ impl ExecutionSignals {
     /// lpm reports which interrupt it was rather than the child's status.
     #[cfg(windows)]
     fn await_the_interrupt_behind(&self, status: ExitStatus) {
-        #[cfg(test)]
-        if status.code() == Some(STATUS_CONTROL_C_EXIT as i32)
-            && let Some(hook) = self
-                .on_await_interrupt
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-        {
-            hook();
-        }
-        exit_follows_console_stop(status, || self.is_stopped());
+        exit_follows_stop(status, || self.is_stopped());
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -363,12 +374,23 @@ impl Drop for ExecutionSignals {
     }
 }
 
-/// Whether a console event has started a shutdown, through a
-/// [`ConsoleStop`]: the processes that share lpm's console got the event
-/// too, and are stopping themselves.
+/// Whether a console Ctrl+C or Ctrl+Break began the shutdown under way,
+/// through a [`ConsoleStop`], and the window hasn't closed since. The
+/// processes that share lpm's console got the interrupt too, and get time to
+/// stop themselves. A closing window leaves them none: Windows ends every
+/// process on the console within about five seconds of it, and lpm needs
+/// that time to release what its session holds. It holds for the rest of
+/// the process, which a shutdown ends.
 #[cfg(windows)]
-pub(crate) fn console_stopping() -> bool {
-    console_interrupts::stopping()
+pub(crate) fn console_interrupted() -> bool {
+    console_interrupts::interrupted()
+}
+
+/// Whether a console interrupt reached lpm's children as well as lpm: only
+/// Windows children share lpm's console event.
+#[cfg(not(windows))]
+pub(crate) const fn console_interrupted() -> bool {
+    false
 }
 
 /// What made a [`ConsoleStop`] call its stop.
@@ -418,20 +440,22 @@ impl Drop for ConsoleStop {
     }
 }
 
-/// Ctrl+C, Ctrl+Break and the window's closing at the console, while a
-/// listener lives, without ending lpm.
+/// Ctrl+C and Ctrl+Break at the console, while a listener lives, without
+/// ending lpm; the window's closing, only for a [`ConsoleStop`] or once the
+/// shutdown one began is under way.
 ///
 /// An [`ExecutionSignals`] records Ctrl+C and Ctrl+Break as SIGINT or
 /// SIGBREAK. The foreground child shares the console, so it gets the event
 /// too and decides for itself, as under cmd.exe; ending lpm at once left a
 /// batch file it ran asking "Terminate batch job (Y/N)?" while the shell
-/// read the keyboard too. A second press stops the child.
+/// read the keyboard too. A second press stops the child. The window's
+/// closing still ends `lpm run`, with its child.
 ///
 /// A [`ConsoleStop`] is called for each, and for the window's closing.
 #[cfg(windows)]
 mod console_interrupts {
     use super::ConsoleStopEvent;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Once, PoisonError};
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
     use windows_sys::Win32::System::Console::{
@@ -506,12 +530,17 @@ mod console_interrupts {
         presses.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Set once a `ConsoleStop` has been called: lpm has a shutdown under
-    /// way, which outlives the listeners, as `lpm dev` releases its tunnel,
-    /// proxy routes and hosts-file entries after its services stop. Later
-    /// events then leave lpm running, as a signal does on Unix once its
-    /// handler's actions are gone.
-    static STOPPING: AtomicBool = AtomicBool::new(false);
+    /// Set, for the rest of the process, once a `ConsoleStop` has been
+    /// called: lpm has a shutdown under way, which outlives the listeners, as
+    /// `lpm dev` releases its tunnel, proxy routes and hosts-file entries
+    /// after its services stop. Later events then leave lpm running, as a
+    /// signal does on Unix once its handler's actions are gone. It records
+    /// which event began the shutdown, and a closing window outranks an
+    /// interrupt before it.
+    static STOPPING: AtomicU8 = AtomicU8::new(NOT_STOPPING);
+    pub(super) const NOT_STOPPING: u8 = 0;
+    pub(super) const INTERRUPTED: u8 = 1;
+    pub(super) const CLOSING: u8 = 2;
 
     /// Runs on a thread of its own that Windows starts for the event.
     unsafe extern "system" fn on_console_event(event: u32) -> BOOL {
@@ -537,7 +566,7 @@ mod console_interrupts {
     pub(super) fn dispatch(
         event: u32,
         listeners: &[ReactionHandle],
-        stopping: &AtomicBool,
+        stopping: &AtomicU8,
         close_grace: std::time::Duration,
     ) -> bool {
         let signal = signal_for(event);
@@ -563,13 +592,15 @@ mod console_interrupts {
                 ReactionHandle::Record { .. } => None,
             })
             .collect();
-        let stop_event = if closing {
-            ConsoleStopEvent::Close
+        let (stop_event, stopped_by) = if closing {
+            (ConsoleStopEvent::Close, CLOSING)
         } else {
-            ConsoleStopEvent::Interrupt
+            (ConsoleStopEvent::Interrupt, INTERRUPTED)
         };
+        if !stops.is_empty() {
+            stopping.fetch_max(stopped_by, Ordering::AcqRel);
+        }
         for stop in &stops {
-            stopping.store(true, Ordering::Release);
             // A panic can't unwind out of the console handler, so one here
             // would abort lpm before its cleanup.
             let stop = std::panic::AssertUnwindSafe(|| stop(stop_event));
@@ -577,13 +608,14 @@ mod console_interrupts {
                 tracing::debug!("a console stop panicked");
             }
         }
-        let shutting_down = !stops.is_empty() || stopping.load(Ordering::Acquire);
+        let shutting_down = stopping.load(Ordering::Acquire) != NOT_STOPPING;
         if closing {
             // Only a shutdown has anything to finish; otherwise the closing
             // window ends lpm, as before.
             if !shutting_down {
                 return false;
             }
+            stopping.fetch_max(CLOSING, Ordering::AcqRel);
             std::thread::sleep(close_grace);
             return true;
         }
@@ -611,8 +643,8 @@ mod console_interrupts {
         id
     }
 
-    pub(super) fn stopping() -> bool {
-        STOPPING.load(Ordering::Acquire)
+    pub(super) fn interrupted() -> bool {
+        STOPPING.load(Ordering::Acquire) == INTERRUPTED
     }
 
     #[cfg(test)]
@@ -703,6 +735,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use std::sync::atomic::AtomicU8;
 
     fn ping(seconds: u32) -> Command {
         let mut command = Command::new("ping");
@@ -795,9 +828,9 @@ mod windows_tests {
     /// the interrupt behind it, as when Windows runs lpm's handler late.
     fn interrupt_once_lpm_waits_for_it(signals: &ExecutionSignals) {
         let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
-        *signals.on_await_interrupt.lock().unwrap() = Some(Box::new(move || {
+        on_next_stop_check(move || {
             console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
-        }));
+        });
     }
 
     #[test]
@@ -869,7 +902,7 @@ mod windows_tests {
             },
             stop_recording(&calls),
         ];
-        let stopping = std::sync::atomic::AtomicBool::new(false);
+        let stopping = AtomicU8::new(console_interrupts::NOT_STOPPING);
 
         let handled = console_interrupts::dispatch(
             CTRL_C_EVENT,
@@ -882,7 +915,11 @@ mod windows_tests {
         assert_eq!(signal.load(Ordering::Acquire), console_interrupts::SIGINT);
         assert_eq!(presses.load(Ordering::Acquire), 1);
         assert_eq!(*calls.lock().unwrap(), [ConsoleStopEvent::Interrupt]);
-        assert!(stopping.load(Ordering::Acquire), "a shutdown is under way");
+        assert_eq!(
+            stopping.load(Ordering::Acquire),
+            console_interrupts::INTERRUPTED,
+            "a shutdown is under way"
+        );
     }
 
     #[test]
@@ -892,7 +929,7 @@ mod windows_tests {
             signal: Arc::new(AtomicUsize::new(0)),
             presses: Arc::new(AtomicUsize::new(0)),
         };
-        let stopping = std::sync::atomic::AtomicBool::new(false);
+        let stopping = AtomicU8::new(console_interrupts::NOT_STOPPING);
         assert!(
             !console_interrupts::dispatch(
                 CTRL_CLOSE_EVENT,
@@ -919,7 +956,7 @@ mod windows_tests {
     #[test]
     fn a_shutdown_under_way_keeps_lpm_running_with_no_listener_left() {
         use windows_sys::Win32::System::Console::{CTRL_C_EVENT, CTRL_CLOSE_EVENT};
-        let idle = std::sync::atomic::AtomicBool::new(false);
+        let idle = AtomicU8::new(console_interrupts::NOT_STOPPING);
         assert!(!console_interrupts::dispatch(
             CTRL_C_EVENT,
             &[],
@@ -927,7 +964,7 @@ mod windows_tests {
             std::time::Duration::ZERO
         ));
 
-        let stopping = std::sync::atomic::AtomicBool::new(true);
+        let stopping = AtomicU8::new(console_interrupts::INTERRUPTED);
         assert!(console_interrupts::dispatch(
             CTRL_C_EVENT,
             &[],
@@ -950,7 +987,7 @@ mod windows_tests {
             console_interrupts::ReactionHandle::Stop(Arc::new(|_| panic!("a stop that panics"))),
             stop_recording(&calls),
         ];
-        let stopping = std::sync::atomic::AtomicBool::new(false);
+        let stopping = AtomicU8::new(console_interrupts::NOT_STOPPING);
 
         assert!(console_interrupts::dispatch(
             CTRL_C_EVENT,
@@ -959,6 +996,38 @@ mod windows_tests {
             std::time::Duration::ZERO
         ));
         assert_eq!(*calls.lock().unwrap(), [ConsoleStopEvent::Interrupt]);
+    }
+
+    /// The window closing during a shutdown an interrupt began leaves the
+    /// processes on the console no time to stop themselves, whether or not
+    /// a listener is left; a later interrupt doesn't give it back.
+    #[test]
+    fn a_closing_window_outranks_the_interrupt_that_began_the_shutdown() {
+        use windows_sys::Win32::System::Console::{CTRL_C_EVENT, CTRL_CLOSE_EVENT};
+        let stopping = AtomicU8::new(console_interrupts::INTERRUPTED);
+
+        assert!(console_interrupts::dispatch(
+            CTRL_CLOSE_EVENT,
+            &[],
+            &stopping,
+            std::time::Duration::ZERO
+        ));
+        assert_eq!(
+            stopping.load(Ordering::Acquire),
+            console_interrupts::CLOSING
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(console_interrupts::dispatch(
+            CTRL_C_EVENT,
+            &[stop_recording(&calls)],
+            &stopping,
+            std::time::Duration::ZERO
+        ));
+        assert_eq!(
+            stopping.load(Ordering::Acquire),
+            console_interrupts::CLOSING
+        );
     }
 
     #[test]

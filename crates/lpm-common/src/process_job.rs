@@ -78,6 +78,12 @@ impl ProcessJob {
         if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        self.wait_until_empty(timeout)
+    }
+
+    /// Waits up to `timeout` for every process in the Job to exit, ending
+    /// none; whether they all did.
+    pub fn wait_until_empty(&self, timeout: Duration) -> io::Result<bool> {
         let deadline = Instant::now() + timeout;
         loop {
             if self.active_processes()? == 0 {
@@ -219,6 +225,38 @@ mod tests {
         assert!(
             grandchild.exits_within(Duration::from_secs(5)),
             "the grandchild outlived its Job"
+        );
+    }
+
+    /// A Job's processes may outlive its root: waiting for the Job waits for
+    /// them, and ends none.
+    #[test]
+    fn waiting_for_a_job_waits_for_what_outlives_its_root_without_ending_it() {
+        let job = ProcessJob::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("worker.js"),
+            "setTimeout(() => require('fs').writeFileSync('done', ''), 500);\n",
+        )
+        .unwrap();
+        let mut root = spawn_in(
+            &job,
+            Command::new("cmd")
+                .args(["/d", "/c", "start /b node worker.js"])
+                .current_dir(directory.path())
+                .stdin(Stdio::null()),
+        );
+        assert!(root.wait().unwrap().success());
+
+        assert!(
+            !job.wait_until_empty(Duration::ZERO).unwrap(),
+            "the worker never ran"
+        );
+        assert!(job.wait_until_empty(Duration::from_secs(10)).unwrap());
+
+        assert!(
+            directory.path().join("done").exists(),
+            "the worker was ended rather than waited for"
         );
     }
 

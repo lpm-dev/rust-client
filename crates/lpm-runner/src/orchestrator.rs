@@ -1685,7 +1685,9 @@ pub fn run_services_with_config(
                 match handle.join() {
                     Ok(Ok(readiness)) => {
                         if let Some(status) = service_exit_status(&children, &name) {
-                            if status.success() {
+                            if status.success()
+                                || recovery::exit_behind_shutdown(status, &shutdown_state)
+                            {
                                 startup_interrupted = true;
                                 continue;
                             }
@@ -1739,11 +1741,7 @@ pub fn run_services_with_config(
                             continue;
                         }
                         if let Some(status) = service_exit_status(&children, &name) {
-                            #[cfg(windows)]
-                            if recovery::console_interrupt_behind(
-                                &[(name.clone(), status)],
-                                &shutdown_state,
-                            ) {
+                            if recovery::exit_behind_shutdown(status, &shutdown_state) {
                                 startup_interrupted = true;
                                 continue;
                             }
@@ -1856,9 +1854,16 @@ pub fn run_services_with_config(
         Ok(())
     })();
 
-    let force = shutdown_state.load(Ordering::Relaxed) >= 2;
+    // Acquire: a console stop records which event began the shutdown before
+    // it moves `shutdown_state` on, and the shutdown below reads that record.
+    let force = shutdown_state.load(Ordering::Acquire) >= 2;
     let shutdown_result = children_guard.begin_shutdown();
-    shutdown_children_ordered(&children, force, Some(&groups));
+    shutdown_children_ordered(
+        &children,
+        force,
+        Some(&groups),
+        crate::execution::console_interrupted(),
+    );
     std::mem::forget(children_guard);
     match runtime_result {
         Ok(()) => shutdown_result,
@@ -2141,8 +2146,10 @@ fn ctrlc_handler(
 /// Ctrl+Break and the console window's closing move the shutdown on as
 /// SIGINT and SIGHUP do on Unix, rather than ending lpm with the services'
 /// cleanup skipped. Services share lpm's console, so the same event reaches
-/// them and runs their own Ctrl+C handlers; lpm then ends what still runs,
-/// in reverse dependency order.
+/// them and runs their own handlers. After a Ctrl+C or Ctrl+Break they get
+/// the grace period; lpm then ends what still runs, in reverse dependency
+/// order. After the window's closing lpm ends them at once, as Windows
+/// allows it only a few seconds to release what the session holds.
 #[cfg(windows)]
 struct SignalHandler {
     /// Held for its `Drop`, which stops listening.
@@ -2161,7 +2168,7 @@ fn ctrlc_handler(
     use crate::execution::ConsoleStopEvent;
     Some(SignalHandler {
         _listener: crate::execution::ConsoleStop::new(move |event| {
-            let previous = shutdown_state.update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            let previous = shutdown_state.update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 state.saturating_add(1)
             });
             match previous {
@@ -2203,7 +2210,12 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
 /// If `force` is true, skips SIGTERM and goes straight to SIGKILL (used when
 /// the user double-pressed Ctrl+C).
 fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force: bool) {
-    shutdown_children_ordered(children, force, None);
+    shutdown_children_ordered(
+        children,
+        force,
+        None,
+        crate::execution::console_interrupted(),
+    );
 }
 
 /// Shutdown with optional reverse topological ordering.
@@ -2211,10 +2223,14 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force
 /// When `groups` is provided, services are stopped in reverse topological order
 /// (dependents first, then their dependencies). All groups share a 2s grace budget.
 /// When `groups` is None, all services are stopped simultaneously (legacy behavior).
+/// When `services_interrupted`, the console interrupt that began the shutdown
+/// has reached the services, which then only get the grace period to stop
+/// themselves.
 fn shutdown_children_ordered(
     children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     force: bool,
     groups: Option<&[Vec<String>]>,
+    services_interrupted: bool,
 ) {
     let locked = children.lock();
     let count = locked.len();
@@ -2256,20 +2272,19 @@ fn shutdown_children_ordered(
                     if let Ok(Some(_)) = child.try_wait() {
                         continue; // Already exited
                     }
+                    if services_interrupted {
+                        continue;
+                    }
                     #[cfg(unix)]
                     {
                         let pid = child.id();
                         signal_service_process_group(pid, libc::SIGTERM);
                         tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
                     }
-                    // Services share lpm's console, so a console event that
-                    // began the shutdown reached them too: they get this
-                    // level's share of the grace period to stop themselves,
-                    // with their own Ctrl+C handlers. Windows can't send a
-                    // Ctrl+C to one service, so a shutdown lpm began itself
-                    // ends them through their Jobs.
+                    // Windows can't send a Ctrl+C to one service, so a
+                    // shutdown lpm began itself ends them through their Jobs.
                     #[cfg(windows)]
-                    if !crate::execution::console_stopping() && !child.end_job() {
+                    if !child.end_job() {
                         let _ = child.kill();
                     }
                     #[cfg(not(any(unix, windows)))]
@@ -2322,17 +2337,24 @@ fn shutdown_children_ordered(
         if let Some(status) = status
             && !child.tree_running()
         {
-            ui_service_note(
-                RESET,
-                name,
-                &format!("stopped (exit {})", status.code().unwrap_or(-1)),
-            );
+            ui_service_note(RESET, name, &stopped_note(status));
         } else {
             tracing::debug!("force-killing service '{name}'");
             force_kill_service_tree(child);
             ui_service_status(RESET, name, RED, "✗", "force-killed");
         }
     }
+}
+
+/// How the shutdown reports a service that stopped with `status`. On
+/// Windows, the console event that began the shutdown ends a service that
+/// doesn't handle it with `STATUS_CONTROL_C_EXIT`, which is no failure.
+fn stopped_note(status: std::process::ExitStatus) -> String {
+    #[cfg(windows)]
+    if status.code() == Some(crate::execution::STATUS_CONTROL_C_EXIT as i32) {
+        return "stopped".to_string();
+    }
+    format!("stopped (exit {})", status.code().unwrap_or(-1))
 }
 
 /// Starts a service in its own process group, so shutdown reaches its whole
@@ -2651,6 +2673,20 @@ mod tests {
         }
     }
 
+    /// A service running node `script` in `project`, started as `lpm dev`
+    /// starts one.
+    #[cfg(windows)]
+    fn spawn_node_service(project: &Path, script: &str) -> ServiceProcess {
+        let cached_cwd = project.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = Command::new("node");
+        command.args(["-e", script]).stdin(Stdio::null());
+        spawn_service_command_with(&mut command, project, &cached_cwd, &service_path, || Ok(()))
+            .unwrap()
+    }
+
     /// A service, started as `lpm dev` starts one, that starts a detached
     /// grandchild, then idles or exits with `exit_code`.
     #[cfg(windows)]
@@ -2658,32 +2694,93 @@ mod tests {
         project: &Path,
         exit_code: Option<i32>,
     ) -> (ServiceProcess, WatchedProcess) {
-        let cached_cwd = project.canonicalize().unwrap();
-        let service_path =
-            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
-                .unwrap();
         let then = exit_code.map_or_else(
             || "setInterval(() => {}, 1000);".to_string(),
             |code| format!("process.exit({code});"),
         );
-        let script = format!(
-            "const grandchild = require('child_process').spawn(process.execPath, \
-             ['-e', 'setInterval(() => {{}}, 1000)'], {{ detached: true, stdio: 'ignore' }}); \
-             require('fs').writeFileSync('grandchild.pid', String(grandchild.pid)); \
-             grandchild.unref(); {then}"
-        );
-        let mut command = Command::new("node");
-        command.args(["-e", &script]).stdin(Stdio::null());
-        let service = spawn_service_command_with(
-            &mut command,
+        let service = spawn_node_service(
             project,
-            &cached_cwd,
-            &service_path,
-            || Ok(()),
-        )
-        .unwrap();
+            &format!(
+                "const grandchild = require('child_process').spawn(process.execPath, \
+                 ['-e', 'setInterval(() => {{}}, 1000)'], {{ detached: true, stdio: 'ignore' }}); \
+                 require('fs').writeFileSync('grandchild.pid', String(grandchild.pid)); \
+                 grandchild.unref(); {then}"
+            ),
+        );
         let grandchild = WatchedProcess::from_pid_file(&project.join("grandchild.pid"));
         (service, grandchild)
+    }
+
+    /// A service that, as if the console interrupt had reached it, takes
+    /// 300 ms to stop itself, recording that it did.
+    #[cfg(windows)]
+    fn spawn_service_stopping_itself(project: &Path) -> ServiceProcess {
+        let service = spawn_node_service(
+            project,
+            "require('fs').writeFileSync('started', ''); \
+             setTimeout(() => { require('fs').writeFileSync('stopped-itself', ''); \
+             process.exit(0); }, 300);",
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !project.join("started").exists() {
+            assert!(Instant::now() < deadline, "the service never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        service
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn services_the_console_interrupt_reached_get_the_grace_period_to_stop_themselves() {
+        let project = tempfile::tempdir().unwrap();
+        let service = spawn_service_stopping_itself(project.path());
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), true);
+
+        assert!(
+            project.path().join("stopped-itself").exists(),
+            "the service was ended before it had stopped itself"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn services_the_console_interrupt_reached_are_ended_once_the_grace_period_is_over() {
+        let project = tempfile::tempdir().unwrap();
+        let (service, grandchild) = spawn_service_with_a_detached_grandchild(project.path(), None);
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        let started = Instant::now();
+
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), true);
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "the service wasn't given the grace period"
+        );
+        assert!(
+            grandchild.exits_within(Duration::from_secs(5)),
+            "what the service started outlived the shutdown"
+        );
+        assert!(!children.lock()[0].1.tree_running());
+    }
+
+    /// Windows can't send a Ctrl+C to one service, so services no console
+    /// interrupt reached are ended at once.
+    #[cfg(windows)]
+    #[test]
+    fn services_lpm_stops_itself_are_ended_at_once() {
+        let project = tempfile::tempdir().unwrap();
+        let service = spawn_service_stopping_itself(project.path());
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), false);
+        std::thread::sleep(Duration::from_millis(600));
+
+        assert!(
+            !project.path().join("stopped-itself").exists(),
+            "lpm waited for a service no console interrupt had reached"
+        );
     }
 
     #[cfg(windows)]
@@ -2723,6 +2820,64 @@ mod tests {
             grandchild.exits_within(Duration::from_secs(5)),
             "an exited service's detached grandchild outlived it"
         );
+    }
+
+    /// The console event that began the shutdown ended the service: it stays
+    /// for the shutdown, and what it started keeps the grace the rest get,
+    /// rather than its Job being ended as soon as lpm sees the exit.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_service_the_console_event_ended_is_left_to_the_shutdown_with_what_it_started() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut service, grandchild) = spawn_service_with_a_detached_grandchild(
+            project.path(),
+            Some(crate::execution::STATUS_CONTROL_C_EXIT as i32),
+        );
+        assert_eq!(
+            service.wait().unwrap().code(),
+            Some(crate::execution::STATUS_CONTROL_C_EXIT as i32)
+        );
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let handler = Arc::clone(&shutdown_state);
+        crate::execution::on_next_stop_check(move || handler.store(1, Ordering::Relaxed));
+
+        let exited = recovery::collect_exited_children(&children, &shutdown_state);
+
+        assert!(
+            exited.is_empty(),
+            "the service was taken for one that crashed"
+        );
+        assert_eq!(children.lock().len(), 1, "the service was taken out");
+        assert!(
+            !grandchild.exits_within(Duration::from_millis(200)),
+            "what the service started was ended before the shutdown's grace"
+        );
+        cleanup_exited_service_tree(&children.lock()[0].1);
+        assert!(grandchild.exits_within(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_stopped_service_is_reported_with_its_exit_code() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+        #[cfg(unix)]
+        let failed = std::process::ExitStatus::from_raw(3 << 8);
+        #[cfg(windows)]
+        let failed = std::process::ExitStatus::from_raw(3);
+
+        assert_eq!(stopped_note(failed), "stopped (exit 3)");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_service_the_console_event_ended_is_reported_as_stopped() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let ended = std::process::ExitStatus::from_raw(crate::execution::STATUS_CONTROL_C_EXIT);
+
+        assert_eq!(stopped_note(ended), "stopped");
     }
 
     fn service_with_dep(command: &str, dep: &str) -> ServiceConfig {
@@ -5055,6 +5210,77 @@ setInterval(() => {{}}, 1000);
         assert!(stop_started.elapsed() < Duration::from_secs(3));
     }
 
+    /// A service found exited after its readiness had succeeded, once the
+    /// shutdown has begun, is the shutdown's, not a crash that fails
+    /// `lpm dev`. On Windows the console interrupt that began the shutdown
+    /// ends such a service, often before lpm's handler has run.
+    #[test]
+    fn a_ready_service_that_exits_behind_the_shutdown_during_startup_is_not_a_crash() {
+        let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
+        drop(ready_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("never-ready.js"),
+            "setInterval(() => {}, 1000);\n",
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let exit_code = crate::execution::STATUS_CONTROL_C_EXIT as i32;
+        #[cfg(not(windows))]
+        let exit_code = 1;
+        std::fs::write(
+            dir.path().join("ended.js"),
+            format!("setTimeout(() => process.exit({exit_code}), 300);\n"),
+        )
+        .unwrap();
+        // Joined in name order: `api`'s readiness lasts until `worker` exits.
+        let services = HashMap::from([
+            (
+                "api".to_string(),
+                ServiceConfig {
+                    command: "node never-ready.js".to_string(),
+                    port: Some(ready_port),
+                    ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
+                    ..Default::default()
+                },
+            ),
+            (
+                "worker".to_string(),
+                ServiceConfig {
+                    command: "node ended.js".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        crate::execution::on_next_stop_check(move || {
+            command_tx.send(OrchestratorCommand::StopAll).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let result = run_services(dir.path(), &services, options);
+        let events: Vec<_> = event_rx.try_iter().collect();
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Crashed(_),
+                    ..
+                }
+            )),
+            "the stopped service was reported as crashed: {events:?}"
+        );
+    }
+
     #[test]
     fn stop_all_interrupts_initial_readiness_without_waiting_for_its_timeout() {
         let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -5289,7 +5515,7 @@ setInterval(() => {{}}, 1000);
 
         std::thread::sleep(Duration::from_millis(100));
         let started = std::time::Instant::now();
-        shutdown_children_ordered(&children, false, Some(&groups));
+        shutdown_children_ordered(&children, false, Some(&groups), false);
 
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -5356,7 +5582,7 @@ setInterval(() => {{}}, 1000);
         children.lock().push(("web".to_string(), child.into()));
         std::thread::sleep(Duration::from_millis(100));
 
-        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]));
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), false);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
@@ -5395,6 +5621,7 @@ setInterval(() => {{}}, 1000);
             &children,
             false,
             Some(&[vec!["db".to_string()], vec!["web".to_string()]]),
+            false,
         );
 
         assert_eq!(std::fs::read_to_string(observation).unwrap().trim(), "gone");

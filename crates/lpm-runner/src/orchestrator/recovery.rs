@@ -202,9 +202,8 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
             break;
         }
 
-        let exited = collect_exited_children(context.children);
-        #[cfg(windows)]
-        if console_interrupt_behind(&exited, context.shutdown_state) {
+        let exited = collect_exited_children(context.children, context.shutdown_state);
+        if context.shutdown_state.load(Ordering::Relaxed) > 0 {
             break;
         }
         for (name, status) in exited {
@@ -272,23 +271,26 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
     }
 }
 
-fn collect_exited_children(
+/// Takes the services that exited out of `children`, ending what they left
+/// running, with their statuses. A service whose exit lies behind the
+/// shutdown stays, for the shutdown to stop with the rest.
+pub(super) fn collect_exited_children(
     children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+    shutdown_state: &AtomicU8,
 ) -> Vec<(String, ExitStatus)> {
-    let mut exited = Vec::new();
-    let mut locked = children.lock();
-    let mut index = 0;
-    while index < locked.len() {
-        match locked[index].1.try_wait() {
-            Ok(Some(status)) => {
-                let (name, child) = locked.remove(index);
-                super::cleanup_exited_service_tree(&child);
-                exited.push((name, status));
-            }
-            Ok(None) | Err(_) => index += 1,
-        }
-    }
+    let exited: Vec<(String, u32)> = children
+        .lock()
+        .iter_mut()
+        .filter_map(|(name, child)| {
+            matches!(child.try_wait(), Ok(Some(_))).then(|| (name.clone(), child.id()))
+        })
+        .collect();
     exited
+        .into_iter()
+        .filter_map(|(name, pid)| {
+            take_exited_service(children, shutdown_state, &name, pid).map(|status| (name, status))
+        })
+        .collect()
 }
 
 fn handle_service_exit(
@@ -725,19 +727,11 @@ fn restart_job_is_current(
             .any(|(name, child)| name == &job.name && child.id() == job.child_pid)
 }
 
-/// Whether services exited because the shutdown began, rather than crashing:
-/// one the console Ctrl+C that began it ended can exit before lpm's handler
-/// has run.
-#[cfg(windows)]
-pub(super) fn console_interrupt_behind(
-    exited: &[(String, ExitStatus)],
-    shutdown_state: &std::sync::atomic::AtomicU8,
-) -> bool {
-    exited.iter().any(|(_, status)| {
-        crate::execution::exit_follows_console_stop(*status, || {
-            shutdown_state.load(Ordering::Relaxed) > 0
-        })
-    })
+/// Whether a service's exit lies behind the shutdown, which then stops it
+/// with what it started, as it does the rest, rather than taking it for a
+/// service that crashed or finished.
+pub(super) fn exit_behind_shutdown(status: ExitStatus, shutdown_state: &AtomicU8) -> bool {
+    crate::execution::exit_follows_stop(status, || shutdown_state.load(Ordering::Relaxed) > 0)
 }
 
 fn restart_child_stopped(
@@ -973,7 +967,12 @@ fn settle_restart_job(
         return Ok(());
     }
     let name = std::mem::take(&mut job.name);
-    if let Some(status) = take_exited_service(context.children, &name, job.child_pid) {
+    if let Some(status) = take_exited_service(
+        context.children,
+        context.shutdown_state,
+        &name,
+        job.child_pid,
+    ) {
         handle_service_exit(context, states, &name, status);
         return Ok(());
     }
@@ -1025,17 +1024,37 @@ fn settle_restart_job(
     Ok(())
 }
 
+/// Takes the service `name`, started as `pid`, out of `children` if it has
+/// exited, unless its exit lies behind the shutdown, ending what it left
+/// running; its status.
 fn take_exited_service(
     children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
+    shutdown_state: &AtomicU8,
     name: &str,
     pid: u32,
 ) -> Option<ExitStatus> {
-    let mut locked = children.lock();
-    let position = locked
-        .iter()
-        .position(|(service_name, child)| service_name == name && child.id() == pid)?;
-    let status = locked[position].1.try_wait().ok().flatten()?;
-    let (_, child) = locked.remove(position);
+    let is_it = |(service_name, child): &(String, ServiceProcess)| {
+        service_name == name && child.id() == pid
+    };
+    let status = children
+        .lock()
+        .iter_mut()
+        .find(|service| is_it(service))?
+        .1
+        .try_wait()
+        .ok()
+        .flatten()?;
+    // Unlocked: this may wait for lpm's console handler, whose second press
+    // takes the lock to force-kill.
+    if exit_behind_shutdown(status, shutdown_state) {
+        return None;
+    }
+    let child = {
+        let mut locked = children.lock();
+        let position = locked.iter().position(is_it)?;
+        locked.remove(position).1
+    };
+    // Unlocked as well: ending a Job waits for its processes to be gone.
     super::cleanup_exited_service_tree(&child);
     Some(status)
 }
@@ -1366,11 +1385,12 @@ mod tests {
             "service".into(),
             ServiceProcess::from(current),
         )]));
-        assert!(take_exited_service(&children, "service", old.id()).is_none());
+        let running = AtomicU8::new(0);
+        assert!(take_exited_service(&children, &running, "service", old.id()).is_none());
         assert_eq!(children.lock().len(), 1);
         assert!(restart_child_stopped(&children, "service", old.id()));
         assert!(
-            take_exited_service(&children, "service", current_pid)
+            take_exited_service(&children, &running, "service", current_pid)
                 .unwrap()
                 .success()
         );
@@ -1576,37 +1596,63 @@ mod tests {
     #[test]
     fn a_service_the_console_interrupt_ended_waits_for_the_shutdown_it_began() {
         use std::os::windows::process::ExitStatusExt as _;
-        let shutdown_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
-        let starter = Arc::clone(&shutdown_state);
-        let handler = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            starter.store(1, Ordering::Relaxed);
-        });
-        let exited = [("web".to_string(), ExitStatus::from_raw(0xC000_013A))];
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let handler = Arc::clone(&shutdown_state);
+        crate::execution::on_next_stop_check(move || handler.store(1, Ordering::Relaxed));
 
-        assert!(console_interrupt_behind(&exited, &shutdown_state));
-        handler.join().unwrap();
+        assert!(exit_behind_shutdown(
+            ExitStatus::from_raw(crate::execution::STATUS_CONTROL_C_EXIT),
+            &shutdown_state
+        ));
     }
 
     #[cfg(windows)]
     #[test]
     fn other_exits_are_not_taken_for_a_console_interrupt() {
         use std::os::windows::process::ExitStatusExt as _;
-        let shutdown_state = std::sync::atomic::AtomicU8::new(0);
+        let shutdown_state = AtomicU8::new(0);
         let started = Instant::now();
 
-        assert!(!console_interrupt_behind(
-            &[("web".to_string(), ExitStatus::from_raw(1))],
+        assert!(!exit_behind_shutdown(
+            ExitStatus::from_raw(1),
             &shutdown_state
         ));
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "an ordinary exit waited"
         );
-        assert!(!console_interrupt_behind(
-            &[("web".to_string(), ExitStatus::from_raw(0xC000_013A))],
+        assert!(!exit_behind_shutdown(
+            ExitStatus::from_raw(crate::execution::STATUS_CONTROL_C_EXIT),
             &shutdown_state
         ));
+    }
+
+    /// Once the shutdown has begun, an exited service stays for it, with
+    /// what it started, rather than being taken out and its tree ended.
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_service_is_left_to_a_shutdown_under_way_with_what_it_started() {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60 & exit 1");
+        super::super::isolate_service_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let root_pid = child.id();
+        assert!(!child.wait().unwrap().success());
+        children.lock().push(("worker".to_string(), child.into()));
+        let shutting_down = AtomicU8::new(1);
+
+        let exited = collect_exited_children(&children, &shutting_down);
+
+        assert!(exited.is_empty());
+        assert_eq!(children.lock().len(), 1, "the service was taken out");
+        assert!(
+            super::super::service_process_group_exists(root_pid),
+            "what the service started was ended before the shutdown's grace"
+        );
+        let running = AtomicU8::new(0);
+        assert_eq!(collect_exited_children(&children, &running).len(), 1);
+        assert!(children.lock().is_empty());
     }
 
     #[cfg(unix)]
@@ -1622,7 +1668,9 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
-            if let Some(status) = take_exited_service(&children, "worker", root_pid) {
+            if let Some(status) =
+                take_exited_service(&children, &AtomicU8::new(0), "worker", root_pid)
+            {
                 break status;
             }
             assert!(Instant::now() < deadline, "root process did not exit");
