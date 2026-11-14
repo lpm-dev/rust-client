@@ -335,6 +335,7 @@ mod simulated {
         pub(super) static NO_RENAME_WITHOUT_REPLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static FAILING_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static RENAME_INTO_ANOTHER_DIRECTORY: std::cell::Cell<Option<std::path::PathBuf>> = const { std::cell::Cell::new(None) };
+        pub(super) static PLACE_UNREADABLE_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The path a rename by full path names `directory` by: the handle's,
@@ -960,6 +961,12 @@ fn landed_in(
     renamed_into: &[u16],
 ) -> io::Result<bool> {
     use std::os::windows::ffi::OsStrExt as _;
+    #[cfg(test)]
+    if simulated::PLACE_UNREADABLE_AFTER_RENAME.take() {
+        return Err(io::Error::other(
+            "injected: the directory's path can't be read",
+        ));
+    }
     let directory_path = directory_final_path(directory)?;
     if directory_path == renamed_into {
         return Ok(true);
@@ -1860,6 +1867,28 @@ mod tests {
             0,
             "the stray file stayed"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_by_full_path_whose_place_can_t_be_read_fails_without_deleting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), b"old").unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        simulated::NO_RELATIVE_RENAME.set(true);
+        simulated::PLACE_UNREADABLE_AFTER_RENAME.set(true);
+
+        let written = write_file_atomic_in_dir_with(&directory, ".gitignore".as_ref(), |file| {
+            file.write_all(b"new")
+        });
+        simulated::NO_RELATIVE_RENAME.set(false);
+        simulated::PLACE_UNREADABLE_AFTER_RENAME.set(false);
+
+        let error = written.unwrap_err();
+        assert!(error.to_string().contains("could not tell"), "{error}");
+        // The file replaced the old one before the check, and stays.
+        assert_eq!(fs::read(dir.path().join(".gitignore")).unwrap(), b"new");
     }
 
     #[cfg(windows)]

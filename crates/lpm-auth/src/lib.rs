@@ -4286,7 +4286,8 @@ mod tests {
             let registry = "https://registry.example";
             let earlier = CredentialAuthority::committed_keychain("keychain-token");
             credential_authority::set(registry, CredentialKind::Access, earlier.clone()).unwrap();
-            // A directory where the credential file goes fails its write.
+            // A directory where the credential file goes fails the file
+            // fallback, which reads the store there before it writes.
             std::fs::create_dir_all(home.join(".lpm").join(".credentials")).unwrap();
 
             let stored = set_credential_with_keychain_writer_unlocked(

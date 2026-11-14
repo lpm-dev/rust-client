@@ -27,7 +27,8 @@ holds the link.
   std's `read_link` asks. Any other path gets the extended prefix `\\?\`,
   so each stays absolute and names what the link names: one Win32 would
   change, such as a name ending in a dot or a space, or holding `.` or a
-  doubled separator; a long one; and one whose server reads as `?` or `.`.
+  doubled separator; a long one; and one that names no share, or a server
+  that reads as `?` or `.`.
   Relative targets are unchanged.
 - `read_link_tests` cover these forms. They are Windows-only, as the
   crate is, and CI's Windows filesystem gate runs them with

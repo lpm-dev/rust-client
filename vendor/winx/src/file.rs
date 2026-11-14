@@ -401,6 +401,20 @@ pub fn read_link(file: &File) -> io::Result<PathBuf> {
     }
 }
 
+/// Whether `rest`, what follows `UNC\`, names a server and a share, neither
+/// of which reads as `?` or `.`, which would turn its Win32 path into a local
+/// or device path.
+fn names_a_share(rest: &[u16]) -> bool {
+    const BACKSLASH: u16 = b'\\' as u16;
+    let mut names = rest.split(|unit| *unit == BACKSLASH);
+    let server = names.next().unwrap_or_default();
+    let share = names.next().unwrap_or_default();
+    !server.is_empty()
+        && !share.is_empty()
+        && server != [u16::from(b'?')]
+        && server != [u16::from(b'.')]
+}
+
 /// The Win32 path of an NT path that followed `\??\`: `C:\dir` stays as it
 /// is, and `UNC\server\share\dir` becomes `\\server\share\dir`, where that
 /// is shorter than the classic path limit and Win32 reads it back unchanged,
@@ -426,7 +440,7 @@ fn win32_path(rest: &[u16]) -> PathBuf {
             if ascii_upper(*u) == u16::from(b'U')
                 && ascii_upper(*n) == u16::from(b'N')
                 && ascii_upper(*c) == u16::from(b'C')
-                && !matches!(share, [server, BACKSLASH, ..] if *server == u16::from(b'?') || *server == u16::from(b'.')) =>
+                && names_a_share(share) =>
         {
             let mut unc = Vec::with_capacity(share.len() + 2);
             unc.extend_from_slice(&[BACKSLASH, BACKSLASH]);
@@ -513,6 +527,8 @@ mod read_link_tests {
             r"C:",
             r"UNC\?\C:\pkg",
             r"UNC\.\C:\pkg",
+            r"UNC\server",
+            r"UNC\server\",
         ] {
             let path = after_nt_prefix(target);
             assert_eq!(path, PathBuf::from(format!(r"\\?\{target}")), "{target}");

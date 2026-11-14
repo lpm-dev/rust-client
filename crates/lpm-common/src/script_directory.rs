@@ -714,6 +714,7 @@ mod windows {
             // Another process's definition of the same letter, stacked on
             // this one's, outlives it.
             let reached = super::super::ScriptDirectory::for_shell(&network).unwrap();
+            assert!(lpm_defined(&reached), "{:?}", reached.path());
             let letter = letter_of(reached.path());
             define(letter, &definition).unwrap();
             drop(reached);
