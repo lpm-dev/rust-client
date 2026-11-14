@@ -1862,7 +1862,7 @@ pub fn run_services_with_config(
         &children,
         force,
         Some(&groups),
-        crate::execution::console_interrupted(),
+        crate::execution::console_interrupted,
     );
     std::mem::forget(children_guard);
     match runtime_result {
@@ -2210,12 +2210,7 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
 /// If `force` is true, skips SIGTERM and goes straight to SIGKILL (used when
 /// the user double-pressed Ctrl+C).
 fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force: bool) {
-    shutdown_children_ordered(
-        children,
-        force,
-        None,
-        crate::execution::console_interrupted(),
-    );
+    shutdown_children_ordered(children, force, None, crate::execution::console_interrupted);
 }
 
 /// Shutdown with optional reverse topological ordering.
@@ -2223,14 +2218,14 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>, force
 /// When `groups` is provided, services are stopped in reverse topological order
 /// (dependents first, then their dependencies). All groups share a 2s grace budget.
 /// When `groups` is None, all services are stopped simultaneously (legacy behavior).
-/// When `services_interrupted`, the console interrupt that began the shutdown
-/// has reached the services, which then only get the grace period to stop
-/// themselves.
+/// While `services_interrupted` holds, the console interrupt that began the
+/// shutdown has reached the services, which then only get the grace period to
+/// stop themselves; once it doesn't, as when the window closes, lpm ends them.
 fn shutdown_children_ordered(
     children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>,
     force: bool,
     groups: Option<&[Vec<String>]>,
-    services_interrupted: bool,
+    services_interrupted: impl Fn() -> bool,
 ) {
     let locked = children.lock();
     let count = locked.len();
@@ -2265,14 +2260,17 @@ fn shutdown_children_ordered(
 
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(2);
     for (group_index, group) in shutdown_order.iter().enumerate() {
+        let interrupted = services_interrupted();
         {
             let mut locked = children.lock();
             for name in group {
                 if let Some((_, child)) = locked.iter_mut().find(|(n, _)| n == name) {
-                    if let Ok(Some(_)) = child.try_wait() {
-                        continue; // Already exited
+                    // A service kept for the shutdown may have exited while
+                    // what it started still runs.
+                    if !child.tree_running() {
+                        continue;
                     }
-                    if services_interrupted {
+                    if interrupted {
                         continue;
                     }
                     #[cfg(unix)]
@@ -2282,7 +2280,8 @@ fn shutdown_children_ordered(
                         tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
                     }
                     // Windows can't send a Ctrl+C to one service, so a
-                    // shutdown lpm began itself ends them through their Jobs.
+                    // shutdown no interrupt reached them in, one lpm began
+                    // itself or the window's closing, ends their Jobs.
                     #[cfg(windows)]
                     if !child.end_job() {
                         let _ = child.kill();
@@ -2310,7 +2309,10 @@ fn shutdown_children_ordered(
                         .is_some_and(|(_, child)| child.tree_running())
                 })
             };
-            if !group_still_running || std::time::Instant::now() >= group_deadline {
+            if !group_still_running
+                || std::time::Instant::now() >= group_deadline
+                || (interrupted && !services_interrupted())
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -2736,7 +2738,7 @@ mod tests {
         let service = spawn_service_stopping_itself(project.path());
         let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
 
-        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), true);
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || true);
 
         assert!(
             project.path().join("stopped-itself").exists(),
@@ -2752,7 +2754,7 @@ mod tests {
         let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
         let started = Instant::now();
 
-        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), true);
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || true);
 
         assert!(
             started.elapsed() >= Duration::from_millis(1500),
@@ -2765,21 +2767,50 @@ mod tests {
         assert!(!children.lock()[0].1.tree_running());
     }
 
+    /// A service kept for the shutdown may have exited while what it started
+    /// still runs: lpm stops that at once too, rather than waiting out the
+    /// grace period for it.
+    #[cfg(windows)]
+    #[test]
+    fn what_an_exited_windows_service_left_is_ended_at_once_when_lpm_stops_it() {
+        let project = tempfile::tempdir().unwrap();
+        let (mut service, grandchild) =
+            spawn_service_with_a_detached_grandchild(project.path(), Some(1));
+        assert!(!service.wait().unwrap().success());
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        let started = Instant::now();
+
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || false);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "lpm waited out the grace period for what the service left"
+        );
+        assert!(
+            grandchild.exits_within(Duration::from_secs(5)),
+            "what the service left outlived the shutdown"
+        );
+    }
+
     /// Windows can't send a Ctrl+C to one service, so services no console
     /// interrupt reached are ended at once.
     #[cfg(windows)]
     #[test]
     fn services_lpm_stops_itself_are_ended_at_once() {
         let project = tempfile::tempdir().unwrap();
-        let service = spawn_service_stopping_itself(project.path());
+        let (service, grandchild) = spawn_service_with_a_detached_grandchild(project.path(), None);
         let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        let started = Instant::now();
 
-        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), false);
-        std::thread::sleep(Duration::from_millis(600));
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || false);
 
         assert!(
-            !project.path().join("stopped-itself").exists(),
+            started.elapsed() < Duration::from_millis(1500),
             "lpm waited for a service no console interrupt had reached"
+        );
+        assert!(
+            grandchild.exits_within(Duration::from_secs(5)),
+            "what the service started outlived the shutdown"
         );
     }
 
@@ -5255,14 +5286,23 @@ setInterval(() => {{}}, 1000);
         ]);
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let controller = OrchestratorCommandController::new(services.len());
         let options = OrchestratorOptions {
             command_rx: Some(command_rx),
+            command_controller: Some(controller.clone()),
             event_tx: Some(event_tx),
             ..Default::default()
         };
+        // The command bridge records the shutdown before it hands the stop
+        // to the controller, so the shutdown has begun once the controller
+        // has it.
         crate::execution::on_next_stop_check(move || {
             command_tx.send(OrchestratorCommand::StopAll).unwrap();
-            std::thread::sleep(Duration::from_millis(200));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !controller.stop_all_requested() {
+                assert!(Instant::now() < deadline, "the stop never reached lpm");
+                std::thread::sleep(Duration::from_millis(1));
+            }
         });
 
         let result = run_services(dir.path(), &services, options);
@@ -5515,7 +5555,7 @@ setInterval(() => {{}}, 1000);
 
         std::thread::sleep(Duration::from_millis(100));
         let started = std::time::Instant::now();
-        shutdown_children_ordered(&children, false, Some(&groups), false);
+        shutdown_children_ordered(&children, false, Some(&groups), || false);
 
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -5582,12 +5622,82 @@ setInterval(() => {{}}, 1000);
         children.lock().push(("web".to_string(), child.into()));
         std::thread::sleep(Duration::from_millis(100));
 
-        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), false);
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || false);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
+        assert!(!service_process_group_exists(root_pid));
+    }
+
+    /// The window closing during the grace period an interrupt began ends
+    /// it: Windows allows lpm only a few seconds after a close.
+    #[test]
+    fn a_closing_window_cuts_the_services_grace_period_short() {
+        let project = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let service = {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("while :; do sleep 0.05; done");
+            isolate_service_process_tree(&mut command);
+            ServiceProcess::from(command.spawn().unwrap())
+        };
+        #[cfg(windows)]
+        let service = spawn_node_service(project.path(), "setInterval(() => {}, 1000);");
+        let children = Arc::new(Mutex::new(vec![("web".to_string(), service)]));
+        let started = Instant::now();
+        let closed_at = started + Duration::from_millis(200);
+
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]), || {
+            Instant::now() < closed_at
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the grace period ran on after the window closed"
+        );
+        assert!(!children.lock()[0].1.tree_running());
+        drop(project);
+    }
+
+    /// A service kept for the shutdown may have exited while what it started
+    /// still runs in its process group: that gets SIGTERM too, and the chance
+    /// to stop itself, rather than only SIGKILL once the grace period is over.
+    #[cfg(unix)]
+    #[test]
+    fn ordered_shutdown_signals_what_an_exited_service_left_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut command = Command::new("sh");
+        command.current_dir(dir.path()).arg("-c").arg(
+            "(trap 'touch got-term; exit 0' TERM; touch trapped; \
+             while :; do sleep 0.05; done) & exit 1",
+        );
+        isolate_service_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let root_pid = child.id();
+        assert!(!child.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("trapped").exists() {
+            assert!(Instant::now() < deadline, "the leftover never set its trap");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let children = Arc::new(Mutex::new(vec![(
+            "worker".to_string(),
+            ServiceProcess::from(child),
+        )]));
+
+        shutdown_children_ordered(
+            &children,
+            false,
+            Some(&[vec!["worker".to_string()]]),
+            || false,
+        );
+
+        assert!(
+            dir.path().join("got-term").exists(),
+            "what the service left got no SIGTERM"
+        );
         assert!(!service_process_group_exists(root_pid));
     }
 
@@ -5621,7 +5731,7 @@ setInterval(() => {{}}, 1000);
             &children,
             false,
             Some(&[vec!["db".to_string()], vec!["web".to_string()]]),
-            false,
+            || false,
         );
 
         assert_eq!(std::fs::read_to_string(observation).unwrap().trim(), "gone");

@@ -236,7 +236,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("worker.js"),
-            "setTimeout(() => require('fs').writeFileSync('done', ''), 500);\n",
+            "const fs = require('fs');\n\
+             const poll = setInterval(() => {\n\
+               if (fs.existsSync('release')) {\n\
+                 clearInterval(poll);\n\
+                 setTimeout(() => fs.writeFileSync('done', ''), 300);\n\
+               }\n\
+             }, 10);\n",
         )
         .unwrap();
         let mut root = spawn_in(
@@ -247,11 +253,12 @@ mod tests {
                 .stdin(Stdio::null()),
         );
         assert!(root.wait().unwrap().success());
-
         assert!(
             !job.wait_until_empty(Duration::ZERO).unwrap(),
             "the worker never ran"
         );
+
+        std::fs::write(directory.path().join("release"), b"").unwrap();
         assert!(job.wait_until_empty(Duration::from_secs(10)).unwrap());
 
         assert!(

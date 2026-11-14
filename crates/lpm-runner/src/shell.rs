@@ -222,31 +222,33 @@ pub(crate) fn register_stop_signals(
     }))
 }
 
-/// How long the dev server's processes have to stop themselves once a
-/// console event has reached them, before lpm ends what still runs.
+/// How long the dev server's processes have to stop themselves after a
+/// console Ctrl+C or Ctrl+Break, before lpm ends what still runs.
 #[cfg(windows)]
 const DEV_SERVER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Waits up to [`DEV_SERVER_STOP_GRACE`] for the dev server's processes to
-/// stop themselves. They share lpm's console, so the Ctrl+C or closing
-/// window that began the stop reached each of them, and what the server
-/// started, such as the server behind `npm run dev`, may still be cleaning
-/// up after the server itself has exited. Windows can't send a Ctrl+C to the
-/// server alone, so a stop lpm began itself doesn't wait.
+/// Waits, while `interrupted` holds, up to [`DEV_SERVER_STOP_GRACE`] for the
+/// dev server's processes to stop themselves. They share lpm's console, so
+/// the Ctrl+C or Ctrl+Break that began the stop reached each of them, and
+/// what the server started, such as the server behind `npm run dev`, may
+/// still be cleaning up after the server itself has exited. A closing window
+/// ends the wait, as Windows allows lpm only a few seconds after it, and a
+/// stop lpm began itself, which reached none of them, doesn't wait at all.
 #[cfg(windows)]
 fn await_dev_server_stop(
     child: &mut std::process::Child,
     job: Option<&lpm_common::process_job::ProcessJob>,
+    interrupted: &dyn Fn() -> bool,
 ) {
     let deadline = std::time::Instant::now() + DEV_SERVER_STOP_GRACE;
-    if let Some(job) = job
-        && job
-            .wait_until_empty(deadline.saturating_duration_since(std::time::Instant::now()))
-            .is_ok()
-    {
-        return;
-    }
-    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+    while interrupted() && std::time::Instant::now() < deadline {
+        let running = match job.map(lpm_common::process_job::ProcessJob::active_processes) {
+            Some(Ok(count)) => count > 0,
+            Some(Err(_)) | None => matches!(child.try_wait(), Ok(None)),
+        };
+        if !running {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
@@ -353,7 +355,7 @@ pub fn spawn_shell_with_endpoint(
         DevServerStopping {
             terminate: crate::ports::terminate_child_process_tree,
             #[cfg(windows)]
-            console_interrupted: crate::execution::console_interrupted,
+            console_interrupted: Box::new(crate::execution::console_interrupted),
         },
     )
 }
@@ -363,9 +365,10 @@ struct DevServerStopping<T> {
     /// Ends the server's whole process tree.
     terminate: T,
     /// Whether the console interrupt that began the stop reached the
-    /// server's processes, which then get a grace period to stop themselves.
+    /// server's processes, which then get a grace period to stop themselves,
+    /// until the window closes.
     #[cfg(windows)]
-    console_interrupted: fn() -> bool,
+    console_interrupted: Box<dyn Fn() -> bool>,
 }
 
 fn spawn_shell_with_endpoint_using<T>(
@@ -493,9 +496,7 @@ where
                 }) {
                     shutdown_result = crate::invoke_shutdown_started(&mut on_shutdown_started);
                     #[cfg(windows)]
-                    if (stopping.console_interrupted)() {
-                        await_dev_server_stop(&mut child, job.as_ref());
-                    }
+                    await_dev_server_stop(&mut child, job.as_ref(), &*stopping.console_interrupted);
                 }
                 break Ok(status);
             }
@@ -513,9 +514,7 @@ where
             if stop_requested {
                 shutdown_result = crate::invoke_shutdown_started(&mut on_shutdown_started);
                 #[cfg(windows)]
-                if (stopping.console_interrupted)() {
-                    await_dev_server_stop(&mut child, job.as_ref());
-                }
+                await_dev_server_stop(&mut child, job.as_ref(), &*stopping.console_interrupted);
             }
             break (stopping.terminate)(&mut child).map_err(|error| {
                 LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
@@ -1604,21 +1603,19 @@ mod tests {
     }
 
     /// Runs `command` as single-script `lpm dev` runs its dev server on
-    /// Windows, after a console interrupt that reached the server when
-    /// `console_interrupted`, with `stop_requested` set once lpm checks for a
-    /// stop behind the server's exit, or from the start. Returns the server's
-    /// status and whether the session's shutdown began.
+    /// Windows, while `console_interrupted` holds, with `stop_requested`, which
+    /// is set once lpm checks for a stop behind the server's exit, if not
+    /// before. Returns the server's status and whether the session's shutdown
+    /// began.
     #[cfg(windows)]
     fn run_dev_server_through_a_console_stop(
         command: &str,
         dir: &std::path::Path,
-        stop_from_the_start: bool,
-        console_interrupted: bool,
+        stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        console_interrupted: impl Fn() -> bool + 'static,
     ) -> (ExitStatus, bool) {
         let path = std::env::var("PATH").unwrap_or_default();
         let envs = empty_envs();
-        let stop_requested =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(stop_from_the_start));
         let late_stop = std::sync::Arc::clone(&stop_requested);
         crate::execution::on_next_stop_check(move || {
             late_stop.store(true, std::sync::atomic::Ordering::Release);
@@ -1643,11 +1640,7 @@ mod tests {
             })),
             DevServerStopping {
                 terminate: crate::ports::terminate_child_process_tree,
-                console_interrupted: if console_interrupted {
-                    || true
-                } else {
-                    || false
-                },
+                console_interrupted: Box::new(console_interrupted),
             },
         )
         .unwrap();
@@ -1657,18 +1650,44 @@ mod tests {
         )
     }
 
-    /// A command that starts `worker.js` in the background, sharing the
-    /// console, then exits as a console Ctrl+C ends a process.
     #[cfg(windows)]
-    fn starting_a_worker_then_ended_by_the_console(dir: &std::path::Path) -> String {
+    fn stop_flag(set: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(set))
+    }
+
+    /// Writes `worker.js`, which records that it started, then takes 300 ms
+    /// to stop itself, as on a console Ctrl+C, recording that it did.
+    #[cfg(windows)]
+    fn write_worker(dir: &std::path::Path) {
         std::fs::write(
             dir.join("worker.js"),
-            "setTimeout(() => require('fs').writeFileSync('cleaned-up', ''), 500);\n",
+            "const fs = require('fs');\n\
+             fs.writeFileSync('started', '');\n\
+             setTimeout(() => fs.writeFileSync('cleaned-up', ''), 300);\n",
         )
         .unwrap();
+    }
+
+    /// A command that starts `worker.js` in the background, sharing the
+    /// console, waits until it has started and `then_ms` more, then `ends`.
+    #[cfg(windows)]
+    fn starting_a_worker(dir: &std::path::Path, then_ms: u32, ends: &str) -> String {
+        write_worker(dir);
         format!(
-            "start /b node worker.js & exit {}",
-            crate::execution::STATUS_CONTROL_C_EXIT as i32
+            "start /b node worker.js & node -e \"const fs = require('fs'); \
+             const poll = setInterval(() => {{ if (fs.existsSync('started')) {{ \
+             clearInterval(poll); setTimeout(() => {{}}, {then_ms}); }} }}, 10)\" & {ends}"
+        )
+    }
+
+    /// A command that starts `worker.js`, then exits as a console Ctrl+C
+    /// ends a process.
+    #[cfg(windows)]
+    fn starting_a_worker_then_ended_by_the_console(dir: &std::path::Path) -> String {
+        starting_a_worker(
+            dir,
+            0,
+            &format!("exit {}", crate::execution::STATUS_CONTROL_C_EXIT as i32),
         )
     }
 
@@ -1683,8 +1702,8 @@ mod tests {
         let (status, shutdown_started) = run_dev_server_through_a_console_stop(
             &format!("exit {}", crate::execution::STATUS_CONTROL_C_EXIT as i32),
             dir.path(),
-            false,
-            false,
+            stop_flag(false),
+            || false,
         );
 
         assert_eq!(
@@ -1704,7 +1723,7 @@ mod tests {
         let command = starting_a_worker_then_ended_by_the_console(dir.path());
 
         let (_, shutdown_started) =
-            run_dev_server_through_a_console_stop(&command, dir.path(), false, true);
+            run_dev_server_through_a_console_stop(&command, dir.path(), stop_flag(false), || true);
 
         assert!(shutdown_started);
         assert!(
@@ -1719,18 +1738,24 @@ mod tests {
     #[test]
     fn a_running_dev_server_s_processes_stop_themselves_on_a_console_stop() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("worker.js"),
-            "setTimeout(() => require('fs').writeFileSync('cleaned-up', ''), 500);\n",
-        )
-        .unwrap();
+        let command = starting_a_worker(dir.path(), 200, "exit 0");
+        let stop_requested = stop_flag(false);
+        let controller_stop = std::sync::Arc::clone(&stop_requested);
+        let started = dir.path().join("started");
+        let controller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !started.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the worker never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            controller_stop.store(true, std::sync::atomic::Ordering::Release);
+        });
 
-        run_dev_server_through_a_console_stop(
-            "start /b node worker.js & node -e \"setTimeout(() => {}, 200)\"",
-            dir.path(),
-            true,
-            true,
-        );
+        run_dev_server_through_a_console_stop(&command, dir.path(), stop_requested, || true);
+        controller.join().unwrap();
 
         assert!(
             dir.path().join("cleaned-up").exists(),
@@ -1746,12 +1771,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let command = starting_a_worker_then_ended_by_the_console(dir.path());
 
-        run_dev_server_through_a_console_stop(&command, dir.path(), true, false);
+        run_dev_server_through_a_console_stop(&command, dir.path(), stop_flag(true), || false);
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         assert!(
             !dir.path().join("cleaned-up").exists(),
             "lpm waited for a dev server no console event had reached"
+        );
+    }
+
+    /// The window closing during the grace period an interrupt began ends
+    /// it: Windows allows lpm only a few seconds after a close.
+    #[cfg(windows)]
+    #[test]
+    fn a_closing_window_cuts_the_dev_server_s_grace_period_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let closed_at = started + std::time::Duration::from_millis(200);
+
+        run_dev_server_through_a_console_stop(
+            "ping -n 30 127.0.0.1 >nul",
+            dir.path(),
+            stop_flag(true),
+            move || std::time::Instant::now() < closed_at,
+        );
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "the grace period ran on after the window closed"
         );
     }
 
