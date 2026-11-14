@@ -1374,11 +1374,11 @@ fn terminate_child_process_tree_windows(
     let deadline = std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT;
     let _ = child.kill();
     let status = wait_for_child_exit_until(child, deadline)?;
-    // A root still exiting at the deadline leaves its descendants one pass,
-    // and is what the error names: they were just ended too.
+    // A root slow to exit leaves its descendants at least a few retries, and
+    // one still exiting at the deadline is what the error names.
     let descendants = terminate_descendants_until_stable_with(
         root_pid,
-        deadline,
+        deadline.max(std::time::Instant::now() + std::time::Duration::from_secs(1)),
         || {
             let snapshot = descendant_process_snapshot_windows_with_trusted(
                 root_pid,

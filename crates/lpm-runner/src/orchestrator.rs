@@ -2219,25 +2219,70 @@ fn ctrlc_handler(
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).
 fn force_kill_children(children: &Arc<Mutex<Vec<(String, ServiceProcess)>>>) {
     let mut locked = children.lock();
-    for (name, child) in locked.iter_mut() {
-        force_kill_and_report(name, child);
+    force_kill_and_report_all(
+        locked
+            .iter_mut()
+            .map(|(name, child)| (name.as_str(), child)),
+    );
+}
+
+/// What [`start_force_kill`] did to a service.
+enum ForceKill {
+    /// Nothing: it had stopped, tree and all, which the shutdown's last
+    /// pass says how.
+    Stopped,
+    /// Killed again what is left of a tree force-killed and waited for
+    /// before.
+    Again,
+    /// Force-killed it, and said so: to be waited for.
+    Now,
+}
+
+/// Starts force-killing `child`'s tree, saying so the first time only: a
+/// second Ctrl+C, a level's deadline and the shutdown's last pass can each
+/// reach the same service.
+fn start_force_kill(name: &str, child: &mut ServiceProcess) -> ForceKill {
+    if !child.tree_running() {
+        return ForceKill::Stopped;
+    }
+    if child.reported_force_killed {
+        kill_dying_service_tree(child);
+        return ForceKill::Again;
+    }
+    kill_service_tree(child);
+    child.reported_force_killed = true;
+    ui_service_status(RESET, name, RED, "✗", "force-killed");
+    ForceKill::Now
+}
+
+/// Force-kills `child`'s tree and waits for it, as [`start_force_kill`]
+/// does: `false` where it had stopped, tree and all.
+fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
+    match start_force_kill(name, child) {
+        ForceKill::Stopped => false,
+        ForceKill::Again => true,
+        ForceKill::Now => {
+            wait_for_killed_service_tree(child, cleanup_deadline());
+            true
+        }
     }
 }
 
-/// Force-kills `child`'s tree, saying so the first time only: a second
-/// Ctrl+C, a level's deadline and the shutdown's last pass can each reach
-/// the same service. One that has stopped, tree and all, is left to the
-/// shutdown's last pass, which says how it stopped; `false` for it.
-fn force_kill_and_report(name: &str, child: &mut ServiceProcess) -> bool {
-    if !child.tree_running() {
-        return false;
+/// Force-kills the trees of `services`, as [`start_force_kill`] does, then
+/// waits for them together until one deadline, so that processes stuck
+/// exiting cost the shutdown that deadline once, however many there are.
+fn force_kill_and_report_all<'a>(
+    services: impl Iterator<Item = (&'a str, &'a mut ServiceProcess)>,
+) {
+    let killed: Vec<&mut ServiceProcess> = services
+        .filter_map(|(name, child)| {
+            matches!(start_force_kill(name, child), ForceKill::Now).then_some(child)
+        })
+        .collect();
+    let deadline = cleanup_deadline();
+    for child in killed {
+        wait_for_killed_service_tree(child, deadline);
     }
-    force_kill_service_tree(child);
-    if !child.reported_force_killed {
-        child.reported_force_killed = true;
-        ui_service_status(RESET, name, RED, "✗", "force-killed");
-    }
-    true
 }
 
 /// Gracefully stop all child processes: SIGTERM first, wait, then SIGKILL.
@@ -2278,9 +2323,11 @@ fn shutdown_children_ordered(
     if force {
         ui_warn(&format!("Force-killing {count} services..."));
         let mut locked = children.lock();
-        for (name, child) in locked.iter_mut() {
-            force_kill_and_report(name, child);
-        }
+        force_kill_and_report_all(
+            locked
+                .iter_mut()
+                .map(|(name, child)| (name.as_str(), child)),
+        );
     } else {
         ui_warn(&format!("Stopping {count} services..."));
     }
@@ -2369,16 +2416,12 @@ fn shutdown_children_ordered(
         }
 
         let mut locked = children.lock();
-        for name in group {
-            let Some((_, child)) = locked.iter_mut().find(|(child_name, _)| child_name == name)
-            else {
-                continue;
-            };
-            if child.tree_running() {
-                tracing::debug!("force-killing service '{name}' before the next dependency level");
-                force_kill_and_report(name, child);
-            }
-        }
+        force_kill_and_report_all(
+            locked
+                .iter_mut()
+                .filter(|(name, _)| group.contains(name))
+                .map(|(name, child)| (name.as_str(), child)),
+        );
     }
 
     // Final pass: force-kill any stragglers and reap zombies
@@ -2651,10 +2694,14 @@ fn cleanup_deadline() -> Instant {
 }
 
 /// Waits, up to `deadline`, for a service lpm has ended to exit.
-#[cfg(any(unix, windows))]
 fn wait_for_ended_service(child: &mut ServiceProcess, deadline: Instant) {
-    if let Err(error) = ports::wait_for_ended_child(child, deadline) {
-        tracing::warn!("service process {}: {error}", child.id());
+    match ports::wait_for_child_exit_until(child, deadline) {
+        Ok(Some(_)) => {}
+        Ok(None) => tracing::warn!(
+            "service process {} was ended but was still exiting at the cleanup deadline",
+            child.id()
+        ),
+        Err(error) => tracing::warn!("could not wait for service process {}: {error}", child.id()),
     }
 }
 
@@ -2710,17 +2757,22 @@ fn terminate_unready_initial_services(
     }
 }
 
-fn force_kill_service_tree(child: &mut ServiceProcess) {
-    let deadline = cleanup_deadline();
+/// Kills `child`'s tree without waiting for it to be gone: its process
+/// group on Unix, its Job on Windows. Where a Windows service has no Job, or
+/// Windows won't end it, the walk of its tree ends what it can, within a
+/// deadline of its own.
+fn kill_service_tree(child: &mut ServiceProcess) {
     #[cfg(unix)]
-    {
-        signal_service_process_group(child.id(), libc::SIGKILL);
-        wait_for_ended_service(child, deadline);
-    }
+    signal_service_process_group(child.id(), libc::SIGKILL);
     #[cfg(windows)]
-    if child.end_job(deadline) {
-        wait_for_ended_service(child, deadline);
-        return;
+    if let Some(job) = &child.job {
+        match job.end(Duration::ZERO) {
+            Ok(_) => return,
+            Err(error) => tracing::warn!(
+                "could not end the processes of service process {}: {error}",
+                child.id()
+            ),
+        }
     }
     #[cfg(not(unix))]
     if let Err(error) = ports::terminate_child_process_tree(child) {
@@ -2729,6 +2781,23 @@ fn force_kill_service_tree(child: &mut ServiceProcess) {
             child.id()
         );
     }
+}
+
+/// Waits until `deadline` for `child`'s tree, killed before, to be gone:
+/// on Windows, what its Job holds, then its own process.
+fn wait_for_killed_service_tree(child: &mut ServiceProcess, deadline: Instant) {
+    #[cfg(windows)]
+    if let Some(job) = &child.job
+        && job
+            .wait_until_empty(deadline.saturating_duration_since(Instant::now()))
+            .is_ok_and(|gone| !gone)
+    {
+        tracing::warn!(
+            "processes of service process {} are still exiting",
+            child.id()
+        );
+    }
+    wait_for_ended_service(child, deadline);
 }
 
 #[cfg(test)]
