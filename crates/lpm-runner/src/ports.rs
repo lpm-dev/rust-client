@@ -1359,8 +1359,12 @@ fn terminate_child_process_tree_windows(
         // The root's own handle still ends it safely; only its descendants
         // can't be told apart from processes that reused their IDs.
         let _ = child.kill();
+        let _ = wait_for_child_exit_until(
+            child,
+            std::time::Instant::now() + crate::shell::SERVICE_TREE_EXIT_TIMEOUT,
+        );
         return Err(std::io::Error::other(format!(
-            "could not capture the identity of child PID {root_pid} before process-tree cleanup, so only it was ended"
+            "could not capture the identity of child PID {root_pid} before process-tree cleanup, so lpm ended only it"
         )));
     };
     let mut trusted = HashMap::from([(root_pid, root_identity)]);
