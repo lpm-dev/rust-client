@@ -24,7 +24,9 @@ impl ScriptDirectory {
     /// for a network folder, the same folder through a drive letter. Without
     /// a letter the user mapped there, LPM defines one for this sign-in, as
     /// `subst` does, from `Z:` down, and removes its definition once nothing
-    /// it runs uses it.
+    /// it runs uses it. Running as LocalSystem, Windows defines it for every
+    /// session instead. One a crash leaves stays until sign-out, or until
+    /// `subst <letter>: /d` removes it.
     ///
     /// # Errors
     ///
@@ -233,6 +235,7 @@ mod windows {
                 }
                 _ => None,
             };
+            let _letters_of_the_session = LetterLock::acquire();
             if let Some(entry) = last
                 && let Err(error) = undefine(entry.letter, &entry.definition)
             {
@@ -252,6 +255,7 @@ mod windows {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let letters = defined.get_or_insert_with(HashMap::new);
+        let _letters_of_the_session = LetterLock::acquire();
         if let Some(entry) = letters.get_mut(&share_key) {
             // Someone may have removed the definition since, or stacked one
             // of another share on it, which the letter then resolves to.
@@ -279,17 +283,30 @@ mod windows {
         }
         // Another LPM process's letter for the share, or one a crash left:
         // this process adds its own definition, which Windows stacks on the
-        // same one, so the letter stays while either uses it.
-        let letter = match (b'A'..=b'Z').find(|letter| {
+        // same one, so the letter stays while either uses it. Something
+        // outside LPM may have taken the letter in between, which the
+        // definitions then show.
+        let mut stacked = None;
+        if let Some(candidate) = (b'A'..=b'Z').find(|letter| {
             dos_definitions(*letter)
                 .first()
                 .is_some_and(|first| first.eq_ignore_ascii_case(&definition))
-        }) {
-            Some(letter) => {
-                define(letter, &definition)?;
-                letter
+        }) && define(candidate, &definition).is_ok()
+        {
+            if dos_definitions(candidate)
+                .iter()
+                .all(|present| present.eq_ignore_ascii_case(&definition))
+            {
+                stacked = Some(candidate);
+            } else {
+                let _ = undefine(candidate, &definition);
             }
+        }
+        let letter = match stacked {
+            Some(letter) => letter,
             None => {
+                // This opens network folders under the locks, so a slow share
+                // delays other scripts' letters until it answers.
                 if let Some((path, folder_handle)) = through_users_drive(folder) {
                     return Ok((
                         path,
@@ -546,6 +563,68 @@ mod windows {
         }
     }
 
+    /// Whether the user's network drive `letter` is remembered, connected or
+    /// not: a remembered drive that is unavailable now has no definition,
+    /// and would fail to reconnect onto one of LPM's.
+    fn is_remembered(letter: u8) -> bool {
+        use windows_sys::Win32::Foundation::ERROR_CONNECTION_UNAVAIL;
+        let local = [u16::from(letter), u16::from(b':'), 0];
+        let mut buffer = [0_u16; 1];
+        let mut length = 1_u32;
+        let status = unsafe {
+            // SAFETY: `local` is NUL-terminated, and `buffer` holds `length` writable units.
+            WNetGetConnectionW(local.as_ptr(), buffer.as_mut_ptr(), &mut length)
+        };
+        matches!(
+            status,
+            NO_ERROR | ERROR_MORE_DATA | ERROR_CONNECTION_UNAVAIL
+        )
+    }
+
+    /// Serializes choosing and defining letters among the LPM processes of
+    /// this session, so that two never take one letter for different shares
+    /// at once. Without it, as when the mutex can't be had, the checks after
+    /// each definition still apply.
+    struct LetterLock(windows_sys::Win32::Foundation::HANDLE);
+
+    impl LetterLock {
+        fn acquire() -> Option<Self> {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+            let name: Vec<u16> = r"Local\lpm-script-drive-letters"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            // SAFETY: `name` is NUL-terminated; default security and no initial owner.
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if handle.is_null() {
+                return None;
+            }
+            // SAFETY: `handle` is the mutex just opened. An abandoned mutex, left by a
+            // process that ended while holding it, is owned all the same.
+            let waited = unsafe { WaitForSingleObject(handle, 10_000) };
+            if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
+                Some(Self(handle))
+            } else {
+                // SAFETY: `handle` is open and not owned.
+                unsafe { CloseHandle(handle) };
+                None
+            }
+        }
+    }
+
+    impl Drop for LetterLock {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::ReleaseMutex;
+            // SAFETY: this process owns the mutex `self.0`, opened in `acquire`.
+            unsafe {
+                ReleaseMutex(self.0);
+                CloseHandle(self.0);
+            }
+        }
+    }
+
     /// Defines the first free drive letter from `Z:` down as `definition`.
     /// A letter something else defined in the meantime is given back.
     fn define_free_letter(definition: &OsStr) -> io::Result<u8> {
@@ -554,7 +633,10 @@ mod windows {
             GetLogicalDrives()
         };
         for letter in (b'D'..=b'Z').rev() {
-            if present & (1 << (letter - b'A')) != 0 || !dos_definitions(letter).is_empty() {
+            if present & (1 << (letter - b'A')) != 0
+                || !dos_definitions(letter).is_empty()
+                || is_remembered(letter)
+            {
                 continue;
             }
             define(letter, definition).map_err(|error| {
