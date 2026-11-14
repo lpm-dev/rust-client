@@ -5,6 +5,11 @@ use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The exit status of a process that Ctrl+C's or Ctrl+Break's default
+/// handler ended.
+#[cfg(windows)]
+const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+
 /// Keep stop handlers active for a command or an entire file-watch session.
 pub struct ExecutionSignals {
     signal: Arc<AtomicUsize>,
@@ -48,6 +53,22 @@ impl ExecutionSignals {
     #[cfg(windows)]
     fn pressed_again(&self) -> bool {
         self.presses.load(Ordering::Acquire) > 1
+    }
+
+    /// Windows runs lpm's console handler on a thread it starts for the
+    /// interrupt, so a child the same interrupt ended can exit before lpm
+    /// has recorded it. For a child that exited that way, waits briefly for
+    /// the record, so lpm reports which interrupt it was rather than the
+    /// child's status.
+    #[cfg(windows)]
+    fn await_the_interrupt_behind(&self, status: ExitStatus) {
+        if status.code() != Some(STATUS_CONTROL_C_EXIT as i32) {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !self.is_stopped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -136,6 +157,8 @@ impl ExecutionSignals {
         // The child got the interrupt too and may have ended well; the run
         // was interrupted all the same, and lpm exits with 128 + signal.
         #[cfg(windows)]
+        self.await_the_interrupt_behind(status);
+        #[cfg(windows)]
         let status = if self.is_stopped() {
             use std::os::windows::process::ExitStatusExt;
             ExitStatus::from_raw(128 + self.signal.load(Ordering::Acquire) as u32)
@@ -206,6 +229,8 @@ impl ChildWait<'_> {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    #[cfg(windows)]
+                    self.signals.await_the_interrupt_behind(status);
                     self.signals.check()?;
                     return Ok(status);
                 }
@@ -524,6 +549,63 @@ mod windows_tests {
         interrupter.join().unwrap();
 
         assert_eq!(output.status.code(), Some(130));
+    }
+
+    /// A child that exits as Ctrl+C's default handler ends a process.
+    fn ended_by_the_console() -> Command {
+        let mut command = Command::new("cmd");
+        command.args([
+            "/D",
+            "/C",
+            "exit",
+            &(STATUS_CONTROL_C_EXIT as i32).to_string(),
+        ]);
+        command
+    }
+
+    /// Windows runs lpm's handler on a thread it starts for the interrupt,
+    /// which can come after the child the same interrupt ended has exited:
+    /// lpm still reports the interruption, not the child's status.
+    #[test]
+    fn a_child_the_console_interrupt_ended_first_reports_the_interruption() {
+        let signals = ExecutionSignals::new().unwrap();
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
+        let mut child = ended_by_the_console().spawn().unwrap();
+        child.wait().unwrap();
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
+        });
+
+        let result = signals.prepare_wait().unwrap().wait(&mut child);
+        interrupter.join().unwrap();
+
+        assert!(matches!(result, Err(LpmError::ExitCode(130))), "{result:?}");
+    }
+
+    #[test]
+    fn a_captured_child_the_console_interrupt_ended_first_reports_the_interruption() {
+        let signals = ExecutionSignals::new().unwrap();
+        let (flag, presses) = (Arc::clone(&signals.signal), Arc::clone(&signals.presses));
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            console_interrupts::notify(&flag, &presses, console_interrupts::SIGINT);
+        });
+
+        let output = signals.capture(&mut ended_by_the_console()).unwrap();
+        interrupter.join().unwrap();
+
+        assert_eq!(output.status.code(), Some(130));
+    }
+
+    /// With no interrupt behind it, such a status is the child's own.
+    #[test]
+    fn a_child_that_exits_as_interrupted_without_an_interrupt_keeps_its_status() {
+        let signals = ExecutionSignals::new().unwrap();
+
+        let status = signals.run(&mut ended_by_the_console()).unwrap();
+
+        assert_eq!(status.code(), Some(STATUS_CONTROL_C_EXIT as i32));
     }
 
     #[test]
