@@ -353,8 +353,7 @@ async fn ensure_detached_started_with_options(
             "failed to prepare detached proxy daemon handles: {err}"
         ))
     })?;
-    let mut child = command
-        .spawn()
+    let mut child = spawn_detached_daemon(&mut command)
         .map_err(|err| LpmError::Proxy(format!("failed to start detached proxy daemon: {err}")))?;
 
     let status = wait_for_detached_start(&mut child).await?;
@@ -483,10 +482,53 @@ fn detach_background_command(command: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
 
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        command.creation_flags(WINDOWS_DETACHED_FLAGS);
     }
+}
+
+#[cfg(windows)]
+const WINDOWS_DETACHED_FLAGS: u32 = windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
+    | windows_sys::Win32::System::Threading::DETACHED_PROCESS;
+
+/// Spawns the machine-wide proxy daemon, prepared by
+/// [`detach_background_command`], so that it outlives what started it.
+///
+/// On Windows that means asking to start outside any Job lpm runs in, as
+/// `setsid` takes it out of lpm's process group on Unix. A Job that
+/// refuses, as an `lpm dev` service's does, keeps it, and then the daemon
+/// ends with that service; lpm says so.
+fn spawn_detached_daemon(command: &mut Command) -> std::io::Result<std::process::Child> {
+    spawn_detached_daemon_with(command, Command::spawn)
+}
+
+fn spawn_detached_daemon_with(
+    command: &mut Command,
+    mut spawn: impl FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+
+        command.creation_flags(WINDOWS_DETACHED_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
+        match spawn(command) {
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                command.creation_flags(WINDOWS_DETACHED_FLAGS);
+                let child = spawn(command)?;
+                tracing::warn!(
+                    "the proxy daemon started inside a Windows Job that keeps what it starts, \
+                     such as an `lpm dev` service's, so it ends when that does; \
+                     run `lpm proxy start --detach` outside it to keep it running"
+                );
+                Ok(child)
+            }
+            result => result,
+        }
+    }
+    #[cfg(not(windows))]
+    spawn(command)
 }
 
 fn append_listener_args(command: &mut Command, options: lpm_proxy::ProxyDaemonOptions) {

@@ -935,3 +935,45 @@ pub(super) fn fake_privileged_runner(directory: &Path, prelude: &str) -> PathBuf
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
+
+/// A Job that refuses breakaway, as an `lpm dev` service's does, makes
+/// CreateProcess fail with ACCESS_DENIED: the daemon then starts inside it
+/// rather than not at all.
+#[cfg(windows)]
+#[test]
+fn a_detached_daemon_a_job_keeps_still_starts() {
+    let mut attempts = 0;
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/d", "/c", "exit", "0"]);
+
+    let mut child = spawn_detached_daemon_with(&mut command, |command| {
+        attempts += 1;
+        if attempts == 1 {
+            Err(std::io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32,
+            ))
+        } else {
+            command.spawn()
+        }
+    })
+    .unwrap();
+
+    assert_eq!(attempts, 2, "a refused breakaway is retried inside the Job");
+    assert!(child.wait().unwrap().success());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_detached_daemon_failing_for_another_reason_is_not_retried() {
+    let mut attempts = 0;
+    let mut command = std::process::Command::new("cmd");
+
+    let error = spawn_detached_daemon_with(&mut command, |_| {
+        attempts += 1;
+        Err(std::io::Error::from_raw_os_error(2))
+    })
+    .unwrap_err();
+
+    assert_eq!(attempts, 1);
+    assert_eq!(error.raw_os_error(), Some(2));
+}
