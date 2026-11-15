@@ -1414,10 +1414,10 @@ mod policy_step_up_tests {
         (result, writes.into_inner().unwrap())
     }
 
-    fn needs_step_up() -> Result<PolicyWrite, LpmError> {
-        Ok(PolicyWrite::NeedsStepUp {
+    fn needs_step_up() -> PolicyWrite {
+        PolicyWrite::NeedsStepUp {
             scope: SCOPE.into(),
-        })
+        }
     }
 
     #[tokio::test]
@@ -1437,7 +1437,10 @@ mod policy_step_up_tests {
     async fn a_confirmed_policy_is_written_once_more_with_the_proof() {
         let written = serde_json::json!({ "policyId": "id" });
         let (result, writes) = confirmation_flow(
-            vec![needs_step_up(), Ok(PolicyWrite::Written(written.clone()))],
+            vec![
+                Ok(needs_step_up()),
+                Ok(PolicyWrite::Written(written.clone())),
+            ],
             Ok("proof".into()),
         )
         .await;
@@ -1448,8 +1451,11 @@ mod policy_step_up_tests {
 
     #[tokio::test]
     async fn a_second_refusal_ends_the_attempt_without_asking_again() {
-        let (result, writes) =
-            confirmation_flow(vec![needs_step_up(), needs_step_up()], Ok("proof".into())).await;
+        let (result, writes) = confirmation_flow(
+            vec![Ok(needs_step_up()), Ok(needs_step_up())],
+            Ok("proof".into()),
+        )
+        .await;
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("didn't accept the confirmation"), "{error}");
@@ -1459,7 +1465,7 @@ mod policy_step_up_tests {
     #[tokio::test]
     async fn a_refused_confirmation_writes_nothing_more() {
         let (result, writes) = confirmation_flow(
-            vec![needs_step_up()],
+            vec![Ok(needs_step_up())],
             Err(LpmError::Env("confirmation refused".into())),
         )
         .await;
