@@ -13,21 +13,14 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_int};
+use std::ffi::{CStr, CString, c_int};
 use std::sync::{LazyLock, Mutex};
 
-/// `SANDBOX_FILTER_GLOBAL_NAME` from `enum sandbox_filter_type`.
-const SANDBOX_FILTER_GLOBAL_NAME: c_int = 2;
 /// `PROC_RUID_ONLY` from `<sys/proc_info.h>`.
 const PROC_RUID_ONLY: u32 = 5;
 /// Bounds the sweep against a tree that keeps forking while it is ended.
 const MAX_SWEEPS: usize = 64;
 const SWEEP_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
-
-unsafe extern "C" {
-    safe static SANDBOX_CHECK_NO_REPORT: c_int;
-    fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
-}
 
 /// The per-spawn identity rendered into a Seatbelt profile.
 pub(crate) struct ProfileMark {
@@ -206,22 +199,9 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// `Some(true)` when `pid`'s profile denies looking up the Mach service
 /// `name`, `Some(false)` when it allows it, `None` when the check failed.
+#[inline]
 pub(crate) fn lookup_denied(pid: libc::pid_t, name: &CStr) -> Option<bool> {
-    // SAFETY: both strings are NUL-terminated and outlive the call; the
-    // global-name filter takes exactly one `const char *` variadic argument.
-    let result = unsafe {
-        sandbox_check(
-            pid,
-            c"mach-lookup".as_ptr(),
-            SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT,
-            name.as_ptr(),
-        )
-    };
-    match result {
-        0 => Some(false),
-        1 => Some(true),
-        _ => None,
-    }
+    lpm_common::platform::macos_mach_lookup_denied(pid, name)
 }
 
 /// Fills `pids` with the processes whose real user is `uid`: the only

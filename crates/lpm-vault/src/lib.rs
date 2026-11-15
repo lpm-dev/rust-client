@@ -24,6 +24,7 @@
 //! let secrets = lpm_vault::try_get_all(&project_dir)?;
 //! ```
 
+mod approval_prompt;
 mod companion;
 pub mod crypto;
 mod fallback;
@@ -132,6 +133,7 @@ pub fn is_env_project_refusal(message: &str) -> bool {
 /// after any interrupted step was finished, or `None` when the directory has
 /// no env project.
 pub fn review_companion_data(project_dir: &Path) -> Result<Option<CompanionReview>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
@@ -152,6 +154,7 @@ pub fn repair_companion_data(
     project_dir: &Path,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Err("this directory has no env project".to_owned());
     };
@@ -174,6 +177,7 @@ pub fn plant_debug_companion_state(
     project_dir: &Path,
     state: &DebugCompanionState,
 ) -> Result<String, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Err("this directory has no env project".to_owned());
     };
@@ -342,6 +346,7 @@ fn reject_invalid_keys<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Result<(
 
 /// Get a single secret value by key from the `default` environment.
 pub fn try_get(project_dir: &Path, key: &str) -> Result<Option<String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let secrets = try_get_all(project_dir)?;
     Ok(secrets.get(key).cloned())
 }
@@ -349,6 +354,7 @@ pub fn try_get(project_dir: &Path, key: &str) -> Result<Option<String>, String> 
 /// Get all vault secrets for the project from the `default` environment.
 /// Returns an empty map when the project has no vault.
 pub fn try_get_all(project_dir: &Path) -> Result<HashMap<String, String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     try_get_all_env(project_dir, "default")
 }
 
@@ -357,6 +363,7 @@ pub fn try_get_all(project_dir: &Path) -> Result<HashMap<String, String>, String
 pub fn try_get_all_environments(
     project_dir: &Path,
 ) -> Result<HashMap<String, HashMap<String, String>>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Ok(HashMap::new()),
@@ -382,6 +389,7 @@ pub fn try_get_run_environment(
     project_dir: &Path,
     env: Option<&str>,
 ) -> Result<RunEnvironment, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(RunEnvironment::default());
     };
@@ -439,6 +447,7 @@ impl AllRunEnvironments {
 
 /// [`AllRunEnvironments`] for the project's vault; empty when it has none.
 pub fn try_get_all_run_environments(project_dir: &Path) -> Result<AllRunEnvironments, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(AllRunEnvironments::default());
     };
@@ -522,6 +531,7 @@ fn read_run_environment_unlocked(
 
 /// Get all vault secrets for a specific environment.
 pub fn try_get_all_env(project_dir: &Path, env: &str) -> Result<HashMap<String, String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Ok(HashMap::new()),
@@ -535,6 +545,7 @@ pub fn try_get_all_env_with_default_fallback(
     project_dir: &Path,
     env: &str,
 ) -> Result<HashMap<String, String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Ok(HashMap::new()),
@@ -567,6 +578,7 @@ pub fn set(
     pairs: &[(&str, &str)],
     source: &history::Source,
 ) -> Result<(), String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -598,6 +610,7 @@ pub fn set_env(
     pairs: &[(&str, &str)],
     source: &history::Source,
 ) -> Result<(), String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -855,6 +868,7 @@ pub fn initialize_environments_from_files_with_snapshot(
     snapshot: EnvironmentInitializationSnapshot,
     source: &history::Source,
 ) -> Result<Vec<EnvironmentFileInitializationResult>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     initialize_environments_from_files_inner(
         project_dir,
         initializations,
@@ -1014,6 +1028,7 @@ pub fn copy_environment(
     overwrite: bool,
     history_source: &history::Source,
 ) -> Result<Option<EnvironmentCopyResult>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     if source == target {
         return Err("source and target environments are the same".to_owned());
     }
@@ -1071,6 +1086,7 @@ pub fn replace_all_environments(
     environments: &HashMap<String, HashMap<String, String>>,
     source: &history::Source,
 ) -> Result<(), String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     reject_invalid_keys(
         environments
             .values()
@@ -1191,6 +1207,7 @@ pub fn commit_remote_environments(
     target: &RemoteSyncTarget,
     version: i32,
 ) -> Result<RemoteEnvironmentCommit, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     commit_remote_environments_inner(
         project_dir,
         expected_vault_id,
@@ -1211,6 +1228,7 @@ pub fn commit_remote_environments_for_principal(
     version: i32,
     principal: vault_id::SyncPrincipal<'_>,
 ) -> Result<RemoteEnvironmentCommit, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     commit_remote_environments_inner(
         project_dir,
         expected_vault_id,
@@ -1427,11 +1445,13 @@ pub fn delete(
     keys: &[&str],
     source: &history::Source,
 ) -> Result<Vec<String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     delete_env(project_dir, "default", keys, source)
 }
 
 /// Get a single secret from a specific environment.
 pub fn try_get_env(project_dir: &Path, env: &str, key: &str) -> Result<Option<String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let secrets = try_get_all_env(project_dir, env)?;
     Ok(secrets.get(key).cloned())
 }
@@ -1446,6 +1466,7 @@ pub fn delete_env(
     keys: &[&str],
     source: &history::Source,
 ) -> Result<Vec<String>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Err("no vault configured for this project".to_string()),
@@ -1484,6 +1505,7 @@ pub fn import_env_file(
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
@@ -1522,6 +1544,7 @@ pub fn import_env_file_to_env(
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
@@ -1622,6 +1645,7 @@ fn env_value_layout(value: &str) -> (bool, usize) {
 /// `None` when it holds none. The caller writes them through
 /// `lpm_common::project_secret`, which keeps the file out of git.
 pub fn export_env_content(project_dir: &Path) -> Result<Option<(String, usize)>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let secrets = try_get_all(project_dir)?;
     Ok((!secrets.is_empty()).then(|| (format_env_file_content(&secrets), secrets.len())))
 }
@@ -1631,6 +1655,7 @@ pub fn export_env_content_from_env(
     project_dir: &Path,
     env: &str,
 ) -> Result<Option<(String, usize)>, String> {
+    let _prompt = approval_prompt::naming_project(project_dir);
     let secrets = try_get_all_env(project_dir, env)?;
     Ok((!secrets.is_empty()).then(|| (format_env_file_content(&secrets), secrets.len())))
 }

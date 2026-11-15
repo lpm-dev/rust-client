@@ -27,6 +27,74 @@ pub fn macos_keychain_operation_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The Mach services that serve Keychain items. secd serves the Data
+/// Protection keychain, including the shared access group LPM's signed
+/// builds use for env values and registry tokens; securityd serves
+/// file-based keychains. trustd is deliberately absent: certificate trust
+/// evaluation is not a Keychain read, and HTTPS clients need it.
+#[cfg(target_os = "macos")]
+pub const MACOS_KEYCHAIN_MACH_SERVICES: &[&str] = &[
+    "com.apple.securityd.xpc",
+    "com.apple.securityd.general",
+    "com.apple.security.kcsharing",
+    "com.apple.security.octagon",
+    "com.apple.securityd.ckks",
+    "com.apple.securityd.sos",
+    "com.apple.security.escrow-update",
+    "com.apple.securityd.aps",
+    "com.apple.SecurityServer",
+];
+
+#[cfg(target_os = "macos")]
+mod macos_sandbox {
+    use std::ffi::{CStr, c_char, c_int};
+
+    /// `SANDBOX_FILTER_GLOBAL_NAME` from `enum sandbox_filter_type`.
+    const SANDBOX_FILTER_GLOBAL_NAME: c_int = 2;
+
+    unsafe extern "C" {
+        safe static SANDBOX_CHECK_NO_REPORT: c_int;
+        fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
+    }
+
+    pub fn mach_lookup_denied(pid: libc::pid_t, name: &CStr) -> Option<bool> {
+        // SAFETY: both strings are NUL-terminated and outlive the call; the
+        // global-name filter takes exactly one `const char *` variadic argument.
+        let result = unsafe {
+            sandbox_check(
+                pid,
+                c"mach-lookup".as_ptr(),
+                SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT,
+                name.as_ptr(),
+            )
+        };
+        match result {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// `Some(true)` when `pid`'s Seatbelt profile denies looking up the Mach
+/// service `name`, `Some(false)` when it allows it, `None` when the check
+/// failed.
+#[cfg(target_os = "macos")]
+pub fn macos_mach_lookup_denied(pid: libc::pid_t, name: &std::ffi::CStr) -> Option<bool> {
+    macos_sandbox::mach_lookup_denied(pid, name)
+}
+
+/// Whether this process runs under a Seatbelt profile that refuses the
+/// Keychain, as LPM's lifecycle-script sandbox does. Keychain backends use it
+/// to turn the resulting `errSecNotAvailable` into an error that says why,
+/// rather than one indistinguishable from a session with no keychain.
+#[cfg(target_os = "macos")]
+pub fn macos_keychain_denied_by_sandbox() -> bool {
+    // SAFETY: getpid has no preconditions and cannot fail.
+    let pid = unsafe { libc::getpid() };
+    macos_sandbox::mach_lookup_denied(pid, c"com.apple.securityd.xpc") == Some(true)
+}
+
 /// Detect the running host's libc flavor.
 ///
 /// Returns `Some("musl")` / `Some("glibc")` on Linux when the loader
@@ -150,6 +218,12 @@ fn has_glibc_loader() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_outside_any_sandbox_is_not_reported_as_keychain_denied() {
+        assert!(!macos_keychain_denied_by_sandbox());
+    }
 
     #[test]
     fn only_an_x86_64_build_on_macos_can_be_translated_by_rosetta() {

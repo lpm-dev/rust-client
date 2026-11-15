@@ -337,6 +337,16 @@ pub(crate) fn render_profile_with_toolchain(
     // read a password just copied, or swap the command the user is about
     // to paste into a shell.
     out.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
+    // Data Protection keychain items are served by secd over XPC, not read
+    // from files, so the `~/Library/Keychains` read deny doesn't cover them.
+    // Denying the services keeps every binary a script runs away from them,
+    // whatever its entitlements, which a check inside that binary couldn't.
+    // trustd stays reachable: HTTPS clients use it to verify certificates.
+    out.push_str("(deny mach-lookup\n");
+    for service in lpm_common::platform::MACOS_KEYCHAIN_MACH_SERVICES {
+        out.push_str(&format!("  (global-name \"{service}\")\n"));
+    }
+    out.push_str(")\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow iokit-open)\n");
 
@@ -891,6 +901,37 @@ mod tests {
         assert!(
             deny > allow,
             "Seatbelt applies the last matching rule, so the deny must follow the allow"
+        );
+    }
+
+    #[test]
+    fn scripts_cannot_reach_the_keychain_services() {
+        let p = render_profile(&spec(), false).unwrap();
+        let allow = p
+            .find("(allow mach-lookup)\n")
+            .expect("Mach lookups are allowed");
+        for service in [
+            "com.apple.securityd.xpc",
+            "com.apple.securityd.general",
+            "com.apple.security.kcsharing",
+            "com.apple.security.octagon",
+            "com.apple.securityd.ckks",
+            "com.apple.securityd.sos",
+            "com.apple.security.escrow-update",
+            "com.apple.securityd.aps",
+            "com.apple.SecurityServer",
+        ] {
+            let deny = p
+                .find(&format!("(global-name \"{service}\")"))
+                .unwrap_or_else(|| panic!("{service} must be denied"));
+            assert!(
+                deny > allow,
+                "Seatbelt applies the last matching rule, so the {service} deny must follow the allow"
+            );
+        }
+        assert!(
+            !p.contains("com.apple.trustd"),
+            "certificate trust evaluation must stay reachable so HTTPS keeps working"
         );
     }
 

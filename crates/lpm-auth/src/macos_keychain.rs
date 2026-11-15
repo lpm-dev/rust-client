@@ -67,8 +67,23 @@ fn identity(service: &str, account: &str, scope: Scope) -> Vec<(CFString, CFType
 }
 
 /// `OSStatus <code>: <Security.framework message>`, keeping the raw status
-/// searchable even when the framework has no message for it.
+/// searchable even when the framework has no message for it, or why the
+/// Keychain is closed when LPM's lifecycle-script sandbox denies it.
 pub(super) fn describe(error: Error) -> String {
+    describe_in(
+        error,
+        lpm_common::platform::macos_keychain_denied_by_sandbox(),
+    )
+}
+
+/// Every Keychain call fails once a sandbox denies its services, so the
+/// sandbox outranks whatever status the failure carries.
+fn describe_in(error: Error, keychain_denied_by_sandbox: bool) -> String {
+    if keychain_denied_by_sandbox {
+        return "LPM's lifecycle-script sandbox closes the macOS Keychain, so registry \
+                credentials can't be read from a package's install script"
+            .to_owned();
+    }
     let code = error.code();
     match error.message() {
         Some(message) => format!("OSStatus {code}: {message}"),
@@ -189,6 +204,18 @@ pub(super) fn delete(service: &str, account: &str, scope: Scope) -> Result<(), E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keychain_failure_inside_lpms_sandbox_says_the_sandbox_closed_the_keychain() {
+        let message = describe_in(Error::from_code(-25291), true);
+        assert!(message.contains("sandbox"), "{message}");
+        assert!(!message.contains("OSStatus"), "{message}");
+    }
+
+    #[test]
+    fn a_keychain_failure_outside_a_sandbox_keeps_its_status() {
+        assert!(describe_in(Error::from_code(-25291), false).starts_with("OSStatus -25291"));
+    }
 
     #[test]
     fn auth_query_selects_the_shared_data_protection_group() {

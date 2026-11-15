@@ -103,6 +103,7 @@ pub use package_instance::{PackageInstanceId, ResolutionNodeId, artifact_binding
 pub use package_name::PackageName;
 #[cfg(windows)]
 pub use paths::absolute_extended_path;
+pub use paths::canonical_identity;
 pub use paths::credential_service;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,

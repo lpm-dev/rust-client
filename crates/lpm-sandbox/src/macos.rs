@@ -430,6 +430,48 @@ mod tests {
     }
 
     #[test]
+    fn a_script_cannot_reach_the_keychain() {
+        use std::io::BufRead;
+
+        let rs = realistic_spec();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let mut cmd = SandboxedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("echo ready; exec /bin/sleep 30")
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        cmd.stdout = SandboxStdio::Piped;
+        let mut child = sb.spawn(cmd).expect("spawn");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut ready)
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let data_protection = crate::seatbelt_tree::lookup_denied(pid, c"com.apple.securityd.xpc");
+        let file_keychains = crate::seatbelt_tree::lookup_denied(pid, c"com.apple.SecurityServer");
+        let trust = crate::seatbelt_tree::lookup_denied(pid, c"com.apple.trustd.agent");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = crate::terminate_sandbox_tree(child.id());
+
+        assert_eq!(ready.trim(), "ready");
+        assert_eq!(
+            trust,
+            Some(false),
+            "certificate trust evaluation must stay reachable so HTTPS keeps working"
+        );
+        assert_eq!(
+            data_protection,
+            Some(true),
+            "a script could reach Data Protection keychain items through secd"
+        );
+        assert_eq!(
+            file_keychains,
+            Some(true),
+            "a script could reach file-based Keychain items through securityd"
+        );
+    }
+
+    #[test]
     fn allows_write_into_package_dir_under_enforce() {
         let td = tempfile::tempdir().unwrap();
         let pkg_dir = td.path().join("store").join("pkg@1.0.0");

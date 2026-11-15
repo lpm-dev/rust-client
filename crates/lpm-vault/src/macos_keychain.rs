@@ -53,9 +53,11 @@ fn operation_prompt(account: &str) -> String {
         Some(kind) if kind == history.kind || kind == history.head_kind => Some("local history"),
         _ => Some("newer data"),
     });
+    let project = crate::approval_prompt::current_project();
+    let project = project.as_deref().unwrap_or(vault_id);
     match holds {
-        Some(holds) => format!("Allow LPM CLI to access env project {vault_id}'s {holds}"),
-        None => format!("Allow LPM CLI to access env project {vault_id}"),
+        Some(holds) => format!("Allow LPM CLI to access env project {project}'s {holds}"),
+        None => format!("Allow LPM CLI to access env project {project}"),
     }
 }
 
@@ -79,20 +81,33 @@ const APPROVAL_MARKER: &[u8] = b"lpm-cli-access:require-approval:v1";
 
 thread_local! {
     // Keep native approval within this CLI invocation; never persist or export it.
-    static AUTHENTICATION_CONTEXT: std::cell::RefCell<Option<CFType>> = const { std::cell::RefCell::new(None) };
+    static AUTHENTICATION_CONTEXT: std::cell::RefCell<
+        Option<objc2::rc::Retained<objc2_local_authentication::LAContext>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The invocation's one context, explaining itself by the project the
+/// running command reads for. macOS shows that reason only when the Keychain
+/// call gives no prompt of its own.
+fn shared_authentication_context() -> objc2::rc::Retained<objc2_local_authentication::LAContext> {
+    AUTHENTICATION_CONTEXT.with_borrow_mut(|stored| {
+        // SAFETY: creating an LAContext has no preconditions.
+        let context = stored
+            .get_or_insert_with(|| unsafe { objc2_local_authentication::LAContext::new() })
+            .clone();
+        let reason =
+            objc2_foundation::NSString::from_str(&crate::approval_prompt::current_reason());
+        // SAFETY: the context copies the string, which outlives the call.
+        unsafe { context.setLocalizedReason(&reason) };
+        context
+    })
 }
 
 fn authentication_context() -> CFType {
-    AUTHENTICATION_CONTEXT.with_borrow_mut(|stored| {
-        stored
-            .get_or_insert_with(|| {
-                // SAFETY: The query retains the LAContext before its owning reference is released.
-                let context = unsafe { objc2_local_authentication::LAContext::new() };
-                let pointer = std::ptr::from_ref(&*context).cast::<std::ffi::c_void>();
-                unsafe { CFType::wrap_under_get_rule(pointer) }
-            })
-            .clone()
-    })
+    let context = shared_authentication_context();
+    let pointer = objc2::rc::Retained::as_ptr(&context).cast::<std::ffi::c_void>();
+    // SAFETY: get-rule retains the context, so the CFType outlives `context`.
+    unsafe { CFType::wrap_under_get_rule(pointer) }
 }
 
 /// A context that never shows authentication UI and never reuses an earlier
@@ -140,6 +155,10 @@ enum KeychainStorageError {
         "the macOS Data Protection Keychain is locked or native env approval is unavailable in this session; retry from an interactive macOS login, or unlock a locked login Keychain with `security unlock-keychain ~/Library/Keychains/login.keychain-db`"
     )]
     InteractionNotAllowed,
+    #[error(
+        "LPM's lifecycle-script sandbox closes the macOS Keychain, so env values can't be read or changed from a package's install script"
+    )]
+    SandboxDenied,
     #[error("env access approval was cancelled; no secrets were released")]
     ApprovalCancelled,
     #[error("env access approval failed; no secrets were released")]
@@ -172,6 +191,23 @@ impl SecurityFrameworkBackend {
     }
 
     fn map_status(operation: &'static str, code: i32) -> KeychainStorageError {
+        Self::map_status_in(
+            operation,
+            code,
+            lpm_common::platform::macos_keychain_denied_by_sandbox(),
+        )
+    }
+
+    /// Every Keychain call fails once a sandbox denies its services, so the
+    /// sandbox outranks whatever status the failure carries.
+    fn map_status_in(
+        operation: &'static str,
+        code: i32,
+        keychain_denied_by_sandbox: bool,
+    ) -> KeychainStorageError {
+        if keychain_denied_by_sandbox {
+            return KeychainStorageError::SandboxDenied;
+        }
         match code {
             -128 => KeychainStorageError::ApprovalCancelled,
             -25293 => KeychainStorageError::ApprovalFailed,
@@ -828,6 +864,31 @@ pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutco
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_keychain_failure_inside_lpms_sandbox_says_the_sandbox_closed_the_keychain() {
+        let error = SecurityFrameworkBackend::map_status_in("read", -25291, true);
+        assert!(
+            matches!(error, KeychainStorageError::SandboxDenied),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("sandbox"), "{error}");
+    }
+
+    #[test]
+    fn a_keychain_failure_outside_a_sandbox_keeps_its_status() {
+        assert!(matches!(
+            SecurityFrameworkBackend::map_status_in("read", -25291, false),
+            KeychainStorageError::Security {
+                operation: "read",
+                code: -25291
+            }
+        ));
+        assert!(matches!(
+            SecurityFrameworkBackend::map_status_in("read", -128, false),
+            KeychainStorageError::ApprovalCancelled
+        ));
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn verifying_a_write_wipes_what_it_read_back() {
@@ -864,6 +925,35 @@ mod tests {
             )),
             "Allow LPM CLI to access env project proj's newer data"
         );
+    }
+
+    #[test]
+    fn approval_prompts_name_the_project_by_the_name_lpm_vault_lists() {
+        let values = "8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40";
+        let _project = crate::approval_prompt::naming("my-app");
+        assert_eq!(
+            operation_prompt(values),
+            "Allow LPM CLI to access env project my-app"
+        );
+        assert_eq!(
+            operation_prompt(&crate::companion::account::record_account(
+                "overrides",
+                values,
+                None
+            )),
+            "Allow LPM CLI to access env project my-app's personal overrides"
+        );
+    }
+
+    #[test]
+    fn a_keychain_read_without_its_own_prompt_still_says_which_project_it_reads() {
+        {
+            let _project = crate::approval_prompt::naming("my-app");
+            let reason = unsafe { shared_authentication_context().localizedReason() };
+            assert_eq!(reason.to_string(), "access env values for my-app");
+        }
+        let reason = unsafe { shared_authentication_context().localizedReason() };
+        assert_eq!(reason.to_string(), "access LPM env values");
     }
 
     #[test]
