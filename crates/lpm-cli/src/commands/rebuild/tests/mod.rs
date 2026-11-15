@@ -3689,6 +3689,62 @@ fn platform_shell_invocation_uses_cmd_exe_on_windows() {
     );
 }
 
+/// A command shim names its script from `%~dp0`, which is the `PATH` entry
+/// cmd.exe found the shim through.
+#[cfg(windows)]
+#[test]
+fn cmd_exe_finds_a_lifecycle_tool_through_a_path_entry_node_can_run() {
+    let scratch = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let bin_dir = scratch.path().canonicalize().unwrap().join("bin");
+    assert!(
+        bin_dir.to_string_lossy().starts_with(r"\\?\"),
+        "{bin_dir:?}"
+    );
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(bin_dir.join("lpm-probe-tool.cmd"), "@echo %~dp0\r\n").unwrap();
+    let parent: super::sandbox_env::ChildEnvironment = std::env::vars_os().collect();
+
+    for project_bins in [true, false] {
+        let envs = super::script_execution::build_lifecycle_environment(
+            &parent,
+            project.path(),
+            scratch.path(),
+            Some(&bin_dir),
+            project_bins,
+        );
+        let path = envs
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).next(),
+            Some(lpm_common::symlink::windows_plain_path(&bin_dir)),
+        );
+
+        let (shell, args) = platform_shell_invocation("lpm-probe-tool").unwrap();
+        let output = std::process::Command::new(shell)
+            .args(args)
+            .current_dir(project.path())
+            .env_clear()
+            .envs(envs)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let found_in = String::from_utf8_lossy(&output.stdout);
+        let found_in = found_in.trim();
+        assert!(
+            !found_in.starts_with(r"\\?\"),
+            "project_bins={project_bins}: {found_in}"
+        );
+        assert!(
+            Path::new(found_in).join("lpm-probe-tool.cmd").is_file(),
+            "project_bins={project_bins}: {found_in}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn platform_shell_invocation_uses_sh_on_unix() {
