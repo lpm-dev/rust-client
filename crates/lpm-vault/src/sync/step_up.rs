@@ -84,12 +84,21 @@ pub async fn request_cli_step_up_approval(
     let status = response.status();
     if status != reqwest::StatusCode::ACCEPTED {
         let body = read_capped_error_text(response).await;
-        return Err(SyncError::http(
-            status,
-            format!("step-up approval: {status}: {body}"),
-        ));
+        let message =
+            server_sentence(&body).unwrap_or_else(|| format!("step-up approval: {status}: {body}"));
+        return Err(SyncError::http(status, message));
     }
     Ok(read_capped_json::<CliStepUpApproval>(response).await?)
+}
+
+/// The sentence an error response carries for the user, when it has one.
+fn server_sentence(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .filter(|sentence| !sentence.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Discover the step-up method the server expects for the calling
@@ -502,6 +511,29 @@ mod tests {
             .expect_err("refusal");
 
         assert!(error.to_string().contains("method_not_available"));
+    }
+
+    #[tokio::test]
+    async fn request_cli_step_up_approval_reports_a_refusal_in_the_servers_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "ok": false,
+                "code": "env_project_not_found",
+                "error": "Env project not found, or you're not an owner or admin of its organization.",
+            })))
+            .mount(&server)
+            .await;
+
+        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE, None)
+            .await
+            .expect_err("refusal");
+
+        assert_eq!(
+            error.to_string(),
+            "Env project not found, or you're not an owner or admin of its organization."
+        );
     }
 
     #[tokio::test]

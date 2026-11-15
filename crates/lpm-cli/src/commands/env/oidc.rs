@@ -680,10 +680,6 @@ where
     }
 }
 
-/// Has the user confirm that it's them before CI is given access to an env
-/// project, and returns the proof the policy write carries. `access` is the
-/// policy being confirmed, shown first: the prompt and the approval page
-/// name the project, not what CI is given.
 /// The policy as the confirmation's approval page is told it: the request
 /// without the fields that address it, which the scope's digest doesn't
 /// cover.
@@ -696,6 +692,11 @@ fn policy_for_approval(policy_body: &serde_json::Value) -> serde_json::Value {
     policy
 }
 
+/// Has the user confirm that it's them before CI is given access to an env
+/// project, and returns the proof the policy write carries. `access` is the
+/// policy being confirmed, shown before the prompt, which names only the
+/// project. `approval_policy` is the same policy for a browser approval's
+/// page to list.
 async fn confirm_ci_access(
     registry_client: &lpm_registry::RegistryClient,
     scope: &str,
