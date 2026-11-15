@@ -71,6 +71,13 @@ async fn v1_install_rejects_another_archive_at_the_coordinate(
         .output()
         .unwrap();
 
+    // An offline install has no archive to compare, so it reports the entry
+    // as absent under the pinned integrity.
+    let expected_error = if extra_args.contains(&"--offline") {
+        "not in the global store under the integrity"
+    } else {
+        "conflict"
+    };
     let message = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -81,7 +88,7 @@ async fn v1_install_rejects_another_archive_at_the_coordinate(
         "the cached archive must not be installed as the selected one: {message}"
     );
     assert!(
-        message.contains("integrity") && message.contains("conflict"),
+        message.contains("integrity") && message.contains(expected_error),
         "{message}"
     );
     assert_ne!(
@@ -107,6 +114,11 @@ async fn v1_install_does_not_reuse_a_coordinate_that_holds_another_archive() {
 #[tokio::test]
 async fn v1_install_from_a_lockfile_does_not_reuse_a_coordinate_that_holds_another_archive() {
     v1_install_rejects_another_archive_at_the_coordinate(&[], &[], Pin::Lockfile).await;
+}
+
+#[tokio::test]
+async fn v1_offline_install_does_not_reuse_a_coordinate_that_holds_another_archive() {
+    v1_install_rejects_another_archive_at_the_coordinate(&[], &["--offline"], Pin::Lockfile).await;
 }
 
 #[tokio::test]

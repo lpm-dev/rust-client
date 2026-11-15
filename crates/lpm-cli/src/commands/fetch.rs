@@ -388,11 +388,12 @@ async fn fetch_artifact(
                         if !stored.insert((&target.name, &target.version)) {
                             continue;
                         }
-                        store.store_package_from_file(
+                        store.store_package_from_file_timed(
                             &target.name,
                             &target.version,
                             downloaded.file.path(),
-                            &downloaded.sri,
+                            &downloaded.sha512_sri,
+                            Some(&downloaded.sri),
                         )?;
                     }
                 }

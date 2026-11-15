@@ -657,7 +657,7 @@ pub(super) async fn run_online_fetch_phase(
     // Step 3: Download & store (parallel).: `store` is
     // already bound above — speculative dispatcher writes into it
     // during resolve, so by the time we reach here the store may hold
-    // tarballs the `has_package` loop below picks up as cache hits.
+    // tarballs the cache check below picks up as hits.
     let wf_fetch_start_ms = start.elapsed().as_millis();
     let fetch_start = Instant::now();
     let fetch_plan_start = Instant::now();
@@ -2170,8 +2170,8 @@ pub(super) async fn run_online_fetch_phase(
                     //: per-key fetch coordination. Acquired BEFORE
                     // the download permit — if a sibling (speculation) is
                     // already fetching this key, we wait here without consuming
-                    // a permit. On wake, `has_package` is true and we skip the
-                    // real fetch entirely (zero bandwidth, zero CPU).
+                    // a permit. On wake, the store holds the package and we skip
+                    // the real fetch entirely (zero bandwidth, zero CPU).
                     let mut key_guard = Some(match reserved_key_guard {
                         Some(guard) => guard,
                         None => coord.lock_for(package_key.clone()).await.lock_owned().await,
@@ -3762,7 +3762,7 @@ pub(super) fn spawn_speculation_dispatcher(
 
         // Wait for all dispatched speculations to either complete or
         // drop — ensures store visibility for the real fetch loop's
-        // `has_package` check. Losing a race to the real loop is fine:
+        // cache check. Losing a race to the real loop is fine:
         // the store's atomic-rename protects against corruption.
         while spec_tasks.join_next().await.is_some() {
             report_retained(spec_tasks.len());
