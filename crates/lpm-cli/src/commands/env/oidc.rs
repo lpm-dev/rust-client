@@ -429,35 +429,37 @@ pub(super) async fn vars_oidc_allow(
             }
         })
     };
-    let result = match write_policy(None).await? {
-        PolicyWrite::Written(result) => result,
-        PolicyWrite::NeedsStepUp { scope } => {
-            let on_or_off = |allowed: bool| if allowed { "allowed" } else { "not allowed" };
-            let mut access = vec![
-                ("Organization", org.unwrap_or_default().to_string()),
-                ("Repository", format!("{provider} {identity_label}")),
-                ("Branches", branches.join(", ")),
-                ("Environments", envs.join(", ")),
-            ];
-            if provider == "github" {
-                access.push(("Workflows", workflows.join(", ")));
-                access.push(("Events", events.join(", ")));
-                access.push(("Forks", on_or_off(allow_forks).to_string()));
-            }
-            let proof = confirm_ci_access(registry_client, &scope, &access).await?;
-            match write_policy(Some(proof)).await? {
-                PolicyWrite::Written(result) => result,
-                PolicyWrite::NeedsStepUp { scope: _ } => {
-                    return Err(LpmError::Env(
-                        "the Registry didn't accept the confirmation, or it expired before the \
-                         policy was sent. Nothing was changed. Run this command again to \
-                         confirm once more."
-                            .into(),
-                    ));
-                }
-            }
-        }
-    };
+    let mut access = vec![
+        ("Organization", org.unwrap_or_default().to_string()),
+        ("Env project", vault_id.clone()),
+    ];
+    if provider == "github" {
+        access.push((
+            "Repository",
+            match &repository_id {
+                Some(id) => format!("github {identity_label} (ID {id})"),
+                None => format!("github {identity_label}"),
+            },
+        ));
+    } else {
+        access.push(("GitLab project", identity_label.clone()));
+    }
+    access.push(("Branches", branches.join(", ")));
+    access.push(("Environments", envs.join(", ")));
+    if provider == "github" {
+        let forks = if allow_forks {
+            "allowed"
+        } else {
+            "not allowed"
+        };
+        access.push(("Workflows", workflows.join(", ")));
+        access.push(("Events", events.join(", ")));
+        access.push(("Forks", forks.to_string()));
+    }
+    let result = write_policy_with_confirmation(write_policy, |scope| async move {
+        confirm_ci_access(registry_client, &scope, &access).await
+    })
+    .await?;
     let policy_id = policy_id_from_response(&result)?;
 
     if let Some(org) = org {
@@ -587,13 +589,13 @@ fn github_api_token() -> Option<String> {
     })
 }
 
-fn oidc_escrow_setup_error(step: &str, error: &str) -> LpmError {
+fn oidc_escrow_setup_error(step: &str, error: &str, org: &str) -> LpmError {
     LpmError::Env(format!(
         "The OIDC policy may already be saved, but escrow setup failed while {step}: {error}. \
          If CI decryption was enabled for this project before, the saved policy can already \
          let CI read it; otherwise CI pulls are not ready. Fix the escrow problem, then rerun \
          the same `lpm env oidc allow` command, which safely updates the existing policy. To \
-         revoke CI access instead, run `lpm env oidc disable`."
+         revoke CI access instead, run `lpm env oidc disable --org={org}`."
     ))
 }
 
@@ -648,6 +650,35 @@ fn is_oidc_policy_step_up_scope(scope: &str) -> bool {
         && is_lower_hex(digest)
 }
 
+/// Writes a policy. When the server first asks for a confirmation, `confirm`
+/// gets the scope it named and returns the proof, and the policy is written
+/// once more with it. A second refusal ends the attempt: the server didn't
+/// take the proof, so asking again here would only repeat it.
+async fn write_policy_with_confirmation<Write, Writing, Confirm, Confirming>(
+    write: Write,
+    confirm: Confirm,
+) -> Result<serde_json::Value, LpmError>
+where
+    Write: Fn(Option<String>) -> Writing,
+    Writing: std::future::Future<Output = Result<PolicyWrite, LpmError>>,
+    Confirm: FnOnce(String) -> Confirming,
+    Confirming: std::future::Future<Output = Result<String, LpmError>>,
+{
+    let scope = match write(None).await? {
+        PolicyWrite::Written(result) => return Ok(result),
+        PolicyWrite::NeedsStepUp { scope } => scope,
+    };
+    let proof = confirm(scope).await?;
+    match write(Some(proof)).await? {
+        PolicyWrite::Written(result) => Ok(result),
+        PolicyWrite::NeedsStepUp { .. } => Err(LpmError::Env(
+            "the server didn't accept the confirmation, or it expired before the policy was \
+             sent. Nothing was changed. Run this command again to confirm once more."
+                .into(),
+        )),
+    }
+}
+
 /// Has the user confirm that it's them before CI is given access to an env
 /// project, and returns the proof the policy write carries. `access` is the
 /// policy being confirmed, shown first: the prompt and the approval page
@@ -661,9 +692,9 @@ async fn confirm_ci_access(
 
     if !std::io::stdin().is_terminal() {
         return Err(LpmError::Env(
-            "Giving CI access to this env project needs a confirmation that it's you, which \
+            "giving CI access to this env project needs a confirmation that it's you, which \
              needs an interactive terminal. Run this command in one, or add the policy on the \
-             env project's page on lpm.dev and then run this command again."
+             env project's Access page in the dashboard and then run this command again."
                 .into(),
         ));
     }
@@ -714,8 +745,8 @@ async fn create_oidc_policy(
         }),
         _ => Err(LpmError::Env(
             "the server asked for a confirmation this LPM CLI doesn't recognize. Update it \
-             with `lpm self-update`, or add the policy on the env project's page on lpm.dev \
-             and then run this command again."
+             with `lpm self-update`, or add the policy on the env project's Access page in \
+             the dashboard and then run this command again."
                 .into(),
         )),
     }
@@ -1310,7 +1341,11 @@ mod oidc_error_hint_tests {
 
 #[cfg(test)]
 mod policy_step_up_tests {
-    use super::{PolicyWrite, create_oidc_policy, is_oidc_policy_step_up_scope};
+    use super::{
+        PolicyWrite, create_oidc_policy, is_oidc_policy_step_up_scope,
+        write_policy_with_confirmation,
+    };
+    use lpm_common::LpmError;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1344,10 +1379,98 @@ mod policy_step_up_tests {
             format!("vault:oidc-policy:{project}:{digest}:extra"),
             format!("vault:public-key:rotate:{project}:{digest}"),
             format!("vault:oidc-policy:{project}:{digest}\n"),
+            format!("vault:oidc-policy:{}:{digest}", project.to_uppercase()),
+            format!("vault:oidc-policy:3f2b8c1e9-a4d-4c6b-8e21-5d7f0a9b1c23:{digest}"),
             String::new(),
         ] {
             assert!(!is_oidc_policy_step_up_scope(&scope), "{scope}");
         }
+    }
+
+    /// Runs the confirmation flow against scripted answers, and returns its
+    /// result with the proof each write carried.
+    async fn confirmation_flow(
+        answers: Vec<Result<PolicyWrite, LpmError>>,
+        confirmation: Result<String, LpmError>,
+    ) -> (Result<serde_json::Value, LpmError>, Vec<Option<String>>) {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        let writes = std::sync::Mutex::new(Vec::new());
+        let result = write_policy_with_confirmation(
+            |proof| {
+                writes.lock().unwrap().push(proof);
+                let answer = answers
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("an unexpected write");
+                async move { answer }
+            },
+            |scope| async move {
+                assert_eq!(scope, SCOPE);
+                confirmation
+            },
+        )
+        .await;
+        (result, writes.into_inner().unwrap())
+    }
+
+    fn needs_step_up() -> Result<PolicyWrite, LpmError> {
+        Ok(PolicyWrite::NeedsStepUp {
+            scope: SCOPE.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_policy_the_server_takes_at_once_asks_for_nothing() {
+        let written = serde_json::json!({ "policyId": "id" });
+        let (result, writes) = confirmation_flow(
+            vec![Ok(PolicyWrite::Written(written.clone()))],
+            Err(LpmError::Env("the user must not be asked".into())),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), written);
+        assert_eq!(writes, [None]);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_policy_is_written_once_more_with_the_proof() {
+        let written = serde_json::json!({ "policyId": "id" });
+        let (result, writes) = confirmation_flow(
+            vec![needs_step_up(), Ok(PolicyWrite::Written(written.clone()))],
+            Ok("proof".into()),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), written);
+        assert_eq!(writes, [None, Some("proof".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_second_refusal_ends_the_attempt_without_asking_again() {
+        let (result, writes) =
+            confirmation_flow(vec![needs_step_up(), needs_step_up()], Ok("proof".into())).await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("didn't accept the confirmation"), "{error}");
+        assert_eq!(writes, [None, Some("proof".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_confirmation_writes_nothing_more() {
+        let (result, writes) = confirmation_flow(
+            vec![needs_step_up()],
+            Err(LpmError::Env("confirmation refused".into())),
+        )
+        .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("confirmation refused")
+        );
+        assert_eq!(writes, [None]);
     }
 
     #[tokio::test]

@@ -9086,6 +9086,64 @@ async fn env_oidc_org_allow_without_a_terminal_stops_at_the_confirmation_request
 }
 
 #[tokio::test]
+async fn env_oidc_org_allow_names_the_organization_to_revoke_when_escrow_setup_fails() {
+    let project = TempProject::empty(r#"{"name":"org-ci-escrow","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"org-ci-project"}"#);
+    lpm_vault::vault_id::write_org_sync_version_for_principal(
+        project.path(),
+        "acme",
+        7,
+        lpm_vault::vault_id::SyncPrincipal {
+            registry_url: &mock.url(),
+            principal_id: "00000000-0000-4000-8000-000000000001",
+        },
+    )
+    .unwrap();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/vault/oidc/policies"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status":"ok","policyId":TEST_OIDC_POLICY_ID})),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let result = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "env",
+            "oidc",
+            "allow",
+            "--org=acme",
+            "--allow-server-decryption",
+            "--provider=gitlab",
+            "--project-id=123",
+            "--env=production",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("policy may already be saved")
+            && stderr.contains("lpm env oidc disable --org=acme"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn env_oidc_org_list_and_disable_preserve_the_organization_selector() {
     let project = TempProject::empty(r#"{"name":"org-ci-controls","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

@@ -1,22 +1,8 @@
-//! CLI wrapper around the dashboard's `/api/auth/cli-step-up` endpoint
-//! (Workstream 2 reauth primitive).
+//! Asks the user to confirm it's them before a sensitive write, through
+//! `/api/auth/cli-step-up`, and returns the proof the write carries.
 //!
-//! Wraps the lpm-vault network clients with cliclack prompts and a
-//! strict non-interactive refusal. Every sensitive CLI write that the
-//! WS3 + WS4 server gates require a step-up proof for routes through
-//! this helper:
-//!
-//!   - `lpm env rotate-sharing-key` →
-//!     `vault:public-key:rotate:<version>:<fingerprint>:<new fingerprint>`
-//!   - `lpm env share` / `lpm env pull --org` first-time registration
-//!     → `vault:public-key:set:<new fingerprint>`
-//!
-//!   Sharing-key scopes name the new key and the key it replaces
-//!   (`lpm_vault::sync::sharing_key_step_up_scope`).
-//!   - (future) force-push gates → `vault:force-push:*`
-//!
-//! An account with a passkey approves the action in the browser instead,
-//! which can also confirm an authenticator code.
+//! The account's method decides the prompt: a password, an authenticator
+//! code, or an approval in the browser, which can also confirm a passkey.
 //!
 //! Always refuses non-interactive callers: a CI environment piping
 //! stdin should never silently advance through a password prompt and
