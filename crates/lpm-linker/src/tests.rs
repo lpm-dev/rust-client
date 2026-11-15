@@ -61,6 +61,12 @@ fn assert_directory_link_target(link: &Path, expected_relative_target: &Path, me
     }
 }
 
+/// Plants `link` to `target` as an install does: a symlink, or on Windows a
+/// junction where the account may not create symlinks.
+fn plant_root_link(target: &Path, link: &Path) {
+    lpm_common::create_dir_symlink_or_junction(target, link).unwrap();
+}
+
 fn create_fake_store_package(dir: &Path, name: &str) -> PathBuf {
     let pkg_dir = dir.join(name);
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -4528,10 +4534,7 @@ fn cleanup_stale_entries_removes_legacy_shape_root_symlink() {
         .join("node_modules")
         .join("express");
     let root_link = nm.join("express");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&legacy_target, &root_link).unwrap();
-    #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(&legacy_target, &root_link);
+    plant_root_link(&legacy_target, &root_link);
 
     // Sanity: the legacy link IS present pre-cleanup.
     assert!(root_link.symlink_metadata().is_ok());
@@ -4584,10 +4587,7 @@ fn cleanup_stale_entries_removes_legacy_shape_scoped_root_symlink() {
         .join("@types")
         .join("node");
     let scoped_link = nm.join("@types").join("node");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&legacy_target, &scoped_link).unwrap();
-    #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(&legacy_target, &scoped_link);
+    plant_root_link(&legacy_target, &scoped_link);
 
     // The scoped pkg IS in the resolution set (a kept direct dep).
     let types_node = LinkTarget {
@@ -4631,10 +4631,7 @@ fn cleanup_stale_entries_preserves_new_shape_root_symlink() {
         .join("node_modules")
         .join("express");
     let root_link = nm.join("express");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&new_target, &root_link).unwrap();
-    #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(&new_target, &root_link);
+    plant_root_link(&new_target, &root_link);
 
     let express = LinkTarget {
         name: "express".to_string(),
@@ -4672,10 +4669,7 @@ fn cleanup_stale_entries_preserves_workspace_member_symlink() {
     std::fs::create_dir_all(&member_src).unwrap();
     let workspace_target = PathBuf::from("..").join("packages").join("foo");
     let root_link = nm.join("foo");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&workspace_target, &root_link).unwrap();
-    #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(&workspace_target, &root_link);
+    plant_root_link(&workspace_target, &root_link);
 
     // Foo is a direct dep so the existing stale-name sweep keeps it.
     let foo = LinkTarget {
@@ -4709,10 +4703,7 @@ fn cleanup_stale_entries_preserves_self_reference_symlink() {
     let nm = project_dir.join("node_modules");
     std::fs::create_dir_all(&nm).unwrap();
     let self_link = nm.join("self-pkg");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(PathBuf::from(".."), &self_link).unwrap();
-    #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(PathBuf::from(".."), &self_link);
+    plant_root_link(Path::new(".."), &self_link);
 
     // Self-pkg is in the package set so the stale-name sweep keeps it.
     let self_pkg = LinkTarget {
@@ -4758,10 +4749,7 @@ fn link_finalize_retargets_legacy_root_symlink_after_migration() {
         .join("node_modules")
         .join("express");
     let root_link = nm.join("express");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&legacy_target, &root_link).unwrap();
-    #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(&legacy_target, &root_link);
+    plant_root_link(&legacy_target, &root_link);
 
     // Run a normal link pass.
     link_packages(
