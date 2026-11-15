@@ -21,6 +21,7 @@ fn make_graph_key() -> GraphKey {
         None,
         None,
         None,
+        &[0; 32],
     )
 }
 

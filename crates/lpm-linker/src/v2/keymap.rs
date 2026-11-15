@@ -23,6 +23,7 @@ pub struct KeyMap {
 
 struct GraphKeyCacheInput {
     target: Arc<V2Target>,
+    source_closure: [u8; 32],
     platform: PlatformTuple,
     linker_tag: LinkerModeTag,
 }
@@ -30,11 +31,13 @@ struct GraphKeyCacheInput {
 impl GraphKeyCacheInput {
     fn from_target(
         target: &Arc<V2Target>,
+        source_closure: &[u8; 32],
         platform: &PlatformTuple,
         linker_tag: LinkerModeTag,
     ) -> Self {
         Self {
             target: Arc::clone(target),
+            source_closure: *source_closure,
             platform: platform.clone(),
             linker_tag,
         }
@@ -43,13 +46,15 @@ impl GraphKeyCacheInput {
     fn matches(
         &self,
         target: &V2Target,
+        source_closure: &[u8; 32],
         platform: &PlatformTuple,
         linker_tag: LinkerModeTag,
     ) -> bool {
         let cached_target = &self.target;
         let cached_link_target = &cached_target.target;
         let link_target = &target.target;
-        cached_link_target.name == link_target.name
+        &self.source_closure == source_closure
+            && cached_link_target.name == link_target.name
             && cached_link_target.version == link_target.version
             && &self.platform == platform
             && self.linker_tag == linker_tag
@@ -86,19 +91,26 @@ impl GraphKeyCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut graph_keys = Vec::with_capacity(targets.len());
-        for target in targets {
-            let fingerprint = graph_key_input_fingerprint(target, platform, linker_tag);
+        for (target, source_closure) in targets.iter().zip(&source_closures(targets)) {
+            let fingerprint =
+                graph_key_input_fingerprint(target, source_closure, platform, linker_tag);
             let bucket = entries.entry(fingerprint).or_default();
-            if let Some(cached) = bucket
-                .iter()
-                .find(|cached| cached.input.matches(target, platform, linker_tag))
-            {
+            if let Some(cached) = bucket.iter().find(|cached| {
+                cached
+                    .input
+                    .matches(target, source_closure, platform, linker_tag)
+            }) {
                 graph_keys.push(Arc::clone(&cached.graph_key));
                 continue;
             }
-            let graph_key = derive_graph_key(target, platform, linker_tag);
+            let graph_key = derive_graph_key(target, source_closure, platform, linker_tag);
             bucket.push(CachedGraphKey {
-                input: GraphKeyCacheInput::from_target(target, platform, linker_tag),
+                input: GraphKeyCacheInput::from_target(
+                    target,
+                    source_closure,
+                    platform,
+                    linker_tag,
+                ),
                 graph_key: Arc::clone(&graph_key),
             });
             graph_keys.push(graph_key);
@@ -148,11 +160,13 @@ fn root_link_identity(target: &LinkTarget) -> Option<&[String]> {
 
 fn graph_key_input_fingerprint(
     target: &V2Target,
+    source_closure: &[u8; 32],
     platform: &PlatformTuple,
     linker_tag: LinkerModeTag,
 ) -> u64 {
     let link_target = &target.target;
     let mut fingerprint = 0xcbf29ce484222325u64;
+    fingerprint_bytes(&mut fingerprint, source_closure);
     for value in [
         link_target.name.as_str(),
         link_target.version.as_str(),
@@ -215,6 +229,7 @@ fn graph_key_input_fingerprint(
 
 fn derive_graph_key(
     target: &V2Target,
+    source_closure: &[u8; 32],
     platform: &PlatformTuple,
     linker_tag: LinkerModeTag,
 ) -> Arc<GraphKey> {
@@ -240,7 +255,140 @@ fn derive_graph_key(
         root_link_identity(link_target),
         link_target.wrapper_id.as_deref(),
         link_target.patch_fingerprint.as_deref(),
+        source_closure,
     ))
+}
+
+/// For each target, a digest over the source it was unpacked from and the
+/// sources of every target its dependency and peer links reach.
+///
+/// A link entry holds links to its dependencies' entries, so the bytes a
+/// package's own code can load are those of everything it reaches. A target
+/// that is not on a cycle is named by its source alone, which lets two
+/// instances of the same materialization keep one entry. Targets on a cycle
+/// reach each other, so they share one digest over all of them.
+fn source_closures(targets: &[Arc<V2Target>]) -> Vec<[u8; 32]> {
+    const UNSEEN: usize = usize::MAX;
+
+    let by_instance: HashMap<_, _> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.instance_id, index))
+        .collect();
+    let reached: Vec<Vec<usize>> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let mut reached: Vec<usize> = target
+                .dependency_targets
+                .values()
+                .chain(target.peer_targets.values())
+                .filter_map(|instance_id| by_instance.get(instance_id).copied())
+                .filter(|&other| other != index)
+                .collect();
+            reached.sort_unstable();
+            reached.dedup();
+            reached
+        })
+        .collect();
+
+    // Tarjan's algorithm, with its own stack so a deep graph can't exhaust
+    // the thread's. It completes a cycle only after everything the cycle
+    // reaches, so each digest is ready when a dependent needs it.
+    let mut discovered = vec![UNSEEN; targets.len()];
+    let mut lowest = vec![UNSEEN; targets.len()];
+    let mut cycle_of = vec![UNSEEN; targets.len()];
+    let mut open = Vec::new();
+    let mut visiting: Vec<(usize, usize)> = Vec::new();
+    let mut digests: Vec<[u8; 32]> = Vec::new();
+    let mut next = 0;
+    for root in 0..targets.len() {
+        if discovered[root] != UNSEEN {
+            continue;
+        }
+        visiting.push((root, 0));
+        while let Some(&(index, position)) = visiting.last() {
+            if position == 0 {
+                discovered[index] = next;
+                lowest[index] = next;
+                next += 1;
+                open.push(index);
+            }
+            if let Some(&other) = reached[index].get(position) {
+                visiting
+                    .last_mut()
+                    .expect("the frame read above is still on the stack")
+                    .1 += 1;
+                if discovered[other] == UNSEEN {
+                    visiting.push((other, 0));
+                } else if cycle_of[other] == UNSEEN {
+                    lowest[index] = lowest[index].min(discovered[other]);
+                }
+                continue;
+            }
+            visiting.pop();
+            if let Some(&(parent, _)) = visiting.last() {
+                lowest[parent] = lowest[parent].min(lowest[index]);
+            }
+            if lowest[index] != discovered[index] {
+                continue;
+            }
+            let start = open
+                .iter()
+                .rposition(|&member| member == index)
+                .expect("a target stays open until its cycle completes");
+            let members = open.split_off(start);
+            for &member in &members {
+                cycle_of[member] = digests.len();
+            }
+            digests.push(cycle_source_digest(
+                targets, &members, &reached, &cycle_of, &digests,
+            ));
+        }
+    }
+    cycle_of.into_iter().map(|cycle| digests[cycle]).collect()
+}
+
+fn cycle_source_digest(
+    targets: &[Arc<V2Target>],
+    members: &[usize],
+    reached: &[Vec<usize>],
+    cycle_of: &[usize],
+    digests: &[[u8; 32]],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-source-closure-v1\0");
+    let source = |hasher: &mut Sha256, target: &V2Target| {
+        hasher.update((target.source_sri.len() as u64).to_le_bytes());
+        hasher.update(target.source_sri.as_bytes());
+    };
+    if let [member] = members {
+        hasher.update([0]);
+        source(&mut hasher, &targets[*member]);
+    } else {
+        let mut members: Vec<_> = members.iter().map(|&member| &targets[member]).collect();
+        members.sort_unstable_by_key(|target| target.instance_id);
+        hasher.update([1]);
+        hasher.update((members.len() as u64).to_le_bytes());
+        for target in members {
+            hasher.update(target.instance_id.as_bytes());
+            source(&mut hasher, target);
+        }
+    }
+    let own_cycle = digests.len();
+    let mut beyond: Vec<_> = members
+        .iter()
+        .flat_map(|&member| &reached[member])
+        .filter(|&&other| cycle_of[other] != own_cycle)
+        .map(|&other| (targets[other].instance_id, &digests[cycle_of[other]]))
+        .collect();
+    beyond.sort_unstable();
+    beyond.dedup();
+    for (instance_id, digest) in beyond {
+        hasher.update(instance_id.as_bytes());
+        hasher.update(digest);
+    }
+    hasher.finalize().into()
 }
 
 impl KeyMap {
@@ -376,7 +524,10 @@ pub(super) fn derive_graph_keys(
         || {
             key_targets
                 .iter()
-                .map(|target| derive_graph_key(target, platform, linker_tag))
+                .zip(&source_closures(key_targets))
+                .map(|(target, source_closure)| {
+                    derive_graph_key(target, source_closure, platform, linker_tag)
+                })
                 .collect()
         },
         |cache| cache.derive_many(key_targets, platform, linker_tag),
@@ -573,6 +724,138 @@ mod tests {
         link.dependencies.clear();
         link.peers.clear();
         node
+    }
+
+    fn keys_of(targets: &[Arc<V2Target>], cache: Option<&GraphKeyCache>) -> KeyMap {
+        let platform = PlatformTuple::new("linux", "x64", None);
+        derive_graph_keys(targets, &platform, LinkerModeTag::Isolated, cache).unwrap()
+    }
+
+    fn with_source(
+        targets: &[Arc<V2Target>],
+        index: usize,
+        source_sri: &str,
+    ) -> Vec<Arc<V2Target>> {
+        let mut changed = targets.to_vec();
+        Arc::make_mut(&mut changed[index]).source_sri = source_sri.to_owned();
+        changed
+    }
+
+    #[test]
+    fn other_bytes_for_the_same_package_get_their_own_key() {
+        let original = [Arc::new(graph_node("package"))];
+        let other = with_source(&original, 0, "sha512-other-bytes");
+        let cache = GraphKeyCache::default();
+
+        assert_ne!(
+            keys_of(&original, Some(&cache)).get_for(&original[0]),
+            keys_of(&other, Some(&cache)).get_for(&other[0]),
+        );
+        assert_ne!(
+            keys_of(&original, None).get_for(&original[0]),
+            keys_of(&other, None).get_for(&other[0]),
+        );
+    }
+
+    #[test]
+    fn other_bytes_reach_the_key_of_every_package_that_links_to_them() {
+        let mut parent = graph_node("parent");
+        let mut middle = graph_node("middle");
+        let leaf = graph_node("leaf");
+        let unrelated = graph_node("unrelated");
+        parent
+            .dependency_targets
+            .insert("middle".to_owned(), middle.instance_id);
+        middle
+            .peer_targets
+            .insert("leaf".to_owned(), leaf.instance_id);
+        let original: Vec<_> = [parent, middle, leaf, unrelated]
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let cache = GraphKeyCache::default();
+        let before = keys_of(&original, Some(&cache));
+
+        let mut changed = with_source(&original, 2, "sha512-other-leaf");
+        let after = keys_of(&changed, Some(&cache));
+        for node in &original[..3] {
+            assert_ne!(before.get_for(node), after.get_for(node));
+        }
+        assert_eq!(before.get_for(&original[3]), after.get_for(&original[3]));
+
+        let middle_only = keys_of(&with_source(&original, 1, "sha512-other-middle"), None);
+        assert_ne!(
+            before.get_for(&original[0]),
+            middle_only.get_for(&original[0])
+        );
+        assert_eq!(
+            before.get_for(&original[2]),
+            middle_only.get_for(&original[2])
+        );
+
+        changed.reverse();
+        let reordered = keys_of(&changed, None);
+        for node in &original {
+            assert_eq!(after.get_for(node), reordered.get_for(node));
+        }
+    }
+
+    #[test]
+    fn other_bytes_reach_every_package_on_a_cycle_and_none_below_it() {
+        let mut first = graph_node("first");
+        let mut second = graph_node("second");
+        let mut third = graph_node("third");
+        let below = graph_node("below");
+        first
+            .dependency_targets
+            .insert("second".to_owned(), second.instance_id);
+        second
+            .dependency_targets
+            .insert("third".to_owned(), third.instance_id);
+        third
+            .dependency_targets
+            .insert("first".to_owned(), first.instance_id);
+        third
+            .dependency_targets
+            .insert("below".to_owned(), below.instance_id);
+        let original: Vec<_> = [first, second, third, below]
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let before = keys_of(&original, None);
+
+        for changed_index in 0..3 {
+            let after = keys_of(&with_source(&original, changed_index, "sha512-other"), None);
+            for node in &original[..3] {
+                assert_ne!(before.get_for(node), after.get_for(node));
+            }
+            assert_eq!(before.get_for(&original[3]), after.get_for(&original[3]));
+        }
+
+        let after = keys_of(&with_source(&original, 3, "sha512-other"), None);
+        for node in &original {
+            assert_ne!(before.get_for(node), after.get_for(node));
+        }
+    }
+
+    #[test]
+    fn a_long_dependency_chain_gets_its_keys() {
+        let mut targets: Vec<V2Target> = (0..50_000)
+            .map(|index| graph_node(&format!("link-{index}")))
+            .collect();
+        for index in 1..targets.len() {
+            let next = targets[index].instance_id;
+            targets[index - 1]
+                .dependency_targets
+                .insert("next".to_owned(), next);
+        }
+        let targets: Vec<_> = targets.into_iter().map(Arc::new).collect();
+        let before = keys_of(&targets, None);
+
+        let last = targets.len() - 1;
+        let after = keys_of(&with_source(&targets, last, "sha512-other"), None);
+
+        assert_ne!(before.get_for(&targets[0]), after.get_for(&targets[0]));
     }
 
     #[test]

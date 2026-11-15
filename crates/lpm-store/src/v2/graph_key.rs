@@ -7,7 +7,7 @@
 //!
 //! # Inputs hashed (stable order)
 //!
-//! 1. Schema version tag (`v=5`)
+//! 1. Schema version tag (`v=6`)
 //! 2. `name`
 //! 3. `version`
 //! 4. Platform tuple `(os, cpu, libc)` — libc empty on non-Linux
@@ -27,6 +27,11 @@
 //!     a project applying a patch gets a distinct link entry: without
 //!     it, v2's cross-project sharing of `<store>/v2/links/<key>/...`
 //!     dirs would let project A's patched bytes leak into project B.
+//! 14. Source closure — a digest over the source this package was
+//!     unpacked from and the sources of everything its links reach.
+//!     A link entry holds the package's files and links to its
+//!     dependencies' entries, so two installs can share it only when
+//!     all of those are the same bytes.
 //!
 //! Each component is preceded by a labeled NUL-delimited prefix
 //! (e.g. `name=\0...\0`) so cross-component byte boundaries are
@@ -152,6 +157,12 @@ pub struct GraphKeyInputs {
     /// and never shares bytes with an unpatched install of the same
     /// coords. `None` for unpatched packages.
     pub patch_fingerprint: Option<String>,
+    /// Digest over the source of this package and of every package its
+    /// dependency and peer links reach, at any depth. The name, version and
+    /// source location of a package don't fix its bytes: a registry can
+    /// serve others, and two projects can each hold a local package at the
+    /// same relative path.
+    pub source_closure: [u8; 32],
 }
 
 impl GraphKeyInputs {
@@ -176,7 +187,14 @@ impl GraphKeyInputs {
             root_link_names: None,
             wrapper_id: None,
             patch_fingerprint: None,
+            source_closure: [0; 32],
         }
+    }
+
+    /// Replace the source closure.
+    pub fn with_source_closure(mut self, source_closure: [u8; 32]) -> Self {
+        self.source_closure = source_closure;
+        self
     }
 
     /// Replace the source-identity disambiguator. `None` for registry
@@ -302,7 +320,7 @@ impl std::hash::Hash for GraphKey {
 impl GraphKey {
     /// Schema version tag. Bump if the input layout changes — older
     /// wrappers will produce different keys and naturally GC.
-    const SCHEMA: &'static [u8] = b"v=5";
+    const SCHEMA: &'static [u8] = b"v=6";
 
     /// Length of the directory-name suffix in hex chars (16 = 64 bits
     /// of the BLAKE3 digest, ~10⁻¹⁹ collision probability for 10⁹ keys).
@@ -365,6 +383,8 @@ impl GraphKey {
         let patch_str = inputs.patch_fingerprint.as_deref().unwrap_or("");
         write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
 
+        write_source_closure(&mut hasher, &inputs.source_closure);
+
         let digest = *hasher.finalize().as_bytes();
         let dir_name = compute_dir_name(&inputs.name, &inputs.version, &digest);
         Self {
@@ -401,6 +421,7 @@ impl GraphKey {
         root_link_names: Option<&[String]>,
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
+        source_closure: &[u8; 32],
     ) -> Self {
         let peer_edges = peers
             .iter()
@@ -417,6 +438,7 @@ impl GraphKey {
             root_link_names,
             wrapper_id,
             patch_fingerprint,
+            source_closure,
         )
     }
 
@@ -433,6 +455,7 @@ impl GraphKey {
         root_link_names: Option<&[String]>,
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
+        source_closure: &[u8; 32],
     ) -> Self {
         Self::derive_raw_exact_peer_edges(
             name,
@@ -447,6 +470,7 @@ impl GraphKey {
             root_link_names,
             wrapper_id,
             patch_fingerprint,
+            source_closure,
         )
     }
 
@@ -465,6 +489,7 @@ impl GraphKey {
         root_link_names: Option<&[String]>,
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
+        source_closure: &[u8; 32],
     ) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(Self::SCHEMA);
@@ -490,6 +515,8 @@ impl GraphKey {
 
         let patch_str = patch_fingerprint.unwrap_or("");
         write_field(&mut hasher, b"patch_fingerprint", patch_str.as_bytes());
+
+        write_source_closure(&mut hasher, source_closure);
 
         let digest = *hasher.finalize().as_bytes();
         let dir_name = compute_dir_name(name, version, &digest);
@@ -616,6 +643,15 @@ fn compute_dir_name(name: &str, version: &str, digest: &[u8; 32]) -> String {
     };
     let short_hex = hex::encode(&digest[..GraphKey::SHORT_HEX_LEN / 2]);
     format!("{}@{}+{}", safe_name, version, short_hex)
+}
+
+/// Hex keeps the digest clear of the NUL that ends a field.
+fn write_source_closure(hasher: &mut blake3::Hasher, source_closure: &[u8; 32]) {
+    write_field(
+        hasher,
+        b"source_closure",
+        hex::encode(source_closure).as_bytes(),
+    );
 }
 
 fn write_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
@@ -1107,6 +1143,14 @@ mod tests {
     // install (or a different-patch install) of the same coords.
 
     #[test]
+    fn other_source_bytes_yield_a_different_key() {
+        assert_ne!(
+            GraphKey::derive(&base_inputs().with_source_closure([1; 32])),
+            GraphKey::derive(&base_inputs().with_source_closure([2; 32])),
+        );
+    }
+
+    #[test]
     fn f1_patched_vs_unpatched_yields_different_keys() {
         let unpatched = base_inputs();
         let patched = base_inputs().with_patch_fingerprint(Some("p-deadbeefdeadbeef".into()));
@@ -1193,6 +1237,7 @@ mod tests {
             None,
             None,
             None,
+            &[0; 32],
         );
         assert_eq!(
             via_struct, via_raw,
@@ -1231,7 +1276,8 @@ mod tests {
             }])
             .with_root_link_names(Some(vec!["foo".into()]))
             .with_wrapper_id(Some("tarball+https://example.com/foo.tgz".into()))
-            .with_patch_fingerprint(Some("p-abc123".into()));
+            .with_patch_fingerprint(Some("p-abc123".into()))
+            .with_source_closure([7; 32]);
         let via_struct = GraphKey::derive(&inputs);
 
         // Build via derive_raw (optimised path).
@@ -1252,6 +1298,7 @@ mod tests {
             Some(&root_names),
             Some("tarball+https://example.com/foo.tgz"),
             Some("p-abc123"),
+            &[7; 32],
         );
         assert_eq!(
             via_struct, via_raw,
@@ -1294,6 +1341,7 @@ mod tests {
             None,
             None,
             None,
+            &[0; 32],
         );
         let raw_reverse = GraphKey::derive_raw(
             "pkg",
@@ -1309,6 +1357,7 @@ mod tests {
             None,
             None,
             None,
+            &[0; 32],
         );
         assert_eq!(
             via_struct, raw_forward,
