@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use lpm_common::LpmError;
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 
+use crate::extraction::EntryKey;
 use crate::integrity::validate_sha256_hex;
 use crate::{PackageStore, STORE_VERSION, is_complete_package_dir};
 
@@ -119,7 +120,7 @@ impl PackageStore {
             "tarball:{}",
             integrity_sri.chars().take(24).collect::<String>()
         );
-        self.store_at_dir(dir, &label, tarball_data)
+        self.store_at_dir(dir, &label, tarball_data, EntryKey::Content)
     }
 
     /// File-backed variant of [`Self::store_tarball_at_cas_path`].
@@ -165,7 +166,7 @@ impl PackageStore {
             "local-tarball:sha256-{}",
             &content_sha256_hex[..16.min(content_sha256_hex.len())]
         );
-        self.store_at_dir(dir, &label, tarball_data)
+        self.store_at_dir(dir, &label, tarball_data, EntryKey::Content)
     }
 }
 

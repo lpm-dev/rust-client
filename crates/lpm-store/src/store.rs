@@ -117,12 +117,13 @@ impl PackageStore {
     /// Check a complete v1 coordinate against its recorded hash or a previously
     /// verified alternate hash for the same archive.
     pub fn has_package_matching_integrity(&self, name: &str, version: &str, sri: &str) -> bool {
-        self.has_package(name, version)
-            && crate::integrity::stored_integrity_matches(
-                self.root(),
-                &self.package_dir(name, version),
-                sri,
-            )
+        let dir = self.package_dir(name, version);
+        let matches = is_complete_package_dir(&dir)
+            && crate::integrity::stored_integrity_matches(self.root(), &dir, sri);
+        if matches {
+            self.backfill_security_cache_if_enabled(&dir, &format!("{name}@{version}"));
+        }
+        matches
     }
 
     pub(crate) fn backfill_security_cache_if_enabled(&self, package_dir: &Path, label: &str) {

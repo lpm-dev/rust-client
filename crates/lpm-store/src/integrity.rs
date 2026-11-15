@@ -84,6 +84,22 @@ fn integrity_alias_path(store_root: &Path, stored: &str, sri: &str) -> Option<st
     Some(path)
 }
 
+/// How much a recorded integrity proves: a SHA-1 match is weaker evidence
+/// of the same bytes than a SHA-256 or SHA-512 one.
+pub(crate) fn integrity_strength(sri: &str) -> Option<u8> {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    Some(match Integrity::parse(sri).ok()?.algorithm {
+        HashAlgorithm::Sha1 => 1,
+        HashAlgorithm::Sha256 => 2,
+        HashAlgorithm::Sha512 => 3,
+    })
+}
+
+/// Whether the entry at `store_dir` is recorded as the archive `sri` names:
+/// by its marker, or by an alias recorded when both hashes were verified
+/// against one archive. An alias to a stronger hash than the marker's is
+/// not accepted. Such a file can remain from an LPM that recorded one after
+/// checking the weaker hash alone, which doesn't show the stronger.
 pub(crate) fn stored_integrity_matches(store_root: &Path, store_dir: &Path, sri: &str) -> bool {
     let Ok(stored) =
         lpm_common::read_text_file_capped_nofollow(&store_dir.join(".integrity"), 4096)
@@ -92,6 +108,9 @@ pub(crate) fn stored_integrity_matches(store_root: &Path, store_dir: &Path, sri:
     };
     if stored == sri {
         return true;
+    }
+    if integrity_strength(sri) > integrity_strength(&stored) {
+        return false;
     }
     let Some(alias) = integrity_alias_path(store_root, &stored, sri) else {
         return false;
@@ -117,6 +136,26 @@ pub(crate) fn record_verified_integrity_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_alias_to_a_stronger_hash_than_the_marker_is_not_a_match() {
+        let directory = tempfile::tempdir().unwrap();
+        let weak = compute_sri_hash_sha1(b"archive");
+        let strong = compute_sri_hash(b"archive");
+        std::fs::write(directory.path().join(".integrity"), &weak).unwrap();
+        record_verified_integrity_alias(directory.path(), &weak, &strong).unwrap();
+
+        assert!(!stored_integrity_matches(
+            directory.path(),
+            directory.path(),
+            &strong
+        ));
+        assert!(stored_integrity_matches(
+            directory.path(),
+            directory.path(),
+            &weak
+        ));
+    }
 
     #[test]
     fn verified_alias_is_invalid_after_the_original_marker_changes() {

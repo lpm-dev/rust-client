@@ -1150,7 +1150,7 @@ pub(super) async fn run_offline_install_phase(
     }
     if !missing.is_empty() {
         return Err(LpmError::Registry(format!(
-            "--offline: {} package(s) not in global store: {}",
+            "--offline: {} package(s) not in the global store under the integrity lpm.lock pins: {}",
             missing.len(),
             missing[..missing.len().min(5)].join(", ")
         )));

@@ -212,6 +212,34 @@ fn store_has_source_aware_does_not_accept_registry_for_tarball_pkg() {
 }
 
 #[test]
+fn store_has_source_aware_takes_a_registry_entry_only_under_the_selected_integrity() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(dir.path());
+    let tarball = build_minimal_tarball_with_pkg("react", "19.0.0");
+    store.store_package("react", "19.0.0", &tarball).unwrap();
+    let registry_package = |source: &str, integrity: Option<String>| {
+        let mut pkg = install_package_for_tarball("https://e.com/react.tgz", None);
+        pkg.name = "react".to_string();
+        pkg.version = "19.0.0".to_string();
+        pkg.source = source.to_string();
+        pkg.integrity = integrity;
+        pkg
+    };
+    let registry = "registry+https://registry.npmjs.org";
+    let stored = Integrity::from_bytes(HashAlgorithm::Sha512, &tarball).to_string();
+    let other = Integrity::from_bytes(HashAlgorithm::Sha512, b"other bytes").to_string();
+
+    assert!(
+        registry_package(registry, Some(stored.clone())).store_has_source_aware(&store, dir.path())
+    );
+    assert!(!registry_package(registry, Some(other)).store_has_source_aware(&store, dir.path()));
+    assert!(!registry_package(registry, None).store_has_source_aware(&store, dir.path()));
+    assert!(!registry_package("", Some(stored)).store_has_source_aware(&store, dir.path()));
+}
+
+#[test]
 fn store_has_source_aware_uses_tarball_cas_when_integrity_present() {
     // Positive: when the same tarball SRI IS in the CAS, the
     // source-aware check returns true.
