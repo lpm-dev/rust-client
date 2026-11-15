@@ -327,7 +327,7 @@ mod tests {
             result
                 .expect_err("wrong credential must remain an error")
                 .to_string()
-                .contains("wrong_credential")
+                .contains("invalid credentials")
         );
     }
 }

@@ -84,21 +84,29 @@ pub async fn request_cli_step_up_approval(
     let status = response.status();
     if status != reqwest::StatusCode::ACCEPTED {
         let body = read_capped_error_text(response).await;
-        let message =
-            server_sentence(&body).unwrap_or_else(|| format!("step-up approval: {status}: {body}"));
-        return Err(SyncError::http(status, message));
+        return Err(SyncError::http(
+            status,
+            refusal("step-up approval", status, &body),
+        ));
     }
     Ok(read_capped_json::<CliStepUpApproval>(response).await?)
 }
 
-/// The sentence an error response carries for the user, when it has one.
-fn server_sentence(body: &str) -> Option<String> {
+/// What a refused step-up request tells the user: the sentence the server
+/// sent for them, or, when the response carries none, which request it was
+/// with the status and body.
+fn refusal(request: &str, status: reqwest::StatusCode, body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
-        .ok()?
-        .get("error")?
-        .as_str()
-        .filter(|sentence| !sentence.trim().is_empty())
-        .map(str::to_owned)
+        .ok()
+        .and_then(|response| {
+            response
+                .get("error")?
+                .as_str()
+                .map(str::trim)
+                .filter(|sentence| !sentence.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("{request}: {status}: {body}"))
 }
 
 /// Discover the step-up method the server expects for the calling
@@ -125,7 +133,7 @@ pub async fn discover_cli_step_up_policy(
         let body = read_capped_error_text(response).await;
         return Err(SyncError::http(
             status,
-            format!("step-up policy: {status}: {body}"),
+            refusal("step-up policy", status, &body),
         ));
     }
 
@@ -146,9 +154,9 @@ struct MintCliStepUpResponse {
 /// `X-LPM-Step-Up-Proof` header for the subsequent sensitive write
 /// (public-key set/rotate, force-push, etc).
 ///
-/// On failure, the returned error includes the server's response body
-/// so the CLI can surface the structured envelope (`code:
-/// wrong_credential`, `code: rate_limited`, etc) to the user.
+/// A refusal carries the server's sentence for the user. A refused
+/// password or code (`code: wrong_credential`) is a
+/// `SyncError::CredentialRejected`, which doesn't sign the CLI out.
 pub async fn mint_cli_step_up_proof(
     registry_url: &str,
     auth_token: &str,
@@ -189,7 +197,7 @@ pub async fn mint_cli_step_up_proof(
     let status = response.status();
     if !status.is_success() {
         let body = read_capped_error_text(response).await;
-        let message = format!("step-up mint: {status}: {body}");
+        let message = refusal("step-up mint", status, &body);
         let rejects_submitted_credential = status == reqwest::StatusCode::UNAUTHORIZED
             && serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
@@ -406,11 +414,61 @@ mod tests {
         )
         .await
         .expect_err("401 must propagate");
-        assert!(err.to_string().contains("401"), "got: {err}");
-        assert!(
-            err.to_string().contains("wrong_credential")
-                || err.to_string().contains("Incorrect password"),
-            "error envelope should be preserved so CLI can render it: {err}"
+        assert_eq!(err.to_string(), "Incorrect password.");
+        assert!(matches!(
+            err,
+            SyncError::CredentialRejected { status: 401, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_without_a_sentence_names_the_request_status_and_body() {
+        for body in [
+            serde_json::json!({ "ok": false, "code": "rate_limited" }),
+            serde_json::json!({ "ok": false, "error": "   " }),
+            serde_json::json!({ "ok": false, "error": { "message": "nested" } }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/auth/cli-step-up"))
+                .respond_with(ResponseTemplate::new(429).set_body_json(&body))
+                .mount(&server)
+                .await;
+
+            let error = mint_cli_step_up_proof(
+                &server.uri(),
+                "token",
+                SCOPE,
+                &CliStepUpCredential::Password { password: "p" },
+            )
+            .await
+            .expect_err("refusal");
+
+            assert_eq!(
+                error.to_string(),
+                format!("step-up mint: 429 Too Many Requests: {body}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_cli_step_up_policy_reports_a_refusal_in_the_servers_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "Step-up needs a signed-in CLI session, not a registry token.",
+            })))
+            .mount(&server)
+            .await;
+
+        let error = discover_cli_step_up_policy(&server.uri(), "token")
+            .await
+            .expect_err("refusal");
+
+        assert_eq!(
+            error.to_string(),
+            "Step-up needs a signed-in CLI session, not a registry token."
         );
     }
 
