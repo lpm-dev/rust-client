@@ -3883,63 +3883,84 @@ fn legacy_build_order_traverses_unscripted_alias_and_peer_dependencies() {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
     let project = tempfile::tempdir().unwrap();
-    let project_dir = project.path().canonicalize().unwrap();
-    std::fs::create_dir_all(project_dir.join("node_modules/.bin")).unwrap();
-    std::fs::create_dir_all(project_dir.join("tools")).unwrap();
-    let inherited = [
-        project_dir.join("node_modules/.bin").display().to_string(),
-        "/usr/local/bin".to_string(),
-        String::new(),
-        ".".to_string(),
-        "relative/bin".to_string(),
-        project_dir.join("tools").display().to_string(),
-        "/opt/other-project/node_modules/.bin".to_string(),
-        "/usr/bin".to_string(),
-    ]
-    .join(":");
+    let project_dir = project.path();
+    let machine = tempfile::tempdir().unwrap();
+    let scratch_bin = machine.path().join("scratch-bin");
+    let first_machine_bin = machine.path().join("bin");
+    let last_machine_bin = machine.path().join("sbin");
+    let other_projects_bin = machine.path().join("other-project/node_modules/.bin");
+    let project_bin = project_dir.join("node_modules/.bin");
+    for directory in [
+        &scratch_bin,
+        &first_machine_bin,
+        &last_machine_bin,
+        &other_projects_bin,
+        &project_bin,
+        &project_dir.join("tools"),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let inherited = std::env::join_paths([
+        project_bin.clone(),
+        first_machine_bin.clone(),
+        PathBuf::new(),
+        PathBuf::from("."),
+        PathBuf::from("relative/bin"),
+        project_dir.join("tools"),
+        other_projects_bin,
+        last_machine_bin.clone(),
+    ])
+    .unwrap();
     let mut parent = super::sandbox_env::ChildEnvironment::new();
-    parent.insert("PATH".into(), inherited.into());
+    parent.insert("PATH".into(), inherited);
     parent.insert("NoDefaultCurrentDirectoryInExePath".into(), "0".into());
-    let value = |envs: &[(std::ffi::OsString, std::ffi::OsString)], name: &str| {
+    let values = |envs: &[(std::ffi::OsString, std::ffi::OsString)], name: &str| {
         envs.iter()
             .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .map(|(_, value)| value.clone())
             .collect::<Vec<_>>()
+    };
+    let path_of = |envs: &[(std::ffi::OsString, std::ffi::OsString)]| {
+        let paths = values(envs, "PATH");
+        assert_eq!(paths.len(), 1, "{envs:?}");
+        std::env::split_paths(&paths[0]).collect::<Vec<_>>()
     };
 
     let green = super::script_execution::build_lifecycle_environment(
         &parent,
-        &project_dir,
-        Path::new("/tmp"),
-        Some(Path::new("/scratch/bin")),
+        project_dir,
+        machine.path(),
+        Some(&scratch_bin),
         false,
     );
     assert_eq!(
-        value(&green, "PATH"),
-        ["/scratch/bin:/usr/local/bin:/usr/bin"]
+        path_of(&green),
+        [
+            scratch_bin.clone(),
+            first_machine_bin.clone(),
+            last_machine_bin.clone()
+        ]
     );
-    assert_eq!(value(&green, "NoDefaultCurrentDirectoryInExePath"), ["1"]);
+    assert_eq!(values(&green, "NoDefaultCurrentDirectoryInExePath"), ["1"]);
 
     let approved = super::script_execution::build_lifecycle_environment(
         &parent,
-        &project_dir,
-        Path::new("/tmp"),
-        Some(Path::new("/scratch/bin")),
+        project_dir,
+        machine.path(),
+        Some(&scratch_bin),
         true,
     );
+    let approved_path = path_of(&approved);
+    assert_eq!(approved_path[..2], [scratch_bin, project_bin]);
+    assert_eq!(approved_path.last(), Some(&last_machine_bin));
     assert!(
-        value(&approved, "PATH")[0].starts_with(&format!(
-            "/scratch/bin:{}:",
-            project_dir.join("node_modules/.bin").display()
-        )),
-        "{approved:?}"
+        approved_path.contains(&first_machine_bin),
+        "{approved_path:?}"
     );
-    assert!(value(&approved, "PATH")[0].ends_with(":/usr/bin"));
     assert_eq!(
-        value(&approved, "NoDefaultCurrentDirectoryInExePath"),
+        values(&approved, "NoDefaultCurrentDirectoryInExePath"),
         ["0"]
     );
 }
