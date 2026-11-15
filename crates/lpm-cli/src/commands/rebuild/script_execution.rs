@@ -118,8 +118,15 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
     ("YARN_ENABLE_SCRIPTS", "false"),
 ];
 
-/// `project_bins` puts the project's `node_modules/.bin` on the `PATH`,
-/// after `bin_dir` and ahead of the caller's own entries.
+/// Makes cmd.exe leave the current directory, which is the package's, out of
+/// its search for commands named without a path.
+const NO_CURRENT_DIRECTORY_SEARCH: (&str, &str) = ("NoDefaultCurrentDirectoryInExePath", "1");
+
+/// With `project_bins`, the `PATH` is npm's: `bin_dir`, the project's
+/// `node_modules/.bin`, then the caller's own entries. Without it, a package
+/// supplies commands through `bin_dir` alone: the caller's entries that could
+/// hold a package's commands are dropped, and cmd.exe doesn't search the
+/// package's directory.
 pub(super) fn build_lifecycle_environment(
     env: &super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
@@ -131,7 +138,7 @@ pub(super) fn build_lifecycle_environment(
     let mut path_value = if project_bins {
         build_lifecycle_path(project_dir, parent_path)
     } else {
-        inherited_path(parent_path).to_owned()
+        host_path(inherited_path(parent_path), project_dir)
     };
     if let Some(bin_dir) = bin_dir {
         let mut prefixed = bin_dir.as_os_str().to_owned();
@@ -152,6 +159,7 @@ pub(super) fn build_lifecycle_environment(
                     && !NESTED_INSTALL_SCRIPT_GUARD
                         .iter()
                         .any(|(name, _)| k.eq_ignore_ascii_case(name))
+                    && (project_bins || !k.eq_ignore_ascii_case(NO_CURRENT_DIRECTORY_SEARCH.0))
             })
             .map(|(k, v)| (k.clone(), v.clone())),
     );
@@ -166,7 +174,35 @@ pub(super) fn build_lifecycle_environment(
             .iter()
             .map(|(name, value)| ((*name).into(), (*value).into())),
     );
+    if !project_bins {
+        envs.push((
+            NO_CURRENT_DIRECTORY_SEARCH.0.into(),
+            NO_CURRENT_DIRECTORY_SEARCH.1.into(),
+        ));
+    }
     envs
+}
+
+/// The entries of `path` that belong to the machine, not to a package: an
+/// absolute directory outside the project and outside every `node_modules`.
+/// The rest are where a dependency's command can sit, such as the project's
+/// `.bin` when LPM was started from a package script, or the current
+/// directory through an empty or relative entry.
+fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
+    let project = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let host = std::env::split_paths(path).filter(|entry| {
+        let resolved = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+        entry.is_absolute()
+            && !resolved.starts_with(&project)
+            && !entry.starts_with(project_dir)
+            && !resolved
+                .components()
+                .chain(entry.components())
+                .any(|component| component.as_os_str() == "node_modules")
+    });
+    std::env::join_paths(host).unwrap_or_default()
 }
 
 /// — resolve the live per-package directory where lifecycle

@@ -248,6 +248,7 @@ pub(crate) fn evaluate_trust(
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
     evaluate_trust_with_hash(
+        None,
         package_dir,
         script_hash.as_deref(),
         name,
@@ -264,8 +265,12 @@ pub(crate) fn evaluate_trust(
     )
 }
 
+/// `registry_packages` are the install's registry packages, by which the
+/// green tier tells a tool's publisher from a dependency that only declares
+/// the tool's name.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_trust_with_hash(
+    registry_packages: Option<&super::lifecycle_tools::RegistryPackages>,
     package_dir: &Path,
     script_hash: Option<&str>,
     name: &str,
@@ -294,7 +299,7 @@ pub(super) fn evaluate_trust_with_hash(
         script_hash,
     );
     let candidate = if candidate == TrustReason::GreenTierUnderTriage
-        && green_package_reaches_beyond_itself(package_dir, scripts)
+        && green_package_reaches_beyond_itself(package_dir, scripts, registry_packages)
     {
         TrustReason::Untrusted
     } else {
@@ -403,12 +408,14 @@ pub(super) fn evaluate_trust_unsuspended(
 fn green_package_reaches_beyond_itself(
     package_dir: &Path,
     scripts: &HashMap<String, String>,
+    registry_packages: Option<&super::lifecycle_tools::RegistryPackages>,
 ) -> bool {
     let phase_bodies: Vec<(String, String)> = lpm_security::EXECUTED_INSTALL_PHASES
         .iter()
         .filter_map(|phase| Some(((*phase).to_string(), scripts.get(*phase)?.clone())))
         .collect();
-    super::lifecycle_tools::script_reach(package_dir, &phase_bodies).requires_individual_review()
+    super::lifecycle_tools::script_reach(package_dir, &phase_bodies, registry_packages)
+        .requires_individual_review()
 }
 
 /// Worst execution tier across the active lifecycle phases.

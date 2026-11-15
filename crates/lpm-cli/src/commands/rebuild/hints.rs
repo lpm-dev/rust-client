@@ -321,6 +321,9 @@ pub fn all_scripted_packages_trusted_in_context(
     >,
     // The caller's index of this project's installed tree, when it has one.
     baseline_index: Option<&V2BaselineIndex>,
+    // The install's registry packages, by which the green tier tells a
+    // tool's publisher from a dependency that only declares its name.
+    registry_packages: Option<&super::RegistryPackages>,
 ) -> bool {
     // Index the virtual-store link entries once before the per-package loop,
     // scoped to this project's tree. Same rationale as `scriptable_package_rows`
@@ -373,6 +376,7 @@ pub fn all_scripted_packages_trusted_in_context(
         has_any_unbuilt = true;
 
         let reason = evaluate_trust_with_hash(
+            registry_packages,
             &pkg_dir,
             script_hash.as_deref(),
             name,

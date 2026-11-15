@@ -33,6 +33,7 @@ fn all_scripted_packages_trusted(
         user_bound,
         advisor_approvals,
         None,
+        None,
     )
 }
 
@@ -3879,4 +3880,66 @@ fn legacy_build_order_traverses_unscripted_alias_and_peer_dependencies() {
     assert_eq!(layers.len(), 2);
     assert_eq!(layers[0][0].name, "z-helper");
     assert_eq!(layers[1][0].name, "a-consumer");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
+    let project = tempfile::tempdir().unwrap();
+    let project_dir = project.path().canonicalize().unwrap();
+    std::fs::create_dir_all(project_dir.join("node_modules/.bin")).unwrap();
+    std::fs::create_dir_all(project_dir.join("tools")).unwrap();
+    let inherited = [
+        project_dir.join("node_modules/.bin").display().to_string(),
+        "/usr/local/bin".to_string(),
+        String::new(),
+        ".".to_string(),
+        "relative/bin".to_string(),
+        project_dir.join("tools").display().to_string(),
+        "/opt/other-project/node_modules/.bin".to_string(),
+        "/usr/bin".to_string(),
+    ]
+    .join(":");
+    let mut parent = super::sandbox_env::ChildEnvironment::new();
+    parent.insert("PATH".into(), inherited.into());
+    parent.insert("NoDefaultCurrentDirectoryInExePath".into(), "0".into());
+    let value = |envs: &[(std::ffi::OsString, std::ffi::OsString)], name: &str| {
+        envs.iter()
+            .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let green = super::script_execution::build_lifecycle_environment(
+        &parent,
+        &project_dir,
+        Path::new("/tmp"),
+        Some(Path::new("/scratch/bin")),
+        false,
+    );
+    assert_eq!(
+        value(&green, "PATH"),
+        ["/scratch/bin:/usr/local/bin:/usr/bin"]
+    );
+    assert_eq!(value(&green, "NoDefaultCurrentDirectoryInExePath"), ["1"]);
+
+    let approved = super::script_execution::build_lifecycle_environment(
+        &parent,
+        &project_dir,
+        Path::new("/tmp"),
+        Some(Path::new("/scratch/bin")),
+        true,
+    );
+    assert!(
+        value(&approved, "PATH")[0].starts_with(&format!(
+            "/scratch/bin:{}:",
+            project_dir.join("node_modules/.bin").display()
+        )),
+        "{approved:?}"
+    );
+    assert!(value(&approved, "PATH")[0].ends_with(":/usr/bin"));
+    assert_eq!(
+        value(&approved, "NoDefaultCurrentDirectoryInExePath"),
+        ["0"]
+    );
 }

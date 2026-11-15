@@ -1685,10 +1685,31 @@ fn tokens_are_compound(tokens: &[String]) -> bool {
 /// dependencies and the project put the commands their `bin` fields declare,
 /// under any name they choose. A green command is therefore the reviewed
 /// tool only when one of `providers` supplies it.
-#[derive(Debug, PartialEq, Eq)]
 pub struct GreenTool {
     pub command: &'static str,
     pub providers: &'static [&'static str],
+    /// Other green tools this one starts by name, which a run of it needs
+    /// on its `PATH` too.
+    pub starts: &'static [&'static str],
+    /// Whether a tokenized command line that begins with `command` is one
+    /// of the forms the allowlist accepts.
+    matches: fn(&[String]) -> bool,
+}
+
+impl PartialEq for GreenTool {
+    fn eq(&self, other: &Self) -> bool {
+        self.command == other.command
+    }
+}
+
+impl std::fmt::Debug for GreenTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.command)
+    }
+}
+
+fn alone(tokens: &[String]) -> bool {
+    tokens.len() == 1
 }
 
 /// Every package-supplied command of the green allowlist. `exit`, `:` and
@@ -1698,30 +1719,44 @@ pub const GREEN_TOOLS: &[GreenTool] = &[
     GreenTool {
         command: "node-gyp",
         providers: &["node-gyp"],
+        starts: &[],
+        matches: matches_node_gyp,
     },
     GreenTool {
         command: "node-gyp-build",
         providers: &["node-gyp-build"],
+        starts: &["node-gyp"],
+        matches: alone,
     },
     GreenTool {
         command: "node-gyp-build-optional-packages",
         providers: &["node-gyp-build-optional-packages"],
+        starts: &["node-gyp"],
+        matches: alone,
     },
     GreenTool {
         command: "electron-rebuild",
         providers: &["@electron/rebuild", "electron-rebuild"],
+        starts: &["node-gyp"],
+        matches: alone,
     },
     GreenTool {
         command: "tsc",
         providers: &["typescript"],
+        starts: &[],
+        matches: matches_tsc,
     },
     GreenTool {
         command: "prisma",
         providers: &["prisma"],
+        starts: &[],
+        matches: matches_prisma,
     },
     GreenTool {
         command: "husky",
         providers: &["husky"],
+        starts: &[],
+        matches: matches_husky,
     },
 ];
 
@@ -1731,17 +1766,22 @@ pub fn green_tool(command: &str) -> Option<&'static GreenTool> {
 }
 
 /// The green tools a lifecycle command can start: each one named where the
-/// shell reads a command, at the start of the script or after an operator.
-/// A script that cannot be tokenized names none.
+/// shell reads a command, at the start of the script or after an operator
+/// that begins a new command. A script that cannot be tokenized names none.
 pub fn green_tools_in(script: &str) -> Vec<&'static GreenTool> {
     let Some(tokens) = shlex::split(&normalize_operators(script)) else {
         return Vec::new();
     };
     let mut tools: Vec<&'static GreenTool> = Vec::new();
     let mut at_command = true;
+    let mut at_redirection_target = false;
     for token in &tokens {
-        if is_compound_op(token) {
+        if matches!(token.as_str(), ">" | ">>" | "<" | "<<") {
+            at_redirection_target = true;
+        } else if is_compound_op(token) {
             at_command = true;
+        } else if std::mem::take(&mut at_redirection_target) {
+            // The file a redirection reads or writes is not a command.
         } else if at_command && !is_environment_assignment(token) {
             at_command = false;
             // A token with a path separator names a file, not a `PATH` lookup.
@@ -1757,18 +1797,17 @@ pub fn green_tools_in(script: &str) -> Vec<&'static GreenTool> {
 }
 
 fn tokens_match_green(tokens: &[String], script: &str) -> bool {
-    match tokens.first().map(String::as_str) {
-        Some("node-gyp") => matches_node_gyp(tokens),
-        Some("node-gyp-build") => tokens.len() == 1,
-        Some("node-gyp-build-optional-packages") => tokens.len() == 1,
-        Some("electron-rebuild") => tokens.len() == 1,
-        Some("tsc") => matches_tsc(tokens),
-        Some("prisma") => matches_prisma(tokens),
-        Some("husky") => matches_husky(tokens),
-        Some("node") => matches_node_relative(script) || matches_node_eval_softfail_green(script),
-        Some("exit") => matches_exit_noop(tokens),
-        Some(":") => tokens.len() == 1,
-        Some("echo") => matches_echo_noop(tokens, script),
+    let Some(command) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+    if let Some(tool) = green_tool(command) {
+        return (tool.matches)(tokens);
+    }
+    match command {
+        "node" => matches_node_relative(script) || matches_node_eval_softfail_green(script),
+        "exit" => matches_exit_noop(tokens),
+        ":" => tokens.len() == 1,
+        "echo" => matches_echo_noop(tokens, script),
         _ => false,
     }
 }
@@ -3798,6 +3837,23 @@ mod tests {
             ["husky", "tsc"]
         );
         assert_eq!(green_commands_in("TSC.CMD"), ["tsc"]);
+    }
+
+    #[test]
+    fn a_redirection_target_is_not_a_command() {
+        assert!(green_tools_in("echo done > tsc").is_empty());
+        assert!(green_tools_in("echo done >> husky").is_empty());
+        assert_eq!(green_commands_in("echo done > log && tsc"), ["tsc"]);
+        assert_eq!(green_commands_in("tsc > tsc"), ["tsc"]);
+    }
+
+    #[test]
+    fn a_tool_another_green_tool_starts_is_itself_a_green_tool() {
+        for tool in GREEN_TOOLS {
+            for started in tool.starts {
+                assert!(green_tool(started).is_some(), "{tool:?} starts {started}");
+            }
+        }
     }
 
     #[test]

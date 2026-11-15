@@ -359,9 +359,9 @@ fn emit_bin_specs(
 pub struct LifecycleBinProvider<'a> {
     pub name: &'a str,
     pub directory: &'a Path,
-    /// The only commands to take from this provider, whatever else its
-    /// manifest declares. `None` takes every command.
-    pub commands: Option<&'a [&'a str]>,
+    /// Commands not to take from this provider, though its manifest
+    /// declares them.
+    pub except: &'a [&'a str],
 }
 
 /// A generated shim and the validated target used to fingerprint its executable inputs.
@@ -406,11 +406,7 @@ pub fn create_lifecycle_bin_links(
         let mut entries = config.entries(provider.name);
         entries.sort_unstable();
         for (name, relative) in entries {
-            if names.contains(&name)
-                || provider
-                    .commands
-                    .is_some_and(|commands| !commands.contains(&name.as_str()))
-            {
+            if names.contains(&name) || provider.except.contains(&name.as_str()) {
                 continue;
             }
             if let Err(error) = validate_bin_name(&name, provider.name) {

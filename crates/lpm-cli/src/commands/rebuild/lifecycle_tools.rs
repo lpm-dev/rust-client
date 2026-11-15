@@ -1,31 +1,31 @@
 use lpm_linker::v2::{LifecycleBin, LifecycleBinProvider, create_lifecycle_bin_links};
 use lpm_security::reach::{ReachFinding, ScriptReach};
-use lpm_security::static_gate::{GREEN_TOOLS, GreenTool, green_tools_in};
+use lpm_security::static_gate::{GREEN_TOOLS, GreenTool, green_tool, green_tools_in};
 use lpm_store::v2::LinkMeta;
 use lpm_store::v2::link_meta::LinkMetaDep;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The registry packages of an install, as its lockfile pins them. A
 /// dependency reached through a tarball URL, a git repository or a directory
 /// can carry any name, so only a member of this set is the package the
 /// registry publishes under its name.
+#[derive(Default)]
 pub(crate) struct RegistryPackages(HashSet<(String, String, String)>);
 
 impl RegistryPackages {
     pub(crate) fn of(lockfile: &lpm_lockfile::Lockfile) -> Self {
-        Self(
+        Self::new(
             lockfile
                 .packages
                 .iter()
+                // A row without a source is a registry package, as the
+                // lockfile's own graph validation reads it.
                 .filter(|package| {
-                    package
-                        .source
-                        .as_deref()
-                        .and_then(|source| lpm_lockfile::Source::parse(source).ok())
-                        .is_some_and(|source| {
-                            matches!(source, lpm_lockfile::Source::Registry { .. })
-                        })
+                    matches!(
+                        package.source_kind(),
+                        None | Some(Ok(lpm_lockfile::Source::Registry { .. }))
+                    )
                 })
                 .filter_map(|package| {
                     Some((
@@ -33,9 +33,13 @@ impl RegistryPackages {
                         package.version.clone(),
                         package.integrity.clone()?,
                     ))
-                })
-                .collect(),
+                }),
         )
+    }
+
+    /// From `(name, version, integrity)` of each registry package.
+    pub(crate) fn new(packages: impl IntoIterator<Item = (String, String, String)>) -> Self {
+        Self(packages.into_iter().collect())
     }
 
     fn publishes(&self, package: &LinkMeta) -> bool {
@@ -47,22 +51,65 @@ impl RegistryPackages {
     }
 }
 
+/// Whether the installed `package` is a registry package that publishes
+/// `tool`. Without the install's registry packages, none is known to be.
+fn publishes_tool(
+    tool: &GreenTool,
+    package: &LinkMeta,
+    registry_packages: Option<&RegistryPackages>,
+) -> bool {
+    tool.providers.contains(&package.name.as_str())
+        && registry_packages.is_some_and(|registry| registry.publishes(package))
+}
+
+/// The green commands a package of this name does not publish, which it
+/// therefore may not supply even to a script that trusts its other commands.
+fn green_commands_of_other_packages(package: &str) -> Vec<&'static str> {
+    GREEN_TOOLS
+        .iter()
+        .filter(|tool| !tool.providers.contains(&package))
+        .map(|tool| tool.command)
+        .collect()
+}
+
+/// The project's own installs of the packages that publish green tools: for
+/// each link directory, the tool publisher installed there. Taken from the
+/// lockfile's root selections, so a compatibility copy under the project's
+/// `node_modules` doesn't stand in for the store entry.
+pub(super) fn project_tool_publishers(
+    lockfile: &lpm_lockfile::Lockfile,
+    package_dir_of: impl Fn(lpm_common::PackageInstanceId) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    lockfile
+        .root_resolutions
+        .values()
+        .filter(|root| {
+            GREEN_TOOLS
+                .iter()
+                .any(|tool| tool.providers.contains(&root.package.as_str()))
+        })
+        .filter_map(|root| package_dir_of(root.instance_id?))
+        .collect()
+}
+
 /// Which package commands a lifecycle script finds on its `PATH`.
 pub(super) enum ToolScope<'a> {
     /// Every command the package's direct dependencies declare, then the
     /// project's own, as npm runs a lifecycle script. For a package the
     /// user approved.
     Dependencies,
-    /// Only the tools of the green allowlist, each from a registry package
-    /// that publishes it: one of the package's direct dependencies, or
-    /// else one of the project's. For a package that runs on its green
-    /// tier alone, which says what the command's text is, not which
-    /// package answers to its name. No other package's command is on the
-    /// `PATH`, so none can stand in for the tool or for a program the tool
-    /// starts.
+    /// Only the commands of registry packages that publish a green tool:
+    /// those among the package's direct dependencies, then the project's
+    /// installs of the publishers of the tools `scripts` name. For a
+    /// package that runs on its green tier alone, which says what the
+    /// command's text is, not which package answers to its name. A green
+    /// tool's name is taken only from its own publisher. No other
+    /// package's command is linked, so none can stand in for the tool or
+    /// for a program the tool starts.
     GreenTools {
         registry_packages: &'a RegistryPackages,
-        project_dir: &'a Path,
+        project_publishers: &'a [PathBuf],
+        scripts: &'a HashMap<String, String>,
     },
 }
 
@@ -72,15 +119,16 @@ pub(super) struct LifecycleTools {
     pub(super) read_dirs: Vec<PathBuf>,
     pub(super) graph_identities: Vec<String>,
     pub(super) has_nested_dependency: bool,
-    /// Whether the project's `node_modules/.bin` follows `bin_dir` on the
-    /// script's `PATH`.
+    /// Whether the script's `PATH` is npm's: the project's
+    /// `node_modules/.bin` and the caller's own entries follow `bin_dir`.
+    /// Otherwise only the caller's entries outside any package follow it.
     pub(super) project_bins: bool,
 }
 
 struct Provider {
     name: String,
     directory: PathBuf,
-    commands: Option<Vec<&'static str>>,
+    except: Vec<&'static str>,
 }
 
 impl LifecycleTools {
@@ -114,40 +162,42 @@ impl LifecycleTools {
         }
         tools.has_nested_dependency = metadata.deps.iter().any(|edge| edge.local == metadata.name);
         let mut providers = Vec::with_capacity(metadata.deps.len());
+        let mut project_providers = Vec::new();
         let mut queue = vec![(package_dir.clone(), metadata)];
         let mut visited = HashSet::new();
         visited.insert(package_dir.clone());
         if let ToolScope::GreenTools {
             registry_packages,
-            project_dir,
+            project_publishers,
+            scripts,
         } = &scope
         {
-            // Seeded before the walk so the project's providers, and what
+            let needed = tools_a_run_needs(scripts);
+            // Queued before the walk so the project's providers, and what
             // they depend on, are readable in the sandbox like the package's
-            // own. They are linked after the package's, so its own win.
-            for (name, commands) in green_tool_publishers() {
-                let Ok(directory) = project_dir.join("node_modules").join(name).canonicalize()
-                else {
+            // own. An install that doesn't check out is left out.
+            for directory in *project_publishers {
+                let Ok(directory) = directory.canonicalize() else {
                     continue;
                 };
                 let Ok(provider) = read_graph(&directory, &root) else {
                     continue;
                 };
-                if provider.name != name || !registry_packages.publishes(&provider) {
+                if !needed
+                    .iter()
+                    .any(|tool| publishes_tool(tool, &provider, Some(registry_packages)))
+                {
                     continue;
                 }
+                project_providers.push(Provider {
+                    except: green_commands_of_other_packages(&provider.name),
+                    name: provider.name.clone(),
+                    directory: directory.clone(),
+                });
                 if visited.insert(directory.clone()) {
                     tools.record_dependency(&directory, &provider);
-                    queue.push((directory.clone(), provider));
+                    queue.push((directory, provider));
                 }
-                providers.push((
-                    false,
-                    Provider {
-                        name: name.to_string(),
-                        directory,
-                        commands: Some(commands),
-                    },
-                ));
             }
         }
         while let Some((directory, mut metadata)) = queue.pop() {
@@ -172,24 +222,23 @@ impl LifecycleTools {
                     ));
                 }
                 if directory == package_dir {
-                    let commands = match &scope {
-                        ToolScope::Dependencies => Some(None),
+                    let except = match &scope {
+                        ToolScope::Dependencies => Some(Vec::new()),
                         ToolScope::GreenTools {
                             registry_packages, ..
-                        } => Some(published_green_commands(&provider_meta.name))
-                            .filter(|commands| !commands.is_empty())
-                            .filter(|_| registry_packages.publishes(&provider_meta))
-                            .map(Some),
+                        } => GREEN_TOOLS
+                            .iter()
+                            .any(|tool| {
+                                publishes_tool(tool, &provider_meta, Some(registry_packages))
+                            })
+                            .then(|| green_commands_of_other_packages(&provider_meta.name)),
                     };
-                    if let Some(commands) = commands {
-                        providers.push((
-                            true,
-                            Provider {
-                                name: provider_meta.name.clone(),
-                                directory: provider.clone(),
-                                commands,
-                            },
-                        ));
+                    if let Some(except) = except {
+                        providers.push(Provider {
+                            name: provider_meta.name.clone(),
+                            directory: provider.clone(),
+                            except,
+                        });
                     }
                 }
                 if visited.insert(provider.clone()) {
@@ -198,15 +247,14 @@ impl LifecycleTools {
                 }
             }
         }
-        // The package's own dependencies answer first; `sort_by_key` keeps
-        // the order within each group.
-        providers.sort_by_key(|(own, _)| !own);
+        // The package's own dependencies answer before the project's.
+        providers.append(&mut project_providers);
         let provider_refs = providers
             .iter()
-            .map(|(_, provider)| LifecycleBinProvider {
+            .map(|provider| LifecycleBinProvider {
                 name: &provider.name,
                 directory: &provider.directory,
-                commands: provider.commands.as_deref(),
+                except: &provider.except,
             })
             .collect::<Vec<_>>();
         tools.bins = create_lifecycle_bin_links(&tools.bin_dir, &provider_refs)
@@ -227,25 +275,32 @@ impl LifecycleTools {
     }
 }
 
-/// Each package that publishes a green tool, with the tools it publishes.
-fn green_tool_publishers() -> impl Iterator<Item = (&'static str, Vec<&'static str>)> {
-    let mut names: Vec<&'static str> = GREEN_TOOLS
-        .iter()
-        .flat_map(|tool| tool.providers.iter().copied())
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
-        .into_iter()
-        .map(|name| (name, published_green_commands(name)))
+/// The green tools the lifecycle commands of `scripts` name, and the green
+/// tools those start.
+fn tools_a_run_needs(scripts: &HashMap<String, String>) -> Vec<&'static GreenTool> {
+    let mut tools = named_green_tools(scripts.values().map(String::as_str));
+    let mut next = 0;
+    while let Some(tool) = tools.get(next).copied() {
+        for started in tool.starts.iter().filter_map(|command| green_tool(command)) {
+            if !tools.contains(&started) {
+                tools.push(started);
+            }
+        }
+        next += 1;
+    }
+    tools
 }
 
-fn published_green_commands(package: &str) -> Vec<&'static str> {
-    GREEN_TOOLS
-        .iter()
-        .filter(|tool| tool.providers.contains(&package))
-        .map(|tool| tool.command)
-        .collect()
+fn named_green_tools<'a>(scripts: impl Iterator<Item = &'a str>) -> Vec<&'static GreenTool> {
+    let mut tools: Vec<&'static GreenTool> = Vec::new();
+    for script in scripts {
+        for tool in green_tools_in(script) {
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+    }
+    tools
 }
 
 /// Where the dependency `edge` of the package `name` at `directory` is linked.
@@ -260,28 +315,25 @@ fn dependency_slot(directory: &Path, name: &str, edge: &LinkMetaDep) -> Result<P
 
 /// What a package's install-time code reaches beyond the package: the scan
 /// of its own files, and each green tool its lifecycle commands name that
-/// one of its installed dependencies would supply without being a publisher
-/// of that tool.
+/// one of its installed dependencies would supply without being the
+/// registry package that publishes the tool.
 ///
-/// The second part goes by the dependency's name alone, since the lockfile
-/// isn't at hand everywhere a package is classified. A package that only
-/// carries a publisher's name, without being the registry's, passes here
-/// and is still left off the `PATH` of a green run by
-/// [`ToolScope::GreenTools`].
-pub(crate) fn script_reach(package_dir: &Path, phase_bodies: &[(String, String)]) -> ScriptReach {
+/// `registry_packages` are the install's, by which a green run chooses its
+/// tools too. Without them no dependency counts as a publisher, so every
+/// dependency that declares the tool is reported.
+pub(crate) fn script_reach(
+    package_dir: &Path,
+    phase_bodies: &[(String, String)],
+    registry_packages: Option<&RegistryPackages>,
+) -> ScriptReach {
     let mut reach = lpm_security::reach::analyze(package_dir, phase_bodies);
-    let mut tools: Vec<&'static GreenTool> = Vec::new();
-    for (_, body) in phase_bodies {
-        for tool in green_tools_in(body) {
-            if !tools.contains(&tool) {
-                tools.push(tool);
-            }
-        }
-    }
+    let tools = named_green_tools(phase_bodies.iter().map(|(_, body)| body.as_str()));
     if !tools.is_empty() {
-        reach
-            .findings
-            .extend(tools_from_other_packages(package_dir, &tools));
+        reach.findings.extend(tools_from_other_packages(
+            package_dir,
+            &tools,
+            registry_packages,
+        ));
     }
     reach
 }
@@ -289,9 +341,10 @@ pub(crate) fn script_reach(package_dir: &Path, phase_bodies: &[(String, String)]
 fn tools_from_other_packages(
     package_dir: &Path,
     tools: &[&'static GreenTool],
+    registry_packages: Option<&RegistryPackages>,
 ) -> Vec<ReachFinding> {
     // A package outside the virtual store has no dependency tool directory:
-    // its scripts find commands on the project's and the system's `PATH`.
+    // no dependency's command is put on its scripts' `PATH`.
     let Ok(package_dir) = package_dir.canonicalize() else {
         return Vec::new();
     };
@@ -314,12 +367,23 @@ fn tools_from_other_packages(
             continue;
         };
         let commands = bins.entries(&edge.target_name);
+        let provider = slot
+            .canonicalize()
+            .ok()
+            .and_then(|directory| read_link_meta(&directory));
         for tool in tools {
-            if tool.providers.contains(&edge.target_name.as_str())
+            let reported = findings.iter().any(|finding| {
+                matches!(
+                    finding,
+                    ReachFinding::RunsToolFromOtherPackage { command, .. }
+                        if command == tool.command
+                )
+            });
+            if reported
                 || !commands.iter().any(|(name, _)| name == tool.command)
-                || findings.iter().any(|finding| {
-                    matches!(finding, ReachFinding::RunsToolFromOtherPackage { command, .. } if command == tool.command)
-                })
+                || provider
+                    .as_ref()
+                    .is_some_and(|provider| publishes_tool(tool, provider, registry_packages))
             {
                 continue;
             }
