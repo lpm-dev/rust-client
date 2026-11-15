@@ -4,8 +4,11 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use lpm_common::integrity::{HashAlgorithm, Integrity};
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_with_registry, write_signed_unlock_for};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 /// Project folders under one home, so they install into one package store.
 struct Neighbours {
@@ -29,9 +32,14 @@ impl Neighbours {
     }
 
     fn install(&self, project: &str, registry: &MockRegistry) {
+        self.install_with(project, registry, &[]);
+    }
+
+    fn install_with(&self, project: &str, registry: &MockRegistry, options: &[&str]) {
         lpm_with_registry(&self.holder, &registry.url())
             .current_dir(self.dir(project))
             .args(["install", "--no-skills", "--no-security-summary"])
+            .args(options)
             .assert()
             .success();
     }
@@ -59,14 +67,18 @@ impl Neighbours {
             .unwrap()
     }
 
-    /// The file a package's own code would load from its dependency.
-    fn seen_by(&self, project: &str, package: &str, dependency_file: &str) -> String {
-        let path = self
-            .store_entry(project, package)
+    /// Where a package's own code would find `dependency`.
+    fn dependency_of(&self, project: &str, package: &str, dependency: &str) -> PathBuf {
+        self.store_entry(project, package)
             .parent()
             .map(Path::to_path_buf)
             .unwrap()
-            .join(dependency_file);
+            .join(dependency)
+    }
+
+    /// The file a package's own code would load from its dependency.
+    fn seen_by(&self, project: &str, package: &str, dependency_file: &str) -> String {
+        let path = self.dependency_of(project, package, dependency_file);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
     }
@@ -83,6 +95,42 @@ async fn serve_family(registry: &MockRegistry, parent: &[u8], child_owner: &str)
         .await;
     registry
         .with_package("child", "1.0.0", &owned_package("child", child_owner))
+        .await;
+}
+
+/// Serves a version as registries did before `dist.integrity`: with a SHA-1
+/// `shasum` only.
+async fn serve_by_shasum(registry: &MockRegistry, name: &str, tarball: &[u8]) {
+    let metadata = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": name,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": registry.tarball_url(name, "1.0.0"),
+                    "shasum": hex::encode(Integrity::from_bytes(HashAlgorithm::Sha1, tarball).hash),
+                },
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" },
+    });
+    for metadata_path in [format!("/api/registry/{name}"), format!("/{name}")] {
+        Mock::given(method("GET"))
+            .and(path(metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(registry.server())
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(name, "1.0.0")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball.to_vec())
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(registry.server())
         .await;
 }
 
@@ -227,4 +275,55 @@ async fn projects_installing_the_same_bytes_share_one_store_entry() {
         neighbours.store_entry("first", "same-bytes"),
         neighbours.store_entry("second", "same-bytes")
     );
+}
+
+#[tokio::test]
+async fn a_package_declared_by_shasum_keeps_its_entry_through_a_build_and_the_next_install() {
+    let registry = MockRegistry::start().await;
+    serve_by_shasum(&registry, "legacy", &owned_package("legacy", "legacy")).await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "built",
+                "version": "1.0.0",
+                "dependencies": { "legacy": "1.0.0" },
+                "scripts": { "postinstall": "node build.js" },
+            }),
+            &[(
+                "build.js",
+                b"require('fs').writeFileSync('built.txt', 'ok');\n",
+            )],
+        )
+        .await;
+    let neighbours = Neighbours::new();
+    neighbours.write(
+        "first",
+        "package.json",
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"built":"1.0.0"},"lpm":{"trustedDependencies":["built"]}}"#,
+    );
+    let install_and_build = || {
+        write_signed_unlock_for(
+            &neighbours.holder,
+            &neighbours.dir("first"),
+            &["sandbox-none", "trust-bulk-approve"],
+        );
+        neighbours.install_with("first", &registry, &["--no-sandbox", "--auto-build"]);
+        assert_eq!(neighbours.installed("first", "built/built.txt"), "ok");
+        [
+            neighbours.store_entry("first", "built"),
+            neighbours
+                .dependency_of("first", "built", "legacy")
+                .canonicalize()
+                .unwrap(),
+        ]
+    };
+
+    let entries = install_and_build();
+    assert_eq!(
+        neighbours.seen_by("first", "built", "legacy/owner.txt"),
+        "legacy"
+    );
+
+    std::fs::remove_dir_all(neighbours.dir("first").join("node_modules")).unwrap();
+    assert_eq!(install_and_build(), entries);
 }

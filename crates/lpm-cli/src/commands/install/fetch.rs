@@ -531,6 +531,12 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) fresh_urls: HashMap<String, String>,
 }
 
+/// Whether `sri` is the one a fetched package's object is stored under.
+fn names_stored_object(sri: &str) -> bool {
+    lpm_common::integrity::Integrity::parse(sri)
+        .is_ok_and(|integrity| integrity.algorithm == lpm_common::integrity::HashAlgorithm::Sha512)
+}
+
 fn provenance_lockfile_id(package: &InstallPackage) -> Result<String, LpmError> {
     let source = lpm_lockfile::Source::parse(&package.source).map_err(|error| {
         LpmError::ProvenanceVerification(format!(
@@ -819,7 +825,11 @@ pub(super) async fn run_online_fetch_phase(
 
     // Predicate: the v2 plan can be precomputed BEFORE fetch iff every
     // CAS-backed target arrives with both
-    // (a) a known SRI (`p.integrity = Some(_)`), and
+    // (a) the SRI its object is stored under: a sha512 one. A fetch stores
+    // the object under the sha512 it computes and records that for the
+    // target, and a graph key covers each package's source, so a plan
+    // made from a declared sha1 or sha256 would name other entries than
+    // the links after the fetch and the next install look for; and
     // (b) resolver-threaded peers (`LinkTarget.peers` populated, or
     // the package declares no peer dependencies).
     // Otherwise `link_v2_prepare` would silently produce an
@@ -847,7 +857,7 @@ pub(super) async fn run_online_fetch_phase(
         for (lt, p) in link_targets.iter().zip(packages.iter()) {
             match lt.materialization {
                 lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
-                    Some(sri) => acc.push(lpm_linker::v2::V2Target {
+                    Some(sri) if names_stored_object(sri) => acc.push(lpm_linker::v2::V2Target {
                         instance_id: p.instance_id.expect("link inputs have exact instance IDs"),
                         target: Arc::new(lt.clone()),
                         dependency_targets: p.dependency_targets.clone(),
@@ -856,7 +866,7 @@ pub(super) async fn run_online_fetch_phase(
                         verified_object_integrity: None,
                         fresh_object: None,
                     }),
-                    None => {
+                    _ => {
                         all_have_sri = false;
                         break;
                     }

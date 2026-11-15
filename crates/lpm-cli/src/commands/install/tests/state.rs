@@ -1,9 +1,13 @@
 // ── install state (delegated to crate::install_state) ──
 
-/// An install-hash file this release trusts: `hash`, and the format of the
-/// shims it links on Windows.
+/// An install-hash file this release trusts: `hash`, the format of the
+/// shims it links on Windows, and the schema of its store keys.
 fn current_hash_file(hash: &str) -> String {
-    format!("{hash}\ns:{}\n", lpm_linker::BIN_SHIM_FORMAT)
+    format!(
+        "{hash}\ns:{}\nk:{}\n",
+        lpm_linker::BIN_SHIM_FORMAT,
+        lpm_store::v2::GraphKey::SCHEMA_VERSION
+    )
 }
 
 /// Set up a tempdir that looks like a post-install project:

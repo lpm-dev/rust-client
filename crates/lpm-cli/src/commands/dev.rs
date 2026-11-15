@@ -6776,8 +6776,13 @@ mod tests {
 
         let hash = compute_install_hash(pkg, "");
         fs::create_dir_all(dir.path().join(".lpm")).unwrap();
-        // With the shim format this release links, as the install writes it.
-        let file = format!("{hash}\ns:{}\n", lpm_linker::BIN_SHIM_FORMAT);
+        // With the shim format and store key schema this release links with,
+        // as the install writes them.
+        let file = format!(
+            "{hash}\ns:{}\nk:{}\n",
+            lpm_linker::BIN_SHIM_FORMAT,
+            lpm_store::v2::GraphKey::SCHEMA_VERSION
+        );
         fs::write(dir.path().join(".lpm/install-hash"), file).unwrap();
 
         assert!(!needs_install(dir.path()).0);
@@ -6933,8 +6938,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            9,
-            "install-hash MUST contain 9 lines (hash + m: + l: + i: + p: + a: + e: + n: + s:), got:\n{on_disk}\n\
+            10,
+            "install-hash MUST contain 10 lines (hash + m: + l: + i: + p: + a: + e: + n: + s: + k:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
