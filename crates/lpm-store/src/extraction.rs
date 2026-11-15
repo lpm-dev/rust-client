@@ -2057,10 +2057,8 @@ mod tests {
         let sri = compute_sri_hash(&loser);
         let mut loser_file = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut loser_file, &loser).unwrap();
-        let paths: [(
-            &str,
-            Box<dyn Fn(&PackageStore) -> Result<(), LpmError> + Send + Sync>,
-        ); 3] = [
+        type Publish<'a> = Box<dyn Fn(&PackageStore) -> Result<(), LpmError> + Send + Sync + 'a>;
+        let paths: [(&str, Publish<'_>); 3] = [
             (
                 "in memory",
                 Box::new(|store| store.store_package("same", "1.0.0", &loser).map(drop)),

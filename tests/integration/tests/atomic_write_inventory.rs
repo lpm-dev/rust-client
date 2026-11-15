@@ -311,16 +311,8 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "performs a cross-filesystem move with copy fallback rather than an atomic file rewrite",
     ),
     (
-        "crates/lpm-store/src/extraction.rs::store_at_dir",
-        "writes are inside an extraction directory that is published as a directory transaction",
-    ),
-    (
-        "crates/lpm-store/src/extraction.rs::store_from_file_at_timed",
-        "writes are inside an extraction directory that is published as a directory transaction",
-    ),
-    (
-        "crates/lpm-store/src/extraction.rs::stream_and_store_package",
-        "writes are inside an extraction directory that is published as a directory transaction",
+        "crates/lpm-store/src/extraction.rs::publish_staged",
+        "publishes a complete extraction directory as a directory transaction",
     ),
     (
         "crates/lpm-store/src/v2/build_cache.rs::publish_build_artifact",
