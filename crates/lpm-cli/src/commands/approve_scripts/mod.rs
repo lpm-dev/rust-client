@@ -72,7 +72,7 @@ mod prelude {
     pub(super) use super::metadata::{
         SCHEMA_VERSION, approval_metadata_from_blocked,
         approval_metadata_preserving_existing_provenance, authorize_project_trust_write,
-        commit_project_trust_write, fetch_provenance_for_effective_set,
+        commit_project_trust_write, fetch_provenance_for_effective_set, install_routes,
         runtime_verify_policy_with_source, snapshot_for_artifact_binding,
     };
     #[allow(unused_imports)]

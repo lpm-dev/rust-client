@@ -35,6 +35,7 @@ fn write_global_trust(
 #[derive(Clone, Copy)]
 pub(super) struct ApprovalProvenanceContext<'a> {
     registry: &'a lpm_registry::RegistryClient,
+    routes: &'a lpm_registry::RouteTable,
     verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
     runtime_enforce: crate::provenance_fetch::EnforceMode,
 }
@@ -42,11 +43,13 @@ pub(super) struct ApprovalProvenanceContext<'a> {
 impl<'a> ApprovalProvenanceContext<'a> {
     pub(super) fn new(
         registry: &'a lpm_registry::RegistryClient,
+        routes: &'a lpm_registry::RouteTable,
         verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
         runtime_enforce: crate::provenance_fetch::EnforceMode,
     ) -> Self {
         Self {
             registry,
+            routes,
             verify_policy,
             runtime_enforce,
         }
@@ -192,7 +195,9 @@ async fn run_global_under_store_lock(
 
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
-    let provenance = ApprovalProvenanceContext::new(registry, &verify_policy, runtime_enforce);
+    let routes = install_routes(&root.global_root())?;
+    let provenance =
+        ApprovalProvenanceContext::new(registry, &routes, &verify_policy, runtime_enforce);
     if !dry_run {
         crate::security_approval::ensure_runtime_sigstore_posture_for_global(
             json_output,
@@ -505,6 +510,7 @@ pub(super) async fn run_global_bulk_yes(
     } else {
         crate::provenance_fetch::fetch_provenance_for_artifacts(
             provenance_context.registry,
+            provenance_context.routes,
             &pairs,
             provenance_context.verify_policy,
         )
@@ -721,6 +727,7 @@ pub(super) async fn run_global_named(
     } else {
         crate::provenance_fetch::fetch_provenance_for_artifacts(
             provenance_context.registry,
+            provenance_context.routes,
             &pairs,
             provenance_context.verify_policy,
         )
@@ -1055,6 +1062,7 @@ async fn fetch_global_approval_snapshots(
         .collect();
     let provenance = crate::provenance_fetch::fetch_provenance_for_artifacts(
         provenance_context.registry,
+        provenance_context.routes,
         &pairs,
         provenance_context.verify_policy,
     )

@@ -157,6 +157,7 @@ pub(super) async fn commit_project_trust_write(
 /// a layer of evidence the install path already captured.
 pub(super) async fn fetch_provenance_for_effective_set(
     registry: &lpm_registry::RegistryClient,
+    routes: &lpm_registry::RouteTable,
     packages: &[BlockedPackage],
     policy: &crate::provenance_fetch::VerifyPolicy,
 ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
@@ -164,7 +165,14 @@ pub(super) async fn fetch_provenance_for_effective_set(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    crate::provenance_fetch::fetch_provenance_for_artifacts(registry, &pkgs, policy).await
+    crate::provenance_fetch::fetch_provenance_for_artifacts(registry, routes, &pkgs, policy).await
+}
+
+/// The registries an install in `dir` resolves packages from: the project
+/// for a project approval, the global install root for a global one.
+pub(super) fn install_routes(dir: &Path) -> Result<lpm_registry::RouteTable, LpmError> {
+    lpm_registry::RouteTable::from_env_and_filesystem(dir)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))
 }
 
 pub(super) fn runtime_verify_policy_with_source() -> (

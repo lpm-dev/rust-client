@@ -425,6 +425,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             } else {
                 fetch_provenance_for_effective_set(
                     registry,
+                    &install_routes(project_dir)?,
                     std::slice::from_ref(target),
                     &verify_policy,
                 )
@@ -574,6 +575,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         } else {
             fetch_provenance_for_effective_set(
                 registry,
+                &install_routes(project_dir)?,
                 &effective_state.blocked_packages,
                 &verify_policy,
             )
@@ -804,6 +806,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     } else {
         crate::provenance_fetch::fetch_provenance_for_artifacts(
             registry,
+            &install_routes(project_dir)?,
             &approved_pairs,
             &verify_policy,
         )
