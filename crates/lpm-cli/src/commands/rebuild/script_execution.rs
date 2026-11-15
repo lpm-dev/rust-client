@@ -141,7 +141,10 @@ pub(super) fn build_lifecycle_environment(
         host_path(inherited_path(parent_path), project_dir)
     };
     if let Some(bin_dir) = bin_dir {
-        let mut prefixed = bin_dir.as_os_str().to_owned();
+        // cmd.exe hands a command found through a `\\?\` entry that prefix as
+        // its own folder (`%~dp0`), and Node can't start the script a command
+        // shim then names with it.
+        let mut prefixed = lpm_common::symlink::windows_plain_path(bin_dir).into_os_string();
         prefixed.push(if cfg!(windows) { ";" } else { ":" });
         prefixed.push(&path_value);
         path_value = prefixed;
@@ -807,7 +810,7 @@ pub(in crate::commands) fn build_lifecycle_path(
     project_dir: &Path,
     parent_path: Option<&OsStr>,
 ) -> OsString {
-    let mut path = project_dir
+    let mut path = lpm_common::symlink::windows_plain_path(project_dir)
         .join("node_modules")
         .join(".bin")
         .into_os_string();
