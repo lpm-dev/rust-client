@@ -56,7 +56,11 @@ pub(super) async fn enable(
     })
     .await
     .map_err(|error| {
-        super::oidc_escrow_setup_error("enabling organization CI decryption", &error.to_string())
+        super::oidc_escrow_setup_error(
+            "enabling organization CI decryption",
+            &error.to_string(),
+            org,
+        )
     })
 }
 

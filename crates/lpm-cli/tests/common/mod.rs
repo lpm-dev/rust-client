@@ -231,6 +231,36 @@ pub fn parse_json_stdout(stdout: &str) -> serde_json::Value {
 /// Seed one encrypted, file-backed LPM credential in an isolated LPM root,
 /// the directory a command under test gets as `LPM_HOME`.
 pub fn seed_lpm_token(lpm_root: &Path, registry_url: &str, token: &str) {
+    seed_lpm_credentials(lpm_root, registry_url, token, None);
+}
+
+/// Seed a signed-in CLI session in an isolated LPM root: the access token,
+/// the refresh token behind it, and an access token that hasn't expired.
+/// Commands that need an interactive session refuse a lone access token.
+pub fn seed_lpm_session(lpm_root: &Path, registry_url: &str, access_token: &str) {
+    seed_lpm_credentials(lpm_root, registry_url, access_token, Some("refresh-token"));
+    std::fs::write(
+        lpm_root.join(".token-expiry.json"),
+        serde_json::to_vec(&serde_json::json!({
+            registry_url: {
+                "expires": "2099-01-01",
+                "reminded_7d": false,
+                "reminded_1d": false,
+                "otp_required": false,
+                "session_access_expires_at": "2099-01-01T00:00:00Z",
+            },
+        }))
+        .expect("serialize test token expiry"),
+    )
+    .expect("write test token expiry");
+}
+
+fn seed_lpm_credentials(
+    lpm_root: &Path,
+    registry_url: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) {
     std::fs::create_dir_all(lpm_root).expect("create test auth directory");
     std::fs::write(
         lpm_root.join(".key"),
@@ -244,7 +274,12 @@ pub fn seed_lpm_token(lpm_root: &Path, registry_url: &str, token: &str) {
     let mut iv = [0_u8; 12];
     rand::rng().fill_bytes(&mut iv);
     let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
-    let plaintext = serde_json::json!({ registry_url: token }).to_string();
+    let mut store = serde_json::Map::new();
+    store.insert(registry_url.to_owned(), access_token.into());
+    if let Some(refresh_token) = refresh_token {
+        store.insert(format!("refresh:{registry_url}"), refresh_token.into());
+    }
+    let plaintext = serde_json::Value::Object(store).to_string();
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
         .expect("encrypt test credential");
@@ -258,24 +293,27 @@ pub fn seed_lpm_token(lpm_root: &Path, registry_url: &str, token: &str) {
     );
     std::fs::write(lpm_root.join(".credentials"), encoded).expect("write test credential");
 
-    let mut credential_id = sha2::Sha256::new();
-    credential_id.update(b"access");
-    credential_id.update([0]);
-    credential_id.update(registry_url.as_bytes());
+    let mut authority = serde_json::Map::new();
+    for (kind, token) in [("access", Some(access_token)), ("refresh", refresh_token)] {
+        let Some(token) = token else { continue };
+        let mut credential_id = sha2::Sha256::new();
+        credential_id.update(kind.as_bytes());
+        credential_id.update([0]);
+        credential_id.update(registry_url.as_bytes());
+        authority.insert(
+            hex::encode(credential_id.finalize()),
+            serde_json::json!({
+                "state": "active",
+                "backend": "encrypted_file_fallback",
+                "credential_digest": hex::encode(sha2::Sha256::digest(token.as_bytes())),
+                "stale_file_cleanup_pending": false,
+            }),
+        );
+    }
     std::fs::write(
         lpm_root.join(".credential-authority.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "credentials": {
-                hex::encode(credential_id.finalize()): {
-                    "state": "active",
-                    "backend": "encrypted_file_fallback",
-                    "credential_digest": hex::encode(sha2::Sha256::digest(token.as_bytes())),
-                    "stale_file_cleanup_pending": false,
-                },
-            },
-        }))
-        .expect("serialize test credential authority"),
+        serde_json::to_vec(&serde_json::json!({ "version": 1, "credentials": authority }))
+            .expect("serialize test credential authority"),
     )
     .expect("write test credential authority");
 }

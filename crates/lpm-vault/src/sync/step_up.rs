@@ -55,18 +55,27 @@ pub struct CliStepUpApproval {
 /// Ask the server for a browser approval of `scope`. The user approves it
 /// with their passkey or authenticator; the token `done_url` then gives the
 /// CLI mints the proof through `CliStepUpCredential::Approval`.
+///
+/// `policy` is the CI access policy a `vault:oidc-policy` scope stands for.
+/// The scope carries only its digest, so the server needs the policy to show
+/// the user what they approve, and refuses one the digest doesn't match.
 pub async fn request_cli_step_up_approval(
     registry_url: &str,
     auth_token: &str,
     scope: &str,
+    policy: Option<&serde_json::Value>,
 ) -> Result<CliStepUpApproval, SyncError> {
     let client = sync_http_client()?;
     let url = format!("{registry_url}/api/auth/cli-step-up");
+    let mut request = serde_json::json!({ "scope": scope, "method": "approval" });
+    if let Some(policy) = policy {
+        request["policy"] = policy.clone();
+    }
 
     let response = client
         .post(&url)
         .bearer_auth(auth_token)
-        .json(&serde_json::json!({ "scope": scope, "method": "approval" }))
+        .json(&request)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -77,10 +86,27 @@ pub async fn request_cli_step_up_approval(
         let body = read_capped_error_text(response).await;
         return Err(SyncError::http(
             status,
-            format!("step-up approval: {status}: {body}"),
+            refusal("step-up approval", status, &body),
         ));
     }
     Ok(read_capped_json::<CliStepUpApproval>(response).await?)
+}
+
+/// What a refused step-up request tells the user: the sentence the server
+/// sent for them, or, when the response carries none, which request it was
+/// with the status and body.
+fn refusal(request: &str, status: reqwest::StatusCode, body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|response| {
+            response
+                .get("error")?
+                .as_str()
+                .map(str::trim)
+                .filter(|sentence| !sentence.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("{request}: {status}: {body}"))
 }
 
 /// Discover the step-up method the server expects for the calling
@@ -107,7 +133,7 @@ pub async fn discover_cli_step_up_policy(
         let body = read_capped_error_text(response).await;
         return Err(SyncError::http(
             status,
-            format!("step-up policy: {status}: {body}"),
+            refusal("step-up policy", status, &body),
         ));
     }
 
@@ -128,9 +154,9 @@ struct MintCliStepUpResponse {
 /// `X-LPM-Step-Up-Proof` header for the subsequent sensitive write
 /// (public-key set/rotate, force-push, etc).
 ///
-/// On failure, the returned error includes the server's response body
-/// so the CLI can surface the structured envelope (`code:
-/// wrong_credential`, `code: rate_limited`, etc) to the user.
+/// A refusal carries the server's sentence for the user. A refused
+/// password or code (`code: wrong_credential`) is a
+/// `SyncError::CredentialRejected`, which doesn't sign the CLI out.
 pub async fn mint_cli_step_up_proof(
     registry_url: &str,
     auth_token: &str,
@@ -171,7 +197,7 @@ pub async fn mint_cli_step_up_proof(
     let status = response.status();
     if !status.is_success() {
         let body = read_capped_error_text(response).await;
-        let message = format!("step-up mint: {status}: {body}");
+        let message = refusal("step-up mint", status, &body);
         let rejects_submitted_credential = status == reqwest::StatusCode::UNAUTHORIZED
             && serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
@@ -388,11 +414,61 @@ mod tests {
         )
         .await
         .expect_err("401 must propagate");
-        assert!(err.to_string().contains("401"), "got: {err}");
-        assert!(
-            err.to_string().contains("wrong_credential")
-                || err.to_string().contains("Incorrect password"),
-            "error envelope should be preserved so CLI can render it: {err}"
+        assert_eq!(err.to_string(), "Incorrect password.");
+        assert!(matches!(
+            err,
+            SyncError::CredentialRejected { status: 401, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_without_a_sentence_names_the_request_status_and_body() {
+        for body in [
+            serde_json::json!({ "ok": false, "code": "rate_limited" }),
+            serde_json::json!({ "ok": false, "error": "   " }),
+            serde_json::json!({ "ok": false, "error": { "message": "nested" } }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/auth/cli-step-up"))
+                .respond_with(ResponseTemplate::new(429).set_body_json(&body))
+                .mount(&server)
+                .await;
+
+            let error = mint_cli_step_up_proof(
+                &server.uri(),
+                "token",
+                SCOPE,
+                &CliStepUpCredential::Password { password: "p" },
+            )
+            .await
+            .expect_err("refusal");
+
+            assert_eq!(
+                error.to_string(),
+                format!("step-up mint: 429 Too Many Requests: {body}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_cli_step_up_policy_reports_a_refusal_in_the_servers_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "Step-up needs a signed-in CLI session, not a registry token.",
+            })))
+            .mount(&server)
+            .await;
+
+        let error = discover_cli_step_up_policy(&server.uri(), "token")
+            .await
+            .expect_err("refusal");
+
+        assert_eq!(
+            error.to_string(),
+            "Step-up needs a signed-in CLI session, not a registry token."
         );
     }
 
@@ -441,7 +517,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let approval = request_cli_step_up_approval(&server.uri(), "token", SCOPE)
+        let approval = request_cli_step_up_approval(&server.uri(), "token", SCOPE, None)
             .await
             .expect("approval");
 
@@ -450,6 +526,30 @@ mod tests {
             approval.done_url,
             "https://lpm.dev/api/auth/cli-approvals/approval-1/secret"
         );
+    }
+
+    #[tokio::test]
+    async fn request_cli_step_up_approval_sends_the_policy_its_scope_stands_for() {
+        let policy = serde_json::json!({ "provider": "github", "subject": "repo:acme/api" });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "scope": SCOPE,
+                "method": "approval",
+                "policy": policy,
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "authUrl": "https://lpm.dev/cli/approve/approval-1",
+                "doneUrl": "https://lpm.dev/api/auth/cli-approvals/approval-1/secret",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        request_cli_step_up_approval(&server.uri(), "token", SCOPE, Some(&policy))
+            .await
+            .expect("approval");
     }
 
     #[tokio::test]
@@ -464,11 +564,34 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE)
+        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE, None)
             .await
             .expect_err("refusal");
 
         assert!(error.to_string().contains("method_not_available"));
+    }
+
+    #[tokio::test]
+    async fn request_cli_step_up_approval_reports_a_refusal_in_the_servers_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "ok": false,
+                "code": "env_project_not_found",
+                "error": "Env project not found, or you're not an owner or admin of its organization.",
+            })))
+            .mount(&server)
+            .await;
+
+        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE, None)
+            .await
+            .expect_err("refusal");
+
+        assert_eq!(
+            error.to_string(),
+            "Env project not found, or you're not an owner or admin of its organization."
+        );
     }
 
     #[tokio::test]

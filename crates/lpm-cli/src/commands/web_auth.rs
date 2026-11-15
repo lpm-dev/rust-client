@@ -181,7 +181,8 @@ pub async fn complete_lpm_browser_approval(
     let challenge = WebAuthChallenge::new(auth_url, done_url, registry_url)?;
     install_ui::settle_spinner();
     install_ui::phase_untrusted(&format!("Approve in your browser to {action}"));
-    println!(
+    // Standard output is the command's answer, which `--json` callers parse.
+    eprintln!(
         "{}",
         crate::install_ui::terminal_line!("  {}", install_ui::bold(&challenge.auth_url))
     );

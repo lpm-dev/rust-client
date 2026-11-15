@@ -838,7 +838,7 @@ async fn register_missing_sharing_key_for_org(
     ));
     let step_up_scope = lpm_vault::sync::sharing_key_step_up_scope(None, &local.public_key_b64)
         .map_err(LpmError::Env)?;
-    let proof = crate::step_up::request_cli_step_up_proof(client, &step_up_scope).await?;
+    let proof = crate::step_up::request_cli_step_up_proof(client, &step_up_scope, None).await?;
     let (refreshed_access, refreshed_registry_url) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let public_key = local.public_key_b64.clone();
@@ -1160,7 +1160,8 @@ pub(super) async fn env_rotate_sharing_key(
     let step_up_scope = server_key
         .step_up_scope_to_install(&pending.public_key_b64)
         .map_err(LpmError::Env)?;
-    let proof = match crate::step_up::request_cli_step_up_proof(client, &step_up_scope).await {
+    let proof = match crate::step_up::request_cli_step_up_proof(client, &step_up_scope, None).await
+    {
         Ok(proof) => proof,
         Err(error) => {
             lpm_vault::sync::discard_pending_x25519_keypair(&key_scope).map_err(LpmError::Env)?;
