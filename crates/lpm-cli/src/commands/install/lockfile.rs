@@ -213,17 +213,22 @@ pub(super) fn run_online_lockfile_write_phase(
 
     if !input.frozen_lockfile_active
         && let Some(lockfile) = input.fast_path_lockfile
-        && let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
+    {
+        let fetched = FetchWritebacks {
+            tarball_urls: input.fresh_urls,
+            integrities: stored_integrities(&lockfile, input.packages_for_lockfile),
+        };
+        if let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
             lockfile,
             input.lockfile_path,
             input.current_lockfile_patches,
             input.current_importer_snapshot,
-            input.fresh_urls,
+            &fetched,
             input.obsolete_binary_lockfile,
             input.json_output,
-        )?
-    {
-        result.record_write(write_ms);
+        )? {
+            result.record_write(write_ms);
+        }
     }
 
     Ok(result)
@@ -504,17 +509,27 @@ mod unpacked_size_preservation_tests {
     }
 }
 
+/// What this install's fetches found for packages the replayed lockfile
+/// already holds, by package key.
+struct FetchWritebacks<'a> {
+    /// The URL that served a package whose locked one no longer does.
+    tarball_urls: &'a HashMap<String, String>,
+    /// See [`stored_integrities`].
+    integrities: HashMap<String, String>,
+}
+
 fn rewrite_fast_path_lockfile_if_needed(
     mut lockfile: Arc<lpm_lockfile::Lockfile>,
     lockfile_path: &Path,
     current_lockfile_patches: &lpm_lockfile::LockfilePatches,
     current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
-    fresh_urls: &HashMap<String, String>,
+    fetched: &FetchWritebacks<'_>,
     obsolete_binary_lockfile: bool,
     json_output: bool,
 ) -> Result<Option<u128>, LpmError> {
     let reasons = FastPathLockfileRewriteReasons {
-        fresh_url_count: fresh_urls.len(),
+        fresh_url_count: fetched.tarball_urls.len(),
+        stored_integrity_count: fetched.integrities.len(),
         importer_snapshot_changed: lockfile.importers.get(".") != Some(current_importer_snapshot),
         patch_records_changed: lockfile.patches != *current_lockfile_patches,
         schema_version_changed: lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION,
@@ -542,7 +557,8 @@ fn rewrite_fast_path_lockfile_if_needed(
     if reasons.importer_snapshot_changed
         || reasons.patch_records_changed
         || reasons.schema_version_changed
-        || !fresh_urls.is_empty()
+        || !fetched.tarball_urls.is_empty()
+        || !fetched.integrities.is_empty()
     {
         let lockfile = Arc::make_mut(&mut lockfile);
         if reasons.importer_snapshot_changed
@@ -555,7 +571,8 @@ fn rewrite_fast_path_lockfile_if_needed(
                 .importers
                 .insert(".".to_string(), current_importer_snapshot.clone());
         }
-        patch_fresh_tarball_urls(lockfile, fresh_urls);
+        patch_fresh_tarball_urls(lockfile, fetched.tarball_urls);
+        patch_stored_integrities(lockfile, &fetched.integrities);
     }
     let write_ms = write_lockfile_and_measure(&lockfile, lockfile_path, "rewrite")?;
     emit_fast_path_lockfile_rewrite_notice(json_output, reasons);
@@ -568,6 +585,7 @@ fn rewrite_fast_path_lockfile_if_needed(
 #[derive(Clone, Copy)]
 struct FastPathLockfileRewriteReasons {
     fresh_url_count: usize,
+    stored_integrity_count: usize,
     importer_snapshot_changed: bool,
     patch_records_changed: bool,
     schema_version_changed: bool,
@@ -576,6 +594,7 @@ struct FastPathLockfileRewriteReasons {
 impl FastPathLockfileRewriteReasons {
     fn requires_write(self) -> bool {
         self.fresh_url_count > 0
+            || self.stored_integrity_count > 0
             || self.importer_snapshot_changed
             || self.patch_records_changed
             || self.schema_version_changed
@@ -593,6 +612,60 @@ fn patch_fresh_tarball_urls(
         ) && let Some(url) = fresh_urls.get(&locked_package_key(package))
         {
             package.tarball = Some(url.clone());
+        }
+    }
+}
+
+/// Whether the lockfile pins `package` by a hash the store doesn't keep
+/// objects under. The store holds each object under its sha512, so such a
+/// package is never found there and every install downloads it again.
+fn pinned_by_weaker_hash(package: &lpm_lockfile::LockedPackage) -> bool {
+    package
+        .integrity
+        .as_deref()
+        .is_some_and(|integrity| !integrity.starts_with("sha512-"))
+}
+
+/// The sha512 this install stored each package under, for the lockfile's
+/// packages pinned by a weaker hash. A fetch checks the bytes against the
+/// pin before it stores them, so the sha512 names the same bytes.
+fn stored_integrities(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[InstallPackage],
+) -> HashMap<String, String> {
+    let mut weaker: HashMap<String, String> = lockfile
+        .packages
+        .iter()
+        .filter(|package| pinned_by_weaker_hash(package))
+        .map(|package| (locked_package_key(package), String::new()))
+        .collect();
+    if weaker.is_empty() {
+        return weaker;
+    }
+    for package in packages {
+        if let Some(integrity) = package.integrity.as_deref()
+            && names_stored_object(integrity)
+            && let Some(stored) = weaker.get_mut(&install_pkg_key(package))
+        {
+            integrity.clone_into(stored);
+        }
+    }
+    weaker.retain(|_, stored| !stored.is_empty());
+    weaker
+}
+
+fn patch_stored_integrities(
+    lockfile: &mut lpm_lockfile::Lockfile,
+    stored_integrities: &HashMap<String, String>,
+) {
+    if stored_integrities.is_empty() {
+        return;
+    }
+    for package in &mut lockfile.packages {
+        if pinned_by_weaker_hash(package)
+            && let Some(stored) = stored_integrities.get(&locked_package_key(package))
+        {
+            package.integrity = Some(stored.clone());
         }
     }
 }
@@ -634,6 +707,12 @@ fn emit_fast_path_lockfile_rewrite_notice(
 
     if let Some(message) = fast_path_lockfile_rewrite_notice(reasons) {
         output::info(&message);
+    }
+    if reasons.stored_integrity_count > 0 {
+        output::info(&format!(
+            "Recorded the sha512 integrity of {} package(s) in lockfile",
+            reasons.stored_integrity_count,
+        ));
     }
 }
 
@@ -3638,6 +3717,7 @@ mod rewrite_notice_tests {
     fn fast_path_lockfile_notice_is_absent_for_importer_only_rewrite() {
         let notice = fast_path_lockfile_rewrite_notice(FastPathLockfileRewriteReasons {
             fresh_url_count: 0,
+            stored_integrity_count: 0,
             importer_snapshot_changed: true,
             patch_records_changed: false,
             schema_version_changed: false,
