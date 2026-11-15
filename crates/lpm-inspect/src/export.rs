@@ -26,6 +26,20 @@ fn shell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// `s` as one shell word: bare when it holds only characters no shell
+/// treats specially, otherwise single-quoted, so a captured value pasted
+/// as part of a command can't add a command of its own.
+fn shell_word(s: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if plain {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(format!("'{}'", shell_single_quote_escape(s)))
+    }
+}
+
 /// Generate a runnable cURL command from a captured request.
 ///
 /// Preserves method, path, headers, and body. The resulting command can be
@@ -37,7 +51,11 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
     // path like `/hook'; touch /tmp/pwn #` would close our single-
     // quoted argument and execute arbitrary shell when pasted.
     let url_escaped = shell_single_quote_escape(url);
-    let mut parts = vec![format!("curl -X {} '{}'", webhook.method, url_escaped)];
+    let mut parts = vec![format!(
+        "curl -X {} '{}'",
+        shell_word(&webhook.method),
+        url_escaped
+    )];
 
     // Headers (sorted for deterministic output)
     let mut headers: Vec<(&String, &String)> = webhook.request_headers.iter().collect();
@@ -159,6 +177,10 @@ fn body_to_export(body: &[u8]) -> ExportBody {
 // ── Test Fixture Generation ───────────────────────────────────────────
 
 /// Generate a Vitest/Jest test fixture from a captured webhook.
+///
+/// Every captured value lands in the module as a JSON literal, which is
+/// valid JavaScript, or in a comment with its line breaks removed, so no
+/// captured text can become a statement of the generated module.
 pub fn to_test_fixture(webhook: &CapturedWebhook) -> String {
     let provider_name = webhook
         .provider
@@ -172,16 +194,13 @@ pub fn to_test_fixture(webhook: &CapturedWebhook) -> String {
 
     let safe_name = event_type.replace(['.', ' ', '/'], "_");
 
-    // Format the body as pretty JSON if possible, otherwise raw string
     let body_fixture =
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&webhook.request_body) {
-            serde_json::to_string_pretty(&json)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&webhook.request_body).into_owned())
+            serde_json::to_string_pretty(&json).map_or_else(|_| js_string(""), js_source)
         } else {
-            String::from_utf8_lossy(&webhook.request_body).into_owned()
+            js_string(&String::from_utf8_lossy(&webhook.request_body))
         };
 
-    // Format headers as a JS object literal
     let mut headers_sorted: Vec<(&String, &String)> = webhook.request_headers.iter().collect();
     headers_sorted.sort_by_key(|(k, _)| k.to_lowercase());
     let headers_entries: Vec<String> = headers_sorted
@@ -190,19 +209,16 @@ pub fn to_test_fixture(webhook: &CapturedWebhook) -> String {
             let lower = k.to_lowercase();
             lower != "host" && lower != "content-length" && lower != "transfer-encoding"
         })
-        .map(|(k, v)| {
-            let escaped_v = v.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\t\t\"{k}\": \"{escaped_v}\"")
-        })
+        .map(|(k, v)| format!("\t\t{}: {}", js_string(k), js_string(v)))
         .collect();
     let headers_js = headers_entries.join(",\n");
 
     format!(
         r#"import {{ describe, it, expect }} from "vitest"
 
-// Captured {provider_name} webhook: {event_type}
+// Captured {provider_comment} webhook: {event_comment}
 // Original status: {status} | Duration: {duration}ms
-// Timestamp: {timestamp}
+// Timestamp: {timestamp_comment}
 
 const mockPayload = {body}
 
@@ -210,11 +226,11 @@ const mockHeaders = {{
 {headers}
 }}
 
-describe("{provider_name} webhook: {safe_name}", () => {{
-	it("should handle {event_type}", async () => {{
+describe({suite}, () => {{
+	it({case}, async () => {{
 		const response = await app.inject({{
-			method: "{method}",
-			url: "{path}",
+			method: {method},
+			url: {path},
 			headers: mockHeaders,
 			payload: mockPayload,
 		}})
@@ -223,17 +239,49 @@ describe("{provider_name} webhook: {safe_name}", () => {{
 	}})
 }})
 "#,
-        provider_name = provider_name,
-        event_type = event_type,
+        provider_comment = comment_text(&provider_name),
+        event_comment = comment_text(event_type),
         status = webhook.response_status,
         duration = webhook.duration_ms,
-        timestamp = webhook.timestamp,
+        timestamp_comment = comment_text(&webhook.timestamp),
         body = body_fixture,
         headers = headers_js,
-        safe_name = safe_name,
-        method = webhook.method,
-        path = webhook.path,
+        suite = js_string(&format!("{provider_name} webhook: {safe_name}")),
+        case = js_string(&format!("should handle {event_type}")),
+        method = js_string(&webhook.method),
+        path = js_string(&webhook.path),
     )
+}
+
+/// `s` as a JavaScript string literal.
+fn js_string(s: &str) -> String {
+    js_source(serde_json::Value::from(s).to_string())
+}
+
+/// JSON text as JavaScript source. JSON leaves U+2028 and U+2029 bare
+/// inside strings, where engines before ES2019 end the line, so they are
+/// escaped as JSON.stringify output meant for a script should be.
+fn js_source(json: String) -> String {
+    if !json.contains(['\u{2028}', '\u{2029}']) {
+        return json;
+    }
+    json.replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// `s` on one line of a `//` comment: JavaScript ends a line comment at any
+/// line terminator, so each one, and every other control character,
+/// becomes a space.
+fn comment_text(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 // ── Provider CLI Export ───────────────────────────────────────────────
@@ -246,7 +294,7 @@ pub fn to_provider_cli(webhook: &CapturedWebhook) -> Option<String> {
     match provider {
         lpm_tunnel::webhook::WebhookProvider::Stripe => {
             let event = event_type.unwrap_or("charge.succeeded".to_string());
-            Some(format!("stripe trigger {event}"))
+            Some(format!("stripe trigger {}", shell_word(&event)))
         }
         lpm_tunnel::webhook::WebhookProvider::GitHub => {
             Some("gh api repos/OWNER/REPO/dispatches -f event_type=webhook_test".to_string())
@@ -466,6 +514,57 @@ mod tests {
         let fixture = to_test_fixture(&wh);
         // Pretty-printed JSON should have indentation
         assert!(fixture.contains("  \"type\": \"charge.succeeded\""));
+    }
+
+    #[test]
+    fn test_fixture_emits_a_body_that_is_not_json_as_a_string_literal() {
+        let mut wh = make_webhook();
+        wh.request_body = b"0; await import('node:fs')".to_vec();
+        let fixture = to_test_fixture(&wh);
+        assert!(
+            fixture.contains(r#"const mockPayload = "0; await import('node:fs')""#),
+            "{fixture}"
+        );
+    }
+
+    #[test]
+    fn test_fixture_keeps_captured_text_from_starting_a_statement() {
+        let mut wh = make_webhook();
+        wh.summary = "Stripe: charge.succeeded\u{2028}await pwn()".to_string();
+        wh.timestamp = "2026-01-01\nawait pwn()".to_string();
+        wh.method = "POST\"\nawait pwn()\n\"".to_string();
+        wh.path = "/x\u{2029}await pwn()".to_string();
+        wh.request_headers = HashMap::from([("x\"\nawait pwn()\n\"".to_string(), "v".to_string())]);
+        let fixture = to_test_fixture(&wh);
+        for line in fixture.split(['\n', '\r', '\u{2028}', '\u{2029}']) {
+            assert!(
+                !line.trim_start().starts_with("await pwn()"),
+                "a captured value started a statement:\n{fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_quotes_a_method_carrying_shell_syntax() {
+        let mut wh = make_webhook();
+        wh.method = "POST$(touch pwned)".to_string();
+        let curl = to_curl(&wh, None);
+        assert!(
+            curl.starts_with("curl -X 'POST$(touch pwned)' '/api/webhook/stripe'"),
+            "{curl}"
+        );
+    }
+
+    #[test]
+    fn provider_cli_quotes_a_stripe_event_carrying_shell_syntax() {
+        let mut wh = make_webhook();
+        wh.request_body = br#"{"type":"charge.succeeded; touch pwned"}"#.to_vec();
+        assert_eq!(
+            to_provider_cli(&wh).unwrap(),
+            "stripe trigger 'charge.succeeded; touch pwned'"
+        );
+        wh.request_body = br#"{"type":"it's"}"#.to_vec();
+        assert_eq!(to_provider_cli(&wh).unwrap(), r"stripe trigger 'it'\''s'");
     }
 
     // ── Provider CLI ────────────────────────────────────────

@@ -397,7 +397,7 @@ mod tests {
     fn details() -> ReadyDetails {
         ReadyDetails {
             public_url: "https://tolga.lpm.fyi".into(),
-            inspector_url: Some("http://127.0.0.1:49256/?token=abc".into()),
+            inspector_url: Some("http://127.0.0.1:49256/#token=abc".into()),
             plan: Some("pro".into()),
             limits: Some("3 tunnels · 20,000/min".into()),
             session_id: "573d2f7c".into(),
@@ -469,7 +469,7 @@ mod tests {
             [
                 "› Tunnel ready",
                 "    public URL  https://tolga.lpm.fyi",
-                "    inspector   http://127.0.0.1:49256/?token=abc",
+                "    inspector   http://127.0.0.1:49256/#token=abc",
                 "    plan        pro",
                 "    limits      3 tunnels · 20,000/min",
                 "    usage       1,245 / 100,000 requests  █░░░░░░░░░  overage on",
