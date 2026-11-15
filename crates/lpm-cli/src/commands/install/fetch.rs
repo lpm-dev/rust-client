@@ -531,12 +531,6 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) fresh_urls: HashMap<String, String>,
 }
 
-/// Whether `sri` is the one a fetched package's object is stored under.
-fn names_stored_object(sri: &str) -> bool {
-    lpm_common::integrity::Integrity::parse(sri)
-        .is_ok_and(|integrity| integrity.algorithm == lpm_common::integrity::HashAlgorithm::Sha512)
-}
-
 fn provenance_lockfile_id(package: &InstallPackage) -> Result<String, LpmError> {
     let source = lpm_lockfile::Source::parse(&package.source).map_err(|error| {
         LpmError::ProvenanceVerification(format!(

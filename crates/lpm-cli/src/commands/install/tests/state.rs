@@ -274,3 +274,27 @@ fn force_bypass_is_meaningful() {
     // We can't test the full pipeline here (needs registry), but we
     // verify that the bypass target exists and returns true.
 }
+
+#[cfg(unix)]
+#[test]
+fn local_directories_named_in_other_bytes_have_their_own_identity() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let identity = |name: &[u8]| {
+        let directory = std::path::Path::new("/projects").join(std::ffi::OsStr::from_bytes(name));
+        super::super::local_source_sri("local-package", "1.0.0", Some("f-source"), &directory)
+    };
+
+    assert_ne!(identity(b"shared-\xfe"), identity(b"shared-\xff"));
+    let written: [&[u8]; 5] = [
+        b"lpm-v2-local-source",
+        b"local-package",
+        b"1.0.0",
+        b"f-source",
+        b"/projects/shared",
+    ];
+    assert_eq!(
+        identity(b"shared"),
+        lpm_store::compute_sri_hash(&written.join(&0)),
+    );
+}

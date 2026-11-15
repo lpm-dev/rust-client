@@ -90,14 +90,44 @@ pub(super) fn local_source_sri(
     wrapper_id: Option<&str>,
     store_path: &Path,
 ) -> String {
-    let seed = format!(
-        "lpm-v2-local-source\0{}\0{}\0{}\0{}",
+    // The path goes in as the platform wrote it: its display form would give
+    // two directories one identity when their names differ only in bytes
+    // that aren't valid UTF-8.
+    let mut seed = format!(
+        "lpm-v2-local-source\0{}\0{}\0{}\0",
         name,
         version,
         wrapper_id.unwrap_or(""),
-        store_path.display()
-    );
-    lpm_store::compute_sri_hash(seed.as_bytes())
+    )
+    .into_bytes();
+    seed.extend_from_slice(store_path.as_os_str().as_encoded_bytes());
+    lpm_store::compute_sri_hash(&seed)
+}
+
+/// Whether every package unpacked from the store already carries the
+/// integrity its object is stored under. A fetch stores an object under the
+/// sha512 it computes and records that for the package, and a store key
+/// covers each package's source, so a link plan made from a declared sha1 or
+/// sha256 would name other entries than the links after the fetch look for.
+pub(super) fn stored_integrities_known(
+    packages: &[InstallPackage],
+    link_targets: &[LinkTarget],
+) -> bool {
+    packages.iter().zip(link_targets).all(|(package, target)| {
+        matches!(
+            target.materialization,
+            lpm_linker::Materialization::DirectorySource
+        ) || package
+            .integrity
+            .as_deref()
+            .is_some_and(names_stored_object)
+    })
+}
+
+/// Whether `sri` is the one a fetched package's object is stored under.
+pub(super) fn names_stored_object(sri: &str) -> bool {
+    lpm_common::integrity::Integrity::parse(sri)
+        .is_ok_and(|integrity| integrity.algorithm == lpm_common::integrity::HashAlgorithm::Sha512)
 }
 
 pub(super) fn build_v2_targets(

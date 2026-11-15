@@ -321,13 +321,10 @@ impl std::hash::Hash for GraphKey {
 }
 
 impl GraphKey {
-    /// Schema version tag. Bump if the input layout changes — older
-    /// wrappers will produce different keys and naturally GC.
-    const SCHEMA: &'static [u8] = b"v=6";
-
-    /// The schema a key was derived under, for records of what a project
-    /// was last linked with. An entry written under another schema is not
-    /// found again.
+    /// Schema version, hashed into every key. Bump if the input layout
+    /// changes — older wrappers will produce different keys and naturally
+    /// GC. An install records it as what the project was last linked with,
+    /// since an entry written under another schema is not found again.
     pub const SCHEMA_VERSION: &'static str = "6";
 
     /// Length of the directory-name suffix in hex chars (16 = 64 bits
@@ -342,8 +339,7 @@ impl GraphKey {
     /// different peer versions could reuse one link entry and expose
     /// the wrong peer layout.
     pub fn derive(inputs: &GraphKeyInputs) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(Self::SCHEMA);
+        let mut hasher = schema_hasher();
         hasher.update(b"\0");
 
         write_field(&mut hasher, b"name", inputs.name.as_bytes());
@@ -408,8 +404,7 @@ impl GraphKey {
     /// The digest [`Self::linked`] gives a key. An install needs it for a
     /// dependency's entry before it names the entries that link to it.
     pub fn linked_digest(own: &[u8; 32], closure: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(Self::SCHEMA);
+        let mut hasher = schema_hasher();
         hasher.update(b"\0linked\0");
         hasher.update(own);
         hasher.update(closure);
@@ -550,8 +545,7 @@ impl GraphKey {
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
     ) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(Self::SCHEMA);
+        let mut hasher = schema_hasher();
         hasher.update(b"\0");
 
         write_field(&mut hasher, b"name", name.as_bytes());
@@ -693,6 +687,13 @@ fn compute_dir_name(name: &str, version: &str, digest: &[u8; 32]) -> String {
     };
     let short_hex = hex::encode(&digest[..GraphKey::SHORT_HEX_LEN / 2]);
     format!("{}@{}+{}", safe_name, version, short_hex)
+}
+
+fn schema_hasher() -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"v=");
+    hasher.update(GraphKey::SCHEMA_VERSION.as_bytes());
+    hasher
 }
 
 fn write_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {

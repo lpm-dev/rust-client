@@ -606,9 +606,11 @@ pub(in crate::commands::install) async fn run(
         &patch_fingerprints,
     )?;
     stage_timings.link_targets_ms = link_targets_start.elapsed().as_millis();
+    if let Some(store_v2) = store_v2_handle.as_ref() {
+        populate_v2_local_source_objects(&link_targets, store_v2)?;
+    }
     let v2_event_plan = match store_v2_handle.as_ref() {
-        Some(store_v2) => {
-            populate_v2_local_source_objects(&link_targets, store_v2)?;
+        Some(store_v2) if stored_integrities_known(&install_packages, &link_targets) => {
             let v2_targets_start = Instant::now();
             let v2_targets = build_v2_targets(&install_packages, &link_targets)?;
             stage_timings.v2_targets_ms = v2_targets_start.elapsed().as_millis();
@@ -628,7 +630,7 @@ pub(in crate::commands::install) async fn run(
             stage_timings.v2_index_ms = v2_index_start.elapsed().as_millis();
             Some((Arc::new(plan), target_by_key))
         }
-        None => None,
+        _ => None,
     };
     stage_timings.pre_fetch_overlap_ms = pre_fetch_start.elapsed().as_millis();
 
