@@ -988,7 +988,10 @@ fn check_install_state_with_paths(
         };
     };
     let cached_hash = cached_hash_file.lines().next().unwrap_or("").trim();
-    if cached_hash != current_hash || !bin_shims_current(&cached_hash_file) {
+    if cached_hash != current_hash
+        || !bin_shims_current(&cached_hash_file)
+        || !store_keys_current(&cached_hash_file)
+    {
         return InstallState {
             up_to_date: false,
             hash: Some(current_hash),
@@ -1027,6 +1030,17 @@ fn bin_shims_current(install_hash: &str) -> bool {
         || install_hash
             .lines()
             .any(|line| line.strip_prefix("s:") == Some(lpm_linker::BIN_SHIM_FORMAT))
+}
+
+/// Whether the install recorded in `install_hash` linked the project to
+/// store entries under the key schema this release derives. Entries under
+/// an earlier schema are not found again, and one written before a key
+/// covered its package's bytes may hold what another project installed, so
+/// the project is linked again once.
+fn store_keys_current(install_hash: &str) -> bool {
+    install_hash
+        .lines()
+        .any(|line| line.strip_prefix("k:") == Some(lpm_store::v2::GraphKey::SCHEMA_VERSION))
 }
 
 fn project_uses_other_virtual_store(project_dir: &Path, selected: lpm_store::StoreVersion) -> bool {
@@ -1125,7 +1139,7 @@ fn try_mtime_fast_path(
     let content =
         lpm_common::read_text_file_capped(&hash_file, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
             .ok()?;
-    if !bin_shims_current(&content) {
+    if !bin_shims_current(&content) || !store_keys_current(&content) {
         return None;
     }
 
@@ -1398,8 +1412,9 @@ fn write_install_hash_with_metadata(
     let security_analysis_str = metadata.security_analysis_policy.as_str();
     let node_runtime_fingerprint = metadata.node_runtime_fingerprint.unwrap_or("none");
     let bin_shim_format = lpm_linker::BIN_SHIM_FORMAT;
+    let store_key_schema = lpm_store::v2::GraphKey::SCHEMA_VERSION;
     let content = format!(
-        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\ns:{bin_shim_format}\n"
+        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\ns:{bin_shim_format}\nk:{store_key_schema}\n"
     );
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
@@ -1638,7 +1653,11 @@ mod tests {
     /// An install-hash file with `hash` and nothing else this release needs
     /// to trust it, as one from the slow path's point of view.
     fn current_hash_file(hash: &str) -> String {
-        format!("{hash}\ns:{}\n", lpm_linker::BIN_SHIM_FORMAT)
+        format!(
+            "{hash}\ns:{}\nk:{}\n",
+            lpm_linker::BIN_SHIM_FORMAT,
+            lpm_store::v2::GraphKey::SCHEMA_VERSION
+        )
     }
 
     fn setup_up_to_date_project() -> TempDir {
@@ -2038,10 +2057,10 @@ mod tests {
     }
 
     #[test]
-    fn v1_bare_hash_file_still_accepted_via_slow_path() {
-        // Forward-compat: a v1 install-hash file (bare 64-char hex,
-        // no mtime line) must still work — the fast path returns None
-        // and the slow path reads + hashes as before.
+    fn a_bare_hash_file_has_its_project_linked_again() {
+        // A v1 install-hash file (bare 64-char hex) names neither the shim
+        // format nor the store key schema its install linked with, so its
+        // matching hash isn't enough.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let _home = scoped_home_for(p);
@@ -2051,12 +2070,15 @@ mod tests {
         fs::create_dir_all(p.join(".lpm")).unwrap();
         let hash =
             compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
-        // Bare write — v1 format only.
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
-        let state = check_install_state(p);
-        // On Windows the install it records wrote `.cmd` shims as releases
-        // before `%dp0%` did, so the project is linked again once.
-        assert_eq!(state.up_to_date, !cfg!(windows));
+        assert!(!check_install_state(p).up_to_date);
+
+        fs::write(
+            p.join(".lpm").join("install-hash"),
+            current_hash_file(&hash),
+        )
+        .unwrap();
+        assert!(check_install_state(p).up_to_date);
     }
 
     #[test]
@@ -2110,6 +2132,10 @@ mod tests {
             lines.next(),
             Some(format!("s:{}", lpm_linker::BIN_SHIM_FORMAT).as_str())
         );
+        assert_eq!(
+            lines.next(),
+            Some(format!("k:{}", lpm_store::v2::GraphKey::SCHEMA_VERSION).as_str())
+        );
         assert_eq!(lines.next(), None);
     }
 
@@ -2142,6 +2168,41 @@ mod tests {
         fs::write(&hash_file, older).unwrap();
 
         assert!(!check_install_state_with_content(p, pkg).up_to_date);
+    }
+
+    /// A project linked before a store key covered its packages' bytes may
+    /// hold what another project installed; it isn't up to date until
+    /// linked again, by either freshness check.
+    #[test]
+    fn a_project_linked_under_an_earlier_store_key_schema_is_not_up_to_date() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let _home = scoped_home_for(p);
+        let pkg = r#"{"dependencies":{}}"#;
+        fs::write(p.join("package.json"), pkg).unwrap();
+        lpm_lockfile::Lockfile::default()
+            .write_to_file(&p.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let hash = check_install_state_with_content(p, pkg).hash.unwrap();
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::default()).unwrap();
+        assert!(check_install_state_with_content(p, pkg).up_to_date);
+        assert!(check_install_state(p).up_to_date);
+
+        let hash_file = p.join(".lpm").join("install-hash");
+        let written = fs::read_to_string(&hash_file).unwrap();
+        for earlier in ["", "k:5\n"] {
+            let older: String = written
+                .lines()
+                .filter(|line| !line.starts_with("k:"))
+                .map(|line| format!("{line}\n"))
+                .chain([earlier.to_owned()])
+                .collect();
+            fs::write(&hash_file, older).unwrap();
+
+            assert!(!check_install_state_with_content(p, pkg).up_to_date);
+            assert!(!check_install_state(p).up_to_date);
+        }
     }
 
     #[test]

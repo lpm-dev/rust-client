@@ -64,14 +64,20 @@ impl GraphKeyCacheInput {
     }
 }
 
-struct CachedGraphKey {
+struct CachedOwnDigest {
     input: GraphKeyCacheInput,
-    graph_key: Arc<GraphKey>,
+    own: [u8; 32],
+}
+
+#[derive(Default)]
+struct CachedKeys {
+    own_digests: HashMap<u64, Vec<CachedOwnDigest>>,
+    by_digest: HashMap<[u8; 32], Arc<GraphKey>>,
 }
 
 #[derive(Default)]
 pub struct GraphKeyCache {
-    entries: Mutex<HashMap<u64, Vec<CachedGraphKey>>>,
+    entries: Mutex<CachedKeys>,
 }
 
 impl GraphKeyCache {
@@ -81,39 +87,55 @@ impl GraphKeyCache {
         platform: &PlatformTuple,
         linker_tag: LinkerModeTag,
     ) -> Vec<Arc<GraphKey>> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut graph_keys = Vec::with_capacity(targets.len());
-        for target in targets {
-            let fingerprint = graph_key_input_fingerprint(target, platform, linker_tag);
-            let bucket = entries.entry(fingerprint).or_default();
-            if let Some(cached) = bucket
+        let own_digests: Vec<[u8; 32]> = {
+            let mut entries = self.lock();
+            targets
                 .iter()
-                .find(|cached| cached.input.matches(target, platform, linker_tag))
-            {
-                graph_keys.push(Arc::clone(&cached.graph_key));
-                continue;
-            }
-            let graph_key = derive_graph_key(target, platform, linker_tag);
-            bucket.push(CachedGraphKey {
-                input: GraphKeyCacheInput::from_target(target, platform, linker_tag),
-                graph_key: Arc::clone(&graph_key),
-            });
-            graph_keys.push(graph_key);
-        }
-        graph_keys
+                .map(|target| {
+                    let fingerprint = graph_key_input_fingerprint(target, platform, linker_tag);
+                    let bucket = entries.own_digests.entry(fingerprint).or_default();
+                    if let Some(cached) = bucket
+                        .iter()
+                        .find(|cached| cached.input.matches(target, platform, linker_tag))
+                    {
+                        return cached.own;
+                    }
+                    let own = own_digest(target, platform, linker_tag);
+                    bucket.push(CachedOwnDigest {
+                        input: GraphKeyCacheInput::from_target(target, platform, linker_tag),
+                        own,
+                    });
+                    own
+                })
+                .collect()
+        };
+        // Workspace members derive their keys at once, so the walk over the
+        // graph stays outside the lock.
+        let digests = linked_digests(targets, &own_digests);
+        let mut entries = self.lock();
+        targets
+            .iter()
+            .zip(digests)
+            .map(|(target, digest)| {
+                Arc::clone(
+                    entries
+                        .by_digest
+                        .entry(digest)
+                        .or_insert_with(|| graph_key(target, digest)),
+                )
+            })
+            .collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CachedKeys> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .map(Vec::len)
-            .sum()
+        self.lock().own_digests.values().map(Vec::len).sum()
     }
 }
 
@@ -213,11 +235,7 @@ fn graph_key_input_fingerprint(
     fingerprint
 }
 
-fn derive_graph_key(
-    target: &V2Target,
-    platform: &PlatformTuple,
-    linker_tag: LinkerModeTag,
-) -> Arc<GraphKey> {
+fn own_digest(target: &V2Target, platform: &PlatformTuple, linker_tag: LinkerModeTag) -> [u8; 32] {
     let link_target = &target.target;
     let mut graph_key_deps: Vec<(String, String)> =
         Vec::with_capacity(link_target.dependencies.len());
@@ -227,7 +245,7 @@ fn derive_graph_key(
             .iter()
             .map(|dep| (dep.local.clone(), dep.graph_key_value().to_string())),
     );
-    Arc::new(GraphKey::derive_raw_exact_peer_edges(
+    GraphKey::own_digest_raw(
         &link_target.name,
         &link_target.version,
         platform,
@@ -240,7 +258,182 @@ fn derive_graph_key(
         root_link_identity(link_target),
         link_target.wrapper_id.as_deref(),
         link_target.patch_fingerprint.as_deref(),
+    )
+}
+
+fn graph_key(target: &V2Target, digest: [u8; 32]) -> Arc<GraphKey> {
+    Arc::new(GraphKey::from_recorded(
+        target.target.name.as_str(),
+        target.target.version.as_str(),
+        digest,
     ))
+}
+
+/// The digest of each target's key, given the digest of each target's own
+/// inputs.
+///
+/// A link entry holds the package's files and links to its dependencies'
+/// and peers' entries, so what a package's own code can load is fixed by its
+/// source and by the keys of those entries. A target's key therefore covers
+/// its source and the key of every target it links to, and through those
+/// keys everything it reaches.
+///
+/// Targets on a dependency cycle reach each other, so no member's key can
+/// come first. They take one digest over all of them: each member's own
+/// digest and source, and the keys of the targets the cycle links to outside
+/// itself. A target on no cycle leaves its instance id out, which lets two
+/// instances of the same materialization keep one entry.
+fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    const UNSEEN: usize = usize::MAX;
+
+    let by_instance: HashMap<_, _> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.instance_id, index))
+        .collect();
+    let linked: Vec<Vec<usize>> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let mut linked: Vec<usize> = target
+                .dependency_targets
+                .values()
+                .chain(target.peer_targets.values())
+                .filter_map(|instance_id| by_instance.get(instance_id).copied())
+                .filter(|&other| other != index)
+                .collect();
+            linked.sort_unstable();
+            linked.dedup();
+            linked
+        })
+        .collect();
+
+    // Tarjan's algorithm, with its own stack so a deep graph can't exhaust
+    // the thread's. It completes a cycle only after everything the cycle
+    // reaches, so each key is ready when a dependent needs it.
+    let mut discovered = vec![UNSEEN; targets.len()];
+    let mut lowest = vec![UNSEEN; targets.len()];
+    let mut completed = vec![false; targets.len()];
+    let mut digests = vec![[0; 32]; targets.len()];
+    let mut open = Vec::new();
+    let mut visiting: Vec<(usize, usize)> = Vec::new();
+    let mut next = 0;
+    for root in 0..targets.len() {
+        if discovered[root] != UNSEEN {
+            continue;
+        }
+        visiting.push((root, 0));
+        while let Some(&(index, position)) = visiting.last() {
+            if position == 0 {
+                discovered[index] = next;
+                lowest[index] = next;
+                next += 1;
+                open.push(index);
+            }
+            if let Some(&other) = linked[index].get(position) {
+                visiting
+                    .last_mut()
+                    .expect("the frame read above is still on the stack")
+                    .1 += 1;
+                if discovered[other] == UNSEEN {
+                    visiting.push((other, 0));
+                } else if !completed[other] {
+                    lowest[index] = lowest[index].min(discovered[other]);
+                }
+                continue;
+            }
+            visiting.pop();
+            if let Some(&(parent, _)) = visiting.last() {
+                lowest[parent] = lowest[parent].min(lowest[index]);
+            }
+            if lowest[index] != discovered[index] {
+                continue;
+            }
+            let start = open
+                .iter()
+                .rposition(|&member| member == index)
+                .expect("a target stays open until its cycle completes");
+            let members = open.split_off(start);
+            let closure = closure_digest(
+                targets,
+                &members,
+                &linked,
+                &completed,
+                own_digests,
+                &digests,
+            );
+            for member in members {
+                completed[member] = true;
+                digests[member] = GraphKey::linked_digest(&own_digests[member], &closure);
+            }
+        }
+    }
+    digests
+}
+
+/// The closure digest of the targets in `members`: one target on no cycle,
+/// or every target of one cycle. The members are not completed yet, which
+/// tells the targets they link to outside the cycle from each other.
+fn closure_digest(
+    targets: &[Arc<V2Target>],
+    members: &[usize],
+    linked: &[Vec<usize>],
+    completed: &[bool],
+    own_digests: &[[u8; 32]],
+    digests: &[[u8; 32]],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-link-closure-v1\0");
+    if let [member] = members {
+        hasher.update([0]);
+        hash_source(&mut hasher, &targets[*member].source_sri);
+    } else {
+        let mut sorted = members.to_vec();
+        sorted.sort_unstable_by_key(|&member| targets[member].instance_id);
+        hasher.update([1]);
+        hasher.update((sorted.len() as u64).to_le_bytes());
+        for member in sorted {
+            hasher.update(targets[member].instance_id.as_bytes());
+            hasher.update(own_digests[member]);
+            hash_source(&mut hasher, &targets[member].source_sri);
+        }
+    }
+    let mut outside: Vec<_> = members
+        .iter()
+        .flat_map(|&member| &linked[member])
+        .filter(|&&other| completed[other])
+        .map(|&other| (targets[other].instance_id, &digests[other]))
+        .collect();
+    outside.sort_unstable();
+    outside.dedup();
+    for (instance_id, digest) in outside {
+        hasher.update(instance_id.as_bytes());
+        hasher.update(digest);
+    }
+    hasher.finalize().into()
+}
+
+/// Hashes what `source_sri` names instead of how it is written, so one
+/// object has one identity. A local source's SRI names its directory.
+fn hash_source(hasher: &mut Sha256, source_sri: &str) {
+    match lpm_common::integrity::Integrity::parse(source_sri) {
+        Ok(integrity) => {
+            hasher.update([
+                1,
+                match integrity.algorithm {
+                    lpm_common::integrity::HashAlgorithm::Sha1 => 1,
+                    lpm_common::integrity::HashAlgorithm::Sha256 => 2,
+                    lpm_common::integrity::HashAlgorithm::Sha512 => 3,
+                },
+            ]);
+            hasher.update(&integrity.hash);
+        }
+        Err(_) => {
+            hasher.update([0]);
+            hasher.update((source_sri.len() as u64).to_le_bytes());
+            hasher.update(source_sri.as_bytes());
+        }
+    }
 }
 
 impl KeyMap {
@@ -374,9 +567,14 @@ pub(super) fn derive_graph_keys(
     let key_targets = contextual_targets.as_deref().unwrap_or(targets);
     let graph_keys = cache.map_or_else(
         || {
+            let own_digests: Vec<_> = key_targets
+                .iter()
+                .map(|target| own_digest(target, platform, linker_tag))
+                .collect();
             key_targets
                 .iter()
-                .map(|target| derive_graph_key(target, platform, linker_tag))
+                .zip(linked_digests(key_targets, &own_digests))
+                .map(|(target, digest)| graph_key(target, digest))
                 .collect()
         },
         |cache| cache.derive_many(key_targets, platform, linker_tag),
@@ -573,6 +771,158 @@ mod tests {
         link.dependencies.clear();
         link.peers.clear();
         node
+    }
+
+    fn keys_of(targets: &[Arc<V2Target>], cache: Option<&GraphKeyCache>) -> KeyMap {
+        let platform = PlatformTuple::new("linux", "x64", None);
+        derive_graph_keys(targets, &platform, LinkerModeTag::Isolated, cache).unwrap()
+    }
+
+    fn with_source(
+        targets: &[Arc<V2Target>],
+        index: usize,
+        source_sri: &str,
+    ) -> Vec<Arc<V2Target>> {
+        let mut changed = targets.to_vec();
+        Arc::make_mut(&mut changed[index]).source_sri = source_sri.to_owned();
+        changed
+    }
+
+    #[test]
+    fn other_bytes_for_the_same_package_get_their_own_key() {
+        let original = [Arc::new(graph_node("package"))];
+        let other = with_source(&original, 0, "sha512-other-bytes");
+        let cache = GraphKeyCache::default();
+
+        assert_ne!(
+            keys_of(&original, Some(&cache)).get_for(&original[0]),
+            keys_of(&other, Some(&cache)).get_for(&other[0]),
+        );
+        assert_ne!(
+            keys_of(&original, None).get_for(&original[0]),
+            keys_of(&other, None).get_for(&other[0]),
+        );
+    }
+
+    #[test]
+    fn other_bytes_reach_the_key_of_every_package_that_links_to_them() {
+        let mut parent = graph_node("parent");
+        let mut middle = graph_node("middle");
+        let leaf = graph_node("leaf");
+        let unrelated = graph_node("unrelated");
+        parent
+            .dependency_targets
+            .insert("middle".to_owned(), middle.instance_id);
+        middle
+            .peer_targets
+            .insert("leaf".to_owned(), leaf.instance_id);
+        let original: Vec<_> = [parent, middle, leaf, unrelated]
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let cache = GraphKeyCache::default();
+        let before = keys_of(&original, Some(&cache));
+
+        let mut changed = with_source(&original, 2, "sha512-other-leaf");
+        let after = keys_of(&changed, Some(&cache));
+        for node in &original[..3] {
+            assert_ne!(before.get_for(node), after.get_for(node));
+        }
+        assert_eq!(before.get_for(&original[3]), after.get_for(&original[3]));
+
+        let middle_only = keys_of(&with_source(&original, 1, "sha512-other-middle"), None);
+        assert_ne!(
+            before.get_for(&original[0]),
+            middle_only.get_for(&original[0])
+        );
+        assert_eq!(
+            before.get_for(&original[2]),
+            middle_only.get_for(&original[2])
+        );
+
+        changed.reverse();
+        let reordered = keys_of(&changed, None);
+        for node in &original {
+            assert_eq!(after.get_for(node), reordered.get_for(node));
+        }
+    }
+
+    #[test]
+    fn a_dependency_linked_another_way_changes_the_key_of_what_links_to_it() {
+        let mut parent = graph_node("parent");
+        let child = graph_node("child");
+        parent
+            .dependency_targets
+            .insert("child".to_owned(), child.instance_id);
+        let original: Vec<_> = [parent, child].into_iter().map(Arc::new).collect();
+        let mut exposed = original.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut exposed[1]).target).root_link_names =
+            Some(vec!["child".to_owned(), "also-child".to_owned()]);
+        let cache = GraphKeyCache::default();
+
+        let before = keys_of(&original, Some(&cache));
+        let after = keys_of(&exposed, Some(&cache));
+
+        assert_ne!(before.get_for(&original[1]), after.get_for(&exposed[1]));
+        assert_ne!(before.get_for(&original[0]), after.get_for(&exposed[0]));
+    }
+
+    #[test]
+    fn other_bytes_reach_every_package_on_a_cycle_and_none_below_it() {
+        let mut first = graph_node("first");
+        let mut second = graph_node("second");
+        let mut third = graph_node("third");
+        let below = graph_node("below");
+        first
+            .dependency_targets
+            .insert("second".to_owned(), second.instance_id);
+        second
+            .dependency_targets
+            .insert("third".to_owned(), third.instance_id);
+        third
+            .dependency_targets
+            .insert("first".to_owned(), first.instance_id);
+        third
+            .dependency_targets
+            .insert("below".to_owned(), below.instance_id);
+        let original: Vec<_> = [first, second, third, below]
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let before = keys_of(&original, None);
+
+        for changed_index in 0..3 {
+            let after = keys_of(&with_source(&original, changed_index, "sha512-other"), None);
+            for node in &original[..3] {
+                assert_ne!(before.get_for(node), after.get_for(node));
+            }
+            assert_eq!(before.get_for(&original[3]), after.get_for(&original[3]));
+        }
+
+        let after = keys_of(&with_source(&original, 3, "sha512-other"), None);
+        for node in &original {
+            assert_ne!(before.get_for(node), after.get_for(node));
+        }
+    }
+
+    #[test]
+    fn a_long_dependency_chain_gets_its_keys() {
+        let mut targets: Vec<V2Target> = (0..50_000)
+            .map(|index| graph_node(&format!("link-{index}")))
+            .collect();
+        for index in 1..targets.len() {
+            let next = targets[index].instance_id;
+            targets[index - 1]
+                .dependency_targets
+                .insert("next".to_owned(), next);
+        }
+        let targets: Vec<_> = targets.into_iter().map(Arc::new).collect();
+        let before = keys_of(&targets, None);
+
+        let last = targets.len() - 1;
+        let after = keys_of(&with_source(&targets, last, "sha512-other"), None);
+
+        assert_ne!(before.get_for(&targets[0]), after.get_for(&targets[0]));
     }
 
     #[test]
