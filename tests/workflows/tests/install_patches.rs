@@ -79,9 +79,15 @@ fn seed_store_package(
         }
         std::fs::write(&p, content).unwrap();
     }
-    let integrity = format!("sha512-fixture-{name}-{version}");
+    let integrity = fixture_integrity(name, version);
     std::fs::write(dir.join(".integrity"), &integrity).unwrap();
     integrity
+}
+
+/// The integrity the seeded store entry records and the lockfile pins. An
+/// install uses a v1 entry only under the integrity its lockfile names.
+fn fixture_integrity(name: &str, version: &str) -> String {
+    lpm_store::compute_sri_hash(format!("{name}@{version}").as_bytes())
 }
 
 /// Write a synthetic `lpm.lock`.
@@ -96,6 +102,7 @@ fn write_lockfile_at(base_dir: &std::path::Path, entries: &[(&str, &str, &[&str]
             name: (*name).to_string(),
             version: (*version).to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some(fixture_integrity(name, version)),
             dependencies: dependencies
                 .iter()
                 .map(|dependency| (*dependency).to_string())
