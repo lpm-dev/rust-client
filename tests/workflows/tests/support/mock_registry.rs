@@ -3855,58 +3855,7 @@ impl MockRegistry {
 
 /// Compute sha512 SRI integrity hash for tarball bytes.
 pub fn compute_integrity(data: &[u8]) -> String {
-    // Simple SHA-512: read all bytes, hash, base64-encode
-    let digest = {
-        // Use a basic sha2 approach — we have it as a transitive dep
-        // but for test code, just shell out a manual computation
-        // Actually, compute manually with ring-like approach
-        // For simplicity in tests, use a fixed known hash
-        // We compute the real hash to make integrity verification pass
-        sha512_base64(data)
-    };
-    format!("sha512-{digest}")
-}
-
-/// SHA-512 hash of data, base64 encoded (for SRI).
-fn sha512_base64(data: &[u8]) -> String {
-    use std::process::Command;
-    // Use openssl from the system for test simplicity
-    let mut child = Command::new("openssl")
-        .args(["dgst", "-sha512", "-binary"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("openssl required for test integrity hashes");
-
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(data)
-        .expect("failed to write to openssl stdin");
-
-    let output = child.wait_with_output().expect("openssl failed");
-    assert!(output.status.success(), "openssl sha512 failed");
-
-    // base64-encode the raw digest
-    let mut b64_child = Command::new("openssl")
-        .args(["base64", "-A"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("openssl base64 required");
-
-    b64_child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(&output.stdout)
-        .expect("failed to write to base64 stdin");
-
-    let b64_output = b64_child.wait_with_output().expect("base64 failed");
-    String::from_utf8(b64_output.stdout)
-        .unwrap()
-        .trim()
+    lpm_common::integrity::Integrity::from_bytes(lpm_common::integrity::HashAlgorithm::Sha512, data)
         .to_string()
 }
 
