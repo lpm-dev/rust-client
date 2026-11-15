@@ -380,7 +380,7 @@ fn tools_from_other_packages(
                 )
             });
             if reported
-                || !commands.iter().any(|(name, _)| name == tool.command)
+                || !commands.iter().any(|(name, _)| tool.is_named(name))
                 || provider
                     .as_ref()
                     .is_some_and(|provider| publishes_tool(tool, provider, registry_packages))

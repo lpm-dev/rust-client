@@ -183,26 +183,37 @@ pub(super) fn build_lifecycle_environment(
     envs
 }
 
-/// The entries of `path` that belong to the machine, not to a package: an
-/// absolute directory outside the project and outside every `node_modules`.
-/// The rest are where a dependency's command can sit, such as the project's
-/// `.bin` when LPM was started from a package script, or the current
-/// directory through an empty or relative entry.
+/// The entries of `path` where no package's command can sit: an absolute
+/// directory outside every `node_modules` and outside the project's `.lpm`.
+/// The rest hold what dependencies declare, such as the project's `.bin`
+/// when LPM was started from a package script, or are the current
+/// directory, through an empty or relative entry. The project's own
+/// directories stay: a Python environment or a toolchain kept in the
+/// project is the user's, and a green tool may need it.
+///
+/// When no entry is left the system directories stand in, because the
+/// shell reads an empty `PATH` component as the current directory.
 fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
-    let project = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let lpm_state = project_dir.join(".lpm");
+    let resolved_lpm_state = lpm_state.canonicalize().ok();
     let host = std::env::split_paths(path).filter(|entry| {
         let resolved = entry.canonicalize().unwrap_or_else(|_| entry.clone());
         entry.is_absolute()
-            && !resolved.starts_with(&project)
-            && !entry.starts_with(project_dir)
+            && !entry.starts_with(&lpm_state)
+            && !resolved_lpm_state
+                .as_ref()
+                .is_some_and(|state| resolved.starts_with(state))
             && !resolved
                 .components()
                 .chain(entry.components())
                 .any(|component| component.as_os_str() == "node_modules")
     });
-    std::env::join_paths(host).unwrap_or_default()
+    let host = std::env::join_paths(host).unwrap_or_default();
+    if host.is_empty() {
+        inherited_path(None).to_owned()
+    } else {
+        host
+    }
 }
 
 /// — resolve the live per-package directory where lifecycle

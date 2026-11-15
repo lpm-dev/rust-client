@@ -288,7 +288,7 @@ fn contains_powershell_red_literal(s: &str) -> bool {
 /// become `> >`): `&&`, `||`, `>>`, `<<`.
 ///
 /// Recognized single-char operators: `|`, `&`, `;`, `<`, `>`, `(`,
-/// `)`.
+/// `)`. An unquoted line break is written as `;`.
 ///
 /// Everything else (including `{`, `}`, brace-expansion, and process
 /// substitution `<(…)`) is left untouched; this is a deliberately
@@ -296,7 +296,8 @@ fn contains_powershell_red_literal(s: &str) -> bool {
 /// patterns matched by the classifier.
 pub(crate) fn normalize_operators(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
-    let mut chars = s.chars().peekable();
+    // A line break before the first command or after the last starts none.
+    let mut chars = s.trim().chars().peekable();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
@@ -346,6 +347,10 @@ pub(crate) fn normalize_operators(s: &str) -> String {
                 out.push(c);
                 out.push(' ');
             }
+            // The shell runs what follows a line break as another command.
+            // The tokenizer reads one as a space, which would make that
+            // command an argument of the one before it.
+            '\n' | '\r' => out.push_str(" ; "),
             _ => out.push(c),
         }
     }
@@ -1696,6 +1701,15 @@ pub struct GreenTool {
     matches: fn(&[String]) -> bool,
 }
 
+impl GreenTool {
+    /// Whether a command a package declares, as its `bin` names it, is this
+    /// tool's to the shell: file systems that ignore case and Windows
+    /// launcher extensions make `Tsc` and `tsc.cmd` answer to `tsc`.
+    pub fn is_named(&self, command: &str) -> bool {
+        command_name(command) == self.command
+    }
+}
+
 impl PartialEq for GreenTool {
     fn eq(&self, other: &Self) -> bool {
         self.command == other.command
@@ -1800,11 +1814,19 @@ fn tokens_match_green(tokens: &[String], script: &str) -> bool {
     let Some(command) = tokens.first().map(String::as_str) else {
         return false;
     };
+    if command == "node" {
+        return matches_node_relative(script) || matches_node_eval_softfail_green(script);
+    }
+    // The tokens are how `sh` reads the script, where a backslash escapes
+    // the next character: `t\sc` is `tsc`. To `cmd.exe` it separates path
+    // components, and names a file of the package.
+    if script.contains('\\') {
+        return false;
+    }
     if let Some(tool) = green_tool(command) {
         return (tool.matches)(tokens);
     }
     match command {
-        "node" => matches_node_relative(script) || matches_node_eval_softfail_green(script),
         "exit" => matches_exit_noop(tokens),
         ":" => tokens.len() == 1,
         "echo" => matches_echo_noop(tokens, script),
@@ -3853,6 +3875,60 @@ mod tests {
             for started in tool.starts {
                 assert!(green_tool(started).is_some(), "{tool:?} starts {started}");
             }
+        }
+    }
+
+    #[test]
+    fn a_line_break_starts_another_command() {
+        for script in [
+            "echo\n./payload",
+            "echo ok\r\n./payload",
+            "tsc -p\n./payload",
+            "tsc\nnode-gyp rebuild",
+            "exit 0\n./payload",
+            ":\n./payload",
+            "node-gyp rebuild\n./payload",
+        ] {
+            assert_eq!(classify(script), StaticTier::Amber, "{script:?}");
+        }
+        assert_eq!(
+            green_tools_in("echo\ntsc"),
+            [green_tool("tsc").unwrap()],
+            "the command on the second line is a command lookup"
+        );
+    }
+
+    #[test]
+    fn a_line_break_around_one_command_or_inside_quotes_is_not_another_command() {
+        assert_eq!(classify("tsc\n"), StaticTier::Green);
+        assert_eq!(classify("\n  node-gyp rebuild \r\n"), StaticTier::Green);
+        assert_eq!(classify("echo 'one\ntwo'"), StaticTier::Green);
+    }
+
+    #[test]
+    fn a_command_spelled_with_a_backslash_is_not_green() {
+        // `sh` reads `t\sc` as `tsc`. `cmd.exe` reads it as the file `sc`
+        // in the package's directory `t`.
+        for script in [
+            r"t\sc",
+            r"tsc -p conf\ig",
+            r"e\xit",
+            r"node-gyp rebuild \--release",
+            r"husk\y install",
+            r"\:",
+        ] {
+            assert_ne!(classify(script), StaticTier::Green, "{script}");
+        }
+    }
+
+    #[test]
+    fn a_dependencys_command_is_a_tools_under_any_case_or_launcher_extension() {
+        let tsc = green_tool("tsc").unwrap();
+        for name in ["tsc", "Tsc", "TSC.CMD", "tsc.exe"] {
+            assert!(tsc.is_named(name), "{name}");
+        }
+        for name in ["tsc2", "ts", "tsc.js"] {
+            assert!(!tsc.is_named(name), "{name}");
         }
     }
 

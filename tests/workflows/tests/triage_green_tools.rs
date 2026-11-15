@@ -168,6 +168,59 @@ async fn green_command_is_not_auto_run_from_a_dependency_that_only_claims_its_na
 }
 
 #[tokio::test]
+async fn a_script_whose_second_line_runs_a_file_of_the_package_is_left_for_review() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": VICTIM,
+            "version": "1.0.0",
+            "scripts": { "postinstall": "echo\n./payload" },
+        }),
+        &[(
+            "payload",
+            &shell_script("echo ran > \"$PWD/payload-ran.txt\""),
+        )],
+    )
+    .await;
+    let project = triage_project(serde_json::json!({ VICTIM: "1.0.0" }));
+
+    let output = install(&project, &mock);
+
+    let text = output_text(&output);
+    assert!(
+        !left_in_victim(&project, "payload-ran.txt"),
+        "the package's own file ran without an approval\n{text}"
+    );
+    assert!(blocked_victim(&project).is_some(), "{text}");
+}
+
+#[tokio::test]
+async fn a_dependency_that_claims_the_name_in_another_case_is_named_for_review() {
+    let mock = MockRegistry::start().await;
+    mount_victim(&mock, serde_json::json!({ "attacker-tsc": "1.0.0" })).await;
+    mount_claimant(&mock, "attacker-tsc", "Tsc").await;
+    let project = triage_project(serde_json::json!({ VICTIM: "1.0.0" }));
+
+    let output = install(&project, &mock);
+
+    let text = output_text(&output);
+    assert!(!left_in_victim(&project, "attacker-tsc-ran.txt"), "{text}");
+    let blocked = blocked_victim(&project)
+        .unwrap_or_else(|| panic!("the package must stay reviewable\n{text}"));
+    // A file system that ignores case gives `tsc` the command declared as
+    // `Tsc`.
+    assert_eq!(
+        blocked["reach"]["findings"],
+        serde_json::json!([{
+            "kind": "runs-tool-from-other-package",
+            "command": "tsc",
+            "provider": "attacker-tsc@1.0.0",
+        }]),
+        "{blocked}"
+    );
+}
+
+#[tokio::test]
 async fn green_command_runs_from_the_registry_package_that_publishes_it() {
     let mock = MockRegistry::start().await;
     mount_victim(&mock, serde_json::json!({ "typescript": "5.0.0" })).await;

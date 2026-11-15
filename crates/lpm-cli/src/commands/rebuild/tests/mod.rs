@@ -3892,13 +3892,17 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
     let last_machine_bin = machine.path().join("sbin");
     let other_projects_bin = machine.path().join("other-project/node_modules/.bin");
     let project_bin = project_dir.join("node_modules/.bin");
+    // The project's own tools, such as a Python environment kept in it.
+    let project_tools = project_dir.join(".venv/bin");
+    let lpm_state_bin = project_dir.join(".lpm/tools/bin");
     for directory in [
         &scratch_bin,
         &first_machine_bin,
         &last_machine_bin,
         &other_projects_bin,
         &project_bin,
-        &project_dir.join("tools"),
+        &project_tools,
+        &lpm_state_bin,
     ] {
         std::fs::create_dir_all(directory).unwrap();
     }
@@ -3908,7 +3912,8 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         PathBuf::new(),
         PathBuf::from("."),
         PathBuf::from("relative/bin"),
-        project_dir.join("tools"),
+        project_tools.clone(),
+        lpm_state_bin,
         other_projects_bin,
         last_machine_bin.clone(),
     ])
@@ -3940,6 +3945,7 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         [
             scratch_bin.clone(),
             first_machine_bin.clone(),
+            project_tools,
             last_machine_bin.clone()
         ]
     );
@@ -3963,4 +3969,44 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         values(&approved, "NoDefaultCurrentDirectoryInExePath"),
         ["0"]
     );
+}
+
+#[test]
+fn a_green_run_whose_inherited_path_names_no_machine_directory_searches_no_empty_entry() {
+    let project = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let project_bin = project.path().join("node_modules/.bin");
+    std::fs::create_dir_all(&project_bin).unwrap();
+
+    for inherited in [project_bin.as_os_str(), std::ffi::OsStr::new("")] {
+        let mut parent = super::sandbox_env::ChildEnvironment::new();
+        parent.insert("PATH".into(), inherited.to_owned());
+        let green = super::script_execution::build_lifecycle_environment(
+            &parent,
+            project.path(),
+            scratch.path(),
+            Some(scratch.path()),
+            false,
+        );
+        let path = green
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+
+        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        // The shell reads an empty entry as the current directory, which is
+        // the package's.
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.is_absolute() && entry != &project_bin),
+            "{path:?}"
+        );
+        assert_eq!(entries[0], scratch.path());
+        assert!(
+            entries.len() > 1,
+            "the system directories stand in: {path:?}"
+        );
+    }
 }
