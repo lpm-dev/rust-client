@@ -26,9 +26,14 @@ use crate::output;
 /// Returns the proof JWT on success. The caller carries it in the
 /// `X-LPM-Step-Up-Proof` header on the subsequent sensitive write
 /// (e.g. `lpm_vault::sync::upload_public_key(..., Some(&proof))`).
+///
+/// `approval_policy` is what a browser approval page is told of a scope
+/// that names its content only by a digest: the CI access policy of a
+/// `vault:oidc-policy` scope. Other scopes pass `None`.
 pub async fn request_cli_step_up_proof(
     client: &lpm_registry::RegistryClient,
     scope: &str,
+    approval_policy: Option<&serde_json::Value>,
 ) -> Result<String, LpmError> {
     // Refuse non-interactive callers up-front. Prompting for a password
     // without a TTY would either block on stdin forever or silently
@@ -53,7 +58,7 @@ pub async fn request_cli_step_up_proof(
             if policy.methods.iter().any(|method| method == "totp") && !approve_in_browser()? {
                 return totp_step_up(client, scope).await;
             }
-            approval_step_up(client, scope).await
+            approval_step_up(client, scope, approval_policy).await
         }
         "password" => {
             output::info(
@@ -125,11 +130,12 @@ fn approve_in_browser() -> Result<bool, LpmError> {
 async fn approval_step_up(
     client: &lpm_registry::RegistryClient,
     scope: &str,
+    policy: Option<&serde_json::Value>,
 ) -> Result<String, LpmError> {
     let approval = crate::commands::env::auth::execute_sync_with_bearer(
         client,
         |registry_url, auth_token| async move {
-            request_cli_step_up_approval(&registry_url, &auth_token, scope).await
+            request_cli_step_up_approval(&registry_url, &auth_token, scope, policy).await
         },
     )
     .await?;

@@ -369,6 +369,7 @@ pub(super) async fn vars_oidc_allow(
     if let Some(repository_id) = &repository_id {
         policy_body["repositoryId"] = serde_json::Value::String(repository_id.clone());
     }
+    let approval_policy = policy_for_approval(&policy_body);
     let write_policy = |step_up_proof: Option<String>| {
         let policy_body = policy_body.clone();
         super::auth::execute_lpm_with_bearer(registry_client, move |registry_url, auth_token| {
@@ -457,7 +458,7 @@ pub(super) async fn vars_oidc_allow(
         access.push(("Forks", forks.to_string()));
     }
     let result = write_policy_with_confirmation(write_policy, |scope| async move {
-        confirm_ci_access(registry_client, &scope, &access).await
+        confirm_ci_access(registry_client, &scope, &access, &approval_policy).await
     })
     .await?;
     let policy_id = policy_id_from_response(&result)?;
@@ -683,10 +684,23 @@ where
 /// project, and returns the proof the policy write carries. `access` is the
 /// policy being confirmed, shown first: the prompt and the approval page
 /// name the project, not what CI is given.
+/// The policy as the confirmation's approval page is told it: the request
+/// without the fields that address it, which the scope's digest doesn't
+/// cover.
+fn policy_for_approval(policy_body: &serde_json::Value) -> serde_json::Value {
+    let mut policy = policy_body.clone();
+    if let Some(fields) = policy.as_object_mut() {
+        fields.remove("org");
+        fields.remove("expectedPrincipalId");
+    }
+    policy
+}
+
 async fn confirm_ci_access(
     registry_client: &lpm_registry::RegistryClient,
     scope: &str,
     access: &[(&'static str, String)],
+    approval_policy: &serde_json::Value,
 ) -> Result<String, LpmError> {
     use std::io::IsTerminal as _;
 
@@ -702,7 +716,7 @@ async fn confirm_ci_access(
     for (label, value) in access {
         output::field(label, value);
     }
-    crate::step_up::request_cli_step_up_proof(registry_client, scope).await
+    crate::step_up::request_cli_step_up_proof(registry_client, scope, Some(approval_policy)).await
 }
 
 async fn create_oidc_policy(
@@ -1364,6 +1378,28 @@ mod policy_step_up_tests {
             .mount(&server)
             .await;
         server
+    }
+
+    #[test]
+    fn the_approval_is_told_the_policy_without_the_fields_that_address_it() {
+        let body = serde_json::json!({
+            "vaultId": "vault",
+            "provider": "github",
+            "subject": "repo:acme/api",
+            "allowForks": false,
+            "org": "acme",
+            "expectedPrincipalId": "principal",
+        });
+
+        assert_eq!(
+            super::policy_for_approval(&body),
+            serde_json::json!({
+                "vaultId": "vault",
+                "provider": "github",
+                "subject": "repo:acme/api",
+                "allowForks": false,
+            })
+        );
     }
 
     #[test]

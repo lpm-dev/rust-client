@@ -55,18 +55,27 @@ pub struct CliStepUpApproval {
 /// Ask the server for a browser approval of `scope`. The user approves it
 /// with their passkey or authenticator; the token `done_url` then gives the
 /// CLI mints the proof through `CliStepUpCredential::Approval`.
+///
+/// `policy` is the CI access policy a `vault:oidc-policy` scope stands for.
+/// The scope carries only its digest, so the server needs the policy to show
+/// the user what they approve, and refuses one the digest doesn't match.
 pub async fn request_cli_step_up_approval(
     registry_url: &str,
     auth_token: &str,
     scope: &str,
+    policy: Option<&serde_json::Value>,
 ) -> Result<CliStepUpApproval, SyncError> {
     let client = sync_http_client()?;
     let url = format!("{registry_url}/api/auth/cli-step-up");
+    let mut request = serde_json::json!({ "scope": scope, "method": "approval" });
+    if let Some(policy) = policy {
+        request["policy"] = policy.clone();
+    }
 
     let response = client
         .post(&url)
         .bearer_auth(auth_token)
-        .json(&serde_json::json!({ "scope": scope, "method": "approval" }))
+        .json(&request)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -441,7 +450,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let approval = request_cli_step_up_approval(&server.uri(), "token", SCOPE)
+        let approval = request_cli_step_up_approval(&server.uri(), "token", SCOPE, None)
             .await
             .expect("approval");
 
@@ -450,6 +459,30 @@ mod tests {
             approval.done_url,
             "https://lpm.dev/api/auth/cli-approvals/approval-1/secret"
         );
+    }
+
+    #[tokio::test]
+    async fn request_cli_step_up_approval_sends_the_policy_its_scope_stands_for() {
+        let policy = serde_json::json!({ "provider": "github", "subject": "repo:acme/api" });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "scope": SCOPE,
+                "method": "approval",
+                "policy": policy,
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "authUrl": "https://lpm.dev/cli/approve/approval-1",
+                "doneUrl": "https://lpm.dev/api/auth/cli-approvals/approval-1/secret",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        request_cli_step_up_approval(&server.uri(), "token", SCOPE, Some(&policy))
+            .await
+            .expect("approval");
     }
 
     #[tokio::test]
@@ -464,7 +497,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE)
+        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE, None)
             .await
             .expect_err("refusal");
 
