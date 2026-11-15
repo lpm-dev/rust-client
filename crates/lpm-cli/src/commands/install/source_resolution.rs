@@ -316,7 +316,7 @@ pub(super) struct InstallRoutingContext {
     pub(super) setup_route_table_ms: u128,
 }
 
-pub(super) fn load_install_route_table(
+pub(crate) fn load_install_route_table(
     project_dir: &Path,
     client: &RegistryClient,
 ) -> Result<RouteTable, LpmError> {

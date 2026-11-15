@@ -2,12 +2,12 @@
 //!
 //! Handles:
 //! - Skipping unsupported dependency types (file:, link:, workspace:, patch:, git:, etc.)
-//! - Inferring the source registry from the resolved URL
+//! - Inferring the source registry from the resolved URL, by its exact host
 //! - Deduplicating same name+version pairs
 //! - Formatting dependencies as `"name@version"` strings
 //! - Sorting output for deterministic lockfiles
 
-use crate::{MigratedPackage, SkippedPackage};
+use crate::{CustomRegistryPackage, MigratedPackage, SkippedPackage};
 use lpm_lockfile::{
     LOCKFILE_VERSION_WITH_STRUCTURED_PEERS, LockedPackage, Lockfile, LockfileMetadata,
 };
@@ -33,7 +33,17 @@ const SKIP_PREFIXES: &[&str] = &[
 ///
 /// Returns the lockfile and a list of skipped packages (with reasons).
 pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPackage>) {
+    let (lockfile, skipped, _) = to_lockfile_with_registries(packages);
+    (lockfile, skipped)
+}
+
+/// [`to_lockfile`], with every package the source package manager fetched
+/// from a registry other than npm's and LPM's.
+pub fn to_lockfile_with_registries(
+    packages: Vec<MigratedPackage>,
+) -> (Lockfile, Vec<SkippedPackage>, Vec<CustomRegistryPackage>) {
     let mut skipped = Vec::new();
+    let mut custom_registry_packages = Vec::new();
     let mut locked_packages = Vec::with_capacity(packages.len());
     let mut seen: HashSet<(String, String)> = HashSet::with_capacity(packages.len());
 
@@ -82,7 +92,8 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             continue;
         }
 
-        let source = infer_source(&pkg.resolved);
+        let (source, custom) = source_of(&pkg.name, &pkg.version, pkg.resolved.as_deref());
+        custom_registry_packages.extend(custom);
 
         // Format dependencies as "name@version" strings
         let dependencies: Vec<String> = pkg
@@ -152,7 +163,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
         ambient_peer_installs: Vec::new(),
     };
 
-    (lockfile, skipped)
+    (lockfile, skipped, custom_registry_packages)
 }
 
 /// Mark packages as dev or optional based on package.json dependency sets.
@@ -189,25 +200,85 @@ fn contains_path_traversal(name: &str) -> bool {
         || name.bytes().any(|b| b < 0x20 && b != b'\t')
 }
 
-/// Infer the source registry URL from the resolved tarball URL.
-fn infer_source(resolved: &Option<String>) -> String {
-    match resolved {
-        Some(url) if url.contains("lpm.dev") => "registry+https://lpm.dev".to_string(),
-        Some(url) if url.contains("registry.npmjs.org") => {
-            "registry+https://registry.npmjs.org".to_string()
-        }
-        Some(url) if url.contains("registry.yarnpkg.com") => {
-            "registry+https://registry.npmjs.org".to_string()
-        }
-        Some(url) => {
-            tracing::warn!(
-                url,
-                "unknown registry URL, defaulting to registry.npmjs.org"
-            );
-            "registry+https://registry.npmjs.org".to_string()
-        }
-        None => "registry+https://registry.npmjs.org".to_string(),
+const NPM_SOURCE: &str = "registry+https://registry.npmjs.org";
+const LPM_SOURCE: &str = "registry+https://lpm.dev";
+
+/// Which registry a tarball URL belongs to, by its exact host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryOrigin {
+    Npm,
+    Lpm,
+    Custom,
+}
+
+/// The registry of an `http(s)` tarball URL. A host that merely contains a
+/// known registry's name, such as `registry.npmjs.org.example`, is custom.
+pub fn registry_origin(url: &str) -> RegistryOrigin {
+    let Some(host) = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return RegistryOrigin::Custom;
+    };
+    match host.as_str() {
+        "registry.npmjs.org" | "registry.yarnpkg.com" => RegistryOrigin::Npm,
+        "lpm.dev" => RegistryOrigin::Lpm,
+        host if host.ends_with(".lpm.dev") => RegistryOrigin::Lpm,
+        _ => RegistryOrigin::Custom,
     }
+}
+
+/// The lockfile source for a package fetched from `resolved`, and the
+/// package as a [`CustomRegistryPackage`] when that registry is neither
+/// npm's nor LPM's.
+fn source_of(
+    name: &str,
+    version: &str,
+    resolved: Option<&str>,
+) -> (String, Option<CustomRegistryPackage>) {
+    let Some(url) = resolved.and_then(public_tarball_url) else {
+        return (NPM_SOURCE.to_owned(), None);
+    };
+    match registry_origin(url.as_str()) {
+        RegistryOrigin::Npm => (NPM_SOURCE.to_owned(), None),
+        RegistryOrigin::Lpm => (LPM_SOURCE.to_owned(), None),
+        RegistryOrigin::Custom => (
+            format!("registry+{}", registry_base(&url, name)),
+            Some(CustomRegistryPackage {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                tarball_url: url.into(),
+            }),
+        ),
+    }
+}
+
+/// `resolved` as an `http(s)` URL without credentials, query or fragment, so
+/// nothing it reports or records can carry a registry token.
+pub(crate) fn public_tarball_url(resolved: &str) -> Option<url::Url> {
+    let mut url = url::Url::parse(resolved).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url)
+}
+
+/// The registry a tarball URL sits under: everything before the npm
+/// layout's `/<name>/-/`, or the origin when the URL doesn't follow it.
+fn registry_base(url: &url::Url, name: &str) -> String {
+    let path = url.path();
+    let encoded = name.replacen('/', "%2f", 1);
+    let prefix_end = [format!("/{name}/-/"), format!("/{encoded}/-/")]
+        .iter()
+        .find_map(|marker| path.to_ascii_lowercase().find(&marker.to_ascii_lowercase()))
+        .map_or(1, |at| at + 1);
+    let mut base = url.origin().ascii_serialization();
+    base.push_str(&path[..prefix_end]);
+    base
 }
 
 #[cfg(test)]
@@ -478,10 +549,76 @@ mod tests {
     }
 
     #[test]
-    fn infer_source_unknown_registry_returns_default() {
-        // Unknown registry URLs should still return npmjs default
-        let source = infer_source(&Some("https://private.corp/pkg.tgz".to_string()));
-        assert_eq!(source, "registry+https://registry.npmjs.org");
+    fn a_registry_is_recognized_by_its_exact_host() {
+        assert_eq!(
+            registry_origin("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+            RegistryOrigin::Npm
+        );
+        assert_eq!(
+            registry_origin("https://registry.yarnpkg.com/ms/-/ms-2.1.3.tgz"),
+            RegistryOrigin::Npm
+        );
+        assert_eq!(
+            registry_origin("https://lpm.dev/api/registry/@lpm.dev/a/-/a-1.0.0.tgz"),
+            RegistryOrigin::Lpm
+        );
+        for custom in [
+            "https://registry.npmjs.org.evil.example/ms/-/ms-2.1.3.tgz",
+            "https://evil-lpm.dev/ms/-/ms-2.1.3.tgz",
+            "https://npm.corp.example/ms/-/ms-2.1.3.tgz",
+        ] {
+            assert_eq!(registry_origin(custom), RegistryOrigin::Custom, "{custom}");
+        }
+    }
+
+    #[test]
+    fn a_package_from_a_custom_registry_is_reported_with_its_tarball_url() {
+        let (lockfile, _, custom) = to_lockfile_with_registries(vec![
+            make_pkg(
+                "ms",
+                "2.1.3",
+                Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+            ),
+            make_pkg(
+                "corp-utils",
+                "1.0.0",
+                Some(
+                    "https://user:secret@npm.corp.example/api/npm/corp-utils/-/corp-utils-1.0.0.tgz?sig=x",
+                ),
+            ),
+        ]);
+        assert_eq!(
+            custom,
+            vec![CustomRegistryPackage {
+                name: "corp-utils".to_owned(),
+                version: "1.0.0".to_owned(),
+                tarball_url: "https://npm.corp.example/api/npm/corp-utils/-/corp-utils-1.0.0.tgz"
+                    .to_owned(),
+            }],
+            "only the custom registry is reported, and never with its credentials"
+        );
+        let corp = lockfile.find_package("corp-utils").unwrap();
+        assert_eq!(
+            corp.source.as_deref(),
+            Some("registry+https://npm.corp.example/api/npm/")
+        );
+    }
+
+    #[test]
+    fn a_scoped_package_records_the_registry_above_its_scope() {
+        let (lockfile, _, _) = to_lockfile_with_registries(vec![make_pkg(
+            "@corp/utils",
+            "1.0.0",
+            Some("https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz"),
+        )]);
+        assert_eq!(
+            lockfile
+                .find_package("@corp/utils")
+                .unwrap()
+                .source
+                .as_deref(),
+            Some("registry+https://npm.corp.example/")
+        );
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod github_source;
 mod gitignore;
 mod lifecycle;
 mod linking;
+mod locked_integrity;
 mod lockfile;
 mod manifest;
 mod package;
@@ -377,6 +378,14 @@ pub(crate) async fn run_silent_for_audit_fix(
     .await
 }
 
+/// What a caller requires of the packages an install resolves, checked
+/// after resolution and before anything is linked.
+#[derive(Default)]
+pub(crate) struct InstallExpectations {
+    root: Option<ExpectedInstallRoot>,
+    locked_integrities: Option<Arc<LockedIntegrities>>,
+}
+
 pub(crate) struct ExpectedInstallRoot {
     pub(crate) name: String,
     pub(crate) version: String,
@@ -384,10 +393,14 @@ pub(crate) struct ExpectedInstallRoot {
     pub(crate) integrity: Option<String>,
 }
 
+pub(crate) use locked_integrity::LockedIntegrities;
+pub(crate) use source_resolution::load_install_route_table;
+
 pub(crate) struct InstallCallerContext<'a> {
     pub(crate) route_table: RouteTable,
     pub(crate) policy_project_dir: Option<&'a Path>,
     pub(crate) expected_root: Option<ExpectedInstallRoot>,
+    pub(crate) locked_integrities: Option<Arc<LockedIntegrities>>,
 }
 
 impl From<RouteTable> for InstallCallerContext<'_> {
@@ -396,6 +409,7 @@ impl From<RouteTable> for InstallCallerContext<'_> {
             route_table,
             policy_project_dir: None,
             expected_root: None,
+            locked_integrities: None,
         }
     }
 }
@@ -444,8 +458,16 @@ pub(crate) async fn run_with_options_with_lpm_root(
         .as_ref()
         .and_then(|context| context.policy_project_dir)
         .unwrap_or(project_dir);
-    let (preloaded_route_table, expected_root) = caller_context
-        .map(|context| (Some(context.route_table), context.expected_root))
+    let (preloaded_route_table, expectations) = caller_context
+        .map(|context| {
+            (
+                Some(context.route_table),
+                InstallExpectations {
+                    root: context.expected_root,
+                    locked_integrities: context.locked_integrities,
+                },
+            )
+        })
         .unwrap_or_default();
     let transaction_root = lpm_workspace::find_workspace_root(project_dir)
         .map_err(|error| LpmError::Workspace(error.to_string()))?
@@ -486,7 +508,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             client,
             project_dir,
             policy_project_dir,
-            expected_root.as_ref(),
+            &expectations,
             json_output,
             offline,
             frozen_lockfile,
@@ -549,7 +571,7 @@ async fn run_with_options_under_store_lock(
     client: &RegistryClient,
     project_dir: &Path,
     policy_project_dir: &Path,
-    expected_root: Option<&ExpectedInstallRoot>,
+    expectations: &InstallExpectations,
     json_output: bool,
     offline: bool,
     frozen_lockfile: FrozenLockfileMode,
@@ -1396,7 +1418,10 @@ async fn run_with_options_under_store_lock(
         current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
     }
 
-    if let Some(expected) = expected_root {
+    if let Some(locked) = &expectations.locked_integrities {
+        locked.check(&packages)?;
+    }
+    if let Some(expected) = &expectations.root {
         let matches = packages.iter().any(|package| {
             package.is_direct
                 && package.name == expected.name

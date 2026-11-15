@@ -1061,6 +1061,13 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     pub(crate) dry_run: bool,
 
+    /// Migrate packages the lockfile took from a registry that LPM wouldn't
+    /// fetch them from, fetching them from LPM's registry instead. A package
+    /// that comes back at its locked version must still match the integrity
+    /// the lockfile recorded.
+    #[arg(long)]
+    pub(crate) allow_registry_change: bool,
+
     /// Overwrite an existing lpm.lock. With --rollback, also restore files
     /// changed after the migration, files LPM can't tell it wrote, and files
     /// whose earlier content the backup keeps, each to the backup's copy.

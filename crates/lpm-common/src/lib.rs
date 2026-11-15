@@ -85,7 +85,7 @@ pub use error::{
     SecurityApprovalRequiredErrorContext, TyposquatErrorContext, TyposquatErrorFinding,
 };
 pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
-pub use integrity::Integrity;
+pub use integrity::{Integrity, SriComparison, compare_sri};
 pub use local_target::{LocalScheme, LocalTarget};
 pub use lpm_json::{
     LpmJsonAndLocalState, LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError,

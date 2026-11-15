@@ -81,6 +81,9 @@ pub(crate) struct RecursiveInstallOptions {
     pub(crate) audit_after_install: bool,
     pub(crate) timing: bool,
     pub(crate) workspace_concurrency: Option<NonZeroUsize>,
+    /// Integrities every member's install must keep at the versions they
+    /// name, as a migration's install does.
+    pub(crate) locked_integrities: Option<Arc<super::LockedIntegrities>>,
 }
 
 struct WorkspaceInstallTarget {
@@ -691,6 +694,20 @@ async fn run_workspace_target_install(
     };
 
     let capture = options.json_output.then(report_capture::new_capture);
+    let caller_context = options
+        .locked_integrities
+        .as_ref()
+        .map(|locked| {
+            Ok::<_, LpmError>(super::InstallCallerContext {
+                route_table: super::source_resolution::load_install_route_table(
+                    &plan.path, &client,
+                )?,
+                policy_project_dir: None,
+                expected_root: None,
+                locked_integrities: Some(Arc::clone(locked)),
+            })
+        })
+        .transpose()?;
     let install = assert_send(run_with_options_with_lpm_root(
         &client,
         &plan.path,
@@ -724,7 +741,7 @@ async fn run_workspace_target_install(
         &[],
         options.json_output,
         false,
-        None,
+        caller_context,
         lpm_root,
     ));
     match &capture {

@@ -269,16 +269,31 @@ fn parse_binary_lockfile(
                 path.display()
             ))
         })?;
-    let mut snapshot = tempfile::Builder::new()
-        .prefix("lpm-bun-lock-")
-        .suffix(".lockb")
-        .tempfile()
+    // Bun reads `bun.lockb` from the directory of the path it's given,
+    // whatever that path's file name, so the snapshot goes into a directory
+    // of its own that only this user can enter. A shared temp directory
+    // would let anyone who planted a `bun.lockb` there choose what gets
+    // converted.
+    let mut dir_builder = tempfile::Builder::new();
+    dir_builder.prefix("lpm-bun-lock-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        dir_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let snapshot_dir = dir_builder.tempdir().map_err(LpmError::Io)?;
+    let snapshot_path = snapshot_dir.path().join("bun.lockb");
+    let mut snapshot = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&snapshot_path)
         .map_err(LpmError::Io)?;
     snapshot.write_all(&input).map_err(LpmError::Io)?;
     snapshot.flush().map_err(LpmError::Io)?;
+    drop(snapshot);
     drop(input);
 
-    let output = run_bun_converter(snapshot.path(), BUN_CONVERSION_TIMEOUT)?;
+    let output = run_bun_converter(&snapshot_path, BUN_CONVERSION_TIMEOUT)?;
     if output.trim_start().starts_with('{') {
         parse_json_str(&output)
     } else {
@@ -292,6 +307,12 @@ fn run_bun_converter(path: &Path, timeout: Duration) -> Result<String, LpmError>
         .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Run beside the snapshot so the project's bunfig.toml and .env stay
+    // out of the conversion, without the credentials LPM was given.
+    if let Some(dir) = path.parent() {
+        command.current_dir(dir);
+    }
+    lpm_common::child_env::strip_inherited_env_hooks(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -584,7 +605,9 @@ mod tests {
     fn with_fake_bun<T>(script: &str, test: impl FnOnce() -> T) -> T {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let _lock = PATH_LOCK.lock().unwrap();
+        let _lock = PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("bun");
         std::fs::write(&executable, script).unwrap();
@@ -778,6 +801,43 @@ mod tests {
                 "error should mention bun: {msg}"
             );
         }
+    }
+
+    /// Real Bun ignores the file name it's given and reads `bun.lockb` from
+    /// that file's directory.
+    #[cfg(unix)]
+    const BUN_READING_BESIDE_ITS_ARGUMENT: &str =
+        "#!/bin/sh\ncat \"$(dirname \"$1\")/bun.lockb\"\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_converter_converts_with_a_bun_that_reads_bun_lockb_beside_its_argument() {
+        with_fake_bun(BUN_READING_BESIDE_ITS_ARGUMENT, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bun.lockb");
+            std::fs::write(&path, sample_json()).unwrap();
+
+            let packages = parse_selected(&path).unwrap();
+
+            assert!(packages.iter().any(|package| package.name == "express"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_converter_hands_bun_a_private_directory_holding_only_the_snapshot() {
+        with_fake_bun(
+            "#!/bin/sh\ndir=$(dirname \"$1\")\n[ \"$(basename \"$1\")\" = bun.lockb ] || exit 7\n[ \"$(ls -A \"$dir\")\" = bun.lockb ] || exit 8\n[ \"$(stat -f %Lp \"$dir\" 2>/dev/null || stat -c %a \"$dir\")\" = 700 ] || exit 9\ncat \"$dir/bun.lockb\"\n",
+            || {
+                let project = tempfile::tempdir().unwrap();
+                let path = project.path().join("bun.lockb");
+                std::fs::write(&path, sample_json()).unwrap();
+
+                let packages = parse_selected(&path).unwrap();
+
+                assert!(packages.iter().any(|package| package.name == "express"));
+            },
+        );
     }
 
     #[cfg(unix)]

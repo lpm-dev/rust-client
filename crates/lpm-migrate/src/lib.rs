@@ -14,6 +14,7 @@ pub mod detect;
 pub mod normalize;
 pub mod npm;
 pub mod pnpm;
+mod registry_config;
 pub mod validate;
 pub mod yarn;
 
@@ -174,6 +175,20 @@ pub struct MigratedPackage {
     pub is_dev: bool,
 }
 
+/// A migrated package that the source package manager fetched from a
+/// registry other than npm's and LPM's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomRegistryPackage {
+    pub name: String,
+    pub version: String,
+    /// The tarball URL, without credentials, query or fragment: where the
+    /// lockfile says the package came from or, for a lockfile that records
+    /// none, where the package manager's registry configuration placed it.
+    /// A configured registry that isn't a URL, such as one naming an
+    /// environment variable, appears as written.
+    pub tarball_url: String,
+}
+
 /// Detected source package manager.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectedSource {
@@ -262,6 +277,9 @@ pub struct MigrateResult {
     pub skipped: Vec<SkippedPackage>,
     /// Number of workspace members detected (0 = not a monorepo).
     pub workspace_members: usize,
+    /// Migrated packages the source package manager fetched from a registry
+    /// other than npm's and LPM's, which LPM must still fetch them from.
+    pub custom_registry_packages: Vec<CustomRegistryPackage>,
 }
 
 /// A package that was skipped during migration.
@@ -320,8 +338,24 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
     // Detect workspace members
     let workspace_members = detect_workspace_members(project_dir)?;
 
+    let configured = match source.kind {
+        SourceKind::Yarn => registry_config::ConfiguredRegistries::yarn(project_dir)?,
+        SourceKind::Bun => registry_config::ConfiguredRegistries::bun(project_dir)?,
+        SourceKind::Npm | SourceKind::Pnpm => None,
+    };
+    let unreadable_registries = configured
+        .map(|registries| registry_config::place_unrecorded(&mut packages, &registries))
+        .unwrap_or_default();
+
     // Normalize to LPM lockfile
-    let (lockfile, skipped) = normalize::to_lockfile(packages);
+    let (lockfile, skipped, mut custom_registry_packages) =
+        normalize::to_lockfile_with_registries(packages);
+    custom_registry_packages.extend(unreadable_registries.into_iter().filter(|package| {
+        lockfile
+            .packages
+            .iter()
+            .any(|locked| locked.name == package.name && locked.version == package.version)
+    }));
 
     // Validate
     let warnings = validate::validate(&lockfile, project_dir);
@@ -340,6 +374,7 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
         warnings,
         skipped,
         workspace_members,
+        custom_registry_packages,
     })
 }
 

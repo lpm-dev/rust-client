@@ -30,6 +30,7 @@ pub async fn run(
     ci: bool,
     no_install: bool,
     dry_run: bool,
+    allow_registry_change: bool,
     force: bool,
     rollback: bool,
     json: bool,
@@ -48,6 +49,7 @@ pub async fn run(
             no_npmrc,
             no_install,
             dry_run,
+            allow_registry_change,
             force,
             json,
             workspace_root: workspace.is_some(),
@@ -58,7 +60,7 @@ pub async fn run(
     } else {
         super::install::workspace_lockfile::with_project_install_lock(cwd, migration).await?
     };
-    let Some((result, mut migration_backup)) = migrated else {
+    let Some((result, mut migration_backup, registry_changes)) = migrated else {
         return Ok(());
     };
 
@@ -103,6 +105,7 @@ pub async fn run(
             "skipped_count": result.skipped.len(),
             "warning_count": result.warnings.len(),
             "workspace_members": result.workspace_members,
+            "registry_changes": registry_changes_json(&registry_changes),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -151,6 +154,7 @@ struct MigrationInstallOptions {
     no_npmrc: bool,
     no_install: bool,
     dry_run: bool,
+    allow_registry_change: bool,
     force: bool,
     json: bool,
     workspace_root: bool,
@@ -160,11 +164,19 @@ async fn migrate_and_install(
     client: &RegistryClient,
     cwd: &Path,
     options: MigrationInstallOptions,
-) -> Result<Option<(lpm_migrate::MigrateResult, MigrationBackup)>, LpmError> {
+) -> Result<
+    Option<(
+        lpm_migrate::MigrateResult,
+        MigrationBackup,
+        Vec<RegistryChange>,
+    )>,
+    LpmError,
+> {
     let MigrationInstallOptions {
         no_npmrc,
         no_install,
         dry_run,
+        allow_registry_change,
         force,
         json,
         workspace_root,
@@ -215,6 +227,17 @@ async fn migrate_and_install(
         eprintln!();
         for w in &result.warnings {
             install_ui::warn_untrusted(w);
+        }
+    }
+
+    let route_table = super::install::load_install_route_table(cwd, client)?;
+    let registry_changes = registry_changes(&result.custom_registry_packages, &route_table);
+    if !registry_changes.is_empty() {
+        if !allow_registry_change {
+            return Err(registry_change_refusal(&registry_changes));
+        }
+        if !json {
+            render_registry_changes(&registry_changes);
         }
     }
 
@@ -270,6 +293,7 @@ async fn migrate_and_install(
                 "skipped_count": result.skipped.len(),
                 "warning_count": result.warnings.len(),
                 "workspace_members": result.workspace_members,
+                "registry_changes": registry_changes_json(&registry_changes),
                 "pnpm_overrides_to_translate": overrides_plan.to_apply.len(),
                 "pnpm_patches_to_translate": patches_plan.to_apply.len(),
                 "pnpm_peer_rules_to_translate": peer_rules_plan.ignore_missing_to_apply.len()
@@ -472,6 +496,9 @@ async fn migrate_and_install(
                 ));
             }
 
+            let locked_integrities = Arc::new(super::install::LockedIntegrities::from_lockfile(
+                &result.lockfile,
+            ));
             let install_result = if workspace.is_some() {
                 super::install::run_recursive_workspace_install(
                     client,
@@ -509,6 +536,7 @@ async fn migrate_and_install(
                         audit_after_install: false,
                         timing: false,
                         workspace_concurrency: None,
+                        locked_integrities: Some(Arc::clone(&locked_integrities)),
                     },
                 )
                 .await
@@ -552,7 +580,12 @@ async fn migrate_and_install(
                     &[],
                     !json,
                     json,
-                    None,
+                    Some(super::install::InstallCallerContext {
+                        route_table: super::install::load_install_route_table(cwd, client)?,
+                        policy_project_dir: None,
+                        expected_root: None,
+                        locked_integrities: Some(Arc::clone(&locked_integrities)),
+                    }),
                     lpm_common::LpmRoot::from_env()?,
                 )
                 .await
@@ -586,7 +619,7 @@ async fn migrate_and_install(
     applied?;
     sealed?;
 
-    Ok(Some((result, migration_backup)))
+    Ok(Some((result, migration_backup, registry_changes)))
 }
 
 fn render_detected_source(result: &lpm_migrate::MigrateResult, dry_run: bool) {
@@ -1631,4 +1664,107 @@ fn record_migrated_patch_records(
         );
     }
     Ok(())
+}
+
+/// A migrated package whose lockfile names a registry that LPM wouldn't
+/// fetch it from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryChange {
+    name: String,
+    version: String,
+    /// The tarball URL the lockfile recorded, without credentials.
+    from: String,
+}
+
+/// Each package the source package manager took from a custom registry
+/// that `route_table` wouldn't fetch it from. A package from npm's or LPM's
+/// registry may go wherever the user's own `.npmrc` sends it; a package
+/// from a private registry must come from that registry again, or a
+/// same-named public package would take its place.
+fn registry_changes(
+    packages: &[lpm_migrate::CustomRegistryPackage],
+    route_table: &lpm_registry::RouteTable,
+) -> Vec<RegistryChange> {
+    packages
+        .iter()
+        .filter(|package| {
+            route_table
+                .custom_route_for_package_url(&package.name, &package.tarball_url)
+                .is_none()
+        })
+        .map(|package| RegistryChange {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            from: package.tarball_url.clone(),
+        })
+        .collect()
+}
+
+/// Packages a refusal names before summarizing the rest.
+const REGISTRY_CHANGES_SHOWN: usize = 10;
+
+fn registry_change_refusal(changes: &[RegistryChange]) -> LpmError {
+    use std::fmt::Write as _;
+    let mut message = format!(
+        "{} package{} came from a registry that LPM wouldn't fetch {} from, so a package \
+         with the same name from another registry could take {} place:",
+        changes.len(),
+        if changes.len() == 1 { "" } else { "s" },
+        if changes.len() == 1 { "it" } else { "them" },
+        if changes.len() == 1 { "its" } else { "their" },
+    );
+    for change in changes.iter().take(REGISTRY_CHANGES_SHOWN) {
+        let _ = write!(
+            message,
+            "\n  {}@{} from {}",
+            change.name,
+            change.version,
+            lpm_common::sanitize_terminal_inline(&change.from)
+        );
+    }
+    if changes.len() > REGISTRY_CHANGES_SHOWN {
+        let _ = write!(
+            message,
+            "\n  and {} more",
+            changes.len() - REGISTRY_CHANGES_SHOWN
+        );
+    }
+    message.push_str(
+        "\nAdd the registry to .npmrc (`registry=<url>`, or `@scope:registry=<url>` for a \
+         scope) and run the migration again, or pass --allow-registry-change to fetch these \
+         packages from the registry LPM uses. No files were modified.",
+    );
+    LpmError::Registry(message)
+}
+
+fn render_registry_changes(changes: &[RegistryChange]) {
+    eprintln!();
+    install_ui::warn_untrusted(&format!(
+        "{} package{} will come from LPM's registry instead of the one the lockfile names \
+         (--allow-registry-change)",
+        changes.len(),
+        if changes.len() == 1 { "" } else { "s" },
+    ));
+    for change in changes.iter().take(REGISTRY_CHANGES_SHOWN) {
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} {}@{} {}",
+            install_ui::dim("-"),
+            change.name,
+            change.version,
+            install_ui::dim(&format!("was {}", change.from))
+        ));
+    }
+}
+
+fn registry_changes_json(changes: &[RegistryChange]) -> serde_json::Value {
+    changes
+        .iter()
+        .map(|change| {
+            serde_json::json!({
+                "name": change.name,
+                "version": change.version,
+                "from": change.from,
+            })
+        })
+        .collect()
 }

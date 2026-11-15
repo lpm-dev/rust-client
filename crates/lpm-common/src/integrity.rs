@@ -196,9 +196,78 @@ impl fmt::Display for Integrity {
     }
 }
 
+/// How two SRI metadata strings compare over the hash algorithms both name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SriComparison {
+    /// They share at least one algorithm, and every shared digest is equal.
+    Agree,
+    /// A digest of an algorithm both name differs.
+    Disagree,
+    /// No algorithm appears in both, so nothing can be compared.
+    NoCommonAlgorithm,
+}
+
+/// Compares two SRI metadata strings, each one or more space-separated
+/// `algorithm-base64` hashes with optional `?options`. Tokens that don't
+/// parse are ignored, as SRI ignores them.
+pub fn compare_sri(left: &str, right: &str) -> SriComparison {
+    fn hashes(sri: &str) -> impl Iterator<Item = Integrity> + '_ {
+        sri.split_ascii_whitespace().filter_map(|token| {
+            Integrity::parse(token.split_once('?').map_or(token, |(hash, _)| hash)).ok()
+        })
+    }
+    let right: Vec<Integrity> = hashes(right).collect();
+    let mut shared = false;
+    for left in hashes(left) {
+        for right in right
+            .iter()
+            .filter(|right| right.algorithm == left.algorithm)
+        {
+            shared = true;
+            if !bool::from(left.hash.ct_eq(&right.hash)) {
+                return SriComparison::Disagree;
+            }
+        }
+    }
+    if shared {
+        SriComparison::Agree
+    } else {
+        SriComparison::NoCommonAlgorithm
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sri_strings_agree_when_their_shared_algorithms_agree() {
+        let sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"package").to_string();
+        let sha1 = Integrity::from_bytes(HashAlgorithm::Sha1, b"package").to_string();
+        let other_sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"other").to_string();
+        assert_eq!(compare_sri(&sha512, &sha512), SriComparison::Agree);
+        assert_eq!(
+            compare_sri(&format!("{sha1} {sha512}?opt"), &sha512),
+            SriComparison::Agree
+        );
+        assert_eq!(compare_sri(&sha512, &other_sha512), SriComparison::Disagree);
+        assert_eq!(
+            compare_sri(
+                &format!("{sha1} {other_sha512}"),
+                &format!("{sha512} {sha1}")
+            ),
+            SriComparison::Disagree,
+            "one disagreeing shared algorithm is enough"
+        );
+        assert_eq!(
+            compare_sri(&sha1, &sha512),
+            SriComparison::NoCommonAlgorithm
+        );
+        assert_eq!(
+            compare_sri("garbage", &sha512),
+            SriComparison::NoCommonAlgorithm
+        );
+    }
 
     #[test]
     fn parse_sha512_integrity() {

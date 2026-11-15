@@ -1116,6 +1116,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                                 audit_after_install: eff_audit_after_install,
                                 timing: eff_timing,
                                 workspace_concurrency,
+                                locked_integrities: None,
                             },
                         )
                         .await
@@ -3302,6 +3303,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 ci,
                 no_install,
                 dry_run,
+                allow_registry_change,
                 force,
                 rollback,
                 yes: _yes,
@@ -3320,6 +3322,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 ci,
                 no_install,
                 dry_run,
+                allow_registry_change,
                 force,
                 rollback,
                 cli.json,
