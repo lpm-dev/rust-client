@@ -37,10 +37,15 @@ pub(super) fn execute_script(
     if cancelled.load(Ordering::Acquire) {
         return Err("Lifecycle script interrupted".to_string());
     }
-    let mut envs: HashMap<_, _> =
-        build_lifecycle_environment(env, project_dir, tmpdir, Some(&tools.bin_dir))
-            .into_iter()
-            .collect();
+    let mut envs: HashMap<_, _> = build_lifecycle_environment(
+        env,
+        project_dir,
+        tmpdir,
+        Some(&tools.bin_dir),
+        tools.project_bins,
+    )
+    .into_iter()
+    .collect();
     lpm_runner::npm_context::NpmScriptContext::new(
         Some(pkg_name),
         Some(pkg_version),
@@ -113,14 +118,28 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
     ("YARN_ENABLE_SCRIPTS", "false"),
 ];
 
+/// Makes cmd.exe leave the current directory, which is the package's, out of
+/// its search for commands named without a path.
+const NO_CURRENT_DIRECTORY_SEARCH: (&str, &str) = ("NoDefaultCurrentDirectoryInExePath", "1");
+
+/// With `project_bins`, the `PATH` is npm's: `bin_dir`, the project's
+/// `node_modules/.bin`, then the caller's own entries. Without it, a package
+/// supplies commands through `bin_dir` alone: the caller's entries that could
+/// hold a package's commands are dropped, and cmd.exe doesn't search the
+/// package's directory.
 pub(super) fn build_lifecycle_environment(
     env: &super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
     tmpdir: &Path,
     bin_dir: Option<&Path>,
+    project_bins: bool,
 ) -> Vec<(OsString, OsString)> {
     let parent_path = find_env_case_insensitive(env, "PATH");
-    let mut path_value = build_lifecycle_path(project_dir, parent_path);
+    let mut path_value = if project_bins {
+        build_lifecycle_path(project_dir, parent_path)
+    } else {
+        host_path(inherited_path(parent_path), project_dir)
+    };
     if let Some(bin_dir) = bin_dir {
         let mut prefixed = bin_dir.as_os_str().to_owned();
         prefixed.push(if cfg!(windows) { ";" } else { ":" });
@@ -140,6 +159,7 @@ pub(super) fn build_lifecycle_environment(
                     && !NESTED_INSTALL_SCRIPT_GUARD
                         .iter()
                         .any(|(name, _)| k.eq_ignore_ascii_case(name))
+                    && (project_bins || !k.eq_ignore_ascii_case(NO_CURRENT_DIRECTORY_SEARCH.0))
             })
             .map(|(k, v)| (k.clone(), v.clone())),
     );
@@ -154,7 +174,46 @@ pub(super) fn build_lifecycle_environment(
             .iter()
             .map(|(name, value)| ((*name).into(), (*value).into())),
     );
+    if !project_bins {
+        envs.push((
+            NO_CURRENT_DIRECTORY_SEARCH.0.into(),
+            NO_CURRENT_DIRECTORY_SEARCH.1.into(),
+        ));
+    }
     envs
+}
+
+/// The entries of `path` where no package's command can sit: an absolute
+/// directory outside every `node_modules` and outside the project's `.lpm`.
+/// The rest hold what dependencies declare, such as the project's `.bin`
+/// when LPM was started from a package script, or are the current
+/// directory, through an empty or relative entry. The project's own
+/// directories stay: a Python environment or a toolchain kept in the
+/// project is the user's, and a green tool may need it.
+///
+/// When no entry is left the system directories stand in, because the
+/// shell reads an empty `PATH` component as the current directory.
+fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
+    let lpm_state = project_dir.join(".lpm");
+    let resolved_lpm_state = lpm_state.canonicalize().ok();
+    let host = std::env::split_paths(path).filter(|entry| {
+        let resolved = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+        entry.is_absolute()
+            && !entry.starts_with(&lpm_state)
+            && !resolved_lpm_state
+                .as_ref()
+                .is_some_and(|state| resolved.starts_with(state))
+            && !resolved
+                .components()
+                .chain(entry.components())
+                .any(|component| component.as_os_str() == "node_modules")
+    });
+    let host = std::env::join_paths(host).unwrap_or_default();
+    if host.is_empty() {
+        inherited_path(None).to_owned()
+    } else {
+        host
+    }
 }
 
 /// — resolve the live per-package directory where lifecycle
@@ -748,20 +807,22 @@ pub(in crate::commands) fn build_lifecycle_path(
     project_dir: &Path,
     parent_path: Option<&OsStr>,
 ) -> OsString {
-    #[cfg(windows)]
-    let (separator, fallback) = (
-        ";",
-        r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem",
-    );
-    #[cfg(not(windows))]
-    let (separator, fallback) = (":", "/usr/bin:/bin");
     let mut path = project_dir
         .join("node_modules")
         .join(".bin")
         .into_os_string();
-    path.push(separator);
-    path.push(parent_path.unwrap_or(OsStr::new(fallback)));
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(inherited_path(parent_path));
     path
+}
+
+/// The caller's `PATH`, or the system directories when it has none.
+fn inherited_path(parent_path: Option<&OsStr>) -> &OsStr {
+    #[cfg(windows)]
+    let fallback = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
+    #[cfg(not(windows))]
+    let fallback = "/usr/bin:/bin";
+    parent_path.unwrap_or(OsStr::new(fallback))
 }
 
 /// Returns an absolute system shell path so package-local PATH entries cannot
@@ -814,6 +875,7 @@ mod cancellation_tests {
                 None,
                 root.path(),
                 root.path(),
+                super::super::lifecycle_tools::ToolScope::Dependencies,
             )
             .unwrap(),
             "cancel-probe",

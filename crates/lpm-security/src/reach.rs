@@ -75,6 +75,15 @@ pub enum ReachFinding {
     /// `npm run`, a line of a shell script, or a `binding.gyp` command
     /// expansion. `source` names where the command came from.
     RunsRedCommand { source: String, command: String },
+    /// A lifecycle command names a tool of the green allowlist, and a
+    /// dependency that is not the registry package that publishes the tool
+    /// declares a command of that name. `provider` is that dependency.
+    /// Recorded by the caller that knows the package's installed
+    /// dependencies; [`analyze`] reads only the package itself.
+    RunsToolFromOtherPackage { command: String, provider: String },
+    /// A finding a later LPM CLI recorded, which this one doesn't know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Package managers whose nested installs can still run dependency
@@ -187,6 +196,20 @@ impl std::fmt::Display for ReachFinding {
                     "runs a command the static gate marks Red ({source}): {command}"
                 )
             }
+            Self::RunsToolFromOtherPackage { command, provider } => {
+                write!(f, "runs `{command}` from {provider}")?;
+                match crate::static_gate::green_tool(command) {
+                    Some(tool) => write!(
+                        f,
+                        ", which is not the registry's {}",
+                        tool.providers.join(" or ")
+                    ),
+                    None => Ok(()),
+                }
+            }
+            Self::Unknown => f.write_str(
+                "reaches something a later LPM CLI recorded; update LPM CLI to see what",
+            ),
             Self::ApprovesOtherPackages { field, packages } => {
                 write!(f, "approves scripts for other packages in {field}: ")?;
                 let shown = packages.len().min(DISPLAYED_PACKAGES);
@@ -210,6 +233,8 @@ impl ReachFinding {
             Self::ChangesScriptPolicy { marker, .. } => marker,
             Self::EditsScriptApprovals { key, .. } => key,
             Self::ApprovesOtherPackages { field, .. } => field,
+            Self::RunsToolFromOtherPackage { command, .. } => command,
+            Self::Unknown => "",
         }
     }
 }
@@ -1584,5 +1609,37 @@ mod tests {
         assert_eq!(package_name("@swc/core"), "@swc/core");
         assert_eq!(package_name("sqlite@1.0.0#sha512-x"), "sqlite");
         assert_eq!(package_name("a>b>@scope/c"), "@scope/c");
+    }
+
+    #[test]
+    fn a_tool_from_another_package_needs_individual_review_and_names_both_packages() {
+        let finding = ReachFinding::RunsToolFromOtherPackage {
+            command: "electron-rebuild".into(),
+            provider: "attacker@1.0.0".into(),
+        };
+        assert!(finding.requires_individual_review());
+        assert_eq!(
+            finding.to_string(),
+            "runs `electron-rebuild` from attacker@1.0.0, which is not the registry's @electron/rebuild or electron-rebuild"
+        );
+        assert_eq!(
+            serde_json::to_value(&finding).unwrap(),
+            serde_json::json!({
+                "kind": "runs-tool-from-other-package",
+                "command": "electron-rebuild",
+                "provider": "attacker@1.0.0",
+            })
+        );
+    }
+
+    #[test]
+    fn a_finding_this_version_does_not_know_still_needs_individual_review() {
+        let reach: ScriptReach = serde_json::from_value(serde_json::json!({
+            "findings": [{ "kind": "something-newer", "detail": "x" }],
+        }))
+        .unwrap();
+
+        assert_eq!(reach.findings, [ReachFinding::Unknown]);
+        assert!(reach.requires_individual_review());
     }
 }

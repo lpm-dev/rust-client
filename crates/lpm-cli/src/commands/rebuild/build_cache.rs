@@ -497,6 +497,7 @@ pub(super) fn build_key_for_package(
         project_dir,
         scratch_path,
         Some(&tools.bin_dir),
+        tools.project_bins,
     );
     let mut build_environment: HashMap<_, _> = lifecycle_environment.iter().cloned().collect();
     let context = lpm_runner::npm_context::NpmScriptContext::new(
@@ -2107,7 +2108,14 @@ mod tests {
                 &invocation,
                 &package,
                 &project,
-                &LifecycleTools::prepare(&project, None, &project, &project).unwrap(),
+                &LifecycleTools::prepare(
+                    &project,
+                    None,
+                    &project,
+                    &project,
+                    super::super::lifecycle_tools::ToolScope::Dependencies
+                )
+                .unwrap(),
                 &project
             )
             .is_none()

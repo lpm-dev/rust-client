@@ -783,6 +783,7 @@ pub fn compute_blocked_packages_with_metadata(
         BlockedSetCaptureOptions {
             advisor_approvals,
             execution_exclusions: None,
+            registry_packages: None,
         },
     )
     .expect("valid test package manifests")
@@ -820,6 +821,9 @@ pub(crate) struct BlockedSetCaptureOptions<'a> {
         Option<&'a std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>>,
     pub(crate) execution_exclusions:
         Option<&'a HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
+    /// The install's registry packages, by which a dependency that only
+    /// declares a green tool's name is told from the tool's publisher.
+    pub(crate) registry_packages: Option<&'a crate::commands::rebuild::RegistryPackages>,
 }
 
 fn compute_blocked_packages_with_metadata_and_baseline(
@@ -962,7 +966,11 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             // populates `static_tier` from the
             // worst-wins reduction above.
             static_tier,
-            reach: Some(lpm_security::reach::analyze(pkg_dir, &phase_bodies)),
+            reach: Some(crate::commands::rebuild::script_reach(
+                pkg_dir,
+                &phase_bodies,
+                extras.registry_packages,
+            )),
             // forwarded from the install
             // pipeline's per-package provenance fetch. Populated
             // for EVERY blocked package that went through the
@@ -1190,6 +1198,7 @@ pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
         BlockedSetCaptureOptions {
             advisor_approvals,
             execution_exclusions,
+            registry_packages: None,
         },
     )
 }
@@ -2082,6 +2091,7 @@ mod tests {
                 BlockedSetCaptureOptions {
                     advisor_approvals: None,
                     execution_exclusions: exclusions,
+                    registry_packages: None,
                 },
             )
             .unwrap()

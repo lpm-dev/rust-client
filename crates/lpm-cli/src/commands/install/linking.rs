@@ -683,6 +683,7 @@ pub(super) async fn run_link_and_finish(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+    let registry_packages = super::lifecycle::registry_packages(&packages);
     // Parse the project
     // capability request + user bound so the offline / lockfile-
     // fast-path install also catches capability-widening packages.
@@ -707,6 +708,7 @@ pub(super) async fn run_link_and_finish(
             &offline_user_bound,
             None,
             baseline_index.as_ref(),
+            Some(&registry_packages),
         );
     let auto_build_attempted = should_auto_build(
         auto_build,
@@ -732,6 +734,7 @@ pub(super) async fn run_link_and_finish(
         crate::build_state::BlockedSetCaptureOptions {
             advisor_approvals: None,
             execution_exclusions: None,
+            registry_packages: Some(&registry_packages),
         },
     )?;
 
@@ -787,6 +790,7 @@ pub(super) async fn run_link_and_finish(
             crate::build_state::BlockedSetCaptureOptions {
                 advisor_approvals: None,
                 execution_exclusions: Some(&execution_exclusions),
+                registry_packages: Some(&registry_packages),
             },
         )?;
 

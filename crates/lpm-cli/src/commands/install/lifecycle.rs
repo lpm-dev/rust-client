@@ -325,6 +325,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
+    let registry_packages = registry_packages(packages);
 
     let capture_packages = resolve_blocked_capture_packages(
         project_dir,
@@ -385,7 +386,10 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         )
         .await;
         if session.is_active() {
-            let amber_requests = collect_amber_requests_from_materializations(&capture_packages)?;
+            let amber_requests = collect_amber_requests_from_materializations(
+                &capture_packages,
+                Some(&registry_packages),
+            )?;
             session.classify_amber(&amber_requests).await;
         }
         Some(session)
@@ -409,6 +413,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
             &user_bound,
             advisor_session.as_ref().map(|s| s.approvals()),
             baseline_index.as_ref(),
+            Some(&registry_packages),
         );
     let auto_build_attempted = should_auto_build(
         auto_build,
@@ -432,6 +437,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
                 advisor_session.as_ref().map(|s| s.approvals()),
             ),
             execution_exclusions: None,
+            registry_packages: Some(&registry_packages),
         },
     )?;
     tracing::debug!(
@@ -592,6 +598,7 @@ pub(super) async fn run_online_auto_build_phase(
                     advisor_session.map(|s| s.approvals()),
                 ),
                 execution_exclusions: Some(&execution_exclusions),
+                registry_packages: Some(&registry_packages(packages)),
             },
         )?;
     }
@@ -903,11 +910,37 @@ pub(super) fn collect_amber_classification_requests(
             })
         })
         .collect();
-    collect_amber_requests_from_materializations(&resolved).unwrap()
+    collect_amber_requests_from_materializations(&resolved, None).unwrap()
+}
+
+/// The registry packages among `packages`, by which the script gate tells
+/// the publisher of a green tool from a dependency that only declares its
+/// name.
+pub(super) fn registry_packages(
+    packages: &[InstallPackage],
+) -> crate::commands::rebuild::RegistryPackages {
+    crate::commands::rebuild::RegistryPackages::new(
+        packages
+            .iter()
+            .filter(|package| {
+                matches!(
+                    package.source_kind(),
+                    Ok(lpm_lockfile::Source::Registry { .. })
+                )
+            })
+            .filter_map(|package| {
+                Some((
+                    package.name.clone(),
+                    package.version.clone(),
+                    package.integrity.clone()?,
+                ))
+            }),
+    )
 }
 
 pub(super) fn collect_amber_requests_from_materializations(
     packages: &[crate::build_state::BlockedCapturePackage],
+    registry_packages: Option<&crate::commands::rebuild::RegistryPackages>,
 ) -> Result<Vec<crate::triage_advisor_session::AmberPackageRequest>, LpmError> {
     use lpm_security::static_gate::classify_for_execution;
     use lpm_security::triage::StaticTier;
@@ -948,7 +981,9 @@ pub(super) fn collect_amber_requests_from_materializations(
         }
         // Code that reaches other packages' script approvals is a human
         // decision; a model reading untrusted text must not make it.
-        if lpm_security::reach::analyze(pkg_dir, &bodies).requires_individual_review() {
+        if crate::commands::rebuild::script_reach(pkg_dir, &bodies, registry_packages)
+            .requires_individual_review()
+        {
             continue;
         }
         // The integrity slot carries source identity. Workspace /
