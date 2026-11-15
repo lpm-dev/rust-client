@@ -431,11 +431,30 @@ pub(super) async fn vars_oidc_allow(
     };
     let result = match write_policy(None).await? {
         PolicyWrite::Written(result) => result,
-        PolicyWrite::NeedsStepUp { scope, .. } => {
-            let proof = confirm_ci_access(registry_client, &scope).await?;
+        PolicyWrite::NeedsStepUp { scope } => {
+            let on_or_off = |allowed: bool| if allowed { "allowed" } else { "not allowed" };
+            let mut access = vec![
+                ("Organization", org.unwrap_or_default().to_string()),
+                ("Repository", format!("{provider} {identity_label}")),
+                ("Branches", branches.join(", ")),
+                ("Environments", envs.join(", ")),
+            ];
+            if provider == "github" {
+                access.push(("Workflows", workflows.join(", ")));
+                access.push(("Events", events.join(", ")));
+                access.push(("Forks", on_or_off(allow_forks).to_string()));
+            }
+            let proof = confirm_ci_access(registry_client, &scope, &access).await?;
             match write_policy(Some(proof)).await? {
                 PolicyWrite::Written(result) => result,
-                PolicyWrite::NeedsStepUp { message, .. } => return Err(LpmError::Env(message)),
+                PolicyWrite::NeedsStepUp { scope: _ } => {
+                    return Err(LpmError::Env(
+                        "the Registry didn't accept the confirmation, or it expired before the \
+                         policy was sent. Nothing was changed. Run this command again to \
+                         confirm once more."
+                            .into(),
+                    ));
+                }
             }
         }
     };
@@ -570,9 +589,11 @@ fn github_api_token() -> Option<String> {
 
 fn oidc_escrow_setup_error(step: &str, error: &str) -> LpmError {
     LpmError::Env(format!(
-        "OIDC policy may already have been created, but CI pulls are not ready because escrow \
-         setup failed while {step}: {error}. Fix the escrow problem, then rerun the same \
-         `lpm env oidc allow` command; rerunning safely updates the existing policy."
+        "The OIDC policy may already be saved, but escrow setup failed while {step}: {error}. \
+         If CI decryption was enabled for this project before, the saved policy can already \
+         let CI read it; otherwise CI pulls are not ready. Fix the escrow problem, then rerun \
+         the same `lpm env oidc allow` command, which safely updates the existing policy. To \
+         revoke CI access instead, run `lpm env oidc disable`."
     ))
 }
 
@@ -598,11 +619,9 @@ async fn parse_authenticated_oidc_response(
 enum PolicyWrite {
     Written(serde_json::Value),
     /// The policy isn't written until the user confirms `scope`, which
-    /// names the env project and this exact policy. `message` is the
-    /// server's wording of the refusal.
+    /// names the env project and this exact policy.
     NeedsStepUp {
         scope: String,
-        message: String,
     },
 }
 
@@ -630,10 +649,13 @@ fn is_oidc_policy_step_up_scope(scope: &str) -> bool {
 }
 
 /// Has the user confirm that it's them before CI is given access to an env
-/// project, and returns the proof the policy write carries.
+/// project, and returns the proof the policy write carries. `access` is the
+/// policy being confirmed, shown first: the prompt and the approval page
+/// name the project, not what CI is given.
 async fn confirm_ci_access(
     registry_client: &lpm_registry::RegistryClient,
     scope: &str,
+    access: &[(&'static str, String)],
 ) -> Result<String, LpmError> {
     use std::io::IsTerminal as _;
 
@@ -646,6 +668,9 @@ async fn confirm_ci_access(
         ));
     }
     output::info("Giving CI access to this env project needs a confirmation that it's you.");
+    for (label, value) in access {
+        output::field(label, value);
+    }
     crate::step_up::request_cli_step_up_proof(registry_client, scope).await
 }
 
@@ -686,7 +711,6 @@ async fn create_oidc_policy(
     match body["requiredScope"].as_str() {
         Some(scope) if is_oidc_policy_step_up_scope(scope) => Ok(PolicyWrite::NeedsStepUp {
             scope: scope.to_string(),
-            message,
         }),
         _ => Err(LpmError::Env(
             "the server asked for a confirmation this LPM CLI doesn't recognize. Update it \
@@ -1343,11 +1367,7 @@ mod policy_step_up_tests {
             .unwrap();
 
         assert!(
-            matches!(
-                &answer,
-                PolicyWrite::NeedsStepUp { scope, message }
-                    if scope == SCOPE && message == "confirm it's you"
-            ),
+            matches!(&answer, PolicyWrite::NeedsStepUp { scope } if scope == SCOPE),
             "{answer:?}"
         );
     }

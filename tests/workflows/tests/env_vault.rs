@@ -9014,6 +9014,78 @@ async fn env_oidc_org_allow_transfers_only_the_authenticated_project_content_key
 }
 
 #[tokio::test]
+async fn env_oidc_org_allow_without_a_terminal_stops_at_the_confirmation_request() {
+    let project = TempProject::empty(r#"{"name":"org-ci-confirm","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let org_id = "00000000-0000-4000-8000-000000000001";
+    project.write_file("lpm.json", r#"{"vault":"org-ci-project"}"#);
+    lpm_vault::vault_id::write_org_sync_version_for_principal(
+        project.path(),
+        "acme",
+        7,
+        lpm_vault::vault_id::SyncPrincipal {
+            registry_url: &mock.url(),
+            principal_id: org_id,
+        },
+    )
+    .unwrap();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/vault/oidc/policies"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "Add the policy on the env project's page on lpm.dev.",
+            "code": "step_up_required",
+            "requiredScope": format!(
+                "vault:oidc-policy:3f2b8c1e-9a4d-4c6b-8e21-5d7f0a9b1c23:{}",
+                "ab".repeat(32)
+            ),
+        })))
+        .mount(mock.server())
+        .await;
+
+    let result = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "oidc",
+            "allow",
+            "--org=acme",
+            "--allow-server-decryption",
+            "--provider=gitlab",
+            "--project-id=123",
+            "--env=production",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    let error = parse_json_output(&result.stdout);
+    assert!(
+        error.to_string().contains("interactive terminal"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let paths: Vec<&str> = requests.iter().map(|r| r.url.path()).collect();
+    assert_eq!(
+        paths,
+        ["/api/vault/oidc/policies"],
+        "nothing is confirmed, retried or uploaded without a terminal"
+    );
+    assert!(!requests[0].headers.contains_key("x-lpm-step-up-proof"));
+}
+
+#[tokio::test]
 async fn env_oidc_org_list_and_disable_preserve_the_organization_selector() {
     let project = TempProject::empty(r#"{"name":"org-ci-controls","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
