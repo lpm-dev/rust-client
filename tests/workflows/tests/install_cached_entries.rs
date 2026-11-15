@@ -196,6 +196,83 @@ async fn v1_file_backed_install_downloads_once_to_prove_a_pin_in_another_hash_al
     v1_install_proves_an_alternate_pin_once(&[("LPM_STREAM_FETCH", "0")]).await;
 }
 
+/// The v1 store holds the archive as an LPM that recorded the lockfile's own
+/// algorithm left it: under its SHA-1, with an alias to the SHA-512 it was
+/// never checked against. A lockfile that pins the SHA-512 downloads the
+/// archive and extracts it over that entry.
+async fn v1_install_extracts_again_over_a_weaker_record(env: &[(&str, &str)]) {
+    use sha2::Digest as _;
+
+    let mock = MockRegistry::start().await;
+    let archive = marked_archive(b"original");
+    mock.with_package("same", "1.0.0", &archive).await;
+    let project = consumer_of_same();
+    lpm_v1_with_registry(&project, &mock.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+    let sha512 = compute_integrity(&archive);
+    assert!(project.read_file("lpm.lock").contains(&sha512));
+    remove_install_output(&project);
+
+    let store = lpm_store::PackageStore::at(project.store_dir());
+    let entry = store.package_dir("same", "1.0.0");
+    std::fs::remove_dir_all(&entry).unwrap();
+    let sha1 = lpm_store::compute_sri_hash_sha1(&archive);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, &archive).unwrap();
+    store
+        .store_package_from_file_timed("same", "1.0.0", file.path(), &sha1, None)
+        .unwrap();
+    std::fs::write(entry.join("left-behind.txt"), b"").unwrap();
+    let aliases = project.store_dir().join("integrity-aliases-v1");
+    std::fs::create_dir_all(&aliases).unwrap();
+    std::fs::write(
+        aliases.join(format!(
+            "{}.sha512",
+            hex::encode(sha2::Sha512::digest(sha1.as_bytes()))
+        )),
+        format!("{sha1}\n{sha512}"),
+    )
+    .unwrap();
+
+    let offline = lpm_v1_with_registry(&project, &mock.url())
+        .args(INSTALL)
+        .arg("--offline")
+        .output()
+        .unwrap();
+    assert!(!offline.status.success());
+    assert!(
+        String::from_utf8_lossy(&offline.stderr)
+            .contains("not in the global store under the integrity"),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert!(entry.join("left-behind.txt").exists());
+
+    lpm_v1_with_registry(&project, &mock.url())
+        .envs(env.iter().copied())
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    assert_eq!(installed_marker(&project).unwrap(), b"original");
+    assert_eq!(lpm_store::read_stored_integrity(&entry).unwrap(), sha512);
+    assert!(!entry.join("left-behind.txt").exists());
+    assert_eq!(mock.tarball_request_count("same", "1.0.0").await, 2);
+}
+
+#[tokio::test]
+async fn v1_install_extracts_the_archive_again_over_an_entry_recorded_under_a_weaker_hash() {
+    v1_install_extracts_again_over_a_weaker_record(&[]).await;
+}
+
+#[tokio::test]
+async fn v1_file_backed_install_extracts_the_archive_again_over_an_entry_recorded_under_a_weaker_hash()
+ {
+    v1_install_extracts_again_over_a_weaker_record(&[("LPM_STREAM_FETCH", "0")]).await;
+}
+
 #[tokio::test]
 async fn missing_install_artifacts_do_not_bypass_frozen_lockfile_validation() {
     let mock = MockRegistry::start().await;

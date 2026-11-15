@@ -4398,11 +4398,13 @@ async fn store_downloaded_registry_tarball(
                 tracing::warn!("no integrity hash for {name}@{version} — skipping verification");
             }
             let integrity_ms = integrity_start.elapsed().as_millis();
+            // The entry is recorded under sha512 whatever the lockfile pins,
+            // so a later pin in a stronger algorithm finds it.
             let (_, stage) = store.store_package_from_file_timed(
                 &name,
                 &version,
                 downloaded.file.path(),
-                &computed_sri,
+                &downloaded.sha512_sri,
                 integrity.as_deref(),
             )?;
             Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
