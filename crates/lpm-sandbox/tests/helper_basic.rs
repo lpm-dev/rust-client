@@ -321,3 +321,75 @@ fn helper_propagates_nonzero_exit_code_from_lifecycle_child() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+/// Windows ends no process with the one that started it, so the helper
+/// ends its script when its own caller goes. The caller here is a
+/// `cmd.exe` the test can end; the script is another that waits for input
+/// nobody sends.
+#[test]
+fn a_script_ends_when_the_process_that_started_its_helper_does() {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let name = format!("LpmCallerEndsTest{:x}{unique_suffix:x}", std::process::id());
+    let _profile = TemporaryAppContainerProfile::new(&name);
+    let helper = assert_cmd::cargo::cargo_bin("lpm-sandbox-helper");
+    let mut caller = std::process::Command::new(r"C:\Windows\System32\cmd.exe");
+    caller
+        .raw_arg(format!(
+            "/d /s /c \"\"{}\" --protocol-version {} --appcontainer-name {name} \
+             --stdio-stdin inherit --stdio-stdout inherit --stdio-stderr null \
+             -- C:\\Windows\\System32\\cmd.exe /d /k\"",
+            helper.display(),
+            PROTOCOL_VERSION.as_str(),
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut caller = caller.spawn().expect("start the helper's caller");
+    let input_nobody_sends = caller.stdin.take().expect("the caller's stdin");
+    let mut output = caller.stdout.take().expect("the caller's stdout");
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 256];
+        loop {
+            let read = output.read(&mut buffer).unwrap_or(0);
+            if said.send(read).is_err() || read == 0 {
+                return;
+            }
+        }
+    });
+    // Neither the caller nor the helper writes anything, so the first
+    // bytes are the script's prompt.
+    let started = heard.recv_timeout(Duration::from_secs(60));
+    assert!(
+        matches!(started, Ok(read) if read > 0),
+        "the script never started: {started:?}"
+    );
+
+    caller.kill().expect("end the helper's caller");
+    caller.wait().expect("reap the helper's caller");
+
+    // The pipe closes once the helper and the script have both let go of it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let closed = loop {
+        match heard.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(0) => break true,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+    // The end of its input stops the script too, so a failure here leaves
+    // nothing running.
+    drop(input_nobody_sends);
+    assert!(
+        closed,
+        "the script outlived the process that started its helper"
+    );
+}
