@@ -8,6 +8,11 @@
 //! all of them. Both happen under the identity's lock, which a run holds
 //! until its child exits, so no other run of the identity changes them
 //! meanwhile.
+//!
+//! The record also names what a run sets outside those trees for as long
+//! as it lasts ([`RunAccess`]). A run takes that back when it ends; one
+//! stopped first, as a script over its time limit is, can't, so the next
+//! run of the identity or its cleanup does.
 
 use super::*;
 use std::collections::HashMap;
@@ -21,22 +26,79 @@ use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER_LOCAL_SETTINGS, KEY_QUERY_VALUE, KEY_READ, RegCloseKey, RegOpenKeyExW,
 };
 
-/// What a grant or sweep record holds: the trees as the helper left them.
+/// What a grant or sweep record holds: the trees as the helper left them
+/// and, in a grant record, what a run still holds outside them.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TreeRecord {
     version: u32,
     trees: Vec<PathBuf>,
+    /// Left out when empty, and read as empty where an earlier release
+    /// wrote the record.
+    #[serde(default, skip_serializing_if = "RunAccess::is_empty")]
+    run: RunAccess,
+}
+
+/// What a run sets for its identity outside the identity's trees, for as
+/// long as the run lasts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct RunAccess {
+    /// Directories the identity may pass through to reach its trees.
+    #[serde(default)]
+    pub(super) traversed: Vec<PathBuf>,
+    /// Secrets the identity is denied reading.
+    #[serde(default)]
+    pub(super) denied: Vec<PathBuf>,
+}
+
+impl RunAccess {
+    fn is_empty(&self) -> bool {
+        self.traversed.is_empty() && self.denied.is_empty()
+    }
+
+    /// Names `other`'s entries too, each once.
+    fn add(&mut self, other: &Self) {
+        let add = |held: &mut Vec<PathBuf>, more: &[PathBuf]| {
+            for path in more {
+                if !held.contains(path) {
+                    held.push(path.clone());
+                }
+            }
+        };
+        add(&mut self.traversed, &other.traversed);
+        add(&mut self.denied, &other.denied);
+    }
+
+    /// Stops naming `other`'s entries.
+    fn remove(&mut self, other: &Self) {
+        self.traversed
+            .retain(|path| !other.traversed.contains(path));
+        self.denied.retain(|path| !other.denied.contains(path));
+    }
 }
 
 const TREE_RECORD_VERSION: u32 = 1;
 
-/// The trees `path` records; none when it doesn't exist yet. One that
-/// can't be read is logged and read as none: the run then revokes nothing
-/// it doesn't grant again, and writes a new record.
-fn read_record(path: &Path) -> Vec<PathBuf> {
+impl TreeRecord {
+    fn naming(trees: Vec<PathBuf>, run: RunAccess) -> Self {
+        Self {
+            version: TREE_RECORD_VERSION,
+            trees,
+            run,
+        }
+    }
+
+    fn empty() -> Self {
+        Self::naming(Vec::new(), RunAccess::default())
+    }
+}
+
+/// What `path` records; nothing when it doesn't exist yet. One that
+/// can't be read is logged and read as naming nothing: the run then
+/// revokes nothing it doesn't grant again, and writes a new record.
+fn read_record(path: &Path) -> TreeRecord {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<TreeRecord>(&bytes) {
-            Ok(record) if record.version == TREE_RECORD_VERSION => record.trees,
+            Ok(record) if record.version == TREE_RECORD_VERSION => record,
             Ok(record) => {
                 tracing::warn!(
                     target: "lpm_sandbox::helper_appcontainer",
@@ -44,7 +106,7 @@ fn read_record(path: &Path) -> Vec<PathBuf> {
                     path.display(),
                     record.version,
                 );
-                Vec::new()
+                TreeRecord::empty()
             }
             Err(error) => {
                 tracing::warn!(
@@ -52,36 +114,39 @@ fn read_record(path: &Path) -> Vec<PathBuf> {
                     "ignoring unreadable {}: {error}",
                     path.display(),
                 );
-                Vec::new()
+                TreeRecord::empty()
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TreeRecord::empty(),
         Err(error) => {
             tracing::warn!(
                 target: "lpm_sandbox::helper_appcontainer",
                 "ignoring unreadable {}: {error}",
                 path.display(),
             );
-            Vec::new()
+            TreeRecord::empty()
         }
     }
 }
 
-/// The trees `path` records, as a cleanup must have them: a record it can't
-/// read, or that another release wrote, may name trees still granted, so it
-/// is an error rather than none. A record that doesn't exist names none.
-fn read_record_strictly(path: &Path) -> Result<Vec<PathBuf>, AppContainerError> {
+/// What `path` records, as a cleanup must have it: a record it can't
+/// read, or that another release wrote, may name access still set, so it
+/// is an error rather than nothing. A record that doesn't exist names
+/// nothing.
+fn read_record_strictly(path: &Path) -> Result<TreeRecord, AppContainerError> {
     let unreadable = |source: std::io::Error| AppContainerError::GrantRecord {
         path: path.to_path_buf(),
         source,
     };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TreeRecord::empty());
+        }
         Err(error) => return Err(unreadable(error)),
     };
     match serde_json::from_slice::<TreeRecord>(&bytes) {
-        Ok(record) if record.version == TREE_RECORD_VERSION => Ok(record.trees),
+        Ok(record) if record.version == TREE_RECORD_VERSION => Ok(record),
         Ok(record) => Err(unreadable(std::io::Error::other(format!(
             "written by another release (version {})",
             record.version
@@ -90,12 +155,8 @@ fn read_record_strictly(path: &Path) -> Result<Vec<PathBuf>, AppContainerError> 
     }
 }
 
-fn write_record(path: &Path, trees: &[PathBuf]) -> Result<(), AppContainerError> {
-    let record = TreeRecord {
-        version: TREE_RECORD_VERSION,
-        trees: trees.to_vec(),
-    };
-    let bytes = serde_json::to_vec_pretty(&record).expect("a tree record serializes");
+fn write_record(path: &Path, record: &TreeRecord) -> Result<(), AppContainerError> {
+    let bytes = serde_json::to_vec_pretty(record).expect("a tree record serializes");
     let written = path
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
@@ -143,13 +204,14 @@ pub(super) fn revoke_stale_grants(
     let previous = read_record(record);
     let covering: Vec<String> = current.iter().map(|tree| comparable(tree)).collect();
     let stale: Vec<PathBuf> = previous
+        .trees
         .iter()
         .filter(|tree| !is_covered(tree, &covering))
         .cloned()
         .collect();
     let mut both = current.to_vec();
     both.extend(stale.iter().cloned());
-    write_record(record, &both)?;
+    write_record(record, &TreeRecord::naming(both, previous.run))?;
     for tree in &stale {
         if let Err(error) = revoke_tree(tree, sid, false) {
             tracing::warn!(
@@ -164,17 +226,99 @@ pub(super) fn revoke_stale_grants(
 
 /// Records that the identity holds `granted`, once a run granted it.
 pub(super) fn record_grants(record: &Path, granted: &[PathBuf]) -> Result<(), AppContainerError> {
-    write_record(record, granted)
+    let run = read_record(record).run;
+    write_record(record, &TreeRecord::naming(granted.to_vec(), run))
 }
 
-/// Revokes every tree the identity was granted and removes its record,
-/// as a cleanup run does once the package leaves the project.
+/// Names `access` in the record before a run sets it, so a run stopped
+/// before it ends leaves the next one everything it may have set.
+pub(super) fn record_run_access(
+    record: &Path,
+    access: &RunAccess,
+) -> Result<(), AppContainerError> {
+    if access.is_empty() {
+        return Ok(());
+    }
+    let mut recorded = read_record(record);
+    recorded.run.add(access);
+    write_record(record, &recorded)
+}
+
+/// Stops naming `access` in the record, once a run took it back.
+pub(super) fn forget_run_access(
+    record: &Path,
+    access: &RunAccess,
+) -> Result<(), AppContainerError> {
+    let mut recorded = read_record(record);
+    if recorded.run.is_empty() {
+        return Ok(());
+    }
+    recorded.run.remove(access);
+    write_record(record, &recorded)
+}
+
+/// Takes back what an earlier run of the identity set for as long as it
+/// lasted and was stopped before taking back. What it can't take back
+/// stays in the record for the run after this one.
+pub(super) fn take_back_run_access(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let mut recorded = read_record(record);
+    if recorded.run.is_empty() {
+        return Ok(());
+    }
+    let (left, _) = take_back(&recorded.run, sid);
+    recorded.run = left;
+    write_record(record, &recorded)
+}
+
+/// Removes the identity's traversal of each directory `access` names and
+/// its read denial on each secret. An entry that is gone, or became a
+/// link, holds neither. Says what it couldn't take back, and the first
+/// reason.
+fn take_back(access: &RunAccess, sid: PSID) -> (RunAccess, Option<AppContainerError>) {
+    let mut left = RunAccess::default();
+    let mut first = None;
+    let mut keep = |held: &mut Vec<PathBuf>, path: &Path, error: AppContainerError| {
+        tracing::warn!(
+            target: "lpm_sandbox::helper_appcontainer",
+            "couldn't take back an earlier run's access to {}: {error}",
+            path.display(),
+        );
+        held.push(path.to_path_buf());
+        first.get_or_insert(error);
+    };
+    let sid_address = sid as usize;
+    // SAFETY: both SIDs are valid for the comparison.
+    let granted = move |ace: PSID| unsafe { EqualSid(ace, sid_address as PSID) != 0 };
+    for path in &access.traversed {
+        match setup::remove_allowed_aces_where(path, granted) {
+            Ok(_) => {}
+            Err(error) if left_the_tree(&error) => {}
+            Err(error) => keep(&mut left.traversed, path, error),
+        }
+    }
+    for path in &access.denied {
+        match setup::remove_appcontainer_read_deny(path, sid) {
+            Ok(()) => {}
+            Err(error) if left_the_tree(&error) => {}
+            Err(error) => keep(&mut left.denied, path, error),
+        }
+    }
+    (left, first)
+}
+
+/// Revokes every tree the identity was granted, takes back what a run of
+/// it left set, and removes its record, as a cleanup run does once the
+/// package leaves the project.
 pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let recorded = read_record_strictly(record)?;
     let mut failed = None;
-    for tree in read_record_strictly(record)? {
-        if let Err(error) = revoke_tree(&tree, sid, true) {
+    for tree in &recorded.trees {
+        if let Err(error) = revoke_tree(tree, sid, true) {
             failed.get_or_insert(error);
         }
+    }
+    if let (_, Some(error)) = take_back(&recorded.run, sid) {
+        failed.get_or_insert(error);
     }
     if let Some(error) = failed {
         return Err(error);
@@ -268,7 +412,7 @@ pub(super) fn sweep_dead_grants(
     own: PSID,
 ) -> Result<(), AppContainerError> {
     let _lock = setup::lock_named(r"Global\LpmSandboxSweep")?;
-    let mut swept = read_record(record);
+    let mut swept = read_record(record).trees;
     let covering: Vec<String> = swept.iter().map(|tree| comparable(tree)).collect();
     let pending: Vec<&PathBuf> = trees
         .iter()
@@ -288,7 +432,7 @@ pub(super) fn sweep_dead_grants(
         sweep_tree(tree, &liveness);
         swept.push(tree.clone());
     }
-    write_record(record, &swept)
+    write_record(record, &TreeRecord::naming(swept, RunAccess::default()))
 }
 
 fn sweep_tree(root: &Path, liveness: &Liveness) {
@@ -807,7 +951,7 @@ mod tests {
             assert!(grants(path, live.0), "{}", path.display());
             assert!(grants(path, packages.Sid), "{}", path.display());
         }
-        assert_eq!(read_record(&record), std::slice::from_ref(&tree));
+        assert_eq!(read_record(&record).trees, std::slice::from_ref(&tree));
         grant_dacl_ace_to_tree(&tree, None, dead.0, FILE_GENERIC_READ, true).unwrap();
         sweep_dead_grants(&record, std::slice::from_ref(&tree), live.0).unwrap();
         assert!(grants(&tree, dead.0), "a swept tree was swept again");
@@ -849,11 +993,160 @@ mod tests {
     fn a_record_round_trips_and_an_unreadable_one_reads_as_none() {
         let directory = tempfile::tempdir().unwrap();
         let record = directory.path().join("nested").join("grants.json");
-        assert!(read_record(&record).is_empty());
+        assert!(read_record(&record).trees.is_empty());
         let trees = vec![PathBuf::from(r"C:\one"), PathBuf::from(r"C:\two")];
-        write_record(&record, &trees).unwrap();
-        assert_eq!(read_record(&record), trees);
+        let run = RunAccess {
+            traversed: vec![PathBuf::from(r"C:\")],
+            denied: vec![PathBuf::from(r"C:\one\.env")],
+        };
+        write_record(&record, &TreeRecord::naming(trees.clone(), run.clone())).unwrap();
+        let read = read_record(&record);
+        assert_eq!((read.trees, read.run), (trees, run));
         std::fs::write(&record, b"not json").unwrap();
-        assert!(read_record(&record).is_empty());
+        let read = read_record(&record);
+        assert!(read.trees.is_empty() && read.run.is_empty());
+    }
+
+    #[test]
+    fn a_record_an_earlier_release_wrote_names_nothing_a_run_left_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("grants.json");
+        std::fs::write(&record, br#"{"version":1,"trees":["C:\\one"]}"#).unwrap();
+
+        let read = read_record_strictly(&record).unwrap();
+
+        assert_eq!(read.trees, [PathBuf::from(r"C:\one")]);
+        assert!(read.run.is_empty());
+        write_record(&record, &read).unwrap();
+        assert!(
+            !std::fs::read_to_string(&record).unwrap().contains("run"),
+            "a record that names no run access reads as before in an earlier release"
+        );
+    }
+
+    /// Whether `path`'s DACL holds an access-denied ACE for `sid`.
+    fn denies(path: &Path, sid: PSID) -> bool {
+        let wide = to_wide_with_nul(path.as_os_str());
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the path lives through the call and both outputs are initialized.
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(error, ERROR_SUCCESS, "{}", path.display());
+        let _descriptor = LocalAllocGuard(descriptor as *mut _);
+        let (_, matching) = dacl_without_aces_where(path, dacl, ACCESS_DENIED_ACE_TYPE, |ace| {
+            // SAFETY: both SIDs are valid for the comparison.
+            unsafe { EqualSid(ace, sid) != 0 }
+        })
+        .unwrap();
+        matching > 0
+    }
+
+    /// What a run that was stopped before it ended leaves behind: its
+    /// traversal of `passed` and its read denial on `secret`, both named
+    /// in `record`.
+    fn stopped_run(record: &Path, passed: &Path, secret: &Path, sid: PSID) -> RunAccess {
+        let access = RunAccess {
+            traversed: vec![passed.to_path_buf()],
+            denied: vec![secret.to_path_buf()],
+        };
+        record_run_access(record, &access).unwrap();
+        setup::update_ace(passed, sid, Some((setup::METADATA_ACCESS, 0))).unwrap();
+        setup::deny_appcontainer_read(secret, sid).unwrap();
+        assert!(grants(passed, sid) && denies(secret, sid));
+        access
+    }
+
+    #[test]
+    fn the_next_run_takes_back_what_a_stopped_run_left_set() {
+        let name = unique_name("LpmIdentityStopped");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let tree = tree_with_a_file(root.path(), "granted");
+        let secret = root.path().join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let record = root.path().join("grants.json");
+        record_grants(&record, std::slice::from_ref(&tree)).unwrap();
+        stopped_run(&record, root.path(), &secret, sid.0);
+
+        take_back_run_access(&record, sid.0).unwrap();
+
+        assert!(!grants(root.path(), sid.0));
+        assert!(!denies(&secret, sid.0));
+        let read = read_record(&record);
+        assert!(read.run.is_empty());
+        assert_eq!(read.trees, [tree], "the identity's trees stay recorded");
+        delete_profile(&name);
+    }
+
+    #[test]
+    fn a_run_that_ends_forgets_what_it_took_back_and_keeps_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("grants.json");
+        let kept = RunAccess {
+            traversed: vec![PathBuf::from(r"C:\kept")],
+            denied: Vec::new(),
+        };
+        let ended = RunAccess {
+            traversed: vec![PathBuf::from(r"C:\Users")],
+            denied: vec![PathBuf::from(r"C:\Users\me\.env")],
+        };
+        record_run_access(&record, &kept).unwrap();
+        record_run_access(&record, &ended).unwrap();
+        record_grants(&record, &[PathBuf::from(r"C:\tree")]).unwrap();
+
+        forget_run_access(&record, &ended).unwrap();
+
+        let read = read_record(&record);
+        assert_eq!(read.run, kept);
+        assert_eq!(read.trees, [PathBuf::from(r"C:\tree")]);
+    }
+
+    #[test]
+    fn an_entry_that_is_gone_holds_nothing_to_take_back() {
+        let name = unique_name("LpmIdentityGone");
+        let sid = derive_appcontainer_sid(&name).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("grants.json");
+        record_run_access(
+            &record,
+            &RunAccess {
+                traversed: vec![root.path().join("removed")],
+                denied: vec![root.path().join("removed").join(".env")],
+            },
+        )
+        .unwrap();
+
+        take_back_run_access(&record, sid.0).unwrap();
+
+        assert!(read_record(&record).run.is_empty());
+    }
+
+    #[test]
+    fn a_cleanup_run_takes_back_what_a_stopped_run_left_set() {
+        let name = unique_name("LpmIdentityCleanupStopped");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let record = root.path().join("grants.json");
+        stopped_run(&record, root.path(), &secret, sid.0);
+
+        revoke_all(&record, sid.0).unwrap();
+
+        assert!(!grants(root.path(), sid.0));
+        assert!(!denies(&secret, sid.0));
+        assert!(!record.exists());
+        delete_profile(&name);
     }
 }

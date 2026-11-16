@@ -564,7 +564,24 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
-    let prepared_access = setup::prepare(&args, &sid)?;
+    // What a run of this identity that was stopped before it ended left
+    // set comes off first; what this run sets until it ends is recorded
+    // before it is set.
+    if let Some(record) = &args.grant_record {
+        identity::take_back_run_access(record, sid.0)?;
+    }
+    let mut prepared_access = setup::prepare(&args, &sid, |traversed| {
+        let Some(record) = &args.grant_record else {
+            return Ok(());
+        };
+        identity::record_run_access(
+            record,
+            &identity::RunAccess {
+                traversed: traversed.to_vec(),
+                denied: args.secret_read_denied_paths.clone(),
+            },
+        )
+    })?;
 
     // What this run grants, minus what the identity was granted before
     // and no longer is; and once, grants that profiles of earlier
@@ -826,6 +843,17 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     }
     for denial in secret_denials.iter_mut().rev() {
         denial.remove()?;
+    }
+    let taken_back = identity::RunAccess {
+        traversed: prepared_access.release(),
+        denied: args.secret_read_denied_paths.clone(),
+    };
+    if let Some(record) = &args.grant_record
+        && let Err(error) = identity::forget_run_access(record, &taken_back)
+    {
+        // The record then names access this run no longer holds, which the
+        // next run finds already taken back.
+        tracing::warn!(target: "lpm_sandbox::helper_appcontainer", "{error}");
     }
     profile_cleanup.delete()?;
     // Exit codes >= 0x80000000 are Windows STATUS_* values

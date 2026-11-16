@@ -556,6 +556,91 @@ fn helper_secret_read_deny_overrides_broad_read_and_does_not_leave_a_stale_deny(
     );
 }
 
+/// Whether `path`'s permissions hold an entry that denies access.
+fn holds_a_denial(path: &std::path::Path) -> bool {
+    let listing = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .expect("icacls lists the permissions");
+    assert!(listing.status.success(), "{listing:?}");
+    String::from_utf8_lossy(&listing.stdout).contains("(DENY)")
+}
+
+#[test]
+fn a_cleanup_takes_back_the_secret_denial_of_a_run_that_was_stopped() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let identity = [
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        format!("LpmFilesystemStopped-{}", std::process::id()),
+        "--grant-record".into(),
+        record.to_string_lossy().into_owned(),
+    ];
+    let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&identity)
+        .args(["--stdio-stdin", "null"])
+        .args(["--stdio-stdout", "null"])
+        .args(["--stdio-stderr", "null"])
+        .arg("--readable-dir")
+        .arg(project.path())
+        .arg("--secret-read-deny")
+        .arg(&secret)
+        .args([
+            "--",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 300",
+        ])
+        .spawn()
+        .expect("spawn helper");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !holds_a_denial(&secret) {
+        assert!(
+            helper.try_wait().expect("poll helper").is_none(),
+            "the run ended before it denied its identity the secret"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never denied its identity the secret"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // As a script over its time limit is stopped: the helper gets no
+    // chance to take back what it set.
+    helper.kill().expect("stop the run");
+    helper.wait().expect("the stopped run exits");
+    assert!(
+        holds_a_denial(&secret),
+        "a stopped run can't take its denial back itself"
+    );
+
+    let cleanup = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&identity)
+        .args(["--revoke-only", "--delete-appcontainer-profile"])
+        .output()
+        .expect("spawn cleanup");
+
+    assert!(cleanup.status.success(), "{cleanup:?}");
+    assert!(
+        !holds_a_denial(&secret),
+        "the cleanup takes back the denial the stopped run left"
+    );
+    assert!(!record.exists());
+    assert_eq!(
+        fs::read_to_string(&secret).expect("the host user keeps access to the secret"),
+        "protected-content"
+    );
+}
+
 #[test]
 fn helper_denies_read_to_path_outside_any_allow_set() {
     let tmp = tempfile::tempdir().expect("tempdir");

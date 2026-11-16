@@ -17,7 +17,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-const METADATA_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
+pub(super) const METADATA_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
 const TOOL_ACCESS: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 
 /// The approved access to one directory.
@@ -601,6 +601,16 @@ pub(super) fn remove_allowed_aces_where(
     path: &Path,
     drops: impl Fn(PSID) -> bool,
 ) -> Result<usize, AppContainerError> {
+    remove_aces_where(path, super::ACCESS_ALLOWED_ACE_TYPE, drops)
+}
+
+/// [`remove_allowed_aces_where`] for the ACEs of `ace_type`, an allow or
+/// a deny type.
+fn remove_aces_where(
+    path: &Path,
+    ace_type: u8,
+    drops: impl Fn(PSID) -> bool,
+) -> Result<usize, AppContainerError> {
     let (handle, identity) = match open_permissions(path, true) {
         Ok(opened) => opened,
         Err(
@@ -611,14 +621,14 @@ pub(super) fn remove_allowed_aces_where(
         ) => {
             let (handle, _) = open_permissions(path, false)?;
             let (old, _descriptor) = read_dacl(&handle, path)?;
-            let (_, held) = super::dacl_without_allowed_aces_where(path, old, &drops)?;
+            let (_, held) = super::dacl_without_aces_where(path, old, ace_type, &drops)?;
             return if held == 0 { Ok(0) } else { Err(error) };
         }
         Err(error) => return Err(error),
     };
     let _lock = lock_object(identity)?;
     let (old, _descriptor) = read_dacl(&handle, path)?;
-    let (mut filtered, removed) = super::dacl_without_allowed_aces_where(path, old, drops)?;
+    let (mut filtered, removed) = super::dacl_without_aces_where(path, old, ace_type, drops)?;
     if removed > 0 {
         write_dacl(&handle, path, filtered.as_mut_ptr().cast())?;
     }
@@ -811,23 +821,17 @@ pub(super) fn deny_appcontainer_read(path: &Path, sid: PSID) -> Result<(), AppCo
 }
 
 /// Removes the read denial [`deny_appcontainer_read`] gave `sid` on `path`,
-/// and nothing else, under the same lock.
+/// and nothing else, under the same lock. A path this user can't change
+/// that holds no such denial needs nothing: none could be set there.
 pub(super) fn remove_appcontainer_read_deny(
     path: &Path,
     sid: PSID,
 ) -> Result<(), AppContainerError> {
-    let (handle, identity) = open_permissions(path, true)?;
-    let _lock = lock_object(identity)?;
-    let (old, _descriptor) = read_dacl(&handle, path)?;
-    let (mut filtered, removed) =
-        super::dacl_without_aces_where(path, old, ACCESS_DENIED_ACE_TYPE, |ace_sid| {
-            // SAFETY: both SIDs are valid for the comparison.
-            unsafe { EqualSid(ace_sid, sid) != 0 }
-        })?;
-    if removed > 0 {
-        write_dacl(&handle, path, filtered.as_mut_ptr().cast())?;
-    }
-    Ok(())
+    remove_aces_where(path, ACCESS_DENIED_ACE_TYPE, |ace_sid| {
+        // SAFETY: both SIDs are valid for the comparison.
+        unsafe { EqualSid(ace_sid, sid) != 0 }
+    })
+    .map(|_| ())
 }
 
 // Reject reparses during the kernel path lookup. Child traversal then uses
@@ -1128,19 +1132,36 @@ pub(super) struct PreparedAccess<'a> {
     invocation: &'a SidGuard,
 }
 
-impl Drop for PreparedAccess<'_> {
-    fn drop(&mut self) {
-        for path in self.temporary.iter().rev() {
-            if let Err(error) = update_ace(path, self.invocation.0, None) {
-                tracing::warn!(path = %path.display(), "cannot remove temporary sandbox metadata access: {error}");
+impl PreparedAccess<'_> {
+    /// Takes back the traversal this run set on directories outside its
+    /// trees, and says which it took back. One it couldn't is logged.
+    pub(super) fn release(&mut self) -> Vec<PathBuf> {
+        let mut released = Vec::with_capacity(self.temporary.len());
+        for path in std::mem::take(&mut self.temporary).into_iter().rev() {
+            match update_ace(&path, self.invocation.0, None) {
+                Ok(()) => released.push(path),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), "cannot remove temporary sandbox metadata access: {error}");
+                }
             }
         }
+        released
     }
 }
 
+impl Drop for PreparedAccess<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Works out what a run's AppContainer needs beyond its trees and sets it.
+/// `before_traversal` gets the directories outside those trees the run is
+/// about to let its identity pass through, before any is changed.
 pub(super) fn prepare<'a>(
     args: &HelperArgs,
     invocation: &'a SidGuard,
+    before_traversal: impl FnOnce(&[PathBuf]) -> Result<(), AppContainerError>,
 ) -> Result<PreparedAccess<'a>, AppContainerError> {
     let user_sid = current_user_sid()?;
     let mut access = PreparedAccess {
@@ -1169,6 +1190,7 @@ pub(super) fn prepare<'a>(
                 .map(Path::to_path_buf),
         );
     }
+    let mut traversed = Vec::new();
     for path in ancestors {
         let entry = grant_for(&path, Permission::Metadata, &user_sid)?;
         if entry.configured {
@@ -1176,10 +1198,14 @@ pub(super) fn prepare<'a>(
                 .capabilities
                 .push(capability_sid(&entry.capability_name)?);
         } else if !packages_can_traverse(&path)? {
-            update_ace(&path, invocation.0, Some((METADATA_ACCESS, 0)))
-                .map_err(|_| AppContainerError::SetupRequired { path: path.clone() })?;
-            access.temporary.push(path);
+            traversed.push(path);
         }
+    }
+    before_traversal(&traversed)?;
+    for path in traversed {
+        update_ace(&path, invocation.0, Some((METADATA_ACCESS, 0)))
+            .map_err(|_| AppContainerError::SetupRequired { path: path.clone() })?;
+        access.temporary.push(path);
     }
     let protected_paths: Vec<_> = args
         .secret_read_denied_paths
