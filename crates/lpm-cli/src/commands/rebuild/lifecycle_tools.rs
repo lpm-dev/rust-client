@@ -144,10 +144,6 @@ pub(super) struct OfferedNodeGyp {
     pub(super) script: PathBuf,
     /// npm's modules, which hold the command's code and what it requires.
     pub(super) modules: PathBuf,
-    /// Where the command keeps the Node headers it downloads: the folder
-    /// a sandboxed script may write, and the build cache watches, in place
-    /// of node-gyp's own choice of a per-platform cache folder.
-    pub(super) headers_dir: Option<PathBuf>,
     /// What a sandboxed script must read to run the command.
     pub(super) read_dirs: Vec<PathBuf>,
 }
@@ -332,7 +328,6 @@ impl LifecycleTools {
             command_dir,
             script: bundled.script,
             modules: bundled.modules,
-            headers_dir: dirs::home_dir().map(|home| home.join(".node-gyp")),
             read_dirs,
         });
         Ok(())

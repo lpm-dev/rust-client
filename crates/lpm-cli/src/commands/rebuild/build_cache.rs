@@ -499,6 +499,8 @@ pub(super) fn build_key_for_package(
         Some(&tools.bin_dir),
         tools.project_bins,
         tools.node_gyp.as_ref(),
+        // A cached build runs without the network, which sets none.
+        None,
     );
     let mut build_environment: HashMap<_, _> = lifecycle_environment.iter().cloned().collect();
     let context = lpm_runner::npm_context::NpmScriptContext::new(

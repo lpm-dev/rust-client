@@ -44,6 +44,7 @@ pub(super) fn execute_script(
         Some(&tools.bin_dir),
         tools.project_bins,
         tools.node_gyp.as_ref(),
+        sandboxed_headers_dir(sandbox_mode, sandbox_options, home_dir).as_deref(),
     )
     .into_iter()
     .collect();
@@ -121,11 +122,28 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
 
 /// Where node-pre-gyp and other build tools look for `node-gyp` before
 /// they search `PATH`, as npm sets it.
-const NPM_CONFIG_NODE_GYP: &str = "npm_config_node_gyp";
+pub(super) const NPM_CONFIG_NODE_GYP: &str = "npm_config_node_gyp";
 
 /// The settings node-gyp reads its headers folder from, the one LPM sets
 /// first. A caller that set either keeps its choice.
 const NODE_GYP_HEADERS_DIR: [&str; 2] = ["npm_config_devdir", "npm_package_config_node_gyp_devdir"];
+
+/// Where a script that runs in the sandbox is told to keep the Node
+/// headers node-gyp downloads. node-gyp's own choice on macOS and Windows
+/// is a per-user cache folder the sandbox doesn't let a script write;
+/// `~/.node-gyp` is one it does. A script without the network downloads
+/// nothing and one outside the sandbox can write node-gyp's folder, so
+/// both keep it, with the headers it may already hold.
+pub(super) fn sandboxed_headers_dir(
+    sandbox_mode: SandboxMode,
+    sandbox_options: &lpm_sandbox::SandboxOptions,
+    home_dir: &Path,
+) -> Option<PathBuf> {
+    (matches!(sandbox_mode, SandboxMode::Enforce)
+        && !sandbox_options.deny_outbound_network
+        && cfg!(any(target_os = "macos", windows)))
+    .then(|| home_dir.join(".node-gyp"))
+}
 
 /// Makes cmd.exe leave the current directory, which is the package's, out of
 /// its search for commands named without a path.
@@ -146,6 +164,7 @@ pub(super) fn build_lifecycle_environment(
     bin_dir: Option<&Path>,
     project_bins: bool,
     node_gyp: Option<&super::lifecycle_tools::OfferedNodeGyp>,
+    headers_dir: Option<&Path>,
 ) -> Vec<(OsString, OsString)> {
     let parent_path = inherited_path(find_env_case_insensitive(env, "PATH"));
     let separator = if cfg!(windows) { ";" } else { ":" };
@@ -198,15 +217,15 @@ pub(super) fn build_lifecycle_environment(
             NPM_CONFIG_NODE_GYP.into(),
             node_gyp.script.as_os_str().to_owned(),
         ));
-        let caller_chose = NODE_GYP_HEADERS_DIR
-            .iter()
-            .any(|name| find_env_case_insensitive(env, name).is_some());
-        if !caller_chose && let Some(headers_dir) = &node_gyp.headers_dir {
-            envs.push((
-                NODE_GYP_HEADERS_DIR[0].into(),
-                headers_dir.as_os_str().to_owned(),
-            ));
-        }
+    }
+    let caller_chose = NODE_GYP_HEADERS_DIR
+        .iter()
+        .any(|name| find_env_case_insensitive(env, name).is_some());
+    if !caller_chose && let Some(headers_dir) = headers_dir {
+        envs.push((
+            NODE_GYP_HEADERS_DIR[0].into(),
+            headers_dir.as_os_str().to_owned(),
+        ));
     }
     let tmp = tmpdir.as_os_str();
     envs.push(("TMPDIR".into(), tmp.to_owned()));

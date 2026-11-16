@@ -597,6 +597,7 @@ fn lifecycle_environment_disables_nested_install_scripts_over_inherited_values()
         None,
         true,
         None,
+        None,
     );
     let policy: Vec<(String, String)> = envs
         .iter()
@@ -3714,6 +3715,7 @@ fn cmd_exe_finds_a_lifecycle_tool_through_a_path_entry_node_can_run() {
             Some(&bin_dir),
             project_bins,
             None,
+            None,
         );
         let path = envs
             .iter()
@@ -3998,6 +4000,7 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         Some(&scratch_bin),
         false,
         None,
+        None,
     );
     assert_eq!(
         path_of(&green),
@@ -4016,6 +4019,7 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         machine.path(),
         Some(&scratch_bin),
         true,
+        None,
         None,
     );
     let approved_path = path_of(&approved);
@@ -4047,6 +4051,7 @@ fn a_green_run_whose_inherited_path_names_no_machine_directory_searches_no_empty
             scratch.path(),
             Some(scratch.path()),
             false,
+            None,
             None,
         );
         let path = green
@@ -4202,6 +4207,7 @@ fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_p
             Some(&tools.bin_dir),
             project_bins,
             tools.node_gyp.as_ref(),
+            None,
         )
     };
 
@@ -4231,32 +4237,57 @@ fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_p
 }
 
 #[test]
-fn the_offered_node_gyp_keeps_its_headers_where_a_sandboxed_script_may_write() {
-    let (root, tools) = tools_beside_a_node_with_npm(lifecycle_tools::ToolScope::Dependencies);
-    let offered = tools.node_gyp.as_ref().unwrap();
-    let headers_dir = offered.headers_dir.clone().expect("a home directory");
-    assert!(headers_dir.ends_with(".node-gyp"));
-    let environment = |parent: &HashMap<std::ffi::OsString, std::ffi::OsString>| {
+fn a_sandboxed_script_that_can_download_keeps_node_headers_where_it_may_write() {
+    let home = Path::new("/home/builder");
+    let online = lpm_sandbox::SandboxOptions::default();
+    let offline = lpm_sandbox::SandboxOptions::with_deny_outbound_network(true);
+    let chosen =
+        |mode, options| super::script_execution::sandboxed_headers_dir(mode, options, home);
+
+    let redirected = cfg!(any(target_os = "macos", windows)).then(|| home.join(".node-gyp"));
+    assert_eq!(
+        chosen(lpm_sandbox::SandboxMode::Enforce, &online),
+        redirected
+    );
+    assert_eq!(chosen(lpm_sandbox::SandboxMode::Enforce, &offline), None);
+    assert_eq!(chosen(lpm_sandbox::SandboxMode::Disabled, &online), None);
+    assert_eq!(chosen(lpm_sandbox::SandboxMode::LogOnly, &online), None);
+}
+
+#[test]
+fn the_headers_folder_is_set_whoever_supplies_node_gyp_unless_the_caller_chose_one() {
+    let root = tempfile::tempdir().unwrap();
+    let headers_dir = root.path().join(".node-gyp");
+    let environment = |parent: &HashMap<std::ffi::OsString, std::ffi::OsString>, headers| {
         super::script_execution::build_lifecycle_environment(
             parent,
             root.path(),
             Path::new("/tmp"),
-            Some(&tools.bin_dir),
+            None,
             true,
-            tools.node_gyp.as_ref(),
+            None,
+            headers,
         )
     };
 
     assert_eq!(
-        values_of(&environment(&HashMap::new()), "npm_config_devdir"),
-        [headers_dir]
+        values_of(
+            &environment(&HashMap::new(), Some(&headers_dir)),
+            "npm_config_devdir"
+        ),
+        std::slice::from_ref(&headers_dir)
     );
+    assert!(values_of(&environment(&HashMap::new(), None), "npm_config_devdir").is_empty());
 
-    let chosen = HashMap::from([("NPM_CONFIG_DEVDIR".into(), "/elsewhere".into())]);
-    assert_eq!(
-        values_of(&environment(&chosen), "npm_config_devdir"),
-        [PathBuf::from("/elsewhere")]
-    );
+    for name in ["NPM_CONFIG_DEVDIR", "npm_package_config_node_gyp_devdir"] {
+        let parent = HashMap::from([(name.into(), "/elsewhere".into())]);
+        let set = environment(&parent, Some(&headers_dir));
+        assert_eq!(values_of(&set, name), [PathBuf::from("/elsewhere")]);
+        assert_eq!(
+            values_of(&set, "npm_config_devdir").len(),
+            usize::from(name == "NPM_CONFIG_DEVDIR")
+        );
+    }
 }
 
 #[test]
