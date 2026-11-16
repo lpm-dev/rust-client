@@ -39,8 +39,9 @@ fn empty_npmrc() -> &'static PathBuf {
     })
 }
 
-fn approval_test_env_vars() -> [(&'static str, OsString); 6] {
+fn approval_test_env_vars() -> [(&'static str, OsString); 7] {
     [
+        ("LPM_HOME", security_test_dir().join("home").into()),
         (
             TEST_SECURITY_DIR_ENV,
             security_test_dir().as_os_str().to_owned(),
@@ -520,6 +521,7 @@ fn malformed_trusted_dependencies_is_not_treated_as_an_empty_trust_list() {
 
 #[tokio::test]
 async fn approve_scripts_yes_and_list_together_hard_errors() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -532,6 +534,7 @@ async fn approve_scripts_yes_and_list_together_hard_errors() {
 
 #[tokio::test]
 async fn approve_scripts_list_with_pkg_arg_hard_errors() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -543,6 +546,7 @@ async fn approve_scripts_list_with_pkg_arg_hard_errors() {
 
 #[tokio::test]
 async fn approve_scripts_with_no_state_file_errors_with_install_first_message() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     // No state file written
@@ -555,6 +559,7 @@ async fn approve_scripts_with_no_state_file_errors_with_install_first_message() 
 
 #[tokio::test]
 async fn approve_scripts_with_no_package_json_errors() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     // No package.json
     let err = run(dir.path(), None, false, true, false, true)
@@ -566,6 +571,7 @@ async fn approve_scripts_with_no_package_json_errors() {
 
 #[tokio::test]
 async fn approve_scripts_with_empty_blocked_set_succeeds_silently() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     write_state(dir.path(), vec![]);
@@ -634,6 +640,7 @@ async fn noninteractive_named_dry_run_does_not_build_baseline_or_fetch_provenanc
 
 #[tokio::test]
 async fn approve_scripts_list_does_not_mutate_package_json() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -813,6 +820,7 @@ async fn approve_scripts_specific_package_with_at_version_approves_only_that_one
 
 #[tokio::test]
 async fn approve_scripts_specific_package_not_in_blocked_set_errors() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2113,6 +2121,7 @@ fn compute_effective_blocked_set_keeps_package_blocked_under_at_star_sentinel() 
 /// already covers strictly.
 #[tokio::test]
 async fn approve_scripts_list_filters_already_approved_packages_from_current_trust() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     // The state file says esbuild is blocked
     write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -2202,6 +2211,7 @@ async fn approve_scripts_yes_skips_packages_already_strict_approved_in_manifest(
 /// "already approved" message rather than a useless re-approval.
 #[tokio::test]
 async fn approve_scripts_specific_pkg_for_already_approved_is_a_no_op_with_message() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
     write_manifest(
@@ -2237,6 +2247,7 @@ async fn approve_scripts_specific_pkg_for_already_approved_is_a_no_op_with_messa
 /// to approve (empty effective blocked set), not the stale entries.
 #[tokio::test]
 async fn approve_scripts_list_reports_nothing_when_all_persisted_blocked_are_already_approved() {
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_state(
         dir.path(),

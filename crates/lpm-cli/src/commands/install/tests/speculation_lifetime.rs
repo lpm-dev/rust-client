@@ -516,7 +516,11 @@ async fn cancelling_legacy_resolution_aborts_speculation_before_tail_handoff() {
 }
 
 async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
-    let _env = crate::test_env::ScopedEnv::set([("LPM_GREEDY_FUSION", "1".into())]);
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::set([
+        ("LPM_GREEDY_FUSION", "1".into()),
+        ("LPM_HOME", home.path().into()),
+    ]);
     let body = build_test_tarball();
     let integrity = lpm_common::integrity::Integrity::from_bytes(
         lpm_common::integrity::HashAlgorithm::Sha512,
@@ -574,7 +578,12 @@ async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
         }
     }));
     let root = tempfile::tempdir().unwrap();
-    let client = Arc::new(RegistryClient::new().with_npm_registry_url(format!("http://{address}")));
+    // A metadata write runs on a task of its own, which could outlive `home`.
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(format!("http://{address}"))
+            .with_cache_dir(None),
+    );
     let route = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
     let coordinator = Arc::new(FetchCoordinator::default());
     let downloads = Arc::new(Semaphore::new(1));

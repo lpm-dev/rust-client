@@ -28,9 +28,7 @@ fn resolve_deploy_target(
     super::paths::resolve_deploy_target(cwd, output_dir, filters, &[], &[], &[], force)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run(
-    client: &RegistryClient,
     cwd: &Path,
     output_dir: &Path,
     filters: &[String],
@@ -61,8 +59,9 @@ async fn run(
             Some(OsString::from("deny")),
         ),
     ]);
-    super::run(
-        client,
+    let client = RegistryClient::new();
+    let result = super::run(
+        &client,
         cwd,
         output_dir,
         filters,
@@ -77,7 +76,10 @@ async fn run(
         false,
         json_output,
     )
-    .await
+    .await;
+    // A metadata write runs on a task of its own, which could outlive the home.
+    client.flush_pending_cache_writes().await;
+    result
 }
 
 /// Helper: build a real on-disk workspace fixture with the given members.
@@ -113,16 +115,7 @@ async fn run_returns_error_when_filters_empty() {
     // Defensive: even though the CLI parser enforces required=true,
     // direct callers (e.g., a future MCP tool) can bypass that.
     let dir = tempfile::tempdir().unwrap();
-    let result = run(
-        &RegistryClient::new(),
-        dir.path(),
-        &dir.path().join("out"),
-        &[],
-        false,
-        false,
-        true,
-    )
-    .await;
+    let result = run(dir.path(), &dir.path().join("out"), &[], false, false, true).await;
     assert!(result.is_err());
     assert!(
         result.unwrap_err().to_string().contains("--filter"),
@@ -1001,7 +994,6 @@ async fn run_dry_run_succeeds_after_target_resolution() {
     let output = output_parent.path().join("prod-api");
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1029,7 +1021,6 @@ async fn run_dry_run_propagates_target_resolution_errors() {
     let output = output_parent.path().join("prod-api");
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["nonexistent".to_string()],
@@ -1066,7 +1057,6 @@ async fn run_full_pipeline_with_empty_deps_member_succeeds_human_mode() {
     let output = output_parent.path().join("prod-api");
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1095,7 +1085,6 @@ async fn run_full_pipeline_with_empty_deps_member_succeeds_json_mode() {
     let output = output_parent.path().join("prod-api");
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1125,7 +1114,6 @@ async fn run_full_pipeline_workspace_protocol_dep_is_localized_in_output() {
     let output = output_parent.path().join("prod-api");
 
     let result = run(
-        &RegistryClient::new(),
         &workspace_root,
         &output,
         &["@scope/api".to_string()],
@@ -1169,7 +1157,6 @@ async fn run_dry_run_with_json_emits_dry_run_marker() {
     let output = output_parent.path().join("prod-api");
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1196,7 +1183,6 @@ async fn run_force_flag_allows_overwrite_of_non_empty_output() {
 
     // Without --force this would error
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1263,7 +1249,6 @@ async fn run_force_actually_cleans_stale_files_from_output_dir() {
     .unwrap();
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1334,7 +1319,6 @@ async fn run_without_force_does_not_remove_existing_dir_tree() {
     // Empty dir is allowed without --force.
 
     let result = run(
-        &RegistryClient::new(),
         tmp.path(),
         &output,
         &["api".to_string()],
@@ -1422,7 +1406,6 @@ async fn run_e2e_combines_deny_list_and_local_workspace_dep_rewrite() {
     let output_parent = tempfile::tempdir().unwrap();
     let output = output_parent.path().join("prod-api");
     let result = run(
-        &RegistryClient::new(),
         &workspace_root,
         &output,
         &["@scope/api".to_string()],

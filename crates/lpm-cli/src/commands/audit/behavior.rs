@@ -302,6 +302,9 @@ mod tests {
     #[test]
     fn behavioral_summary_counts_only_actionable_findings_that_survive_level_filter() {
         let project = tempfile::tempdir().unwrap();
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.path().as_os_str().to_owned())]);
         let package_dir = project.path().join("node_modules/info-only");
         std::fs::create_dir_all(&package_dir).unwrap();
         std::fs::write(
@@ -357,6 +360,9 @@ mod tests {
 
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.path().as_os_str().to_owned())]);
         let package_dir = project.path().join("node_modules/replaced");
         std::fs::create_dir_all(&package_dir).unwrap();
         std::fs::write(

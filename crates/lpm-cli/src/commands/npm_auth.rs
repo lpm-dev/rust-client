@@ -324,7 +324,10 @@ mod tests {
 
     const NPM_ID_TOKEN: &str = "ci-oidc-id-token";
 
-    fn scoped(set: &[(&'static str, &str)]) -> ScopedEnv {
+    /// The environment a test asks for, and an LPM home of its own, where a
+    /// token lookup keeps its session lock.
+    fn scoped(set: &[(&'static str, &str)]) -> (ScopedEnv, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
         let keys = [
             "NPM_ID_TOKEN",
             "NPM_TOKEN",
@@ -341,8 +344,9 @@ mod tests {
                 set.iter()
                     .map(|(key, value)| (*key, Some(OsString::from(*value)))),
             )
+            .chain([("LPM_HOME", Some(home.path().into()))])
             .collect();
-        ScopedEnv::update(pairs)
+        (ScopedEnv::update(pairs), home)
     }
 
     #[test]
