@@ -621,9 +621,10 @@ fn patch_fresh_tarball_urls(
 }
 
 /// Gives each package the lockfile pins by a proven integrity the sha512
-/// of the same bytes, and says how many it changed. A package that shares
-/// a key with a fetched one but is pinned by another integrity keeps it:
-/// no bytes were checked against that one.
+/// of the same bytes, and says how many packages it changed, however many
+/// rows each has. A row that shares a key with a fetched package but is
+/// pinned by another integrity keeps it: no bytes were checked against
+/// that one. So does a signed row, whose signature covers its integrity.
 pub(super) fn record_proven_pins(
     lockfile: &mut lpm_lockfile::Lockfile,
     proven_pins: &HashMap<String, ProvenPin>,
@@ -631,21 +632,23 @@ pub(super) fn record_proven_pins(
     if proven_pins.is_empty() {
         return 0;
     }
-    let mut recorded = 0;
+    let mut recorded = HashSet::new();
     for package in &mut lockfile.packages {
-        let sha512 = match package.integrity.as_deref() {
+        if !package.registry_signatures.is_empty() {
+            continue;
+        }
+        let proven = match package.integrity.as_deref() {
             Some(pin) if !names_stored_object(pin) => proven_pins
-                .get(&locked_package_key(package))
-                .filter(|proven| proven.pin == pin)
-                .map(|proven| proven.sha512.clone()),
+                .get_key_value(&locked_package_key(package))
+                .filter(|(_, proven)| proven.pin == pin),
             _ => None,
         };
-        if let Some(sha512) = sha512 {
-            package.integrity = Some(sha512);
-            recorded += 1;
+        if let Some((key, proven)) = proven {
+            package.integrity = Some(proven.sha512.clone());
+            recorded.insert(key);
         }
     }
-    recorded
+    recorded.len()
 }
 
 /// The source a replay gives a locked package that records none.

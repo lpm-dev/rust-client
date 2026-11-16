@@ -2552,9 +2552,48 @@ fn only_packages_pinned_by_the_proven_integrity_get_the_sha512() {
 
     let recorded = record_proven_pins(&mut lockfile, &proven);
 
-    assert_eq!(recorded, 2);
+    assert_eq!(recorded, 1, "two rows of one package");
     assert_eq!(
         locked_integrities(&lockfile),
         [&stored, &stored, OTHER_PROVEN_SHA1, &other, PROVEN_SHA1]
     );
+}
+
+fn signature() -> lpm_registry::RegistrySignature {
+    lpm_registry::RegistrySignature {
+        keyid: Some("SHA256:key".into()),
+        sig: Some("signature".into()),
+    }
+}
+
+#[test]
+fn a_signed_package_keeps_the_integrity_its_signature_covers() {
+    let stored = sha512_of(b"archive");
+    let mut package = installing(PROVEN_SHA1);
+    package.registry_signatures = vec![signature()];
+    assert!(
+        proven_weaker_pins(
+            std::slice::from_ref(&package),
+            &fetched_as(&package, &stored)
+        )
+        .is_empty()
+    );
+
+    let mut signed = locked_pin(PROVEN_SHA1, Some(DEFAULT_REGISTRY_SOURCE));
+    signed.registry_signatures = vec![lpm_lockfile::LockedRegistrySignature {
+        keyid: Some("SHA256:key".into()),
+        sig: Some("signature".into()),
+    }];
+    let mut lockfile = lpm_lockfile::Lockfile {
+        packages: vec![signed],
+        ..Default::default()
+    };
+    let unsigned = installing(PROVEN_SHA1);
+    let proven = proven_weaker_pins(
+        std::slice::from_ref(&unsigned),
+        &fetched_as(&unsigned, &stored),
+    );
+
+    assert_eq!(record_proven_pins(&mut lockfile, &proven), 0);
+    assert_eq!(locked_integrities(&lockfile), [PROVEN_SHA1]);
 }

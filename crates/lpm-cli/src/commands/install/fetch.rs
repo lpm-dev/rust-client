@@ -547,6 +547,11 @@ pub(super) struct ProvenPin {
 /// One fetch serves every package that shares a key. Where those packages
 /// carry different integrities, only one was checked and nothing says
 /// which, so the key is left out.
+///
+/// A registry signature is made over a package's name, version and
+/// integrity as the registry spelled it. Replacing the integrity of a
+/// signed package would leave a signature that no longer verifies, so a
+/// signed package proves nothing here and keeps its pin.
 pub(super) fn proven_weaker_pins(
     packages: &[InstallPackage],
     fetched: &HashMap<String, String>,
@@ -559,7 +564,7 @@ pub(super) fn proven_weaker_pins(
         let Some(pin) = package.integrity.as_deref() else {
             continue;
         };
-        if names_stored_object(pin) {
+        if names_stored_object(pin) || !package.registry_signatures.is_empty() {
             continue;
         }
         let key = install_pkg_key(package);
