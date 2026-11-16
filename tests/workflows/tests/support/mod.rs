@@ -833,6 +833,21 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     let lpm_home = project.home().join(".lpm");
     cmd.set_env("LPM_HOME", lpm_home.as_os_str());
 
+    // The user's `.npmrc` is the one in the test's home. `HOME` leads a
+    // POSIX host there once no variable names another file. Windows reads
+    // it from `USERPROFILE`, which also tells Node, npm and Git where the
+    // account's folders are, so there the file is named and the profile
+    // stays the account's.
+    if cfg!(windows) {
+        cmd.set_env(
+            "NPM_CONFIG_USERCONFIG",
+            project.home().join(".npmrc").as_os_str(),
+        );
+    } else {
+        cmd.remove_env("NPM_CONFIG_USERCONFIG");
+        cmd.remove_env("npm_config_userconfig");
+    }
+
     // Isolate XDG dirs to prevent leaking desktop state
     cmd.set_env(
         "XDG_CONFIG_HOME",

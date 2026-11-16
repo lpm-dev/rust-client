@@ -2288,9 +2288,9 @@ async fn assert_recursive_workspace_materialization_processes_shared_registry_ro
     mount_registry_packages(&mock, &[("shared-dep", "1.0.0")]).await;
     let project =
         TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
-    let user_npmrc = project.home().join(".npmrc");
     if disable_union_resolution {
-        std::fs::write(&user_npmrc, "strict-ssl=false\n").expect("write TLS-customized npmrc");
+        std::fs::write(project.home().join(".npmrc"), "strict-ssl=false\n")
+            .expect("write TLS-customized npmrc");
     }
     for member in ["first", "second"] {
         project.write_file(
@@ -2302,7 +2302,6 @@ async fn assert_recursive_workspace_materialization_processes_shared_registry_ro
     }
 
     let seed = lpm_with_registry(&project, &mock.url())
-        .env("NPM_CONFIG_USERCONFIG", &user_npmrc)
         .env("LPM_STORE_VERSION", "v2")
         .arg("install")
         .arg("--recursive")
@@ -2334,7 +2333,6 @@ async fn assert_recursive_workspace_materialization_processes_shared_registry_ro
     }
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env("NPM_CONFIG_USERCONFIG", &user_npmrc)
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_TIMING_DETAIL", "1")
         .env("RUST_LOG", "lpm=debug")
