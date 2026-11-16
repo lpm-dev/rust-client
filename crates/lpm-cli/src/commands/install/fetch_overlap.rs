@@ -953,7 +953,7 @@ async fn fetch_selected_package(
                 package_display: package_display.clone(),
                 computed_sri: Some(computed_sri),
                 timings: Some(timings),
-                final_url: Some(final_url),
+                final_url: refreshed_tarball_url(&package, final_url),
             },
         )))
     }

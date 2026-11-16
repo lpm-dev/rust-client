@@ -532,6 +532,12 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) proven_pins: HashMap<String, ProvenPin>,
 }
 
+/// The URL that served `package`, unless it is the one the package already
+/// names: only a URL that changed is written back.
+pub(super) fn refreshed_tarball_url(package: &InstallPackage, served: String) -> Option<String> {
+    (package.tarball_url.as_deref() != Some(served.as_str())).then_some(served)
+}
+
 /// An integrity in a hash the store doesn't keep objects under, and the
 /// sha512 of the bytes a fetch checked against it.
 #[derive(Debug, PartialEq, Eq)]
@@ -2521,7 +2527,7 @@ pub(super) async fn run_online_fetch_phase(
                         task_timings,
                         link_h,
                         v2_link_h,
-                        Some(final_url),
+                        refreshed_tarball_url(&p, final_url),
                     ))
                 }
                 .instrument(fetch_span),
@@ -2529,12 +2535,10 @@ pub(super) async fn run_online_fetch_phase(
         }
 
         // Collect computed integrity hashes and fold per-task timings into
-        // the aggregate breakdown. `fresh_urls` aggregates
-        // the URL that actually served bytes for each (name, version),
-        // so the writeback step at install-end can detect divergence
-        // from the stored lockfile URL (stale-URL recovery) or from
-        // `None` (origin-mismatch rebase that on-demand-resolved a
-        // fresh URL).
+        // the aggregate breakdown. `fresh_urls` aggregates the URL that
+        // served a package's bytes where it isn't the one the package
+        // named: a stale-URL recovery, or an origin-mismatch rebase that
+        // resolved a URL on demand for a package that named none.
         for handle in handles {
             let (pkg_key, package_display, sri, timings, link_h, v2_link_h, final_url) = handle
                 .await
