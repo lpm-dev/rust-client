@@ -27,6 +27,121 @@ pub fn macos_keychain_operation_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The Mach services that serve Data Protection keychain items: secd's,
+/// including the shared access group LPM's signed builds use for env values
+/// and registry tokens, and securityd_system's. securityd
+/// (`com.apple.SecurityServer`) is deliberately absent: it serves the trust
+/// settings HTTPS clients list the system roots from, and the file-based
+/// keychains it also serves stay closed by the sandbox's file rules. So is
+/// trustd, which verifies certificates.
+#[cfg(target_os = "macos")]
+pub const MACOS_KEYCHAIN_MACH_SERVICES: &[&str] = &[
+    "com.apple.securityd.xpc",
+    "com.apple.securityd.general",
+    "com.apple.security.kcsharing",
+    "com.apple.security.octagon",
+    "com.apple.securityd.ckks",
+    "com.apple.securityd.sos",
+    "com.apple.security.escrow-update",
+    "com.apple.securityd.aps",
+    "com.apple.securityd.systemkeychain",
+];
+
+/// A Mach service name LPM's lifecycle-script profile denies while allowing
+/// [`MACOS_LIFECYCLE_SANDBOX_MEMBER`], which its broad Mach allowance covers.
+/// A deny-by-default profile denies both, and no profile but LPM's answers
+/// the pair this way, so a process can tell which sandbox closed its
+/// Keychain.
+#[cfg(target_os = "macos")]
+pub const MACOS_LIFECYCLE_SANDBOX_MARK: &std::ffi::CStr = c"dev.lpm.sandbox.lifecycle";
+
+#[cfg(target_os = "macos")]
+pub const MACOS_LIFECYCLE_SANDBOX_MEMBER: &std::ffi::CStr = c"dev.lpm.sandbox.lifecycle.member";
+
+#[cfg(target_os = "macos")]
+mod macos_sandbox {
+    use std::ffi::{CStr, c_char, c_int};
+
+    /// `SANDBOX_FILTER_GLOBAL_NAME` from `enum sandbox_filter_type`.
+    const SANDBOX_FILTER_GLOBAL_NAME: c_int = 2;
+
+    unsafe extern "C" {
+        safe static SANDBOX_CHECK_NO_REPORT: c_int;
+        fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
+    }
+
+    pub fn mach_lookup_denied(pid: libc::pid_t, name: &CStr) -> Option<bool> {
+        // SAFETY: both strings are NUL-terminated and outlive the call; the
+        // global-name filter takes exactly one `const char *` variadic argument.
+        let result = unsafe {
+            sandbox_check(
+                pid,
+                c"mach-lookup".as_ptr(),
+                SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT,
+                name.as_ptr(),
+            )
+        };
+        match result {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_sandboxed(pid: libc::pid_t) -> bool {
+        // SAFETY: a null operation with no filter asks only whether `pid` has
+        // a profile, and takes no variadic arguments.
+        unsafe { sandbox_check(pid, std::ptr::null(), 0) != 0 }
+    }
+}
+
+/// `Some(true)` when `pid`'s Seatbelt profile denies looking up the Mach
+/// service `name`, `Some(false)` when it allows it, `None` when the check
+/// failed.
+#[cfg(target_os = "macos")]
+pub fn macos_mach_lookup_denied(pid: libc::pid_t, name: &std::ffi::CStr) -> Option<bool> {
+    macos_sandbox::mach_lookup_denied(pid, name)
+}
+
+/// Which sandbox closes the macOS Keychain to this process.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacosKeychainDenial {
+    /// LPM's own lifecycle-script sandbox, as when a package's install
+    /// script runs `lpm`.
+    LifecycleSandbox,
+    /// Another sandbox around this process.
+    OtherSandbox,
+}
+
+/// Which sandbox, if any, refuses this process the Keychain. Keychain
+/// backends use it to turn the resulting `errSecNotAvailable` into an error
+/// that says why, rather than one indistinguishable from a session with no
+/// keychain.
+#[cfg(target_os = "macos")]
+pub fn macos_keychain_denial() -> Option<MacosKeychainDenial> {
+    // SAFETY: getpid has no preconditions and cannot fail.
+    let pid = unsafe { libc::getpid() };
+    classify_keychain_denial(|name| macos_sandbox::mach_lookup_denied(pid, name))
+}
+
+#[cfg(target_os = "macos")]
+fn classify_keychain_denial(
+    lookup_denied: impl Fn(&std::ffi::CStr) -> Option<bool>,
+) -> Option<MacosKeychainDenial> {
+    if lookup_denied(c"com.apple.securityd.xpc") != Some(true) {
+        return None;
+    }
+    let lifecycle = lookup_denied(MACOS_LIFECYCLE_SANDBOX_MARK) == Some(true)
+        && lookup_denied(MACOS_LIFECYCLE_SANDBOX_MEMBER) == Some(false);
+    Some(if lifecycle {
+        MacosKeychainDenial::LifecycleSandbox
+    } else {
+        MacosKeychainDenial::OtherSandbox
+    })
+}
+
 /// Detect the running host's libc flavor.
 ///
 /// Returns `Some("musl")` / `Some("glibc")` on Linux when the loader
@@ -150,6 +265,70 @@ fn has_glibc_loader() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_outside_any_sandbox_is_not_reported_as_keychain_denied() {
+        // SAFETY: getpid has no preconditions and cannot fail.
+        if macos_sandbox::is_sandboxed(unsafe { libc::getpid() }) {
+            return;
+        }
+        assert_eq!(macos_keychain_denial(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_keychain_refusal_is_put_down_to_lpms_sandbox_only_when_its_mark_answers() {
+        fn classify(denied: &[&std::ffi::CStr]) -> Option<MacosKeychainDenial> {
+            classify_keychain_denial(|name| Some(denied.contains(&name)))
+        }
+        let securityd: &std::ffi::CStr = c"com.apple.securityd.xpc";
+        assert_eq!(
+            classify(&[securityd, MACOS_LIFECYCLE_SANDBOX_MARK]),
+            Some(MacosKeychainDenial::LifecycleSandbox)
+        );
+        assert_eq!(
+            classify(&[
+                securityd,
+                MACOS_LIFECYCLE_SANDBOX_MARK,
+                MACOS_LIFECYCLE_SANDBOX_MEMBER
+            ]),
+            Some(MacosKeychainDenial::OtherSandbox),
+            "a deny-by-default profile denies the mark's sibling too"
+        );
+        assert_eq!(
+            classify(&[securityd]),
+            Some(MacosKeychainDenial::OtherSandbox)
+        );
+        assert_eq!(classify(&[]), None);
+    }
+
+    /// Every service the system's secd and securityd_system launch
+    /// definitions advertise must be on the list, so a macOS release that
+    /// adds one can't reopen the Keychain to lifecycle scripts unnoticed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_data_protection_keychain_service_this_macos_advertises_is_listed() {
+        for plist in [
+            "/System/Library/LaunchAgents/com.apple.secd.plist",
+            "/System/Library/LaunchDaemons/com.apple.securityd.system.plist",
+        ] {
+            let output = std::process::Command::new("/usr/bin/plutil")
+                .args(["-extract", "MachServices", "json", "-o", "-", plist])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{plist}: {output:?}");
+            let services: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&output.stdout).unwrap();
+            assert!(!services.is_empty(), "{plist} advertises no services");
+            for service in services.keys() {
+                assert!(
+                    MACOS_KEYCHAIN_MACH_SERVICES.contains(&service.as_str()),
+                    "{plist} advertises {service}, which lifecycle scripts can still reach"
+                );
+            }
+        }
+    }
 
     #[test]
     fn only_an_x86_64_build_on_macos_can_be_translated_by_rosetta() {

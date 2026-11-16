@@ -253,6 +253,10 @@ pub(super) fn probe_sandbox_backend_with_global(
                  ({required}+). {remediation}"
             ),
         ),
+        Err(error @ SandboxError::LpmHomeReachable { .. }) => Check::fail(
+            &doctor_catalog::SANDBOX_LPM_HOME_REACHABLE,
+            &error.to_string(),
+        ),
         Err(e) => Check::fail(
             &doctor_catalog::SANDBOX_PROBE_FAILED,
             &format!(
@@ -290,6 +294,7 @@ mod tests {
             "sandbox_config_approval_required",
             "sandbox_unsupported_platform",
             "sandbox_kernel_too_old",
+            "sandbox_lpm_home_reachable",
             "sandbox_probe_failed",
         ];
         assert!(
@@ -298,6 +303,32 @@ mod tests {
             c.code(),
             allowed
         );
+    }
+
+    /// `cfg(unix)`: the home directory is steered through `HOME`, which
+    /// Windows doesn't consult.
+    #[cfg(unix)]
+    #[test]
+    fn an_lpm_home_inside_a_cache_scripts_can_write_is_reported_with_how_to_move_it() {
+        let security = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut env = isolated_security_env_vars(security.path());
+        env.push(("HOME", home.path().as_os_str().to_owned()));
+        env.push((
+            "LPM_HOME",
+            home.path().join(".cache").join("lpm").into_os_string(),
+        ));
+        let _env = crate::test_env::ScopedEnv::set(env);
+
+        let check = probe_sandbox_backend();
+
+        assert_eq!(
+            check.code(),
+            "sandbox_lpm_home_reachable",
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("Move LPM_HOME"), "{}", check.detail);
     }
 
     /// Universal smoke test: the sandbox probe must always return a

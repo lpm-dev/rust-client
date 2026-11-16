@@ -231,6 +231,18 @@ pub(crate) fn render_profile_with_toolchain(
     if !spec.read_project_full {
         render_secret_denies(&mut out, &canon_project_dir)?;
     }
+    // Keychain files stay unreadable wherever a script has read access,
+    // except the system's own, which certificate trust needs.
+    out.push_str(&format!(
+        "(deny file-read* (regex {}))\n",
+        seatbelt_regex_literal(&format!("{KEYCHAIN_FILE_SUFFIX}$"))
+    ));
+    out.push_str(&format!(
+        "(allow file-read* (regex {}))\n",
+        seatbelt_regex_literal(&format!(
+            "^/System/Library/Keychains/[^/]+{KEYCHAIN_FILE_SUFFIX}$"
+        ))
+    ));
     render_secret_read_allow_overrides(&mut out, &spec.secret_read_allow)?;
     out.push('\n');
 
@@ -264,6 +276,12 @@ pub(crate) fn render_profile_with_toolchain(
         }
     }
     out.push_str(")\n");
+    // A keychain file in a directory the script can write stays put, so a
+    // rename can't take it out of the read deny above.
+    out.push_str(&format!(
+        "(deny file-write* (regex {}))\n",
+        seatbelt_regex_literal(&format!("{KEYCHAIN_FILE_SUFFIX}$"))
+    ));
     out.push('\n');
 
     // Network denial is opt-in, not default. The default posture
@@ -337,6 +355,22 @@ pub(crate) fn render_profile_with_toolchain(
     // read a password just copied, or swap the command the user is about
     // to paste into a shell.
     out.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
+    // Data Protection keychain items are served by secd over XPC, not read
+    // from files, so the `~/Library/Keychains` read deny doesn't cover them.
+    // Denying the services keeps every binary a script runs away from them,
+    // whatever its entitlements, which a check inside that binary couldn't.
+    // The mark that follows lets a refused `lpm` say which sandbox refused it.
+    out.push_str("(deny mach-lookup\n");
+    for service in lpm_common::platform::MACOS_KEYCHAIN_MACH_SERVICES {
+        out.push_str(&format!("  (global-name \"{service}\")\n"));
+    }
+    out.push_str(&format!(
+        "  (global-name \"{}\")\n",
+        lpm_common::platform::MACOS_LIFECYCLE_SANDBOX_MARK
+            .to_str()
+            .expect("the mark is ASCII")
+    ));
+    out.push_str(")\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow iokit-open)\n");
 
@@ -442,6 +476,10 @@ fn render_secret_read_allow_overrides(
 /// character (NOT a Scheme escape), so `\.pem` in the source
 /// reaches the regex engine unchanged. Only `"` is escaped by the
 /// SBPL parser; we mirror that.
+/// `.keychain` or `.keychain-db` in any case, as a case-insensitive volume
+/// opens it.
+const KEYCHAIN_FILE_SUFFIX: &str = r"\.[kK][eE][yY][cC][hH][aA][iI][nN](-[dD][bB])?";
+
 fn seatbelt_regex_literal(r: &str) -> String {
     let mut out = String::with_capacity(r.len() + 4);
     out.push_str("#\"");
@@ -891,6 +929,44 @@ mod tests {
         assert!(
             deny > allow,
             "Seatbelt applies the last matching rule, so the deny must follow the allow"
+        );
+    }
+
+    #[test]
+    fn scripts_cannot_reach_the_keychain_services() {
+        let p = render_profile(&spec(), false).unwrap();
+        let allow = p
+            .find("(allow mach-lookup)\n")
+            .expect("Mach lookups are allowed");
+        for service in [
+            "com.apple.securityd.xpc",
+            "com.apple.securityd.general",
+            "com.apple.security.kcsharing",
+            "com.apple.security.octagon",
+            "com.apple.securityd.ckks",
+            "com.apple.securityd.sos",
+            "com.apple.security.escrow-update",
+            "com.apple.securityd.aps",
+            "com.apple.securityd.systemkeychain",
+            "dev.lpm.sandbox.lifecycle",
+        ] {
+            let deny = p
+                .find(&format!("(global-name \"{service}\")"))
+                .unwrap_or_else(|| panic!("{service} must be denied"));
+            assert!(
+                deny > allow,
+                "Seatbelt applies the last matching rule, so the {service} deny must follow the allow"
+            );
+        }
+        for service in ["com.apple.trustd", "com.apple.SecurityServer"] {
+            assert!(
+                !p.contains(service),
+                "{service} must stay reachable: HTTPS clients verify certificates and list the system roots through it"
+            );
+        }
+        assert!(
+            !p.contains("dev.lpm.sandbox.lifecycle.member"),
+            "the mark's sibling stays allowed, which no deny-by-default profile does"
         );
     }
 
@@ -1477,6 +1553,44 @@ mod tests {
     /// overrides the permissive-with-report fallback for the named
     /// secret paths.
     #[test]
+    fn scripts_cannot_read_a_keychain_file_kept_in_the_project() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.keychain$""#), "{p}");
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.keychain-db$""#), "{p}");
+    }
+
+    #[test]
+    fn keychain_files_are_unreadable_everywhere_but_the_systems_own() {
+        let p = render_profile(&spec(), false).unwrap();
+        let suffix = r"\.[kK][eE][yY][cC][hH][aA][iI][nN](-[dD][bB])?$";
+        let deny = p
+            .find(&format!("(deny file-read* (regex #\"{suffix}\"))"))
+            .expect("keychain read deny");
+        let system = p
+            .find(&format!(
+                "(allow file-read* (regex #\"^/System/Library/Keychains/[^/]+{suffix}\"))"
+            ))
+            .expect("system keychains re-allowed");
+        let write = p
+            .find(&format!("(deny file-write* (regex #\"{suffix}\"))"))
+            .expect("keychain write deny");
+        assert!(
+            deny < system,
+            "the system's keychains must be allowed after the deny: {p}"
+        );
+        assert!(
+            p.find("(subpath \"/System\")")
+                .is_some_and(|grant| grant < deny),
+            "the read deny must follow the read grants it narrows: {p}"
+        );
+        assert!(
+            p.find("(allow file-write*\n")
+                .is_some_and(|grant| grant < write),
+            "the write deny must follow the write grants it narrows: {p}"
+        );
+    }
+
+    #[test]
     fn logonly_profile_inherits_secret_deny_block() {
         let p = render_logonly_profile(&spec(), false).unwrap();
         assert!(p.contains("(deny file-read*"));
@@ -1537,9 +1651,10 @@ mod tests {
     #[test]
     fn empty_secret_read_allow_emits_no_override_block() {
         let p = render_profile(&spec(), false).unwrap();
-        // Exactly ONE `(allow file-read*` (the broad project_dir
-        // allow) and ZERO follow-up overrides.
-        let count = p.matches("(allow file-read*").count();
+        // Exactly ONE `(allow file-read*` block (the broad project_dir
+        // allow) and ZERO follow-up override blocks; the system keychain
+        // allow is a single rule.
+        let count = p.matches("(allow file-read*\n").count();
         assert_eq!(count, 1, "no override block expected:\n{p}");
     }
 

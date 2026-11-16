@@ -384,6 +384,7 @@ fn doctor_all_emits_extended_codes() {
         "sandbox_disabled_by_user",
         "sandbox_kernel_too_old",
         "sandbox_unsupported_platform",
+        "sandbox_lpm_home_reachable",
         "sandbox_probe_failed",
     ]
     .iter()

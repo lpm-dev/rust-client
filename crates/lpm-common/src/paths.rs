@@ -91,7 +91,10 @@ fn credential_scope_from_env() -> Option<String> {
     scope
 }
 
-fn canonical_identity(path: &Path) -> PathBuf {
+/// A location as one comparable value: canonical where it exists, else its
+/// nearest existing ancestor made canonical with the rest appended, so the
+/// value doesn't change when the location is created.
+pub fn canonical_identity(path: &Path) -> PathBuf {
     let mut missing = Vec::new();
     let mut current = path;
     loop {

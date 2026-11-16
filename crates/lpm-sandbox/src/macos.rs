@@ -430,6 +430,146 @@ mod tests {
     }
 
     #[test]
+    fn a_script_cannot_read_a_keychain_file_in_a_directory_it_can_otherwise_read() {
+        let mut rs = realistic_spec();
+        let dependency = rs.spec.project_dir.join("node_modules").join("dep");
+        std::fs::create_dir_all(&dependency).unwrap();
+        rs.spec.dependency_read_dirs = vec![dependency.clone()];
+        let readable = dependency.join("notes.txt");
+        let keychain = dependency.join("build.keychain-db");
+        std::fs::write(&readable, b"notes").unwrap();
+        std::fs::write(&keychain, b"keychain").unwrap();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let read = |path: &std::path::Path| {
+            let mut cmd = SandboxedCommand::new("/bin/cat")
+                .arg(path)
+                .envs_cleared([("PATH", "/usr/bin:/bin")]);
+            cmd.stdout = SandboxStdio::Null;
+            cmd.stderr = SandboxStdio::Null;
+            sb.spawn(cmd)
+                .expect("spawn")
+                .wait()
+                .expect("wait")
+                .success()
+        };
+
+        assert!(
+            read(&readable),
+            "the dependency's directory must stay readable"
+        );
+        assert!(
+            !read(&keychain),
+            "a keychain file in a readable directory was readable"
+        );
+    }
+
+    #[test]
+    fn a_script_cannot_read_a_keychain_file_in_its_temporary_directory_but_reads_the_system_roots()
+    {
+        let mut rs = realistic_spec();
+        let tmpdir = rs._tmp.path().join("script-tmp");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        rs.spec.tmpdir = tmpdir.clone();
+        let readable = tmpdir.join("notes.txt");
+        let keychain = tmpdir.join("signing.keychain-db");
+        let capitals = tmpdir.join("BUILD.KEYCHAIN");
+        std::fs::write(&readable, b"notes").unwrap();
+        std::fs::write(&keychain, b"keychain").unwrap();
+        std::fs::write(&capitals, b"keychain").unwrap();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let read = |path: &std::path::Path| {
+            let mut cmd = SandboxedCommand::new("/bin/cat")
+                .arg(path)
+                .envs_cleared([("PATH", "/usr/bin:/bin")]);
+            cmd.stdout = SandboxStdio::Null;
+            cmd.stderr = SandboxStdio::Null;
+            sb.spawn(cmd)
+                .expect("spawn")
+                .wait()
+                .expect("wait")
+                .success()
+        };
+
+        assert!(
+            read(&readable),
+            "the script's temporary directory must stay readable"
+        );
+        assert!(
+            !read(&keychain),
+            "a keychain file in the temporary directory was readable"
+        );
+        assert!(
+            !read(&capitals),
+            "a keychain file named in capitals was readable"
+        );
+        let renamed = tmpdir.join("signing.txt");
+        let mut mv = SandboxedCommand::new("/bin/mv")
+            .arg(&keychain)
+            .arg(&renamed)
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        mv.stdout = SandboxStdio::Null;
+        mv.stderr = SandboxStdio::Null;
+        let moved = sb.spawn(mv).expect("spawn").wait().expect("wait").success();
+        assert!(
+            !moved && !renamed.exists(),
+            "a keychain file was renamed out of the read deny"
+        );
+        let system_roots =
+            std::path::Path::new("/System/Library/Keychains/SystemRootCertificates.keychain");
+        if system_roots.exists() {
+            assert!(
+                read(system_roots),
+                "the system roots keychain must stay readable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_cannot_reach_the_keychain() {
+        use std::io::BufRead;
+
+        let rs = realistic_spec();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let mut cmd = SandboxedCommand::new("/bin/sh")
+            .arg("-c")
+            .arg("echo ready; exec /bin/sleep 30")
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        cmd.stdout = SandboxStdio::Piped;
+        let mut child = sb.spawn(cmd).expect("spawn");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut ready)
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let lookup = |name: &std::ffi::CStr| crate::seatbelt_tree::lookup_denied(pid, name);
+        let data_protection = lookup(c"com.apple.securityd.xpc");
+        let system_roots = lookup(c"com.apple.SecurityServer");
+        let trust = lookup(c"com.apple.trustd.agent");
+        let mark = lookup(lpm_common::platform::MACOS_LIFECYCLE_SANDBOX_MARK);
+        let member = lookup(lpm_common::platform::MACOS_LIFECYCLE_SANDBOX_MEMBER);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = crate::terminate_sandbox_tree(child.id());
+
+        assert_eq!(ready.trim(), "ready");
+        assert_eq!(
+            (trust, system_roots),
+            (Some(false), Some(false)),
+            "HTTPS clients must still verify certificates and list the system roots"
+        );
+        assert_eq!(
+            data_protection,
+            Some(true),
+            "a script could reach Data Protection keychain items through secd"
+        );
+        assert_eq!(
+            (mark, member),
+            (Some(true), Some(false)),
+            "a refused lpm couldn't tell LPM's sandbox from another one"
+        );
+    }
+
+    #[test]
     fn allows_write_into_package_dir_under_enforce() {
         let td = tempfile::tempdir().unwrap();
         let pkg_dir = td.path().join("store").join("pkg@1.0.0");

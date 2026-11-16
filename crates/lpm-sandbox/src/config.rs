@@ -1145,6 +1145,42 @@ pub(crate) fn validate_builtin_write_dirs(spec: &crate::SandboxSpec) -> Result<(
     validate_real_dirs(&spec.home_dir, &home_names)
 }
 
+/// The home directories every sandboxed script reaches without
+/// configuration: it may write the first three and read the last.
+const HOME_SCRIPT_GRANTS: [&str; 4] = [".cache", ".node-gyp", ".npm", ".nvm/versions"];
+
+/// The home directories a script still reads while it builds an artifact
+/// for the native build cache, which keeps its writes package-local.
+const ISOLATED_HOME_SCRIPT_GRANTS: [&str; 2] = [".node-gyp", ".nvm/versions"];
+
+/// Fails when the LPM home lies in a home directory the script can reach.
+///
+/// The LPM home holds the store every package runs from, the local CA key and
+/// file-backed credentials, so a home inside one of those directories would
+/// hand every script the same reach. `sandboxWriteDirs` entries inside the
+/// home are already rejected; this holds the built-in grants to the same rule.
+pub(crate) fn validate_lpm_home_outside_script_grants(
+    spec: &crate::SandboxSpec,
+    build_cache_isolation: bool,
+) -> Result<(), SandboxError> {
+    let Some(lpm_home) = spec.store_root.parent() else {
+        return Ok(());
+    };
+    let lpm_home = lpm_common::canonical_identity(lpm_home);
+    let grants: &[&'static str] = if build_cache_isolation {
+        &ISOLATED_HOME_SCRIPT_GRANTS
+    } else {
+        &HOME_SCRIPT_GRANTS
+    };
+    for &grant in grants {
+        let granted = lpm_common::canonical_identity(&spec.home_dir.join(grant));
+        if lpm_home.starts_with(&granted) {
+            return Err(SandboxError::LpmHomeReachable { lpm_home, grant });
+        }
+    }
+    Ok(())
+}
+
 /// Fails unless `relative`, below the project, is a real directory or
 /// doesn't exist yet, with no symlink or reparse point on the way to it.
 pub(crate) fn validate_project_write_dir(

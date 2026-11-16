@@ -4448,6 +4448,8 @@ dependencies = [
  "lpm-env-companion",
  "lpm-http",
  "lpm-keyring",
+ "objc2",
+ "objc2-foundation",
  "objc2-local-authentication",
  "p256",
  "rand 0.10.3",
