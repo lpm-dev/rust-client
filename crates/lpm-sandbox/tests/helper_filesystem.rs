@@ -660,6 +660,15 @@ impl Drop for RunIdentity {
 #[test]
 fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
     let project = tempfile::tempdir().expect("project tempdir");
+    // Where no folder above inherits, a new one doesn't either and the run
+    // would have nothing to keep. icacls writes the folder as Windows' own
+    // tools do, and what is made inside it then inherits as it does.
+    let marked = std::process::Command::new("icacls.exe")
+        .arg(project.path())
+        .arg("/inheritance:e")
+        .output()
+        .expect("run icacls");
+    assert!(marked.status.success(), "{marked:?}");
     let records = tempfile::tempdir().expect("record tempdir");
     let secret = project.path().join(".env");
     fs::write(&secret, "protected-content").expect("seed protected file");
@@ -681,8 +690,11 @@ fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
     };
     let before = inheritance();
     assert!(
-        before.iter().any(|(_, flags)| flags.contains("AI")),
-        "nothing here inherits its permissions, so the run has nothing to keep: {before:?}"
+        before
+            .iter()
+            .filter(|(path, _)| path.starts_with(project.path()))
+            .all(|(_, flags)| flags.contains("AI")),
+        "the project doesn't inherit its permissions, so the run has nothing to keep: {before:?}"
     );
     let identity = RunIdentity(vec![
         "--protocol-version".to_string(),
@@ -725,6 +737,7 @@ fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
 
     assert!(cleanup.status.success(), "{cleanup:?}");
     assert_eq!(inheritance(), before, "after the cleanup");
+    assert!(saved_inheritance(&created).contains("AI"));
     // A file the script made inherited the run's entry from the project
     // folder. The cleanup's write to it carries the file's inheritance,
     // which must not bring that entry back.

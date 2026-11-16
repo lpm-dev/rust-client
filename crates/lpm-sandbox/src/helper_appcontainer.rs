@@ -1364,30 +1364,37 @@ fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
         .all(|mask| mask & access_mask == access_mask)
 }
 
+/// A DACL with some of its ACEs left out, every other one copied
+/// unchanged and in order.
+struct FilteredDacl {
+    acl: Vec<u32>,
+    /// How many ACEs were left out.
+    removed: usize,
+    /// Whether one of them was inherited from the object's parent.
+    inherited: bool,
+}
+
 fn dacl_without_allowed_aces_for_sid(
     path: &Path,
     old_dacl: *const ACL,
     sid: PSID,
-) -> Result<Vec<u32>, AppContainerError> {
+) -> Result<FilteredDacl, AppContainerError> {
     // SAFETY: both SIDs are valid for the comparison.
     dacl_without_allowed_aces_where(path, old_dacl, |ace_sid| unsafe {
         EqualSid(ace_sid, sid) != 0
     })
-    .map(|(filtered, _)| filtered)
 }
 
-/// `old_dacl` without the access-allowed ACEs whose SID `drops` picks,
-/// every other ACE copied unchanged and in order, and how many it left out.
+/// `old_dacl` without the access-allowed ACEs whose SID `drops` picks.
 fn dacl_without_allowed_aces_where(
     path: &Path,
     old_dacl: *const ACL,
     drops: impl Fn(PSID) -> bool,
-) -> Result<(Vec<u32>, usize), AppContainerError> {
+) -> Result<FilteredDacl, AppContainerError> {
     dacl_without_aces_where(path, old_dacl, ACCESS_ALLOWED_ACE_TYPE, drops)
 }
 
-/// `old_dacl` without the ACEs of `ace_type` whose SID `drops` picks, every
-/// other ACE copied unchanged and in order, and how many it left out.
+/// `old_dacl` without the ACEs of `ace_type` whose SID `drops` picks.
 /// `ace_type` must be an allow or deny type: both share the
 /// `ACCESS_ALLOWED_ACE` layout.
 fn dacl_without_aces_where(
@@ -1395,7 +1402,7 @@ fn dacl_without_aces_where(
     old_dacl: *const ACL,
     ace_type: u8,
     drops: impl Fn(PSID) -> bool,
-) -> Result<(Vec<u32>, usize), AppContainerError> {
+) -> Result<FilteredDacl, AppContainerError> {
     // SAFETY: `old_dacl` is non-null and owned by the live security descriptor.
     let old_acl_size = unsafe { (*old_dacl).AclSize } as usize;
     // Preserve ACL_REVISION_DS when the existing DACL contains object-specific ACEs.
@@ -1419,6 +1426,7 @@ fn dacl_without_aces_where(
     // SAFETY: the ACL header belongs to the security descriptor and is readable.
     let ace_count = unsafe { (*old_dacl).AceCount } as u32;
     let mut removed = 0;
+    let mut inherited = false;
     for index in 0..ace_count {
         let mut ace: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: `index` is bounded by the ACL's AceCount.
@@ -1440,6 +1448,10 @@ fn dacl_without_aces_where(
         };
         if dropped {
             removed += 1;
+            // SAFETY: the header read above is still live.
+            inherited |= u32::from(unsafe { (*header).AceFlags })
+                & windows_sys::Win32::Security::INHERITED_ACE
+                != 0;
             continue;
         }
         // SAFETY: the complete ACE byte range is valid and copied unchanged into the new ACL.
@@ -1459,7 +1471,11 @@ fn dacl_without_aces_where(
             });
         }
     }
-    Ok((filtered, removed))
+    Ok(FilteredDacl {
+        acl: filtered,
+        removed,
+        inherited,
+    })
 }
 
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
