@@ -16,6 +16,21 @@ pub fn implied_install_script(
     package_dir: &Path,
     manifest: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'static str> {
+    (leaves_install_to_binding_gyp(manifest)
+        && std::fs::symlink_metadata(package_dir.join(BINDING_GYP))
+            .is_ok_and(|metadata| metadata.is_file()))
+    .then_some(IMPLIED_INSTALL_SCRIPT)
+}
+
+/// The file at a package's root that implies its native build.
+pub const BINDING_GYP: &str = "binding.gyp";
+
+/// Whether `manifest` leaves the `install` script to a [`BINDING_GYP`]
+/// beside it: it names no `install` and no `preinstall` script and doesn't
+/// set `gypfile` to `false`. For a caller that looks for the file itself.
+pub fn leaves_install_to_binding_gyp(
+    manifest: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
     let names = |phase: &str| {
         manifest
             .get("scripts")
@@ -23,15 +38,9 @@ pub fn implied_install_script(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|body| !body.is_empty())
     };
-    if names("install")
-        || names("preinstall")
-        || manifest.get("gypfile") == Some(&serde_json::Value::Bool(false))
-    {
-        return None;
-    }
-    std::fs::symlink_metadata(package_dir.join("binding.gyp"))
-        .is_ok_and(|metadata| metadata.is_file())
-        .then_some(IMPLIED_INSTALL_SCRIPT)
+    !names("install")
+        && !names("preinstall")
+        && manifest.get("gypfile") != Some(&serde_json::Value::Bool(false))
 }
 
 #[cfg(test)]

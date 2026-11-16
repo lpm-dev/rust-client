@@ -162,5 +162,16 @@ pub(super) fn collect_registry_issues(
             source: "registry".to_string(),
             ..AuditIssue::default()
         });
+    } else if ver_meta.has_install_script == Some(true) {
+        // The registry sets this for a package whose install script is
+        // the native build its `binding.gyp` implies, which no script of
+        // the manifest names.
+        issues.push(AuditIssue {
+            severity: "moderate".to_string(),
+            message: "lifecycle scripts: install".to_string(),
+            category: "scripts".to_string(),
+            source: "registry".to_string(),
+            ..AuditIssue::default()
+        });
     }
 }
