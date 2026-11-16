@@ -81,7 +81,7 @@ pub use unlocks::{
     approve_project_runtime_override, ensure_global_unlock, ensure_project_unlock,
     has_active_project_unlock, list_active_global_unlocks, list_active_project_unlocks,
     list_active_unlocks, lock_global_scopes_command, lock_project_scopes_command,
-    unlock_global_scopes_command, unlock_scopes_command,
+    project_unlock_a_run_needs, unlock_global_scopes_command, unlock_scopes_command,
 };
 
 pub(crate) fn record_force_floor_removed() {

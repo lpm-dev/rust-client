@@ -894,6 +894,77 @@ fn rebuild_json_names_each_package_that_failed_and_why() {
 }
 
 #[test]
+fn a_dry_run_names_the_approval_the_run_itself_would_stop_for() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-dry-run-approvals", None, &[]);
+    write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
+    let store_pkg = seed_scripted_package(&project, "scripted-pkg", "1.0.0", "exit 0");
+    seed_wrapper(&project, &store_pkg, "scripted-pkg", "1.0.0");
+    write_lockfile_for_packages(&project, &[("scripted-pkg", "1.0.0")]);
+    let dry_run = |flags: &[&str]| {
+        let output = lpm(&project)
+            .args(["rebuild", "--all", "--dry-run"])
+            .args(flags)
+            .output()
+            .expect("run rebuild --dry-run");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        (stdout, stderr)
+    };
+    let json = |flags: &[&str]| -> serde_json::Value {
+        let (stdout, stderr) = dry_run(flags);
+        serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|error| panic!("{error}\n{stdout}\n{stderr}"))
+    };
+
+    assert_eq!(
+        json(&["--json"])["approvals_required"],
+        serde_json::json!([])
+    );
+
+    let needed = json(&["--no-sandbox", "--json"]);
+    let approvals = needed["approvals_required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{needed}"));
+    assert_eq!(approvals.len(), 1, "{needed}");
+    assert_eq!(
+        approvals[0]["requested_scopes"],
+        serde_json::json!(["sandbox-none"])
+    );
+    let command = approvals[0]["suggested_command"].as_str().unwrap();
+    assert!(
+        command.starts_with("lpm security unlock sandbox-none"),
+        "{command}"
+    );
+    assert_eq!(
+        needed["count"], 1,
+        "the preview itself is unchanged: {needed}"
+    );
+
+    let (stdout, stderr) = dry_run(&["--no-sandbox"]);
+    let shown = strip_ansi(&format!("{stdout}{stderr}"));
+    assert!(shown.contains("scripted-pkg"), "{shown}");
+    assert!(shown.contains("sandbox-none"), "{shown}");
+    assert!(shown.contains(command), "{shown}");
+    assert!(
+        !project
+            .path()
+            .join(".lpm/wrappers/scripted-pkg@1.0.0/node_modules/scripted-pkg/.lpm-built")
+            .exists()
+            && !store_pkg.join(".lpm-built").exists(),
+        "a dry run builds nothing"
+    );
+
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none", "scripts-allow"]);
+    assert_eq!(
+        json(&["--no-sandbox", "--json"])["approvals_required"],
+        serde_json::json!([]),
+        "an unlock that covers the run leaves nothing to approve"
+    );
+}
+
+#[test]
 fn standalone_rebuild_waits_for_the_project_install_lock() {
     let project = TempProject::empty("");
     write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
