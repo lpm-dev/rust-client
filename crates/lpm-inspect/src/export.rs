@@ -59,9 +59,11 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
     // The path comes from whoever sent the request to a public tunnel
     // endpoint, so it's quoted as shell text.
     let url_escaped = shell_single_quote_escape(url);
-    // `--url` keeps a URL starting with `-` from being read as an option.
+    // `--url` keeps a URL starting with `-` from being read as an option,
+    // and `--globoff` keeps `[1-100]` or `{a,b}` in it from fanning out
+    // into many requests.
     let mut parts = vec![format!(
-        "curl -X {} --url '{}'",
+        "curl --globoff -X {} --url '{}'",
         shell_word(&webhook.method),
         url_escaped
     )];
@@ -396,7 +398,7 @@ mod tests {
     fn curl_basic() {
         let wh = make_webhook();
         let curl = to_curl(&wh, None);
-        assert!(curl.starts_with("curl -X POST --url '/api/webhook/stripe'"));
+        assert!(curl.starts_with("curl --globoff -X POST --url '/api/webhook/stripe'"));
         assert!(curl.contains("-H 'content-type: application/json'"));
         assert!(curl.contains("-H 'stripe-signature: t=123,v1=abc'"));
         assert!(curl.contains("--data-raw '"));
@@ -431,6 +433,17 @@ mod tests {
     }
 
     #[test]
+    fn curl_sends_one_request_for_a_path_with_brackets_or_braces() {
+        let mut wh = make_webhook();
+        wh.path = "/x[1-100000]{a,b}".to_string();
+        let curl = to_curl(&wh, None);
+        assert!(
+            curl.starts_with("curl --globoff -X POST --url '/x[1-100000]{a,b}'"),
+            "{curl}"
+        );
+    }
+
+    #[test]
     fn curl_sends_a_body_starting_with_at_as_text_rather_than_a_file() {
         let mut wh = make_webhook();
         wh.request_body = b"@/tmp/file".to_vec();
@@ -445,7 +458,7 @@ mod tests {
         wh.path = "-K/tmp/config".to_string();
         let curl = to_curl(&wh, None);
         assert!(
-            curl.starts_with("curl -X POST --url '-K/tmp/config'"),
+            curl.starts_with("curl --globoff -X POST --url '-K/tmp/config'"),
             "{curl}"
         );
     }
@@ -621,7 +634,7 @@ mod tests {
         wh.method = "POST$(echo x)".to_string();
         let curl = to_curl(&wh, None);
         assert!(
-            curl.starts_with("curl -X 'POST$(echo x)' --url '/api/webhook/stripe'"),
+            curl.starts_with("curl --globoff -X 'POST$(echo x)' --url '/api/webhook/stripe'"),
             "{curl}"
         );
     }
