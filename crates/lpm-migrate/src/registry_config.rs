@@ -31,6 +31,9 @@ struct ConfiguredRegistry {
     /// The setting and file that configure it, so a value LPM can't read as
     /// a URL is reported by where it's set rather than by what it holds.
     setting: String,
+    /// Whether expansion put an environment variable's value into it. Such a
+    /// value may carry a token, so it's compared but never shown or recorded.
+    expanded: bool,
 }
 
 impl ConfiguredRegistry {
@@ -40,8 +43,10 @@ impl ConfiguredRegistry {
         expand: fn(&str, Environment<'_>) -> Option<String>,
         env: Environment<'_>,
     ) -> Self {
+        let value = expand(raw, env);
         Self {
-            value: expand(raw, env),
+            expanded: value.as_deref() != Some(raw),
+            value,
             setting,
         }
     }
@@ -53,6 +58,19 @@ impl ConfiguredRegistry {
             "names an environment variable that isn't set"
         };
         format!("the registry {} names, which {reason}", self.setting)
+    }
+
+    /// A value an environment variable holds whole may carry a token too.
+    fn from_environment(mut self) -> Self {
+        self.expanded = true;
+        self
+    }
+
+    fn describe_expanded(&self) -> String {
+        format!(
+            "the registry {} names, with its environment variables expanded",
+            self.setting
+        )
     }
 }
 
@@ -100,12 +118,15 @@ impl ConfiguredRegistries {
         }
         if let Some(server) = env("YARN_NPM_REGISTRY_SERVER").filter(|server| !server.is_empty()) {
             configured = true;
-            registries.default = Some(ConfiguredRegistry::new(
-                &server,
-                "`YARN_NPM_REGISTRY_SERVER`".to_owned(),
-                expand_yarn,
-                env,
-            ));
+            registries.default = Some(
+                ConfiguredRegistry::new(
+                    &server,
+                    "`YARN_NPM_REGISTRY_SERVER`".to_owned(),
+                    expand_yarn,
+                    env,
+                )
+                .from_environment(),
+            );
         }
         Ok(configured.then_some(registries))
     }
@@ -208,12 +229,10 @@ impl ConfiguredRegistries {
                 .map(|registry| (variable, registry))
         }) {
             configured = true;
-            registries.default = Some(ConfiguredRegistry::new(
-                &registry,
-                format!("`{variable}`"),
-                expand_bun,
-                env,
-            ));
+            registries.default = Some(
+                ConfiguredRegistry::new(&registry, format!("`{variable}`"), expand_bun, env)
+                    .from_environment(),
+            );
         }
         Ok(configured.then_some(registries))
     }
@@ -306,6 +325,7 @@ fn expand_yarn(value: &str, env: Environment<'_>) -> Option<String> {
         expanded.push_str(&rest[..start]);
         let reference = &rest[start + 2..];
         let Some(end) = reference.find('}') else {
+            rest = &rest[start..];
             break;
         };
         let inner = &reference[..end];
@@ -385,15 +405,25 @@ fn read_config(path: &Path) -> Result<Option<String>, LpmError> {
     }
 }
 
+/// What [`place_unrecorded`] learned beyond the URLs it placed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// Packages a configured registry LPM can't read as a URL couldn't
+    /// place, to be refused rather than taken for npm's.
+    pub(crate) unreadable: Vec<CustomRegistryPackage>,
+    /// For each package, by published name and version, placed on a
+    /// registry whose value came from environment variables: how to name
+    /// that registry, since its URL may carry a token.
+    pub(crate) expanded: HashMap<(String, String), String>,
+}
+
 /// Gives each registry package that records no URL the tarball URL its
-/// configured registry would serve, when that registry is a custom one. A
-/// configured registry LPM can't read as a URL can't place its packages, so
-/// they are returned to be refused rather than taken for npm's.
+/// configured registry would serve, when that registry is a custom one.
 pub(crate) fn place_unrecorded(
     packages: &mut [MigratedPackage],
     registries: &ConfiguredRegistries,
-) -> Vec<CustomRegistryPackage> {
-    let mut unreadable = Vec::new();
+) -> Placement {
+    let mut placement = Placement::default();
     let mut reported = HashSet::new();
     for package in packages
         .iter_mut()
@@ -415,23 +445,31 @@ pub(crate) fn place_unrecorded(
         });
         match placed {
             Some(url) if registry_origin(url.as_str()) == RegistryOrigin::Custom => {
+                if registry.expanded {
+                    placement.expanded.insert(
+                        (registry_name.to_owned(), package.version.clone()),
+                        registry.describe_expanded(),
+                    );
+                }
                 package.resolved = Some(url.into());
             }
             Some(_) => {}
             None => {
                 let key = (registry_name.to_owned(), package.version.clone());
                 if !reported.contains(&key) {
-                    unreadable.push(CustomRegistryPackage {
+                    let description = registry.describe();
+                    placement.unreadable.push(CustomRegistryPackage {
                         name: key.0.clone(),
                         version: key.1.clone(),
-                        tarball_url: registry.describe(),
+                        tarball_url: description.clone(),
+                        shown_as: description,
                     });
                     reported.insert(key);
                 }
             }
         }
     }
-    unreadable
+    placement
 }
 
 #[cfg(test)]
@@ -449,6 +487,7 @@ mod tests {
             dependencies: Vec::new(),
             is_optional: false,
             is_dev: false,
+            published_as: None,
             fetched_from: FetchedFrom::Registry,
         }
     }
@@ -475,7 +514,10 @@ mod tests {
 
     fn placed(registries: &ConfiguredRegistries, name: &str) -> Option<String> {
         let mut packages = vec![unrecorded(name)];
-        assert!(place_unrecorded(&mut packages, registries).is_empty());
+        assert_eq!(
+            place_unrecorded(&mut packages, registries).unreadable,
+            Vec::new()
+        );
         packages.remove(0).resolved
     }
 
@@ -505,10 +547,13 @@ mod tests {
         let registries =
             yarnrc("npmScopes:\n  corp:\n    npmRegistryServer: \"https://npm.corp.example/\"\n");
         let mut packages = vec![MigratedPackage {
-            fetched_from: FetchedFrom::RegistryAs("@corp/utils".to_owned()),
+            published_as: Some("@corp/utils".to_owned()),
             ..unrecorded("utils")
         }];
-        assert!(place_unrecorded(&mut packages, &registries).is_empty());
+        assert_eq!(
+            place_unrecorded(&mut packages, &registries),
+            Placement::default()
+        );
         assert_eq!(
             packages[0].resolved.as_deref(),
             Some("https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz")
@@ -522,7 +567,10 @@ mod tests {
             fetched_from: FetchedFrom::DependencySpec,
             ..unrecorded("xlsx")
         }];
-        assert!(place_unrecorded(&mut packages, &registries).is_empty());
+        assert_eq!(
+            place_unrecorded(&mut packages, &registries),
+            Placement::default()
+        );
         assert_eq!(packages[0].resolved, None);
     }
 
@@ -553,6 +601,7 @@ mod tests {
             Some("$CORP"),
             "Yarn needs braces"
         );
+        assert_eq!(expand("https://h/${X").as_deref(), Some("https://h/${X"));
     }
 
     #[test]
@@ -577,7 +626,7 @@ mod tests {
             "npmScopes:\n  corp:\n    npmRegistryServer: \"${CORP_REGISTRY:-https://user:secret@npm.corp.example}${PATH_PART}\"\n",
         );
         let mut packages = vec![unrecorded("@corp/utils")];
-        let reported = place_unrecorded(&mut packages, &registries);
+        let reported = place_unrecorded(&mut packages, &registries).unreadable;
         assert_eq!(reported.len(), 1);
         let from = &reported[0].tarball_url;
         assert!(from.contains("npmScopes.corp.npmRegistryServer"), "{from}");
@@ -590,10 +639,42 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_whose_value_comes_from_the_environment_is_placed_but_named_by_its_setting() {
+        let mut registries = ConfiguredRegistries::default();
+        let env = |name: &str| (name == "REG_TOKEN").then(|| "secret123".to_owned());
+        registries
+            .merge_yarnrc(
+                "npmScopes:\n  corp:\n    npmRegistryServer: \"https://dl.example/${REG_TOKEN}/npm/\"\nnpmRegistryServer: \"https://mirror.example/\"\n",
+                Path::new(".yarnrc.yml"),
+                &env,
+            )
+            .unwrap();
+        let mut packages = vec![unrecorded("@corp/utils"), unrecorded("ms")];
+        let placement = place_unrecorded(&mut packages, &registries);
+        assert_eq!(
+            packages[0].resolved.as_deref(),
+            Some("https://dl.example/secret123/npm/@corp/utils/-/utils-1.0.0.tgz"),
+            "the route check compares the expanded URL"
+        );
+        let shown = &placement.expanded[&("@corp/utils".to_owned(), "1.0.0".to_owned())];
+        assert!(
+            shown.contains("npmScopes.corp.npmRegistryServer"),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret123"), "{shown}");
+        assert!(
+            !placement
+                .expanded
+                .contains_key(&("ms".to_owned(), "1.0.0".to_owned())),
+            "a value written out in full is shown as it is"
+        );
+    }
+
+    #[test]
     fn a_configured_registry_that_is_not_a_url_is_reported_without_its_value() {
         let registries = bunfig("[install]\nregistry = \"npm_secretToken123\"\n");
         let mut packages = vec![unrecorded("ms")];
-        let reported = place_unrecorded(&mut packages, &registries);
+        let reported = place_unrecorded(&mut packages, &registries).unreadable;
         assert_eq!(reported.len(), 1);
         let from = &reported[0].tarball_url;
         assert!(

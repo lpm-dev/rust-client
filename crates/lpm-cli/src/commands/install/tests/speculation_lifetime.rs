@@ -618,6 +618,7 @@ async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
         npm_firewall_lookup_mode: Default::default(),
         npm_firewall_policy_profile: Default::default(),
         npm_firewall_chunk_size: 64,
+        locked_integrities: None,
         tarball_prefetch_held: false,
         force: true,
         offline: false,

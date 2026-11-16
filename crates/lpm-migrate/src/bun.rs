@@ -231,6 +231,7 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
             dependencies,
             is_optional,
             is_dev,
+            published_as: None,
             fetched_from: crate::FetchedFrom::Registry,
         });
     }

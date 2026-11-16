@@ -213,7 +213,7 @@ pub enum SriComparison {
 /// The hashes in SRI metadata: one or more space-separated
 /// `algorithm-base64` tokens with optional `?options`. Tokens that don't
 /// parse are ignored, as SRI ignores them.
-fn sri_hashes(sri: &str) -> impl Iterator<Item = Integrity> + '_ {
+pub fn sri_hashes(sri: &str) -> impl Iterator<Item = Integrity> + '_ {
     sri.split_ascii_whitespace().filter_map(|token| {
         Integrity::parse(token.split_once('?').map_or(token, |(hash, _)| hash)).ok()
     })
@@ -251,20 +251,6 @@ pub fn compare_sri(left: &str, right: &str) -> SriComparison {
         SriComparison::Agree
     } else {
         SriComparison::NoCommonAlgorithm
-    }
-}
-
-impl Integrity {
-    /// The hash of the strongest algorithm in SRI metadata, the first such
-    /// when it lists several, or `None` when no token parses.
-    pub fn strongest_in(sri: &str) -> Option<Self> {
-        sri_hashes(sri).reduce(|strongest, hash| {
-            if hash.algorithm > strongest.algorithm {
-                hash
-            } else {
-                strongest
-            }
-        })
     }
 }
 
@@ -307,16 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn the_strongest_hash_in_sri_metadata_is_chosen() {
+    fn sri_metadata_yields_each_hash_that_parses_without_its_options() {
         let sha1 = Integrity::from_bytes(HashAlgorithm::Sha1, b"package");
-        let sha256 = Integrity::from_bytes(HashAlgorithm::Sha256, b"package");
         let sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"package");
         assert_eq!(
-            Integrity::strongest_in(&format!("{sha1} {sha512}?x {sha256}")),
-            Some(sha512)
+            sri_hashes(&format!("{sha1} garbage {sha512}?x")).collect::<Vec<_>>(),
+            vec![sha1, sha512]
         );
-        assert_eq!(Integrity::strongest_in(&sha1.to_string()), Some(sha1));
-        assert_eq!(Integrity::strongest_in("garbage"), None);
     }
 
     #[test]

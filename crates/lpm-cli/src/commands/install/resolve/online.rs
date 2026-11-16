@@ -28,6 +28,9 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) npm_firewall_policy_profile:
         lpm_registry::client::NpmFirewallPolicyProfile,
     pub(in crate::commands::install) npm_firewall_chunk_size: usize,
+    /// The integrities a migrated lockfile recorded, which a tarball-URL
+    /// dependency is held to before it's extracted.
+    pub(in crate::commands::install) locked_integrities: Option<&'a LockedIntegrities>,
     /// Whether tarballs wait for the checks that run after resolution, as
     /// policy extensions and a migrated lockfile's recorded integrities
     /// require, rather than downloading while it runs.
@@ -114,6 +117,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
         npm_firewall_chunk_size,
+        locked_integrities,
         tarball_prefetch_held,
         force,
         offline,
@@ -164,6 +168,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &v2_workspace_root_pre_resolve.optional_registry_roots,
             &v2_workspace_root_pre_resolve.promoted_git_root_names,
             auto_install_peers,
+            locked_integrities,
         )
         .await?
     };

@@ -177,33 +177,38 @@ pub struct MigratedPackage {
     pub is_optional: bool,
     /// Whether this is a dev dependency.
     pub is_dev: bool,
+    /// The name the package is published under, when it's installed under
+    /// another: the target of an npm alias, or the name a tarball's own
+    /// manifest gives. `None` when it's [`Self::name`].
+    pub published_as: Option<String>,
     /// Where the source package manager fetched the package from.
     pub fetched_from: FetchedFrom,
 }
 
 impl MigratedPackage {
+    /// The name the package is published under.
+    #[inline]
+    pub fn published_name(&self) -> &str {
+        self.published_as.as_deref().unwrap_or(&self.name)
+    }
+
     /// The name the package is published under on its registry, or `None`
     /// for a package fetched from its dependency spec.
     #[inline]
     pub fn registry_name(&self) -> Option<&str> {
-        match &self.fetched_from {
-            FetchedFrom::Registry => Some(&self.name),
-            FetchedFrom::RegistryAs(name) => Some(name),
+        match self.fetched_from {
+            FetchedFrom::Registry => Some(self.published_name()),
             FetchedFrom::DependencySpec => None,
         }
     }
 }
 
 /// Where a package manager fetched a package from.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FetchedFrom {
-    /// A registry, under the package's own name.
+    /// A registry.
     #[default]
     Registry,
-    /// A registry, under the name an npm alias (`npm:<name>@<range>`)
-    /// gives: the package installed as [`MigratedPackage::name`] is
-    /// published as this one.
-    RegistryAs(String),
     /// The tarball URL or Git host a dependency spec names. LPM fetches the
     /// package from that spec too, so no registry routes it.
     DependencySpec,
@@ -222,6 +227,10 @@ pub struct CustomRegistryPackage {
     /// A configured registry LPM can't read as a URL is described by where
     /// it's set instead, never by its value.
     pub tarball_url: String,
+    /// How to name where the package came from in messages and JSON: the
+    /// tarball URL, or, when that URL holds values expanded from environment
+    /// variables, the setting that configures its registry.
+    pub shown_as: String,
 }
 
 /// Detected source package manager.
@@ -324,6 +333,48 @@ pub struct SkippedPackage {
     pub reason: String,
 }
 
+/// Names each registry whose URL holds values expanded from environment
+/// variables by the setting that configures it, and records only its origin
+/// in the lockfile, so no token those values carry is printed or committed.
+fn keep_expanded_registries_unshown(
+    lockfile: &mut lpm_lockfile::Lockfile,
+    custom_registry_packages: &mut [CustomRegistryPackage],
+    expanded: &HashMap<(String, String), String>,
+) {
+    let mut by_name: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    for ((name, version), shown) in expanded {
+        by_name
+            .entry(name.as_str())
+            .or_default()
+            .insert(version.as_str(), shown.as_str());
+    }
+    let shown_for = |name: &str, version: &str| {
+        by_name
+            .get(name)
+            .and_then(|versions| versions.get(version))
+            .copied()
+    };
+    for package in custom_registry_packages.iter_mut() {
+        if let Some(shown) = shown_for(&package.name, &package.version) {
+            package.shown_as = shown.to_owned();
+        }
+    }
+    for package in &mut lockfile.packages {
+        if shown_for(&package.name, &package.version).is_none() {
+            continue;
+        }
+        let origin = package
+            .source
+            .as_deref()
+            .and_then(|source| source.strip_prefix("registry+"))
+            .and_then(|base| url::Url::parse(base).ok())
+            .map(|base| format!("registry+{}/", base.origin().ascii_serialization()));
+        if let Some(origin) = origin {
+            package.source = Some(origin);
+        }
+    }
+}
+
 /// Run the full migration pipeline: detect → parse → normalize → validate.
 ///
 /// Does NOT write files — caller decides what to do with the result.
@@ -386,13 +437,19 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
         SourceKind::Bun => registry_config::ConfiguredRegistries::bun(project_dir)?,
         SourceKind::Yarn | SourceKind::Npm | SourceKind::Pnpm => None,
     };
-    let unreadable_registries = configured
+    let registry_config::Placement {
+        unreadable: unreadable_registries,
+        expanded,
+    } = configured
         .map(|registries| registry_config::place_unrecorded(&mut packages, &registries))
         .unwrap_or_default();
 
     // Normalize to LPM lockfile
-    let (lockfile, skipped, mut custom_registry_packages) =
+    let (mut lockfile, skipped, mut custom_registry_packages) =
         normalize::to_lockfile_with_registries(packages)?;
+    if !expanded.is_empty() {
+        keep_expanded_registries_unshown(&mut lockfile, &mut custom_registry_packages, &expanded);
+    }
     if !unreadable_registries.is_empty() {
         let locked: std::collections::HashSet<(&str, &str)> = lockfile
             .packages

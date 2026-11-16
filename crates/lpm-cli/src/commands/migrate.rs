@@ -1690,7 +1690,7 @@ fn registry_changes(
         .map(|package| RegistryChange {
             name: package.name.clone(),
             version: package.version.clone(),
-            from: package.tarball_url.clone(),
+            from: package.shown_as.clone(),
             to: match route_table.route_for_package(&package.name) {
                 lpm_registry::UpstreamRoute::LpmWorker => client.base_url().to_owned(),
                 lpm_registry::UpstreamRoute::NpmDirect => client.npm_registry_url().to_owned(),

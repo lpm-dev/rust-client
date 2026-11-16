@@ -1050,6 +1050,7 @@ where
             dependencies,
             is_optional,
             is_dev,
+            published_as: _,
             fetched_from: _,
         } = package;
         let (path, scan_mode) = match selected_path {

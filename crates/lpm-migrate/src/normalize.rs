@@ -8,6 +8,7 @@
 //! - Sorting output for deterministic lockfiles
 
 use crate::{CustomRegistryPackage, FetchedFrom, MigratedPackage, SkippedPackage};
+use lpm_common::integrity::{HashAlgorithm, sri_hashes};
 use lpm_common::{LpmError, SriComparison, compare_sri};
 use lpm_lockfile::{
     LOCKFILE_VERSION_WITH_STRUCTURED_PEERS, LockedPackage, Lockfile, LockfileMetadata,
@@ -54,15 +55,16 @@ pub fn to_lockfile_with_registries(
     let mut skipped = Vec::new();
     let mut custom_registry_packages: Vec<CustomRegistryPackage> = Vec::new();
     let mut locked_packages: Vec<LockedPackage> = Vec::with_capacity(packages.len());
-    let mut locked_at: HashMap<(String, String), usize> = HashMap::with_capacity(packages.len());
+    let mut locked_at: HashMap<(String, String, Option<String>), usize> =
+        HashMap::with_capacity(packages.len());
     let alias_targets: HashMap<(String, String), String> = packages
         .iter()
-        .filter_map(|package| match &package.fetched_from {
-            FetchedFrom::RegistryAs(target) => Some((
+        .filter_map(|package| {
+            let target = package.published_as.as_ref()?;
+            Some((
                 (package.name.clone(), package.version.clone()),
                 target.clone(),
-            )),
-            FetchedFrom::Registry | FetchedFrom::DependencySpec => None,
+            ))
         })
         .collect();
 
@@ -77,9 +79,7 @@ pub fn to_lockfile_with_registries(
         }
 
         // Reject path traversal in package names
-        if contains_path_traversal(&pkg.name)
-            || pkg.registry_name().is_some_and(contains_path_traversal)
-        {
+        if contains_path_traversal(&pkg.name) || contains_path_traversal(pkg.published_name()) {
             skipped.push(SkippedPackage {
                 name: pkg.name.clone(),
                 reason: "rejected: package name contains path traversal".to_string(),
@@ -114,27 +114,36 @@ pub fn to_lockfile_with_registries(
             custom_registry_packages.push(custom);
         }
 
-        let name = match pkg.fetched_from {
-            FetchedFrom::RegistryAs(target) => target,
-            FetchedFrom::Registry | FetchedFrom::DependencySpec => pkg.name,
-        };
-        let key = (name, pkg.version);
+        // A copy fetched from a tarball URL is a different package from a
+        // registry copy of the same version, and LPM keeps both apart.
+        let spec_source = (pkg.fetched_from == FetchedFrom::DependencySpec).then(|| source.clone());
+        let key = (
+            pkg.published_as.unwrap_or(pkg.name),
+            pkg.version,
+            spec_source,
+        );
         if let Some(&index) = locked_at.get(&key) {
             let locked = &mut locked_packages[index];
             match (locked.integrity.as_deref(), pkg.integrity) {
-                (Some(recorded), Some(other))
-                    if compare_sri(recorded, &other) == SriComparison::Disagree =>
-                {
-                    return Err(LpmError::Script(format!(
-                        "the lockfile records two different integrities for {}@{}, \
-                         and LPM installs one copy of each package version. Install the \
-                         project with its current package manager to settle on one, then \
-                         migrate again.",
-                        key.0, key.1
-                    )));
-                }
+                (Some(recorded), Some(other)) => match compare_sri(recorded, &other) {
+                    SriComparison::Disagree => {
+                        return Err(LpmError::Script(format!(
+                            "the lockfile records two different integrities for {}@{} from \
+                             the same source, and LPM installs one copy of it. Install the \
+                             project with its current package manager to settle on one, then \
+                             migrate again.",
+                            key.0, key.1
+                        )));
+                    }
+                    SriComparison::NoCommonAlgorithm
+                        if strongest_algorithm(&other) > strongest_algorithm(recorded) =>
+                    {
+                        locked.integrity = Some(other);
+                    }
+                    SriComparison::Agree | SriComparison::NoCommonAlgorithm => {}
+                },
                 (None, Some(other)) => locked.integrity = Some(other),
-                _ => {}
+                (_, None) => {}
             }
             continue;
         }
@@ -155,7 +164,7 @@ pub fn to_lockfile_with_registries(
         alias_dependencies.dedup_by(|later, earlier| later[0] == earlier[0]);
 
         locked_at.insert(key.clone(), locked_packages.len());
-        let (name, version) = key;
+        let (name, version, _) = key;
         locked_packages.push(LockedPackage {
             instance_id: None,
             dependency_targets: std::collections::BTreeMap::new(),
@@ -186,7 +195,14 @@ pub fn to_lockfile_with_registries(
     }
 
     // Sort by name, then version for deterministic output
-    locked_packages.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
+    // The lockfile orders packages by name, version, then source identity,
+    // which only a version taken from both a registry and a tarball URL needs.
+    locked_packages.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.package_key().source_id.cmp(&b.package_key().source_id))
+    });
 
     let lockfile = Lockfile {
         metadata: LockfileMetadata {
@@ -214,6 +230,10 @@ pub fn to_lockfile_with_registries(
     };
 
     Ok((lockfile, skipped, custom_registry_packages))
+}
+
+fn strongest_algorithm(sri: &str) -> Option<HashAlgorithm> {
+    sri_hashes(sri).map(|hash| hash.algorithm).max()
 }
 
 /// Mark packages as dev or optional based on package.json dependency sets.
@@ -294,10 +314,14 @@ fn source_of(package: &MigratedPackage) -> (String, Option<CustomRegistryPackage
             .resolved
             .as_deref()
             .is_some_and(|resolved| !resolved.trim().is_empty())
-            .then(|| CustomRegistryPackage {
-                name: registry_name.to_owned(),
-                version: package.version.clone(),
-                tarball_url: "a resolved location that isn't an http(s) URL".to_owned(),
+            .then(|| {
+                let shown = "a resolved location that isn't an http(s) URL".to_owned();
+                CustomRegistryPackage {
+                    name: registry_name.to_owned(),
+                    version: package.version.clone(),
+                    tarball_url: shown.clone(),
+                    shown_as: shown,
+                }
             });
         return (NPM_SOURCE.to_owned(), unreadable);
     };
@@ -309,6 +333,7 @@ fn source_of(package: &MigratedPackage) -> (String, Option<CustomRegistryPackage
             Some(CustomRegistryPackage {
                 name: registry_name.to_owned(),
                 version: package.version.clone(),
+                shown_as: url.to_string(),
                 tarball_url: url.into(),
             }),
         ),
@@ -367,6 +392,7 @@ mod tests {
             dependencies: Vec::new(),
             is_optional: false,
             is_dev: false,
+            published_as: None,
             fetched_from: FetchedFrom::Registry,
         }
     }
@@ -417,6 +443,7 @@ mod tests {
                 dependencies: Vec::new(),
                 is_optional: false,
                 is_dev: false,
+                published_as: None,
                 fetched_from: FetchedFrom::Registry,
             },
             MigratedPackage {
@@ -428,6 +455,7 @@ mod tests {
                 dependencies: Vec::new(),
                 is_optional: false,
                 is_dev: false,
+                published_as: None,
                 fetched_from: FetchedFrom::Registry,
             },
             MigratedPackage {
@@ -439,6 +467,7 @@ mod tests {
                 dependencies: Vec::new(),
                 is_optional: false,
                 is_dev: false,
+                published_as: None,
                 fetched_from: FetchedFrom::Registry,
             },
         ];
@@ -465,6 +494,7 @@ mod tests {
             dependencies: Vec::new(),
             is_optional: false,
             is_dev: false,
+            published_as: None,
             fetched_from: FetchedFrom::Registry,
         }];
 
@@ -590,6 +620,7 @@ mod tests {
             ],
             is_optional: false,
             is_dev: false,
+            published_as: None,
             fetched_from: FetchedFrom::Registry,
         }];
 
@@ -673,6 +704,8 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 tarball_url: "https://npm.corp.example/api/npm/corp-utils/-/corp-utils-1.0.0.tgz"
                     .to_owned(),
+                shown_as: "https://npm.corp.example/api/npm/corp-utils/-/corp-utils-1.0.0.tgz"
+                    .to_owned(),
             }],
             "only the custom registry is reported, and never with its credentials"
         );
@@ -703,7 +736,7 @@ mod tests {
 
     fn aliased(installed: &str, target: &str, version: &str, resolved: &str) -> MigratedPackage {
         MigratedPackage {
-            fetched_from: FetchedFrom::RegistryAs(target.to_owned()),
+            published_as: Some(target.to_owned()),
             ..make_pkg(installed, version, Some(resolved))
         }
     }
@@ -744,6 +777,7 @@ mod tests {
                 name: "@corp/utils".to_owned(),
                 version: "1.0.0".to_owned(),
                 tarball_url: "https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz".to_owned(),
+                shown_as: "https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz".to_owned(),
             }]
         );
         lockfile
@@ -770,6 +804,98 @@ mod tests {
     }
 
     #[test]
+    fn a_tarball_dependency_is_recorded_under_the_name_its_own_package_gives() {
+        let (lockfile, _, custom) = to_lockfile_with_registries(vec![MigratedPackage {
+            published_as: Some("actual".to_owned()),
+            fetched_from: FetchedFrom::DependencySpec,
+            ..make_pkg(
+                "shim",
+                "1.0.0",
+                Some("https://example.test/actual-1.0.0.tgz"),
+            )
+        }])
+        .unwrap();
+        assert!(custom.is_empty(), "{custom:?}");
+        assert!(lockfile.find_package("shim").is_none());
+        assert_eq!(
+            lockfile.find_package("actual").unwrap().source.as_deref(),
+            Some("tarball+https://example.test/actual-1.0.0.tgz")
+        );
+    }
+
+    fn real_sri(algorithm: lpm_common::integrity::HashAlgorithm, data: &[u8]) -> String {
+        lpm_common::Integrity::from_bytes(algorithm, data).to_string()
+    }
+
+    #[test]
+    fn a_version_from_a_tarball_url_and_from_a_registry_is_kept_as_two_packages() {
+        use lpm_common::integrity::HashAlgorithm::Sha512;
+        let fork = MigratedPackage {
+            integrity: Some(real_sri(Sha512, b"fork")),
+            fetched_from: FetchedFrom::DependencySpec,
+            ..make_pkg("foo", "1.0.0", Some("https://example.test/foo-1.0.0.tgz"))
+        };
+        let registry = MigratedPackage {
+            integrity: Some(real_sri(Sha512, b"registry")),
+            ..make_pkg(
+                "foo",
+                "1.0.0",
+                Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
+            )
+        };
+        let (lockfile, _, _) = to_lockfile_with_registries(vec![fork, registry]).unwrap();
+        let mut sources: Vec<_> = lockfile
+            .packages
+            .iter()
+            .map(|package| {
+                (
+                    package.source.clone().unwrap(),
+                    package.integrity.clone().unwrap(),
+                )
+            })
+            .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![
+                (
+                    "registry+https://registry.npmjs.org".to_owned(),
+                    real_sri(Sha512, b"registry")
+                ),
+                (
+                    "tarball+https://example.test/foo-1.0.0.tgz".to_owned(),
+                    real_sri(Sha512, b"fork")
+                ),
+            ]
+        );
+        lockfile
+            .to_toml()
+            .expect("two sources of one version must satisfy the lockfile's order");
+    }
+
+    #[test]
+    fn the_stronger_integrity_of_two_copies_is_kept_whichever_came_first() {
+        use lpm_common::integrity::HashAlgorithm::{Sha1, Sha512};
+        let copy = |integrity: String| MigratedPackage {
+            integrity: Some(integrity),
+            ..make_pkg(
+                "ms",
+                "2.1.3",
+                Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+            )
+        };
+        let (lockfile, _, _) = to_lockfile_with_registries(vec![
+            copy(real_sri(Sha1, b"ms")),
+            copy(real_sri(Sha512, b"ms")),
+        ])
+        .unwrap();
+        assert_eq!(
+            lockfile.find_package("ms").unwrap().integrity,
+            Some(real_sri(Sha512, b"ms"))
+        );
+    }
+
+    #[test]
     fn every_copy_of_a_version_from_a_custom_registry_is_reported() {
         let (lockfile, _, custom) = to_lockfile_with_registries(vec![
             make_pkg(
@@ -792,6 +918,7 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 tarball_url: "https://npm.corp.example/corp-utils/-/corp-utils-1.0.0.tgz"
                     .to_owned(),
+                shown_as: "https://npm.corp.example/corp-utils/-/corp-utils-1.0.0.tgz".to_owned(),
             }]
         );
     }
@@ -884,6 +1011,7 @@ mod tests {
             dependencies: Vec::new(),
             is_optional: false,
             is_dev: false,
+            published_as: None,
             fetched_from: FetchedFrom::Registry,
         }];
 
@@ -904,6 +1032,7 @@ mod tests {
                 dependencies: Vec::new(),
                 is_optional: false,
                 is_dev: false,
+                published_as: None,
                 fetched_from: FetchedFrom::Registry,
             },
             MigratedPackage {
@@ -915,6 +1044,7 @@ mod tests {
                 dependencies: Vec::new(),
                 is_optional: false,
                 is_dev: false,
+                published_as: None,
                 fetched_from: FetchedFrom::Registry,
             },
         ];

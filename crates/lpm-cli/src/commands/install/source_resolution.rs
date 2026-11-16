@@ -780,6 +780,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
         &HashSet::new(),
         &HashSet::new(),
         true,
+        None,
     )
     .await
 }
@@ -797,6 +798,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     inherited_optional_registry_roots: &HashSet<String>,
     promoted_git_root_names: &HashSet<String>,
     auto_install_peers: bool,
+    locked_integrities: Option<&super::LockedIntegrities>,
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Gate the manifest boundary for non-registry specifiers.
     //
@@ -1137,6 +1139,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                     .await?
             }
         };
+        if let Some(locked) = locked_integrities {
+            locked.check_tarball_file(&url, downloaded.file.path())?;
+        }
         let computed_sri = downloaded.sri.clone();
         let store_sri = computed_sri.clone();
         let store = store.clone();

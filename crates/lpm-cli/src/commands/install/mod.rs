@@ -1256,6 +1256,7 @@ async fn run_with_options_under_store_lock(
             &v2_workspace_root_pre_resolve.optional_registry_roots,
             &v2_workspace_root_pre_resolve.promoted_git_root_names,
             auto_install_peers,
+            None,
         )
         .await?;
 
@@ -1366,6 +1367,7 @@ async fn run_with_options_under_store_lock(
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
         npm_firewall_chunk_size,
+        locked_integrities: expectations.locked_integrities.as_deref(),
         tarball_prefetch_held: policy_extensions_disable_tarball_prefetch(
             &policy_extension_configs,
         ) || expectations.locked_integrities.is_some(),

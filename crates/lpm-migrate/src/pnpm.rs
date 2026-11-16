@@ -144,6 +144,7 @@ fn parse_package_rows(
             dependencies,
             is_optional,
             is_dev,
+            published_as: None,
             fetched_from,
         });
     }
@@ -191,6 +192,7 @@ fn parse_v9_snapshots(
                 .and_then(|package| package.optional)
                 .unwrap_or(false),
             is_dev: metadata.and_then(|package| package.dev).unwrap_or(false),
+            published_as: None,
             fetched_from,
         });
     }

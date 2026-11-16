@@ -470,26 +470,24 @@ mod tests {
             r#"{"dependencies": {"utils": "npm:@corp/utils@^1.0.0", "app-lib": "^2.0.0"}}"#,
         )
         .unwrap();
-        let package = |name: &str, version: &str, fetched_from| crate::MigratedPackage {
-            lockfile_key: None,
-            name: name.to_owned(),
-            version: version.to_owned(),
-            resolved: None,
-            integrity: None,
-            dependencies: Vec::new(),
-            is_optional: false,
-            is_dev: false,
-            fetched_from,
-        };
-        let mut dependent = package("app-lib", "2.0.0", crate::FetchedFrom::Registry);
+        let package =
+            |name: &str, version: &str, published_as: Option<&str>| crate::MigratedPackage {
+                lockfile_key: None,
+                name: name.to_owned(),
+                version: version.to_owned(),
+                resolved: None,
+                integrity: None,
+                dependencies: Vec::new(),
+                is_optional: false,
+                is_dev: false,
+                published_as: published_as.map(str::to_owned),
+                fetched_from: crate::FetchedFrom::Registry,
+            };
+        let mut dependent = package("app-lib", "2.0.0", None);
         dependent.dependencies = vec![("utils".to_owned(), "1.0.0".to_owned())];
         let (lockfile, _) = crate::normalize::to_lockfile(vec![
             dependent,
-            package(
-                "utils",
-                "1.0.0",
-                crate::FetchedFrom::RegistryAs("@corp/utils".to_owned()),
-            ),
+            package("utils", "1.0.0", Some("@corp/utils")),
         ])
         .unwrap();
 

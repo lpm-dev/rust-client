@@ -74,7 +74,7 @@ fn parse_berry_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         let resolution = mapping_string(entry, "resolution");
         let mut deps_with_ranges = extract_berry_deps(entry, "dependencies");
         deps_with_ranges.extend(extract_berry_deps(entry, "optionalDependencies"));
-        let (fetched_from, resolved) = berry_resolution(&name, resolution.as_deref());
+        let (published_as, fetched_from, resolved) = berry_resolution(&name, resolution.as_deref());
 
         entries.push(YarnEntry {
             specifiers: split_descriptor_list(descriptor_key),
@@ -83,6 +83,7 @@ fn parse_berry_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
             resolved,
             integrity: None,
             deps_with_ranges,
+            published_as,
             fetched_from,
         });
     }
@@ -124,6 +125,7 @@ fn resolve_entries(entries: Vec<YarnEntry>) -> Vec<MigratedPackage> {
                 dependencies,
                 is_optional: false,
                 is_dev: false,
+                published_as: entry.published_as,
                 fetched_from: entry.fetched_from,
             }
         })
@@ -213,6 +215,9 @@ struct YarnEntry {
     integrity: Option<String>,
     /// Dependencies as (name, range) — ranges not yet resolved.
     deps_with_ranges: Vec<(String, String)>,
+    /// The name the package is published under, when an `npm:` alias
+    /// installs it as `name`.
+    published_as: Option<String>,
     /// Where Yarn fetched the package from.
     fetched_from: FetchedFrom,
 }
@@ -314,11 +319,15 @@ fn extract_berry_deps(entry: &serde_yaml::Mapping, field: &str) -> Vec<(String, 
     out
 }
 
-/// Where Yarn Berry fetched a package from, by its `resolution` locator,
-/// and the URL the locator records: a tarball URL, the archive URL a
-/// registry package carries when its registry serves tarballs outside the
-/// npm layout, or an unsupported reference for normalization to skip.
-fn berry_resolution(name: &str, resolution: Option<&str>) -> (FetchedFrom, Option<String>) {
+/// The name Yarn Berry's `resolution` locator publishes a package under,
+/// when it isn't `name`; where Yarn fetched it from; and the URL the locator
+/// records: a tarball URL, the archive URL a registry package carries when
+/// its registry serves tarballs outside the npm layout, or an unsupported
+/// reference for normalization to skip.
+fn berry_resolution(
+    name: &str,
+    resolution: Option<&str>,
+) -> (Option<String>, FetchedFrom, Option<String>) {
     const UNSUPPORTED_PREFIXES: &[&str] = &[
         "exec:",
         "file:",
@@ -331,45 +340,59 @@ fn berry_resolution(name: &str, resolution: Option<&str>) -> (FetchedFrom, Optio
         "workspace:",
     ];
     let Some((locator_name, reference)) = resolution.and_then(split_yarn_descriptor) else {
-        return (FetchedFrom::Registry, None);
+        return (None, FetchedFrom::Registry, None);
     };
+    let published_as = (locator_name != name).then(|| locator_name.to_owned());
     if UNSUPPORTED_PREFIXES
         .iter()
         .any(|prefix| reference.starts_with(prefix))
     {
-        return (FetchedFrom::Registry, Some(reference.to_owned()));
+        return (
+            published_as,
+            FetchedFrom::Registry,
+            Some(reference.to_owned()),
+        );
     }
     if reference.starts_with("https://") || reference.starts_with("http://") {
-        return (FetchedFrom::DependencySpec, Some(reference.to_owned()));
+        return (
+            published_as,
+            FetchedFrom::DependencySpec,
+            Some(reference.to_owned()),
+        );
     }
-    let fetched_from = if locator_name == name {
-        FetchedFrom::Registry
-    } else {
-        FetchedFrom::RegistryAs(locator_name.to_owned())
-    };
     let archive_url = reference.split_once("::").and_then(|(_, parameters)| {
         url::form_urlencoded::parse(parameters.as_bytes())
             .find(|(key, _)| key == "__archiveUrl")
             .map(|(_, url)| url.into_owned())
     });
-    (fetched_from, archive_url)
+    (published_as, FetchedFrom::Registry, archive_url)
 }
 
-/// Where Yarn v1 fetched a package from, by the specifiers its entry
-/// resolves. A registry specifier, or an `npm:` alias naming the package
-/// its registry publishes, wins over a tarball URL or Git specifier.
-fn v1_fetched_from(name: &str, specifiers: &[String]) -> FetchedFrom {
+/// The name Yarn v1 records a package as published under, when an `npm:`
+/// alias installs it as `name`, and where Yarn fetched it from, by the
+/// specifiers its entry resolves. A registry specifier, or an `npm:` alias,
+/// wins over a tarball URL or Git specifier.
+fn v1_fetched_from(name: &str, specifiers: &[String]) -> (Option<String>, FetchedFrom) {
     let registry_target = specifiers.iter().find_map(|specifier| {
         let (_, range) = split_yarn_descriptor(specifier)?;
         if let Some(target) = range.strip_prefix("npm:") {
-            return Some(npm_alias_target(target).unwrap_or(name));
+            // Yarn v1 reads everything after `npm:` as `<name>[@<range>]`;
+            // only a bare range names no other package.
+            let is_range = lpm_semver::VersionReq::parse(target).is_ok();
+            return Some(if is_range {
+                name
+            } else {
+                npm_alias_target(target).unwrap_or(target)
+            });
         }
         (!range_fetches_directly(range)).then_some(name)
     });
     match registry_target {
-        Some(target) if target == name => FetchedFrom::Registry,
-        Some(target) => FetchedFrom::RegistryAs(target.to_owned()),
-        None => FetchedFrom::DependencySpec,
+        Some(target) => (
+            (target != name).then(|| target.to_owned()),
+            FetchedFrom::Registry,
+        ),
+        None => (None, FetchedFrom::DependencySpec),
     }
 }
 
@@ -421,7 +444,7 @@ fn flush_and_start_new(
                 )));
             }
         };
-        let fetched_from = v1_fetched_from(&name, &specifiers);
+        let (published_as, fetched_from) = v1_fetched_from(&name, &specifiers);
         *current = Some(YarnEntry {
             specifiers,
             name,
@@ -429,6 +452,7 @@ fn flush_and_start_new(
             resolved: None,
             integrity: None,
             deps_with_ranges: Vec::new(),
+            published_as,
             fetched_from,
         });
         Ok(Some(State::InEntry))
@@ -484,7 +508,7 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
                             )));
                         }
                     };
-                    let fetched_from = v1_fetched_from(&name, &specifiers);
+                    let (published_as, fetched_from) = v1_fetched_from(&name, &specifiers);
 
                     current = Some(YarnEntry {
                         specifiers,
@@ -493,6 +517,7 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
                         resolved: None,
                         integrity: None,
                         deps_with_ranges: Vec::new(),
+                        published_as,
                         fetched_from,
                     });
                     state = State::InEntry;
@@ -620,12 +645,11 @@ fn strip_quotes(s: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn fetched_from<'a>(packages: &'a [MigratedPackage], name: &str) -> &'a FetchedFrom {
-        &packages
+    fn package<'a>(packages: &'a [MigratedPackage], name: &str) -> &'a MigratedPackage {
+        packages
             .iter()
             .find(|package| package.name == name)
             .unwrap_or_else(|| panic!("{name} is missing from {packages:?}"))
-            .fetched_from
     }
 
     #[test]
@@ -651,19 +675,37 @@ ms@^2.1.3:
   resolved "https://registry.yarnpkg.com/ms/-/ms-2.1.3.tgz#ghi"
 "#;
         let packages = parse_str(input).unwrap();
+        let utils = package(&packages, "utils");
+        assert_eq!(utils.published_name(), "@corp/utils");
+        assert_eq!(utils.fetched_from, FetchedFrom::Registry);
         assert_eq!(
-            fetched_from(&packages, "utils"),
-            &FetchedFrom::RegistryAs("@corp/utils".to_owned())
+            package(&packages, "xlsx").fetched_from,
+            FetchedFrom::DependencySpec
         );
         assert_eq!(
-            fetched_from(&packages, "xlsx"),
-            &FetchedFrom::DependencySpec
+            package(&packages, "tool").fetched_from,
+            FetchedFrom::DependencySpec
         );
-        assert_eq!(
-            fetched_from(&packages, "tool"),
-            &FetchedFrom::DependencySpec
-        );
-        assert_eq!(fetched_from(&packages, "ms"), &FetchedFrom::Registry);
+        assert_eq!(package(&packages, "ms").fetched_from, FetchedFrom::Registry);
+        assert_eq!(package(&packages, "ms").published_as, None);
+    }
+
+    #[test]
+    fn a_yarn_v1_alias_with_no_range_names_the_package_it_installs() {
+        let input = r#"# yarn lockfile v1
+
+
+"foo@npm:lodash":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#abc"
+
+"bar@npm:^1.0.0":
+  version "1.2.0"
+  resolved "https://registry.yarnpkg.com/bar/-/bar-1.2.0.tgz#def"
+"#;
+        let packages = parse_str(input).unwrap();
+        assert_eq!(package(&packages, "foo").published_name(), "lodash");
+        assert_eq!(package(&packages, "bar").published_as, None);
     }
 
     #[test]
@@ -691,10 +733,9 @@ ms@^2.1.3:
   linkType: hard
 "#;
         let packages = parse_str(input).unwrap();
-        assert_eq!(
-            fetched_from(&packages, "utils"),
-            &FetchedFrom::RegistryAs("@corp/utils".to_owned())
-        );
+        let utils = package(&packages, "utils");
+        assert_eq!(utils.published_name(), "@corp/utils");
+        assert_eq!(utils.fetched_from, FetchedFrom::Registry);
         let xlsx = packages
             .iter()
             .find(|package| package.name == "xlsx")

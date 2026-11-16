@@ -333,8 +333,8 @@ fn invalid_package_path(raw: &str) -> LpmError {
 struct RawEntry {
     name: String,
     version: String,
-    /// The name the registry publishes the package as, when an npm alias
-    /// installs it under `name`.
+    /// The name the package is published under, when an npm alias or a
+    /// tarball whose manifest names itself otherwise installs it as `name`.
     registry_name: Option<String>,
     /// Whether npm fetched the package from a URL a dependency spec names.
     fetched_from_spec: bool,
@@ -391,9 +391,9 @@ fn parse_packages_block(
             .get("resolved")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let fetched_from_spec = resolved
-            .as_deref()
-            .is_some_and(|resolved| url_specs.contains(without_fragment(resolved)));
+        let fetched_from_spec = resolved.as_deref().is_some_and(|resolved| {
+            url_specs.contains(&(name.as_str(), without_fragment(resolved)))
+        });
         let registry_name = value
             .get("name")
             .and_then(Value::as_str)
@@ -429,10 +429,10 @@ fn parse_packages_block(
     finalize_entries(entries)
 }
 
-/// Every `http(s)` URL a package row declares as a dependency spec. npm
-/// records such a dependency's `resolved` as that URL and fetches it from
-/// there, not from a registry.
-fn declared_url_specs(packages: &serde_json::Map<String, Value>) -> HashSet<&str> {
+/// Every dependency a package row declares by an `http(s)` URL, as its name
+/// and that URL. npm records such a dependency's `resolved` as that URL and
+/// fetches it from there, not from a registry.
+fn declared_url_specs(packages: &serde_json::Map<String, Value>) -> HashSet<(&str, &str)> {
     const SPEC_FIELDS: [&str; 4] = [
         "dependencies",
         "optionalDependencies",
@@ -445,11 +445,11 @@ fn declared_url_specs(packages: &serde_json::Map<String, Value>) -> HashSet<&str
             SPEC_FIELDS
                 .iter()
                 .filter_map(|field| package.get(*field).and_then(Value::as_object))
-                .flat_map(serde_json::Map::values)
+                .flatten()
         })
-        .filter_map(Value::as_str)
-        .filter(|spec| spec.starts_with("https://") || spec.starts_with("http://"))
-        .map(without_fragment)
+        .filter_map(|(dependency, spec)| Some((dependency.as_str(), spec.as_str()?)))
+        .filter(|(_, spec)| spec.starts_with("https://") || spec.starts_with("http://"))
+        .map(|(dependency, spec)| (dependency, without_fragment(spec)))
         .collect()
 }
 
@@ -648,11 +648,11 @@ fn migrated_package(entry: RawEntry, dependencies: Vec<(String, String)>) -> Mig
     let fetched_from = if entry.fetched_from_spec {
         FetchedFrom::DependencySpec
     } else {
-        entry
-            .registry_name
-            .filter(|registry_name| *registry_name != entry.name)
-            .map_or(FetchedFrom::Registry, FetchedFrom::RegistryAs)
+        FetchedFrom::Registry
     };
+    let published_as = entry
+        .registry_name
+        .filter(|published_name| *published_name != entry.name);
     MigratedPackage {
         lockfile_key: Some(entry.key),
         name: entry.name,
@@ -662,6 +662,7 @@ fn migrated_package(entry: RawEntry, dependencies: Vec<(String, String)>) -> Mig
         dependencies,
         is_optional: entry.is_optional,
         is_dev: entry.is_dev,
+        published_as,
         fetched_from,
     }
 }
@@ -1175,10 +1176,8 @@ mod tests {
             .iter()
             .find(|package| package.name == "utils")
             .unwrap();
-        assert_eq!(
-            utils.fetched_from,
-            FetchedFrom::RegistryAs("@corp/utils".to_owned())
-        );
+        assert_eq!(utils.published_as.as_deref(), Some("@corp/utils"));
+        assert_eq!(utils.fetched_from, FetchedFrom::Registry);
         let ms = packages
             .iter()
             .find(|package| package.name == "ms")
@@ -1207,10 +1206,49 @@ mod tests {
                 .find(|package| package.name == name)
                 .unwrap()
                 .fetched_from
-                .clone()
         };
         assert_eq!(fetched_from("xlsx"), FetchedFrom::DependencySpec);
         assert_eq!(fetched_from("corp-utils"), FetchedFrom::Registry);
+    }
+
+    #[test]
+    fn a_row_resolved_to_a_url_declared_for_another_dependency_stays_a_registry_package() {
+        let tarball = "https://example.test/shared-1.0.0.tgz";
+        let json = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "dependencies": { "shim": tarball, "corp-utils": "^1.0.0" } },
+                "node_modules/shim": { "version": "1.0.0", "resolved": tarball },
+                "node_modules/corp-utils": { "version": "1.0.0", "resolved": tarball }
+            }
+        });
+        let packages = parse_value(&json, 3).unwrap();
+        let fetched_from = |name: &str| {
+            packages
+                .iter()
+                .find(|package| package.name == name)
+                .unwrap()
+                .fetched_from
+        };
+        assert_eq!(fetched_from("shim"), FetchedFrom::DependencySpec);
+        assert_eq!(fetched_from("corp-utils"), FetchedFrom::Registry);
+    }
+
+    #[test]
+    fn a_tarball_dependency_keeps_the_name_its_own_package_gives() {
+        let tarball = "https://example.test/actual-1.0.0.tgz";
+        let json = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "dependencies": { "shim": tarball } },
+                "node_modules/shim": { "name": "actual", "version": "1.0.0", "resolved": tarball }
+            }
+        });
+        let packages = parse_value(&json, 3).unwrap();
+        assert_eq!(packages[0].name, "shim");
+        assert_eq!(packages[0].published_name(), "actual");
+        assert_eq!(packages[0].fetched_from, FetchedFrom::DependencySpec);
+        assert_eq!(packages[0].registry_name(), None);
     }
 
     #[test]
@@ -1227,10 +1265,8 @@ mod tests {
         let packages = parse_value(&json, 1).unwrap();
         assert_eq!(packages[0].name, "utils");
         assert_eq!(packages[0].version, "1.0.0");
-        assert_eq!(
-            packages[0].fetched_from,
-            FetchedFrom::RegistryAs("@corp/utils".to_owned())
-        );
+        assert_eq!(packages[0].published_as.as_deref(), Some("@corp/utils"));
+        assert_eq!(packages[0].fetched_from, FetchedFrom::Registry);
     }
 
     #[test]

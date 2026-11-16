@@ -500,3 +500,128 @@ async fn migrate_installs_an_aliased_package_from_the_registry_its_scope_routes_
     );
     assert_eq!(requests_for(&public, "utils").await, 0);
 }
+
+fn files_containing(root: &std::path::Path, name: &str, content: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(path),
+                Ok(kind) if kind.is_file() && entry.file_name() == name => {
+                    if std::fs::read(&path).is_ok_and(|bytes| bytes == content) {
+                        found.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn migrate_refuses_a_tarball_dependency_whose_url_now_serves_other_bytes_before_storing_them()
+{
+    let public = MockRegistry::start().await;
+    let cdn = MockServer::start().await;
+    let original = make_tarball_with_files("actual", "1.0.0", &[("origin.txt", b"original")]);
+    let swapped = make_tarball_with_files("actual", "1.0.0", &[("origin.txt", b"swapped")]);
+    Mock::given(method("GET"))
+        .and(path("/actual-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(swapped))
+        .mount(&cdn)
+        .await;
+    let url = format!("{}/actual-1.0.0.tgz", cdn.uri());
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "migration-host",
+            "version": "1.0.0",
+            "dependencies": { "shim": url }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "package-lock.json",
+        &serde_json::json!({
+            "name": "migration-host",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "migration-host",
+                    "version": "1.0.0",
+                    "dependencies": { "shim": url }
+                },
+                "node_modules/shim": {
+                    "name": "actual",
+                    "version": "1.0.0",
+                    "resolved": url,
+                    "integrity": compute_integrity(&original)
+                }
+            }
+        })
+        .to_string(),
+    );
+
+    let output = migrate(&project, &public, &[]);
+
+    assert!(!output.status.success(), "{}", report(&output));
+    let text = report(&output);
+    assert!(
+        text.contains("integrity") && text.contains("lpm migrate --rollback"),
+        "{text}"
+    );
+    assert!(!project.file_exists("node_modules/shim"));
+    assert_eq!(
+        files_containing(project.home(), "origin.txt", b"swapped"),
+        Vec::<std::path::PathBuf>::new(),
+        "the other bytes were extracted before the check refused them"
+    );
+}
+
+#[tokio::test]
+async fn migrate_names_a_registry_built_from_environment_variables_without_printing_their_values() {
+    let public = MockRegistry::start().await;
+    let private = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{"name":"migration-host","version":"1.0.0","dependencies":{"@corp/utils":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "yarn.lock",
+        "__metadata:\n  version: 8\n  cacheKey: 10\n\n\"@corp/utils@npm:1.0.0\":\n  version: 1.0.0\n  resolution: \"@corp/utils@npm:1.0.0\"\n  languageName: node\n  linkType: hard\n",
+    );
+    project.write_file(
+        ".yarnrc.yml",
+        &format!(
+            "npmScopes:\n  corp:\n    npmRegistryServer: \"{}/${{REG_TOKEN}}/npm/\"\n",
+            private.url()
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &public.url())
+        .env("REG_TOKEN", "tok_4f9a2c")
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", report(&output));
+    let text = report(&output);
+    assert!(text.contains("@corp/utils@1.0.0"), "{text}");
+    assert!(text.contains("npmScopes.corp.npmRegistryServer"), "{text}");
+    assert!(
+        !text.contains("tok_4f9a2c"),
+        "a value from the environment was printed:\n{text}"
+    );
+    assert!(!project.file_exists("lpm.lock"));
+}
