@@ -231,6 +231,18 @@ pub(crate) fn render_profile_with_toolchain(
     if !spec.read_project_full {
         render_secret_denies(&mut out, &canon_project_dir)?;
     }
+    // securityd decrypts a file keychain's items for any process that can
+    // read the file and reach it, as the system roots keep it reachable. So
+    // a keychain file is unreadable wherever a script could otherwise read
+    // it, such as its temporary directory, except the system's own.
+    out.push_str(&format!(
+        "(deny file-read* (regex {}))\n",
+        seatbelt_regex_literal(r"\.keychain(-db)?$")
+    ));
+    out.push_str(&format!(
+        "(allow file-read* (regex {}))\n",
+        seatbelt_regex_literal(r"^/System/Library/Keychains/[^/]+\.keychain(-db)?$")
+    ));
     render_secret_read_allow_overrides(&mut out, &spec.secret_read_allow)?;
     out.push('\n');
 
@@ -1538,6 +1550,26 @@ mod tests {
     }
 
     #[test]
+    fn keychain_files_are_unreadable_everywhere_but_the_systems_own() {
+        let p = render_profile(&spec(), false).unwrap();
+        let deny = p
+            .find(r#"(deny file-read* (regex #"\.keychain(-db)?$"))"#)
+            .expect("keychain deny");
+        let system = p
+            .find(r#"(allow file-read* (regex #"^/System/Library/Keychains/[^/]+\.keychain(-db)?$"))"#)
+            .expect("system keychains re-allowed");
+        assert!(
+            deny < system,
+            "the system's keychains must be allowed after the deny: {p}"
+        );
+        assert!(
+            p.find("(subpath \"/System\")")
+                .is_some_and(|grant| grant < deny),
+            "the deny must follow the read grants it narrows: {p}"
+        );
+    }
+
+    #[test]
     fn logonly_profile_inherits_secret_deny_block() {
         let p = render_logonly_profile(&spec(), false).unwrap();
         assert!(p.contains("(deny file-read*"));
@@ -1598,9 +1630,10 @@ mod tests {
     #[test]
     fn empty_secret_read_allow_emits_no_override_block() {
         let p = render_profile(&spec(), false).unwrap();
-        // Exactly ONE `(allow file-read*` (the broad project_dir
-        // allow) and ZERO follow-up overrides.
-        let count = p.matches("(allow file-read*").count();
+        // Exactly ONE `(allow file-read*` block (the broad project_dir
+        // allow) and ZERO follow-up override blocks; the system keychain
+        // allow is a single rule.
+        let count = p.matches("(allow file-read*\n").count();
         assert_eq!(count, 1, "no override block expected:\n{p}");
     }
 

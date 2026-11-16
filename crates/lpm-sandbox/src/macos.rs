@@ -464,6 +464,49 @@ mod tests {
     }
 
     #[test]
+    fn a_script_cannot_read_a_keychain_file_in_its_temporary_directory_but_reads_the_system_roots()
+    {
+        let mut rs = realistic_spec();
+        let tmpdir = rs._tmp.path().join("script-tmp");
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        rs.spec.tmpdir = tmpdir.clone();
+        let readable = tmpdir.join("notes.txt");
+        let keychain = tmpdir.join("signing.keychain-db");
+        std::fs::write(&readable, b"notes").unwrap();
+        std::fs::write(&keychain, b"keychain").unwrap();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let read = |path: &std::path::Path| {
+            let mut cmd = SandboxedCommand::new("/bin/cat")
+                .arg(path)
+                .envs_cleared([("PATH", "/usr/bin:/bin")]);
+            cmd.stdout = SandboxStdio::Null;
+            cmd.stderr = SandboxStdio::Null;
+            sb.spawn(cmd)
+                .expect("spawn")
+                .wait()
+                .expect("wait")
+                .success()
+        };
+
+        assert!(
+            read(&readable),
+            "the script's temporary directory must stay readable"
+        );
+        assert!(
+            !read(&keychain),
+            "a keychain file in the temporary directory was readable"
+        );
+        let system_roots =
+            std::path::Path::new("/System/Library/Keychains/SystemRootCertificates.keychain");
+        if system_roots.exists() {
+            assert!(
+                read(system_roots),
+                "the system roots keychain must stay readable"
+            );
+        }
+    }
+
+    #[test]
     fn a_script_cannot_reach_the_keychain() {
         use std::io::BufRead;
 
