@@ -161,6 +161,10 @@ impl BuildCacheInvocation {
         extra_read_paths: &[PathBuf],
         capabilities: &CapabilitySet,
     ) -> Option<Self> {
+        if !CACHES_NATIVE_BUILDS {
+            debug_bypass("native builds are cached on macOS and Linux only");
+            return None;
+        }
         if sandbox_mode != SandboxMode::Enforce {
             debug_bypass("sandbox is not enforcing");
             return None;
@@ -225,8 +229,11 @@ enum NativeBuildKind {
     NativeToolchain,
 }
 
+/// The systems whose native builds are recognized, and so cached.
+const CACHES_NATIVE_BUILDS: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
 fn native_build_kind(name: &str, scripts: &HashMap<String, String>) -> Option<NativeBuildKind> {
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+    if !CACHES_NATIVE_BUILDS {
         return None;
     }
     let mut kind = None;
@@ -780,8 +787,15 @@ fn toolchain_probe_environment(
         "PKG_CONFIG_LIBDIR",
         "PKG_CONFIG_SYSROOT_DIR",
     ];
-    let mut probe_environment = HashMap::with_capacity(PASSTHROUGH.len() + 2);
-    for name in PASSTHROUGH {
+    // Node aborts at startup on Windows when it can't find the system
+    // directory to load its random number provider from.
+    const SYSTEM: &[&str] = if cfg!(windows) {
+        &["SystemRoot", "windir"]
+    } else {
+        &[]
+    };
+    let mut probe_environment = HashMap::with_capacity(PASSTHROUGH.len() + SYSTEM.len() + 2);
+    for name in PASSTHROUGH.iter().chain(SYSTEM) {
         if let Some((key, value)) = trusted_environment
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
@@ -813,17 +827,7 @@ pub(super) fn trusted_host_output(
     {
         return None;
     }
-    let mut probe_environment = toolchain_probe_environment(environment);
-    // Node aborts at startup on Windows when it can't find the system
-    // directory to load its random number provider from.
-    for name in ["SystemRoot", "windir"] {
-        if let Some((key, value)) = environment
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        {
-            probe_environment.insert(key.clone(), value.clone());
-        }
-    }
+    let probe_environment = toolchain_probe_environment(environment);
     let output = run_bounded_toolchain_probe(&invocation, args, &probe_environment)?;
     let complete = usize::try_from(output.stdout.total_bytes) == Ok(output.stdout.retained.len());
     (output.status.success() && complete)
@@ -2221,6 +2225,20 @@ mod tests {
         assert!(!probe.contains_key(OsStr::new("NODE_OPTIONS")));
         assert!(!probe.contains_key(OsStr::new("LD_PRELOAD")));
         assert!(!probe.contains_key(OsStr::new("DYLD_INSERT_LIBRARIES")));
+    }
+
+    #[test]
+    fn a_probe_is_told_where_windows_is_and_only_there() {
+        let trusted = HashMap::from([
+            ("Path".into(), r"C:\Tools".into()),
+            ("SYSTEMROOT".into(), r"C:\Windows".into()),
+            ("windir".into(), r"C:\Windows".into()),
+        ]);
+
+        let probe = toolchain_probe_environment(&trusted);
+
+        let told = ["SYSTEMROOT", "windir"].map(|name| probe.contains_key(OsStr::new(name)));
+        assert_eq!(told, [cfg!(windows); 2]);
     }
 
     #[test]
