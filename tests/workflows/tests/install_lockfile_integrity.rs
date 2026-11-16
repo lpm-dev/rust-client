@@ -4,7 +4,9 @@
 mod support;
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+use support::mock_registry::{
+    MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
+};
 use support::{TempProject, lpm_with_registry};
 
 const INSTALL: [&str; 3] = ["install", "--no-skills", "--no-security-summary"];
@@ -167,6 +169,153 @@ async fn a_frozen_lockfile_keeps_the_integrity_it_was_written_with() {
 
     assert_eq!(project.read_file("lpm.lock"), pinned);
     assert!(project.file_exists("node_modules/pinned/package.json"));
+}
+
+/// A lockfile that can't be rewritten keeps its SHA-1 pin, and the store
+/// keeps the package under the sha512 of its bytes. The store remembers
+/// which bytes a fetch checked against the pin, so only the first install
+/// downloads them.
+async fn a_pin_that_stays_is_downloaded_once(project: TempProject, installed: &str) {
+    let registry = MockRegistry::start().await;
+    pinned_by(&project, &registry, sha1_of).await;
+    let pinned = project.read_file("lpm.lock");
+    let fetched_before = registry.tarball_request_count("pinned", "1.0.0").await;
+    let frozen_install = || {
+        let mut install = lpm_with_registry(&project, &registry.url());
+        install.args(INSTALL).arg("--frozen-lockfile");
+        install
+    };
+
+    frozen_install().assert().success();
+    assert_eq!(
+        registry.tarball_request_count("pinned", "1.0.0").await,
+        fetched_before + 1
+    );
+
+    forget_install(&project);
+    frozen_install().assert().success();
+
+    assert_eq!(
+        registry.tarball_request_count("pinned", "1.0.0").await,
+        fetched_before + 1,
+        "the store names the package its pin was checked against"
+    );
+    assert_eq!(project.read_file("lpm.lock"), pinned);
+    assert!(project.file_exists(installed));
+
+    forget_install(&project);
+    frozen_install().arg("--offline").assert().success();
+    assert!(project.file_exists(installed));
+
+    // A lockfile that could take the sha512 keeps its pin too: only a
+    // download of the install itself changes it.
+    forget_install(&project);
+    lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+    assert_eq!(
+        registry.tarball_request_count("pinned", "1.0.0").await,
+        fetched_before + 1
+    );
+    assert_eq!(project.read_file("lpm.lock"), pinned);
+    assert!(project.file_exists(installed));
+}
+
+/// A registry that publishes only a SHA-1 signs over it. The lockfile row
+/// keeps that integrity beside the signature, which a replay then
+/// verifies, and the store finds the package by its record.
+#[tokio::test]
+async fn a_signed_package_published_by_a_weaker_hash_keeps_it_and_is_downloaded_once() {
+    let registry = MockRegistry::start().await;
+    let signer = RegistrySigningFixture::new();
+    registry.with_registry_signing_keys(&signer).await;
+    let tarball = make_tarball("pinned", "1.0.0");
+    let published = sha1_of(&tarball);
+    let mut metadata = registry.package_metadata("pinned", "1.0.0", &tarball);
+    metadata["versions"]["1.0.0"]["dist"]["integrity"] = serde_json::json!(published);
+    metadata["versions"]["1.0.0"]["dist"]["signatures"] =
+        serde_json::json!([signer.signature_json("pinned", "1.0.0", &published)]);
+    registry
+        .with_package_metadata("pinned", "1.0.0", &tarball, metadata.clone())
+        .await;
+    registry.with_batch_metadata(vec![metadata]).await;
+    let project = single_project();
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(lpm_dir.join("config.toml"), "signatures = true\n").unwrap();
+
+    lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(lockfile.contains(&published), "{lockfile}");
+    assert!(
+        !lockfile.contains(&compute_integrity(&tarball)),
+        "{lockfile}"
+    );
+    let fetched = registry.tarball_request_count("pinned", "1.0.0").await;
+
+    forget_install(&project);
+    lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .arg("--frozen-lockfile")
+        .assert()
+        .success();
+
+    assert_eq!(
+        registry.tarball_request_count("pinned", "1.0.0").await,
+        fetched
+    );
+    assert!(project.file_exists("node_modules/pinned/package.json"));
+}
+
+/// What the store remembers is the pin a fetch checked. A lockfile that
+/// pins the same package by another integrity is checked against the
+/// registry's bytes like any other.
+#[tokio::test]
+async fn the_store_answers_only_for_the_pin_a_fetch_checked() {
+    let registry = MockRegistry::start().await;
+    let project = single_project();
+    pinned_by(&project, &registry, sha1_of).await;
+    let checked = sha1_of(&make_tarball("pinned", "1.0.0"));
+    let frozen_install = || {
+        let mut install = lpm_with_registry(&project, &registry.url());
+        install.args(INSTALL).arg("--frozen-lockfile");
+        install
+    };
+    frozen_install().assert().success();
+    let fetched = registry.tarball_request_count("pinned", "1.0.0").await;
+
+    forget_install(&project);
+    let another = sha1_of(b"another archive");
+    project.write_file(
+        "lpm.lock",
+        &project.read_file("lpm.lock").replace(&checked, &another),
+    );
+    frozen_install().assert().failure();
+
+    assert_eq!(
+        registry.tarball_request_count("pinned", "1.0.0").await,
+        fetched + 1
+    );
+    assert!(!project.file_exists("node_modules/pinned/package.json"));
+}
+
+#[tokio::test]
+async fn a_frozen_lockfile_pinned_by_a_weaker_hash_downloads_its_package_once() {
+    a_pin_that_stays_is_downloaded_once(single_project(), "node_modules/pinned/package.json").await;
+}
+
+#[tokio::test]
+async fn a_frozen_workspace_lockfile_pinned_by_a_weaker_hash_downloads_its_package_once() {
+    a_pin_that_stays_is_downloaded_once(
+        workspace(),
+        "packages/app/node_modules/pinned/package.json",
+    )
+    .await;
 }
 
 #[tokio::test]

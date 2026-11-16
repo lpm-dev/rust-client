@@ -62,9 +62,10 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     let mut pkg = fake_pkg("cache-hit", "1.0.0", true);
     pkg.integrity = Some(sri.clone());
 
-    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
-        .await
-        .unwrap();
+    let prevalidation =
+        prevalidate_v2_reusable_objects(&[pkg], &HashMap::new(), std::sync::Arc::new(store))
+            .await
+            .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
     assert_eq!(prevalidation.hit_count, 1);
@@ -99,9 +100,10 @@ async fn prevalidate_v2_reusable_objects_source_policy_trusts_tampered_registry_
     let mut pkg = fake_pkg("tampered", "1.0.0", true);
     pkg.integrity = Some(sri);
 
-    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
-        .await
-        .unwrap();
+    let prevalidation =
+        prevalidate_v2_reusable_objects(&[pkg], &HashMap::new(), std::sync::Arc::new(store))
+            .await
+            .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
     assert_eq!(prevalidation.hit_count, 1);
@@ -130,9 +132,10 @@ async fn prevalidate_v2_reusable_objects_tree_policy_removes_tampered_registry_o
     let mut pkg = fake_pkg("tampered-tree", "1.0.0", true);
     pkg.integrity = Some(sri);
 
-    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
-        .await
-        .unwrap();
+    let prevalidation =
+        prevalidate_v2_reusable_objects(&[pkg], &HashMap::new(), std::sync::Arc::new(store))
+            .await
+            .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
     assert_eq!(prevalidation.hit_count, 0);

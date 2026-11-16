@@ -593,8 +593,10 @@ fn record_workspace_fetch_completion(
     }
 }
 
-/// Whether the virtual store holds `package`'s object. The fetch phase
-/// validates stored objects before reuse, so the overlap leaves them to it.
+/// Whether the virtual store holds `package`'s object, under the package's
+/// integrity or the one a fetch that checked it recorded for it. The fetch
+/// phase validates stored objects before reuse, so the overlap leaves them
+/// to it.
 fn object_already_stored(
     package: &InstallPackage,
     store_v2: Option<&lpm_store::v2::Store>,
@@ -602,9 +604,10 @@ fn object_already_stored(
     let (Some(store_v2), Some(integrity)) = (store_v2, package.integrity.as_deref()) else {
         return false;
     };
+    let checked = store_v2.checked_pin(&package.name, &package.version, integrity);
     store_v2
         .paths()
-        .object_dir(integrity)
+        .object_dir(checked.as_deref().unwrap_or(integrity))
         .is_ok_and(|object_dir| object_dir.exists())
 }
 
@@ -900,7 +903,9 @@ async fn fetch_selected_package(
         let key_lock = fetch_coord.lock_for(key.clone()).await;
         let _key_guard = key_lock.lock().await;
 
-        if package.store_has_for_install_layout(&store, store_v2_handle.as_deref(), &project_dir) {
+        if package.store_has_for_install_layout(&store, store_v2_handle.as_deref(), &project_dir)
+            || object_already_stored(&package, store_v2_handle.as_deref())
+        {
             return Ok(FetchOverlapTaskStatus::CacheHit);
         }
 
