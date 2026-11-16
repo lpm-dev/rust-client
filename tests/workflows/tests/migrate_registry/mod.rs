@@ -778,9 +778,14 @@ async fn installing_one_workspace_member_over_a_migrated_lockfile_is_refused_unt
 
     assert!(!installed.status.success(), "{}", report(&installed));
     assert!(
-        report(&installed).contains("lpm install --recursive"),
+        report(&installed).contains("from the workspace root"),
         "{}",
         report(&installed)
+    );
+    assert!(
+        !project.file_exists("packages/app/node_modules/corp-utils")
+            && !project.file_exists("node_modules/corp-utils"),
+        "the member's install ran before it was refused"
     );
     assert!(
         project
@@ -827,5 +832,95 @@ async fn registry_signatures_are_checked_against_the_published_integrity_when_th
     assert_eq!(
         project.read_file("node_modules/corp-utils/origin.txt"),
         "signed"
+    );
+}
+
+#[tokio::test]
+async fn migrate_names_the_destination_registry_without_values_npmrc_expanded_into_it() {
+    let registries = registries().await;
+    let project = TempProject::empty(PROJECT);
+    project.write_file(
+        "package-lock.json",
+        &package_lock(
+            &registries.private.tarball_url("corp-utils", "1.0.0"),
+            &registries.private_integrity,
+        ),
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!("registry={}/${{REG_TOKEN}}/npm/\n", registries.public.url()),
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &registries.public.url())
+        .env("REG_TOKEN", "tok_8c1e5d")
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", report(&output));
+    let text = report(&output);
+    assert!(text.contains("corp-utils@1.0.0"), "{text}");
+    assert!(
+        !text.contains("tok_8c1e5d"),
+        "a value .npmrc expanded was printed:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_migrated_lockfile_records_only_the_origin_of_a_registry_built_from_environment_variables()
+ {
+    let public = MockRegistry::start().await;
+    let private = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{"name":"migration-host","version":"1.0.0","dependencies":{"@corp/utils":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "yarn.lock",
+        "__metadata:\n  version: 8\n  cacheKey: 10\n\n\"@corp/utils@npm:1.0.0\":\n  version: 1.0.0\n  resolution: \"@corp/utils@npm:1.0.0\"\n  languageName: node\n  linkType: hard\n",
+    );
+    project.write_file(
+        ".yarnrc.yml",
+        &format!(
+            "npmScopes:\n  corp:\n    npmRegistryServer: \"{}/${{REG_TOKEN}}/npm/\"\n",
+            private.url()
+        ),
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!("@corp:registry={}/${{REG_TOKEN}}/npm/\n", private.url()),
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &public.url())
+        .env("REG_TOKEN", "tok_3b7f90")
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+            "--no-install",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        !report(&output).contains("tok_3b7f90"),
+        "{}",
+        report(&output)
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(!lockfile.contains("tok_3b7f90"), "{lockfile}");
+    assert!(
+        lockfile.contains(&format!("source = \"registry+{}/\"", private.url())),
+        "{lockfile}"
     );
 }

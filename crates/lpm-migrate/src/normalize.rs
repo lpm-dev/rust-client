@@ -140,7 +140,7 @@ pub fn to_lockfile_with_registries(
                             key.0, key.1
                         )));
                     }
-                    SriComparison::NoCommonAlgorithm
+                    SriComparison::Agree | SriComparison::NoCommonAlgorithm
                         if strongest_algorithm(&other) > strongest_algorithm(recorded) =>
                     {
                         locked.integrity = Some(other);
@@ -898,6 +898,33 @@ mod tests {
             lockfile.find_package("ms").unwrap().integrity,
             Some(real_sri(Sha512, b"ms"))
         );
+    }
+
+    #[test]
+    fn the_stronger_integrity_of_two_agreeing_copies_is_kept_in_either_order() {
+        use lpm_common::integrity::HashAlgorithm::{Sha1, Sha512};
+        let copy = |integrity: String| MigratedPackage {
+            integrity: Some(integrity),
+            ..make_pkg(
+                "ms",
+                "2.1.3",
+                Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+            )
+        };
+        let weak = real_sri(Sha1, b"ms");
+        let strong = format!("{weak} {}", real_sri(Sha512, b"ms"));
+        for order in [
+            [weak.clone(), strong.clone()],
+            [strong.clone(), weak.clone()],
+        ] {
+            let (lockfile, _, _) =
+                to_lockfile_with_registries(order.iter().cloned().map(copy).collect()).unwrap();
+            assert_eq!(
+                lockfile.find_package("ms").unwrap().integrity.as_deref(),
+                Some(strong.as_str()),
+                "{order:?}"
+            );
+        }
     }
 
     #[test]

@@ -24,9 +24,10 @@ pub(crate) struct LockedIntegrities {
     /// The recorded integrity of each registry package, by name, then
     /// version.
     by_name: HashMap<String, HashMap<String, String>>,
-    /// The recorded integrity of each package fetched from a tarball URL, by
-    /// that URL without credentials, query or fragment.
-    by_tarball: HashMap<String, String>,
+    /// The recorded integrities of packages fetched from a tarball URL, by
+    /// that URL without credentials, query or fragment. URLs that differ only
+    /// in their query share a key, so each key can hold several records.
+    by_tarball: HashMap<String, Vec<String>>,
 }
 
 impl LockedIntegrities {
@@ -101,7 +102,11 @@ impl LockedIntegrities {
             {
                 Some(url) => {
                     if let Some(url) = tarball_key(url) {
-                        integrities.by_tarball.insert(url, integrity.clone());
+                        integrities
+                            .by_tarball
+                            .entry(url)
+                            .or_default()
+                            .push(integrity.clone());
                     }
                 }
                 None => {
@@ -116,40 +121,25 @@ impl LockedIntegrities {
         integrities
     }
 
-    /// Refuses a tarball downloaded from `url` whose bytes don't match the
-    /// integrity recorded for that URL, before anything extracts it. For
-    /// each algorithm the record names, one of its digests must match.
+    /// Refuses a tarball downloaded from `url` whose bytes match none of the
+    /// integrities recorded for that URL, before anything extracts it.
     pub(super) fn check_tarball_file(&self, url: &str, file: &Path) -> Result<(), LpmError> {
-        let Some(locked) = tarball_key(url).and_then(|key| self.by_tarball.get(&key)) else {
+        let Some(records) = tarball_key(url).and_then(|key| self.by_tarball.get(&key)) else {
             return Ok(());
         };
-        let mut algorithms: Vec<HashAlgorithm> =
-            sri_hashes(locked).map(|hash| hash.algorithm).collect();
-        algorithms.sort_unstable();
-        algorithms.dedup();
-        for algorithm in algorithms {
-            let mut matched = false;
-            for expected in sri_hashes(locked).filter(|hash| hash.algorithm == algorithm) {
-                match expected.verify_file(file) {
-                    Ok(()) => {
-                        matched = true;
-                        break;
-                    }
-                    Err(LpmError::IntegrityMismatch { .. }) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            if !matched {
-                return Err(LpmError::Registry(format!(
-                    "the tarball at {} doesn't have the integrity {locked} that the lockfile \
-                     `lpm migrate` wrote recorded for it, so these aren't the bytes the project \
-                     had. Nothing was installed. Find out which tarball is the right one before \
-                     going on: `lpm migrate --rollback` restores the original lockfile.",
-                    lpm_common::safe_url_origin(url),
-                )));
+        for record in records {
+            if file_matches(record, file)? {
+                return Ok(());
             }
         }
-        Ok(())
+        Err(LpmError::Registry(format!(
+            "the tarball at {} doesn't have the integrity {} that the lockfile `lpm migrate` \
+             wrote recorded for it, so these aren't the bytes the project had. Nothing was \
+             installed. Find out which tarball is the right one before going on: `lpm migrate \
+             --rollback` restores the original lockfile.",
+            lpm_common::safe_url_origin(url),
+            records.join(" or "),
+        )))
     }
 
     /// Holds each package resolved at a recorded version to the recorded
@@ -172,23 +162,30 @@ impl LockedIntegrities {
     }
 
     fn apply_to(&self, package: &mut InstallPackage) -> Result<(), LpmError> {
-        let locked = match package.source.strip_prefix("tarball+") {
-            Some(url) => tarball_key(url).and_then(|url| self.by_tarball.get(&url)),
+        let records: &[String] = match package.source.strip_prefix("tarball+") {
+            Some(url) => tarball_key(url)
+                .and_then(|url| self.by_tarball.get(&url))
+                .map_or(&[], Vec::as_slice),
             None => self
                 .by_name
                 .get(&package.name)
-                .and_then(|versions| versions.get(&package.version)),
+                .and_then(|versions| versions.get(&package.version))
+                .map_or(&[], std::slice::from_ref),
         };
-        let Some(locked) = locked else {
+        let Some(first) = records.first() else {
             return Ok(());
         };
-        let resolved_strength = match package.integrity.as_deref() {
-            None => None,
+        let (locked, resolved_strength) = match package.integrity.as_deref() {
+            None if records.len() > 1 => return Ok(()),
+            None => (first, None),
             Some(resolved) => {
-                if compare_sri(locked, resolved) == SriComparison::Disagree {
-                    return Err(refusal(package, resolved, locked));
-                }
-                strongest_algorithm(resolved)
+                let Some(locked) = records
+                    .iter()
+                    .find(|record| compare_sri(record, resolved) != SriComparison::Disagree)
+                else {
+                    return Err(refusal(package, resolved, first));
+                };
+                (locked, strongest_algorithm(resolved))
             }
         };
         if strongest_algorithm(locked) > resolved_strength
@@ -198,6 +195,32 @@ impl LockedIntegrities {
         }
         Ok(())
     }
+}
+
+/// Whether `file` has the integrity `record` names: for each algorithm in
+/// it, one of its digests matches.
+fn file_matches(record: &str, file: &Path) -> Result<bool, LpmError> {
+    let mut algorithms: Vec<HashAlgorithm> =
+        sri_hashes(record).map(|hash| hash.algorithm).collect();
+    algorithms.sort_unstable();
+    algorithms.dedup();
+    for algorithm in algorithms {
+        let mut matched = false;
+        for expected in sri_hashes(record).filter(|hash| hash.algorithm == algorithm) {
+            match expected.verify_file(file) {
+                Ok(()) => {
+                    matched = true;
+                    break;
+                }
+                Err(LpmError::IntegrityMismatch { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn strongest_algorithm(sri: &str) -> Option<HashAlgorithm> {
@@ -391,7 +414,11 @@ mod tests {
         let mut pins = LockedIntegrities::default();
         pins.by_tarball.insert(
             "https://cdn.example/actual-1.0.0.tgz".to_owned(),
-            format!("{} {}", sri(Sha1, b"original"), sri(Sha512, b"original")),
+            vec![format!(
+                "{} {}",
+                sri(Sha1, b"original"),
+                sri(Sha512, b"original")
+            )],
         );
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("downloaded.tgz");
@@ -427,11 +454,40 @@ mod tests {
     }
 
     #[test]
+    fn tarballs_whose_urls_differ_only_by_query_are_each_held_to_their_own_record() {
+        let mut pins = LockedIntegrities::default();
+        pins.by_tarball.insert(
+            "https://host.example/download".to_owned(),
+            vec![sri(Sha512, b"a"), sri(Sha512, b"b")],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("downloaded.tgz");
+        for (url, bytes) in [
+            ("https://host.example/download?file=a.tgz", b"a"),
+            ("https://host.example/download?file=b.tgz", b"b"),
+        ] {
+            std::fs::write(&file, bytes).unwrap();
+            pins.check_tarball_file(url, &file).unwrap();
+        }
+        std::fs::write(&file, b"c").unwrap();
+        assert!(
+            pins.check_tarball_file("https://host.example/download?file=a.tgz", &file)
+                .is_err()
+        );
+
+        let mut package = resolved("a", "1.0.0", Some(&sri(Sha512, b"a")));
+        package.source = "tarball+https://host.example/download?file=a.tgz".to_owned();
+        apply_one(&pins, package.clone()).unwrap();
+        package.integrity = Some(sri(Sha512, b"c"));
+        assert!(apply_one(&pins, package).is_err());
+    }
+
+    #[test]
     fn a_tarball_package_is_held_to_the_record_for_its_url_not_a_registry_copys() {
         let mut pins = locked("foo", "1.0.0", &sri(Sha512, b"registry"));
         pins.by_tarball.insert(
             "https://example.test/foo-1.0.0.tgz".to_owned(),
-            sri(Sha512, b"fork"),
+            vec![sri(Sha512, b"fork")],
         );
         let mut fork = resolved("foo", "1.0.0", Some(&sri(Sha512, b"fork")));
         fork.source = "tarball+https://example.test/foo-1.0.0.tgz".to_owned();

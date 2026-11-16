@@ -1694,10 +1694,26 @@ fn registry_changes(
             to: match route_table.route_for_package(&package.name) {
                 lpm_registry::UpstreamRoute::LpmWorker => client.base_url().to_owned(),
                 lpm_registry::UpstreamRoute::NpmDirect => client.npm_registry_url().to_owned(),
-                lpm_registry::UpstreamRoute::Custom { target, .. } => target.base_url.to_string(),
+                lpm_registry::UpstreamRoute::Custom { target, .. } => {
+                    shown_registry(&target.base_url)
+                }
             },
         })
         .collect()
+}
+
+/// A configured registry by its origin alone. Its path can hold a value
+/// `.npmrc` expanded from an environment variable, such as a token.
+fn shown_registry(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return "the registry .npmrc names".to_owned();
+    };
+    let origin = url.origin().ascii_serialization();
+    if url.path().trim_matches('/').is_empty() {
+        origin
+    } else {
+        format!("{origin}/…")
+    }
 }
 
 /// Packages a refusal or warning names before summarizing the rest.

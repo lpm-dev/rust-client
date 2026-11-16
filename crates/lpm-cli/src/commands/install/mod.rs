@@ -483,11 +483,24 @@ pub(crate) async fn run_with_options_with_lpm_root(
             )
         })
         .unwrap_or_default();
-    let transaction_root = lpm_workspace::find_workspace_root(project_dir)
-        .map_err(|error| LpmError::Workspace(error.to_string()))?
+    let workspace_root = lpm_workspace::find_workspace_root(project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    let transaction_root = workspace_root
+        .clone()
         .unwrap_or_else(|| project_dir.to_path_buf());
     if expectations.locked_integrities.is_none() {
         expectations.locked_integrities = LockedIntegrities::detect(&transaction_root)?;
+        // A workspace install that carries the integrities in installs every
+        // member; one that finds them itself covers only part of the
+        // workspace and couldn't replace the lockfile without dropping them.
+        if expectations.locked_integrities.is_some() && workspace_root.is_some() {
+            return Err(LpmError::Registry(format!(
+                "{} was written by `lpm migrate`, and every workspace member must be checked \
+                 against the integrities it recorded before it's replaced. Run `lpm install` \
+                 from the workspace root, which installs every member.",
+                transaction_root.join(lpm_lockfile::LOCKFILE_NAME).display()
+            )));
+        }
     }
     crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;

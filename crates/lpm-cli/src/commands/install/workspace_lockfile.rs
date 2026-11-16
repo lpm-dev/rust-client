@@ -341,6 +341,7 @@ impl WorkspaceLockfileCoordinator {
             }
         }
         if self.migrated_lockfile
+            && !staged.is_empty()
             && let Some(importer) = self.valid_importers.iter().find(|importer| {
                 !staged.contains_key(*importer) && !non_persisting_importers.contains(*importer)
             })
@@ -1425,6 +1426,63 @@ mod tests {
         coordinator.stage(".", staged.clone());
 
         assert_eq!(coordinator.projection(".").unwrap(), staged);
+    }
+
+    fn migrated_workspace(directory: &std::path::Path) -> WorkspaceLockfileCoordinator {
+        let (lockfile, _) =
+            lpm_migrate::normalize::to_lockfile(vec![lpm_migrate::MigratedPackage {
+                lockfile_key: None,
+                name: "corp-utils".to_owned(),
+                version: "1.0.0".to_owned(),
+                resolved: Some(
+                    "https://registry.npmjs.org/corp-utils/-/corp-utils-1.0.0.tgz".to_owned(),
+                ),
+                integrity: None,
+                dependencies: Vec::new(),
+                is_optional: false,
+                is_dev: false,
+                published_as: None,
+                fetched_from: lpm_migrate::FetchedFrom::Registry,
+            }])
+            .unwrap();
+        lockfile
+            .write_all(&directory.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        WorkspaceLockfileCoordinator::new(
+            directory,
+            &[("packages/app".to_owned(), directory.join("packages/app"))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_commit_that_stages_nothing_leaves_a_migrated_lockfile_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = migrated_workspace(directory.path());
+        assert!(!coordinator.commit(&[]).unwrap());
+    }
+
+    #[test]
+    fn a_commit_that_skips_a_member_does_not_replace_a_migrated_lockfile() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = migrated_workspace(directory.path());
+        coordinator.stage(
+            ".",
+            lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion"),
+        );
+        let error = coordinator
+            .commit(&[".".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("packages/app") && error.contains("--recursive"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_to_string(directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+                .unwrap()
+                .contains("resolved-with = \"migrate\"")
+        );
     }
 
     #[test]
