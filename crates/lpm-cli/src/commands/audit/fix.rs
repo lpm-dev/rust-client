@@ -586,7 +586,10 @@ async fn fetch_audit_fix_metadata(
         client.get_package_metadata(&package_name).await
     } else {
         match npm_source {
-            Some(NpmMetadataSource::PublicNpm) => client.get_npm_metadata_direct(name).await,
+            Some(NpmMetadataSource::PublicNpm) => client
+                .revalidate_npm_metadata_direct_with_timings(name)
+                .await
+                .map(|revalidated| revalidated.metadata),
             Some(NpmMetadataSource::ConfiguredRegistry) => {
                 client.get_npm_package_metadata_proxy_only(name).await
             }

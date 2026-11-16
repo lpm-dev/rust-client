@@ -35,24 +35,51 @@ fn write_global_trust(
 #[derive(Clone, Copy)]
 pub(super) struct ApprovalProvenanceContext<'a> {
     registry: &'a lpm_registry::RegistryClient,
-    routes: &'a lpm_registry::RouteTable,
+    global_root: &'a Path,
     verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
     runtime_enforce: crate::provenance_fetch::EnforceMode,
+    json_output: bool,
 }
 
 impl<'a> ApprovalProvenanceContext<'a> {
     pub(super) fn new(
         registry: &'a lpm_registry::RegistryClient,
-        routes: &'a lpm_registry::RouteTable,
+        global_root: &'a Path,
         verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
         runtime_enforce: crate::provenance_fetch::EnforceMode,
+        json_output: bool,
     ) -> Self {
         Self {
             registry,
-            routes,
+            global_root,
             verify_policy,
             runtime_enforce,
+            json_output,
         }
+    }
+
+    /// Reads the provenance of `artifacts` from the registries a global
+    /// install resolves them from. The global root's `.npmrc` is read
+    /// here and not before, so a run that fetches nothing, such as a dry
+    /// run, doesn't depend on it.
+    async fn fetch(
+        &self,
+        artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    ) -> Result<HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>, LpmError>
+    {
+        let registries = install_registries(
+            self.registry,
+            self.global_root,
+            artifacts.iter().map(|artifact| artifact.0.as_str()),
+            self.json_output,
+        )?;
+        Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
+            &registries.client,
+            &registries.route_table,
+            artifacts,
+            self.verify_policy,
+        )
+        .await)
     }
 }
 
@@ -195,9 +222,14 @@ async fn run_global_under_store_lock(
 
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
-    let routes = install_routes(&root.global_root())?;
-    let provenance =
-        ApprovalProvenanceContext::new(registry, &routes, &verify_policy, runtime_enforce);
+    let global_root = root.global_root();
+    let provenance = ApprovalProvenanceContext::new(
+        registry,
+        &global_root,
+        &verify_policy,
+        runtime_enforce,
+        json_output,
+    );
     if !dry_run {
         crate::security_approval::ensure_runtime_sigstore_posture_for_global(
             json_output,
@@ -508,13 +540,7 @@ pub(super) async fn run_global_bulk_yes(
     let provenance = if dry_run {
         HashMap::new()
     } else {
-        crate::provenance_fetch::fetch_provenance_for_artifacts(
-            provenance_context.registry,
-            provenance_context.routes,
-            &pairs,
-            provenance_context.verify_policy,
-        )
-        .await
+        provenance_context.fetch(&pairs).await?
     };
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
@@ -725,13 +751,7 @@ pub(super) async fn run_global_named(
     let provenance = if dry_run {
         HashMap::new()
     } else {
-        crate::provenance_fetch::fetch_provenance_for_artifacts(
-            provenance_context.registry,
-            provenance_context.routes,
-            &pairs,
-            provenance_context.verify_policy,
-        )
-        .await
+        provenance_context.fetch(&pairs).await?
     };
     let snap = snapshot_for_artifact_binding(
         &provenance,
@@ -1060,13 +1080,7 @@ async fn fetch_global_approval_snapshots(
         .iter()
         .map(|row| (row.name.clone(), row.version.clone(), row.integrity.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_artifacts(
-        provenance_context.registry,
-        provenance_context.routes,
-        &pairs,
-        provenance_context.verify_policy,
-    )
-    .await;
+    let provenance = provenance_context.fetch(&pairs).await?;
     rows.iter()
         .map(|row| {
             snapshot_for_artifact_binding(

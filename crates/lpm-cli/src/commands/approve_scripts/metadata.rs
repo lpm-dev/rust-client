@@ -155,24 +155,134 @@ pub(super) async fn commit_project_trust_write(
 /// path's only job is to record a binding, and degrading
 /// individual packages to identity-only there would silently strip
 /// a layer of evidence the install path already captured.
+#[cfg(test)]
 pub(super) async fn fetch_provenance_for_effective_set(
     registry: &lpm_registry::RegistryClient,
     routes: &lpm_registry::RouteTable,
     packages: &[BlockedPackage],
     policy: &crate::provenance_fetch::VerifyPolicy,
 ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
-    let pkgs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = packages
-        .iter()
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
+    let pkgs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> =
+        packages.iter().map(artifact_key).collect();
     crate::provenance_fetch::fetch_provenance_for_artifacts(registry, routes, &pkgs, policy).await
 }
 
-/// The registries an install in `dir` resolves packages from: the project
-/// for a project approval, the global install root for a global one.
-pub(super) fn install_routes(dir: &Path) -> Result<lpm_registry::RouteTable, LpmError> {
-    lpm_registry::RouteTable::from_env_and_filesystem(dir)
-        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))
+pub(super) fn artifact_key(
+    package: &BlockedPackage,
+) -> crate::provenance_fetch::ProvenanceArtifactKey {
+    (
+        package.name.clone(),
+        package.version.clone(),
+        package.integrity.clone(),
+    )
+}
+
+/// The client and routes an install in `dir` resolves `names` with: the
+/// project for a project approval, the global install root for a global
+/// one. The client carries the TLS settings an `.npmrc` gives those
+/// registries, as an install's does.
+pub(super) fn install_registries<'a>(
+    registry: &lpm_registry::RegistryClient,
+    dir: &Path,
+    names: impl Iterator<Item = &'a str>,
+    json_output: bool,
+) -> Result<crate::commands::registry_reads::RoutedReadContext, LpmError> {
+    let names: Vec<String> = names.map(str::to_owned).collect();
+    crate::commands::registry_reads::prepare_routed_read_context(registry, dir, &names, json_output)
+}
+
+/// Reads provenance for a project's blocked packages from the registries
+/// its install got them from.
+pub(super) struct ProjectProvenance {
+    registries: crate::commands::registry_reads::RoutedReadContext,
+    /// The registry the lockfile records for each candidate that came
+    /// from one.
+    recorded: HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+}
+
+impl ProjectProvenance {
+    /// Loads the project's routes and what its lockfile records for
+    /// `candidates`. A broken `.npmrc` fails here, before anything is
+    /// asked of the user or a registry.
+    pub(super) fn prepare(
+        registry: &lpm_registry::RegistryClient,
+        project_dir: &Path,
+        candidates: &[BlockedPackage],
+        json_output: bool,
+    ) -> Result<Self, LpmError> {
+        let registries = install_registries(
+            registry,
+            project_dir,
+            candidates.iter().map(|package| package.name.as_str()),
+            json_output,
+        )?;
+        let lockfile = crate::commands::install::workspace_lockfile::read_project(project_dir).ok();
+        let recorded = recorded_registries(
+            candidates.iter().map(artifact_key).collect(),
+            lockfile.iter().flat_map(|lockfile| &lockfile.packages),
+        );
+        Ok(Self {
+            registries,
+            recorded,
+        })
+    }
+
+    /// Reads the provenance of those of `packages` a registry can speak
+    /// for. The rest get no status, and so no provenance to compare a
+    /// later install with.
+    pub(super) async fn fetch(
+        &self,
+        packages: impl Iterator<Item = crate::provenance_fetch::ProvenanceArtifactKey>,
+        policy: &crate::provenance_fetch::VerifyPolicy,
+    ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
+        let vouched: Vec<_> = packages
+            .filter(|package| {
+                self.recorded.get(package).is_some_and(|recorded| {
+                    same_registry(
+                        recorded,
+                        &crate::commands::install::registry_source_url_for(
+                            &package.0,
+                            &self.registries.route_table,
+                            &self.registries.client,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        crate::provenance_fetch::fetch_provenance_for_artifacts(
+            &self.registries.client,
+            &self.registries.route_table,
+            &vouched,
+            policy,
+        )
+        .await
+    }
+}
+
+/// The registry each of `candidates` was installed from, as the lockfile
+/// `rows` record it. A package installed from a tarball, a git repository
+/// or a directory has none: a registry that publishes something under the
+/// same name and version says nothing about it.
+pub(super) fn recorded_registries<'a>(
+    candidates: std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
+    rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
+) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String> {
+    rows.filter_map(|row| {
+        let registry = match row.source_kind() {
+            Some(Ok(lpm_lockfile::Source::Registry { url })) => url,
+            _ => return None,
+        };
+        let key = (row.name.clone(), row.version.clone(), row.integrity.clone());
+        candidates.contains(&key).then_some((key, registry))
+    })
+    .collect()
+}
+
+/// Whether two registry URLs name one registry. A package is asked about
+/// only at the registry it was installed from, so a route that changed
+/// since the install sends its name nowhere new.
+fn same_registry(recorded: &str, routed: &str) -> bool {
+    recorded.trim_end_matches('/') == routed.trim_end_matches('/')
 }
 
 pub(super) fn runtime_verify_policy_with_source() -> (

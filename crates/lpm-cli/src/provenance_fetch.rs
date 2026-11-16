@@ -994,6 +994,8 @@ pub async fn fetch_provenance_for_artifacts(
             let registry_url =
                 crate::commands::install::registry_source_url_for(&name, routes, registry);
             let registry_url = registry_url.as_str();
+            let route = routes.route_for_package(&name);
+            let from_configured_registry = matches!(route, lpm_registry::UpstreamRoute::Custom { .. });
             let meta_result = if name.starts_with("@lpm.dev/") {
                 match lpm_common::PackageName::parse(&name) {
                     Ok(pkg_name) => registry.get_package_metadata(&pkg_name).await,
@@ -1007,9 +1009,7 @@ pub async fn fetch_provenance_for_artifacts(
                     }
                 }
             } else {
-                registry
-                    .get_npm_metadata_routed(&name, routes.route_for_package(&name))
-                    .await
+                registry.get_npm_metadata_routed(&name, route).await
             };
             let meta = match meta_result {
                 Ok(meta) => meta,
@@ -1047,6 +1047,25 @@ pub async fn fetch_provenance_for_artifacts(
             let verification_integrity = expected_integrity
                 .as_deref()
                 .or(registry_integrity.as_deref());
+
+            // A registry an `.npmrc` names can be a mirror that hands on the
+            // attestation URL of the registry it mirrors, or one that isn't
+            // served over HTTPS. An attestation is fetched only from the
+            // registry that served the package, so there is none to read
+            // here. That says nothing about the publisher, so it is no
+            // reason to refuse the approval.
+            if from_configured_registry
+                && let Some(url) = attestation_ref.as_ref().and_then(|a| a.url.as_deref())
+                && !AttestationUrlPolicy::for_registry(registry_url)
+                    .is_ok_and(|policy| policy.validate(url).is_ok())
+            {
+                tracing::warn!(
+                    pkg = %name,
+                    version = %version,
+                    "the attestation is not served by the package's configured registry; no provenance recorded"
+                );
+                return (artifact_key(), ProvenanceStatus::TransportDegraded);
+            }
 
             // Skip path: operator opted out of cryptographic
             // verification for this name (CLI flag) OR fleet-wide

@@ -2577,9 +2577,10 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &direct_routes(),
+            &std::env::temp_dir(),
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2653,9 +2654,10 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &direct_routes(),
+            &std::env::temp_dir(),
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2687,9 +2689,10 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &direct_routes(),
+            &std::env::temp_dir(),
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2712,9 +2715,10 @@ async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
         false,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &direct_routes(),
+            &std::env::temp_dir(),
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2743,7 +2747,13 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
         &root,
         &row_refs,
         false,
-        ApprovalProvenanceContext::new(&registry, &direct_routes(), &policy, EnforceMode::Deny),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &std::env::temp_dir(),
+            &policy,
+            EnforceMode::Deny,
+            true,
+        ),
     )
     .await
     .unwrap();
@@ -2873,6 +2883,102 @@ async fn provenance_capture_asks_the_public_registry_about_a_public_package() {
 }
 
 #[tokio::test]
+async fn an_attestation_a_configured_registry_does_not_serve_is_no_reason_to_refuse() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let integrity = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha512,
+        b"native-addon archive",
+    )
+    .to_string();
+    let mut blocked = make_blocked("native-addon", "1.0.0");
+    blocked.integrity = Some(integrity.clone());
+    let mirror = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/native-addon"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "native-addon",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "native-addon",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/native-addon/-/native-addon-1.0.0.tgz", mirror.uri()),
+                            "integrity": integrity,
+                            "attestations": {
+                                "url": "https://registry.npmjs.org/-/npm/v1/attestations/native-addon@1.0.0",
+                            },
+                        },
+                    },
+                },
+            })),
+        )
+        .mount(&mirror)
+        .await;
+    let registry = unreachable_registry();
+    let npmrc =
+        lpm_registry::NpmrcConfig::parse(&format!("registry={}/\n", mirror.uri()), "test", &|_| {
+            None
+        });
+    let routes = lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+
+    let provenance =
+        fetch_provenance_for_effective_set(&registry, &routes, &[blocked], &deny_verify_policy())
+            .await;
+
+    assert_eq!(
+        provenance.values().collect::<Vec<_>>(),
+        [&ProvenanceStatus::TransportDegraded],
+    );
+}
+
+#[test]
+fn only_a_package_the_lockfile_records_from_a_registry_has_one_to_ask() {
+    let locked = |name: &str, source: &str| lpm_lockfile::LockedPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        source: Some(source.into()),
+        integrity: Some(format!("sha512-{name}-integrity")),
+        ..Default::default()
+    };
+    let rows = [
+        locked("from-registry", "registry+https://registry.npmjs.org"),
+        locked(
+            "from-tarball",
+            "tarball+https://example.test/from-tarball.tgz",
+        ),
+        locked("not-blocked", "registry+https://registry.npmjs.org"),
+    ];
+    let key = |name: &str| {
+        (
+            name.to_string(),
+            "1.0.0".to_string(),
+            Some(format!("sha512-{name}-integrity")),
+        )
+    };
+    let other_bytes = (
+        "from-registry".to_string(),
+        "1.0.0".to_string(),
+        Some("sha512-other".to_string()),
+    );
+
+    let recorded = recorded_registries(
+        [key("from-registry"), key("from-tarball"), other_bytes].into(),
+        rows.iter(),
+    );
+
+    assert_eq!(
+        recorded,
+        HashMap::from([(
+            key("from-registry"),
+            "https://registry.npmjs.org".to_string()
+        )])
+    );
+}
+
+#[tokio::test]
 async fn provenance_capture_asks_only_the_registry_an_npmrc_names_for_a_scope() {
     let tmp = tempdir().unwrap();
     let _env = scoped_lpm_home_with_security(tmp.path());
@@ -2930,9 +3036,10 @@ async fn run_global_named_approves_only_the_matched_row() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &direct_routes(),
+            &std::env::temp_dir(),
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2961,9 +3068,10 @@ async fn run_global_named_errors_for_unknown_package() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &direct_routes(),
+            &std::env::temp_dir(),
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -3228,9 +3336,10 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             true,
             ApprovalProvenanceContext::new(
                 &unreachable_registry(),
-                &direct_routes(),
+                &std::env::temp_dir(),
                 &policy,
                 EnforceMode::Deny,
+                true,
             ),
         )
         .await
@@ -3246,9 +3355,10 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             true,
             ApprovalProvenanceContext::new(
                 &unreachable_registry(),
-                &direct_routes(),
+                &std::env::temp_dir(),
                 &policy,
                 EnforceMode::Deny,
+                true,
             ),
         )
         .await

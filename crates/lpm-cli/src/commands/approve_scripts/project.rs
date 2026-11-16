@@ -423,12 +423,13 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             let provenance_by_pkg = if dry_run {
                 HashMap::new()
             } else {
-                fetch_provenance_for_effective_set(
+                ProjectProvenance::prepare(
                     registry,
-                    &install_routes(project_dir)?,
+                    project_dir,
                     std::slice::from_ref(target),
-                    &verify_policy,
-                )
+                    json_output,
+                )?
+                .fetch(std::iter::once(artifact_key(target)), &verify_policy)
                 .await
             };
             // write-path: carry install-time provenance + behavioral-tag captures
@@ -573,10 +574,14 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         let provenance_by_pkg = if dry_run {
             HashMap::new()
         } else {
-            fetch_provenance_for_effective_set(
+            ProjectProvenance::prepare(
                 registry,
-                &install_routes(project_dir)?,
+                project_dir,
                 &effective_state.blocked_packages,
+                json_output,
+            )?
+            .fetch(
+                effective_state.blocked_packages.iter().map(artifact_key),
                 &verify_policy,
             )
             .await
@@ -658,6 +663,17 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 .into(),
         ));
     }
+
+    let provenance = if dry_run {
+        None
+    } else {
+        Some(ProjectProvenance::prepare(
+            registry,
+            project_dir,
+            &effective_state.blocked_packages,
+            json_output,
+        )?)
+    };
 
     // Walk one at a time. Quit aborts WITHOUT writing in-progress entries
     // (atomic). The accumulator only gets flushed to disk after the loop.
@@ -801,16 +817,13 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             )
         })
         .collect();
-    let provenance_by_pkg = if dry_run || approved_pairs.is_empty() {
-        HashMap::new()
-    } else {
-        crate::provenance_fetch::fetch_provenance_for_artifacts(
-            registry,
-            &install_routes(project_dir)?,
-            &approved_pairs,
-            &verify_policy,
-        )
-        .await
+    let provenance_by_pkg = match &provenance {
+        Some(provenance) if !approved_pairs.is_empty() => {
+            provenance
+                .fetch(approved_pairs.iter().cloned(), &verify_policy)
+                .await
+        }
+        _ => HashMap::new(),
     };
 
     // Apply approvals (atomic single write)
