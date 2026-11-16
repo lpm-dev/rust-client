@@ -785,40 +785,67 @@ mod tests {
             .output()
             .unwrap();
         assert!(granted.status.success(), "{granted:?}");
-        let args = crate::helper_protocol::parse_argv(
-            [
-                "--protocol-version",
-                &crate::helper_protocol::PROTOCOL_VERSION.to_string(),
-                "--appcontainer-name",
-                &name,
-                "--stdio-stdin",
-                "null",
-                "--stdio-stdout",
-                "null",
-                "--stdio-stderr",
-                "null",
-                "--readable-dir",
-                project.to_str().unwrap(),
-                "--",
-                "cmd.exe",
-            ]
-            .into_iter()
-            .map(std::ffi::OsString::from),
-        )
-        .unwrap();
+        let reading = |directory: &Path| {
+            crate::helper_protocol::parse_argv(
+                [
+                    "--protocol-version",
+                    &crate::helper_protocol::PROTOCOL_VERSION.to_string(),
+                    "--appcontainer-name",
+                    &name,
+                    "--stdio-stdin",
+                    "null",
+                    "--stdio-stdout",
+                    "null",
+                    "--stdio-stderr",
+                    "null",
+                    "--readable-dir",
+                    directory.to_str().unwrap(),
+                    "--",
+                    "cmd.exe",
+                ]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+            )
+            .unwrap()
+        };
+        // A standard account without the sandbox setup can't change the
+        // drive's root, so a run there stops before it reaches `locked`. A
+        // run for the directory beside `locked`, ended before it sets
+        // anything, tells where that is.
+        let beside = root.path().join("beside");
+        std::fs::create_dir(&beside).unwrap();
+        let mut passable = false;
+        let stopped_above = without_privileges(|| {
+            setup::prepare(&reading(&beside), &sid, |_| {
+                passable = true;
+                Err(AppContainerError::Setup {
+                    reason: "ended before anything is set".into(),
+                })
+            })
+            .err()
+        });
+        let expected = match stopped_above {
+            Some(AppContainerError::SetupRequired { path }) if !passable => path,
+            Some(AppContainerError::Setup { .. }) if passable => locked.canonicalize().unwrap(),
+            other => panic!("{other:?}"),
+        };
         let mut recorded = false;
 
         let stopped = without_privileges(|| {
-            setup::prepare(&args, &sid, |_| {
+            setup::prepare(&reading(&project), &sid, |_| {
                 recorded = true;
                 Ok(())
             })
             .err()
         });
 
-        assert!(
-            matches!(stopped, Some(AppContainerError::SetupRequired { .. })),
-            "{stopped:?}"
+        let Some(AppContainerError::SetupRequired { path }) = &stopped else {
+            panic!("{stopped:?}");
+        };
+        assert_eq!(
+            path.canonicalize().unwrap(),
+            expected.canonicalize().unwrap(),
+            "the run stops at the first directory it can't change"
         );
         assert!(!recorded);
         for directory in root.path().ancestors().chain([locked.as_path()]) {

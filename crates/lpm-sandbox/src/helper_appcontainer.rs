@@ -1851,15 +1851,18 @@ fn lock_directory_for_test(path: &Path) {
     assert!(!without_privileges(|| setup::can_change_permissions(path)));
 }
 
-/// Runs `run` on this thread with every privilege disabled. Hosted CI
-/// administrators hold backup and restore privileges that let them open
-/// any directory to change its DACL, so a test that needs one it can't
-/// change runs its check here. Other threads keep the process token.
+/// Runs `run` on this thread with every privilege disabled but the one
+/// every account holds. Hosted CI administrators hold backup and restore
+/// privileges that let them open any directory to change its DACL, so a
+/// test that needs one it can't change runs its check here. Other threads
+/// keep the process token.
 #[cfg(test)]
 fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Foundation::LUID;
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
-        TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        AdjustTokenPrivileges, ImpersonateSelf, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+        RevertToSelf, SE_PRIVILEGE_ENABLED, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES,
+        TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
@@ -1900,6 +1903,47 @@ fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
             )
         },
         0
+    );
+    // Without "bypass traverse checking" Windows gives no handle its final
+    // path, so no path could be made canonical, whatever its permissions.
+    let name = str_to_wide_with_nul("SeChangeNotifyPrivilege");
+    let mut traverse = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: the name is terminated and `traverse` is an initialized output slot.
+    assert_ne!(
+        unsafe { LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut traverse) },
+        0
+    );
+    let kept = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: traverse,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    // SAFETY: `kept` is a one-entry list that outlives the call, and no
+    // previous state is asked for.
+    assert_ne!(
+        unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw(),
+                0,
+                &kept,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        0
+    );
+    // The call succeeds for a token that doesn't hold the privilege, and
+    // says so only here.
+    assert_eq!(
+        unsafe { GetLastError() },
+        ERROR_SUCCESS,
+        "the test's token holds no bypass-traverse privilege to keep"
     );
     run()
 }
