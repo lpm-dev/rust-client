@@ -143,25 +143,44 @@ impl LockedIntegrities {
     }
 
     /// Holds each package resolved at a recorded version to the recorded
-    /// integrity. Refuses one whose registry integrity disagrees with it.
-    /// One whose registry gives no integrity, or none as strong as the
-    /// record's, takes the record's strongest hash, so its fetch verifies
-    /// the bytes against what the lockfile recorded; a record that offers
-    /// several alternatives of that algorithm can't be narrowed to one, and
-    /// is left as compared. A record weaker than the registry's integrity
-    /// leaves the fetch to verify the registry's.
+    /// integrity, refusing one whose registry integrity disagrees with it.
+    ///
+    /// For a package to fetch whose registry gives no integrity, or none as
+    /// strong as the record's, the fetch verifies the bytes against the
+    /// record's strongest hash instead. The lockfile still records the
+    /// integrity the registry published, which its signatures cover; the
+    /// returned [`PublishedIntegrities`] restores it after the fetch. A
+    /// record weaker than the registry's integrity leaves the fetch to verify
+    /// the registry's.
     pub(super) fn apply(
         &self,
         packages: &mut [InstallPackage],
-        packages_for_lockfile: &mut [InstallPackage],
-    ) -> Result<(), LpmError> {
-        for package in packages.iter_mut().chain(packages_for_lockfile.iter_mut()) {
-            self.apply_to(package)?;
+        packages_for_lockfile: &[InstallPackage],
+    ) -> Result<PublishedIntegrities, LpmError> {
+        for package in packages_for_lockfile {
+            self.held_integrity(package)?;
         }
-        Ok(())
+        let mut published = PublishedIntegrities::default();
+        for package in packages.iter_mut() {
+            if let Some(held) = self.held_integrity(package)? {
+                if let Some(previous) = package.integrity.replace(held) {
+                    published.by_package.insert(
+                        (
+                            package.name.clone(),
+                            package.version.clone(),
+                            package.source.clone(),
+                        ),
+                        previous,
+                    );
+                }
+            }
+        }
+        Ok(published)
     }
 
-    fn apply_to(&self, package: &mut InstallPackage) -> Result<(), LpmError> {
+    /// The integrity the fetch must verify for `package`, when the record
+    /// asks for more than the registry's: `None` when the registry's will do.
+    fn held_integrity(&self, package: &InstallPackage) -> Result<Option<String>, LpmError> {
         let records: &[String] = match package.source.strip_prefix("tarball+") {
             Some(url) => tarball_key(url)
                 .and_then(|url| self.by_tarball.get(&url))
@@ -173,10 +192,10 @@ impl LockedIntegrities {
                 .map_or(&[], std::slice::from_ref),
         };
         let Some(first) = records.first() else {
-            return Ok(());
+            return Ok(None);
         };
         let (locked, resolved_strength) = match package.integrity.as_deref() {
-            None if records.len() > 1 => return Ok(()),
+            None if records.len() > 1 => return Ok(None),
             None => (first, None),
             Some(resolved) => {
                 let Some(locked) = records
@@ -188,12 +207,46 @@ impl LockedIntegrities {
                 (locked, strongest_algorithm(resolved))
             }
         };
-        if strongest_algorithm(locked) > resolved_strength
-            && let Some(strongest) = unique_strongest(locked)
-        {
-            package.integrity = Some(strongest.to_string());
+        if strongest_algorithm(locked) <= resolved_strength {
+            return Ok(None);
         }
-        Ok(())
+        match unique_strongest(locked) {
+            Some(strongest) => Ok(Some(strongest.to_string())),
+            None if resolved_strength.is_none() => Err(LpmError::Registry(format!(
+                "{}@{}'s registry gives no integrity, and the lockfile `lpm migrate` wrote \
+                 records {locked}, several digests of one algorithm, so LPM can't tell which \
+                 one the download must match. Nothing was installed.",
+                package.name, package.version,
+            ))),
+            None => Ok(None),
+        }
+    }
+}
+
+/// The integrities registries published for the packages whose fetch
+/// [`LockedIntegrities::apply`] held to a stronger recorded hash.
+#[derive(Debug, Default)]
+pub(super) struct PublishedIntegrities {
+    by_package: HashMap<(String, String, String), String>,
+}
+
+impl PublishedIntegrities {
+    /// Puts back the published integrity the fetch replaced, so the
+    /// lockfile records the integrity the registry's signatures cover.
+    pub(super) fn restore(&self, packages_for_lockfile: &mut [InstallPackage]) {
+        if self.by_package.is_empty() {
+            return;
+        }
+        for package in packages_for_lockfile {
+            let key = (
+                package.name.clone(),
+                package.version.clone(),
+                package.source.clone(),
+            );
+            if let Some(published) = self.by_package.get(&key) {
+                package.integrity = Some(published.clone());
+            }
+        }
     }
 }
 
@@ -249,10 +302,11 @@ fn tarball_key(url: &str) -> Option<String> {
 }
 
 fn refusal(package: &InstallPackage, resolved: &str, locked: &str) -> LpmError {
-    let source = package
+    let url = package
         .source
-        .strip_prefix("registry+")
-        .unwrap_or(&package.source);
+        .split_once('+')
+        .map_or(package.source.as_str(), |(_, url)| url);
+    let source = lpm_common::safe_url_origin(url);
     LpmError::Registry(format!(
         "{}@{} from {source} has integrity {resolved}, but the lockfile `lpm migrate` wrote \
          recorded {locked} for that version, so these aren't the bytes the project had. \
@@ -313,7 +367,7 @@ mod tests {
         package: InstallPackage,
     ) -> Result<InstallPackage, LpmError> {
         let mut packages = vec![package];
-        pins.apply(&mut packages, &mut [])?;
+        pins.apply(&mut packages, &[])?;
         Ok(packages.remove(0))
     }
 
@@ -329,17 +383,21 @@ mod tests {
         assert!(error.contains("corp-utils@1.0.0"), "{error}");
         assert!(error.contains("registry.npmjs.org"), "{error}");
         assert!(error.contains("lpm migrate --rollback"), "{error}");
+        let mut tokened = resolved("corp-utils", "1.0.0", Some(&sri(Sha512, b"public")));
+        tokened.source = "registry+https://npm.example/tok_5a1/".to_owned();
+        let error = apply_one(&pins, tokened).unwrap_err().to_string();
+        assert!(!error.contains("tok_5a1"), "{error}");
     }
 
     #[test]
     fn a_package_in_the_lockfile_list_with_other_bytes_is_refused_too() {
         let pins = locked("corp-utils", "1.0.0", &sri(Sha512, b"private"));
-        let mut for_lockfile = vec![resolved(
+        let for_lockfile = vec![resolved(
             "corp-utils",
             "1.0.0",
             Some(&sri(Sha512, b"public")),
         )];
-        assert!(pins.apply(&mut [], &mut for_lockfile).is_err());
+        assert!(pins.apply(&mut [], &for_lockfile).is_err());
     }
 
     #[test]
@@ -399,14 +457,34 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_several_digests_of_its_strongest_algorithm_is_not_narrowed_to_one() {
+    fn a_record_with_several_digests_of_its_strongest_algorithm_and_no_registry_integrity_is_refused()
+     {
         let pins = locked(
             "corp-utils",
             "1.0.0",
             &format!("{} {}", sri(Sha512, b"one"), sri(Sha512, b"two")),
         );
-        let package = apply_one(&pins, resolved("corp-utils", "1.0.0", None)).unwrap();
-        assert_eq!(package.integrity, None);
+        let error = apply_one(&pins, resolved("corp-utils", "1.0.0", None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corp-utils@1.0.0"), "{error}");
+    }
+
+    #[test]
+    fn the_lockfile_keeps_the_published_integrity_the_fetch_was_held_above() {
+        let recorded = sri(Sha512, b"private");
+        let published = sri(Sha1, b"private");
+        let pins = locked("corp-utils", "1.0.0", &recorded);
+        let mut packages = vec![resolved("corp-utils", "1.0.0", Some(&published))];
+        let mut for_lockfile = packages.clone();
+        let restore = pins.apply(&mut packages, &for_lockfile).unwrap();
+        assert_eq!(packages[0].integrity.as_deref(), Some(recorded.as_str()));
+        for_lockfile[0].integrity = Some(recorded.clone());
+        restore.restore(&mut for_lockfile);
+        assert_eq!(
+            for_lockfile[0].integrity.as_deref(),
+            Some(published.as_str())
+        );
     }
 
     #[test]

@@ -89,6 +89,25 @@ impl ManifestSelectionStats {
     }
 }
 
+/// A deploy installs its member outside the workspace, where nothing holds
+/// it to the integrities a migrated lockfile recorded, so it waits until a
+/// workspace install has checked them and replaced that lockfile.
+fn refuse_a_migrated_workspace(member_dir: &std::path::Path) -> Result<(), LpmError> {
+    let Some(root) = lpm_workspace::find_workspace_root(member_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if super::install::LockedIntegrities::detect(&root)?.is_some() {
+        return Err(LpmError::Script(format!(
+            "lpm deploy: {} was written by `lpm migrate`. Run `lpm install` from the workspace \
+             root first, so every member is checked against the integrities it recorded.",
+            root.join(lpm_lockfile::LOCKFILE_NAME).display()
+        )));
+    }
+    Ok(())
+}
+
 /// Run the `lpm deploy` command.
 ///
 /// All four steps are wired — target resolution, source file
@@ -128,6 +147,7 @@ pub async fn run(
         test_pattern,
         force,
     )?;
+    refuse_a_migrated_workspace(&plan.member_dir)?;
     let member_name = read_member_name(&plan.member_manifest);
     let materialize_message = crate::install_ui::terminal_line!(
         "Materializing {} closure for {}",

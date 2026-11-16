@@ -1419,7 +1419,7 @@ async fn run_with_options_under_store_lock(
     workspace_resolution::finish_resolution();
     let OnlineResolutionPhaseResult {
         mut packages,
-        mut packages_for_lockfile,
+        packages_for_lockfile,
         resolve_ms,
         used_lockfile,
         platform_skipped,
@@ -1456,9 +1456,11 @@ async fn run_with_options_under_store_lock(
     let packages_as_published = (verify_registry_signatures
         && expectations.locked_integrities.is_some())
     .then(|| packages.clone());
-    if let Some(locked) = &expectations.locked_integrities {
-        locked.apply(&mut packages, &mut packages_for_lockfile)?;
-    }
+    let published_integrities = expectations
+        .locked_integrities
+        .as_ref()
+        .map(|locked| locked.apply(&mut packages, &packages_for_lockfile))
+        .transpose()?;
     if let Some(expected) = &expectations.root {
         let matches = packages.iter().any(|package| {
             package.is_direct
@@ -1612,7 +1614,7 @@ async fn run_with_options_under_store_lock(
     });
     let OnlineFetchPhaseResult {
         packages,
-        packages_for_lockfile,
+        mut packages_for_lockfile,
         link_targets,
         event_driven_link,
         event_link_handles,
@@ -1644,6 +1646,9 @@ async fn run_with_options_under_store_lock(
         }
         None => fetch_phase.await?,
     };
+    if let Some(published) = &published_integrities {
+        published.restore(&mut packages_for_lockfile);
+    }
 
     if used_lockfile && strict_peer_dependencies {
         enforce_replayed_peer_dependencies(

@@ -833,6 +833,15 @@ async fn registry_signatures_are_checked_against_the_published_integrity_when_th
         project.read_file("node_modules/corp-utils/origin.txt"),
         "signed"
     );
+    let replay = lpm_with_registry(&project, &public.url())
+        .args(["install", "--frozen-lockfile", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "a replay of the migrated install must verify the same signatures:\n{}",
+        report(&replay)
+    );
 }
 
 #[tokio::test]
@@ -923,4 +932,26 @@ async fn a_migrated_lockfile_records_only_the_origin_of_a_registry_built_from_en
         lockfile.contains(&format!("source = \"registry+{}/\"", private.url())),
         "{lockfile}"
     );
+}
+
+#[tokio::test]
+async fn deploying_a_member_of_a_migrated_workspace_waits_for_a_workspace_install() {
+    let registries = registries().await;
+    let project = workspace_project(&registries.private, &registries.private_integrity);
+    let migrated = migrate(&project, &registries.public, &["--no-install"]);
+    assert!(migrated.status.success(), "{}", report(&migrated));
+    let out = tempfile::tempdir().unwrap();
+
+    let deployed = lpm_with_registry(&project, &registries.public.url())
+        .args(["deploy", out.path().to_str().unwrap(), "--filter", "app"])
+        .output()
+        .unwrap();
+
+    assert!(!deployed.status.success(), "{}", report(&deployed));
+    assert!(
+        report(&deployed).contains("lpm install"),
+        "{}",
+        report(&deployed)
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
 }
