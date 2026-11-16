@@ -565,27 +565,10 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
     // What a run of this identity that was stopped before it ended left
-    // set comes off first; what this run sets until it ends is recorded
-    // before it is set.
-    if let Some(record) = &args.grant_record {
-        identity::take_back_run_access(record, sid.0)?;
-    }
-    let mut prepared_access = setup::prepare(&args, &sid, |traversed| {
-        let Some(record) = &args.grant_record else {
-            return Ok(());
-        };
-        identity::record_run_access(
-            record,
-            &identity::RunAccess {
-                traversed: traversed.to_vec(),
-                denied: args.secret_read_denied_paths.clone(),
-            },
-        )
-    })?;
-
-    // What this run grants, minus what the identity was granted before
-    // and no longer is; and once, grants that profiles of earlier
-    // releases, one per run, left on these trees.
+    // set comes off first, then the trees the identity was granted before
+    // and no longer is. Revoking one of those takes every entry of the
+    // identity off it and what is inside it, so it comes before this run
+    // sets its own entries there.
     let granted: Vec<PathBuf> = args
         .best_effort_readable_dirs
         .iter()
@@ -594,8 +577,35 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         .cloned()
         .collect();
     if let Some(record) = &args.grant_record {
+        identity::take_back_run_access(record, sid.0)?;
         identity::revoke_stale_grants(record, &granted, sid.0)?;
     }
+    // What this run sets until it ends is recorded before it is set. An
+    // entry this user can't open to change is left out: setting it fails
+    // first, so it never holds anything of the run, and a cleanup may not
+    // be able to read it to see that.
+    let mut prepared_access = setup::prepare(&args, &sid, |traversed| {
+        let Some(record) = &args.grant_record else {
+            return Ok(());
+        };
+        let changeable = |paths: &[PathBuf]| -> Vec<PathBuf> {
+            paths
+                .iter()
+                .filter(|path| setup::can_change_permissions(path))
+                .cloned()
+                .collect()
+        };
+        identity::record_run_access(
+            record,
+            &identity::RunAccess {
+                traversed: changeable(traversed),
+                denied: changeable(&args.secret_read_denied_paths),
+            },
+        )
+    })?;
+
+    // Once, grants that profiles of earlier releases, one per run, left on
+    // this run's trees.
     if let Some(record) = &args.sweep_record {
         let owned: Vec<PathBuf> = args
             .readable_dirs

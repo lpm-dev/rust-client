@@ -1250,7 +1250,6 @@ pub(super) fn prepare<'a>(
 }
 
 /// Whether this thread can open `path` to change its permissions.
-#[cfg(test)]
 pub(super) fn can_change_permissions(path: &Path) -> bool {
     open_permissions(path, true).is_ok()
 }

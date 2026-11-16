@@ -556,24 +556,93 @@ fn helper_secret_read_deny_overrides_broad_read_and_does_not_leave_a_stale_deny(
     );
 }
 
-/// Whether `path`'s permissions hold an entry that denies access.
-fn holds_a_denial(path: &std::path::Path) -> bool {
+/// The entries of `path`'s permissions as `icacls` saves them: one string
+/// per entry, such as `D;;FRFX;;;S-1-15-2-1-2` for a denial. The saved
+/// form names every trustee by SID and doesn't depend on the language
+/// Windows runs in.
+fn saved_entries(path: &std::path::Path) -> Vec<String> {
+    let directory = tempfile::tempdir().expect("directory for the saved permissions");
+    let saved = directory.path().join("permissions");
     let listing = std::process::Command::new("icacls")
         .arg(path)
+        .arg("/save")
+        .arg(&saved)
         .output()
-        .expect("icacls lists the permissions");
+        .expect("icacls saves the permissions");
     assert!(listing.status.success(), "{listing:?}");
-    String::from_utf8_lossy(&listing.stdout).contains("(DENY)")
+    let bytes = fs::read(&saved).expect("read the saved permissions");
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    String::from_utf16_lossy(&units)
+        .split('(')
+        .skip(1)
+        .filter_map(|entry| entry.split(')').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The AppContainer SIDs `path`'s permissions deny access.
+fn denied_app_containers(path: &std::path::Path) -> Vec<String> {
+    saved_entries(path)
+        .iter()
+        .filter(|entry| entry.starts_with("D;"))
+        .filter_map(|entry| entry.rsplit(';').next())
+        .filter(|trustee| trustee.starts_with("S-1-15-2-"))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn names_trustee(path: &std::path::Path, sid: &str) -> bool {
+    saved_entries(path)
+        .iter()
+        .any(|entry| entry.rsplit(';').next() == Some(sid))
+}
+
+/// A sandboxed run that is stopped rather than left to end. Whatever the
+/// test goes on to find, dropping this stops the helper and cleans up
+/// after its identity, while the record that says what to clean still
+/// exists.
+struct StoppedRun {
+    helper: std::process::Child,
+    identity: Vec<String>,
+}
+
+impl StoppedRun {
+    /// As a script over its time limit is stopped: the helper gets no
+    /// chance to take back what it set.
+    fn stop(&mut self) {
+        let _ = self.helper.kill();
+        let _ = self.helper.wait();
+    }
+
+    fn clean_up(&self) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .args(&self.identity)
+            .args(["--revoke-only", "--delete-appcontainer-profile"])
+            .output()
+            .expect("spawn cleanup")
+    }
+}
+
+impl Drop for StoppedRun {
+    fn drop(&mut self) {
+        self.stop();
+        let _ = self.clean_up();
+    }
 }
 
 #[test]
-fn a_cleanup_takes_back_the_secret_denial_of_a_run_that_was_stopped() {
+fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
     let project = tempfile::tempdir().expect("project tempdir");
     let records = tempfile::tempdir().expect("record tempdir");
     let secret = project.path().join(".env");
     fs::write(&secret, "protected-content").expect("seed protected file");
     let record = records.path().join("grants.json");
-    let identity = [
+    let identity = vec![
         "--protocol-version".to_string(),
         lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
         "--appcontainer-name".into(),
@@ -581,7 +650,7 @@ fn a_cleanup_takes_back_the_secret_denial_of_a_run_that_was_stopped() {
         "--grant-record".into(),
         record.to_string_lossy().into_owned(),
     ];
-    let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+    let helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
         .args(&identity)
         .args(["--stdio-stdin", "null"])
         .args(["--stdio-stdout", "null"])
@@ -600,10 +669,14 @@ fn a_cleanup_takes_back_the_secret_denial_of_a_run_that_was_stopped() {
         ])
         .spawn()
         .expect("spawn helper");
+    let mut run = StoppedRun { helper, identity };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while !holds_a_denial(&secret) {
+    let sid = loop {
+        if let Some(sid) = denied_app_containers(&secret).pop() {
+            break sid;
+        }
         assert!(
-            helper.try_wait().expect("poll helper").is_none(),
+            run.helper.try_wait().expect("poll helper").is_none(),
             "the run ended before it denied its identity the secret"
         );
         assert!(
@@ -611,29 +684,49 @@ fn a_cleanup_takes_back_the_secret_denial_of_a_run_that_was_stopped() {
             "the run never denied its identity the secret"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    };
 
-    // As a script over its time limit is stopped: the helper gets no
-    // chance to take back what it set.
-    helper.kill().expect("stop the run");
-    helper.wait().expect("the stopped run exits");
-    assert!(
-        holds_a_denial(&secret),
+    run.stop();
+    assert_eq!(
+        denied_app_containers(&secret),
+        std::slice::from_ref(&sid),
         "a stopped run can't take its denial back itself"
     );
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("the run recorded what it set"))
+            .expect("the record is JSON");
+    let traversed: Vec<std::path::PathBuf> = recorded["run"]["traversed"]
+        .as_array()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|path| path.as_str())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    for directory in &traversed {
+        assert!(
+            names_trustee(directory, &sid),
+            "the stopped run still passes through {}",
+            directory.display()
+        );
+    }
 
-    let cleanup = Command::cargo_bin("lpm-sandbox-helper")
-        .expect("locate helper")
-        .args(&identity)
-        .args(["--revoke-only", "--delete-appcontainer-profile"])
-        .output()
-        .expect("spawn cleanup");
+    let cleanup = run.clean_up();
 
     assert!(cleanup.status.success(), "{cleanup:?}");
     assert!(
-        !holds_a_denial(&secret),
+        denied_app_containers(&secret).is_empty(),
         "the cleanup takes back the denial the stopped run left"
     );
+    for directory in &traversed {
+        assert!(
+            !names_trustee(directory, &sid),
+            "the cleanup takes back the run's way through {}",
+            directory.display()
+        );
+    }
     assert!(!record.exists());
     assert_eq!(
         fs::read_to_string(&secret).expect("the host user keeps access to the secret"),

@@ -1090,6 +1090,26 @@ mod tests {
     }
 
     #[test]
+    fn revoking_a_stale_tree_keeps_what_a_stopped_run_left_recorded() {
+        let name = unique_name("LpmIdentityStaleRun");
+        let sid = derive_appcontainer_sid(&name).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let kept = tree_with_a_file(root.path(), "kept");
+        let dropped = tree_with_a_file(root.path(), "dropped");
+        let record = root.path().join("grants.json");
+        record_grants(&record, &[kept.clone(), dropped]).unwrap();
+        let left = RunAccess {
+            traversed: vec![root.path().to_path_buf()],
+            denied: vec![root.path().join(".env")],
+        };
+        record_run_access(&record, &left).unwrap();
+
+        revoke_stale_grants(&record, std::slice::from_ref(&kept), sid.0).unwrap();
+
+        assert_eq!(read_record(&record).run, left);
+    }
+
+    #[test]
     fn a_run_that_ends_forgets_what_it_took_back_and_keeps_the_rest() {
         let directory = tempfile::tempdir().unwrap();
         let record = directory.path().join("grants.json");
