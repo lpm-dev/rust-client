@@ -428,7 +428,12 @@ fn scan_binding_gyp(root: &Path, dir: &Path, entries: &mut BTreeSet<PathBuf>, re
         let opened = expansion.get(0).expect("the whole match").end();
         match balanced_argument(&bytes[opened..]) {
             Some(command) if expansion.get(1).is_none() => {
-                record_if_red(reach, &source, &String::from_utf8_lossy(command));
+                // The command sits inside a quoted string of the file, so
+                // the quotes it uses itself are escaped there.
+                let command = String::from_utf8_lossy(command)
+                    .replace("\\\"", "\"")
+                    .replace("\\'", "'");
+                record_if_red(reach, &source, &command);
             }
             // A Python module of the package runs as gyp imports it, and
             // an expansion that never closes is one gyp reads otherwise.
@@ -1309,6 +1314,21 @@ mod tests {
             }),
             "{:?}",
             nested.findings
+        );
+    }
+
+    #[test]
+    fn a_gyp_command_is_reported_as_gyp_runs_it() {
+        let reach = scan_of_binding_gyp(
+            r#"{"targets":[{"include_dirs":["<!(node -e \"require('nan')\")"]}]}"#,
+        );
+        assert!(
+            reach.findings.contains(&ReachFinding::RunsRedCommand {
+                source: "binding.gyp".into(),
+                command: r#"node -e "require('nan')""#.into(),
+            }),
+            "{:?}",
+            reach.findings
         );
     }
 
