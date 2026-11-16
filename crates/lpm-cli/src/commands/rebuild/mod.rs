@@ -30,6 +30,7 @@
 //! - On Windows: `Child::kill()` terminates the process tree via `TerminateProcess`
 
 mod build_cache;
+mod bundled_node_gyp;
 mod hints;
 mod lifecycle_tools;
 mod package_dir;
@@ -1280,7 +1281,7 @@ async fn run_under_store_lock(
             } else {
                 lifecycle_tools::ToolScope::Dependencies
             };
-            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path, scope)
+            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path, scope, script_execution::find_env_case_insensitive(&sanitized_env, "PATH"))
         }) {
             Ok(tools) => tools,
             Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }
@@ -1549,6 +1550,16 @@ async fn run_under_store_lock(
                             install_ui::dim(phase),
                             lpm_common::sanitize_terminal_inline(&e),
                         ));
+                        if tools.lacks_node_gyp(
+                            &pkg.scripts,
+                            project_dir,
+                            script_execution::find_env_case_insensitive(&sanitized_env, "PATH"),
+                        ) {
+                            install_ui::detail_line(crate::install_ui::terminal_line!(
+                                "    {}",
+                                install_ui::dim(lifecycle_tools::NODE_GYP_MISSING),
+                            ));
+                        }
                     }
                     break; // Don't run subsequent phases if one fails
                 }
