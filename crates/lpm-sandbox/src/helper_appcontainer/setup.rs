@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Security::{
-    CopySid, DeriveCapabilitySidsFromName, GetLengthSid, GetTokenInformation, TOKEN_ELEVATION,
-    TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
+    CopySid, DeriveCapabilitySidsFromName, GetLengthSid, GetSecurityDescriptorControl,
+    GetTokenInformation, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
+    SECURITY_DESCRIPTOR_CONTROL, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
@@ -512,13 +514,58 @@ fn has_grant(
     Ok(granted & mask == mask)
 }
 
-fn write_dacl(handle: &HandleGuard, path: &Path, acl: *mut ACL) -> Result<(), AppContainerError> {
+/// How an object's DACL takes part in inheritance: whether it is protected
+/// from its parent's entries, and whether its inherited entries are ones
+/// the system keeps in step with the parent's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DaclInheritance(SECURITY_DESCRIPTOR_CONTROL);
+
+impl DaclInheritance {
+    const BITS: SECURITY_DESCRIPTOR_CONTROL = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED;
+
+    /// What the descriptor [`read_dacl`] returned says of its object.
+    fn of(descriptor: &LocalAllocGuard) -> Result<Self, AppContainerError> {
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: the descriptor is live and both outputs are correctly typed.
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(last_error("read how a sandbox permission target inherits"));
+        }
+        Ok(Self(control & Self::BITS))
+    }
+
+    /// The bits a write carries to leave the object as it is. The system
+    /// keeps "auto-inherited" only when the request bit comes with it.
+    fn requested(self) -> SECURITY_DESCRIPTOR_CONTROL {
+        if self.0 & SE_DACL_AUTO_INHERITED == 0 {
+            self.0
+        } else {
+            self.0 | SE_DACL_AUTO_INHERIT_REQ
+        }
+    }
+}
+
+/// Replaces the object's DACL and nothing else. This write sets the
+/// inheritance bits from the descriptor it is given, so one that named
+/// none would unprotect a protected DACL and stop Windows treating the
+/// object's inherited entries as inherited.
+fn write_dacl(
+    handle: &HandleGuard,
+    path: &Path,
+    acl: *mut ACL,
+    inheritance: DaclInheritance,
+) -> Result<(), AppContainerError> {
     let mut descriptor = windows_sys::Win32::Security::SECURITY_DESCRIPTOR::default();
     // SAFETY: the initialized descriptor borrows the live ACL for the duration of the call.
     let success = unsafe {
         let raw = ptr::addr_of_mut!(descriptor).cast();
         windows_sys::Win32::Security::InitializeSecurityDescriptor(raw, 1) != 0
             && windows_sys::Win32::Security::SetSecurityDescriptorDacl(raw, 1, acl, 0) != 0
+            && windows_sys::Win32::Security::SetSecurityDescriptorControl(
+                raw,
+                DaclInheritance::BITS | SE_DACL_AUTO_INHERIT_REQ,
+                inheritance.requested(),
+            ) != 0
             && windows_sys::Win32::Security::SetKernelObjectSecurity(
                 handle.as_raw(),
                 DACL_SECURITY_INFORMATION,
@@ -627,10 +674,15 @@ fn remove_aces_where(
         Err(error) => return Err(error),
     };
     let _lock = lock_object(identity)?;
-    let (old, _descriptor) = read_dacl(&handle, path)?;
+    let (old, descriptor) = read_dacl(&handle, path)?;
     let (mut filtered, removed) = super::dacl_without_aces_where(path, old, ace_type, drops)?;
     if removed > 0 {
-        write_dacl(&handle, path, filtered.as_mut_ptr().cast())?;
+        write_dacl(
+            &handle,
+            path,
+            filtered.as_mut_ptr().cast(),
+            DaclInheritance::of(&descriptor)?,
+        )?;
     }
     Ok(removed)
 }
@@ -641,9 +693,9 @@ fn update_open_ace(
     sid: PSID,
     grant: Option<(u32, u32)>,
 ) -> Result<(), AppContainerError> {
-    let (old, _descriptor) = read_dacl(handle, path)?;
     match grant {
         Some((mask, inheritance)) => {
+            let (old, descriptor) = read_dacl(handle, path)?;
             let entry = EXPLICIT_ACCESS_W {
                 grfAccessPermissions: mask,
                 grfAccessMode: SET_ACCESS,
@@ -666,20 +718,21 @@ fn update_open_ace(
                 });
             }
             let _updated = LocalAllocGuard(updated.cast());
-            write_dacl(handle, path, updated)
+            write_dacl(handle, path, updated, DaclInheritance::of(&descriptor)?)
         }
         None => remove_open_ace(handle, path, sid).map(|_| ()),
     }
 }
 
 /// Takes `sid`'s allow entries out of the open object's DACL, writing
-/// nothing when it holds none, and gives back the DACL it had when it did.
+/// nothing when it holds none, and gives back the DACL it had when it did,
+/// with the inheritance it keeps.
 fn remove_open_ace(
     handle: &HandleGuard,
     path: &Path,
     sid: PSID,
-) -> Result<Option<Vec<u32>>, AppContainerError> {
-    let (old, _descriptor) = read_dacl(handle, path)?;
+) -> Result<Option<(Vec<u32>, DaclInheritance)>, AppContainerError> {
+    let (old, descriptor) = read_dacl(handle, path)?;
     // SAFETY: both SIDs are valid for the comparison.
     let (mut filtered, removed) =
         super::dacl_without_allowed_aces_where(path, old, |ace| unsafe {
@@ -693,8 +746,9 @@ fn remove_open_ace(
     let mut saved = vec![0u32; size.div_ceil(std::mem::size_of::<u32>())];
     // SAFETY: `saved` holds at least `size` bytes and doesn't overlap `old`.
     unsafe { ptr::copy_nonoverlapping(old.cast::<u8>(), saved.as_mut_ptr().cast::<u8>(), size) };
-    write_dacl(handle, path, filtered.as_mut_ptr().cast())?;
-    Ok(Some(saved))
+    let inheritance = DaclInheritance::of(&descriptor)?;
+    write_dacl(handle, path, filtered.as_mut_ptr().cast(), inheritance)?;
+    Ok(Some((saved, inheritance)))
 }
 
 /// A tree that receives a lifecycle grant: its root, opened once by path,
@@ -792,7 +846,7 @@ impl GrantTree {
 pub(super) fn deny_appcontainer_read(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let (handle, identity) = open_permissions(path, true)?;
     let _lock = lock_object(identity)?;
-    let (old, _descriptor) = read_dacl(&handle, path)?;
+    let (old, descriptor) = read_dacl(&handle, path)?;
     let mut filtered = dacl_without_allowed_aces_for_sid(path, old, sid)?;
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
@@ -817,7 +871,7 @@ pub(super) fn deny_appcontainer_read(path: &Path, sid: PSID) -> Result<(), AppCo
         });
     }
     let _denied = LocalAllocGuard(denied.cast());
-    write_dacl(&handle, path, denied)
+    write_dacl(&handle, path, denied, DaclInheritance::of(&descriptor)?)
 }
 
 /// Removes the read denial [`deny_appcontainer_read`] gave `sid` on `path`,
@@ -888,6 +942,7 @@ pub(super) struct SavedDacl {
     handle: HandleGuard,
     path: PathBuf,
     dacl: Vec<u32>,
+    inheritance: DaclInheritance,
 }
 
 /// Takes `sid`'s entries out of the pinned object's DACL, as
@@ -900,7 +955,7 @@ pub(super) fn remove_pinned_ace_saving(
     journal: &mut Vec<SavedDacl>,
 ) -> Result<(), AppContainerError> {
     let _lock = lock_pinned(handle)?;
-    let Some(dacl) = remove_open_ace(handle, path, sid)? else {
+    let Some((dacl, inheritance)) = remove_open_ace(handle, path, sid)? else {
         return Ok(());
     };
     let mut duplicate = ptr::null_mut();
@@ -920,13 +975,14 @@ pub(super) fn remove_pinned_ace_saving(
     {
         let error = last_error("keep the permission target open to undo a removal");
         // Put this one back now: nothing else would.
-        let _ = write_dacl(handle, path, dacl.as_ptr().cast_mut().cast());
+        let _ = write_dacl(handle, path, dacl.as_ptr().cast_mut().cast(), inheritance);
         return Err(error);
     }
     journal.push(SavedDacl {
         handle: HandleGuard(duplicate),
         path: path.to_path_buf(),
         dacl,
+        inheritance,
     });
     Ok(())
 }
@@ -936,7 +992,12 @@ fn restore_saved(journal: Vec<SavedDacl>) -> Result<(), AppContainerError> {
     let mut first_error = None;
     for mut saved in journal.into_iter().rev() {
         let restored = lock_pinned(&saved.handle).and_then(|_lock| {
-            write_dacl(&saved.handle, &saved.path, saved.dacl.as_mut_ptr().cast())
+            write_dacl(
+                &saved.handle,
+                &saved.path,
+                saved.dacl.as_mut_ptr().cast(),
+                saved.inheritance,
+            )
         });
         if let Err(error) = restored {
             first_error.get_or_insert(error);
@@ -1311,6 +1372,69 @@ mod tests {
             old_control & SE_DACL_PROTECTED,
             new_control & SE_DACL_PROTECTED
         );
+    }
+
+    fn inheritance_of(path: &Path) -> DaclInheritance {
+        let (handle, _) = open_permissions(path, false).unwrap();
+        let (_, descriptor) = read_dacl(&handle, path).unwrap();
+        DaclInheritance::of(&descriptor).unwrap()
+    }
+
+    /// Writes `path`'s DACL back as it is, marked to inherit as `inheritance` says.
+    fn mark_inheritance(path: &Path, inheritance: DaclInheritance) {
+        let (handle, _) = open_permissions(path, true).unwrap();
+        let (acl, _descriptor) = read_dacl(&handle, path).unwrap();
+        write_dacl(&handle, path, acl, inheritance).unwrap();
+        assert_eq!(inheritance_of(path), inheritance);
+    }
+
+    #[test]
+    fn a_permission_change_leaves_how_the_object_inherits() {
+        let user = current_user_sid().unwrap();
+        for bits in [
+            0,
+            SE_DACL_AUTO_INHERITED,
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED,
+        ] {
+            let inheritance = DaclInheritance(bits);
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().join("directory");
+            std::fs::create_dir(&directory).unwrap();
+            let file = directory.join(".env");
+            std::fs::write(&file, "private content").unwrap();
+            let capability = grant_for(&directory, Permission::Metadata, &user).unwrap();
+            let sid = capability_sid(&capability.capability_name).unwrap();
+            mark_inheritance(&directory, inheritance);
+            mark_inheritance(&file, inheritance);
+
+            update_ace(&directory, sid.raw(), Some((METADATA_ACCESS, 0))).unwrap();
+            assert_eq!(inheritance_of(&directory), inheritance, "a grant");
+            update_ace(&directory, sid.raw(), None).unwrap();
+            assert_eq!(inheritance_of(&directory), inheritance, "its removal");
+
+            GrantTree::open(&directory)
+                .unwrap()
+                .grant_root(
+                    sid.raw(),
+                    (TOOL_ACCESS, Permission::ToolReadExecute.inheritance()),
+                )
+                .unwrap();
+            assert_eq!(inheritance_of(&directory), inheritance, "a tree's grant");
+            let (handle, _) = open_permissions(&directory, true).unwrap();
+            let mut journal = Vec::new();
+            remove_pinned_ace_saving(&handle, &directory, sid.raw(), &mut journal).unwrap();
+            assert_eq!(journal.len(), 1);
+            assert_eq!(inheritance_of(&directory), inheritance, "a saved removal");
+            restore_saved(journal).unwrap();
+            assert!(holds_ace(&handle, &directory, sid.raw()).unwrap());
+            assert_eq!(inheritance_of(&directory), inheritance, "its undoing");
+
+            deny_appcontainer_read(&file, sid.raw()).unwrap();
+            assert_eq!(inheritance_of(&file), inheritance, "a denial");
+            remove_appcontainer_read_deny(&file, sid.raw()).unwrap();
+            assert_eq!(inheritance_of(&file), inheritance, "the denial's removal");
+        }
     }
 
     #[test]

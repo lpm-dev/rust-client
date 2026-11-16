@@ -561,6 +561,29 @@ fn helper_secret_read_deny_overrides_broad_read_and_does_not_leave_a_stale_deny(
 /// form names every trustee by SID and doesn't depend on the language
 /// Windows runs in.
 fn saved_entries(path: &std::path::Path) -> Vec<String> {
+    saved_permissions(path)
+        .split('(')
+        .skip(1)
+        .filter_map(|entry| entry.split(')').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// How `path`'s permissions inherit, as `icacls` saves it ahead of the
+/// entries: `AI` when Windows keeps the inherited ones in step with the
+/// parent's, `P` when the parent's don't apply, both, or neither.
+fn saved_inheritance(path: &std::path::Path) -> String {
+    let saved = saved_permissions(path);
+    let descriptor = saved
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("D:"))
+        .unwrap_or_else(|| panic!("no permissions were saved for {}", path.display()));
+    descriptor.split('(').next().unwrap_or_default().to_owned()
+}
+
+/// What `icacls /save` writes for `path`: its name, then its permissions.
+fn saved_permissions(path: &std::path::Path) -> String {
     let directory = tempfile::tempdir().expect("directory for the saved permissions");
     let saved = directory.path().join("permissions");
     let listing = std::process::Command::new("icacls")
@@ -578,11 +601,6 @@ fn saved_entries(path: &std::path::Path) -> Vec<String> {
         .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     String::from_utf16_lossy(&units)
-        .split('(')
-        .skip(1)
-        .filter_map(|entry| entry.split(')').next())
-        .map(str::to_owned)
-        .collect()
 }
 
 /// The AppContainer SIDs `path`'s permissions deny access.
@@ -600,6 +618,96 @@ fn names_trustee(path: &std::path::Path, sid: &str) -> bool {
     saved_entries(path)
         .iter()
         .any(|entry| entry.rsplit(';').next() == Some(sid))
+}
+
+/// Takes back what the runs of one identity set, and deletes its profile,
+/// when dropped.
+struct RunIdentity(Vec<String>);
+
+impl RunIdentity {
+    fn clean_up(&self) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .args(&self.0)
+            .args(["--revoke-only", "--delete-appcontainer-profile"])
+            .output()
+            .expect("spawn cleanup")
+    }
+}
+
+impl Drop for RunIdentity {
+    fn drop(&mut self) {
+        let _ = self.clean_up();
+    }
+}
+
+#[test]
+fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let kept = project.path().join("kept.txt");
+    fs::write(&kept, "kept").expect("seed a file the grant reaches");
+    let created = project.path().join("created-by-child.txt");
+    let watched: Vec<std::path::PathBuf> = project
+        .path()
+        .ancestors()
+        .filter(|ancestor| ancestor.parent().is_some())
+        .map(std::path::Path::to_path_buf)
+        .chain([secret.clone(), kept])
+        .collect();
+    let inheritance = || -> Vec<(&std::path::Path, String)> {
+        watched
+            .iter()
+            .map(|path| (path.as_path(), saved_inheritance(path)))
+            .collect()
+    };
+    let before = inheritance();
+    assert!(
+        before.iter().any(|(_, flags)| flags.contains("AI")),
+        "nothing here inherits its permissions, so the run has nothing to keep: {before:?}"
+    );
+    let identity = RunIdentity(vec![
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        format!("LpmFilesystemInheritance-{}", std::process::id()),
+        "--grant-record".into(),
+        records
+            .path()
+            .join("grants.json")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&identity.0)
+        .args(["--stdio-stdin", "null"])
+        .args(["--stdio-stdout", "piped"])
+        .args(["--stdio-stderr", "piped"])
+        .arg("--writable-dir")
+        .arg(project.path())
+        .arg("--secret-read-deny")
+        .arg(&secret)
+        .args([
+            "--",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+        ])
+        .arg(ps_write_file(&created.to_string_lossy()))
+        .output()
+        .expect("spawn helper");
+
+    assert!(run.status.success(), "{run:?}");
+    assert!(created.exists());
+    assert_eq!(inheritance(), before, "after the run");
+
+    let cleanup = identity.clean_up();
+
+    assert!(cleanup.status.success(), "{cleanup:?}");
+    assert_eq!(inheritance(), before, "after the cleanup");
 }
 
 /// A sandboxed run that is stopped rather than left to end. Whatever the
