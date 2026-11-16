@@ -230,41 +230,41 @@ input, select { font-family: var(--font); }
 		<div class="hdr-info" id="hdr-info">Connecting...</div>
 		<div class="hdr-spacer"></div>
 		<div class="hdr-count" id="hdr-count">0</div>
-		<button class="hdr-btn" onclick="toggleTheme()" title="Toggle theme">Theme</button>
-		<button class="hdr-btn" onclick="showPatterns()" title="Failure patterns">Failures</button>
-		<button class="hdr-btn" onclick="showSnapshotCreator()" title="Create snapshot">Snapshot</button>
+		<button class="hdr-btn" data-action="toggle-theme" title="Toggle theme">Theme</button>
+		<button class="hdr-btn" data-action="show-patterns" title="Failure patterns">Failures</button>
+		<button class="hdr-btn" data-action="show-snapshot-creator" title="Create snapshot">Snapshot</button>
 	</div>
 	<div class="toolbar" id="toolbar">
 		<input class="search-input" id="search-input" placeholder="Search bodies, paths, summaries... (Enter)" autocomplete="off">
-		<button class="hdr-btn" onclick="saveCurrentFilter()" title="Bookmark current filter">Save</button>
+		<button class="hdr-btn" data-action="save-filter" title="Bookmark current filter">Save</button>
 		<div id="saved-filters"></div>
 	</div>
 	<div class="filterbar" id="filterbar" role="toolbar" aria-label="Filters">
-		<button class="filter-chip toned m-get" data-filter="method:GET" aria-pressed="false" onclick="toggleFilter(this)">GET</button>
-		<button class="filter-chip toned m-post" data-filter="method:POST" aria-pressed="false" onclick="toggleFilter(this)">POST</button>
-		<button class="filter-chip toned m-put" data-filter="method:PUT" aria-pressed="false" onclick="toggleFilter(this)">PUT</button>
-		<button class="filter-chip toned m-patch" data-filter="method:PATCH" aria-pressed="false" onclick="toggleFilter(this)">PATCH</button>
-		<button class="filter-chip toned m-delete" data-filter="method:DELETE" aria-pressed="false" onclick="toggleFilter(this)">DELETE</button>
-		<button class="filter-chip toned m-other" data-filter="method:other" aria-pressed="false" onclick="toggleFilter(this)" title="OPTIONS, HEAD, and other methods">Other</button>
+		<button class="filter-chip toned m-get" data-filter="method:GET" aria-pressed="false" data-action="toggle-filter">GET</button>
+		<button class="filter-chip toned m-post" data-filter="method:POST" aria-pressed="false" data-action="toggle-filter">POST</button>
+		<button class="filter-chip toned m-put" data-filter="method:PUT" aria-pressed="false" data-action="toggle-filter">PUT</button>
+		<button class="filter-chip toned m-patch" data-filter="method:PATCH" aria-pressed="false" data-action="toggle-filter">PATCH</button>
+		<button class="filter-chip toned m-delete" data-filter="method:DELETE" aria-pressed="false" data-action="toggle-filter">DELETE</button>
+		<button class="filter-chip toned m-other" data-filter="method:other" aria-pressed="false" data-action="toggle-filter" title="OPTIONS, HEAD, and other methods">Other</button>
 		<span class="filter-sep" aria-hidden="true"></span>
-		<button class="filter-chip toned s2" data-filter="status:2xx" aria-pressed="false" onclick="toggleFilter(this)">2xx</button>
-		<button class="filter-chip toned s3" data-filter="status:3xx" aria-pressed="false" onclick="toggleFilter(this)">3xx</button>
-		<button class="filter-chip toned s4" data-filter="status:4xx" aria-pressed="false" onclick="toggleFilter(this)">4xx</button>
-		<button class="filter-chip toned s5" data-filter="status:5xx" aria-pressed="false" onclick="toggleFilter(this)">5xx</button>
-		<button class="filter-chip toned s5" data-filter="status:error" aria-pressed="false" onclick="toggleFilter(this)" title="4xx and 5xx">Errors</button>
+		<button class="filter-chip toned s2" data-filter="status:2xx" aria-pressed="false" data-action="toggle-filter">2xx</button>
+		<button class="filter-chip toned s3" data-filter="status:3xx" aria-pressed="false" data-action="toggle-filter">3xx</button>
+		<button class="filter-chip toned s4" data-filter="status:4xx" aria-pressed="false" data-action="toggle-filter">4xx</button>
+		<button class="filter-chip toned s5" data-filter="status:5xx" aria-pressed="false" data-action="toggle-filter">5xx</button>
+		<button class="filter-chip toned s5" data-filter="status:error" aria-pressed="false" data-action="toggle-filter" title="4xx and 5xx">Errors</button>
 		<span class="filter-sep" aria-hidden="true"></span>
-		<button class="filter-chip" data-filter="provider:Stripe" aria-pressed="false" onclick="toggleFilter(this)">Stripe</button>
-		<button class="filter-chip" data-filter="provider:GitHub" aria-pressed="false" onclick="toggleFilter(this)">GitHub</button>
+		<button class="filter-chip" data-filter="provider:Stripe" aria-pressed="false" data-action="toggle-filter">Stripe</button>
+		<button class="filter-chip" data-filter="provider:GitHub" aria-pressed="false" data-action="toggle-filter">GitHub</button>
 	</div>
 	<div class="sidebar" id="sidebar">
 		<div class="sidebar-nav">
-			<div class="sidebar-nav-item active" data-view="http" onclick="switchView('http')">HTTP Requests</div>
-			<div class="sidebar-nav-item" data-view="ws" onclick="switchView('ws')">WebSocket</div>
+			<div class="sidebar-nav-item active" data-view="http" data-action="switch-view">HTTP Requests</div>
+			<div class="sidebar-nav-item" data-view="ws" data-action="switch-view">WebSocket</div>
 		</div>
 		<div class="sidebar-section">
 			<div class="sidebar-section-head">
 				<div class="sidebar-section-title">Sessions</div>
-				<button class="sidebar-clear" id="clear-ended-sessions" onclick="promptDeleteEndedSessions()" title="Delete every stopped session and its requests" hidden>clear ended</button>
+				<button class="sidebar-clear" id="clear-ended-sessions" data-action="delete-ended-sessions" title="Delete every stopped session and its requests" hidden>clear ended</button>
 			</div>
 			<div id="session-list"></div>
 		</div>
@@ -275,7 +275,7 @@ input, select { font-family: var(--font); }
 	<div class="detail-panel" id="detail-panel">
 		<div class="detail-empty">Select a request to inspect</div>
 	</div>
-	<div class="reconnect-banner" id="reconnect-banner">SSE connection lost. Events may have been missed. <button onclick="loadAll()">Refresh</button></div>
+	<div class="reconnect-banner" id="reconnect-banner">SSE connection lost. Events may have been missed. <button data-action="reload">Refresh</button></div>
 	<div class="status-bar">
 		<span id="sb-tunnel">No tunnel</span>
 		<span id="sb-port">--</span>
@@ -289,6 +289,7 @@ input, select { font-family: var(--font); }
 "use strict";
 const $ = (s, p) => (p || document).querySelector(s)
 const $$ = (s, p) => [...(p || document).querySelectorAll(s)]
+const enc = encodeURIComponent
 
 // ── State ──────────────────────────────────────────────
 let requests = [], wsConns = [], sessions = []
@@ -297,7 +298,7 @@ let diffSelectMode = false, diffFirstId = null
 let currentView = "http" // "http" | "ws"
 let activeFilters = { provider: null, status: null, method: null, query: "" }
 let activeSessionFilter = null
-let savedFilters = JSON.parse(localStorage.getItem("lpm_filters") || "[]")
+let savedFilters = readSavedFilters()
 let allTags = new Set()
 
 // ── SSE ────────────────────────────────────────────────
@@ -330,10 +331,19 @@ async function loadAll() {
 	const data = await resp.json()
 	requests = data.items || []; renderList(); updateCount()
 }
+// False only when the server refused the key; the bootstrap has then shown
+// how to open the inspector. Any other failure leaves the rest to retry.
 async function loadStatus() {
-	const resp = await fetch("/api/status"); const data = await resp.json()
-	if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
-	$("#sb-port").textContent = data.local_ready ? data.local_url : "waiting for dev server…"
+	let resp
+	try { resp = await fetch("/api/status") } catch { return true }
+	if (resp.status === 401) return false
+	if (!resp.ok) return true
+	try {
+		const data = await resp.json()
+		if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
+		$("#sb-port").textContent = data.local_ready ? data.local_url : "waiting for dev server…"
+	} catch {}
+	return true
 }
 async function loadSessions() {
 	try { const resp = await fetch("/api/sessions"); if (resp.ok) { sessions = await resp.json(); renderSessions() } } catch {}
@@ -352,26 +362,26 @@ async function searchRequests(q, provider, status, method) {
 	const data = await resp.json(); requests = data.items || []; renderList(); updateCount()
 }
 async function loadDetail(id) {
-	const resp = await fetch(`/api/requests/${id}`); if (!resp.ok) return
+	const resp = await fetch(`/api/requests/${enc(id)}`); if (!resp.ok) return
 	const data = await resp.json(); currentDetailTags = data.tags || []; renderDetail(data)
-	const dResp = await fetch(`/api/requests/${id}/diagnose`)
+	const dResp = await fetch(`/api/requests/${enc(id)}/diagnose`)
 	if (dResp.status === 200) renderDiagnosis(await dResp.json())
 }
 async function loadWsDetail(connId) {
-	const resp = await fetch(`/api/ws/connections/${connId}`); if (!resp.ok) return
+	const resp = await fetch(`/api/ws/connections/${enc(connId)}`); if (!resp.ok) return
 	renderWsDetail(connId, await resp.json())
 }
-async function copyCurl(id) { const r = await fetch(`/api/requests/${id}/curl`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("cURL copied") } }
-async function copyFixture(id) { const r = await fetch(`/api/requests/${id}/fixture`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("Test fixture copied") } }
-async function copyProviderCli(id) { const r = await fetch(`/api/requests/${id}/provider-cli`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("Provider CLI copied") } }
+async function copyCurl(id) { const r = await fetch(`/api/requests/${enc(id)}/curl`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("cURL copied") } }
+async function copyFixture(id) { const r = await fetch(`/api/requests/${enc(id)}/fixture`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("Test fixture copied") } }
+async function copyProviderCli(id) { const r = await fetch(`/api/requests/${enc(id)}/provider-cli`); if (r.ok) { await navigator.clipboard.writeText(await r.text()); toast("Provider CLI copied") } }
 async function downloadExport(id) {
-	const r = await fetch(`/api/requests/${id}/export`); if (!r.ok) return
+	const r = await fetch(`/api/requests/${enc(id)}/export`); if (!r.ok) return
 	const data = await r.json(); dl(JSON.stringify(data, null, 2), `${id}.lpm-webhook`, "application/json"); toast("Downloaded .lpm-webhook")
 }
-async function updateTags(id, tags) { await fetch(`/api/requests/${id}/tags`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }) }
-async function renameSession(id, name) { await fetch(`/api/sessions/${id}/name`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }); loadSessions() }
+async function updateTags(id, tags) { await fetch(`/api/requests/${enc(id)}/tags`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }) }
+async function renameSession(id, name) { await fetch(`/api/sessions/${enc(id)}/name`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }); loadSessions() }
 async function deleteSession(id) {
-	const r = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" })
+	const r = await fetch(`/api/sessions/${enc(id)}`, { method: "DELETE" })
 	if (r.status === 409) { toast("This session is still running"); loadSessions(); return }
 	if (!r.ok) { toast("Could not delete the session"); return }
 	toast("Session deleted"); afterSessionsDeleted(new Set([id]))
@@ -384,7 +394,7 @@ async function deleteEndedSessions() {
 	toast(`Deleted ${deleted_sessions} ${deleted_sessions === 1 ? "session" : "sessions"}`); afterSessionsDeleted(ended)
 }
 async function replayReq(id, opts) {
-	const r = await fetch(`/api/requests/${id}/replay`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) })
+	const r = await fetch(`/api/requests/${enc(id)}/replay`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) })
 	if (!r.ok) { toast("Replay failed"); return null }; return await r.json()
 }
 async function replaySequence(ids, delayMs, skipSig) {
@@ -415,8 +425,14 @@ function statusMatches(s, filter) {
 	const cls = /^([1-5])xx$/.exec(filter)
 	return cls ? Math.floor(s / 100) === Number(cls[1]) : s === Number(filter)
 }
+function readSavedFilters() {
+	try {
+		const saved = JSON.parse(localStorage.getItem("lpm_filters") || "[]")
+		return Array.isArray(saved) ? saved.filter(f => f && typeof f === "object") : []
+	} catch { return [] }
+}
 function filtersActive() { return Boolean(activeFilters.query || activeFilters.provider || activeFilters.status || activeFilters.method) }
-function fmtT(ts) { return ts?.length >= 19 ? ts.substring(11, 19) : ts || "" }
+function fmtT(ts) { return esc(ts?.length >= 19 ? ts.substring(11, 19) : ts || "") }
 function esc(s) { if (s == null) return ""; return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;") }
 function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("show"); setTimeout(() => t.classList.remove("show"), 2500) }
 function updateCount() { $("#hdr-count").textContent = `${requests.length} req` }
@@ -460,9 +476,9 @@ function applySavedFilter(i) {
 	$("#search-input").value = activeFilters.query
 	syncFilterChips(); applyFilters()
 }
-function removeSavedFilter(i, ev) { ev.stopPropagation(); savedFilters.splice(i, 1); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters() }
+function removeSavedFilter(i) { savedFilters.splice(i, 1); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters() }
 function renderSavedFilters() {
-	$("#saved-filters").innerHTML = savedFilters.map((f, i) => `<span class="saved-filter" onclick="applySavedFilter(${i})">${esc(f.label)}<span class="x" onclick="removeSavedFilter(${i},event)">&times;</span></span>`).join("")
+	$("#saved-filters").innerHTML = savedFilters.map((f, i) => `<span class="saved-filter" data-action="apply-saved-filter" data-index="${i}">${esc(f.label)}<span class="x" data-action="remove-saved-filter" data-index="${i}">&times;</span></span>`).join("")
 }
 
 // ── Rendering: List ────────────────────────────────────
@@ -475,7 +491,7 @@ function renderList() {
 		const sel = r.id === selectedId ? " selected" : "", ack = r.auto_acked ? " acked" : ""
 		const prov = r.provider ? `<span class="req-prov">${esc(r.provider)}</span>` : ""
 		const badges = []; if (r.auto_acked) badges.push(`<span class="badge badge-ack">ACK</span>`); if (r.has_signature_issue) badges.push(`<span class="badge badge-sig">SIG</span>`)
-		html += `<div class="req-item${sel}${ack}" onclick="selectRequest('${esc(r.id)}')">
+		html += `<div class="req-item${sel}${ack}" data-action="select-request" data-id="${esc(r.id)}">
 			<span class="req-method ${mc(r.method)}">${esc(r.method)}</span><span class="req-status ${sc(r.status)}">${r.status}</span>
 			<span class="req-path" title="${esc(r.path)}">${esc(r.path)}</span>${prov}
 			<span class="req-badges">${badges.join("")}</span>
@@ -500,12 +516,12 @@ function renderDetail(d) {
 			<span class="detail-title">${esc(d.path)}</span>
 			${d.provider ? `<span class="req-prov">${esc(d.provider)}</span>` : ""}
 			<div class="detail-actions">
-				<button onclick="showReplayForm('${esc(d.id)}')">Replay</button>
-				<button onclick="copyCurl('${esc(d.id)}')">cURL</button>
-				<button onclick="copyFixture('${esc(d.id)}')">Fixture</button>
-				<button onclick="copyProviderCli('${esc(d.id)}')">CLI</button>
-				<button onclick="downloadExport('${esc(d.id)}')">Export</button>
-				<button onclick="startDiff('${esc(d.id)}')">Diff</button>
+				<button data-action="show-replay" data-id="${esc(d.id)}">Replay</button>
+				<button data-action="copy-curl" data-id="${esc(d.id)}">cURL</button>
+				<button data-action="copy-fixture" data-id="${esc(d.id)}">Fixture</button>
+				<button data-action="copy-provider-cli" data-id="${esc(d.id)}">CLI</button>
+				<button data-action="download-export" data-id="${esc(d.id)}">Export</button>
+				<button data-action="start-diff" data-id="${esc(d.id)}">Diff</button>
 			</div>
 		</div>
 		<div id="diag-slot"></div>
@@ -532,7 +548,7 @@ function renderDiagnosis(diag) {
 let currentDetailTags = []
 function renderTags(id) {
 	const row = $("#tags-row"); if (!row) return
-	row.innerHTML = currentDetailTags.map((t,i) => `<span class="tag-pill">${esc(t)}<span class="tag-x" onclick="removeTag(${i},'${esc(id)}')">&times;</span></span>`).join("") + `<span class="tag-add" onclick="showTagInput('${esc(id)}')">+ tag</span>`
+	row.innerHTML = currentDetailTags.map((t,i) => `<span class="tag-pill">${esc(t)}<span class="tag-x" data-action="remove-tag" data-index="${i}" data-id="${esc(id)}">&times;</span></span>`).join("") + `<span class="tag-add" data-action="add-tag" data-id="${esc(id)}">+ tag</span>`
 }
 function showTagInput(id) {
 	const row = $("#tags-row"); if (!row) return
@@ -549,12 +565,12 @@ function renderSessions() {
 	const el = $("#session-list")
 	$("#clear-ended-sessions").hidden = !sessions.some(s => s.ended_at)
 	if (!sessions.length) { el.innerHTML = `<div style="color:var(--fg-muted);font-size:10px;padding:4px">No sessions yet</div>`; return }
-	el.innerHTML = `<div class="sidebar-item ${!activeSessionFilter?"active":""}" onclick="filterSession(null)"><span class="name">All requests</span></div>` +
+	el.innerHTML = `<div class="sidebar-item ${!activeSessionFilter?"active":""}" data-action="filter-session"><span class="name">All requests</span></div>` +
 		sessions.map(s => {
 			const active = activeSessionFilter === s.id ? " active" : ""
 			const dot = !s.ended_at ? `<span class="dot" title="Running"></span>` : ""
-			const remove = s.ended_at ? `<button class="sidebar-delete" title="Delete session and its requests" aria-label="Delete session ${esc(sessionName(s))}" onclick="event.stopPropagation();promptDeleteSession('${esc(s.id)}')">×</button>` : ""
-			return `<div class="sidebar-item${active}" onclick="filterSession('${esc(s.id)}')">${dot}<span class="name" title="${esc(s.id)}">${esc(sessionName(s))}</span><span class="count">${s.request_count}</span><button class="sidebar-edit" onclick="event.stopPropagation();promptRenameSession('${esc(s.id)}')">edit</button>${remove}</div>`
+			const remove = s.ended_at ? `<button class="sidebar-delete" title="Delete session and its requests" aria-label="Delete session ${esc(sessionName(s))}" data-action="delete-session" data-id="${esc(s.id)}">×</button>` : ""
+			return `<div class="sidebar-item${active}" data-action="filter-session" data-id="${esc(s.id)}">${dot}<span class="name" title="${esc(s.id)}">${esc(sessionName(s))}</span><span class="count">${s.request_count}</span><button class="sidebar-edit" data-action="rename-session" data-id="${esc(s.id)}">edit</button>${remove}</div>`
 		}).join("")
 }
 function filterSession(id) { activeSessionFilter = id; renderList(); renderSessions() }
@@ -596,7 +612,7 @@ function renderWsList() {
 	panel.innerHTML = wsConns.map(c => {
 		const sel = c.connection_id === selectedWsId ? " selected" : ""
 		const status = c.ended_at ? "closed" : "active"
-		return `<div class="ws-item${sel}" onclick="selectWs('${esc(c.connection_id)}')">
+		return `<div class="ws-item${sel}" data-action="select-ws" data-id="${esc(c.connection_id)}">
 			<span class="ws-url" title="${esc(c.url)}">${esc(c.url)}</span>
 			<span class="ws-frames">${c.frame_count} frames</span>
 			<span class="ws-frames">${c.inbound_frames} in / ${c.outbound_frames} out</span>
@@ -625,13 +641,13 @@ function makeOverlay(cls, inner) { const o = document.createElement("div"); o.cl
 
 function showReplayForm(id) {
 	const req = requests.find(r => r.id === id); if (!req) return
-	makeOverlay("replay-panel", `<div class="overlay-hdr"><h3>Replay: ${esc(req.method)} ${esc(req.path)}</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+	makeOverlay("replay-panel", `<div class="overlay-hdr"><h3>Replay: ${esc(req.method)} ${esc(req.path)}</h3><span class="overlay-close" data-action="close-overlay">&times;</span></div>
 		<div class="replay-form"><div class="rp-field"><label>Path</label><input id="rp-path" value="${esc(req.path)}"></div>
 		<div class="rp-field"><label>Method</label><input id="rp-method" value="${esc(req.method)}"></div>
 		<div class="rp-field"><label>Port</label><input id="rp-port" placeholder="default"></div>
 		<div class="rp-field"><label>Body (empty = original)</label><textarea id="rp-body"></textarea></div>
 		<label class="rp-check"><input type="checkbox" id="rp-skip"> Skip signatures</label>
-		<button class="rp-submit" onclick="doReplay('${esc(id)}')">Send</button></div><div class="rp-result" id="rp-result" style="display:none"></div>`)
+		<button class="rp-submit" data-action="replay" data-id="${esc(id)}">Send</button></div><div class="rp-result" id="rp-result" style="display:none"></div>`)
 }
 async function doReplay(id) {
 	const o = {}; const p = $("#rp-path")?.value; const m = $("#rp-method")?.value; const pt = $("#rp-port")?.value; const b = $("#rp-body")?.value
@@ -644,19 +660,19 @@ async function doReplay(id) {
 
 function startDiff(id) { diffFirstId = id; diffSelectMode = true; toast("Select a second request to compare") }
 async function loadDiff(a, b) {
-	const r = await fetch(`/api/diff/${a}/${b}`); if (!r.ok) { toast("Diff failed"); return }; const d = await r.json()
+	const r = await fetch(`/api/diff/${enc(a)}/${enc(b)}`); if (!r.ok) { toast("Diff failed"); return }; const d = await r.json()
 	const entries = [...(d.request_body||[]), ...(d.headers||[])], summary = d.request_body_summary || {}
 	const rows = entries.map(e => { const o = e.old!=null?JSON.stringify(e.old):"", n = e.new!=null?JSON.stringify(e.new):""
 		return `<div class="diff-entry ${e.kind}"><span class="diff-p">${esc(e.path||"/")}</span><span class="diff-o">${esc(o)}</span><span class="diff-n">${esc(n)}</span></div>` }).join("")
-	makeOverlay("diff-panel", `<div class="overlay-hdr"><h3>Diff: ${esc(a).substring(0,12)} vs ${esc(b).substring(0,12)}</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+	makeOverlay("diff-panel", `<div class="overlay-hdr"><h3>Diff: ${esc(a).substring(0,12)} vs ${esc(b).substring(0,12)}</h3><span class="overlay-close" data-action="close-overlay">&times;</span></div>
 		<div class="diff-sum">${summary.added||0} added, ${summary.removed||0} removed, ${summary.changed||0} changed</div>
 		<div style="display:grid;grid-template-columns:180px 1fr 1fr;gap:6px;padding:3px 14px;font-size:9px;color:var(--fg-muted);border-bottom:1px solid var(--bg-3)"><span>Path</span><span>Old</span><span>New</span></div>${rows||'<div style="padding:14px;color:var(--fg-muted)">No differences</div>'}`)
 }
 
 async function showPatterns() {
 	const r = await fetch("/api/failures/patterns"); if (!r.ok) return; const patterns = await r.json()
-	const rows = patterns.map(p => `<div class="pat-item" onclick="filterByPattern('${esc(p.fingerprint)}')"><div class="pat-head"><span class="pat-count">${p.count}x</span><span class="req-status ${sc(p.status)}">${p.status}</span><span class="pat-msg">${esc(p.error_extract?.message||p.category)}</span>${p.provider?`<span class="req-prov">${esc(p.provider)}</span>`:""}</div><div class="pat-meta">${esc(p.paths.join(", "))} | ${fmtT(p.first_seen)} — ${fmtT(p.last_seen)}</div></div>`).join("")
-	makeOverlay("patterns-panel", `<div class="overlay-hdr"><h3>Failure Patterns (${patterns.length})</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>${rows||'<div style="padding:14px;color:var(--fg-muted)">No failure patterns detected</div>'}`)
+	const rows = patterns.map(p => `<div class="pat-item" data-action="filter-pattern" data-fingerprint="${esc(p.fingerprint)}"><div class="pat-head"><span class="pat-count">${p.count}x</span><span class="req-status ${sc(p.status)}">${p.status}</span><span class="pat-msg">${esc(p.error_extract?.message||p.category)}</span>${p.provider?`<span class="req-prov">${esc(p.provider)}</span>`:""}</div><div class="pat-meta">${esc(p.paths.join(", "))} | ${fmtT(p.first_seen)} — ${fmtT(p.last_seen)}</div></div>`).join("")
+	makeOverlay("patterns-panel", `<div class="overlay-hdr"><h3>Failure Patterns (${patterns.length})</h3><span class="overlay-close" data-action="close-overlay">&times;</span></div>${rows||'<div style="padding:14px;color:var(--fg-muted)">No failure patterns detected</div>'}`)
 }
 function filterByPattern(fp) { $$(".overlay").forEach(o => o.remove()); activeFilters.status = "error"; syncFilterChips(); applyFilters() }
 
@@ -664,10 +680,10 @@ function showSnapshotCreator() {
 	const failed = requests.filter(r => r.status >= 400).slice(0, 20)
 	const items = (failed.length ? failed : requests.slice(0, 20))
 	const checks = items.map((r,i) => `<label class="snap-check"><input type="checkbox" value="${esc(r.id)}" ${i<5?"checked":""}> ${esc(r.method)} ${esc(r.path)} ${r.status}</label>`).join("")
-	makeOverlay("snap-panel", `<div class="overlay-hdr"><h3>Create Snapshot</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+	makeOverlay("snap-panel", `<div class="overlay-hdr"><h3>Create Snapshot</h3><span class="overlay-close" data-action="close-overlay">&times;</span></div>
 		<div class="snap-form"><div class="rp-field"><label>Description</label><input id="snap-desc" placeholder="Bug repro, edge case..."></div>
 		<div class="snap-list">${checks}</div>
-		<button class="rp-submit" onclick="doCreateSnapshot()">Download .lpm-webhook</button></div>`)
+		<button class="rp-submit" data-action="create-snapshot">Download .lpm-webhook</button></div>`)
 }
 function doCreateSnapshot() {
 	const ids = $$(".snap-check input:checked").map(c => c.value); if (!ids.length) { toast("Select at least one request"); return }
@@ -676,12 +692,12 @@ function doCreateSnapshot() {
 
 function showSequenceBuilder() {
 	const items = requests.filter(r => r.status >= 400).slice(0, 10)
-	const rows = items.map((r,i) => `<div class="seq-item" data-id="${esc(r.id)}"><span class="seq-handle">=</span><span>${esc(r.method)} ${esc(r.path)} ${r.status}</span><span class="seq-remove" onclick="this.closest('.seq-item').remove()">&times;</span></div>`).join("")
-	makeOverlay("seq-panel", `<div class="overlay-hdr"><h3>Sequence Replay</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>
+	const rows = items.map((r,i) => `<div class="seq-item" data-id="${esc(r.id)}"><span class="seq-handle">=</span><span>${esc(r.method)} ${esc(r.path)} ${r.status}</span><span class="seq-remove" data-action="remove-sequence-item">&times;</span></div>`).join("")
+	makeOverlay("seq-panel", `<div class="overlay-hdr"><h3>Sequence Replay</h3><span class="overlay-close" data-action="close-overlay">&times;</span></div>
 		<div class="seq-list" id="seq-list">${rows||'<div style="color:var(--fg-muted)">No failed requests to replay</div>'}</div>
 		<div class="replay-form"><div class="rp-field"><label>Delay between requests (ms)</label><input id="seq-delay" value="500"></div>
 		<label class="rp-check"><input type="checkbox" id="seq-skip"> Skip signatures</label>
-		<button class="rp-submit" onclick="doSequenceReplay()">Run Sequence</button></div>
+		<button class="rp-submit" data-action="run-sequence">Run Sequence</button></div>
 		<div class="seq-progress hidden" id="seq-progress"><div class="seq-progress-bar"><div class="seq-progress-fill" id="seq-fill"></div></div><div id="seq-status"></div></div>`)
 }
 async function doSequenceReplay() {
@@ -728,8 +744,71 @@ $("#search-input").addEventListener("keydown", e => {
 	else if (e.key === "Escape") { e.target.value = ""; activeFilters.query = ""; e.target.blur(); applyFilters() }
 })
 
+// ── Actions ────────────────────────────────────────────
+// Controls name their action in data-action and carry their values in data-*
+// attributes, which come back as text: nothing a capture holds is compiled as
+// script, and the page's policy refuses inline handlers.
+const ACTIONS = {
+	"toggle-theme": () => toggleTheme(),
+	"show-patterns": () => showPatterns(),
+	"show-snapshot-creator": () => showSnapshotCreator(),
+	"save-filter": () => saveCurrentFilter(),
+	"toggle-filter": el => toggleFilter(el),
+	"switch-view": el => switchView(el.dataset.view),
+	"delete-ended-sessions": () => promptDeleteEndedSessions(),
+	"reload": () => loadAll(),
+	"apply-saved-filter": el => applySavedFilter(Number(el.dataset.index)),
+	"remove-saved-filter": el => removeSavedFilter(Number(el.dataset.index)),
+	"select-request": el => selectRequest(el.dataset.id),
+	"show-replay": el => showReplayForm(el.dataset.id),
+	"copy-curl": el => copyCurl(el.dataset.id),
+	"copy-fixture": el => copyFixture(el.dataset.id),
+	"copy-provider-cli": el => copyProviderCli(el.dataset.id),
+	"download-export": el => downloadExport(el.dataset.id),
+	"start-diff": el => startDiff(el.dataset.id),
+	"remove-tag": el => removeTag(Number(el.dataset.index), el.dataset.id),
+	"add-tag": el => showTagInput(el.dataset.id),
+	"filter-session": el => filterSession("id" in el.dataset ? el.dataset.id : null),
+	"delete-session": el => promptDeleteSession(el.dataset.id),
+	"rename-session": el => promptRenameSession(el.dataset.id),
+	"select-ws": el => selectWs(el.dataset.id),
+	"close-overlay": el => el.closest(".overlay").remove(),
+	"replay": el => doReplay(el.dataset.id),
+	"filter-pattern": el => filterByPattern(el.dataset.fingerprint),
+	"create-snapshot": () => doCreateSnapshot(),
+	"remove-sequence-item": el => el.closest(".seq-item").remove(),
+	"run-sequence": () => doSequenceReplay(),
+}
+// Only the innermost control acts, so a button inside a row never also
+// triggers the row.
+document.addEventListener("click", e => {
+	const el = e.target.closest("[data-action]")
+	const run = el && Object.hasOwn(ACTIONS, el.dataset.action) && ACTIONS[el.dataset.action]
+	if (run) run(el)
+})
+
+function showAccessNotice() {
+	$("#list-panel").innerHTML = `<div class="empty"><div class="icon">~</div><div>Open the inspector from the link LPM printed.</div><div style="font-size:11px">That link carries this session's access key.</div></div>`
+	$("#hdr-info").textContent = "Not connected"
+}
+
+// The bootstrap reports a key the inspector refuses, as after it restarts on
+// the same port, so one notice replaces the errors each call would show.
+window.addEventListener("lpm-inspector-unauthorized", () => {
+	if (es) { es.close(); es = null }
+	$("#reconnect-banner").classList.remove("show")
+	showAccessNotice()
+})
+
+async function startInspector() {
+	if (!(await loadStatus())) return
+	loadAll(); loadSessions(); connectSSE()
+}
+
 // ── Init ───────────────────────────────────────────────
-loadTheme(); loadStatus(); loadAll(); loadSessions(); connectSSE(); renderSavedFilters()
+loadTheme(); renderSavedFilters()
+if (window.lpmInspectorHasToken) startInspector()
+else showAccessNotice()
 </script>
 </body>
 </html>

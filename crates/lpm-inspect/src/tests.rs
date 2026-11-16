@@ -753,7 +753,8 @@ mod integration_tests {
         }
         let body = resp.text().await.unwrap();
         assert!(
-            body.contains("sessionStorage.setItem(\"lpm_inspector_token\""),
+            body.contains("var KEY = \"lpm_inspector_token\"")
+                && body.contains("sessionStorage.setItem(KEY, token)"),
             "expected SPA bootstrap to set sessionStorage; body sample: {}",
             &body[..body.len().min(400)]
         );
@@ -789,6 +790,170 @@ mod integration_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
+        handle.shutdown().await.unwrap();
+    }
+
+    /// The value of every ` on<event>="` attribute opener in `html`.
+    fn inline_handler_attributes(html: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for (start, _) in html.match_indices(" on") {
+            let rest = &html[start + 3..];
+            let name_len = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+            if name_len > 0 && rest[name_len..].starts_with("=\"") {
+                found.push(format!("on{}", &rest[..name_len]));
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn the_inspector_refuses_a_request_addressed_to_another_host() {
+        let state = InspectorState::new(3000);
+        let handle = crate::start(state.clone(), 0).await.expect("start");
+        let port = handle.port;
+        let client = reqwest::Client::new();
+
+        for path in ["/", "/index.html", "/api/status"] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .header("Host", format!("other.example:{port}"))
+                .bearer_auth(state.auth_token())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::MISDIRECTED_REQUEST,
+                "a page that rebinds its own hostname to loopback reached {path}"
+            );
+            let body = resp.text().await.unwrap();
+            assert!(!body.contains(state.auth_token()));
+            assert!(
+                body.contains(&format!("http://127.0.0.1:{port}/")),
+                "the refusal says where the inspector answers: {body}"
+            );
+        }
+        for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}/"))
+                .header("Host", &host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{host}");
+        }
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_inspector_refuses_a_request_that_names_no_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = InspectorState::new(3000);
+        let handle = crate::start(state.clone(), 0).await.expect("start");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.0 421"), "{response}");
+        assert!(!response.contains(state.auth_token()));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_inspector_page_never_carries_the_access_token() {
+        let state = InspectorState::new(3000);
+        let handle = crate::start(state.clone(), 0).await.expect("start");
+        let port = handle.port;
+
+        for path in [
+            "/".to_string(),
+            "/index.html".to_string(),
+            "/deep/path".to_string(),
+            format!("/?token={}", state.auth_token()),
+        ] {
+            let resp = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            assert!(
+                !resp.text().await.unwrap().contains(state.auth_token()),
+                "anything that can fetch {path} from loopback would get the key to the API"
+            );
+        }
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_inspector_page_runs_only_its_own_scripts() {
+        let state = InspectorState::new(3000);
+        let handle = crate::start(state.clone(), 0).await.expect("start");
+        let url = format!("http://127.0.0.1:{}/", handle.port);
+
+        let mut nonces = Vec::new();
+        for _ in 0..2 {
+            let resp = reqwest::get(&url).await.unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let policy = header("content-security-policy");
+            assert_eq!(header("cache-control"), "no-store");
+            assert_eq!(header("x-content-type-options"), "nosniff");
+            let script_src = policy
+                .split(';')
+                .map(str::trim)
+                .find(|directive| directive.starts_with("script-src "))
+                .unwrap_or_else(|| panic!("no script-src in {policy:?}"))
+                .to_owned();
+            assert!(!script_src.contains("'unsafe-inline'"), "{script_src}");
+            let nonce = script_src
+                .split_whitespace()
+                .find_map(|source| source.strip_prefix("'nonce-")?.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("no nonce in {script_src}"))
+                .to_owned();
+            let body = resp.text().await.unwrap();
+            let tagged = format!("<script nonce=\"{nonce}\">");
+            assert_eq!(
+                body.matches("<script").count(),
+                body.matches(&tagged).count(),
+                "every script carries the response's nonce"
+            );
+            assert!(body.contains(&tagged));
+            assert_eq!(
+                inline_handler_attributes(&body),
+                Vec::<String>::new(),
+                "an inline handler would run captured text as script, and the policy blocks it"
+            );
+            nonces.push(nonce);
+        }
+        assert_ne!(nonces[0], nonces[1], "each page gets its own nonce");
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_inspector_launch_url_keeps_the_token_out_of_the_request() {
+        let state = InspectorState::new(3000);
+        let handle = crate::start(state.clone(), 0).await.expect("start");
+        assert_eq!(
+            handle.url,
+            format!(
+                "http://127.0.0.1:{}/#token={}",
+                handle.port,
+                state.auth_token()
+            )
+        );
         handle.shutdown().await.unwrap();
     }
 

@@ -1,9 +1,10 @@
 //! axum HTTP server setup and lifecycle.
 //!
 //! Binds to `127.0.0.1:{port}` (never `0.0.0.0`) and serves the REST
-//! API, SSE stream, and embedded web UI. Strict CORS pinned to the
-//! actually-bound port; every `/api/*` route requires the per-process
-//! auth token from `InspectorState`.
+//! API, SSE stream, and embedded web UI. Every route answers only requests
+//! addressed to that loopback origin at the actually-bound port, CORS is
+//! pinned to the same origin, and every `/api/*` route requires the
+//! per-process auth token from `InspectorState`.
 
 use crate::InspectorHandle;
 use crate::state::InspectorState;
@@ -11,7 +12,7 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use lpm_common::LpmError;
 use std::net::SocketAddr;
@@ -55,6 +56,67 @@ async fn require_auth_token(
     }
 
     Ok(next.run(request).await)
+}
+
+/// The authorities the inspector answers to: its own loopback origin at the
+/// bound port. Browsers leave out port 80, so on that port the bare host
+/// counts too.
+#[derive(Clone)]
+struct LoopbackAuthorities {
+    port: u16,
+    authorities: std::sync::Arc<[String]>,
+}
+
+impl LoopbackAuthorities {
+    fn for_port(port: u16) -> Self {
+        let mut authorities = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+        if port == 80 {
+            authorities.extend(["127.0.0.1".to_owned(), "localhost".to_owned()]);
+        }
+        Self {
+            port,
+            authorities: authorities.into(),
+        }
+    }
+
+    fn admits(&self, authority: &str) -> bool {
+        self.authorities
+            .iter()
+            .any(|own| own.eq_ignore_ascii_case(authority))
+    }
+}
+
+/// Refuses a request addressed to any other host. A web page that points
+/// its own hostname at 127.0.0.1 reaches the listener, but sends its own
+/// name, so it can't read the UI or call the API through the user's browser.
+async fn require_loopback_host(
+    State(authorities): State<LoopbackAuthorities>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authority = request
+        .uri()
+        .authority()
+        .map(axum::http::uri::Authority::as_str)
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        });
+    if authority.is_some_and(|authority| authorities.admits(authority)) {
+        return next.run(request).await;
+    }
+    let port = authorities.port;
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(
+            "This LPM inspector answers only at http://127.0.0.1:{port}/ and \
+             http://localhost:{port}/.\n"
+        ),
+    )
+        .into_response()
 }
 
 /// Resolves once the inspector starts shutting down, or its handle is dropped.
@@ -173,17 +235,21 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         ))
         .layer(axum::Extension(ServerShutdown(shutdown_rx.clone())));
 
-    // SPA fallback stays unauthenticated so the browser can fetch
-    // HTML/JS/CSS; the injected bootstrap then carries the token on
-    // every API call.
+    // The UI pages stay unauthenticated so the browser can fetch them; they
+    // hold no secret, and their bootstrap carries the token from the launch
+    // URL's fragment on every API call.
     let app = Router::new()
         .merge(api_routes)
         .fallback(get(crate::ui::serve_ui))
         .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            LoopbackAuthorities::for_port(bound_port),
+            require_loopback_host,
+        ))
         .with_state(state.clone());
 
     let url = format!(
-        "http://127.0.0.1:{bound_port}/?token={}",
+        "http://127.0.0.1:{bound_port}/#token={}",
         state.auth_token()
     );
     tracing::info!(port = bound_port, "inspector listening on loopback");
@@ -209,6 +275,17 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
 #[cfg(test)]
 mod server_tests {
     use super::*;
+
+    #[test]
+    fn an_inspector_on_port_80_answers_the_host_a_browser_sends_without_the_port() {
+        let authorities = LoopbackAuthorities::for_port(80);
+        for authority in ["127.0.0.1", "localhost", "127.0.0.1:80", "LOCALHOST:80"] {
+            assert!(authorities.admits(authority), "{authority}");
+        }
+        let other = LoopbackAuthorities::for_port(4500);
+        assert!(!other.admits("127.0.0.1"));
+        assert!(!other.admits("127.0.0.1:80"));
+    }
     use crate::state::InspectorState;
 
     /// `port = 0` must auto-pick a free ephemeral port; the handle reports the
@@ -231,8 +308,8 @@ mod server_tests {
             base,
         );
         assert!(
-            handle.url.contains("?token="),
-            "url {} should embed the auth token",
+            handle.url.contains("#token="),
+            "url {} should carry the auth token in its fragment",
             handle.url
         );
         handle.shutdown().await.unwrap();
