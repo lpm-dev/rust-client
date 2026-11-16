@@ -104,21 +104,30 @@ impl BundledNodeGyp {
     }
 
     fn command_text(&self) -> String {
-        let script = self.script.to_string_lossy();
         if cfg!(windows) {
-            format!(
-                "@ECHO off\r\nREM node-gyp {}, from the npm beside node\r\nnode \"{}\" %*\r\n",
-                self.version,
-                script.replace('%', "%%"),
-            )
-        } else {
-            format!(
-                "#!/bin/sh\n# node-gyp {}, from the npm beside node\nexec node '{}' \"$@\"\n",
-                self.version,
-                script.replace('\'', r"'\''"),
-            )
+            return windows_command_text(&self.version);
         }
+        format!(
+            "#!/bin/sh\n# node-gyp {}, from the npm beside node\nexec node '{}' \"$@\"\n",
+            self.version,
+            self.script.to_string_lossy().replace('\'', r"'\''"),
+        )
     }
+}
+
+/// The `.cmd` file that runs the offered node-gyp. It names the script
+/// through the variable a build is given its path in, and so holds no
+/// path of its own: cmd.exe reads a batch file in the console's code
+/// page, and would get a folder with letters outside it wrong.
+fn windows_command_text(version: &str) -> String {
+    format!(
+        "{}@REM node-gyp {version}, from the npm beside node\r\n{}",
+        lpm_common::symlink::WINDOWS_CMD_SHIM_PREAMBLE,
+        lpm_common::symlink::windows_node_cmd_shim_body(
+            &format!("%{}%", super::script_execution::NPM_CONFIG_NODE_GYP),
+            None,
+        ),
+    )
 }
 
 fn in_a_package(path: &Path) -> bool {
@@ -139,6 +148,19 @@ fn npm_modules_beside(node: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn the_windows_command_holds_no_path_for_cmd_to_misread() {
+        let text = windows_command_text("11.5.0");
+
+        assert!(text.is_ascii());
+        assert!(text.contains("DisableDelayedExpansion"), "{text}");
+        assert!(text.contains("\"%npm_config_node_gyp%\" %*"), "{text}");
+        assert!(
+            text.lines()
+                .all(|line| line.starts_with('@') || line.starts_with(':'))
+        );
+    }
 
     /// A Node installation under `prefix` whose npm ships `node-gyp` as
     /// `script` says, and the directory to put on `PATH` for it.
