@@ -1075,8 +1075,9 @@ async fn run_under_store_lock(
     if let Some(node) = stuck_node
         && let Some(warning) = node.warning_once(timeout)
     {
-        tracing::warn!(target: "lpm_cli::sandbox", "{warning}");
-        if !json_output {
+        if json_output {
+            tracing::warn!(target: "lpm_cli::sandbox", "{warning}");
+        } else {
             crate::output::warn(&warning);
         }
     }
