@@ -191,10 +191,10 @@ impl ConfiguredRegistries {
         )
     }
 
-    /// Bun reads its global `.bunfig.toml`, from `$XDG_CONFIG_HOME` or else
-    /// the home directory, under the project's `bunfig.toml`, and lets
-    /// `BUN_CONFIG_REGISTRY`, then `NPM_CONFIG_REGISTRY`, override the
-    /// default registry.
+    /// Bun reads its global `.bunfig.toml` from `$XDG_CONFIG_HOME` when that
+    /// is set, and from the home directory otherwise, under the project's
+    /// `bunfig.toml`, and lets `BUN_CONFIG_REGISTRY`, then
+    /// `NPM_CONFIG_REGISTRY`, override the default registry.
     fn bun_with(
         project_dir: &Path,
         home: Option<&Path>,
@@ -203,9 +203,8 @@ impl ConfiguredRegistries {
         let global = env("XDG_CONFIG_HOME")
             .filter(|directory| !directory.is_empty())
             .map(PathBuf::from)
-            .map(|directory| directory.join(".bunfig.toml"))
-            .filter(|file| file.is_file())
-            .or_else(|| home.map(|home| home.join(".bunfig.toml")));
+            .or_else(|| home.map(Path::to_path_buf))
+            .map(|directory| directory.join(".bunfig.toml"));
         let project = project_dir.join("bunfig.toml");
 
         let mut registries = Self::default();
@@ -810,6 +809,28 @@ mod tests {
         assert_eq!(
             placed(&registries, "ms").as_deref(),
             Some("https://npm-env.example/ms/-/ms-1.0.0.tgz")
+        );
+    }
+
+    #[test]
+    fn bun_reads_no_home_file_while_xdg_config_home_is_set() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config_home = root.path().join("config");
+        let project = root.path().join("project");
+        for directory in [&home, &config_home, &project] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            home.join(".bunfig.toml"),
+            "[install]\nregistry = \"https://home.example/\"\n",
+        )
+        .unwrap();
+        let config_home_text = config_home.to_string_lossy().into_owned();
+        let env = |name: &str| (name == "XDG_CONFIG_HOME").then(|| config_home_text.clone());
+        assert_eq!(
+            ConfiguredRegistries::bun_with(&project, Some(&home), &env).unwrap(),
+            None
         );
     }
 

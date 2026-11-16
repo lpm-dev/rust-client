@@ -386,6 +386,20 @@ pub(crate) struct InstallExpectations {
     locked_integrities: Option<Arc<LockedIntegrities>>,
 }
 
+impl InstallExpectations {
+    /// Whether tarballs wait for the checks that run after resolution
+    /// instead of downloading while it runs: policy extensions judge each
+    /// package first, and a recorded integrity may replace the one a fetch
+    /// verifies.
+    fn hold_tarball_prefetch(
+        &self,
+        policy_extension_configs: &[policy_extensions::PolicyExtensionConfig],
+    ) -> bool {
+        policy_extensions_disable_tarball_prefetch(policy_extension_configs)
+            || self.locked_integrities.is_some()
+    }
+}
+
 pub(crate) struct ExpectedInstallRoot {
     pub(crate) name: String,
     pub(crate) version: String,
@@ -1368,9 +1382,7 @@ async fn run_with_options_under_store_lock(
         npm_firewall_policy_profile,
         npm_firewall_chunk_size,
         locked_integrities: expectations.locked_integrities.as_deref(),
-        tarball_prefetch_held: policy_extensions_disable_tarball_prefetch(
-            &policy_extension_configs,
-        ) || expectations.locked_integrities.is_some(),
+        tarball_prefetch_held: expectations.hold_tarball_prefetch(&policy_extension_configs),
         force,
         offline,
         omit_policy,
@@ -1426,6 +1438,11 @@ async fn run_with_options_under_store_lock(
         current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
     }
 
+    // Registry signatures cover the integrity the registry published, which
+    // a recorded integrity may replace below for the fetch to verify.
+    let packages_as_published = (verify_registry_signatures
+        && expectations.locked_integrities.is_some())
+    .then(|| packages.clone());
     if let Some(locked) = &expectations.locked_integrities {
         locked.apply(&mut packages, &mut packages_for_lockfile)?;
     }
@@ -1518,7 +1535,7 @@ async fn run_with_options_under_store_lock(
         enforce_registry_signature_policy(
             Arc::clone(&arc_client),
             &route_table,
-            &packages,
+            packages_as_published.as_deref().unwrap_or(&packages),
             json_output,
             true,
             registry_signature_timings.clone(),

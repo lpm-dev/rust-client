@@ -54,6 +54,7 @@ pub fn to_lockfile_with_registries(
 ) -> Result<(Lockfile, Vec<SkippedPackage>, Vec<CustomRegistryPackage>), LpmError> {
     let mut skipped = Vec::new();
     let mut custom_registry_packages: Vec<CustomRegistryPackage> = Vec::new();
+    let mut reported_custom: HashSet<(String, String, String)> = HashSet::new();
     let mut locked_packages: Vec<LockedPackage> = Vec::with_capacity(packages.len());
     let mut locked_at: HashMap<(String, String, Option<String>), usize> =
         HashMap::with_capacity(packages.len());
@@ -109,7 +110,11 @@ pub fn to_lockfile_with_registries(
 
         let (source, custom) = source_of(&pkg);
         if let Some(custom) = custom
-            && !custom_registry_packages.contains(&custom)
+            && reported_custom.insert((
+                custom.name.clone(),
+                custom.version.clone(),
+                custom.tarball_url.clone(),
+            ))
         {
             custom_registry_packages.push(custom);
         }

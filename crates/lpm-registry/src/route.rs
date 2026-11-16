@@ -576,7 +576,18 @@ fn registry_serves(candidate: &str, registry: &str) -> bool {
         && candidate.host_str().map(str::to_ascii_lowercase)
             == registry.host_str().map(str::to_ascii_lowercase)
         && (path_lies_under(candidate.path(), registry.path())
-            || gitlab_project_tarball_under(candidate.path(), registry.path()))
+            || gitlab_project_tarball_under(candidate.path(), registry.path())
+            || github_packages_download(&candidate))
+}
+
+/// GitHub Packages serves its npm registry at `npm.pkg.github.com`, with or
+/// without an owner path, and its tarballs from `/download/` on the same
+/// host.
+fn github_packages_download(candidate: &reqwest::Url) -> bool {
+    candidate
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("npm.pkg.github.com"))
+        && candidate.path().starts_with("/download/")
 }
 
 /// GitLab's instance endpoint, `<root>/api/v4/packages/npm`, and a group's,
@@ -806,6 +817,30 @@ mod tests {
             !table
                 .fetches_package_from("utils", "https://npm.corp.example/utils/-/utils-1.0.0.tgz")
         );
+    }
+
+    #[test]
+    fn a_github_packages_tarball_counts_as_fetched_from_the_owner_route_on_its_host() {
+        let tarball = "https://npm.pkg.github.com/download/@owner/pkg/1.0.0/0123abcd";
+        for registry in [
+            "https://npm.pkg.github.com/owner",
+            "https://npm.pkg.github.com/",
+        ] {
+            let npmrc =
+                NpmrcConfig::parse(&format!("@owner:registry={registry}\n"), "test", &no_env);
+            let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+            assert!(
+                table.fetches_package_from("@owner/pkg", tarball),
+                "{registry}"
+            );
+        }
+        let npmrc = NpmrcConfig::parse(
+            "@owner:registry=https://npm.corp.example/owner\n",
+            "test",
+            &no_env,
+        );
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        assert!(!table.fetches_package_from("@owner/pkg", tarball));
     }
 
     #[test]

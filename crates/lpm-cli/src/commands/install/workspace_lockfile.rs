@@ -14,6 +14,10 @@ pub(super) struct WorkspaceLockfileCoordinator {
     existing: Option<lpm_lockfile::ValidatedLockfile>,
     migration_pending: bool,
     exact_graph_migration_pending: bool,
+    /// Whether the root lockfile is one `lpm migrate` wrote, whose recorded
+    /// integrities every member's install must be checked against before a
+    /// new lockfile replaces it.
+    migrated_lockfile: bool,
     valid_importers: BTreeSet<String>,
     existing_projection_metadata: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     projection_content: Mutex<BTreeMap<String, (u64, Arc<str>)>>,
@@ -41,6 +45,10 @@ impl WorkspaceLockfileCoordinator {
         } else {
             None
         };
+        let migrated_lockfile = root_lockfile.as_ref().is_some_and(|lockfile| {
+            lockfile.as_lockfile().metadata.resolved_with.as_deref()
+                == Some(lpm_migrate::MIGRATED_LOCKFILE_RESOLVER)
+        });
         let exact_graph_migration_pending = root_lockfile.as_ref().is_some_and(|lockfile| {
             lockfile.as_lockfile().metadata.lockfile_version
                 < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
@@ -114,6 +122,7 @@ impl WorkspaceLockfileCoordinator {
             existing,
             migration_pending,
             exact_graph_migration_pending,
+            migrated_lockfile,
             valid_importers,
             existing_projection_metadata: Mutex::new(BTreeMap::new()),
             projection_content: Mutex::new(BTreeMap::new()),
@@ -330,6 +339,19 @@ impl WorkspaceLockfileCoordinator {
                     "workspace importer {importer:?} completed without producing a lockfile projection"
                 )));
             }
+        }
+        if self.migrated_lockfile
+            && let Some(importer) = self.valid_importers.iter().find(|importer| {
+                !staged.contains_key(*importer) && !non_persisting_importers.contains(*importer)
+            })
+        {
+            return Err(LpmError::Registry(format!(
+                "{} was written by `lpm migrate`, and this install doesn't cover workspace \
+                 importer {importer:?}, so replacing the lockfile now would drop the integrities \
+                 recorded for it before it's checked. Run `lpm install --recursive` from the \
+                 workspace root. No lockfile changes were committed.",
+                self.root.join(lpm_lockfile::LOCKFILE_NAME).display()
+            )));
         }
         if self.exact_graph_migration_pending
             && let Some(existing) = &self.existing

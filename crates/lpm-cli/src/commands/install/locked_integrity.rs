@@ -447,6 +447,17 @@ mod tests {
     }
 
     #[test]
+    fn tarballs_wait_for_the_check_while_a_migrated_lockfile_holds_integrities() {
+        let without = super::super::InstallExpectations::default();
+        assert!(!without.hold_tarball_prefetch(&[]));
+        let with = super::super::InstallExpectations {
+            locked_integrities: Some(Arc::new(LockedIntegrities::default())),
+            ..Default::default()
+        };
+        assert!(with.hold_tarball_prefetch(&[]));
+    }
+
+    #[test]
     fn a_migrated_lockfile_holding_only_a_tarball_package_is_detected() {
         let directory = tempfile::tempdir().unwrap();
         let (mut lockfile, _) =

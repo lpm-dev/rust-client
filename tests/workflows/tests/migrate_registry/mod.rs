@@ -6,7 +6,9 @@
 //! installed at the version the lockfile locked must have the bytes it
 //! recorded.
 
-use crate::support::mock_registry::{MockRegistry, compute_integrity, make_tarball_with_files};
+use crate::support::mock_registry::{
+    MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball_with_files,
+};
 use crate::support::{TempProject, lpm_with_registry};
 use std::process::Output;
 use wiremock::matchers::{method, path};
@@ -624,4 +626,204 @@ async fn migrate_names_a_registry_built_from_environment_variables_without_print
         "a value from the environment was printed:\n{text}"
     );
     assert!(!project.file_exists("lpm.lock"));
+}
+
+async fn tarball_requests_for(registry: &MockRegistry, name: &str) -> usize {
+    registry
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available")
+        .iter()
+        .filter(|request| request.url.path().contains(name) && request.url.path().ends_with(".tgz"))
+        .count()
+}
+
+#[tokio::test]
+async fn a_package_refused_at_its_locked_version_is_never_downloaded() {
+    let registries = registries().await;
+    let project = TempProject::empty(PROJECT);
+    project.write_file(
+        "package-lock.json",
+        &package_lock(
+            &registries.private.tarball_url("corp-utils", "1.0.0"),
+            &registries.private_integrity,
+        ),
+    );
+
+    // Downloads would otherwise start from the first selected package.
+    let output = lpm_with_registry(&project, &registries.public.url())
+        .env("LPM_FETCH_OVERLAP", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+            "--allow-registry-change",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", report(&output));
+    assert_eq!(
+        tarball_requests_for(&registries.public, "corp-utils").await,
+        0,
+        "the tarball was downloaded before its integrity was checked"
+    );
+}
+
+#[tokio::test]
+async fn an_install_with_the_experimental_resolver_requested_still_holds_the_locked_integrity() {
+    let registries = registries().await;
+    let project = TempProject::empty(PROJECT);
+    project.write_file(
+        "package-lock.json",
+        &package_lock(
+            &registries.private.tarball_url("corp-utils", "1.0.0"),
+            &registries.private_integrity,
+        ),
+    );
+    let migrated = migrate(
+        &project,
+        &registries.public,
+        &["--allow-registry-change", "--no-install"],
+    );
+    assert!(migrated.status.success(), "{}", report(&migrated));
+
+    let installed = lpm_with_registry(&project, &registries.public.url())
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_GRAPH", "resolve-worklist")
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(!installed.status.success(), "{}", report(&installed));
+    let text = report(&installed);
+    assert!(
+        text.contains("corp-utils@1.0.0") && text.contains("integrity"),
+        "{text}"
+    );
+    assert!(!project.file_exists("node_modules/corp-utils"));
+}
+
+fn workspace_project(registry: &MockRegistry, integrity: &str) -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"migration-host","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    for member in ["app", "lib"] {
+        project.write_file(
+            &format!("packages/{member}/package.json"),
+            &format!(
+                r#"{{"name":"{member}","version":"1.0.0","dependencies":{{"corp-utils":"1.0.0"}}}}"#
+            ),
+        );
+    }
+    project.write_file(
+        "package-lock.json",
+        &serde_json::json!({
+            "name": "migration-host",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "migration-host", "version": "1.0.0", "workspaces": ["packages/*"] },
+                "packages/app": { "name": "app", "version": "1.0.0", "dependencies": { "corp-utils": "1.0.0" } },
+                "packages/lib": { "name": "lib", "version": "1.0.0", "dependencies": { "corp-utils": "1.0.0" } },
+                "node_modules/app": { "resolved": "packages/app", "link": true },
+                "node_modules/lib": { "resolved": "packages/lib", "link": true },
+                "node_modules/corp-utils": {
+                    "version": "1.0.0",
+                    "resolved": registry.tarball_url("corp-utils", "1.0.0"),
+                    "integrity": integrity
+                }
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(".npmrc", &format!("registry={}/\n", registry.url()));
+    project
+}
+
+#[tokio::test]
+async fn migrating_a_workspace_installs_every_member_held_to_its_locked_integrity() {
+    let registries = registries().await;
+    let project = workspace_project(&registries.private, &registries.private_integrity);
+
+    let output = migrate(&project, &registries.public, &[]);
+
+    assert!(output.status.success(), "{}", report(&output));
+    assert!(
+        !project
+            .read_file("lpm.lock")
+            .contains("resolved-with = \"migrate\"")
+    );
+}
+
+#[tokio::test]
+async fn installing_one_workspace_member_over_a_migrated_lockfile_is_refused_until_all_are_checked()
+{
+    let registries = registries().await;
+    let project = workspace_project(&registries.private, &registries.private_integrity);
+    let migrated = migrate(&project, &registries.public, &["--no-install"]);
+    assert!(migrated.status.success(), "{}", report(&migrated));
+
+    let installed = lpm_with_registry(&project, &registries.public.url())
+        .current_dir(project.path().join("packages/app"))
+        .args(["install", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!installed.status.success(), "{}", report(&installed));
+    assert!(
+        report(&installed).contains("lpm install --recursive"),
+        "{}",
+        report(&installed)
+    );
+    assert!(
+        project
+            .read_file("lpm.lock")
+            .contains("resolved-with = \"migrate\""),
+        "a partial install replaced the migrated lockfile"
+    );
+}
+
+#[tokio::test]
+async fn registry_signatures_are_checked_against_the_published_integrity_when_the_recorded_one_is_stronger()
+ {
+    let public = MockRegistry::start().await;
+    let signer = RegistrySigningFixture::new();
+    public.with_registry_signing_keys(&signer).await;
+    let tarball = make_tarball_with_files("corp-utils", "1.0.0", &[("origin.txt", b"signed")]);
+    let published =
+        lpm_common::Integrity::from_bytes(lpm_common::integrity::HashAlgorithm::Sha1, &tarball)
+            .to_string();
+    let mut metadata = public.package_metadata("corp-utils", "1.0.0", &tarball);
+    metadata["versions"]["1.0.0"]["dist"]["integrity"] = serde_json::json!(published);
+    metadata["versions"]["1.0.0"]["dist"]["signatures"] =
+        serde_json::json!([signer.signature_json("corp-utils", "1.0.0", &published)]);
+    public
+        .with_package_metadata("corp-utils", "1.0.0", &tarball, metadata.clone())
+        .await;
+    public.with_batch_metadata(vec![metadata]).await;
+    let project = TempProject::empty(PROJECT);
+    project.write_file(
+        "package-lock.json",
+        &package_lock(
+            &public.tarball_url("corp-utils", "1.0.0"),
+            &compute_integrity(&tarball),
+        ),
+    );
+    project.write_file(".npmrc", &format!("registry={}/\n", public.url()));
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(lpm_dir.join("config.toml"), "signatures = true\n").unwrap();
+
+    let output = migrate(&project, &public, &[]);
+
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(
+        project.read_file("node_modules/corp-utils/origin.txt"),
+        "signed"
+    );
 }
