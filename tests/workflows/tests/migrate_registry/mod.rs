@@ -908,6 +908,7 @@ async fn migrate_names_the_destination_registry_without_values_npmrc_expanded_in
 
     let output = lpm_with_registry(&project, &registries.public.url())
         .env("REG_TOKEN", "tok_8c1e5d")
+        .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
         .args([
             "migrate",
             "--skip-verify",
@@ -954,6 +955,7 @@ async fn a_migrated_lockfile_records_only_the_origin_of_a_registry_built_from_en
 
     let output = lpm_with_registry(&project, &public.url())
         .env("REG_TOKEN", "tok_3b7f90")
+        .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
         .args([
             "migrate",
             "--skip-verify",
