@@ -2639,3 +2639,25 @@ fn only_a_served_url_other_than_the_locked_one_is_written_back() {
 
     assert_eq!(refreshed, [key("moved"), key("unnamed")]);
 }
+
+#[test]
+fn a_package_that_records_no_tarball_url_is_never_reported_as_refreshed() {
+    let source =
+        "git+https://git.example.test/owner/repo.git#0123456789abcdef0123456789abcdef01234567";
+    let row = lpm_lockfile::LockedPackage {
+        name: "from-git".into(),
+        version: "1.0.0".into(),
+        source: Some(source.into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        row.source_kind(),
+        Some(Ok(lpm_lockfile::Source::Git { .. }))
+    ));
+    let served = HashMap::from([(
+        format!("from-git\0{}\0{source}", "1.0.0"),
+        "https://git.example.test/owner/repo/archive/0123456.tar.gz".to_string(),
+    )]);
+
+    assert!(urls_other_than_locked(std::iter::once(&row), &served).is_empty());
+}

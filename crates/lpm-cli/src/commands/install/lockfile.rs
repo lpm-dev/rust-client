@@ -641,11 +641,21 @@ pub(super) fn urls_other_than_locked<'a>(
     rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
     served: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    rows.filter_map(|package| {
-        let (key, url) = served.get_key_value(&locked_package_key(package))?;
-        (package.tarball.as_deref() != Some(url.as_str())).then(|| (key.clone(), url.clone()))
-    })
-    .collect()
+    rows.filter(|package| records_tarball_url(package))
+        .filter_map(|package| {
+            let (key, url) = served.get_key_value(&locked_package_key(package))?;
+            (package.tarball.as_deref() != Some(url.as_str())).then(|| (key.clone(), url.clone()))
+        })
+        .collect()
+}
+
+/// Whether the lockfile keeps the URL that serves `package`: it does for
+/// a package from a registry, and for one whose row names no source.
+fn records_tarball_url(package: &lpm_lockfile::LockedPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+    )
 }
 
 fn patch_fresh_tarball_urls(
@@ -653,10 +663,8 @@ fn patch_fresh_tarball_urls(
     fresh_urls: &HashMap<String, String>,
 ) {
     for package in &mut lockfile.packages {
-        if matches!(
-            package.source_kind(),
-            Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
-        ) && let Some(url) = fresh_urls.get(&locked_package_key(package))
+        if records_tarball_url(package)
+            && let Some(url) = fresh_urls.get(&locked_package_key(package))
         {
             package.tarball = Some(url.clone());
         }
