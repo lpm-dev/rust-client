@@ -231,17 +231,17 @@ pub(crate) fn render_profile_with_toolchain(
     if !spec.read_project_full {
         render_secret_denies(&mut out, &canon_project_dir)?;
     }
-    // securityd decrypts a file keychain's items for any process that can
-    // read the file and reach it, as the system roots keep it reachable. So
-    // a keychain file is unreadable wherever a script could otherwise read
-    // it, such as its temporary directory, except the system's own.
+    // Keychain files stay unreadable wherever a script has read access,
+    // except the system's own, which certificate trust needs.
     out.push_str(&format!(
         "(deny file-read* (regex {}))\n",
-        seatbelt_regex_literal(r"\.keychain(-db)?$")
+        seatbelt_regex_literal(&format!("{KEYCHAIN_FILE_SUFFIX}$"))
     ));
     out.push_str(&format!(
         "(allow file-read* (regex {}))\n",
-        seatbelt_regex_literal(r"^/System/Library/Keychains/[^/]+\.keychain(-db)?$")
+        seatbelt_regex_literal(&format!(
+            "^/System/Library/Keychains/[^/]+{KEYCHAIN_FILE_SUFFIX}$"
+        ))
     ));
     render_secret_read_allow_overrides(&mut out, &spec.secret_read_allow)?;
     out.push('\n');
@@ -276,6 +276,12 @@ pub(crate) fn render_profile_with_toolchain(
         }
     }
     out.push_str(")\n");
+    // A keychain file in a directory the script can write stays put, so a
+    // rename can't take it out of the read deny above.
+    out.push_str(&format!(
+        "(deny file-write* (regex {}))\n",
+        seatbelt_regex_literal(&format!("{KEYCHAIN_FILE_SUFFIX}$"))
+    ));
     out.push('\n');
 
     // Network denial is opt-in, not default. The default posture
@@ -470,6 +476,10 @@ fn render_secret_read_allow_overrides(
 /// character (NOT a Scheme escape), so `\.pem` in the source
 /// reaches the regex engine unchanged. Only `"` is escaped by the
 /// SBPL parser; we mirror that.
+/// `.keychain` or `.keychain-db` in any case, as a case-insensitive volume
+/// opens it.
+const KEYCHAIN_FILE_SUFFIX: &str = r"\.[kK][eE][yY][cC][hH][aA][iI][nN](-[dD][bB])?";
+
 fn seatbelt_regex_literal(r: &str) -> String {
     let mut out = String::with_capacity(r.len() + 4);
     out.push_str("#\"");
@@ -1552,12 +1562,18 @@ mod tests {
     #[test]
     fn keychain_files_are_unreadable_everywhere_but_the_systems_own() {
         let p = render_profile(&spec(), false).unwrap();
+        let suffix = r"\.[kK][eE][yY][cC][hH][aA][iI][nN](-[dD][bB])?$";
         let deny = p
-            .find(r#"(deny file-read* (regex #"\.keychain(-db)?$"))"#)
-            .expect("keychain deny");
+            .find(&format!("(deny file-read* (regex #\"{suffix}\"))"))
+            .expect("keychain read deny");
         let system = p
-            .find(r#"(allow file-read* (regex #"^/System/Library/Keychains/[^/]+\.keychain(-db)?$"))"#)
+            .find(&format!(
+                "(allow file-read* (regex #\"^/System/Library/Keychains/[^/]+{suffix}\"))"
+            ))
             .expect("system keychains re-allowed");
+        let write = p
+            .find(&format!("(deny file-write* (regex #\"{suffix}\"))"))
+            .expect("keychain write deny");
         assert!(
             deny < system,
             "the system's keychains must be allowed after the deny: {p}"
@@ -1565,7 +1581,12 @@ mod tests {
         assert!(
             p.find("(subpath \"/System\")")
                 .is_some_and(|grant| grant < deny),
-            "the deny must follow the read grants it narrows: {p}"
+            "the read deny must follow the read grants it narrows: {p}"
+        );
+        assert!(
+            p.find("(allow file-write*\n")
+                .is_some_and(|grant| grant < write),
+            "the write deny must follow the write grants it narrows: {p}"
         );
     }
 

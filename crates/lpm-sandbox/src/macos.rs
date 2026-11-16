@@ -472,8 +472,10 @@ mod tests {
         rs.spec.tmpdir = tmpdir.clone();
         let readable = tmpdir.join("notes.txt");
         let keychain = tmpdir.join("signing.keychain-db");
+        let capitals = tmpdir.join("BUILD.KEYCHAIN");
         std::fs::write(&readable, b"notes").unwrap();
         std::fs::write(&keychain, b"keychain").unwrap();
+        std::fs::write(&capitals, b"keychain").unwrap();
         let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
         let read = |path: &std::path::Path| {
             let mut cmd = SandboxedCommand::new("/bin/cat")
@@ -495,6 +497,22 @@ mod tests {
         assert!(
             !read(&keychain),
             "a keychain file in the temporary directory was readable"
+        );
+        assert!(
+            !read(&capitals),
+            "a keychain file named in capitals was readable"
+        );
+        let renamed = tmpdir.join("signing.txt");
+        let mut mv = SandboxedCommand::new("/bin/mv")
+            .arg(&keychain)
+            .arg(&renamed)
+            .envs_cleared([("PATH", "/usr/bin:/bin")]);
+        mv.stdout = SandboxStdio::Null;
+        mv.stderr = SandboxStdio::Null;
+        let moved = sb.spawn(mv).expect("spawn").wait().expect("wait").success();
+        assert!(
+            !moved && !renamed.exists(),
+            "a keychain file was renamed out of the read deny"
         );
         let system_roots =
             std::path::Path::new("/System/Library/Keychains/SystemRootCertificates.keychain");
