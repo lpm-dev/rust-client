@@ -688,11 +688,38 @@ impl VersionMetadata {
             .into_iter()
             .any(|(present, key)| present && !self.tag_is_tests_only(key))
         });
-        let has_lifecycle = self
-            .lifecycle_scripts
-            .as_ref()
-            .is_some_and(|s| !s.is_empty());
-        has_findings || has_dangerous_tags || has_lifecycle
+        has_findings || has_dangerous_tags || !self.install_script_phases().is_empty()
+    }
+
+    /// The lifecycle scripts the registry reports for this version, by
+    /// name and sorted: the ones it lists, or, when it only flags the
+    /// version as having an install script, the install phases its
+    /// manifest names. A version flagged without any is one whose
+    /// `binding.gyp` implies the native build, which runs as `install`.
+    pub fn install_script_phases(&self) -> Vec<&str> {
+        const INSTALL_PHASES: [&str; 3] = ["preinstall", "install", "postinstall"];
+        let mut phases: Vec<&str> = match &self.lifecycle_scripts {
+            Some(listed) if !listed.is_empty() => listed.keys().map(String::as_str).collect(),
+            _ if self.has_install_script == Some(true) => {
+                let named: Vec<&str> = INSTALL_PHASES
+                    .into_iter()
+                    .filter(|phase| {
+                        self.scripts
+                            .as_ref()
+                            .and_then(|scripts| scripts.get(*phase))
+                            .is_some_and(|body| !body.trim().is_empty())
+                    })
+                    .collect();
+                if named.is_empty() {
+                    vec!["install"]
+                } else {
+                    named
+                }
+            }
+            _ => Vec::new(),
+        };
+        phases.sort_unstable();
+        phases
     }
 
     /// Returns the ecosystem, checking both _ecosystem and lpmConfig.ecosystem.
@@ -2571,6 +2598,40 @@ mod tests {
                 .get("ua-parser-js")
                 .map(|meta| meta.optional),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn a_version_the_registry_only_flags_as_scripted_has_an_install_script() {
+        let flagged = VersionMetadata {
+            has_install_script: Some(true),
+            ..Default::default()
+        };
+        assert!(flagged.has_security_issues());
+        assert_eq!(flagged.install_script_phases(), ["install"]);
+
+        let named = VersionMetadata {
+            has_install_script: Some(true),
+            scripts: Some(HashMap::from([
+                ("postinstall".into(), "node setup.js".into()),
+                ("test".into(), "node test.js".into()),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(named.install_script_phases(), ["postinstall"]);
+
+        let listed = VersionMetadata {
+            lifecycle_scripts: Some(HashMap::from([
+                ("preinstall".into(), "node a.js".into()),
+                ("install".into(), "node b.js".into()),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(listed.install_script_phases(), ["install", "preinstall"]);
+        assert!(
+            VersionMetadata::default()
+                .install_script_phases()
+                .is_empty()
         );
     }
 

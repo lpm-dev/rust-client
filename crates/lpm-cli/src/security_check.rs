@@ -619,9 +619,7 @@ fn collect_registry_warnings(
         }
     }
 
-    if let Some(scripts) = &ver_meta.lifecycle_scripts
-        && !scripts.is_empty()
-    {
+    if !ver_meta.install_script_phases().is_empty() {
         counts.insert_lifecycle_scripts(pkg_id);
     }
 }
@@ -1634,6 +1632,18 @@ mod tests {
 
         let ver_meta = lpm_registry::VersionMetadata {
             lifecycle_scripts: Some(scripts),
+            ..Default::default()
+        };
+        let mut counts = SummaryCounts::default();
+        collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
+
+        assert!(counts.lifecycle_scripts.contains("pkg@1.0.0"));
+    }
+
+    #[test]
+    fn registry_warnings_count_a_build_the_registry_only_flags() {
+        let ver_meta = lpm_registry::VersionMetadata {
+            has_install_script: Some(true),
             ..Default::default()
         };
         let mut counts = SummaryCounts::default();
