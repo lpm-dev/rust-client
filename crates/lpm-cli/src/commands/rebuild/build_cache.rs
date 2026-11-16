@@ -787,15 +787,8 @@ fn toolchain_probe_environment(
         "PKG_CONFIG_LIBDIR",
         "PKG_CONFIG_SYSROOT_DIR",
     ];
-    // Node aborts at startup on Windows when it can't find the system
-    // directory to load its random number provider from.
-    const SYSTEM: &[&str] = if cfg!(windows) {
-        &["SystemRoot", "windir"]
-    } else {
-        &[]
-    };
-    let mut probe_environment = HashMap::with_capacity(PASSTHROUGH.len() + SYSTEM.len() + 2);
-    for name in PASSTHROUGH.iter().chain(SYSTEM) {
+    let mut probe_environment = HashMap::with_capacity(PASSTHROUGH.len() + 4);
+    for name in PASSTHROUGH {
         if let Some((key, value)) = trusted_environment
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
@@ -805,6 +798,18 @@ fn toolchain_probe_environment(
     }
     probe_environment.insert("LANG".into(), "C".into());
     probe_environment.insert("LC_ALL".into(), "C".into());
+    // Node aborts at startup on Windows when it can't find the system
+    // directory to load its random number provider from. Windows is asked
+    // where that is, so the variable can't send a probe's libraries
+    // elsewhere.
+    #[cfg(windows)]
+    if let Ok(system) = lpm_common::platform::windows_system_directory()
+        && let Some(windows) = system.parent()
+    {
+        for name in ["SystemRoot", "windir"] {
+            probe_environment.insert(name.into(), windows.as_os_str().to_owned());
+        }
+    }
     probe_environment
 }
 
@@ -2228,17 +2233,25 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_is_told_where_windows_is_and_only_there() {
+    fn a_probe_is_told_where_windows_is_by_windows_alone() {
         let trusted = HashMap::from([
             ("Path".into(), r"C:\Tools".into()),
-            ("SYSTEMROOT".into(), r"C:\Windows".into()),
-            ("windir".into(), r"C:\Windows".into()),
+            ("SYSTEMROOT".into(), r"C:\Elsewhere".into()),
+            ("windir".into(), r"C:\Elsewhere".into()),
         ]);
 
         let probe = toolchain_probe_environment(&trusted);
 
-        let told = ["SYSTEMROOT", "windir"].map(|name| probe.contains_key(OsStr::new(name)));
-        assert_eq!(told, [cfg!(windows); 2]);
+        let told: Vec<_> = probe
+            .iter()
+            .filter(|(name, _)| {
+                ["SystemRoot", "windir"]
+                    .iter()
+                    .any(|known| name.eq_ignore_ascii_case(known))
+            })
+            .collect();
+        assert_eq!(told.len(), if cfg!(windows) { 2 } else { 0 });
+        assert!(told.iter().all(|(_, value)| *value != r"C:\Elsewhere"));
     }
 
     #[test]
