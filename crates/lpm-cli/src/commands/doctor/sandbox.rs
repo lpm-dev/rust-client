@@ -305,6 +305,9 @@ mod tests {
         );
     }
 
+    /// `cfg(unix)`: the home directory is steered through `HOME`, which
+    /// Windows doesn't consult.
+    #[cfg(unix)]
     #[test]
     fn an_lpm_home_inside_a_cache_scripts_can_write_is_reported_with_how_to_move_it() {
         let security = tempfile::tempdir().unwrap();

@@ -430,6 +430,40 @@ mod tests {
     }
 
     #[test]
+    fn a_script_cannot_read_a_keychain_file_in_a_directory_it_can_otherwise_read() {
+        let mut rs = realistic_spec();
+        let dependency = rs.spec.project_dir.join("node_modules").join("dep");
+        std::fs::create_dir_all(&dependency).unwrap();
+        rs.spec.dependency_read_dirs = vec![dependency.clone()];
+        let readable = dependency.join("notes.txt");
+        let keychain = dependency.join("build.keychain-db");
+        std::fs::write(&readable, b"notes").unwrap();
+        std::fs::write(&keychain, b"keychain").unwrap();
+        let sb = new_for_platform(rs.spec, SandboxMode::Enforce).unwrap();
+        let read = |path: &std::path::Path| {
+            let mut cmd = SandboxedCommand::new("/bin/cat")
+                .arg(path)
+                .envs_cleared([("PATH", "/usr/bin:/bin")]);
+            cmd.stdout = SandboxStdio::Null;
+            cmd.stderr = SandboxStdio::Null;
+            sb.spawn(cmd)
+                .expect("spawn")
+                .wait()
+                .expect("wait")
+                .success()
+        };
+
+        assert!(
+            read(&readable),
+            "the dependency's directory must stay readable"
+        );
+        assert!(
+            !read(&keychain),
+            "a keychain file in a readable directory was readable"
+        );
+    }
+
+    #[test]
     fn a_script_cannot_reach_the_keychain() {
         use std::io::BufRead;
 
