@@ -135,7 +135,7 @@ pub(super) fn probe_sandbox_backend_with_global(
                         return Check::warn(
                             &doctor_catalog::SANDBOX_SETUP_REQUIRED,
                             &format!(
-                                "Windows sandbox metadata permissions need administrator setup for {}. Run `lpm doctor sandbox-setup` from your project to preview the grants. Include --tool-dir for protected tool installations, then apply from an administrator terminal for your normal user. Publishing stays unelevated.",
+                                "Windows sandbox metadata permissions need administrator setup for {}. Run `lpm doctor sandbox-setup` from your project to preview the grants. Include --tool-dir for protected tool installations, then apply from an administrator terminal for your normal user. Everything else still runs without elevation.",
                                 missing
                                     .iter()
                                     .map(|path| path.display().to_string())

@@ -134,7 +134,7 @@ const PROFILE_CREATION_MUTEX_NAME: &str = r"Local\LpmSandboxAppContainerProfileC
 pub enum AppContainerError {
     /// A required filesystem permission needs explicit administrator setup.
     #[error(
-        "Windows sandbox permissions are missing for {path}. Preview them with `lpm doctor sandbox-setup`. Apply the preview from an administrator terminal for your normal Windows user, then retry publishing without elevation."
+        "Windows sandbox permissions are missing for {path}. Preview them with `lpm doctor sandbox-setup`. Apply the preview from an administrator terminal for your normal Windows user, then retry without elevation."
     )]
     SetupRequired {
         /// Directory whose metadata is inaccessible to the sandbox.
