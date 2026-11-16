@@ -4066,3 +4066,41 @@ fn a_green_run_whose_inherited_path_names_no_machine_directory_searches_no_empty
         );
     }
 }
+
+#[test]
+fn a_binding_gyp_package_that_names_no_install_script_gets_the_implied_build() {
+    let package = tempfile::tempdir().unwrap();
+    let manifest = package.path().join("package.json");
+    std::fs::write(&manifest, r#"{"name":"native","version":"1.0.0"}"#).unwrap();
+    assert!(read_lifecycle_scripts(&manifest).unwrap().is_none());
+
+    std::fs::write(package.path().join("binding.gyp"), "{}").unwrap();
+
+    assert_eq!(
+        read_lifecycle_scripts(&manifest).unwrap(),
+        Some(HashMap::from([(
+            "install".to_string(),
+            "node-gyp rebuild".to_string()
+        )]))
+    );
+}
+
+#[test]
+fn a_binding_gyp_package_keeps_the_install_script_it_names() {
+    let package = tempfile::tempdir().unwrap();
+    let manifest = package.path().join("package.json");
+    std::fs::write(
+        &manifest,
+        r#"{"name":"native","version":"1.0.0","scripts":{"install":"node-gyp-build"}}"#,
+    )
+    .unwrap();
+    std::fs::write(package.path().join("binding.gyp"), "{}").unwrap();
+
+    assert_eq!(
+        read_lifecycle_scripts(&manifest).unwrap(),
+        Some(HashMap::from([(
+            "install".to_string(),
+            "node-gyp-build".to_string()
+        )]))
+    );
+}

@@ -15,6 +15,7 @@
 //! Supply chain security: SLSA, Sigstore, typosquatting, OSV audit, release age.
 
 pub mod behavioral;
+pub mod native_build;
 pub mod provenance;
 pub mod quality;
 pub mod query;
