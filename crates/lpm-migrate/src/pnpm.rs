@@ -415,7 +415,6 @@ packages:
                 .find(|package| package.name == name)
                 .unwrap()
                 .fetched_from
-                .clone()
         };
         assert_eq!(fetched_from("xlsx"), FetchedFrom::DependencySpec);
         assert_eq!(fetched_from("ms"), FetchedFrom::Registry);

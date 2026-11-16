@@ -61,7 +61,7 @@ impl ConfiguredRegistry {
     }
 
     /// A value an environment variable holds whole may carry a token too.
-    fn from_environment(mut self) -> Self {
+    fn set_by_environment(mut self) -> Self {
         self.expanded = true;
         self
     }
@@ -125,7 +125,7 @@ impl ConfiguredRegistries {
                     expand_yarn,
                     env,
                 )
-                .from_environment(),
+                .set_by_environment(),
             );
         }
         Ok(configured.then_some(registries))
@@ -230,7 +230,7 @@ impl ConfiguredRegistries {
             configured = true;
             registries.default = Some(
                 ConfiguredRegistry::new(&registry, format!("`{variable}`"), expand_bun, env)
-                    .from_environment(),
+                    .set_by_environment(),
             );
         }
         Ok(configured.then_some(registries))

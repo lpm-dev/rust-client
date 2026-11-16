@@ -514,10 +514,12 @@ fn files_containing(root: &std::path::Path, name: &str, content: &[u8]) -> Vec<s
             let path = entry.path();
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(path),
-                Ok(kind) if kind.is_file() && entry.file_name() == name => {
-                    if std::fs::read(&path).is_ok_and(|bytes| bytes == content) {
-                        found.push(path);
-                    }
+                Ok(kind)
+                    if kind.is_file()
+                        && entry.file_name() == name
+                        && std::fs::read(&path).is_ok_and(|bytes| bytes == content) =>
+                {
+                    found.push(path);
                 }
                 _ => {}
             }
