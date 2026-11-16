@@ -35,7 +35,7 @@ fn write_global_trust(
 #[derive(Clone, Copy)]
 pub(super) struct ApprovalProvenanceContext<'a> {
     registry: &'a lpm_registry::RegistryClient,
-    global_root: &'a Path,
+    root: &'a lpm_common::LpmRoot,
     verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
     runtime_enforce: crate::provenance_fetch::EnforceMode,
     json_output: bool,
@@ -44,24 +44,26 @@ pub(super) struct ApprovalProvenanceContext<'a> {
 impl<'a> ApprovalProvenanceContext<'a> {
     pub(super) fn new(
         registry: &'a lpm_registry::RegistryClient,
-        global_root: &'a Path,
+        root: &'a lpm_common::LpmRoot,
         verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
         runtime_enforce: crate::provenance_fetch::EnforceMode,
         json_output: bool,
     ) -> Self {
         Self {
             registry,
-            global_root,
+            root,
             verify_policy,
             runtime_enforce,
             json_output,
         }
     }
 
-    /// Reads the provenance of `artifacts` from the registries a global
-    /// install resolves them from. The global root's `.npmrc` is read
-    /// here and not before, so a run that fetches nothing, such as a dry
-    /// run, doesn't depend on it.
+    /// Reads the provenance of those of `artifacts` a registry can speak
+    /// for: the ones a global install's lockfile records from the
+    /// registry a global install resolves them from now. The global
+    /// root's `.npmrc` and the lockfiles are read here and not before, so
+    /// a run that fetches nothing, such as a dry run, doesn't depend on
+    /// them.
     async fn fetch(
         &self,
         artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
@@ -69,14 +71,26 @@ impl<'a> ApprovalProvenanceContext<'a> {
     {
         let registries = install_registries(
             self.registry,
-            self.global_root,
+            &self.root.global_root(),
             artifacts.iter().map(|artifact| artifact.0.as_str()),
             self.json_output,
         )?;
+        let lockfiles: Vec<lpm_lockfile::Lockfile> =
+            crate::global_blocked_set::install_roots(self.root)?
+                .iter()
+                .filter_map(|install| lpm_lockfile::Lockfile::read_for_project(install).ok())
+                .map(|project| project.lockfile)
+                .collect();
+        let recorded = recorded_registries(
+            artifacts.iter().cloned().collect(),
+            lockfiles.iter().flat_map(|lockfile| &lockfile.packages),
+        );
+        let vouched =
+            installed_from_their_registry(&registries, &recorded, artifacts.iter().cloned());
         Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
             &registries.client,
             &registries.route_table,
-            artifacts,
+            &vouched,
             self.verify_policy,
         )
         .await)
@@ -222,10 +236,9 @@ async fn run_global_under_store_lock(
 
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
-    let global_root = root.global_root();
     let provenance = ApprovalProvenanceContext::new(
         registry,
-        &global_root,
+        &root,
         &verify_policy,
         runtime_enforce,
         json_output,

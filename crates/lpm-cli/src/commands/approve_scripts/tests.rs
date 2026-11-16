@@ -2577,7 +2577,7 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &std::env::temp_dir(),
+            &root,
             &policy,
             EnforceMode::Deny,
             true,
@@ -2654,7 +2654,7 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &std::env::temp_dir(),
+            &root,
             &policy,
             EnforceMode::Deny,
             true,
@@ -2689,7 +2689,7 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &std::env::temp_dir(),
+            &root,
             &policy,
             EnforceMode::Deny,
             true,
@@ -2715,7 +2715,7 @@ async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
         false,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &std::env::temp_dir(),
+            &root,
             &policy,
             EnforceMode::Deny,
             true,
@@ -2747,13 +2747,7 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
         &root,
         &row_refs,
         false,
-        ApprovalProvenanceContext::new(
-            &registry,
-            &std::env::temp_dir(),
-            &policy,
-            EnforceMode::Deny,
-            true,
-        ),
+        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
     )
     .await
     .unwrap();
@@ -3067,6 +3061,96 @@ async fn provenance_capture_asks_only_the_registry_an_npmrc_names_for_a_scope() 
     assert_eq!(requests_to(&lpm).await, 0);
 }
 
+/// A global install of `eslint` whose lockfile records `esbuild` from
+/// `source`, and which blocks its script.
+fn seed_global_install_locking(root: &lpm_common::LpmRoot, source: &str) -> AggregateBlockedRow {
+    let mut blocked = row("esbuild", "0.25.1", &["eslint"]);
+    blocked.integrity = Some(
+        lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha512,
+            b"esbuild archive",
+        )
+        .to_string(),
+    );
+    seed_global_manifest_with_blocked(root, "eslint", "9.0.0", vec![blocked.clone()]);
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    let instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &blocked.name,
+        &blocked.version,
+        source,
+        "root",
+    ));
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: blocked.name.clone(),
+        version: blocked.version.clone(),
+        source: Some(source.into()),
+        integrity: blocked.integrity.clone(),
+        instance_id,
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        blocked.name.clone(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id,
+            package: blocked.name.clone(),
+            version: blocked.version.clone(),
+            source: Some(source.into()),
+        },
+    );
+    lockfile
+        .write_all(&root.global_root().join("installs/eslint@9.0.0/lpm.lock"))
+        .unwrap();
+    blocked
+}
+
+#[tokio::test]
+async fn a_global_approval_asks_the_registry_its_install_got_the_package_from() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let npm = registry_publishing("esbuild").await;
+    let registry = unreachable_registry().with_npm_registry_url(npm.uri());
+    let blocked = seed_global_install_locking(&root, &format!("registry+{}", npm.uri()));
+    let policy = deny_verify_policy();
+
+    // The registry in this test publishes other bytes under the name, so
+    // what the approval then decides is not what is being tested.
+    let _ = global::commit_global_approval_batch(
+        &root,
+        &[&blocked],
+        false,
+        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+    )
+    .await;
+
+    assert_eq!(requests_to(&npm).await, 1);
+}
+
+#[tokio::test]
+async fn a_global_approval_asks_no_registry_about_a_package_installed_from_elsewhere() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let npm = registry_publishing("esbuild").await;
+    let registry = unreachable_registry().with_npm_registry_url(npm.uri());
+    let blocked =
+        seed_global_install_locking(&root, "tarball+https://example.test/esbuild-0.25.1.tgz");
+    let policy = deny_verify_policy();
+
+    global::commit_global_approval_batch(
+        &root,
+        &[&blocked],
+        false,
+        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(requests_to(&npm).await, 0);
+    let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+    assert!(trust.trusted.contains_key("esbuild@0.25.1"));
+}
+
 /// Named-package approval writes exactly ONE entry to the trust
 /// file, leaving other rows unapproved.
 #[tokio::test]
@@ -3090,7 +3174,7 @@ async fn run_global_named_approves_only_the_matched_row() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &std::env::temp_dir(),
+            &root,
             &policy,
             EnforceMode::Deny,
             true,
@@ -3122,7 +3206,7 @@ async fn run_global_named_errors_for_unknown_package() {
         true,
         ApprovalProvenanceContext::new(
             &unreachable_registry(),
-            &std::env::temp_dir(),
+            &root,
             &policy,
             EnforceMode::Deny,
             true,
@@ -3390,7 +3474,7 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             true,
             ApprovalProvenanceContext::new(
                 &unreachable_registry(),
-                &std::env::temp_dir(),
+                &root,
                 &policy,
                 EnforceMode::Deny,
                 true,
@@ -3409,7 +3493,7 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             true,
             ApprovalProvenanceContext::new(
                 &unreachable_registry(),
-                &std::env::temp_dir(),
+                &root,
                 &policy,
                 EnforceMode::Deny,
                 true,

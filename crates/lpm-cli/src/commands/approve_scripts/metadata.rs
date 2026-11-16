@@ -235,20 +235,7 @@ impl ProjectProvenance {
         packages: impl Iterator<Item = crate::provenance_fetch::ProvenanceArtifactKey>,
         policy: &crate::provenance_fetch::VerifyPolicy,
     ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
-        let vouched: Vec<_> = packages
-            .filter(|package| {
-                self.recorded.get(package).is_some_and(|recorded| {
-                    same_registry(
-                        recorded,
-                        &crate::commands::install::registry_source_url_for(
-                            &package.0,
-                            &self.registries.route_table,
-                            &self.registries.client,
-                        ),
-                    )
-                })
-            })
-            .collect();
+        let vouched = installed_from_their_registry(&self.registries, &self.recorded, packages);
         crate::provenance_fetch::fetch_provenance_for_artifacts(
             &self.registries.client,
             &self.registries.route_table,
@@ -259,23 +246,62 @@ impl ProjectProvenance {
     }
 }
 
+/// Those of `packages` that `registries` still sends to the registry
+/// `recorded` says they were installed from.
+pub(super) fn installed_from_their_registry(
+    registries: &crate::commands::registry_reads::RoutedReadContext,
+    recorded: &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    packages: impl Iterator<Item = crate::provenance_fetch::ProvenanceArtifactKey>,
+) -> Vec<crate::provenance_fetch::ProvenanceArtifactKey> {
+    packages
+        .filter(|package| {
+            recorded.get(package).is_some_and(|recorded| {
+                same_registry(
+                    recorded,
+                    &crate::commands::install::registry_source_url_for(
+                        &package.0,
+                        &registries.route_table,
+                        &registries.client,
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 /// The registry each of `candidates` was installed from, as the lockfile
 /// `rows` record it. A package installed from a tarball, a git repository
 /// or a directory has none: a registry that publishes something under the
-/// same name and version says nothing about it.
+/// same name and version says nothing about it. Nor has one that rows
+/// record from two registries, as two global installs can.
 pub(super) fn recorded_registries<'a>(
     candidates: std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
     rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
 ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String> {
-    rows.filter_map(|row| {
-        let registry = match row.source_kind() {
-            Some(Ok(lpm_lockfile::Source::Registry { url })) => url,
-            _ => return None,
-        };
+    let mut recorded = HashMap::new();
+    let mut disputed = std::collections::HashSet::new();
+    for row in rows {
         let key = (row.name.clone(), row.version.clone(), row.integrity.clone());
-        candidates.contains(&key).then_some((key, registry))
-    })
-    .collect()
+        if !candidates.contains(&key) {
+            continue;
+        }
+        let Some(Ok(lpm_lockfile::Source::Registry { url })) = row.source_kind() else {
+            disputed.insert(key);
+            continue;
+        };
+        match recorded.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(url);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if !same_registry(entry.get(), &url) {
+                    disputed.insert(entry.key().clone());
+                }
+            }
+        }
+    }
+    recorded.retain(|key, _| !disputed.contains(key));
+    recorded
 }
 
 /// Whether two registry URLs name one registry. A package is asked about

@@ -123,6 +123,17 @@ pub fn aggregate_blocked_across_globals(root: &LpmRoot) -> Result<AggregateBlock
     Ok(aggregate_with_manifest_and_trust(root, &manifest, &trusted))
 }
 
+/// The install roots [`aggregate_blocked_across_globals`] reads: one for
+/// each globally-installed package that isn't a link to a local folder.
+pub fn install_roots(root: &LpmRoot) -> Result<Vec<PathBuf>, LpmError> {
+    Ok(read_global_manifest_or_empty(root)?
+        .packages
+        .values()
+        .filter(|entry| entry.source != lpm_global::PackageSource::LocalLink)
+        .map(|entry| root.global_root().join(&entry.root))
+        .collect())
+}
+
 /// Lower-level helper exposed for testing: the caller supplies the
 /// manifest + trust snapshot directly, so the test doesn't have to
 /// materialize a real `~/.lpm/global/` tree.
