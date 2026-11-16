@@ -252,8 +252,14 @@ pub(super) mod tests {
 
         let text = std::fs::read_to_string(&command.shim).unwrap();
         assert!(text.contains("node-gyp 11.2.0rm-rf,"), "{text}");
-        assert!(text.contains(&*found.script.to_string_lossy()), "{text}");
-        assert_eq!(text.lines().count(), 3, "{text}");
+        let script = found.script.to_string_lossy();
+        if cfg!(windows) {
+            assert!(!text.contains(&*script), "{text}");
+            assert!(text.contains("\"%npm_config_node_gyp%\" %*"), "{text}");
+        } else {
+            assert!(text.contains(&*script), "{text}");
+            assert_eq!(text.lines().count(), 3, "{text}");
+        }
         assert_eq!(command.name, "node-gyp");
         assert_eq!(command.target, found.script);
     }
