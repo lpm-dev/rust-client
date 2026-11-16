@@ -579,7 +579,24 @@ fn saved_inheritance(path: &std::path::Path) -> String {
         .rev()
         .find_map(|line| line.trim().strip_prefix("D:"))
         .unwrap_or_else(|| panic!("no permissions were saved for {}", path.display()));
-    descriptor.split('(').next().unwrap_or_default().to_owned()
+    dacl_inheritance(descriptor).to_owned()
+}
+
+/// The flags that open the DACL part of saved permissions, given what
+/// follows `D:`. They end at the first entry, or at the `S:` part when
+/// the DACL has no entries.
+fn dacl_inheritance(descriptor: &str) -> &str {
+    let flags = descriptor.split('(').next().unwrap_or_default();
+    flags.split("S:").next().unwrap_or_default()
+}
+
+#[test]
+fn the_saved_inheritance_is_read_from_the_dacl_part_alone() {
+    assert_eq!(dacl_inheritance("AI(A;ID;FA;;;SY)(A;;FA;;;BA)"), "AI");
+    assert_eq!(dacl_inheritance("PAI(A;;FA;;;BA)S:AI(ML;;NW;;;LW)"), "PAI");
+    assert_eq!(dacl_inheritance("(A;;FA;;;BA)"), "");
+    assert_eq!(dacl_inheritance("AIS:(AU;SA;FA;;;WD)"), "AI");
+    assert_eq!(dacl_inheritance("S:(AU;SA;FA;;;WD)"), "");
 }
 
 /// What `icacls /save` writes for `path`: its name, then its permissions.
@@ -691,7 +708,7 @@ fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
         .arg(&secret)
         .args([
             "--",
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            POWERSHELL,
             "-NoProfile",
             "-NonInteractive",
             "-Command",
