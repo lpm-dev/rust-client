@@ -1635,6 +1635,7 @@ async fn run_with_options_under_store_lock(
         install_provenance_status_map,
         verified_provenance_for_lockfile,
         fresh_urls,
+        proven_pins,
     } = match deferred_engine_check {
         // A mismatch fails the install without waiting for the downloads.
         Some(check) => {
@@ -2014,6 +2015,7 @@ async fn run_with_options_under_store_lock(
         frozen_lockfile_active,
         fast_path_lockfile,
         fresh_urls: &fresh_urls,
+        proven_pins: &proven_pins,
         obsolete_binary_lockfile,
         json_output,
     })?;

@@ -529,6 +529,62 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) verified_provenance_for_lockfile:
         std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
     pub(super) fresh_urls: HashMap<String, String>,
+    pub(super) proven_pins: HashMap<String, ProvenPin>,
+}
+
+/// An integrity in a hash the store doesn't keep objects under, and the
+/// sha512 of the bytes a fetch checked against it.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ProvenPin {
+    pub(super) pin: String,
+    pub(super) sha512: String,
+}
+
+/// The weaker integrities this install's fetches proved, by package key.
+/// A fetch checks the bytes against the integrity its package carries
+/// before it stores them, so the sha512 in `fetched` names the same bytes.
+///
+/// One fetch serves every package that shares a key. Where those packages
+/// carry different integrities, only one was checked and nothing says
+/// which, so the key is left out.
+pub(super) fn proven_weaker_pins(
+    packages: &[InstallPackage],
+    fetched: &HashMap<String, String>,
+) -> HashMap<String, ProvenPin> {
+    let mut proven = HashMap::new();
+    if fetched.is_empty() {
+        return proven;
+    }
+    for package in packages {
+        let Some(pin) = package.integrity.as_deref() else {
+            continue;
+        };
+        if names_stored_object(pin) {
+            continue;
+        }
+        let key = install_pkg_key(package);
+        if let Some(sha512) = fetched.get(&key)
+            && names_stored_object(sha512)
+        {
+            proven.entry(key).or_insert_with(|| ProvenPin {
+                pin: pin.to_owned(),
+                sha512: sha512.clone(),
+            });
+        }
+    }
+    if proven.is_empty() {
+        return proven;
+    }
+    for package in packages {
+        let key = install_pkg_key(package);
+        if proven
+            .get(&key)
+            .is_some_and(|proven| package.integrity.as_deref() != Some(proven.pin.as_str()))
+        {
+            proven.remove(&key);
+        }
+    }
+    proven
 }
 
 fn provenance_lockfile_id(package: &InstallPackage) -> Result<String, LpmError> {
@@ -2532,6 +2588,7 @@ pub(super) async fn run_online_fetch_phase(
             }
         }
     };
+    let proven_pins = proven_weaker_pins(&packages_for_lockfile, &integrity_map);
     apply_fetch_writebacks(&mut packages);
     apply_fetch_writebacks(&mut packages_for_lockfile);
 
@@ -2592,6 +2649,7 @@ pub(super) async fn run_online_fetch_phase(
         install_provenance_status_map,
         verified_provenance_for_lockfile,
         fresh_urls,
+        proven_pins,
     })
 }
 
