@@ -254,6 +254,20 @@ pub fn compare_sri(left: &str, right: &str) -> SriComparison {
     }
 }
 
+/// Whether two SRI strings name different bytes. Hashes of different
+/// algorithms say nothing about each other, so they never contradict; a
+/// string that names no hash at all is compared as written.
+pub fn contradict(left: &str, right: &str) -> bool {
+    match compare_sri(left, right) {
+        SriComparison::Disagree => true,
+        SriComparison::Agree => false,
+        SriComparison::NoCommonAlgorithm => {
+            (sri_hashes(left).next().is_none() || sri_hashes(right).next().is_none())
+                && left != right
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +456,18 @@ mod tests {
         let serialized = original.to_string();
         let parsed = Integrity::parse(&serialized).unwrap();
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn only_two_hashes_of_one_algorithm_can_contradict() {
+        let sha512 = |data: &[u8]| Integrity::from_bytes(HashAlgorithm::Sha512, data).to_string();
+        let sha1 = |data: &[u8]| Integrity::from_bytes(HashAlgorithm::Sha1, data).to_string();
+
+        assert!(!contradict(&sha512(b"archive"), &sha512(b"archive")));
+        assert!(contradict(&sha512(b"archive"), &sha512(b"another")));
+        assert!(!contradict(&sha512(b"archive"), &sha1(b"archive")));
+        assert!(!contradict(&sha512(b"archive"), &sha1(b"another")));
+        assert!(contradict("sha512-one", "sha512-two"));
+        assert!(!contradict("sha512-one", "sha512-one"));
     }
 }

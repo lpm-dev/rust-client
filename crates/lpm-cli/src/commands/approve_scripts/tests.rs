@@ -2883,6 +2883,60 @@ async fn provenance_capture_asks_the_public_registry_about_a_public_package() {
 }
 
 #[tokio::test]
+async fn a_registry_that_lists_only_a_sha1_does_not_refuse_an_artifact_known_by_its_sha512() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let archive = b"native-addon archive";
+    let sha512 = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha512,
+        archive,
+    )
+    .to_string();
+    let sha1 = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha1,
+        archive,
+    );
+    let mut blocked = make_blocked("native-addon", "1.0.0");
+    blocked.integrity = Some(sha512);
+    let npm = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/native-addon"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "native-addon",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "native-addon",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/native-addon/-/native-addon-1.0.0.tgz", npm.uri()),
+                            "shasum": hex::encode(&sha1.hash),
+                        },
+                    },
+                },
+            })),
+        )
+        .mount(&npm)
+        .await;
+    let registry = unreachable_registry().with_npm_registry_url(npm.uri());
+
+    let provenance = fetch_provenance_for_effective_set(
+        &registry,
+        &direct_routes(),
+        &[blocked],
+        &deny_verify_policy(),
+    )
+    .await;
+
+    assert_eq!(
+        provenance.values().collect::<Vec<_>>(),
+        [&ProvenanceStatus::Absent],
+        "a sha1 and a sha512 can't contradict each other",
+    );
+}
+
+#[tokio::test]
 async fn an_attestation_a_configured_registry_does_not_serve_is_no_reason_to_refuse() {
     let tmp = tempdir().unwrap();
     let _env = scoped_lpm_home_with_security(tmp.path());

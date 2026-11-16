@@ -1034,7 +1034,7 @@ pub async fn fetch_provenance_for_artifacts(
                     .map(std::borrow::Cow::into_owned);
             if let (Some(expected), Some(registry_value)) =
                 (expected_integrity.as_deref(), registry_integrity.as_deref())
-                && expected != registry_value
+                && lpm_common::integrity::contradict(expected, registry_value)
             {
                 return (
                     artifact_key(),
