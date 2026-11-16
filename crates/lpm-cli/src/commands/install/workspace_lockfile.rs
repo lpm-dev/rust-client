@@ -14,6 +14,10 @@ pub(super) struct WorkspaceLockfileCoordinator {
     existing: Option<lpm_lockfile::ValidatedLockfile>,
     migration_pending: bool,
     exact_graph_migration_pending: bool,
+    /// Whether the root lockfile is one `lpm migrate` wrote, whose recorded
+    /// integrities every member's install must be checked against before a
+    /// new lockfile replaces it.
+    migrated_lockfile: bool,
     valid_importers: BTreeSet<String>,
     existing_projection_metadata: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     projection_content: Mutex<BTreeMap<String, (u64, Arc<str>)>>,
@@ -41,6 +45,10 @@ impl WorkspaceLockfileCoordinator {
         } else {
             None
         };
+        let migrated_lockfile = root_lockfile.as_ref().is_some_and(|lockfile| {
+            lockfile.as_lockfile().metadata.resolved_with.as_deref()
+                == Some(lpm_migrate::MIGRATED_LOCKFILE_RESOLVER)
+        });
         let exact_graph_migration_pending = root_lockfile.as_ref().is_some_and(|lockfile| {
             lockfile.as_lockfile().metadata.lockfile_version
                 < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
@@ -114,6 +122,7 @@ impl WorkspaceLockfileCoordinator {
             existing,
             migration_pending,
             exact_graph_migration_pending,
+            migrated_lockfile,
             valid_importers,
             existing_projection_metadata: Mutex::new(BTreeMap::new()),
             projection_content: Mutex::new(BTreeMap::new()),
@@ -330,6 +339,20 @@ impl WorkspaceLockfileCoordinator {
                     "workspace importer {importer:?} completed without producing a lockfile projection"
                 )));
             }
+        }
+        if self.migrated_lockfile
+            && !staged.is_empty()
+            && let Some(importer) = self.valid_importers.iter().find(|importer| {
+                !staged.contains_key(*importer) && !non_persisting_importers.contains(*importer)
+            })
+        {
+            return Err(LpmError::Registry(format!(
+                "{} was written by `lpm migrate`, and this install doesn't cover workspace \
+                 importer {importer:?}, so replacing the lockfile now would drop the integrities \
+                 recorded for it before it's checked. Run `lpm install --recursive` from the \
+                 workspace root. No lockfile changes were committed.",
+                self.root.join(lpm_lockfile::LOCKFILE_NAME).display()
+            )));
         }
         if self.exact_graph_migration_pending
             && let Some(existing) = &self.existing
@@ -1403,6 +1426,63 @@ mod tests {
         coordinator.stage(".", staged.clone());
 
         assert_eq!(coordinator.projection(".").unwrap(), staged);
+    }
+
+    fn migrated_workspace(directory: &std::path::Path) -> WorkspaceLockfileCoordinator {
+        let (lockfile, _) =
+            lpm_migrate::normalize::to_lockfile(vec![lpm_migrate::MigratedPackage {
+                lockfile_key: None,
+                name: "corp-utils".to_owned(),
+                version: "1.0.0".to_owned(),
+                resolved: Some(
+                    "https://registry.npmjs.org/corp-utils/-/corp-utils-1.0.0.tgz".to_owned(),
+                ),
+                integrity: None,
+                dependencies: Vec::new(),
+                is_optional: false,
+                is_dev: false,
+                published_as: None,
+                fetched_from: lpm_migrate::FetchedFrom::Registry,
+            }])
+            .unwrap();
+        lockfile
+            .write_all(&directory.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        WorkspaceLockfileCoordinator::new(
+            directory,
+            &[("packages/app".to_owned(), directory.join("packages/app"))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_commit_that_stages_nothing_leaves_a_migrated_lockfile_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = migrated_workspace(directory.path());
+        assert!(!coordinator.commit(&[]).unwrap());
+    }
+
+    #[test]
+    fn a_commit_that_skips_a_member_does_not_replace_a_migrated_lockfile() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = migrated_workspace(directory.path());
+        coordinator.stage(
+            ".",
+            lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion"),
+        );
+        let error = coordinator
+            .commit(&[".".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("packages/app") && error.contains("--recursive"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_to_string(directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+                .unwrap()
+                .contains("resolved-with = \"migrate\"")
+        );
     }
 
     #[test]

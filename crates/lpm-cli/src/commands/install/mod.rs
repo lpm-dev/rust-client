@@ -35,6 +35,7 @@ mod github_source;
 mod gitignore;
 mod lifecycle;
 mod linking;
+mod locked_integrity;
 mod lockfile;
 mod manifest;
 mod package;
@@ -377,6 +378,28 @@ pub(crate) async fn run_silent_for_audit_fix(
     .await
 }
 
+/// What a caller requires of the packages an install resolves, checked
+/// after resolution and before anything is linked.
+#[derive(Default)]
+pub(crate) struct InstallExpectations {
+    root: Option<ExpectedInstallRoot>,
+    locked_integrities: Option<Arc<LockedIntegrities>>,
+}
+
+impl InstallExpectations {
+    /// Whether tarballs wait for the checks that run after resolution
+    /// instead of downloading while it runs: policy extensions judge each
+    /// package first, and a recorded integrity may replace the one a fetch
+    /// verifies.
+    fn hold_tarball_prefetch(
+        &self,
+        policy_extension_configs: &[policy_extensions::PolicyExtensionConfig],
+    ) -> bool {
+        policy_extensions_disable_tarball_prefetch(policy_extension_configs)
+            || self.locked_integrities.is_some()
+    }
+}
+
 pub(crate) struct ExpectedInstallRoot {
     pub(crate) name: String,
     pub(crate) version: String,
@@ -384,10 +407,14 @@ pub(crate) struct ExpectedInstallRoot {
     pub(crate) integrity: Option<String>,
 }
 
+pub(crate) use locked_integrity::LockedIntegrities;
+pub(crate) use source_resolution::load_install_route_table;
+
 pub(crate) struct InstallCallerContext<'a> {
     pub(crate) route_table: RouteTable,
     pub(crate) policy_project_dir: Option<&'a Path>,
     pub(crate) expected_root: Option<ExpectedInstallRoot>,
+    pub(crate) locked_integrities: Option<Arc<LockedIntegrities>>,
 }
 
 impl From<RouteTable> for InstallCallerContext<'_> {
@@ -396,6 +423,7 @@ impl From<RouteTable> for InstallCallerContext<'_> {
             route_table,
             policy_project_dir: None,
             expected_root: None,
+            locked_integrities: None,
         }
     }
 }
@@ -444,12 +472,36 @@ pub(crate) async fn run_with_options_with_lpm_root(
         .as_ref()
         .and_then(|context| context.policy_project_dir)
         .unwrap_or(project_dir);
-    let (preloaded_route_table, expected_root) = caller_context
-        .map(|context| (Some(context.route_table), context.expected_root))
+    let (preloaded_route_table, mut expectations) = caller_context
+        .map(|context| {
+            (
+                Some(context.route_table),
+                InstallExpectations {
+                    root: context.expected_root,
+                    locked_integrities: context.locked_integrities,
+                },
+            )
+        })
         .unwrap_or_default();
-    let transaction_root = lpm_workspace::find_workspace_root(project_dir)
-        .map_err(|error| LpmError::Workspace(error.to_string()))?
+    let workspace_root = lpm_workspace::find_workspace_root(project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    let transaction_root = workspace_root
+        .clone()
         .unwrap_or_else(|| project_dir.to_path_buf());
+    if expectations.locked_integrities.is_none() {
+        expectations.locked_integrities = LockedIntegrities::detect(&transaction_root)?;
+        // A workspace install that carries the integrities in installs every
+        // member; one that finds them itself covers only part of the
+        // workspace and couldn't replace the lockfile without dropping them.
+        if expectations.locked_integrities.is_some() && workspace_root.is_some() {
+            return Err(LpmError::Registry(format!(
+                "{} was written by `lpm migrate`, and every workspace member must be checked \
+                 against the integrities it recorded before it's replaced. Run `lpm install` \
+                 from the workspace root, which installs every member.",
+                transaction_root.join(lpm_lockfile::LOCKFILE_NAME).display()
+            )));
+        }
+    }
     crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;
     workspace_project_state::sweep_stale_rollback_dirs(project_dir);
@@ -486,7 +538,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             client,
             project_dir,
             policy_project_dir,
-            expected_root.as_ref(),
+            &expectations,
             json_output,
             offline,
             frozen_lockfile,
@@ -549,7 +601,7 @@ async fn run_with_options_under_store_lock(
     client: &RegistryClient,
     project_dir: &Path,
     policy_project_dir: &Path,
-    expected_root: Option<&ExpectedInstallRoot>,
+    expectations: &InstallExpectations,
     json_output: bool,
     offline: bool,
     frozen_lockfile: FrozenLockfileMode,
@@ -1139,8 +1191,9 @@ async fn run_with_options_under_store_lock(
     let project_needs_virtual_store_migration =
         store_v2_handle.is_some() && needs_virtual_store_migration(project_dir);
 
-    let experimental_resolver_requested =
-        experimental_resolver::enabled() && policy_project_dir == project_dir;
+    let experimental_resolver_requested = experimental_resolver::enabled()
+        && policy_project_dir == project_dir
+        && expectations.locked_integrities.is_none();
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
         let script_policy_cfg =
             crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
@@ -1230,6 +1283,7 @@ async fn run_with_options_under_store_lock(
             &v2_workspace_root_pre_resolve.optional_registry_roots,
             &v2_workspace_root_pre_resolve.promoted_git_root_names,
             auto_install_peers,
+            None,
         )
         .await?;
 
@@ -1340,7 +1394,8 @@ async fn run_with_options_under_store_lock(
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
         npm_firewall_chunk_size,
-        policy_extension_configs: &policy_extension_configs,
+        locked_integrities: expectations.locked_integrities.as_deref(),
+        tarball_prefetch_held: expectations.hold_tarball_prefetch(&policy_extension_configs),
         force,
         offline,
         omit_policy,
@@ -1363,7 +1418,7 @@ async fn run_with_options_under_store_lock(
     .await;
     workspace_resolution::finish_resolution();
     let OnlineResolutionPhaseResult {
-        packages,
+        mut packages,
         packages_for_lockfile,
         resolve_ms,
         used_lockfile,
@@ -1396,7 +1451,17 @@ async fn run_with_options_under_store_lock(
         current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
     }
 
-    if let Some(expected) = expected_root {
+    // Registry signatures cover the integrity the registry published, which
+    // a recorded integrity may replace below for the fetch to verify.
+    let packages_as_published = (verify_registry_signatures
+        && expectations.locked_integrities.is_some())
+    .then(|| packages.clone());
+    let published_integrities = expectations
+        .locked_integrities
+        .as_ref()
+        .map(|locked| locked.apply(&mut packages, &packages_for_lockfile))
+        .transpose()?;
+    if let Some(expected) = &expectations.root {
         let matches = packages.iter().any(|package| {
             package.is_direct
                 && package.name == expected.name
@@ -1485,7 +1550,7 @@ async fn run_with_options_under_store_lock(
         enforce_registry_signature_policy(
             Arc::clone(&arc_client),
             &route_table,
-            &packages,
+            packages_as_published.as_deref().unwrap_or(&packages),
             json_output,
             true,
             registry_signature_timings.clone(),
@@ -1549,7 +1614,7 @@ async fn run_with_options_under_store_lock(
     });
     let OnlineFetchPhaseResult {
         packages,
-        packages_for_lockfile,
+        mut packages_for_lockfile,
         link_targets,
         event_driven_link,
         event_link_handles,
@@ -1581,6 +1646,9 @@ async fn run_with_options_under_store_lock(
         }
         None => fetch_phase.await?,
     };
+    if let Some(published) = &published_integrities {
+        published.restore(&mut packages_for_lockfile);
+    }
 
     if used_lockfile && strict_peer_dependencies {
         enforce_replayed_peer_dependencies(

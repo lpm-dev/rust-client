@@ -7,7 +7,8 @@
 //! 2. Build a specifier→version map, then resolve each dependency range to an exact version.
 
 use crate::{
-    BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, read_lockfile_snapshot,
+    BoundedMap, FetchedFrom, MAX_PACKAGES, MigratedPackage, enforce_package_limit,
+    read_lockfile_snapshot,
 };
 use lpm_common::LpmError;
 use std::collections::HashMap;
@@ -73,14 +74,17 @@ fn parse_berry_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         let resolution = mapping_string(entry, "resolution");
         let mut deps_with_ranges = extract_berry_deps(entry, "dependencies");
         deps_with_ranges.extend(extract_berry_deps(entry, "optionalDependencies"));
+        let (published_as, fetched_from, resolved) = berry_resolution(&name, resolution.as_deref());
 
         entries.push(YarnEntry {
             specifiers: split_descriptor_list(descriptor_key),
             name,
             version,
-            resolved: unsupported_berry_resolution(resolution.as_deref()),
+            resolved,
             integrity: None,
             deps_with_ranges,
+            published_as,
+            fetched_from,
         });
     }
 
@@ -121,6 +125,8 @@ fn resolve_entries(entries: Vec<YarnEntry>) -> Vec<MigratedPackage> {
                 dependencies,
                 is_optional: false,
                 is_dev: false,
+                published_as: entry.published_as,
+                fetched_from: entry.fetched_from,
             }
         })
         .collect();
@@ -128,7 +134,7 @@ fn resolve_entries(entries: Vec<YarnEntry>) -> Vec<MigratedPackage> {
     packages
 }
 
-fn is_berry_lockfile(content: &str) -> bool {
+pub(crate) fn is_berry_lockfile(content: &str) -> bool {
     content.lines().any(|line| line.trim() == "__metadata:")
 }
 
@@ -209,6 +215,11 @@ struct YarnEntry {
     integrity: Option<String>,
     /// Dependencies as (name, range) — ranges not yet resolved.
     deps_with_ranges: Vec<(String, String)>,
+    /// The name the package is published under, when an `npm:` alias
+    /// installs it as `name`.
+    published_as: Option<String>,
+    /// Where Yarn fetched the package from.
+    fetched_from: FetchedFrom,
 }
 
 /// Parser states for the line-by-line state machine.
@@ -308,8 +319,15 @@ fn extract_berry_deps(entry: &serde_yaml::Mapping, field: &str) -> Vec<(String, 
     out
 }
 
-fn unsupported_berry_resolution(resolution: Option<&str>) -> Option<String> {
-    let (_, reference) = split_yarn_descriptor(resolution?)?;
+/// The name Yarn Berry's `resolution` locator publishes a package under,
+/// when it isn't `name`; where Yarn fetched it from; and the URL the locator
+/// records: a tarball URL, the archive URL a registry package carries when
+/// its registry serves tarballs outside the npm layout, or an unsupported
+/// reference for normalization to skip.
+fn berry_resolution(
+    name: &str,
+    resolution: Option<&str>,
+) -> (Option<String>, FetchedFrom, Option<String>) {
     const UNSUPPORTED_PREFIXES: &[&str] = &[
         "exec:",
         "file:",
@@ -321,11 +339,80 @@ fn unsupported_berry_resolution(resolution: Option<&str>) -> Option<String> {
         "portal:",
         "workspace:",
     ];
-
-    UNSUPPORTED_PREFIXES
+    let Some((locator_name, reference)) = resolution.and_then(split_yarn_descriptor) else {
+        return (None, FetchedFrom::Registry, None);
+    };
+    let published_as = (locator_name != name).then(|| locator_name.to_owned());
+    if UNSUPPORTED_PREFIXES
         .iter()
         .any(|prefix| reference.starts_with(prefix))
-        .then(|| reference.to_owned())
+    {
+        return (
+            published_as,
+            FetchedFrom::Registry,
+            Some(reference.to_owned()),
+        );
+    }
+    if reference.starts_with("https://") || reference.starts_with("http://") {
+        return (
+            published_as,
+            FetchedFrom::DependencySpec,
+            Some(reference.to_owned()),
+        );
+    }
+    let archive_url = reference.split_once("::").and_then(|(_, parameters)| {
+        url::form_urlencoded::parse(parameters.as_bytes())
+            .find(|(key, _)| key == "__archiveUrl")
+            .map(|(_, url)| url.into_owned())
+    });
+    (published_as, FetchedFrom::Registry, archive_url)
+}
+
+/// The name Yarn v1 records a package as published under, when an `npm:`
+/// alias installs it as `name`, and where Yarn fetched it from, by the
+/// specifiers its entry resolves. A registry specifier, or an `npm:` alias,
+/// wins over a tarball URL or Git specifier.
+fn v1_fetched_from(name: &str, specifiers: &[String]) -> (Option<String>, FetchedFrom) {
+    let registry_target = specifiers.iter().find_map(|specifier| {
+        let (_, range) = split_yarn_descriptor(specifier)?;
+        if let Some(target) = range.strip_prefix("npm:") {
+            // Yarn v1 reads everything after `npm:` as `<name>[@<range>]`;
+            // only a bare range names no other package.
+            let is_range = lpm_semver::VersionReq::parse(target).is_ok();
+            return Some(if is_range {
+                name
+            } else {
+                npm_alias_target(target).unwrap_or(target)
+            });
+        }
+        (!range_fetches_directly(range)).then_some(name)
+    });
+    match registry_target {
+        Some(target) => (
+            (target != name).then(|| target.to_owned()),
+            FetchedFrom::Registry,
+        ),
+        None => (None, FetchedFrom::DependencySpec),
+    }
+}
+
+/// The package an `npm:` alias names: `@scope/name@range` or `name@range`
+/// give the name; a bare range or tag names none.
+fn npm_alias_target(target: &str) -> Option<&str> {
+    if target.starts_with('@') {
+        return Some(split_yarn_descriptor(target).map_or(target, |(name, _)| name));
+    }
+    target
+        .find('@')
+        .filter(|&at| at > 0)
+        .map(|at| &target[..at])
+}
+
+/// Whether a range names something fetched directly rather than a version
+/// on a registry: a URL, a Git host or repository, or a local path. Semver
+/// ranges and dist-tags never contain a `/` or a protocol.
+fn range_fetches_directly(range: &str) -> bool {
+    range.contains(':') || range.contains('/')
 }
 
 /// Flush the current entry and attempt to start a new one from a top-level specifier line.
@@ -349,7 +436,7 @@ fn flush_and_start_new(
             .map(|s| s.trim().trim_matches('"').to_owned())
             .collect();
         let first_spec = &specifiers[0];
-        let name = match split_specifier(first_spec) {
+        let name = match split_yarn_descriptor(first_spec) {
             Some((name, _)) => name.to_owned(),
             None => {
                 return Err(LpmError::Registry(format!(
@@ -357,6 +444,7 @@ fn flush_and_start_new(
                 )));
             }
         };
+        let (published_as, fetched_from) = v1_fetched_from(&name, &specifiers);
         *current = Some(YarnEntry {
             specifiers,
             name,
@@ -364,6 +452,8 @@ fn flush_and_start_new(
             resolved: None,
             integrity: None,
             deps_with_ranges: Vec::new(),
+            published_as,
+            fetched_from,
         });
         Ok(Some(State::InEntry))
     } else {
@@ -410,7 +500,7 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
 
                     // Extract package name from first specifier.
                     let first_spec = &specifiers[0];
-                    let name = match split_specifier(first_spec) {
+                    let name = match split_yarn_descriptor(first_spec) {
                         Some((name, _)) => name.to_owned(),
                         None => {
                             return Err(LpmError::Registry(format!(
@@ -418,6 +508,7 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
                             )));
                         }
                     };
+                    let (published_as, fetched_from) = v1_fetched_from(&name, &specifiers);
 
                     current = Some(YarnEntry {
                         specifiers,
@@ -426,6 +517,8 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
                         resolved: None,
                         integrity: None,
                         deps_with_ranges: Vec::new(),
+                        published_as,
+                        fetched_from,
                     });
                     state = State::InEntry;
                 } else {
@@ -551,6 +644,117 @@ fn strip_quotes(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn package<'a>(packages: &'a [MigratedPackage], name: &str) -> &'a MigratedPackage {
+        packages
+            .iter()
+            .find(|package| package.name == name)
+            .unwrap_or_else(|| panic!("{name} is missing from {packages:?}"))
+    }
+
+    #[test]
+    fn yarn_v1_entries_record_aliases_and_packages_fetched_from_their_specifiers() {
+        let input = r#"# yarn lockfile v1
+
+
+"utils@npm:@corp/utils@^1.0.0":
+  version "1.0.0"
+  resolved "https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz#abc"
+  integrity sha512-utils==
+
+"xlsx@https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz":
+  version "0.20.3"
+  resolved "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz#def"
+
+"tool@github:owner/tool#0123456":
+  version "2.0.0"
+  resolved "https://codeload.github.com/owner/tool/tar.gz/0123456"
+
+ms@^2.1.3:
+  version "2.1.3"
+  resolved "https://registry.yarnpkg.com/ms/-/ms-2.1.3.tgz#ghi"
+"#;
+        let packages = parse_str(input).unwrap();
+        let utils = package(&packages, "utils");
+        assert_eq!(utils.published_name(), "@corp/utils");
+        assert_eq!(utils.fetched_from, FetchedFrom::Registry);
+        assert_eq!(
+            package(&packages, "xlsx").fetched_from,
+            FetchedFrom::DependencySpec
+        );
+        assert_eq!(
+            package(&packages, "tool").fetched_from,
+            FetchedFrom::DependencySpec
+        );
+        assert_eq!(package(&packages, "ms").fetched_from, FetchedFrom::Registry);
+        assert_eq!(package(&packages, "ms").published_as, None);
+    }
+
+    #[test]
+    fn a_yarn_v1_alias_with_no_range_names_the_package_it_installs() {
+        let input = r#"# yarn lockfile v1
+
+
+"foo@npm:lodash":
+  version "4.17.21"
+  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#abc"
+
+"bar@npm:^1.0.0":
+  version "1.2.0"
+  resolved "https://registry.yarnpkg.com/bar/-/bar-1.2.0.tgz#def"
+"#;
+        let packages = parse_str(input).unwrap();
+        assert_eq!(package(&packages, "foo").published_name(), "lodash");
+        assert_eq!(package(&packages, "bar").published_as, None);
+    }
+
+    #[test]
+    fn yarn_berry_resolutions_record_aliases_tarball_urls_and_archive_urls() {
+        let input = r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"utils@npm:@corp/utils@^1.0.0":
+  version: 1.0.0
+  resolution: "@corp/utils@npm:1.0.0"
+  languageName: node
+  linkType: hard
+
+"xlsx@https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz":
+  version: 0.20.3
+  resolution: "xlsx@https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  languageName: node
+  linkType: hard
+
+"lib@npm:^3.0.0":
+  version: 3.0.0
+  resolution: "lib@npm:3.0.0::__archiveUrl=https%3A%2F%2Fnpm.corp.example%2Fapi%2Flib-3.0.0.tgz"
+  languageName: node
+  linkType: hard
+"#;
+        let packages = parse_str(input).unwrap();
+        let utils = package(&packages, "utils");
+        assert_eq!(utils.published_name(), "@corp/utils");
+        assert_eq!(utils.fetched_from, FetchedFrom::Registry);
+        let xlsx = packages
+            .iter()
+            .find(|package| package.name == "xlsx")
+            .unwrap();
+        assert_eq!(xlsx.fetched_from, FetchedFrom::DependencySpec);
+        assert_eq!(
+            xlsx.resolved.as_deref(),
+            Some("https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz")
+        );
+        let lib = packages
+            .iter()
+            .find(|package| package.name == "lib")
+            .unwrap();
+        assert_eq!(lib.fetched_from, FetchedFrom::Registry);
+        assert_eq!(
+            lib.resolved.as_deref(),
+            Some("https://npm.corp.example/api/lib-3.0.0.tgz")
+        );
+    }
 
     #[test]
     fn parse_minimal() {

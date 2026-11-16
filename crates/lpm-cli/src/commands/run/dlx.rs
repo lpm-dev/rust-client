@@ -293,6 +293,7 @@ async fn install_dlx_target(
                     integrity: identity.integrity.clone(),
                 }
             }),
+            locked_integrities: None,
         }),
         lpm_common::LpmRoot::from_env()?,
     )

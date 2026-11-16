@@ -4,6 +4,7 @@
 //! including backup creation, rollback, and dry-run.
 
 mod migrate_contract;
+mod migrate_registry;
 mod support;
 
 use support::assertions;

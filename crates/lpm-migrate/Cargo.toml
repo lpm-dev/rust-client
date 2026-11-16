@@ -17,6 +17,8 @@ hex = { workspace = true }
 serde_json = { workspace = true }
 serde_json_lenient = "0.2.4"
 serde_yaml = "0.9"
+toml = { workspace = true }
+url = "2"
 tracing = { workspace = true }
 tempfile = "3"
 cap-std = "4.0.2"

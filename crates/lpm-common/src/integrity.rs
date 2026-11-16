@@ -20,7 +20,8 @@ pub struct Integrity {
     pub hash: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered weakest to strongest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HashAlgorithm {
     Sha1,
     Sha256,
@@ -196,9 +197,110 @@ impl fmt::Display for Integrity {
     }
 }
 
+/// How two SRI metadata strings compare over the hash algorithms both name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SriComparison {
+    /// They share at least one algorithm, and for each one they share, a
+    /// digest on one side equals a digest on the other.
+    Agree,
+    /// For an algorithm both name, no digest on one side equals any on the
+    /// other.
+    Disagree,
+    /// No algorithm appears in both, so nothing can be compared.
+    NoCommonAlgorithm,
+}
+
+/// The hashes in SRI metadata: one or more space-separated
+/// `algorithm-base64` tokens with optional `?options`. Tokens that don't
+/// parse are ignored, as SRI ignores them.
+pub fn sri_hashes(sri: &str) -> impl Iterator<Item = Integrity> + '_ {
+    sri.split_ascii_whitespace().filter_map(|token| {
+        Integrity::parse(token.split_once('?').map_or(token, |(hash, _)| hash)).ok()
+    })
+}
+
+/// Compares two SRI metadata strings. Several digests of one algorithm are
+/// alternatives, as SRI treats them, so one match among them is enough.
+pub fn compare_sri(left: &str, right: &str) -> SriComparison {
+    let right: Vec<Integrity> = sri_hashes(right).collect();
+    let left: Vec<Integrity> = sri_hashes(left).collect();
+    let mut shared = false;
+    for algorithm in [
+        HashAlgorithm::Sha512,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Sha1,
+    ] {
+        let mut on_right = right
+            .iter()
+            .filter(|hash| hash.algorithm == algorithm)
+            .peekable();
+        if on_right.peek().is_none() || !left.iter().any(|hash| hash.algorithm == algorithm) {
+            continue;
+        }
+        shared = true;
+        let matched = on_right.any(|right| {
+            left.iter()
+                .filter(|left| left.algorithm == algorithm)
+                .any(|left| bool::from(left.hash.ct_eq(&right.hash)))
+        });
+        if !matched {
+            return SriComparison::Disagree;
+        }
+    }
+    if shared {
+        SriComparison::Agree
+    } else {
+        SriComparison::NoCommonAlgorithm
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sri_strings_agree_when_their_shared_algorithms_agree() {
+        let sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"package").to_string();
+        let sha1 = Integrity::from_bytes(HashAlgorithm::Sha1, b"package").to_string();
+        let other_sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"other").to_string();
+        assert_eq!(compare_sri(&sha512, &sha512), SriComparison::Agree);
+        assert_eq!(
+            compare_sri(&format!("{sha1} {sha512}?opt"), &sha512),
+            SriComparison::Agree
+        );
+        assert_eq!(compare_sri(&sha512, &other_sha512), SriComparison::Disagree);
+        assert_eq!(
+            compare_sri(
+                &format!("{sha1} {other_sha512}"),
+                &format!("{sha512} {sha1}")
+            ),
+            SriComparison::Disagree,
+            "one disagreeing shared algorithm is enough"
+        );
+        assert_eq!(
+            compare_sri(&format!("{other_sha512} {sha512}"), &sha512),
+            SriComparison::Agree,
+            "alternatives of one algorithm agree when any one matches"
+        );
+        assert_eq!(
+            compare_sri(&sha1, &sha512),
+            SriComparison::NoCommonAlgorithm
+        );
+        assert_eq!(
+            compare_sri("garbage", &sha512),
+            SriComparison::NoCommonAlgorithm
+        );
+    }
+
+    #[test]
+    fn sri_metadata_yields_each_hash_that_parses_without_its_options() {
+        let sha1 = Integrity::from_bytes(HashAlgorithm::Sha1, b"package");
+        let sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"package");
+        assert_eq!(
+            sri_hashes(&format!("{sha1} garbage {sha512}?x")).collect::<Vec<_>>(),
+            vec![sha1, sha512]
+        );
+    }
 
     #[test]
     fn parse_sha512_integrity() {

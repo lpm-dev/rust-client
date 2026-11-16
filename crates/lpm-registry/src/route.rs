@@ -300,6 +300,23 @@ impl RouteTable {
         })
     }
 
+    /// Whether LPM fetches `name` from the registry the tarball URL
+    /// `candidate` lies under, by the route [`Self::route_for_package`]
+    /// selects, so `@lpm.dev/*` and package route overrides come first.
+    ///
+    /// A tarball recorded over `http` on the route's host and port counts,
+    /// since LPM fetches it from the same registry over `https`. So does a
+    /// GitLab project's tarball under a route to the same GitLab's instance
+    /// or group endpoint, whose metadata points at its projects' tarballs.
+    pub fn fetches_package_from(&self, name: &str, candidate: &str) -> bool {
+        let registry = match self.selected_route_for_package(name) {
+            SelectedRoute::Custom(target) => &*target.base_url,
+            SelectedRoute::Jsr => &*JSR_TARGET.base_url,
+            SelectedRoute::Mode(_) => return false,
+        };
+        registry_serves(candidate, registry)
+    }
+
     fn selected_route_for_package<'a>(&'a self, name: &str) -> SelectedRoute<'a> {
         if name.starts_with("@lpm.dev/") {
             return SelectedRoute::Mode(RouteMode::Proxy);
@@ -529,13 +546,66 @@ fn registry_url_contains_parsed(candidate: &str, registry: &reqwest::Url) -> boo
     {
         return false;
     }
-    let base = registry.path().trim_end_matches('/');
+    path_lies_under(candidate.path(), registry.path())
+}
+
+fn path_lies_under(candidate: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
     base.is_empty()
-        || candidate.path() == base
+        || candidate == base
         || candidate
-            .path()
             .strip_prefix(base)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn registry_serves(candidate: &str, registry: &str) -> bool {
+    let (Ok(candidate), Ok(registry)) = (
+        reqwest::Url::parse(candidate),
+        reqwest::Url::parse(registry),
+    ) else {
+        return false;
+    };
+    let same_endpoint = if candidate.scheme() == registry.scheme() {
+        candidate.port_or_known_default() == registry.port_or_known_default()
+    } else {
+        candidate.scheme() == "http"
+            && registry.scheme() == "https"
+            && candidate.port() == registry.port()
+    };
+    same_endpoint
+        && candidate.host_str().map(str::to_ascii_lowercase)
+            == registry.host_str().map(str::to_ascii_lowercase)
+        && (path_lies_under(candidate.path(), registry.path())
+            || gitlab_project_tarball_under(candidate.path(), registry.path())
+            || github_packages_download(&candidate))
+}
+
+/// GitHub Packages serves its npm registry at `npm.pkg.github.com`, with or
+/// without an owner path, and its tarballs from `/download/` on the same
+/// host.
+fn github_packages_download(candidate: &reqwest::Url) -> bool {
+    candidate
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("npm.pkg.github.com"))
+        && candidate.path().starts_with("/download/")
+}
+
+/// GitLab's instance endpoint, `<root>/api/v4/packages/npm`, and a group's,
+/// `<root>/api/v4/groups/<id>/-/packages/npm`, serve metadata whose
+/// tarballs sit under each project's endpoint,
+/// `<root>/api/v4/projects/<id>/packages/npm/`.
+fn gitlab_project_tarball_under(candidate: &str, registry: &str) -> bool {
+    let registry = registry.trim_end_matches('/');
+    let root = registry.strip_suffix("/api/v4/packages/npm").or_else(|| {
+        let (root, group) = registry
+            .strip_suffix("/-/packages/npm")?
+            .rsplit_once("/api/v4/groups/")?;
+        (!group.is_empty() && !group.contains('/')).then_some(root)
+    });
+    root.and_then(|root| candidate.strip_prefix(root))
+        .and_then(|rest| rest.strip_prefix("/api/v4/projects/"))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(project, rest)| !project.is_empty() && rest.starts_with("packages/npm/"))
 }
 
 /// Fatal `.npmrc` parse errors that block `RouteTable` construction.
@@ -672,6 +742,146 @@ mod tests {
         assert_eq!(
             table.route_for_package("@lpm.dev/acme.util"),
             UpstreamRoute::LpmWorker
+        );
+    }
+
+    #[test]
+    fn a_package_counts_as_fetched_from_a_registry_only_by_the_route_lpm_takes_for_it() {
+        let npmrc = NpmrcConfig::parse(
+            "registry=https://corp.example/npm/\n@corp:registry=https://scoped.example/\n",
+            "test",
+            &no_env,
+        );
+        let table = RouteTable::new(RouteMode::Direct, npmrc)
+            .expect("npmrc has no errors")
+            .with_package_route_overrides(std::collections::HashMap::from([(
+                "pinned".to_owned(),
+                RouteMode::Direct,
+            )]));
+
+        assert!(
+            table.fetches_package_from("utils", "https://corp.example/npm/utils/-/utils-1.0.0.tgz")
+        );
+        assert!(table.fetches_package_from(
+            "@corp/utils",
+            "https://scoped.example/@corp/utils/-/utils-1.0.0.tgz"
+        ));
+        assert!(
+            !table.fetches_package_from(
+                "@corp/utils",
+                "https://corp.example/npm/@corp/utils/-/utils-1.0.0.tgz"
+            ),
+            "a scope route wins over the default registry"
+        );
+        assert!(
+            !table.fetches_package_from(
+                "@lpm.dev/acme.util",
+                "https://corp.example/npm/@lpm.dev/acme.util/-/acme.util-1.0.0.tgz"
+            ),
+            "LPM's own scope always comes from LPM"
+        );
+        assert!(
+            !table.fetches_package_from(
+                "pinned",
+                "https://corp.example/npm/pinned/-/pinned-1.0.0.tgz"
+            ),
+            "a package route override wins over the default registry"
+        );
+        assert!(!table.fetches_package_from("utils", "https://corp.example/other/utils-1.0.0.tgz"));
+        assert!(table.fetches_package_from(
+            "@jsr/std__path",
+            "https://npm.jsr.io/~/11/@jsr/std__path/1.0.8.tgz"
+        ));
+    }
+
+    #[test]
+    fn a_tarball_recorded_over_http_counts_as_fetched_from_the_same_registry_over_https() {
+        let npmrc =
+            NpmrcConfig::parse("registry=https://npm.corp.example:4873/\n", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        assert!(table.fetches_package_from(
+            "utils",
+            "http://npm.corp.example:4873/utils/-/utils-1.0.0.tgz"
+        ));
+        assert!(!table.fetches_package_from(
+            "utils",
+            "http://npm.corp.example:4874/utils/-/utils-1.0.0.tgz"
+        ));
+
+        let npmrc = NpmrcConfig::parse("registry=http://npm.corp.example/\n", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        assert!(
+            table.fetches_package_from("utils", "http://npm.corp.example/utils/-/utils-1.0.0.tgz")
+        );
+        assert!(
+            !table
+                .fetches_package_from("utils", "https://npm.corp.example/utils/-/utils-1.0.0.tgz")
+        );
+    }
+
+    #[test]
+    fn a_github_packages_tarball_counts_as_fetched_from_the_owner_route_on_its_host() {
+        let tarball = "https://npm.pkg.github.com/download/@owner/pkg/1.0.0/0123abcd";
+        for registry in [
+            "https://npm.pkg.github.com/owner",
+            "https://npm.pkg.github.com/",
+        ] {
+            let npmrc =
+                NpmrcConfig::parse(&format!("@owner:registry={registry}\n"), "test", &no_env);
+            let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+            assert!(
+                table.fetches_package_from("@owner/pkg", tarball),
+                "{registry}"
+            );
+        }
+        let npmrc = NpmrcConfig::parse(
+            "@owner:registry=https://npm.corp.example/owner\n",
+            "test",
+            &no_env,
+        );
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        assert!(!table.fetches_package_from("@owner/pkg", tarball));
+    }
+
+    #[test]
+    fn a_gitlab_project_tarball_counts_as_fetched_from_its_instance_or_group_endpoint() {
+        let tarball = "https://gitlab.example/api/v4/projects/42/packages/npm/@corp/utils/-/@corp/utils-1.0.0.tgz";
+        for registry in [
+            "https://gitlab.example/api/v4/packages/npm/",
+            "https://gitlab.example/api/v4/groups/7/-/packages/npm/",
+        ] {
+            let npmrc =
+                NpmrcConfig::parse(&format!("@corp:registry={registry}\n"), "test", &no_env);
+            let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+            assert!(
+                table.fetches_package_from("@corp/utils", tarball),
+                "{registry}"
+            );
+            assert!(
+                !table.fetches_package_from(
+                    "@corp/utils",
+                    "https://other.example/api/v4/projects/42/packages/npm/@corp/utils/-/@corp/utils-1.0.0.tgz"
+                ),
+                "{registry}"
+            );
+            assert!(
+                !table.fetches_package_from(
+                    "@corp/utils",
+                    "https://gitlab.example/api/v4/projects/42/other/@corp/utils-1.0.0.tgz"
+                ),
+                "{registry}"
+            );
+        }
+
+        let npmrc = NpmrcConfig::parse(
+            "@corp:registry=https://gitlab.example/api/v4/projects/41/packages/npm/\n",
+            "test",
+            &no_env,
+        );
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        assert!(
+            !table.fetches_package_from("@corp/utils", tarball),
+            "one project's endpoint doesn't serve another project's packages"
         );
     }
 

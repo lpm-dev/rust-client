@@ -450,6 +450,11 @@ fn migrate_dry_run_json_output() {
     let json = parse_json_output(&output.stdout);
     assert_json_field(&json, "success", JsonType::Bool);
     assert_eq!(json["success"], true);
+    assert_eq!(
+        json["registry_changes"],
+        serde_json::json!([]),
+        "a lockfile from npm's registry changes no package's registry"
+    );
 }
 
 // ─── lpm run multi-task --json ───────────────────────────────────

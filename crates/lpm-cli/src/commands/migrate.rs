@@ -30,6 +30,7 @@ pub async fn run(
     ci: bool,
     no_install: bool,
     dry_run: bool,
+    allow_registry_change: bool,
     force: bool,
     rollback: bool,
     json: bool,
@@ -48,6 +49,7 @@ pub async fn run(
             no_npmrc,
             no_install,
             dry_run,
+            allow_registry_change,
             force,
             json,
             workspace_root: workspace.is_some(),
@@ -58,7 +60,7 @@ pub async fn run(
     } else {
         super::install::workspace_lockfile::with_project_install_lock(cwd, migration).await?
     };
-    let Some((result, mut migration_backup)) = migrated else {
+    let Some((result, mut migration_backup, registry_changes)) = migrated else {
         return Ok(());
     };
 
@@ -103,6 +105,7 @@ pub async fn run(
             "skipped_count": result.skipped.len(),
             "warning_count": result.warnings.len(),
             "workspace_members": result.workspace_members,
+            "registry_changes": registry_changes_json(&registry_changes),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -151,6 +154,7 @@ struct MigrationInstallOptions {
     no_npmrc: bool,
     no_install: bool,
     dry_run: bool,
+    allow_registry_change: bool,
     force: bool,
     json: bool,
     workspace_root: bool,
@@ -160,11 +164,19 @@ async fn migrate_and_install(
     client: &RegistryClient,
     cwd: &Path,
     options: MigrationInstallOptions,
-) -> Result<Option<(lpm_migrate::MigrateResult, MigrationBackup)>, LpmError> {
+) -> Result<
+    Option<(
+        lpm_migrate::MigrateResult,
+        MigrationBackup,
+        Vec<RegistryChange>,
+    )>,
+    LpmError,
+> {
     let MigrationInstallOptions {
         no_npmrc,
         no_install,
         dry_run,
+        allow_registry_change,
         force,
         json,
         workspace_root,
@@ -215,6 +227,21 @@ async fn migrate_and_install(
         eprintln!();
         for w in &result.warnings {
             install_ui::warn_untrusted(w);
+        }
+    }
+
+    let registry_changes = if result.custom_registry_packages.is_empty() {
+        Vec::new()
+    } else {
+        let route_table = super::install::load_install_route_table(cwd, client)?;
+        registry_changes(&result.custom_registry_packages, &route_table, client)
+    };
+    if !registry_changes.is_empty() {
+        if !allow_registry_change {
+            return Err(registry_change_refusal(&registry_changes));
+        }
+        if !json {
+            render_registry_changes(&registry_changes);
         }
     }
 
@@ -270,6 +297,7 @@ async fn migrate_and_install(
                 "skipped_count": result.skipped.len(),
                 "warning_count": result.warnings.len(),
                 "workspace_members": result.workspace_members,
+                "registry_changes": registry_changes_json(&registry_changes),
                 "pnpm_overrides_to_translate": overrides_plan.to_apply.len(),
                 "pnpm_patches_to_translate": patches_plan.to_apply.len(),
                 "pnpm_peer_rules_to_translate": peer_rules_plan.ignore_missing_to_apply.len()
@@ -569,9 +597,10 @@ async fn migrate_and_install(
                         eprintln!();
                         install_ui::warn_untrusted(&format!("Install failed: {e}"));
                         install_ui::detail_line(crate::install_ui::terminal_line!(
-                            "  {} The lockfile was written successfully. Run {} manually to retry.",
+                            "  {} The lockfile was written. {} retries with the same checks, and {} undoes the migration.",
                             install_ui::dim("hint:"),
-                            install_ui::yellow("lpm install")
+                            install_ui::yellow("lpm install"),
+                            install_ui::yellow("lpm migrate --rollback")
                         ));
                     }
                     return Err(e);
@@ -586,7 +615,7 @@ async fn migrate_and_install(
     applied?;
     sealed?;
 
-    Ok(Some((result, migration_backup)))
+    Ok(Some((result, migration_backup, registry_changes)))
 }
 
 fn render_detected_source(result: &lpm_migrate::MigrateResult, dry_run: bool) {
@@ -1631,4 +1660,141 @@ fn record_migrated_patch_records(
         );
     }
     Ok(())
+}
+
+/// A migrated package whose lockfile names a registry that LPM wouldn't
+/// fetch it from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryChange {
+    name: String,
+    version: String,
+    /// Where the lockfile says the package came from, without credentials.
+    from: String,
+    /// The registry LPM fetches the package from instead.
+    to: String,
+}
+
+/// Each package the source package manager took from a custom registry
+/// that `route_table` wouldn't fetch it from. A package from npm's or LPM's
+/// registry may go wherever the user's own `.npmrc` sends it; a package
+/// from a private registry must come from that registry again, or a
+/// same-named public package would take its place.
+fn registry_changes(
+    packages: &[lpm_migrate::CustomRegistryPackage],
+    route_table: &lpm_registry::RouteTable,
+    client: &RegistryClient,
+) -> Vec<RegistryChange> {
+    packages
+        .iter()
+        .filter(|package| !route_table.fetches_package_from(&package.name, &package.tarball_url))
+        .map(|package| RegistryChange {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            from: package.shown_as.clone(),
+            to: match route_table.route_for_package(&package.name) {
+                lpm_registry::UpstreamRoute::LpmWorker => client.base_url().to_owned(),
+                lpm_registry::UpstreamRoute::NpmDirect => client.npm_registry_url().to_owned(),
+                lpm_registry::UpstreamRoute::Custom { target, .. } => {
+                    shown_registry(&target.base_url)
+                }
+            },
+        })
+        .collect()
+}
+
+/// A configured registry by its origin alone. Its path can hold a value
+/// `.npmrc` expanded from an environment variable, such as a token.
+fn shown_registry(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return "the registry .npmrc names".to_owned();
+    };
+    let origin = url.origin().ascii_serialization();
+    if url.path().trim_matches('/').is_empty() {
+        origin
+    } else {
+        format!("{origin}/…")
+    }
+}
+
+/// Packages a refusal or warning names before summarizing the rest.
+const REGISTRY_CHANGES_SHOWN: usize = 10;
+
+fn registry_change_refusal(changes: &[RegistryChange]) -> LpmError {
+    use std::fmt::Write as _;
+    let mut message = format!(
+        "{} package{} came from a registry that LPM wouldn't fetch {} from, so a package \
+         with the same name from another registry could take {} place:",
+        changes.len(),
+        if changes.len() == 1 { "" } else { "s" },
+        if changes.len() == 1 { "it" } else { "them" },
+        if changes.len() == 1 { "its" } else { "their" },
+    );
+    for change in changes.iter().take(REGISTRY_CHANGES_SHOWN) {
+        let _ = write!(
+            message,
+            "\n  {}@{} from {}, which LPM would fetch from {}",
+            lpm_common::sanitize_terminal_inline(&change.name),
+            lpm_common::sanitize_terminal_inline(&change.version),
+            lpm_common::sanitize_terminal_inline(&change.from),
+            lpm_common::sanitize_terminal_inline(&change.to),
+        );
+    }
+    if changes.len() > REGISTRY_CHANGES_SHOWN {
+        let _ = write!(
+            message,
+            "\n  and {} more",
+            changes.len() - REGISTRY_CHANGES_SHOWN
+        );
+    }
+    message.push_str(
+        "\nAdd the registry to .npmrc (`registry=<url>`, or `@scope:registry=<url>` for a \
+         scope) and run the migration again, or pass --allow-registry-change to fetch these \
+         packages from the registries LPM routes them to. No files were modified.",
+    );
+    LpmError::Registry(message)
+}
+
+fn render_registry_changes(changes: &[RegistryChange]) {
+    eprintln!();
+    install_ui::warn_untrusted(&format!(
+        "{} package{} will come from the registry LPM routes {} to instead of the one the \
+         lockfile names (--allow-registry-change)",
+        changes.len(),
+        if changes.len() == 1 { "" } else { "s" },
+        if changes.len() == 1 { "it" } else { "them" },
+    ));
+    for change in changes.iter().take(REGISTRY_CHANGES_SHOWN) {
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} {}@{} from {} {}",
+            install_ui::dim("-"),
+            lpm_common::sanitize_terminal_inline(&change.name),
+            lpm_common::sanitize_terminal_inline(&change.version),
+            lpm_common::sanitize_terminal_inline(&change.to),
+            install_ui::dim(&format!(
+                "was {}",
+                lpm_common::sanitize_terminal_inline(&change.from)
+            ))
+        ));
+    }
+    if changes.len() > REGISTRY_CHANGES_SHOWN {
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} and {} more",
+            install_ui::dim("-"),
+            changes.len() - REGISTRY_CHANGES_SHOWN
+        ));
+    }
+}
+
+fn registry_changes_json(changes: &[RegistryChange]) -> serde_json::Value {
+    changes
+        .iter()
+        .map(|change| {
+            serde_json::json!({
+                "name": change.name,
+                "version": change.version,
+                "from": change.from,
+                "to": change.to,
+            })
+        })
+        .collect()
 }

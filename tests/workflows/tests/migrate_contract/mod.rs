@@ -545,7 +545,8 @@ fn migration_json_reserves_stdout_for_install_hooks_and_cached_verification() {
               "integrity_count": 0,
               "skipped_count": 0,
               "warning_count": 0,
-              "workspace_members": 0
+              "workspace_members": 0,
+              "registry_changes": []
             }
             "#); }
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -386,6 +386,8 @@ pub(crate) async fn run_recursive_workspace_install(
         let workspace_root = workspace.root.clone();
         let started = Instant::now();
         let lpm_root = lpm_common::LpmRoot::from_env()?;
+        // Read once, before any member's install can replace the lockfile.
+        let locked_integrities = super::LockedIntegrities::detect(&workspace_root)?;
         let options = Arc::new(options);
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
@@ -449,6 +451,7 @@ pub(crate) async fn run_recursive_workspace_install(
                             &lpm_root,
                             Arc::clone(&active_workspace),
                             Arc::clone(&options),
+                            locked_integrities.as_ref().map(Arc::clone),
                             Arc::clone(&materialization_coordinator),
                             Arc::clone(&workspace_lockfile_coordinator),
                             Arc::clone(&workspace_project_state_coordinator),
@@ -584,6 +587,7 @@ fn spawn_workspace_target_install(
     lpm_root: &lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
+    locked_integrities: Option<Arc<super::LockedIntegrities>>,
     materialization_coordinator: Arc<
         workspace_materialization::WorkspaceMaterializationCoordinator,
     >,
@@ -619,6 +623,7 @@ fn spawn_workspace_target_install(
             lpm_root,
             base_workspace,
             options,
+            locked_integrities,
             workspace_freshness_cache,
             root_provider_fingerprint,
         );
@@ -654,12 +659,14 @@ where
     future
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_workspace_target_install(
     plan: WorkspaceInstallTarget,
     client: RegistryClient,
     lpm_root: lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
     options: Arc<RecursiveInstallOptions>,
+    locked_integrities: Option<Arc<super::LockedIntegrities>>,
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
 ) -> Result<TargetTaskResult, LpmError> {
@@ -691,6 +698,18 @@ async fn run_workspace_target_install(
     };
 
     let capture = options.json_output.then(report_capture::new_capture);
+    let caller_context = locked_integrities
+        .map(|locked| {
+            Ok::<_, LpmError>(super::InstallCallerContext {
+                route_table: super::source_resolution::load_install_route_table(
+                    &plan.path, &client,
+                )?,
+                policy_project_dir: None,
+                expected_root: None,
+                locked_integrities: Some(locked),
+            })
+        })
+        .transpose()?;
     let install = assert_send(run_with_options_with_lpm_root(
         &client,
         &plan.path,
@@ -724,7 +743,7 @@ async fn run_workspace_target_install(
         &[],
         options.json_output,
         false,
-        None,
+        caller_context,
         lpm_root,
     ));
     match &capture {
