@@ -913,10 +913,7 @@ mod tests {
         };
         let weak = real_sri(Sha1, b"ms");
         let strong = format!("{weak} {}", real_sri(Sha512, b"ms"));
-        for order in [
-            [weak.clone(), strong.clone()],
-            [strong.clone(), weak.clone()],
-        ] {
+        for order in [[weak.clone(), strong.clone()], [strong.clone(), weak]] {
             let (lockfile, _, _) =
                 to_lockfile_with_registries(order.iter().cloned().map(copy).collect()).unwrap();
             assert_eq!(

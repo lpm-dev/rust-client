@@ -162,17 +162,17 @@ impl LockedIntegrities {
         }
         let mut published = PublishedIntegrities::default();
         for package in packages.iter_mut() {
-            if let Some(held) = self.held_integrity(package)? {
-                if let Some(previous) = package.integrity.replace(held) {
-                    published.by_package.insert(
-                        (
-                            package.name.clone(),
-                            package.version.clone(),
-                            package.source.clone(),
-                        ),
-                        previous,
-                    );
-                }
+            if let Some(held) = self.held_integrity(package)?
+                && let Some(previous) = package.integrity.replace(held)
+            {
+                published.by_package.insert(
+                    (
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.source.clone(),
+                    ),
+                    previous,
+                );
             }
         }
         Ok(published)
@@ -479,7 +479,7 @@ mod tests {
         let mut for_lockfile = packages.clone();
         let restore = pins.apply(&mut packages, &for_lockfile).unwrap();
         assert_eq!(packages[0].integrity.as_deref(), Some(recorded.as_str()));
-        for_lockfile[0].integrity = Some(recorded.clone());
+        for_lockfile[0].integrity = Some(recorded);
         restore.restore(&mut for_lockfile);
         assert_eq!(
             for_lockfile[0].integrity.as_deref(),
