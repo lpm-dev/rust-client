@@ -767,6 +767,59 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_cannot_pass_through_a_directory_records_and_sets_nothing() {
+        let name = unique_name("LpmIdentityNoWay");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        let project = locked.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        lock_directory_for_test(&locked);
+        let args = crate::helper_protocol::parse_argv(
+            [
+                "--protocol-version",
+                &crate::helper_protocol::PROTOCOL_VERSION.to_string(),
+                "--appcontainer-name",
+                &name,
+                "--stdio-stdin",
+                "null",
+                "--stdio-stdout",
+                "null",
+                "--stdio-stderr",
+                "null",
+                "--readable-dir",
+                project.to_str().unwrap(),
+                "--",
+                "cmd.exe",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let mut recorded = false;
+
+        let stopped = without_privileges(|| {
+            setup::prepare(&args, &sid, |_| {
+                recorded = true;
+                Ok(())
+            })
+            .err()
+        });
+
+        assert!(
+            matches!(stopped, Some(AppContainerError::SetupRequired { .. })),
+            "{stopped:?}"
+        );
+        assert!(!recorded);
+        for directory in root.path().ancestors().chain([locked.as_path()]) {
+            assert!(!grants(directory, sid.0), "{}", directory.display());
+        }
+        std::fs::remove_dir(&project).unwrap();
+        std::fs::remove_dir(&locked).unwrap();
+    }
+
+    #[test]
     fn a_cleanup_run_passes_a_recorded_tree_it_never_granted_and_could_not_change() {
         let name = unique_name("LpmIdentityUnchanged");
         let sid = create_or_reuse_appcontainer_sid(&name).unwrap();

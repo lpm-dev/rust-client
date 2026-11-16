@@ -1201,6 +1201,11 @@ pub(super) fn prepare<'a>(
             traversed.push(path);
         }
     }
+    // A directory this user can't change stops the run before anything
+    // is recorded or set, so the record names exactly what is then set.
+    if let Some(path) = traversed.iter().find(|path| !can_change_permissions(path)) {
+        return Err(AppContainerError::SetupRequired { path: path.clone() });
+    }
     before_traversal(&traversed)?;
     for path in traversed {
         update_ace(&path, invocation.0, Some((METADATA_ACCESS, 0)))
@@ -1249,9 +1254,14 @@ pub(super) fn prepare<'a>(
     Ok(access)
 }
 
+/// Fails unless this thread can open `path` to change its permissions.
+pub(super) fn require_changeable(path: &Path) -> Result<(), AppContainerError> {
+    open_permissions(path, true).map(|_| ())
+}
+
 /// Whether this thread can open `path` to change its permissions.
 pub(super) fn can_change_permissions(path: &Path) -> bool {
-    open_permissions(path, true).is_ok()
+    require_changeable(path).is_ok()
 }
 
 #[cfg(test)]

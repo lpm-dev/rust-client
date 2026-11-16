@@ -466,6 +466,26 @@ struct SecretDenial {
     active: bool,
 }
 
+/// Fails for a listed secret that exists and this user can't change,
+/// before anything is recorded or set. The run couldn't deny it, and a
+/// cleanup that can't read it couldn't tell that it holds nothing of the
+/// run.
+fn refuse_secrets_that_cannot_be_denied(listed: &[PathBuf]) -> Result<(), AppContainerError> {
+    for path in listed {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => setup::require_changeable(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AppContainerError::InspectDaclPath {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SecretDenial {
     /// Denies `sid` reading `path`. A secret removed since it was listed
     /// needs no denial.
@@ -580,26 +600,20 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         identity::take_back_run_access(record, sid.0)?;
         identity::revoke_stale_grants(record, &granted, sid.0)?;
     }
-    // What this run sets until it ends is recorded before it is set. An
-    // entry this user can't open to change is left out: setting it fails
-    // first, so it never holds anything of the run, and a cleanup may not
-    // be able to read it to see that.
+    // What this run sets until it ends is recorded before any of it is
+    // set, and nothing is set that the record doesn't name. A listed
+    // secret that doesn't exist yet is named too: one that appears while
+    // the trees are granted is still denied.
+    refuse_secrets_that_cannot_be_denied(&args.secret_read_denied_paths)?;
     let mut prepared_access = setup::prepare(&args, &sid, |traversed| {
         let Some(record) = &args.grant_record else {
             return Ok(());
         };
-        let changeable = |paths: &[PathBuf]| -> Vec<PathBuf> {
-            paths
-                .iter()
-                .filter(|path| setup::can_change_permissions(path))
-                .cloned()
-                .collect()
-        };
         identity::record_run_access(
             record,
             &identity::RunAccess {
-                traversed: changeable(traversed),
-                denied: changeable(&args.secret_read_denied_paths),
+                traversed: traversed.to_vec(),
+                denied: args.secret_read_denied_paths.clone(),
             },
         )
     })?;
@@ -1809,8 +1823,8 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-/// Makes `path`, a directory, one the test process can read but not change
-/// while it runs [`without_privileges`], as `C:\Program Files` is to an
+/// Makes `path` one the test process can read but not change while it
+/// runs [`without_privileges`], as `C:\Program Files` is to an
 /// administrator. Entries it inherits become its own, a grant among them;
 /// the Administrators, SYSTEM and the user then lose theirs; and only
 /// reading is left, to the user and, through OWNER RIGHTS, to the owner,
@@ -1893,11 +1907,29 @@ fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows_sys::Win32::Security::GetLengthSid;
     use windows_sys::Win32::Security::{
         GetFileSecurityW, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
     };
+
+    #[test]
+    fn a_run_stops_at_a_secret_it_cannot_deny_and_at_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join(".env");
+        std::fs::write(&secret, "TOKEN=1").unwrap();
+        let listed = [secret.clone(), tmp.path().join(".env.local")];
+
+        refuse_secrets_that_cannot_be_denied(&listed).unwrap();
+
+        lock_directory_for_test(&secret);
+        let stopped = without_privileges(|| refuse_secrets_that_cannot_be_denied(&listed));
+        assert!(
+            matches!(&stopped, Err(AppContainerError::WriteDacl { path, .. }) if *path == secret),
+            "{stopped:?}"
+        );
+    }
 
     /// `path`'s self-relative security descriptor with its DACL, as stored.
     fn security_descriptor(path: &Path) -> Vec<u32> {
