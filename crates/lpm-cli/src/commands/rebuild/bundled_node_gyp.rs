@@ -27,22 +27,36 @@ impl BundledNodeGyp {
     /// installer puts npm under the directory that holds `node.exe` on
     /// Windows and under `lib` beside `bin` elsewhere; a `node` reached
     /// through a link is looked beside too.
+    ///
+    /// `path` is the host's: the caller's entries that hold no package's
+    /// commands. A `node` that is, or leads to, a file inside a package
+    /// offers nothing, because what sits beside it is that package's to
+    /// choose, and the command would run it for a script that was never
+    /// approved to run that package's code.
     pub(super) fn beside_node_on(path: &OsStr) -> Option<Self> {
         let node = std::env::split_paths(path)
             .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join(NODE))
             .find(|candidate| candidate.is_file())?;
-        [Some(node.clone()), node.canonicalize().ok()]
-            .into_iter()
-            .flatten()
-            .filter_map(|node| npm_modules_beside(&node))
+        let resolved = node.canonicalize().ok()?;
+        if in_a_package(&node) || in_a_package(&resolved) {
+            return None;
+        }
+        [node, resolved]
+            .iter()
+            .filter_map(|node| npm_modules_beside(node))
             .find_map(Self::in_modules)
     }
 
     fn in_modules(modules: PathBuf) -> Option<Self> {
+        let modules = modules.canonicalize().ok()?;
         let package = modules.join("node-gyp");
-        let script = package.join("bin").join("node-gyp.js");
-        if !script.is_file() {
+        let script = package
+            .join("bin")
+            .join("node-gyp.js")
+            .canonicalize()
+            .ok()?;
+        if !script.is_file() || !script.starts_with(&modules) {
             return None;
         }
         let manifest = lpm_common::read_file_capped(
@@ -104,6 +118,11 @@ impl BundledNodeGyp {
     }
 }
 
+fn in_a_package(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "node_modules")
+}
+
 fn npm_modules_beside(node: &Path) -> Option<PathBuf> {
     let directory = node.parent()?;
     let global_modules = if cfg!(windows) {
@@ -160,6 +179,27 @@ pub(super) mod tests {
         assert!(found.script.starts_with(&found.modules));
         assert!(found.modules.ends_with("npm/node_modules"));
         assert_eq!(found.version, "11.2.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_node_that_leads_into_a_package_offers_none() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let package_bin = node_with_npm(
+            &root_path.join("project/node_modules/claims-node"),
+            "11.2.0",
+            "",
+        );
+        let host_bin = root_path.join("host-bin");
+        std::fs::create_dir(&host_bin).unwrap();
+        std::os::unix::fs::symlink(package_bin.join(NODE), host_bin.join(NODE)).unwrap();
+
+        assert_eq!(BundledNodeGyp::beside_node_on(host_bin.as_os_str()), None);
+        assert_eq!(
+            BundledNodeGyp::beside_node_on(package_bin.as_os_str()),
+            None
+        );
     }
 
     #[test]

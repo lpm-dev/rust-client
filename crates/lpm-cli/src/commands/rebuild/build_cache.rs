@@ -1422,10 +1422,15 @@ fn lifecycle_tools_identity(
         .dependency_input_hashes
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // npm's modules hold the offered node-gyp and what it requires. They
+    // are fingerprinted by content like a dependency's directory: the
+    // command's text names only a version.
+    let offered_modules = tools.node_gyp.as_ref().map(|offered| &offered.modules);
     for directory in tools
         .read_dirs
         .iter()
         .filter(|directory| **directory != tools.bin_dir)
+        .chain(offered_modules)
     {
         let fingerprint = match input_hashes.get(directory) {
             Some(fingerprint) => fingerprint.clone(),

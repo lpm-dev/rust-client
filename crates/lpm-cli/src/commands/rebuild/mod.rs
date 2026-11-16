@@ -961,6 +961,13 @@ async fn run_under_store_lock(
         .map(PathBuf::from)
         .collect();
     let tmpdir = std::env::temp_dir();
+    let host_tools = script_execution::host_path(
+        script_execution::inherited_path(script_execution::find_env_case_insensitive(
+            &sanitized_env,
+            "PATH",
+        )),
+        project_dir,
+    );
 
     if !matches!(sandbox_mode, SandboxMode::Disabled) {
         // Scripts can write inside approved directories, but cannot create them
@@ -1281,7 +1288,7 @@ async fn run_under_store_lock(
             } else {
                 lifecycle_tools::ToolScope::Dependencies
             };
-            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path, scope, script_execution::find_env_case_insensitive(&sanitized_env, "PATH"))
+            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path, scope, Some(&host_tools))
         }) {
             Ok(tools) => tools,
             Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }
@@ -1550,11 +1557,12 @@ async fn run_under_store_lock(
                             install_ui::dim(phase),
                             lpm_common::sanitize_terminal_inline(&e),
                         ));
-                        if tools.lacks_node_gyp(
-                            &pkg.scripts,
-                            project_dir,
-                            script_execution::find_env_case_insensitive(&sanitized_env, "PATH"),
-                        ) {
+                        let searched = if tools.project_bins {
+                            script_execution::find_env_case_insensitive(&sanitized_env, "PATH")
+                        } else {
+                            Some(host_tools.as_os_str())
+                        };
+                        if tools.lacks_node_gyp(&pkg.scripts, project_dir, searched) {
                             install_ui::detail_line(crate::install_ui::terminal_line!(
                                 "    {}",
                                 install_ui::dim(lifecycle_tools::NODE_GYP_MISSING),

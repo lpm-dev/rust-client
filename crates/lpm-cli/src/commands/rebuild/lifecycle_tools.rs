@@ -142,6 +142,8 @@ pub(super) struct OfferedNodeGyp {
     pub(super) command_dir: PathBuf,
     /// What npm names to scripts as `npm_config_node_gyp`.
     pub(super) script: PathBuf,
+    /// npm's modules, which hold the command's code and what it requires.
+    pub(super) modules: PathBuf,
     /// What a sandboxed script must read to run the command.
     pub(super) read_dirs: Vec<PathBuf>,
 }
@@ -159,7 +161,7 @@ impl LifecycleTools {
         links_root: &Path,
         scratch: &Path,
         scope: ToolScope<'_>,
-        host_path: Option<&OsStr>,
+        host_tools: Option<&OsStr>,
     ) -> Result<Self, String> {
         let bin_dir = scratch
             .canonicalize()
@@ -184,7 +186,7 @@ impl LifecycleTools {
                 .any(|tool| tool.command == NODE_GYP),
         };
         let Some(graph_digest) = graph_digest else {
-            tools.offer_node_gyp(may_need_node_gyp, host_path)?;
+            tools.offer_node_gyp(may_need_node_gyp, host_tools)?;
             return Ok(tools);
         };
         let root = links_root.canonicalize().map_err(|e| e.to_string())?;
@@ -295,17 +297,19 @@ impl LifecycleTools {
         tools.read_dirs.push(tools.bin_dir.clone());
         tools.read_dirs.sort_unstable();
         tools.graph_identities.sort_unstable();
-        tools.offer_node_gyp(may_need_node_gyp, host_path)?;
+        tools.offer_node_gyp(may_need_node_gyp, host_tools)?;
         Ok(tools)
     }
 
-    /// Offers the `node-gyp` of the npm beside the script's `node`, as npm
+    /// Offers the `node-gyp` of the npm beside the host's `node`, as npm
     /// does for the scripts it runs, unless a dependency supplies one.
-    fn offer_node_gyp(&mut self, may_need: bool, host_path: Option<&OsStr>) -> Result<(), String> {
+    /// `host_tools` is the caller's `PATH` without the entries that hold a
+    /// package's commands.
+    fn offer_node_gyp(&mut self, may_need: bool, host_tools: Option<&OsStr>) -> Result<(), String> {
         if !may_need || self.bins.iter().any(|bin| bin.name == NODE_GYP) {
             return Ok(());
         }
-        let Some(bundled) = host_path.and_then(BundledNodeGyp::beside_node_on) else {
+        let Some(bundled) = host_tools.and_then(BundledNodeGyp::beside_node_on) else {
             return Ok(());
         };
         let command_dir = self.bin_dir.with_file_name("node-gyp-bin");
@@ -318,11 +322,12 @@ impl LifecycleTools {
         // On Windows npm sits inside the directory that holds `node.exe`,
         // which a sandboxed script reads as a tool directory already.
         if !cfg!(windows) {
-            read_dirs.push(bundled.modules);
+            read_dirs.push(bundled.modules.clone());
         }
         self.node_gyp = Some(OfferedNodeGyp {
             command_dir,
             script: bundled.script,
+            modules: bundled.modules,
             read_dirs,
         });
         Ok(())

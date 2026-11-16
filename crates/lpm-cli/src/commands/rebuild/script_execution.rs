@@ -223,7 +223,7 @@ pub(super) fn build_lifecycle_environment(
 ///
 /// When no entry is left the system directories stand in, because the
 /// shell reads an empty `PATH` component as the current directory.
-fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
+pub(super) fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
     let lpm_state = project_dir.join(".lpm");
     let resolved_lpm_state = lpm_state.canonicalize().ok();
     let host = std::env::split_paths(path).filter(|entry| {
@@ -827,7 +827,7 @@ fn project_bin_dir(project_dir: &Path) -> PathBuf {
 }
 
 /// The caller's `PATH`, or the system directories when it has none.
-fn inherited_path(parent_path: Option<&OsStr>) -> &OsStr {
+pub(super) fn inherited_path(parent_path: Option<&OsStr>) -> &OsStr {
     #[cfg(windows)]
     let fallback = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
     #[cfg(not(windows))]
