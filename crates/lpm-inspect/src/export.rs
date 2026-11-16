@@ -603,10 +603,10 @@ mod tests {
     #[test]
     fn test_fixture_emits_a_body_that_is_not_json_as_a_string_literal() {
         let mut wh = make_webhook();
-        wh.request_body = b"0; await import('node:fs')".to_vec();
+        wh.request_body = b"0; marker()".to_vec();
         let fixture = to_test_fixture(&wh);
         assert!(
-            fixture.contains(r#"const mockPayload = "0; await import('node:fs')""#),
+            fixture.contains(r#"const mockPayload = "0; marker()""#),
             "{fixture}"
         );
     }
