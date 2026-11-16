@@ -991,6 +991,7 @@ fn check_install_state_with_paths(
     if cached_hash != current_hash
         || !bin_shims_current(&cached_hash_file)
         || !store_keys_current(&cached_hash_file)
+        || !install_script_rules_current(&cached_hash_file)
     {
         return InstallState {
             up_to_date: false,
@@ -1041,6 +1042,15 @@ fn store_keys_current(install_hash: &str) -> bool {
     install_hash
         .lines()
         .any(|line| line.strip_prefix("k:") == Some(lpm_store::v2::GraphKey::SCHEMA_VERSION))
+}
+
+/// Whether the install recorded in `install_hash` read its packages'
+/// install-time scripts under the rules this release reads them by (see
+/// [`lpm_security::INSTALL_SCRIPT_RULES`]).
+fn install_script_rules_current(install_hash: &str) -> bool {
+    install_hash
+        .lines()
+        .any(|line| line.strip_prefix("r:") == Some(lpm_security::INSTALL_SCRIPT_RULES))
 }
 
 fn project_uses_other_virtual_store(project_dir: &Path, selected: lpm_store::StoreVersion) -> bool {
@@ -1139,7 +1149,10 @@ fn try_mtime_fast_path(
     let content =
         lpm_common::read_text_file_capped(&hash_file, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
             .ok()?;
-    if !bin_shims_current(&content) || !store_keys_current(&content) {
+    if !bin_shims_current(&content)
+        || !store_keys_current(&content)
+        || !install_script_rules_current(&content)
+    {
         return None;
     }
 
@@ -1413,8 +1426,9 @@ fn write_install_hash_with_metadata(
     let node_runtime_fingerprint = metadata.node_runtime_fingerprint.unwrap_or("none");
     let bin_shim_format = lpm_linker::BIN_SHIM_FORMAT;
     let store_key_schema = lpm_store::v2::GraphKey::SCHEMA_VERSION;
+    let install_script_rules = lpm_security::INSTALL_SCRIPT_RULES;
     let content = format!(
-        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\ns:{bin_shim_format}\nk:{store_key_schema}\n"
+        "{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\np:{platform_str}\na:{security_analysis_str}\ne:{dependency_engine_key}\nn:{node_runtime_fingerprint}\ns:{bin_shim_format}\nk:{store_key_schema}\nr:{install_script_rules}\n"
     );
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
@@ -1654,9 +1668,10 @@ mod tests {
     /// to trust it, as one from the slow path's point of view.
     fn current_hash_file(hash: &str) -> String {
         format!(
-            "{hash}\ns:{}\nk:{}\n",
+            "{hash}\ns:{}\nk:{}\nr:{}\n",
             lpm_linker::BIN_SHIM_FORMAT,
-            lpm_store::v2::GraphKey::SCHEMA_VERSION
+            lpm_store::v2::GraphKey::SCHEMA_VERSION,
+            lpm_security::INSTALL_SCRIPT_RULES
         )
     }
 
@@ -2136,6 +2151,10 @@ mod tests {
             lines.next(),
             Some(format!("k:{}", lpm_store::v2::GraphKey::SCHEMA_VERSION).as_str())
         );
+        assert_eq!(
+            lines.next(),
+            Some(format!("r:{}", lpm_security::INSTALL_SCRIPT_RULES).as_str())
+        );
         assert_eq!(lines.next(), None);
     }
 
@@ -2195,6 +2214,34 @@ mod tests {
             let older: String = written
                 .lines()
                 .filter(|line| !line.starts_with("k:"))
+                .map(|line| format!("{line}\n"))
+                .chain([earlier.to_owned()])
+                .collect();
+            fs::write(&hash_file, older).unwrap();
+
+            assert!(!check_install_state_with_content(p, pkg).up_to_date);
+            assert!(!check_install_state(p).up_to_date);
+        }
+    }
+
+    #[test]
+    fn a_project_installed_under_earlier_install_script_rules_is_not_up_to_date() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let pkg = r#"{"dependencies":{}}"#;
+        fs::write(p.join("package.json"), pkg).unwrap();
+        fs::write(p.join("lpm.lock"), "").unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let hash = check_install_state_with_content(p, pkg).hash.unwrap();
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::default()).unwrap();
+        assert!(check_install_state_with_content(p, pkg).up_to_date);
+
+        let hash_file = p.join(".lpm").join("install-hash");
+        let written = fs::read_to_string(&hash_file).unwrap();
+        for earlier in ["", "r:1\n"] {
+            let older: String = written
+                .lines()
+                .filter(|line| !line.starts_with("r:"))
                 .map(|line| format!("{line}\n"))
                 .chain([earlier.to_owned()])
                 .collect();

@@ -374,8 +374,36 @@ const NODE_GYP_COMMANDS: &[&str] = &[
     "node-pre-gyp",
 ];
 
-static GYP_COMMAND_EXPANSION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<!@?\(([^)]*)\)").expect("valid gyp command expansion regex"));
+/// Where gyp runs something as it reads a file: `<!(…)`, the same with
+/// `>` or `^` for a variable expanded later, each also with `@` for a
+/// list. `pymod_do_main` imports a Python module instead of running a
+/// command.
+static GYP_COMMAND_EXPANSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[<>^]!@?(pymod_do_main)?\(").expect("valid gyp command expansion regex")
+});
+
+/// A `.gypi` file a `binding.gyp` includes is read as part of it.
+static GYP_INCLUDES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"['"]includes['"]\s*:"#).expect("valid gyp includes regex"));
+
+/// What an expansion holds up to the bracket that closes it, counting the
+/// brackets inside as gyp does; `None` when it never closes.
+fn balanced_argument(rest: &[u8]) -> Option<&[u8]> {
+    let mut depth = 1_usize;
+    for (index, byte) in rest.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 static GYP_SCRIPT_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"['"]([^'"\s]+\.(?:js|cjs|mjs|ts|sh))['"]"#).expect("valid gyp script path regex")
@@ -387,13 +415,25 @@ fn scan_binding_gyp(root: &Path, dir: &Path, entries: &mut BTreeSet<PathBuf>, re
         &root.join(&gyp),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) else {
+        // No `binding.gyp` runs nothing. One that can't be read may.
+        reach.incomplete |= root.join(&gyp).symlink_metadata().is_ok();
         return;
     };
     let source = path_to_slash_string(&gyp);
-    scan_bytes(content.as_bytes(), &source, reach);
-    for capture in GYP_COMMAND_EXPANSION.captures_iter(content.as_bytes()) {
-        let command = String::from_utf8_lossy(&capture[1]);
-        record_if_red(reach, &source, &command);
+    let bytes = content.as_bytes();
+    scan_bytes(bytes, &source, reach);
+    // What an included file runs isn't followed.
+    reach.incomplete |= GYP_INCLUDES.is_match(bytes);
+    for expansion in GYP_COMMAND_EXPANSION.captures_iter(bytes) {
+        let opened = expansion.get(0).expect("the whole match").end();
+        match balanced_argument(&bytes[opened..]) {
+            Some(command) if expansion.get(1).is_none() => {
+                record_if_red(reach, &source, &String::from_utf8_lossy(command));
+            }
+            // A Python module of the package runs as gyp imports it, and
+            // an expansion that never closes is one gyp reads otherwise.
+            _ => reach.incomplete = true,
+        }
     }
     for capture in GYP_SCRIPT_PATH.captures_iter(content.as_bytes()) {
         let path = String::from_utf8_lossy(&capture[1]);
@@ -1232,6 +1272,56 @@ mod tests {
                 command: "bun install".into(),
             }]
         );
+    }
+
+    fn scan_of_binding_gyp(binding_gyp: &str) -> ScriptReach {
+        scan(
+            serde_json::json!({"name":"x","scripts":{"install":"node-gyp rebuild"}}),
+            &[("binding.gyp", binding_gyp)],
+        )
+    }
+
+    #[test]
+    fn every_form_of_gyp_command_expansion_is_read_to_its_closing_bracket() {
+        for expansion in [
+            "<!(bun install)",
+            "<!@(bun install)",
+            ">!(bun install)",
+            "^!@(bun install)",
+        ] {
+            let reach = scan_of_binding_gyp(&format!("{{'variables':{{'v':'{expansion}'}}}}\n"));
+            assert!(
+                reach.findings.contains(&ReachFinding::RunsRedCommand {
+                    source: "binding.gyp".into(),
+                    command: "bun install".into(),
+                }),
+                "{expansion}: {:?}",
+                reach.findings
+            );
+        }
+
+        let nested =
+            scan_of_binding_gyp("{'variables':{'v':'<!(bun install --cwd $(dirname x))'}}\n");
+        assert!(
+            nested.findings.contains(&ReachFinding::RunsRedCommand {
+                source: "binding.gyp".into(),
+                command: "bun install --cwd $(dirname x)".into(),
+            }),
+            "{:?}",
+            nested.findings
+        );
+    }
+
+    #[test]
+    fn what_a_binding_gyp_runs_beyond_its_commands_leaves_the_scan_incomplete() {
+        assert!(!scan_of_binding_gyp("{'targets':[{'target_name':'x'}]}\n").incomplete);
+        for binding_gyp in [
+            "{'variables':{'v':'<!pymod_do_main(build_tools)'}}\n",
+            "{'includes':['common.gypi'],'targets':[]}\n",
+            "{'variables':{'v':'<!(bun install'}}\n",
+        ] {
+            assert!(scan_of_binding_gyp(binding_gyp).incomplete, "{binding_gyp}");
+        }
     }
 
     #[test]

@@ -4,9 +4,10 @@
 /// shims it links on Windows, and the schema of its store keys.
 fn current_hash_file(hash: &str) -> String {
     format!(
-        "{hash}\ns:{}\nk:{}\n",
+        "{hash}\ns:{}\nk:{}\nr:{}\n",
         lpm_linker::BIN_SHIM_FORMAT,
-        lpm_store::v2::GraphKey::SCHEMA_VERSION
+        lpm_store::v2::GraphKey::SCHEMA_VERSION,
+        lpm_security::INSTALL_SCRIPT_RULES
     )
 }
 
