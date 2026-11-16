@@ -725,6 +725,19 @@ fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
 
     assert!(cleanup.status.success(), "{cleanup:?}");
     assert_eq!(inheritance(), before, "after the cleanup");
+    // A file the script made inherited the run's entry from the project
+    // folder. The cleanup's write to it carries the file's inheritance,
+    // which must not bring that entry back.
+    let left: Vec<String> = saved_entries(&created)
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .rsplit(';')
+                .next()
+                .is_some_and(|trustee| trustee.starts_with("S-1-15-2-") && trustee.len() > 12)
+        })
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 /// A sandboxed run that is stopped rather than left to end. Whatever the

@@ -1955,7 +1955,9 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows_sys::Win32::Security::GetLengthSid;
     use windows_sys::Win32::Security::{
-        GetFileSecurityW, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+        GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     #[test]
@@ -2421,7 +2423,74 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// Whether `path`'s DACL is protected from its parent's entries, and
+    /// whether Windows keeps its inherited entries in step with them.
+    fn inheritance_of(path: &Path) -> (bool, bool) {
+        let descriptor = security_descriptor(path);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: the descriptor is live and both outputs are correctly typed.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorControl(
+                    descriptor.as_ptr().cast_mut().cast(),
+                    &mut control,
+                    &mut revision,
+                )
+            },
+            0
+        );
+        (
+            control & SE_DACL_PROTECTED != 0,
+            control & SE_DACL_AUTO_INHERITED != 0,
+        )
+    }
+
+    #[test]
+    fn a_change_leaves_a_descriptor_windows_wrote_with_its_inheritance_and_entries() {
+        let sid = create_or_reuse_appcontainer_sid("LpmDescriptorKeptTest").unwrap();
+        for protection in ["D:AI", "D:PAI"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let directory = tmp.path().join("directory");
+            std::fs::create_dir(&directory).unwrap();
+            let file = directory.join(".env");
+            std::fs::write(&file, "private content").unwrap();
+            set_test_dacl(&directory, &format!("{protection}(A;OICI;FA;;;WD)"));
+            set_test_dacl(&file, &format!("{protection}(A;;FA;;;WD)"));
+            let written = (protection == "D:PAI", true);
+            assert_eq!(inheritance_of(&directory), written, "{protection}");
+            assert_eq!(inheritance_of(&file), written, "{protection}");
+            let entries = (aces(&directory), aces(&file));
+
+            setup::update_ace(&directory, sid.0, Some((FILE_GENERIC_READ, 0))).unwrap();
+            assert_eq!(inheritance_of(&directory), written, "{protection}: a grant");
+            assert_ne!(aces(&directory), entries.0);
+            setup::update_ace(&directory, sid.0, None).unwrap();
+            assert_eq!(
+                inheritance_of(&directory),
+                written,
+                "{protection}: its removal"
+            );
+
+            setup::deny_appcontainer_read(&file, sid.0).unwrap();
+            assert_eq!(inheritance_of(&file), written, "{protection}: a denial");
+            assert!(denies(&file, sid.0));
+            setup::remove_appcontainer_read_deny(&file, sid.0).unwrap();
+            assert_eq!(inheritance_of(&file), written, "{protection}: its removal");
+
+            assert_eq!((aces(&directory), aces(&file)), entries, "{protection}");
+        }
+    }
+
+    /// Replaces `path`'s DACL with `sddl`'s, as Windows' own tools write
+    /// one: protected from the parent's entries when `sddl` says `P`, and
+    /// with the parent's inheritable entries added when it doesn't.
     fn set_test_dacl(path: &Path, sddl: &str) {
+        let protection = if sddl.starts_with("D:P") {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
@@ -2451,7 +2520,7 @@ mod tests {
                 SetNamedSecurityInfoW(
                     to_wide_with_nul(path.as_os_str()).as_ptr(),
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    DACL_SECURITY_INFORMATION | protection,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     dacl,
