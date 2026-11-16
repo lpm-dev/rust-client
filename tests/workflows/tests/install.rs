@@ -1341,14 +1341,11 @@ fn bare_install_builds_the_binding_gyp_beside_the_manifest_each_time() {
     }
 }
 
-/// With no `node-gyp` among the project's packages and none named by the
-/// caller, the build runs the one of the npm installed beside `node`.
+/// A Node under `host` with an npm beside it whose `node-gyp` records how
+/// it was run, and the directory that puts that Node on `PATH`.
 #[cfg(unix)]
-#[test]
-fn bare_install_builds_a_binding_gyp_with_the_node_gyp_of_the_npm_beside_node() {
-    let (project, _) = native_addon_project(r#"{ "name": "native-addon", "version": "1.0.0" }"#);
-    let host = tempfile::tempdir().unwrap();
-    let prefix = host.path().join("node's home");
+fn node_with_recording_npm_node_gyp(host: &std::path::Path) -> std::path::PathBuf {
+    let prefix = host.join("node's home");
     let node = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|directory| directory.join("node"))
         .find(|candidate| candidate.is_file())
@@ -1363,9 +1360,20 @@ fn bare_install_builds_a_binding_gyp_with_the_node_gyp_of_the_npm_beside_node() 
         r#"{ "name": "node-gyp", "version": "11.2.0" }"#,
     )
     .unwrap();
+    prefix.join("bin")
+}
+
+/// With no `node-gyp` among the project's packages and none named by the
+/// caller, the build runs the one of the npm installed beside `node`.
+#[cfg(unix)]
+#[test]
+fn bare_install_builds_a_binding_gyp_with_the_node_gyp_of_the_npm_beside_node() {
+    let (project, _) = native_addon_project(r#"{ "name": "native-addon", "version": "1.0.0" }"#);
+    let host = tempfile::tempdir().unwrap();
+    let node_bin = node_with_recording_npm_node_gyp(host.path());
 
     let output = lpm(&project)
-        .env("PATH", prefix.join("bin"))
+        .env("PATH", node_bin)
         .env_remove("npm_config_node_gyp")
         .args(["install", "--no-security-summary", "--no-skills"])
         .output()
@@ -1378,6 +1386,72 @@ fn bare_install_builds_a_binding_gyp_with_the_node_gyp_of_the_npm_beside_node() 
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(project.read_file("node-gyp.log"), "rebuild:install\n");
+}
+
+/// A script the project names gets npm's `node-gyp` as the implied build
+/// does: after the project's own commands, and giving way to the script
+/// the caller names.
+#[cfg(unix)]
+#[test]
+fn a_script_the_project_names_finds_the_node_gyp_of_the_npm_beside_node() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "native-addon",
+            "version": "1.0.0",
+            "scripts": { "install": "node-gyp rebuild", "compile": "node-gyp configure" }
+        }"#,
+    );
+    let host = tempfile::tempdir().unwrap();
+    let node_bin = node_with_recording_npm_node_gyp(host.path());
+    let run = |arguments: &[&str], named: Option<&std::path::Path>| {
+        let mut command = lpm(&project);
+        command.env("PATH", &node_bin).args(arguments);
+        match named {
+            Some(script) => command.env("npm_config_node_gyp", script),
+            None => command.env_remove("npm_config_node_gyp"),
+        };
+        let output = command.output().expect("failed to run lpm");
+        assert!(
+            output.status.success(),
+            "{arguments:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = project.read_file("node-gyp.log");
+        std::fs::remove_file(project.path().join("node-gyp.log")).unwrap();
+        log
+    };
+    let install = ["install", "--no-security-summary", "--no-skills"];
+
+    assert_eq!(run(&install, None), "rebuild:install\n");
+    assert_eq!(run(&["run", "compile"], None), "configure:compile\n");
+    let commands = project.cache_dir().join("node-gyp-bin");
+    let written: Vec<_> = std::fs::read_dir(&commands)
+        .unwrap_or_else(|error| panic!("{}: {error}", commands.display()))
+        .map(|entry| entry.unwrap().path().join("node-gyp"))
+        .collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert!(written[0].is_file(), "{written:?}");
+
+    project.write_file(
+        "named-node-gyp.js",
+        "require('fs').appendFileSync('node-gyp.log', `named ${process.argv.slice(2).join(' ')}\\n`);\n",
+    );
+    let named = project.path().join("named-node-gyp.js");
+    assert_eq!(run(&["run", "compile"], Some(&named)), "named configure\n");
+
+    let own = project.path().join("node_modules/.bin/node-gyp");
+    project.write_file(
+        "node_modules/.bin/node-gyp",
+        "#!/bin/sh\necho \"the project's own $*\" >> node-gyp.log\n",
+    );
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        run(&["run", "compile"], Some(&named)),
+        "the project's own configure\n"
+    );
 }
 
 #[test]

@@ -45,6 +45,8 @@ pub(crate) fn run() -> Result<()> {
         commands::cert::change_windows_root_store_through_helper,
     );
 
+    lpm_runner::node_gyp::offer_to_scripts();
+
     // Color policy must initialize BEFORE any styled output, including
     // the `--version` fast path (which prints an `update_check` notice)
     // and the bare-`lpm install` fast lane below (which prints a header
