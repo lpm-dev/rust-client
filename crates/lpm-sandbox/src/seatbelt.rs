@@ -341,11 +341,17 @@ pub(crate) fn render_profile_with_toolchain(
     // from files, so the `~/Library/Keychains` read deny doesn't cover them.
     // Denying the services keeps every binary a script runs away from them,
     // whatever its entitlements, which a check inside that binary couldn't.
-    // trustd stays reachable: HTTPS clients use it to verify certificates.
+    // The mark that follows lets a refused `lpm` say which sandbox refused it.
     out.push_str("(deny mach-lookup\n");
     for service in lpm_common::platform::MACOS_KEYCHAIN_MACH_SERVICES {
         out.push_str(&format!("  (global-name \"{service}\")\n"));
     }
+    out.push_str(&format!(
+        "  (global-name \"{}\")\n",
+        lpm_common::platform::MACOS_LIFECYCLE_SANDBOX_MARK
+            .to_str()
+            .expect("the mark is ASCII")
+    ));
     out.push_str(")\n");
     out.push_str("(allow sysctl-read)\n");
     out.push_str("(allow iokit-open)\n");
@@ -919,7 +925,8 @@ mod tests {
             "com.apple.securityd.sos",
             "com.apple.security.escrow-update",
             "com.apple.securityd.aps",
-            "com.apple.SecurityServer",
+            "com.apple.securityd.systemkeychain",
+            "dev.lpm.sandbox.lifecycle",
         ] {
             let deny = p
                 .find(&format!("(global-name \"{service}\")"))
@@ -929,9 +936,15 @@ mod tests {
                 "Seatbelt applies the last matching rule, so the {service} deny must follow the allow"
             );
         }
+        for service in ["com.apple.trustd", "com.apple.SecurityServer"] {
+            assert!(
+                !p.contains(service),
+                "{service} must stay reachable: HTTPS clients verify certificates and list the system roots through it"
+            );
+        }
         assert!(
-            !p.contains("com.apple.trustd"),
-            "certificate trust evaluation must stay reachable so HTTPS keeps working"
+            !p.contains("dev.lpm.sandbox.lifecycle.member"),
+            "the mark's sibling stays allowed, which no deny-by-default profile does"
         );
     }
 
@@ -1517,6 +1530,13 @@ mod tests {
     /// Enforce body. Last-match-wins still applies — the deny
     /// overrides the permissive-with-report fallback for the named
     /// secret paths.
+    #[test]
+    fn scripts_cannot_read_a_keychain_file_kept_in_the_project() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.keychain$""#), "{p}");
+        assert!(p.contains(r#"#"^/home/u/proj/.*\.keychain-db$""#), "{p}");
+    }
+
     #[test]
     fn logonly_profile_inherits_secret_deny_block() {
         let p = render_logonly_profile(&spec(), false).unwrap();

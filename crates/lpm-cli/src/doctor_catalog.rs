@@ -1866,6 +1866,18 @@ pub static SANDBOX_UNSUPPORTED_PLATFORM: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static SANDBOX_LPM_HOME_REACHABLE: CheckEntry = CheckEntry {
+    code: "sandbox_lpm_home_reachable",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    tier: Tier::Extended,
+    description: "LPM_HOME is inside a home directory every lifecycle script can reach.",
+    when_fires: "LPM_HOME resolves inside `~/.cache`, `~/.node-gyp`, `~/.npm` or `~/.nvm/versions`. A script there could read or rewrite the package store, the local CA key and file-backed credentials, so LPM CLI runs no lifecycle script in the sandbox.",
+    remediation: "Move LPM_HOME out of `~/.cache`, `~/.node-gyp`, `~/.npm` and `~/.nvm/versions`, for example back to the default `~/.lpm`.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
 pub static SANDBOX_PROBE_FAILED: CheckEntry = CheckEntry {
     code: "sandbox_probe_failed",
     name: "Sandbox",
@@ -2235,6 +2247,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &SANDBOX_CONFIG_APPROVAL_REQUIRED,
     &SANDBOX_KERNEL_TOO_OLD,
     &SANDBOX_UNSUPPORTED_PLATFORM,
+    &SANDBOX_LPM_HOME_REACHABLE,
     &SANDBOX_PROBE_FAILED,
     &POLICY_FORCE_SECURITY_FLOOR,
     // Sigstore provenance posture

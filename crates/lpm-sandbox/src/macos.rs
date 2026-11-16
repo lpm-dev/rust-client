@@ -446,18 +446,21 @@ mod tests {
             .read_line(&mut ready)
             .unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
-        let data_protection = crate::seatbelt_tree::lookup_denied(pid, c"com.apple.securityd.xpc");
-        let file_keychains = crate::seatbelt_tree::lookup_denied(pid, c"com.apple.SecurityServer");
-        let trust = crate::seatbelt_tree::lookup_denied(pid, c"com.apple.trustd.agent");
+        let lookup = |name: &std::ffi::CStr| crate::seatbelt_tree::lookup_denied(pid, name);
+        let data_protection = lookup(c"com.apple.securityd.xpc");
+        let system_roots = lookup(c"com.apple.SecurityServer");
+        let trust = lookup(c"com.apple.trustd.agent");
+        let mark = lookup(lpm_common::platform::MACOS_LIFECYCLE_SANDBOX_MARK);
+        let member = lookup(lpm_common::platform::MACOS_LIFECYCLE_SANDBOX_MEMBER);
         let _ = child.kill();
         let _ = child.wait();
         let _ = crate::terminate_sandbox_tree(child.id());
 
         assert_eq!(ready.trim(), "ready");
         assert_eq!(
-            trust,
-            Some(false),
-            "certificate trust evaluation must stay reachable so HTTPS keeps working"
+            (trust, system_roots),
+            (Some(false), Some(false)),
+            "HTTPS clients must still verify certificates and list the system roots"
         );
         assert_eq!(
             data_protection,
@@ -465,9 +468,9 @@ mod tests {
             "a script could reach Data Protection keychain items through secd"
         );
         assert_eq!(
-            file_keychains,
-            Some(true),
-            "a script could reach file-based Keychain items through securityd"
+            (mark, member),
+            (Some(true), Some(false)),
+            "a refused lpm couldn't tell LPM's sandbox from another one"
         );
     }
 

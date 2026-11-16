@@ -372,7 +372,6 @@ pub fn timeline(
     filter: &Filter<'_>,
     reveal: bool,
 ) -> Result<Option<Timeline>, HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     with_opened(project_dir, Values::Needed, |parts, opened, values| {
         Ok(read_timeline(
             opened,
@@ -388,7 +387,6 @@ pub fn timeline(
 /// marker that can't be read is an error; history records that can't be
 /// read right now pause it.
 pub fn status(project_dir: &Path) -> Result<HistoryStatus, HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     let vault_id = project_vault_id(project_dir)?;
     let paused = |reason| HistoryStatus {
         state: HistoryState::Paused(reason),
@@ -489,7 +487,6 @@ pub struct Shown {
 
 /// The entry whose ID starts with `prefix`, in one read of history.
 pub fn show(project_dir: &Path, prefix_text: &str, reveal: bool) -> Result<Shown, HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     let prefix = prefix(prefix_text)?;
     with_opened(project_dir, Values::Unused, |parts, opened, _| {
         if reveal {
@@ -516,7 +513,6 @@ pub fn review_rollback(
     prefix_text: &str,
     choose: impl FnOnce(&EntryInfo) -> Result<Target, HistoryError>,
 ) -> Result<(EntryInfo, RollbackPlan), HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     let prefix = prefix(prefix_text)?;
     with_opened(project_dir, Values::Needed, |parts, opened, values| {
         plan_rollback(opened, parts, &values_of(values), &prefix, choose)
@@ -531,7 +527,6 @@ pub fn commit_rollback(
     plan: &RollbackPlan,
     choices: &Choices,
 ) -> Result<Vec<String>, HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     let vault_id = project_vault_id(project_dir)?;
     let project_name = crate::vault_id::read_project_name(project_dir);
     let project_path = project_dir
@@ -680,7 +675,6 @@ pub fn review_forget(
     prefix_text: &str,
     choose: impl FnOnce(&EntryInfo) -> Result<ChosenSide, HistoryError>,
 ) -> Result<(EntryInfo, RemovalReview), HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     let prefix = prefix(prefix_text)?;
     with_opened(project_dir, Values::Needed, |parts, opened, values| {
         review_removal_for(opened, parts, &values_of(values), &prefix, choose)
@@ -695,7 +689,6 @@ pub fn forget(
     review: &RemovalReview,
     selection: &BTreeSet<usize>,
 ) -> Result<(), HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     let vault_id = project_vault_id(project_dir)?;
     let result = in_history_lock(|directory| {
         crate::authorize_companion(directory, &vault_id, Operation::Write)?;
@@ -739,13 +732,11 @@ pub fn forget(
 /// transaction. Works when history is damaged or newer than this client,
 /// but not when the project itself is refused.
 pub fn turn_off(project_dir: &Path) -> Result<(), HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     switch(project_dir, true)
 }
 
 /// Turn history back on; it starts empty at the next change.
 pub fn turn_on(project_dir: &Path) -> Result<(), HistoryError> {
-    let _prompt = crate::approval_prompt::naming_project(project_dir);
     switch(project_dir, false)
 }
 

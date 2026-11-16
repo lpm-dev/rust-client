@@ -726,6 +726,22 @@ pub enum SandboxError {
         /// Which field violated what invariant.
         reason: String,
     },
+
+    /// The LPM home lies in a home directory every sandboxed script can
+    /// reach, so a script could read or rewrite the package store, the local
+    /// CA key and file-backed credentials.
+    #[error(
+        "LPM_HOME {} is inside ~/{grant}, which lifecycle scripts can reach, so a script \
+         could read or rewrite LPM's store, local CA key and credentials. Move LPM_HOME out \
+         of ~/.cache, ~/.node-gyp, ~/.npm and ~/.nvm/versions.",
+        lpm_home.display()
+    )]
+    LpmHomeReachable {
+        /// The LPM home, resolved.
+        lpm_home: PathBuf,
+        /// The home directory it lies in, such as `.cache`.
+        grant: &'static str,
+    },
 }
 
 /// Trait every platform backend implements.
@@ -807,6 +823,7 @@ pub fn new_for_platform_with_options(
 
     validate_spec(&spec)?;
     config::validate_project_state_boundary(&spec, options.build_cache_isolation)?;
+    config::validate_lpm_home_outside_script_grants(&spec, options.build_cache_isolation)?;
     if !options.build_cache_isolation {
         prepare_package_write_dirs(&spec)?;
     }
@@ -1260,7 +1277,6 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
         }
     }
     config::validate_builtin_write_dirs(spec)?;
-    config::validate_lpm_home_outside_script_grants(spec)?;
     for path in &spec.secret_read_allow {
         config::validate_read_file(&spec.project_dir, path)?;
     }
@@ -1656,11 +1672,35 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let home = std::fs::canonicalize(tmp.path()).unwrap();
             let lpm_home = home.join(grant).join("lpm");
-            let error = validate_spec(&spec_with_lpm_home(&home, &lpm_home))
-                .expect_err("scripts could read or rewrite LPM's store, CA key and credentials")
-                .to_string();
-            assert!(error.contains("LPM_HOME"), "{grant}: {error}");
-            assert!(error.contains(grant), "{grant}: {error}");
+            let error = config::validate_lpm_home_outside_script_grants(
+                &spec_with_lpm_home(&home, &lpm_home),
+                false,
+            )
+            .expect_err("scripts could read or rewrite LPM's store, CA key and credentials");
+            assert!(
+                matches!(&error, SandboxError::LpmHomeReachable { grant: reached, .. } if *reached == grant),
+                "{grant}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_cache_isolated_script_refuses_only_the_lpm_homes_it_can_still_reach() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        for grant in [".cache", ".npm"] {
+            config::validate_lpm_home_outside_script_grants(
+                &spec_with_lpm_home(&home, &home.join(grant).join("lpm")),
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{grant} isn't granted under isolation: {error}"));
+        }
+        for grant in [".node-gyp", ".nvm/versions"] {
+            config::validate_lpm_home_outside_script_grants(
+                &spec_with_lpm_home(&home, &home.join(grant).join("lpm")),
+                true,
+            )
+            .expect_err(grant);
         }
     }
 
@@ -1672,17 +1712,26 @@ mod tests {
         let real = home.join(".cache").join("lpm");
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, home.join(".lpm")).unwrap();
-        let error = validate_spec(&spec_with_lpm_home(&home, &home.join(".lpm")))
-            .expect_err("the link leads LPM_HOME into ~/.cache")
-            .to_string();
-        assert!(error.contains("LPM_HOME"), "{error}");
+        let error = config::validate_lpm_home_outside_script_grants(
+            &spec_with_lpm_home(&home, &home.join(".lpm")),
+            false,
+        )
+        .expect_err("the link leads LPM_HOME into ~/.cache");
+        assert!(
+            matches!(error, SandboxError::LpmHomeReachable { .. }),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_script_is_sandboxed_with_lpm_home_in_its_default_place() {
         let tmp = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(tmp.path()).unwrap();
-        validate_spec(&spec_with_lpm_home(&home, &home.join(".lpm"))).unwrap();
+        config::validate_lpm_home_outside_script_grants(
+            &spec_with_lpm_home(&home, &home.join(".lpm")),
+            false,
+        )
+        .unwrap();
     }
 
     fn hoisted_spec(project: &Path, name: &str) -> SandboxSpec {

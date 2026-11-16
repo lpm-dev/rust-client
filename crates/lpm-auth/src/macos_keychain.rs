@@ -67,24 +67,31 @@ fn identity(service: &str, account: &str, scope: Scope) -> Vec<(CFString, CFType
 }
 
 /// `OSStatus <code>: <Security.framework message>`, keeping the raw status
-/// searchable even when the framework has no message for it, or why the
-/// Keychain is closed when LPM's lifecycle-script sandbox denies it.
+/// searchable even when the framework has no message for it, or which
+/// sandbox closes the Keychain when one denies it.
 pub(super) fn describe(error: Error) -> String {
-    describe_in(
-        error,
-        lpm_common::platform::macos_keychain_denied_by_sandbox(),
-    )
+    describe_in(error, lpm_common::platform::macos_keychain_denial())
 }
 
 /// Every Keychain call fails once a sandbox denies its services, so the
 /// sandbox outranks whatever status the failure carries.
-fn describe_in(error: Error, keychain_denied_by_sandbox: bool) -> String {
-    if keychain_denied_by_sandbox {
-        return "LPM's lifecycle-script sandbox closes the macOS Keychain, so registry \
-                credentials can't be read from a package's install script"
-            .to_owned();
-    }
+fn describe_in(error: Error, denial: Option<lpm_common::platform::MacosKeychainDenial>) -> String {
+    use lpm_common::platform::MacosKeychainDenial;
     let code = error.code();
+    match denial {
+        Some(MacosKeychainDenial::LifecycleSandbox) => {
+            return "LPM's lifecycle-script sandbox closes the macOS Keychain, so registry \
+                    credentials can't be used from a package's install script"
+                .to_owned();
+        }
+        Some(MacosKeychainDenial::OtherSandbox) => {
+            return format!(
+                "a sandbox around this process closes the macOS Keychain (OSStatus {code}), so \
+                 registry credentials can't be used here; run lpm outside it"
+            );
+        }
+        None => {}
+    }
     match error.message() {
         Some(message) => format!("OSStatus {code}: {message}"),
         None => format!("OSStatus {code}"),
@@ -206,15 +213,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_keychain_failure_inside_lpms_sandbox_says_the_sandbox_closed_the_keychain() {
-        let message = describe_in(Error::from_code(-25291), true);
-        assert!(message.contains("sandbox"), "{message}");
-        assert!(!message.contains("OSStatus"), "{message}");
+    fn a_keychain_failure_inside_lpms_sandbox_says_its_install_script_sandbox_closed_the_keychain()
+    {
+        let message = describe_in(
+            Error::from_code(-25291),
+            Some(lpm_common::platform::MacosKeychainDenial::LifecycleSandbox),
+        );
+        assert!(message.contains("install script"), "{message}");
+    }
+
+    #[test]
+    fn a_keychain_failure_inside_another_sandbox_names_no_install_script_and_keeps_its_status() {
+        let message = describe_in(
+            Error::from_code(-25291),
+            Some(lpm_common::platform::MacosKeychainDenial::OtherSandbox),
+        );
+        assert!(!message.contains("install script"), "{message}");
+        assert!(message.contains("-25291"), "{message}");
     }
 
     #[test]
     fn a_keychain_failure_outside_a_sandbox_keeps_its_status() {
-        assert!(describe_in(Error::from_code(-25291), false).starts_with("OSStatus -25291"));
+        assert!(describe_in(Error::from_code(-25291), None).starts_with("OSStatus -25291"));
     }
 
     #[test]

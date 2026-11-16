@@ -1145,11 +1145,15 @@ pub(crate) fn validate_builtin_write_dirs(spec: &crate::SandboxSpec) -> Result<(
     validate_real_dirs(&spec.home_dir, &home_names)
 }
 
-/// The home directories every sandboxed script reaches without configuration:
-/// it may write the first three and read the last.
+/// The home directories every sandboxed script reaches without
+/// configuration: it may write the first three and read the last.
 const HOME_SCRIPT_GRANTS: [&str; 4] = [".cache", ".node-gyp", ".npm", ".nvm/versions"];
 
-/// Fails when the LPM home lies in a home directory every script reaches.
+/// The home directories a script still reads while it builds an artifact
+/// for the native build cache, which keeps its writes package-local.
+const ISOLATED_HOME_SCRIPT_GRANTS: [&str; 2] = [".node-gyp", ".nvm/versions"];
+
+/// Fails when the LPM home lies in a home directory the script can reach.
 ///
 /// The LPM home holds the store every package runs from, the local CA key and
 /// file-backed credentials, so a home inside one of those directories would
@@ -1157,22 +1161,21 @@ const HOME_SCRIPT_GRANTS: [&str; 4] = [".cache", ".node-gyp", ".npm", ".nvm/vers
 /// home are already rejected; this holds the built-in grants to the same rule.
 pub(crate) fn validate_lpm_home_outside_script_grants(
     spec: &crate::SandboxSpec,
+    build_cache_isolation: bool,
 ) -> Result<(), SandboxError> {
     let Some(lpm_home) = spec.store_root.parent() else {
         return Ok(());
     };
     let lpm_home = lpm_common::canonical_identity(lpm_home);
-    for grant in HOME_SCRIPT_GRANTS {
+    let grants: &[&'static str] = if build_cache_isolation {
+        &ISOLATED_HOME_SCRIPT_GRANTS
+    } else {
+        &HOME_SCRIPT_GRANTS
+    };
+    for &grant in grants {
         let granted = lpm_common::canonical_identity(&spec.home_dir.join(grant));
         if lpm_home.starts_with(&granted) {
-            return Err(SandboxError::InvalidSpec {
-                reason: format!(
-                    "LPM_HOME {home} is inside ~/{grant}, which lifecycle scripts can reach, so \
-                     a script could read or rewrite LPM's store, local CA key and credentials. \
-                     Move LPM_HOME out of ~/.cache, ~/.node-gyp, ~/.npm and ~/.nvm/versions.",
-                    home = lpm_home.display(),
-                ),
-            });
+            return Err(SandboxError::LpmHomeReachable { lpm_home, grant });
         }
     }
     Ok(())

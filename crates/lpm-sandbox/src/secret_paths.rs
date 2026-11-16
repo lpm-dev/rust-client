@@ -107,4 +107,6 @@ pub(crate) const SECRET_FILE_EXTENSIONS: &[&str] = &[
     ".tfstate",
     ".tfvars",
     ".tfvars.json",
+    ".keychain",
+    ".keychain-db",
 ];
