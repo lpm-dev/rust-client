@@ -59,6 +59,9 @@ impl BundledNodeGyp {
         if !script.is_file() || !script.starts_with(&modules) {
             return None;
         }
+        // Node can't start a script named with the prefix a resolved path
+        // carries on Windows.
+        let script = lpm_common::symlink::windows_plain_path(&script);
         let manifest = lpm_common::read_file_capped(
             &package.join("package.json"),
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
@@ -176,7 +179,11 @@ pub(super) mod tests {
         let found = BundledNodeGyp::beside_node_on(&path).unwrap();
 
         assert!(found.script.ends_with("node-gyp/bin/node-gyp.js"));
-        assert!(found.script.starts_with(&found.modules));
+        assert!(
+            found
+                .script
+                .starts_with(lpm_common::symlink::windows_plain_path(&found.modules))
+        );
         assert!(found.modules.ends_with("npm/node_modules"));
         assert_eq!(found.version, "11.2.0");
     }

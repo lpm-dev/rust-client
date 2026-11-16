@@ -4191,6 +4191,9 @@ fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_p
         ),
     ]);
     let offered = tools.node_gyp.as_ref().unwrap();
+    // A script's `PATH` names LPM's own directories without the prefix a
+    // resolved path carries on Windows.
+    let plain = |path: &Path| lpm_common::symlink::windows_plain_path(path);
     let environment = |project_bins| {
         super::script_execution::build_lifecycle_environment(
             &parent,
@@ -4207,9 +4210,9 @@ fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_p
     assert_eq!(
         path,
         [
-            tools.bin_dir.clone(),
+            plain(&tools.bin_dir),
             project.join("node_modules").join(".bin"),
-            offered.command_dir.clone(),
+            plain(&offered.command_dir),
             caller.clone(),
         ]
     );
@@ -4223,7 +4226,7 @@ fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_p
     let path: Vec<_> = std::env::split_paths(&values_of(&green, "PATH")[0]).collect();
     assert_eq!(
         path,
-        [tools.bin_dir.clone(), offered.command_dir.clone(), caller]
+        [plain(&tools.bin_dir), plain(&offered.command_dir), caller]
     );
 }
 
