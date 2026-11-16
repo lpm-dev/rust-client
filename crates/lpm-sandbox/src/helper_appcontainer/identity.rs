@@ -776,6 +776,15 @@ mod tests {
         let project = locked.join("project");
         std::fs::create_dir_all(&project).unwrap();
         lock_directory_for_test(&locked);
+        // The lock took away every entry `project` inherited, and the run
+        // has to open it to reach `locked` as a directory above it.
+        let user = setup::current_user_sid().unwrap();
+        let granted = std::process::Command::new("icacls.exe")
+            .arg(&project)
+            .args(["/grant", &format!("*{user}:(OI)(CI)F")])
+            .output()
+            .unwrap();
+        assert!(granted.status.success(), "{granted:?}");
         let args = crate::helper_protocol::parse_argv(
             [
                 "--protocol-version",
