@@ -753,7 +753,8 @@ mod integration_tests {
         }
         let body = resp.text().await.unwrap();
         assert!(
-            body.contains("sessionStorage.setItem(\"lpm_inspector_token\""),
+            body.contains("var KEY = \"lpm_inspector_token\"")
+                && body.contains("sessionStorage.setItem(KEY, token)"),
             "expected SPA bootstrap to set sessionStorage; body sample: {}",
             &body[..body.len().min(400)]
         );
@@ -825,7 +826,12 @@ mod integration_tests {
                 reqwest::StatusCode::MISDIRECTED_REQUEST,
                 "a page that rebinds its own hostname to loopback reached {path}"
             );
-            assert!(!resp.text().await.unwrap().contains(state.auth_token()));
+            let body = resp.text().await.unwrap();
+            assert!(!body.contains(state.auth_token()));
+            assert!(
+                body.contains(&format!("http://127.0.0.1:{port}/")),
+                "the refusal says where the inspector answers: {body}"
+            );
         }
         for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
             let resp = client
@@ -837,6 +843,26 @@ mod integration_tests {
             assert_eq!(resp.status(), 200, "{host}");
         }
 
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_inspector_refuses_a_request_that_names_no_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = InspectorState::new(3000);
+        let handle = crate::start(state.clone(), 0).await.expect("start");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.0 421"), "{response}");
+        assert!(!response.contains(state.auth_token()));
         handle.shutdown().await.unwrap();
     }
 

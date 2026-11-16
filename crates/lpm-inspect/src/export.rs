@@ -19,11 +19,21 @@ use std::collections::HashMap;
 
 // ── cURL Export ───────────────────────────────────────────────────────
 
-/// Escape a string for safe interpolation inside a single-quoted POSIX
-/// shell word. `'foo'\''bar'` is the canonical POSIX way to embed a
-/// literal `'`: close the quoted run, emit `\'`, reopen the quoted run.
+/// Escape a string for safe interpolation inside a single-quoted shell
+/// word: each `'` closes the quoted run, emits `\'` and reopens it, the
+/// canonical POSIX form. A backslash is taken out of the quotes the same
+/// way, as `\\`, because fish reads `\'` inside single quotes as an
+/// escaped quote, which would let a value close the word early.
 fn shell_single_quote_escape(s: &str) -> String {
-    s.replace('\'', "'\\''")
+    let mut escaped = String::with_capacity(s.len());
+    for character in s.chars() {
+        match character {
+            '\'' => escaped.push_str("'\\''"),
+            '\\' => escaped.push_str("'\\\\'"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 /// `s` as one shell word: bare when it holds only characters no shell
@@ -51,8 +61,9 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
     // path like `/hook'; touch /tmp/pwn #` would close our single-
     // quoted argument and execute arbitrary shell when pasted.
     let url_escaped = shell_single_quote_escape(url);
+    // `--url` keeps a URL starting with `-` from being read as an option.
     let mut parts = vec![format!(
-        "curl -X {} '{}'",
+        "curl -X {} --url '{}'",
         shell_word(&webhook.method),
         url_escaped
     )];
@@ -64,7 +75,12 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
     for (key, value) in headers {
         let lower = key.to_lowercase();
         // Skip hop-by-hop headers that curl manages
-        if lower == "host" || lower == "content-length" || lower == "transfer-encoding" {
+        // curl reads `-H @<file>` as a file of headers.
+        if lower == "host"
+            || lower == "content-length"
+            || lower == "transfer-encoding"
+            || key.starts_with('@')
+        {
             continue;
         }
         // Both header NAME and VALUE flow from the captured request,
@@ -81,9 +97,17 @@ pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
             // Try to compact JSON for readability
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
                 let compact = serde_json::to_string(&json).unwrap_or_else(|_| body_str.to_string());
-                parts.push(format!("  -d '{}'", shell_single_quote_escape(&compact)));
+                parts.push(format!(
+                    "  --data-raw '{}'",
+                    shell_single_quote_escape(&compact)
+                ));
             } else {
-                parts.push(format!("  -d '{}'", shell_single_quote_escape(body_str)));
+                // `--data-raw`, unlike `-d`, sends a body starting with `@`
+                // as text instead of uploading the file it names.
+                parts.push(format!(
+                    "  --data-raw '{}'",
+                    shell_single_quote_escape(body_str)
+                ));
             }
         } else {
             // Binary body — use base64 with decode pipe. Base64 output
@@ -294,13 +318,24 @@ pub fn to_provider_cli(webhook: &CapturedWebhook) -> Option<String> {
     match provider {
         lpm_tunnel::webhook::WebhookProvider::Stripe => {
             let event = event_type.unwrap_or("charge.succeeded".to_string());
-            Some(format!("stripe trigger {}", shell_word(&event)))
+            is_stripe_event_name(&event).then(|| format!("stripe trigger {event}"))
         }
         lpm_tunnel::webhook::WebhookProvider::GitHub => {
             Some("gh api repos/OWNER/REPO/dispatches -f event_type=webhook_test".to_string())
         }
         _ => None,
     }
+}
+
+/// Stripe event names are lowercase words joined by `.` and `_`. Anything
+/// else, such as a type starting with `-`, would reach `stripe trigger` as
+/// something other than an event.
+fn is_stripe_event_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['.', '_'])
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_')
+        })
 }
 
 fn extract_event_type(webhook: &CapturedWebhook) -> Option<String> {
@@ -363,10 +398,10 @@ mod tests {
     fn curl_basic() {
         let wh = make_webhook();
         let curl = to_curl(&wh, None);
-        assert!(curl.starts_with("curl -X POST '/api/webhook/stripe'"));
+        assert!(curl.starts_with("curl -X POST --url '/api/webhook/stripe'"));
         assert!(curl.contains("-H 'content-type: application/json'"));
         assert!(curl.contains("-H 'stripe-signature: t=123,v1=abc'"));
-        assert!(curl.contains("-d '"));
+        assert!(curl.contains("--data-raw '"));
         assert!(curl.contains("charge.succeeded"));
     }
 
@@ -394,7 +429,51 @@ mod tests {
         let mut wh = make_webhook();
         wh.request_body = Vec::new();
         let curl = to_curl(&wh, None);
-        assert!(!curl.contains("-d "));
+        assert!(!curl.contains("--data"));
+    }
+
+    #[test]
+    fn curl_sends_a_body_starting_with_at_as_text_rather_than_a_file() {
+        let mut wh = make_webhook();
+        wh.request_body = b"@/Users/me/.aws/credentials".to_vec();
+        let curl = to_curl(&wh, None);
+        assert!(
+            curl.contains("--data-raw '@/Users/me/.aws/credentials'"),
+            "{curl}"
+        );
+        assert!(!curl.contains(" -d "), "{curl}");
+    }
+
+    #[test]
+    fn curl_passes_the_url_as_an_option_value_so_a_path_cannot_become_an_option() {
+        let mut wh = make_webhook();
+        wh.path = "-K/tmp/config".to_string();
+        let curl = to_curl(&wh, None);
+        assert!(
+            curl.starts_with("curl -X POST --url '-K/tmp/config'"),
+            "{curl}"
+        );
+    }
+
+    #[test]
+    fn curl_leaves_out_a_header_whose_name_would_make_curl_read_a_file() {
+        let mut wh = make_webhook();
+        wh.request_headers
+            .insert("@/etc/passwd".to_string(), String::new());
+        let curl = to_curl(&wh, None);
+        assert!(!curl.contains("@/etc/passwd"), "{curl}");
+    }
+
+    #[test]
+    fn curl_keeps_backslashes_outside_single_quotes_for_shells_that_read_them_there() {
+        let mut wh = make_webhook();
+        wh.request_headers
+            .insert("x-test".to_string(), r"\'; touch /tmp/pwned #".to_string());
+        let curl = to_curl(&wh, None);
+        assert!(
+            curl.contains(r"-H 'x-test: '\\''\''; touch /tmp/pwned #'"),
+            "{curl}"
+        );
     }
 
     #[test]
@@ -550,21 +629,24 @@ mod tests {
         wh.method = "POST$(touch pwned)".to_string();
         let curl = to_curl(&wh, None);
         assert!(
-            curl.starts_with("curl -X 'POST$(touch pwned)' '/api/webhook/stripe'"),
+            curl.starts_with("curl -X 'POST$(touch pwned)' --url '/api/webhook/stripe'"),
             "{curl}"
         );
     }
 
     #[test]
-    fn provider_cli_quotes_a_stripe_event_carrying_shell_syntax() {
+    fn provider_cli_offers_no_command_for_a_type_that_is_not_a_stripe_event_name() {
         let mut wh = make_webhook();
-        wh.request_body = br#"{"type":"charge.succeeded; touch pwned"}"#.to_vec();
-        assert_eq!(
-            to_provider_cli(&wh).unwrap(),
-            "stripe trigger 'charge.succeeded; touch pwned'"
-        );
-        wh.request_body = br#"{"type":"it's"}"#.to_vec();
-        assert_eq!(to_provider_cli(&wh).unwrap(), r"stripe trigger 'it'\''s'");
+        for event_type in [
+            "charge.succeeded; touch pwned",
+            "--api-key=sk_live_x",
+            "it's",
+        ] {
+            wh.request_body = serde_json::json!({ "type": event_type })
+                .to_string()
+                .into_bytes();
+            assert_eq!(to_provider_cli(&wh), None, "{event_type}");
+        }
     }
 
     // ── Provider CLI ────────────────────────────────────────

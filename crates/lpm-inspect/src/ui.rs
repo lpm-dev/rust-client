@@ -28,16 +28,15 @@ struct Assets;
 pub async fn serve_ui(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
-    let file = if path.is_empty() {
-        Assets::get("index.html")
-    } else {
-        Assets::get(path).or_else(|| Assets::get("index.html"))
+    let (served, file) = match Assets::get(path).filter(|_| !path.is_empty()) {
+        Some(file) => (path, Some(file)),
+        None => ("index.html", Assets::get("index.html")),
     };
 
     let Some(content) = file else {
         return html_response(include_str!("inspector_ui.html"));
     };
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let mime = mime_guess::from_path(served).first_or_octet_stream();
     let bytes = content.data.into_owned();
     if mime.type_() == mime_guess::mime::TEXT && mime.subtype() == mime_guess::mime::HTML {
         return html_response(&String::from_utf8_lossy(&bytes));
@@ -98,11 +97,10 @@ fn content_security_policy(nonce: &str) -> String {
     )
 }
 
-/// `html` with the bootstrap as the first script the browser runs, and
-/// every script tag carrying `nonce`.
+/// `html` with the bootstrap as the first script the browser runs, right
+/// after the `<head>` start tag, and every script start tag carrying `nonce`.
 fn render_page(html: &str, nonce: &str) -> String {
-    let at = html
-        .find("</head>")
+    let at = head_content_start(html)
         .or_else(|| html.find("<body"))
         .unwrap_or(0);
     let mut page = String::with_capacity(html.len() + BOOTSTRAP.len() + 128);
@@ -116,52 +114,115 @@ fn render_page(html: &str, nonce: &str) -> String {
     page
 }
 
-/// Appends `html` with `nonce` added to each script start tag.
+/// Where the `<head>` element's content begins, past its start tag. A tag
+/// such as `<header>` shares the prefix but isn't the head.
+fn head_content_start(html: &str) -> Option<usize> {
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("<head") {
+        let name_end = from + found + "<head".len();
+        if lower[name_end..].starts_with(['>', ' ', '\t', '\n', '\r', '/']) {
+            return lower[name_end..]
+                .find('>')
+                .map(|close| name_end + close + 1);
+        }
+        from = name_end;
+    }
+    None
+}
+
+/// Appends `html` with `nonce` added to each script start tag, matched in any
+/// case. A script's own text runs to its end tag untouched, so `"<script>"`
+/// inside JavaScript stays as written.
 fn push_with_nonce(page: &mut String, html: &str, nonce: &str) {
     const OPEN: &str = "<script";
-    let mut rest = html;
-    while let Some(at) = rest.find(OPEN) {
-        let (before, after) = rest.split_at(at + OPEN.len());
-        page.push_str(before);
-        if after.starts_with(['>', ' ', '\t', '\n', '\r']) {
-            page.push_str(" nonce=\"");
-            page.push_str(nonce);
-            page.push('"');
+    const CLOSE: &str = "</script";
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find(OPEN) {
+        let name_end = from + found + OPEN.len();
+        page.push_str(&html[from..name_end]);
+        from = name_end;
+        if !lower[name_end..].starts_with(['>', ' ', '\t', '\n', '\r', '/']) {
+            continue;
         }
-        rest = after;
+        page.push_str(" nonce=\"");
+        page.push_str(nonce);
+        page.push('"');
+        let script_end = lower[name_end..]
+            .find(CLOSE)
+            .map_or(html.len(), |close| name_end + close);
+        page.push_str(&html[name_end..script_end]);
+        from = script_end;
     }
-    page.push_str(rest);
+    page.push_str(&html[from..]);
 }
 
 const BOOTSTRAP: &str = r#"
 (function () {
   var KEY = "lpm_inspector_token";
   var T = null;
-  try {
-    var u = new URL(window.location.href);
-    var given = new URLSearchParams(u.hash.slice(1)).get("token") || u.searchParams.get("token");
-    if (given) {
-      sessionStorage.setItem("lpm_inspector_token", given);
+  function suppliedToken() {
+    try {
+      var u = new URL(window.location.href);
+      return new URLSearchParams(u.hash.slice(1)).get("token") || u.searchParams.get("token");
+    } catch (_) { return null; }
+  }
+  function forgetSuppliedToken() {
+    try {
+      var u = new URL(window.location.href);
       u.searchParams.delete("token");
       window.history.replaceState(null, "", u.pathname + u.search);
-    }
-    T = sessionStorage.getItem(KEY);
-  } catch (_) {}
+    } catch (_) {}
+  }
+  function remember(token) {
+    try { sessionStorage.setItem(KEY, token); return true; } catch (_) { return false; }
+  }
+
+  var supplied = suppliedToken();
+  if (supplied) {
+    T = supplied;
+    forgetSuppliedToken();
+    remember(T);
+  } else {
+    try { T = sessionStorage.getItem(KEY); } catch (_) { T = null; }
+  }
+  Object.defineProperty(window, "lpmInspectorHasToken", { value: Boolean(T) });
+
+  // A link pasted into an open tab changes only the fragment, which doesn't
+  // load the page again. When the key can't be stored, the reload carries it
+  // in the fragment instead.
+  window.addEventListener("hashchange", function () {
+    var next = suppliedToken();
+    if (!next) return;
+    if (remember(next)) forgetSuppliedToken();
+    window.location.reload();
+  });
   if (!T) return;
 
   var origFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
     var url = typeof input === "string" ? input : (input && input.url) || "";
-    var sameOrigin = false;
-    try { sameOrigin = new URL(url, window.location.href).origin === window.location.origin; }
-    catch (_) { sameOrigin = false; }
-    if (sameOrigin && url.indexOf("/api/") !== -1) {
+    var api = false;
+    try {
+      var target = new URL(url, window.location.href);
+      api = target.origin === window.location.origin && target.pathname.indexOf("/api/") === 0;
+    } catch (_) { api = false; }
+    if (api) {
       init = init || {};
       var headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
       if (!headers.has("Authorization")) headers.set("Authorization", "Bearer " + T);
       init.headers = headers;
     }
-    return origFetch(input, init);
+    var response = origFetch(input, init);
+    if (!api) return response;
+    return response.then(function (r) {
+      if (r.status === 401) {
+        try { sessionStorage.removeItem(KEY); } catch (_) {}
+        window.dispatchEvent(new Event("lpm-inspector-unauthorized"));
+      }
+      return r;
+    });
   };
 
   if (typeof window.EventSource === "function") {
@@ -209,7 +270,57 @@ mod tests {
     }
 
     #[test]
-    fn nonces_are_unguessable_and_fit_the_policy_grammar() {
+    fn a_script_tag_inside_a_script_stays_text_and_tags_match_in_any_case() {
+        let page = render_page(
+            "<html><head></head><body><script>const t = \"<script>\";</script><SCRIPT>b()</SCRIPT><scripts></scripts></body></html>",
+            "N0nce",
+        );
+        assert!(page.contains("const t = \"<script>\";"), "{page}");
+        assert!(page.contains("<SCRIPT nonce=\"N0nce\">b()"), "{page}");
+        assert!(page.contains("<scripts>"), "{page}");
+        assert_eq!(page.matches("nonce=\"N0nce\"").count(), 3, "{page}");
+    }
+
+    #[test]
+    fn the_bootstrap_runs_before_any_script_in_the_head() {
+        let page = render_page(
+            "<html><head><header-like></header-like><script>early()</script></head><body></body></html>",
+            "N0nce",
+        );
+        let bootstrap = page.find("lpm_inspector_token").unwrap();
+        assert!(bootstrap < page.find("early()").unwrap(), "{page}");
+        assert!(page.find("<head>").unwrap() < bootstrap, "{page}");
+    }
+
+    #[test]
+    fn the_bootstrap_reloads_for_a_link_pasted_into_an_open_tab_and_reports_a_refused_key() {
+        assert!(BOOTSTRAP.contains("\"hashchange\""));
+        assert!(BOOTSTRAP.contains("lpm-inspector-unauthorized"));
+        assert!(BOOTSTRAP.contains("lpmInspectorHasToken"));
+    }
+
+    #[test]
+    fn every_control_in_the_page_names_an_action_the_page_defines() {
+        let page = include_str!("inspector_ui.html");
+        let used: std::collections::BTreeSet<&str> = page
+            .match_indices("data-action=\"")
+            .map(|(at, marker)| {
+                let rest = &page[at + marker.len()..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        let table = &page[page.find("const ACTIONS = {").unwrap()..];
+        let table = &table[..table.find("\n}").unwrap()];
+        let defined: std::collections::BTreeSet<&str> = table
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
+            .collect();
+        assert!(!used.is_empty());
+        assert_eq!(used, defined);
+    }
+
+    #[test]
+    fn nonces_differ_per_page_and_fit_the_policy_grammar() {
         let first = new_nonce();
         assert_ne!(first, new_nonce());
         assert_eq!(first.len(), 22);

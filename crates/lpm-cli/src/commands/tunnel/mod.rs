@@ -4898,7 +4898,7 @@ mod tests {
             "http://[::1]:5173/app/",
             None,
             None,
-            Some("http://127.0.0.1:4400/?token=redacted"),
+            Some("http://127.0.0.1:4400/#token=redacted"),
             false,
         );
 
@@ -4918,7 +4918,7 @@ mod tests {
           "limits": null,
           "usage": null,
           "tunnel_auth": null,
-          "inspector_url": "http://127.0.0.1:4400/?token=redacted",
+          "inspector_url": "http://127.0.0.1:4400/#token=redacted",
           "auto_ack": false
         }
         "###);

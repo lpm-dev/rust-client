@@ -298,7 +298,7 @@ let diffSelectMode = false, diffFirstId = null
 let currentView = "http" // "http" | "ws"
 let activeFilters = { provider: null, status: null, method: null, query: "" }
 let activeSessionFilter = null
-let savedFilters = JSON.parse(localStorage.getItem("lpm_filters") || "[]")
+let savedFilters = readSavedFilters()
 let allTags = new Set()
 
 // ── SSE ────────────────────────────────────────────────
@@ -333,10 +333,11 @@ async function loadAll() {
 }
 async function loadStatus() {
 	const resp = await fetch("/api/status")
-	if (resp.status === 401) { showAccessNotice(); return }
+	if (!resp.ok) return false
 	const data = await resp.json()
 	if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
 	$("#sb-port").textContent = data.local_ready ? data.local_url : "waiting for dev server…"
+	return true
 }
 async function loadSessions() {
 	try { const resp = await fetch("/api/sessions"); if (resp.ok) { sessions = await resp.json(); renderSessions() } } catch {}
@@ -418,8 +419,14 @@ function statusMatches(s, filter) {
 	const cls = /^([1-5])xx$/.exec(filter)
 	return cls ? Math.floor(s / 100) === Number(cls[1]) : s === Number(filter)
 }
+function readSavedFilters() {
+	try {
+		const saved = JSON.parse(localStorage.getItem("lpm_filters") || "[]")
+		return Array.isArray(saved) ? saved.filter(f => f && typeof f === "object") : []
+	} catch { return [] }
+}
 function filtersActive() { return Boolean(activeFilters.query || activeFilters.provider || activeFilters.status || activeFilters.method) }
-function fmtT(ts) { return ts?.length >= 19 ? ts.substring(11, 19) : ts || "" }
+function fmtT(ts) { return esc(ts?.length >= 19 ? ts.substring(11, 19) : ts || "") }
 function esc(s) { if (s == null) return ""; return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;") }
 function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("show"); setTimeout(() => t.classList.remove("show"), 2500) }
 function updateCount() { $("#hdr-count").textContent = `${requests.length} req` }
@@ -779,11 +786,23 @@ function showAccessNotice() {
 	$("#hdr-info").textContent = "Not connected"
 }
 
+// The bootstrap reports a key the inspector refuses, as after it restarts on
+// the same port, so one notice replaces the errors each call would show.
+window.addEventListener("lpm-inspector-unauthorized", () => {
+	if (es) { es.close(); es = null }
+	$("#reconnect-banner").classList.remove("show")
+	showAccessNotice()
+})
+
+async function startInspector() {
+	if (!(await loadStatus())) return
+	loadAll(); loadSessions(); connectSSE()
+}
+
 // ── Init ───────────────────────────────────────────────
 loadTheme(); renderSavedFilters()
-let hasToken = false
-try { hasToken = Boolean(sessionStorage.getItem("lpm_inspector_token")) } catch {}
-if (hasToken) { loadStatus(); loadAll(); loadSessions(); connectSSE() } else showAccessNotice()
+if (window.lpmInspectorHasToken) startInspector()
+else showAccessNotice()
 </script>
 </body>
 </html>

@@ -140,6 +140,19 @@ pub fn import_snapshot(json: &str) -> Result<Snapshot, SnapshotError> {
         return Err(SnapshotError::TooLarge(snapshot.webhooks.len()));
     }
 
+    // Every capture LPM records carries an RFC 3339 time. Refusing any other
+    // keeps text a shared file chose out of the places the UI shows times.
+    if let Some(position) = snapshot
+        .webhooks
+        .iter()
+        .position(|webhook| chrono::DateTime::parse_from_rfc3339(&webhook.timestamp).is_err())
+    {
+        return Err(SnapshotError::InvalidFormat(format!(
+            "request {} has a timestamp that isn't an RFC 3339 time",
+            position + 1
+        )));
+    }
+
     Ok(snapshot)
 }
 
@@ -211,6 +224,44 @@ impl std::error::Error for SnapshotError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_whose_timestamp_is_not_rfc_3339_is_refused() {
+        let snapshot = serde_json::json!({
+            "version": 1,
+            "metadata": {
+                "created_at": "2026-11-15T12:00:00Z",
+                "description": null,
+                "count": 1,
+                "providers": [],
+                "redaction_summary": {
+                    "total_headers_redacted": 0,
+                    "total_body_patterns_redacted": 0,
+                    "pattern_types": []
+                }
+            },
+            "webhooks": [{
+                "version": 1,
+                "id": "w1",
+                "timestamp": "<a href=//e.co>x",
+                "method": "POST",
+                "path": "/hook",
+                "request_headers": {},
+                "request_body": { "encoding": "empty" },
+                "response_status": 200,
+                "response_headers": {},
+                "response_body": { "encoding": "empty" },
+                "duration_ms": 1,
+                "provider": null,
+                "summary": "s"
+            }]
+        });
+        let error = import_snapshot(&snapshot.to_string()).unwrap_err();
+        assert!(
+            matches!(error, SnapshotError::InvalidFormat(_)),
+            "{error:?}"
+        );
+    }
     use crate::export::ExportBody;
     use lpm_tunnel::webhook::WebhookProvider;
     use std::collections::HashMap;

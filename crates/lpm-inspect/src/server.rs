@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use lpm_common::LpmError;
 use std::net::SocketAddr;
@@ -59,20 +59,30 @@ async fn require_auth_token(
 }
 
 /// The authorities the inspector answers to: its own loopback origin at the
-/// bound port.
+/// bound port. Browsers leave out port 80, so on that port the bare host
+/// counts too.
 #[derive(Clone)]
-struct LoopbackAuthorities(std::sync::Arc<[String; 2]>);
+struct LoopbackAuthorities {
+    port: u16,
+    authorities: std::sync::Arc<[String]>,
+}
 
 impl LoopbackAuthorities {
     fn for_port(port: u16) -> Self {
-        Self(std::sync::Arc::new([
-            format!("127.0.0.1:{port}"),
-            format!("localhost:{port}"),
-        ]))
+        let mut authorities = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+        if port == 80 {
+            authorities.extend(["127.0.0.1".to_owned(), "localhost".to_owned()]);
+        }
+        Self {
+            port,
+            authorities: authorities.into(),
+        }
     }
 
     fn admits(&self, authority: &str) -> bool {
-        self.0.iter().any(|own| own.eq_ignore_ascii_case(authority))
+        self.authorities
+            .iter()
+            .any(|own| own.eq_ignore_ascii_case(authority))
     }
 }
 
@@ -83,7 +93,7 @@ async fn require_loopback_host(
     State(authorities): State<LoopbackAuthorities>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     let authority = request
         .uri()
         .authority()
@@ -94,10 +104,19 @@ async fn require_loopback_host(
                 .get(header::HOST)
                 .and_then(|value| value.to_str().ok())
         });
-    match authority {
-        Some(authority) if authorities.admits(authority) => Ok(next.run(request).await),
-        _ => Err(StatusCode::MISDIRECTED_REQUEST),
+    if authority.is_some_and(|authority| authorities.admits(authority)) {
+        return next.run(request).await;
     }
+    let port = authorities.port;
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(
+            "This LPM inspector answers only at http://127.0.0.1:{port}/ and \
+             http://localhost:{port}/.\n"
+        ),
+    )
+        .into_response()
 }
 
 /// Resolves once the inspector starts shutting down, or its handle is dropped.
@@ -256,6 +275,17 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
 #[cfg(test)]
 mod server_tests {
     use super::*;
+
+    #[test]
+    fn an_inspector_on_port_80_answers_the_host_a_browser_sends_without_the_port() {
+        let authorities = LoopbackAuthorities::for_port(80);
+        for authority in ["127.0.0.1", "localhost", "127.0.0.1:80", "LOCALHOST:80"] {
+            assert!(authorities.admits(authority), "{authority}");
+        }
+        let other = LoopbackAuthorities::for_port(4500);
+        assert!(!other.admits("127.0.0.1"));
+        assert!(!other.admits("127.0.0.1:80"));
+    }
     use crate::state::InspectorState;
 
     /// `port = 0` must auto-pick a free ephemeral port; the handle reports the
