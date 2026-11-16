@@ -30,8 +30,11 @@ pub(crate) fn is_up_to_date(
     };
     if crate::install_recovery::pending(project_dir)
         || project_dir.join("Package.swift").exists()
-        || crate::commands::root_lifecycle::RootProjectLifecycle::from_package(&package)
-            .has_scripts()
+        || crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
+            project_dir,
+            &package,
+        )
+        .has_scripts()
         || lpm_workspace::find_workspace_root(project_dir)
             .map_err(|error| LpmError::Workspace(error.to_string()))?
             .is_some()

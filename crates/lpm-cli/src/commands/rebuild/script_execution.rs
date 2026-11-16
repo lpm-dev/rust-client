@@ -122,7 +122,7 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
 
 /// Where node-pre-gyp and other build tools look for `node-gyp` before
 /// they search `PATH`, as npm sets it.
-pub(super) const NPM_CONFIG_NODE_GYP: &str = "npm_config_node_gyp";
+pub(crate) const NPM_CONFIG_NODE_GYP: &str = "npm_config_node_gyp";
 
 /// The settings node-gyp reads its headers folder from, the one LPM sets
 /// first. A caller that set either keeps its choice.
