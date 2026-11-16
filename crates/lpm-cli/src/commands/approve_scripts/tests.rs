@@ -3026,6 +3026,32 @@ fn only_a_package_the_lockfile_records_from_a_registry_has_one_to_ask() {
     );
 }
 
+#[test]
+fn a_package_the_lockfile_pins_by_another_hash_is_still_the_one_it_records() {
+    let archive = b"native-addon archive";
+    let hash =
+        |algorithm| lpm_common::integrity::Integrity::from_bytes(algorithm, archive).to_string();
+    let row = lpm_lockfile::LockedPackage {
+        name: "native-addon".into(),
+        version: "1.0.0".into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
+        integrity: Some(hash(lpm_common::integrity::HashAlgorithm::Sha1)),
+        ..Default::default()
+    };
+    let installed = (
+        "native-addon".to_string(),
+        "1.0.0".to_string(),
+        Some(hash(lpm_common::integrity::HashAlgorithm::Sha512)),
+    );
+
+    let recorded = recorded_registries([installed.clone()].into(), std::iter::once(&row));
+
+    assert_eq!(
+        recorded,
+        HashMap::from([(installed, "https://registry.npmjs.org".to_string())])
+    );
+}
+
 #[tokio::test]
 async fn provenance_capture_asks_only_the_registry_an_npmrc_names_for_a_scope() {
     let tmp = tempdir().unwrap();

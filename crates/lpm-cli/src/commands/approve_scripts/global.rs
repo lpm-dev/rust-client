@@ -78,8 +78,12 @@ impl<'a> ApprovalProvenanceContext<'a> {
         let lockfiles: Vec<lpm_lockfile::Lockfile> =
             crate::global_blocked_set::install_roots(self.root)?
                 .iter()
-                .filter_map(|install| lpm_lockfile::Lockfile::read_for_project(install).ok())
-                .map(|project| project.lockfile)
+                .filter_map(|install| {
+                    read_lockfile(install, || {
+                        lpm_lockfile::Lockfile::read_for_project(install)
+                            .map(|project| project.lockfile)
+                    })
+                })
                 .collect();
         let recorded = recorded_registries(
             artifacts.iter().cloned().collect(),

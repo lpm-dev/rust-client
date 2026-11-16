@@ -71,8 +71,8 @@ mod prelude {
         ProjectProvenance, SCHEMA_VERSION, approval_metadata_from_blocked,
         approval_metadata_preserving_existing_provenance, artifact_key,
         authorize_project_trust_write, commit_project_trust_write, install_registries,
-        installed_from_their_registry, recorded_registries, runtime_verify_policy_with_source,
-        snapshot_for_artifact_binding,
+        installed_from_their_registry, read_lockfile, recorded_registries,
+        runtime_verify_policy_with_source, snapshot_for_artifact_binding,
     };
     #[cfg(test)]
     pub(super) use super::metadata::{

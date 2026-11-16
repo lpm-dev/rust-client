@@ -216,7 +216,9 @@ impl ProjectProvenance {
             candidates.iter().map(|package| package.name.as_str()),
             json_output,
         )?;
-        let lockfile = crate::commands::install::workspace_lockfile::read_project(project_dir).ok();
+        let lockfile = read_lockfile(project_dir, || {
+            crate::commands::install::workspace_lockfile::read_project(project_dir)
+        });
         let recorded = recorded_registries(
             candidates.iter().map(artifact_key).collect(),
             lockfile.iter().flat_map(|lockfile| &lockfile.packages),
@@ -244,6 +246,23 @@ impl ProjectProvenance {
         )
         .await
     }
+}
+
+/// The lockfile of the install in `dir`, or `None` with a warning when it
+/// can't be read: no package is then known to come from a registry, and
+/// an approval records no provenance.
+pub(super) fn read_lockfile(
+    dir: &Path,
+    read: impl FnOnce() -> Result<lpm_lockfile::Lockfile, lpm_lockfile::LockfileError>,
+) -> Option<lpm_lockfile::Lockfile> {
+    read()
+        .inspect_err(|error| {
+            tracing::warn!(
+                "no provenance is recorded for packages installed in {}: its lockfile can't be read: {error}",
+                dir.display()
+            );
+        })
+        .ok()
 }
 
 /// Those of `packages` that `registries` still sends to the registry
@@ -274,33 +293,52 @@ pub(super) fn installed_from_their_registry(
 /// or a directory has none: a registry that publishes something under the
 /// same name and version says nothing about it. Nor has one that rows
 /// record from two registries, as two global installs can.
+///
+/// A row is a candidate's when the name and version are and the two
+/// integrities don't contradict each other: a lockfile can pin by a
+/// weaker hash the bytes an install knows by their sha512.
 pub(super) fn recorded_registries<'a>(
     candidates: std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
     rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
 ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String> {
+    let mut by_version: HashMap<
+        (&str, &str),
+        Vec<&crate::provenance_fetch::ProvenanceArtifactKey>,
+    > = HashMap::new();
+    for candidate in &candidates {
+        by_version
+            .entry((candidate.0.as_str(), candidate.1.as_str()))
+            .or_default()
+            .push(candidate);
+    }
     let mut recorded = HashMap::new();
     let mut disputed = std::collections::HashSet::new();
     for row in rows {
-        let key = (row.name.clone(), row.version.clone(), row.integrity.clone());
-        if !candidates.contains(&key) {
-            continue;
-        }
-        let Some(Ok(lpm_lockfile::Source::Registry { url })) = row.source_kind() else {
-            disputed.insert(key);
+        let Some(installed) = by_version.get(&(row.name.as_str(), row.version.as_str())) else {
             continue;
         };
-        match recorded.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(url);
+        let registry = match row.source_kind() {
+            Some(Ok(lpm_lockfile::Source::Registry { url })) => Some(url),
+            _ => None,
+        };
+        for candidate in installed {
+            if let (Some(pinned), Some(known)) = (&row.integrity, &candidate.2)
+                && lpm_common::integrity::contradict(pinned, known)
+            {
+                continue;
             }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                if !same_registry(entry.get(), &url) {
-                    disputed.insert(entry.key().clone());
+            match (&registry, recorded.get(*candidate)) {
+                (Some(registry), None) => {
+                    recorded.insert((*candidate).clone(), registry.clone());
+                }
+                (Some(registry), Some(earlier)) if same_registry(earlier, registry) => {}
+                _ => {
+                    disputed.insert((*candidate).clone());
                 }
             }
         }
     }
-    recorded.retain(|key, _| !disputed.contains(key));
+    recorded.retain(|candidate, _| !disputed.contains(candidate));
     recorded
 }
 
