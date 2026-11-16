@@ -123,6 +123,10 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
 /// they search `PATH`, as npm sets it.
 const NPM_CONFIG_NODE_GYP: &str = "npm_config_node_gyp";
 
+/// The settings node-gyp reads its headers folder from, the one LPM sets
+/// first. A caller that set either keeps its choice.
+const NODE_GYP_HEADERS_DIR: [&str; 2] = ["npm_config_devdir", "npm_package_config_node_gyp_devdir"];
+
 /// Makes cmd.exe leave the current directory, which is the package's, out of
 /// its search for commands named without a path.
 const NO_CURRENT_DIRECTORY_SEARCH: (&str, &str) = ("NoDefaultCurrentDirectoryInExePath", "1");
@@ -194,6 +198,15 @@ pub(super) fn build_lifecycle_environment(
             NPM_CONFIG_NODE_GYP.into(),
             node_gyp.script.as_os_str().to_owned(),
         ));
+        let caller_chose = NODE_GYP_HEADERS_DIR
+            .iter()
+            .any(|name| find_env_case_insensitive(env, name).is_some());
+        if !caller_chose && let Some(headers_dir) = &node_gyp.headers_dir {
+            envs.push((
+                NODE_GYP_HEADERS_DIR[0].into(),
+                headers_dir.as_os_str().to_owned(),
+            ));
+        }
     }
     let tmp = tmpdir.as_os_str();
     envs.push(("TMPDIR".into(), tmp.to_owned()));

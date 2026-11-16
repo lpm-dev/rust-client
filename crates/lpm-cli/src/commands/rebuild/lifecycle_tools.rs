@@ -12,7 +12,7 @@ use super::bundled_node_gyp::BundledNodeGyp;
 const NODE_GYP: &str = "node-gyp";
 
 /// What a failed build is told when [`LifecycleTools::lacks_node_gyp`].
-pub(super) const NODE_GYP_MISSING: &str = "this build needs node-gyp and none was found: add node-gyp to the project's devDependencies, or use a Node that is installed with npm";
+pub(super) const NODE_GYP_MISSING: &str = "this build needs node-gyp and none was found: add node-gyp to the project's devDependencies, or put a Node on PATH that has npm installed beside it (a version manager's shim has none)";
 
 /// The registry packages of an install, as its lockfile pins them. A
 /// dependency reached through a tarball URL, a git repository or a directory
@@ -144,6 +144,10 @@ pub(super) struct OfferedNodeGyp {
     pub(super) script: PathBuf,
     /// npm's modules, which hold the command's code and what it requires.
     pub(super) modules: PathBuf,
+    /// Where the command keeps the Node headers it downloads: the folder
+    /// a sandboxed script may write, and the build cache watches, in place
+    /// of node-gyp's own choice of a per-platform cache folder.
+    pub(super) headers_dir: Option<PathBuf>,
     /// What a sandboxed script must read to run the command.
     pub(super) read_dirs: Vec<PathBuf>,
 }
@@ -328,6 +332,7 @@ impl LifecycleTools {
             command_dir,
             script: bundled.script,
             modules: bundled.modules,
+            headers_dir: dirs::home_dir().map(|home| home.join(".node-gyp")),
             read_dirs,
         });
         Ok(())

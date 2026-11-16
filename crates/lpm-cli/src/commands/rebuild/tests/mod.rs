@@ -4169,6 +4169,15 @@ fn a_green_script_is_offered_node_gyp_only_when_its_commands_lead_to_it() {
     }
 }
 
+/// The value of each variable named `name`, as a script's environment
+/// lists them: one that is set twice shows twice.
+fn values_of(envs: &[(std::ffi::OsString, std::ffi::OsString)], name: &str) -> Vec<PathBuf> {
+    envs.iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| PathBuf::from(value))
+        .collect()
+}
+
 #[test]
 fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_path() {
     let (root, tools) = tools_beside_a_node_with_npm(lifecycle_tools::ToolScope::Dependencies);
@@ -4181,32 +4190,69 @@ fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_p
             "/elsewhere/node-gyp.js".into(),
         ),
     ]);
-
-    let envs: HashMap<_, _> = super::script_execution::build_lifecycle_environment(
-        &parent,
-        &project,
-        Path::new("/tmp"),
-        Some(&tools.bin_dir),
-        true,
-        tools.node_gyp.as_ref(),
-    )
-    .into_iter()
-    .collect();
-
     let offered = tools.node_gyp.as_ref().unwrap();
-    let path: Vec<_> = std::env::split_paths(&envs[std::ffi::OsStr::new("PATH")]).collect();
+    let environment = |project_bins| {
+        super::script_execution::build_lifecycle_environment(
+            &parent,
+            &project,
+            Path::new("/tmp"),
+            Some(&tools.bin_dir),
+            project_bins,
+            tools.node_gyp.as_ref(),
+        )
+    };
+
+    let approved = environment(true);
+    let path: Vec<_> = std::env::split_paths(&values_of(&approved, "PATH")[0]).collect();
     assert_eq!(
         path,
         [
             tools.bin_dir.clone(),
             project.join("node_modules").join(".bin"),
             offered.command_dir.clone(),
-            caller,
+            caller.clone(),
         ]
     );
     assert_eq!(
-        envs[std::ffi::OsStr::new("npm_config_node_gyp")],
-        offered.script.as_os_str()
+        values_of(&approved, "npm_config_node_gyp"),
+        std::slice::from_ref(&offered.script),
+        "the caller's own setting is replaced, not kept beside it"
+    );
+
+    let green = environment(false);
+    let path: Vec<_> = std::env::split_paths(&values_of(&green, "PATH")[0]).collect();
+    assert_eq!(
+        path,
+        [tools.bin_dir.clone(), offered.command_dir.clone(), caller]
+    );
+}
+
+#[test]
+fn the_offered_node_gyp_keeps_its_headers_where_a_sandboxed_script_may_write() {
+    let (root, tools) = tools_beside_a_node_with_npm(lifecycle_tools::ToolScope::Dependencies);
+    let offered = tools.node_gyp.as_ref().unwrap();
+    let headers_dir = offered.headers_dir.clone().expect("a home directory");
+    assert!(headers_dir.ends_with(".node-gyp"));
+    let environment = |parent: &HashMap<std::ffi::OsString, std::ffi::OsString>| {
+        super::script_execution::build_lifecycle_environment(
+            parent,
+            root.path(),
+            Path::new("/tmp"),
+            Some(&tools.bin_dir),
+            true,
+            tools.node_gyp.as_ref(),
+        )
+    };
+
+    assert_eq!(
+        values_of(&environment(&HashMap::new()), "npm_config_devdir"),
+        [headers_dir]
+    );
+
+    let chosen = HashMap::from([("NPM_CONFIG_DEVDIR".into(), "/elsewhere".into())]);
+    assert_eq!(
+        values_of(&environment(&chosen), "npm_config_devdir"),
+        [PathBuf::from("/elsewhere")]
     );
 }
 
