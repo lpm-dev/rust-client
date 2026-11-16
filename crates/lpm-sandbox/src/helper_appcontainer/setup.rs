@@ -585,9 +585,10 @@ fn write_dacl(
     set_dacl(handle, path, acl, inheritance.requested())
 }
 
-/// One DACL write. It sets the inheritance bits from `control`, so one
-/// that named none would unprotect a protected DACL and stop Windows
-/// treating the object's inherited entries as inherited.
+/// One DACL write, with `control` as the bits that say how the object
+/// inherits. Windows takes "auto-inherited" from the write: one that
+/// named none would stop it treating the object's inherited entries as
+/// inherited.
 fn set_dacl(
     handle: &HandleGuard,
     path: &Path,
@@ -811,18 +812,27 @@ fn remove_open_ace(
     unsafe { ptr::copy_nonoverlapping(old.cast::<u8>(), saved.as_mut_ptr().cast::<u8>(), size) };
     let inheritance = DaclInheritance::of(&descriptor)?;
     let rewrite = Rewrite::of(&filtered);
-    write_dacl(
+    let mut replaced = ReplacedDacl {
+        dacl: saved,
+        inheritance,
+        rewrite,
+    };
+    if let Err(error) = write_dacl(
         handle,
         path,
         filtered.acl.as_mut_ptr().cast(),
         inheritance,
         rewrite,
-    )?;
-    Ok(Some(ReplacedDacl {
-        dacl: saved,
-        inheritance,
-        rewrite,
-    }))
+    ) {
+        // The first of the two writes a removal of inherited entries makes
+        // may have gone through, and the caller is told of no removal to
+        // undo.
+        if rewrite == Rewrite::Inherited {
+            let _ = replaced.restore(handle, path);
+        }
+        return Err(error);
+    }
+    Ok(Some(replaced))
 }
 
 /// A tree that receives a lifecycle grant: its root, opened once by path,
