@@ -331,12 +331,18 @@ async function loadAll() {
 	const data = await resp.json()
 	requests = data.items || []; renderList(); updateCount()
 }
+// False only when the server refused the key; the bootstrap has then shown
+// how to open the inspector. Any other failure leaves the rest to retry.
 async function loadStatus() {
-	const resp = await fetch("/api/status")
-	if (!resp.ok) return false
-	const data = await resp.json()
-	if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
-	$("#sb-port").textContent = data.local_ready ? data.local_url : "waiting for dev server…"
+	let resp
+	try { resp = await fetch("/api/status") } catch { return true }
+	if (resp.status === 401) return false
+	if (!resp.ok) return true
+	try {
+		const data = await resp.json()
+		if (data.tunnel_url) { $("#sb-tunnel").textContent = data.tunnel_url; $("#hdr-info").textContent = data.tunnel_url }
+		$("#sb-port").textContent = data.local_ready ? data.local_url : "waiting for dev server…"
+	} catch {}
 	return true
 }
 async function loadSessions() {

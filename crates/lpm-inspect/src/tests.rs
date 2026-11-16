@@ -816,7 +816,7 @@ mod integration_tests {
         for path in ["/", "/index.html", "/api/status"] {
             let resp = client
                 .get(format!("http://127.0.0.1:{port}{path}"))
-                .header("Host", format!("rebind.attacker.test:{port}"))
+                .header("Host", format!("other.example:{port}"))
                 .bearer_auth(state.auth_token())
                 .send()
                 .await

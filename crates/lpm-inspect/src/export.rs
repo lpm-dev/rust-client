@@ -56,10 +56,8 @@ fn shell_word(s: &str) -> std::borrow::Cow<'_, str> {
 /// copied and pasted directly into a terminal.
 pub fn to_curl(webhook: &CapturedWebhook, target_url: Option<&str>) -> String {
     let url = target_url.unwrap_or(&webhook.path);
-    // The webhook URL/path comes from the upstream request (attacker-
-    // controllable on a public tunnel endpoint). Without escaping, a
-    // path like `/hook'; touch /tmp/pwn #` would close our single-
-    // quoted argument and execute arbitrary shell when pasted.
+    // The path comes from whoever sent the request to a public tunnel
+    // endpoint, so it's quoted as shell text.
     let url_escaped = shell_single_quote_escape(url);
     // `--url` keeps a URL starting with `-` from being read as an option.
     let mut parts = vec![format!(
@@ -435,12 +433,9 @@ mod tests {
     #[test]
     fn curl_sends_a_body_starting_with_at_as_text_rather_than_a_file() {
         let mut wh = make_webhook();
-        wh.request_body = b"@/Users/me/.aws/credentials".to_vec();
+        wh.request_body = b"@/tmp/file".to_vec();
         let curl = to_curl(&wh, None);
-        assert!(
-            curl.contains("--data-raw '@/Users/me/.aws/credentials'"),
-            "{curl}"
-        );
+        assert!(curl.contains("--data-raw '@/tmp/file'"), "{curl}");
         assert!(!curl.contains(" -d "), "{curl}");
     }
 
@@ -468,12 +463,9 @@ mod tests {
     fn curl_keeps_backslashes_outside_single_quotes_for_shells_that_read_them_there() {
         let mut wh = make_webhook();
         wh.request_headers
-            .insert("x-test".to_string(), r"\'; touch /tmp/pwned #".to_string());
+            .insert("x-test".to_string(), r"\'; echo x #".to_string());
         let curl = to_curl(&wh, None);
-        assert!(
-            curl.contains(r"-H 'x-test: '\\''\''; touch /tmp/pwned #'"),
-            "{curl}"
-        );
+        assert!(curl.contains(r"-H 'x-test: '\\''\''; echo x #'"), "{curl}");
     }
 
     #[test]
@@ -609,15 +601,15 @@ mod tests {
     #[test]
     fn test_fixture_keeps_captured_text_from_starting_a_statement() {
         let mut wh = make_webhook();
-        wh.summary = "Stripe: charge.succeeded\u{2028}await pwn()".to_string();
-        wh.timestamp = "2026-01-01\nawait pwn()".to_string();
-        wh.method = "POST\"\nawait pwn()\n\"".to_string();
-        wh.path = "/x\u{2029}await pwn()".to_string();
-        wh.request_headers = HashMap::from([("x\"\nawait pwn()\n\"".to_string(), "v".to_string())]);
+        wh.summary = "Stripe: charge.succeeded\u{2028}marker()".to_string();
+        wh.timestamp = "2026-01-01\nmarker()".to_string();
+        wh.method = "POST\"\nmarker()\n\"".to_string();
+        wh.path = "/x\u{2029}marker()".to_string();
+        wh.request_headers = HashMap::from([("x\"\nmarker()\n\"".to_string(), "v".to_string())]);
         let fixture = to_test_fixture(&wh);
         for line in fixture.split(['\n', '\r', '\u{2028}', '\u{2029}']) {
             assert!(
-                !line.trim_start().starts_with("await pwn()"),
+                !line.trim_start().starts_with("marker()"),
                 "a captured value started a statement:\n{fixture}"
             );
         }
@@ -626,10 +618,10 @@ mod tests {
     #[test]
     fn curl_quotes_a_method_carrying_shell_syntax() {
         let mut wh = make_webhook();
-        wh.method = "POST$(touch pwned)".to_string();
+        wh.method = "POST$(echo x)".to_string();
         let curl = to_curl(&wh, None);
         assert!(
-            curl.starts_with("curl -X 'POST$(touch pwned)' --url '/api/webhook/stripe'"),
+            curl.starts_with("curl -X 'POST$(echo x)' --url '/api/webhook/stripe'"),
             "{curl}"
         );
     }
@@ -637,11 +629,7 @@ mod tests {
     #[test]
     fn provider_cli_offers_no_command_for_a_type_that_is_not_a_stripe_event_name() {
         let mut wh = make_webhook();
-        for event_type in [
-            "charge.succeeded; touch pwned",
-            "--api-key=sk_live_x",
-            "it's",
-        ] {
+        for event_type in ["charge.succeeded; echo x", "--flag=value", "it's"] {
             wh.request_body = serde_json::json!({ "type": event_type })
                 .to_string()
                 .into_bytes();
