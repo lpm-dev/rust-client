@@ -134,6 +134,10 @@ pub struct HelperArgs {
     /// delete the profile if asked to, and exit without a program
     /// (`--revoke-only`).
     pub revoke_only: bool,
+    /// Take back what a run of this identity that was stopped left set for
+    /// as long as it lasted, keep its trees and its profile, and exit
+    /// without a program (`--take-back-run`).
+    pub take_back_run: bool,
     /// Trees already swept of grants to AppContainer profiles that no
     /// longer exist, as earlier releases' per-run profiles left behind
     /// (`--sweep-record`), so each tree is swept once.
@@ -233,10 +237,16 @@ pub enum ParseError {
     /// `--` separator was present but no program followed it.
     #[error("argv contains `--` but no program path follows it")]
     MissingProgram,
-    /// `--revoke-only` runs no program, so argv with one is a protocol
-    /// break.
-    #[error("`--revoke-only` runs no program, but argv names one after `--`")]
-    ProgramWithRevokeOnly,
+    /// A cleanup run (`--revoke-only`, `--take-back-run`) runs no program,
+    /// so argv with one is a protocol break.
+    #[error("`{0}` runs no program, but argv names one after `--`")]
+    ProgramWithCleanup(&'static str),
+    /// `--revoke-only` and `--take-back-run` are different cleanups.
+    #[error("`--revoke-only` and `--take-back-run` were both given")]
+    TwoCleanups,
+    /// `--take-back-run` leaves the identity for its next run.
+    #[error("`--take-back-run` keeps the profile `--delete-appcontainer-profile` would delete")]
+    TakeBackDeletesProfile,
     /// A required flag was absent.
     #[error("required flag `--{0}` was not provided")]
     MissingFlag(String),
@@ -283,8 +293,9 @@ pub enum ParseError {
 /// | `--protocol-version` | u32 (must equal [`PROTOCOL_VERSION`]) | required, once |
 /// | `--appcontainer-name` | non-empty string | required, once |
 /// | `--delete-appcontainer-profile` | (flag) | optional |
-/// | `--grant-record` | absolute path | optional, once (required with `--revoke-only`) |
-/// | `--revoke-only` | (flag) | optional: no stdio flags, `--` or program |
+/// | `--grant-record` | absolute path | optional, once (required by a cleanup run) |
+/// | `--revoke-only` | (flag) | optional cleanup run: no stdio flags, `--` or program |
+/// | `--take-back-run` | (flag) | optional cleanup run: no stdio flags, `--` or program |
 /// | `--sweep-record` | absolute path | optional, once |
 /// | `--readable-dir` | absolute path | zero+ (strict — root-grant failure is fatal) |
 /// | `--readable-dir-best-effort` | absolute path | zero+ (root-grant failure logs WARN + continues) |
@@ -312,6 +323,7 @@ where
     let mut delete_appcontainer_profile = false;
     let mut grant_record: Option<PathBuf> = None;
     let mut revoke_only = false;
+    let mut take_back_run = false;
     let mut sweep_record: Option<PathBuf> = None;
     let mut readable_dirs: Vec<PathBuf> = Vec::new();
     let mut best_effort_readable_dirs: Vec<PathBuf> = Vec::new();
@@ -380,6 +392,9 @@ where
             "--revoke-only" => {
                 revoke_only = true;
             }
+            "--take-back-run" => {
+                take_back_run = true;
+            }
             "--sweep-record" => {
                 sweep_record = Some(absolute_value(&mut it, "--sweep-record")?);
             }
@@ -428,9 +443,18 @@ where
         }
     }
 
-    if revoke_only {
+    let cleanup = match (revoke_only, take_back_run) {
+        (true, true) => return Err(ParseError::TwoCleanups),
+        (true, false) => Some("--revoke-only"),
+        (false, true) => Some("--take-back-run"),
+        (false, false) => None,
+    };
+    if take_back_run && delete_appcontainer_profile {
+        return Err(ParseError::TakeBackDeletesProfile);
+    }
+    if let Some(cleanup) = cleanup {
         if saw_separator {
-            return Err(ParseError::ProgramWithRevokeOnly);
+            return Err(ParseError::ProgramWithCleanup(cleanup));
         }
         if grant_record.is_none() {
             return Err(ParseError::MissingFlag("grant-record".to_string()));
@@ -440,7 +464,7 @@ where
     }
     let program = match program {
         Some(program) => program,
-        None if revoke_only => OsString::new(),
+        None if cleanup.is_some() => OsString::new(),
         None => return Err(ParseError::MissingProgram),
     };
 
@@ -457,7 +481,7 @@ where
         .ok_or_else(|| ParseError::MissingFlag("appcontainer-name".to_string()))?;
     let stdio = |mode: Option<StdioMode>, flag: &str| match mode {
         Some(mode) => Ok(mode),
-        None if revoke_only => Ok(StdioMode::Null),
+        None if cleanup.is_some() => Ok(StdioMode::Null),
         None => Err(ParseError::MissingFlag(flag.to_string())),
     };
     let stdio_stdin = stdio(stdio_stdin, "stdio-stdin")?;
@@ -470,6 +494,7 @@ where
         delete_appcontainer_profile,
         grant_record,
         revoke_only,
+        take_back_run,
         sweep_record,
         readable_dirs,
         best_effort_readable_dirs,
@@ -642,7 +667,48 @@ mod tests {
         ]);
         assert_eq!(
             parse_argv(make_argv(&with_program)).unwrap_err(),
-            ParseError::ProgramWithRevokeOnly
+            ParseError::ProgramWithCleanup("--revoke-only")
+        );
+    }
+
+    #[test]
+    fn parse_argv_accepts_a_take_back_run_as_it_does_a_revoke_only_one() {
+        let base = [
+            "--protocol-version",
+            "3",
+            "--appcontainer-name",
+            "LpmSandboxLifecycleChild-0123",
+            "--take-back-run",
+        ];
+        assert_eq!(
+            parse_argv(make_argv(&base)).unwrap_err(),
+            ParseError::MissingFlag("grant-record".to_string())
+        );
+        let mut recorded = base.to_vec();
+        recorded.extend(["--grant-record", "C:/record.json"]);
+
+        let parsed = parse_argv(make_argv(&recorded)).expect("a take-back argv must parse");
+
+        assert!(parsed.take_back_run && !parsed.revoke_only);
+        assert!(parsed.program.is_empty());
+        assert_eq!(parsed.stdio_stdin, StdioMode::Null);
+        let mut with_program = recorded.clone();
+        with_program.extend(["--", "C:/Windows/System32/cmd.exe"]);
+        assert_eq!(
+            parse_argv(make_argv(&with_program)).unwrap_err(),
+            ParseError::ProgramWithCleanup("--take-back-run")
+        );
+        let mut both = recorded.clone();
+        both.push("--revoke-only");
+        assert_eq!(
+            parse_argv(make_argv(&both)).unwrap_err(),
+            ParseError::TwoCleanups
+        );
+        let mut deleting = recorded;
+        deleting.push("--delete-appcontainer-profile");
+        assert_eq!(
+            parse_argv(make_argv(&deleting)).unwrap_err(),
+            ParseError::TakeBackDeletesProfile
         );
     }
 

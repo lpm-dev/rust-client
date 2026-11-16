@@ -630,6 +630,18 @@ fn lock_object(identity: Identity) -> Result<ProfileCreationLock, AppContainerEr
 }
 
 pub(super) fn lock_named(name: &str) -> Result<ProfileCreationLock, AppContainerError> {
+    match lock_named_within(name, INFINITE)? {
+        Some(lock) => Ok(lock),
+        None => Err(failure("the sandbox permission lock was never free")),
+    }
+}
+
+/// Takes the lock `name`, or gives `None` when another holder keeps it
+/// for longer than `wait_ms`.
+pub(super) fn lock_named_within(
+    name: &str,
+    wait_ms: u32,
+) -> Result<Option<ProfileCreationLock>, AppContainerError> {
     let wide = str_to_wide_with_nul(name);
     let sddl = str_to_wide_with_nul("D:(A;;0x00100001;;;AU)(A;;GA;;;SY)");
     let mut descriptor = ptr::null_mut();
@@ -662,11 +674,14 @@ pub(super) fn lock_named(name: &str) -> Result<ProfileCreationLock, AppContainer
         return Err(last_error("open the sandbox permission lock"));
     }
     let handle = HandleGuard(raw);
-    let wait = unsafe { WaitForSingleObject(raw, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(raw, wait_ms) };
+    if wait == windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+        return Ok(None);
+    }
     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         return Err(last_error("acquire the sandbox permission lock"));
     }
-    Ok(ProfileCreationLock(handle))
+    Ok(Some(ProfileCreationLock(handle)))
 }
 
 pub(super) fn update_ace(
