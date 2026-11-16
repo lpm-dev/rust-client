@@ -551,7 +551,9 @@ pub(super) struct ProvenPin {
 /// A registry signature is made over a package's name, version and
 /// integrity as the registry spelled it. Replacing the integrity of a
 /// signed package would leave a signature that no longer verifies, so a
-/// signed package proves nothing here and keeps its pin.
+/// signed package proves nothing here and keeps its pin. The store finds
+/// a package by its sha512, so one that is both signed and pinned by a
+/// weaker hash is downloaded by every install that links it.
 pub(super) fn proven_weaker_pins(
     packages: &[InstallPackage],
     fetched: &HashMap<String, String>,
