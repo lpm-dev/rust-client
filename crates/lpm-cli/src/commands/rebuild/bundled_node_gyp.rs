@@ -34,7 +34,10 @@ impl BundledNodeGyp {
     /// choose, and the command would run it for a script that was never
     /// approved to run that package's code.
     pub(super) fn beside_node_on(path: &OsStr) -> Option<Self> {
-        let node = node_on(path)?;
+        let node = std::env::split_paths(path)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join(NODE))
+            .find(|candidate| candidate.is_file())?;
         let resolved = node.canonicalize().ok()?;
         if in_a_package(&node) || in_a_package(&resolved) {
             return None;
@@ -125,14 +128,6 @@ fn windows_command_text(version: &str) -> String {
             None,
         ),
     )
-}
-
-/// The `node` a script finds first on `path`.
-pub(super) fn node_on(path: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        .filter(|directory| directory.is_absolute())
-        .map(|directory| directory.join(NODE))
-        .find(|candidate| candidate.is_file())
 }
 
 fn in_a_package(path: &Path) -> bool {

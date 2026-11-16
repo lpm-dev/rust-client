@@ -43,25 +43,42 @@ impl StuckNode {
         })
     }
 
-    /// The `node` a script finds first on `path`, when it is affected.
+    /// The host's `node` on the script environment's `PATH`, when it is
+    /// affected. It is asked once per process, the way a toolchain probe
+    /// is, so a `node` the project controls is never run here. A script
+    /// that finds another `node` first, one a dependency supplies, runs
+    /// that one instead, and this says nothing about it.
     #[cfg(windows)]
-    pub(super) fn on(path: Option<&std::ffi::OsStr>) -> Option<Self> {
-        let node = super::bundled_node_gyp::node_on(path?)?;
-        let printed = std::process::Command::new(node)
-            .args(["-p", "process.version + ' ' + process.versions.uv"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        Self::from_versions(std::str::from_utf8(&printed.stdout).ok()?)
+    pub(super) fn on_host(
+        environment: &super::sandbox_env::ChildEnvironment,
+        project_dir: &std::path::Path,
+    ) -> Option<&'static Self> {
+        static HOST: std::sync::OnceLock<Option<StuckNode>> = std::sync::OnceLock::new();
+        HOST.get_or_init(|| {
+            Self::from_versions(&super::build_cache::trusted_host_output(
+                "node.exe",
+                &["-p", "process.version + ' ' + process.versions.uv"],
+                environment,
+                project_dir,
+            )?)
+        })
+        .as_ref()
     }
 
-    /// What a run is told before its scripts start.
-    pub(super) fn warning(&self) -> String {
+    /// What a process is told once, before the first scripts it runs
+    /// start; `None` after that.
+    #[cfg(windows)]
+    pub(super) fn warning_once(&self, timeout: std::time::Duration) -> Option<String> {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        (!WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)).then(|| self.warning(timeout))
+    }
+
+    fn warning(&self, timeout: std::time::Duration) -> String {
         format!(
-            "Node {} can't start child processes inside the Windows sandbox: it bundles libuv {}, and libuv {} fixes this. An install script that starts one stops at its time limit.",
+            "The Node on PATH ({}) bundles libuv {}, which can't create a child process's output pipes inside the Windows sandbox. An install script that starts a child process and reads its output stops responding until its time limit ({}s). libuv {} fixes this, and no Node release includes it yet.",
             self.node,
             self.libuv,
+            timeout.as_secs(),
             FIRST_LIBUV_FOR_APPCONTAINER
                 .map(|number| number.to_string())
                 .join("."),
@@ -71,7 +88,7 @@ impl StuckNode {
     /// What a script that ran out of time is told.
     pub(super) fn timeout_hint(&self) -> String {
         format!(
-            "Node {} can't start a child process inside the Windows sandbox (libuv {}), which is the likely reason this script didn't finish",
+            "one possible cause: Node {} (libuv {}) can't create a child process's output pipes inside the Windows sandbox",
             self.node, self.libuv,
         )
     }
@@ -85,11 +102,10 @@ mod tests {
     fn a_node_with_a_libuv_before_the_fix_is_stuck() {
         for printed in ["v22.23.5 1.51.0\n", "v24.11.0 1.52.1", "v20.0.0 1.44.2-dev"] {
             let stuck = StuckNode::from_versions(printed).expect(printed);
-            assert!(
-                stuck.warning().contains("libuv 1.53.0 fixes this"),
-                "{printed}"
-            );
-            assert!(stuck.timeout_hint().starts_with("Node v2"), "{printed}");
+            let warning = stuck.warning(std::time::Duration::from_secs(300));
+            assert!(warning.contains("libuv 1.53.0 fixes this"), "{printed}");
+            assert!(warning.contains("its time limit (300s)"), "{printed}");
+            assert!(stuck.timeout_hint().contains("Node v2"), "{printed}");
         }
         assert_eq!(
             StuckNode::from_versions("v22.23.5 1.51.0"),

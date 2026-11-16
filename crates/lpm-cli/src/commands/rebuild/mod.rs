@@ -971,22 +971,6 @@ async fn run_under_store_lock(
         project_dir,
     );
 
-    #[cfg(windows)]
-    let stuck_node = matches!(sandbox_mode, SandboxMode::Enforce)
-        .then(|| {
-            sandbox_node::StuckNode::on(script_execution::find_env_case_insensitive(
-                &sanitized_env,
-                "PATH",
-            ))
-        })
-        .flatten();
-    #[cfg(windows)]
-    if let Some(node) = &stuck_node
-        && !json_output
-    {
-        crate::output::warn(&node.warning());
-    }
-
     if !matches!(sandbox_mode, SandboxMode::Disabled) {
         // Scripts can write inside approved directories, but cannot create them
         // without write access to their parent.
@@ -1081,6 +1065,20 @@ async fn run_under_store_lock(
             }
         }
         drop(probe_sandbox);
+    }
+
+    #[cfg(windows)]
+    let stuck_node = matches!(sandbox_mode, SandboxMode::Enforce)
+        .then(|| sandbox_node::StuckNode::on_host(&sanitized_env, project_dir))
+        .flatten();
+    #[cfg(windows)]
+    if let Some(node) = stuck_node
+        && let Some(warning) = node.warning_once(timeout)
+    {
+        tracing::warn!(target: "lpm_cli::sandbox", "{warning}");
+        if !json_output {
+            crate::output::warn(&warning);
+        }
     }
 
     let cache_preparation_start = std::time::Instant::now();
@@ -1576,8 +1574,8 @@ async fn run_under_store_lock(
                             lpm_common::sanitize_terminal_inline(&e),
                         ));
                         #[cfg(windows)]
-                        if e.starts_with("timeout")
-                            && let Some(node) = &stuck_node
+                        if e.starts_with(process_tree::TIMEOUT_ERROR)
+                            && let Some(node) = stuck_node
                         {
                             install_ui::detail_line(crate::install_ui::terminal_line!(
                                 "    {}",
