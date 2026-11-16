@@ -458,7 +458,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
         .as_ref()
         .and_then(|context| context.policy_project_dir)
         .unwrap_or(project_dir);
-    let (preloaded_route_table, expectations) = caller_context
+    let (preloaded_route_table, mut expectations) = caller_context
         .map(|context| {
             (
                 Some(context.route_table),
@@ -472,6 +472,9 @@ pub(crate) async fn run_with_options_with_lpm_root(
     let transaction_root = lpm_workspace::find_workspace_root(project_dir)
         .map_err(|error| LpmError::Workspace(error.to_string()))?
         .unwrap_or_else(|| project_dir.to_path_buf());
+    if expectations.locked_integrities.is_none() {
+        expectations.locked_integrities = LockedIntegrities::detect(&transaction_root)?;
+    }
     crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;
     workspace_project_state::sweep_stale_rollback_dirs(project_dir);
@@ -1161,8 +1164,9 @@ async fn run_with_options_under_store_lock(
     let project_needs_virtual_store_migration =
         store_v2_handle.is_some() && needs_virtual_store_migration(project_dir);
 
-    let experimental_resolver_requested =
-        experimental_resolver::enabled() && policy_project_dir == project_dir;
+    let experimental_resolver_requested = experimental_resolver::enabled()
+        && policy_project_dir == project_dir
+        && expectations.locked_integrities.is_none();
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
         let script_policy_cfg =
             crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
@@ -1362,7 +1366,9 @@ async fn run_with_options_under_store_lock(
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
         npm_firewall_chunk_size,
-        policy_extension_configs: &policy_extension_configs,
+        tarball_prefetch_held: policy_extensions_disable_tarball_prefetch(
+            &policy_extension_configs,
+        ) || expectations.locked_integrities.is_some(),
         force,
         offline,
         omit_policy,
@@ -1385,8 +1391,8 @@ async fn run_with_options_under_store_lock(
     .await;
     workspace_resolution::finish_resolution();
     let OnlineResolutionPhaseResult {
-        packages,
-        packages_for_lockfile,
+        mut packages,
+        mut packages_for_lockfile,
         resolve_ms,
         used_lockfile,
         platform_skipped,
@@ -1419,7 +1425,7 @@ async fn run_with_options_under_store_lock(
     }
 
     if let Some(locked) = &expectations.locked_integrities {
-        locked.check(&packages)?;
+        locked.apply(&mut packages, &mut packages_for_lockfile)?;
     }
     if let Some(expected) = &expectations.root {
         let matches = packages.iter().any(|package| {

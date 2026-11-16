@@ -1,7 +1,8 @@
 //! Parser for pnpm-lock.yaml (v5, v6, and v9 formats).
 
 use crate::{
-    BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, read_lockfile_snapshot,
+    BoundedMap, FetchedFrom, MAX_PACKAGES, MigratedPackage, enforce_package_limit,
+    read_lockfile_snapshot,
 };
 use lpm_common::LpmError;
 use serde::Deserialize;
@@ -133,6 +134,7 @@ fn parse_package_rows(
         let is_dev = pkg.dev.unwrap_or(false);
         let is_optional = pkg.optional.unwrap_or(false);
 
+        let fetched_from = fetched_from_version(&version);
         result.push(MigratedPackage {
             lockfile_key: Some(key.clone()),
             name,
@@ -142,6 +144,7 @@ fn parse_package_rows(
             dependencies,
             is_optional,
             is_dev,
+            fetched_from,
         });
     }
     result
@@ -172,6 +175,7 @@ fn parse_v9_snapshots(
         dependencies.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         dependencies.dedup();
 
+        let fetched_from = fetched_from_version(&version);
         result.push(MigratedPackage {
             lockfile_key: Some(key.clone()),
             name,
@@ -187,9 +191,20 @@ fn parse_v9_snapshots(
                 .and_then(|package| package.optional)
                 .unwrap_or(false),
             is_dev: metadata.and_then(|package| package.dev).unwrap_or(false),
+            fetched_from,
         });
     }
     result
+}
+
+/// pnpm keys a package fetched from a tarball URL by that URL in place of
+/// a version, and fetches it from there rather than from a registry.
+fn fetched_from_version(version: &str) -> FetchedFrom {
+    if version.starts_with("https://") || version.starts_with("http://") {
+        FetchedFrom::DependencySpec
+    } else {
+        FetchedFrom::Registry
+    }
 }
 
 fn package_uses_local_resolution(package: &PnpmPackage) -> bool {
@@ -378,6 +393,31 @@ fn extract_deps(deps: &HashMap<String, serde_yaml::Value>) -> Vec<(String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_v9_package_keyed_by_a_tarball_url_was_fetched_from_that_url() {
+        let yaml = r#"
+lockfileVersion: '9.0'
+
+packages:
+  xlsx@https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz:
+    resolution: {tarball: https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz}
+    version: 0.20.3
+  ms@2.1.3:
+    resolution: {integrity: sha512-ms}
+"#;
+        let packages = parse_str(yaml).unwrap();
+        let fetched_from = |name: &str| {
+            packages
+                .iter()
+                .find(|package| package.name == name)
+                .unwrap()
+                .fetched_from
+                .clone()
+        };
+        assert_eq!(fetched_from("xlsx"), FetchedFrom::DependencySpec);
+        assert_eq!(fetched_from("ms"), FetchedFrom::Registry);
+    }
 
     #[test]
     fn parse_v9_simple() {

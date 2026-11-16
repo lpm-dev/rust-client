@@ -52,15 +52,37 @@ fn check_completeness(lockfile: &Lockfile, warnings: &mut Vec<String>) {
     for pkg in &lockfile.packages {
         for dep_str in &pkg.dependencies {
             // Dependencies are formatted as "name@version"
-            if let Some((dep_name, dep_version)) = parse_dep_ref(dep_str)
-                && !known.contains(&(dep_name, dep_version))
-            {
+            let Some((dep_name, dep_version)) = parse_dep_ref(dep_str) else {
+                continue;
+            };
+            let target = pkg
+                .alias_dependencies
+                .iter()
+                .find(|[local, _]| local == dep_name)
+                .map_or(dep_name, |[_, target]| target.as_str());
+            if !known.contains(&(target, dep_version)) {
                 warnings.push(format!(
                     "missing dependency: {} requires {}@{} but it is not in the lockfile",
-                    pkg.name, dep_name, dep_version,
+                    pkg.name, target, dep_version,
                 ));
             }
         }
+    }
+}
+
+/// The package a root dependency installs: the target of an `npm:` alias,
+/// split at its last `@` as LPM's resolver splits it, or the dependency
+/// itself.
+fn root_dependency_target<'a>(name: &'a str, spec: Option<&'a str>) -> &'a str {
+    let Some(body) = spec
+        .and_then(|spec| spec.trim().strip_prefix("npm:"))
+        .filter(|body| !body.is_empty())
+    else {
+        return name;
+    };
+    match body.rfind('@') {
+        Some(0) | None => body,
+        Some(at) => &body[..at],
     }
 }
 
@@ -86,8 +108,9 @@ fn check_root_deps(lockfile: &Lockfile, project_dir: &Path, warnings: &mut Vec<S
     // Check both dependencies and devDependencies
     for field in &["dependencies", "devDependencies"] {
         if let Some(deps) = json.get(*field).and_then(|d| d.as_object()) {
-            for dep_name in deps.keys() {
-                if !lockfile_names.contains(dep_name.as_str()) {
+            for (dep_name, spec) in deps {
+                let target = root_dependency_target(dep_name, spec.as_str());
+                if !lockfile_names.contains(target) {
                     warnings.push(format!(
                         "root dependency '{}' from package.json ({}) not found in lockfile",
                         dep_name, field,
@@ -437,6 +460,41 @@ mod tests {
         let warnings = validate(&lockfile, dir.path());
         assert!(warnings.iter().any(|w| w.contains("lodash")));
         assert!(warnings.iter().any(|w| w.contains("root dependency")));
+    }
+
+    #[test]
+    fn aliased_dependencies_count_as_present_under_the_package_they_install() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"utils": "npm:@corp/utils@^1.0.0", "app-lib": "^2.0.0"}}"#,
+        )
+        .unwrap();
+        let package = |name: &str, version: &str, fetched_from| crate::MigratedPackage {
+            lockfile_key: None,
+            name: name.to_owned(),
+            version: version.to_owned(),
+            resolved: None,
+            integrity: None,
+            dependencies: Vec::new(),
+            is_optional: false,
+            is_dev: false,
+            fetched_from,
+        };
+        let mut dependent = package("app-lib", "2.0.0", crate::FetchedFrom::Registry);
+        dependent.dependencies = vec![("utils".to_owned(), "1.0.0".to_owned())];
+        let (lockfile, _) = crate::normalize::to_lockfile(vec![
+            dependent,
+            package(
+                "utils",
+                "1.0.0",
+                crate::FetchedFrom::RegistryAs("@corp/utils".to_owned()),
+            ),
+        ])
+        .unwrap();
+
+        let warnings = validate(&lockfile, dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

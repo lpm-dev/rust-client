@@ -231,6 +231,7 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
             dependencies,
             is_optional,
             is_dev,
+            fetched_from: crate::FetchedFrom::Registry,
         });
     }
 
@@ -582,16 +583,13 @@ fn resolve_bun_dependency<'a>(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[cfg(unix)]
     struct EnvRestore {
         key: &'static str,
         value: Option<std::ffi::OsString>,
     }
 
-    #[cfg(unix)]
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             match self.value.take() {
@@ -601,20 +599,16 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    fn with_fake_bun<T>(script: &str, test: impl FnOnce() -> T) -> T {
-        use std::os::unix::fs::PermissionsExt as _;
-
+    /// Runs `test` with `directory` searched first for executables, or with
+    /// it alone when `keep_path` is false. Tests that run Bun hold the lock,
+    /// so none sees another's `PATH`.
+    fn with_path<T>(directory: &Path, keep_path: bool, test: impl FnOnce() -> T) -> T {
         let _lock = PATH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("bun");
-        std::fs::write(&executable, script).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let old_path = std::env::var_os("PATH");
-        let mut paths = vec![directory.path().to_path_buf()];
-        if let Some(path) = old_path.as_deref() {
+        let mut paths = vec![directory.to_path_buf()];
+        if keep_path && let Some(path) = old_path.as_deref() {
             paths.extend(std::env::split_paths(path));
         }
         let path = std::env::join_paths(paths).unwrap();
@@ -624,6 +618,17 @@ mod tests {
             value: old_path,
         };
         test()
+    }
+
+    #[cfg(unix)]
+    fn with_fake_bun<T>(script: &str, test: impl FnOnce() -> T) -> T {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("bun");
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        with_path(directory.path(), true, test)
     }
 
     fn sample_json() -> &'static str {
@@ -785,22 +790,18 @@ mod tests {
 
     #[test]
     fn binary_missing_bun_errors() {
-        // Create a temp directory with only bun.lockb (no bun.lock, no bun binary)
         let dir = tempfile::tempdir().unwrap();
         let lockb_path = dir.path().join("bun.lockb");
         std::fs::write(&lockb_path, b"\x00\x01\x02").unwrap();
+        let no_executables = tempfile::tempdir().unwrap();
 
-        let result = parse(&lockb_path);
-        // This will either fail because bun isn't installed or succeed if it is.
-        // On most CI/dev machines without bun, it should error.
-        // We just verify it doesn't panic.
-        if let Err(e) = result {
-            let msg = format!("{e}");
-            assert!(
-                msg.contains("bun") || msg.contains("parse"),
-                "error should mention bun: {msg}"
-            );
-        }
+        let message = with_path(no_executables.path(), false, || parse(&lockb_path))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("bun"),
+            "error should mention bun: {message}"
+        );
     }
 
     /// Real Bun ignores the file name it's given and reads `bun.lockb` from
@@ -827,7 +828,7 @@ mod tests {
     #[test]
     fn binary_converter_hands_bun_a_private_directory_holding_only_the_snapshot() {
         with_fake_bun(
-            "#!/bin/sh\ndir=$(dirname \"$1\")\n[ \"$(basename \"$1\")\" = bun.lockb ] || exit 7\n[ \"$(ls -A \"$dir\")\" = bun.lockb ] || exit 8\n[ \"$(stat -f %Lp \"$dir\" 2>/dev/null || stat -c %a \"$dir\")\" = 700 ] || exit 9\ncat \"$dir/bun.lockb\"\n",
+            "#!/bin/sh\ndir=$(dirname \"$1\")\n[ \"$(basename \"$1\")\" = bun.lockb ] || exit 7\n[ \"$(ls -A \"$dir\")\" = bun.lockb ] || exit 8\n[ \"$(stat -c %a \"$dir\" 2>/dev/null || stat -f %Lp \"$dir\")\" = 700 ] || exit 9\ncat \"$dir/bun.lockb\"\n",
             || {
                 let project = tempfile::tempdir().unwrap();
                 let path = project.path().join("bun.lockb");

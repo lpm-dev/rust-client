@@ -9,6 +9,8 @@
 use crate::support::mock_registry::{MockRegistry, compute_integrity, make_tarball_with_files};
 use crate::support::{TempProject, lpm_with_registry};
 use std::process::Output;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const PROJECT: &str =
     r#"{"name":"migration-host","version":"1.0.0","dependencies":{"corp-utils":"1.0.0"}}"#;
@@ -125,6 +127,11 @@ async fn migrate_refuses_a_package_locked_to_a_registry_lpm_would_not_fetch_it_f
         "a refused migration wrote the lockfile"
     );
     assert!(!project.file_exists("node_modules/corp-utils"));
+    assert!(
+        !project.file_exists(".lpm/migrate-backup")
+            && !project.file_exists(".lpm-migrate-manifest.json"),
+        "a refused migration left a backup behind"
+    );
 }
 
 #[tokio::test]
@@ -221,14 +228,23 @@ async fn migrate_with_registry_change_allowed_moves_a_mirrored_package_to_npm() 
         "same"
     );
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let changes = envelope["registry_changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0]["name"], "corp-utils");
+    assert_eq!(changes[0]["version"], "1.0.0");
     assert_eq!(
-        envelope["registry_changes"],
-        serde_json::json!([{
-            "name": "corp-utils",
-            "version": "1.0.0",
-            "from": mirror.tarball_url("corp-utils", "1.0.0"),
-        }])
+        changes[0]["from"],
+        mirror.tarball_url("corp-utils", "1.0.0")
     );
+    assert_eq!(
+        changes[0]["to"], "https://registry.npmjs.org",
+        "the registry is named by what LPM routes to, not by the transport a test redirects"
+    );
+    assert!(
+        requests_for(&public, "corp-utils").await > 0,
+        "the package wasn't fetched from npm"
+    );
+    assert_eq!(requests_for(&mirror, "corp-utils").await, 0);
 }
 
 #[tokio::test]
@@ -258,4 +274,229 @@ async fn migrate_refuses_a_yarn_scope_lpm_does_not_route() {
     assert!(text.contains(&private.url()), "{text}");
     assert_eq!(requests_for(&public, "utils").await, 0);
     assert!(!project.file_exists("lpm.lock"));
+}
+
+fn workspace_package_lock(resolved: &str, integrity: &str) -> String {
+    serde_json::json!({
+        "name": "migration-host",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "migration-host",
+                "version": "1.0.0",
+                "workspaces": ["packages/*"]
+            },
+            "packages/app": {
+                "name": "app",
+                "version": "1.0.0",
+                "dependencies": { "corp-utils": "1.0.0" }
+            },
+            "node_modules/app": { "resolved": "packages/app", "link": true },
+            "node_modules/corp-utils": {
+                "version": "1.0.0",
+                "resolved": resolved,
+                "integrity": integrity
+            }
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn migrate_refuses_a_workspace_members_package_with_other_bytes_at_the_locked_version() {
+    let registries = registries().await;
+    let project = TempProject::empty(
+        r#"{"name":"migration-host","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"corp-utils":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        &workspace_package_lock(
+            &registries.private.tarball_url("corp-utils", "1.0.0"),
+            &registries.private_integrity,
+        ),
+    );
+
+    let output = migrate(&project, &registries.public, &["--allow-registry-change"]);
+
+    assert!(!output.status.success(), "{}", report(&output));
+    let text = report(&output);
+    assert!(
+        text.contains("corp-utils@1.0.0") && text.contains("integrity"),
+        "{text}"
+    );
+    assert!(!project.file_exists("node_modules/corp-utils"));
+    assert!(!project.file_exists("packages/app/node_modules/corp-utils"));
+}
+
+#[tokio::test]
+async fn an_install_after_migrating_without_installing_still_refuses_other_bytes_at_the_locked_version()
+ {
+    let registries = registries().await;
+    let project = TempProject::empty(PROJECT);
+    project.write_file(
+        "package-lock.json",
+        &package_lock(
+            &registries.private.tarball_url("corp-utils", "1.0.0"),
+            &registries.private_integrity,
+        ),
+    );
+    let migrated = migrate(
+        &project,
+        &registries.public,
+        &["--allow-registry-change", "--no-install"],
+    );
+    assert!(migrated.status.success(), "{}", report(&migrated));
+
+    let installed = lpm_with_registry(&project, &registries.public.url())
+        .args(["install", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!installed.status.success(), "{}", report(&installed));
+    let text = report(&installed);
+    assert!(
+        text.contains("corp-utils@1.0.0") && text.contains("integrity"),
+        "{text}"
+    );
+    assert!(!project.file_exists("node_modules/corp-utils"));
+    assert!(
+        project
+            .read_file("lpm.lock")
+            .contains("resolved-with = \"migrate\""),
+        "a refused install replaced the migrated lockfile and its integrities"
+    );
+}
+
+#[tokio::test]
+async fn migrate_refuses_a_bun_scope_lpm_does_not_route() {
+    let public = MockRegistry::start().await;
+    let private = MockRegistry::start().await;
+    let tarball = make_tarball_with_files("@corp/utils", "1.0.0", &[("origin.txt", b"private")]);
+    let project = TempProject::empty(
+        r#"{"name":"migration-host","version":"1.0.0","dependencies":{"@corp/utils":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "bun.lock",
+        &serde_json::json!({
+            "lockfileVersion": 1,
+            "workspaces": {
+                "": {
+                    "name": "migration-host",
+                    "dependencies": { "@corp/utils": "1.0.0" }
+                }
+            },
+            "packages": {
+                "@corp/utils": ["@corp/utils@1.0.0", "", {}, compute_integrity(&tarball)]
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "bunfig.toml",
+        &format!("[install.scopes]\ncorp = \"{}/\"\n", private.url()),
+    );
+
+    let output = migrate(&project, &public, &[]);
+
+    assert!(!output.status.success(), "{}", report(&output));
+    let text = report(&output);
+    assert!(text.contains("@corp/utils@1.0.0"), "{text}");
+    assert!(text.contains(&private.url()), "{text}");
+    assert_eq!(requests_for(&public, "utils").await, 0);
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn migrate_installs_a_tarball_url_dependency_from_its_url() {
+    let public = MockRegistry::start().await;
+    let cdn = MockServer::start().await;
+    let tarball = make_tarball_with_files("xlsx", "0.20.3", &[("origin.txt", b"cdn")]);
+    Mock::given(method("GET"))
+        .and(path("/xlsx-0.20.3/xlsx-0.20.3.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .mount(&cdn)
+        .await;
+    let url = format!("{}/xlsx-0.20.3/xlsx-0.20.3.tgz", cdn.uri());
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "migration-host",
+            "version": "1.0.0",
+            "dependencies": { "xlsx": url }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "package-lock.json",
+        &serde_json::json!({
+            "name": "migration-host",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "migration-host",
+                    "version": "1.0.0",
+                    "dependencies": { "xlsx": url }
+                },
+                "node_modules/xlsx": {
+                    "version": "0.20.3",
+                    "resolved": url,
+                    "integrity": compute_integrity(&tarball)
+                }
+            }
+        })
+        .to_string(),
+    );
+
+    let output = migrate(&project, &public, &[]);
+
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(project.read_file("node_modules/xlsx/origin.txt"), "cdn");
+}
+
+#[tokio::test]
+async fn migrate_installs_an_aliased_package_from_the_registry_its_scope_routes_to() {
+    let public = MockRegistry::start().await;
+    let private = MockRegistry::start().await;
+    let tarball = make_tarball_with_files("@corp/utils", "1.0.0", &[("origin.txt", b"private")]);
+    private.with_package("@corp/utils", "1.0.0", &tarball).await;
+    let project = TempProject::empty(
+        r#"{"name":"migration-host","version":"1.0.0","dependencies":{"utils":"npm:@corp/utils@1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        &serde_json::json!({
+            "name": "migration-host",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "migration-host",
+                    "version": "1.0.0",
+                    "dependencies": { "utils": "npm:@corp/utils@1.0.0" }
+                },
+                "node_modules/utils": {
+                    "name": "@corp/utils",
+                    "version": "1.0.0",
+                    "resolved": private.tarball_url("@corp/utils", "1.0.0"),
+                    "integrity": compute_integrity(&tarball)
+                }
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(".npmrc", &format!("@corp:registry={}/\n", private.url()));
+
+    let output = migrate(&project, &public, &[]);
+
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(
+        project.read_file("node_modules/utils/origin.txt"),
+        "private"
+    );
+    assert_eq!(requests_for(&public, "utils").await, 0);
 }

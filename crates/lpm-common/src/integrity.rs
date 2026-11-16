@@ -20,7 +20,8 @@ pub struct Integrity {
     pub hash: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered weakest to strongest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HashAlgorithm {
     Sha1,
     Sha256,
@@ -199,40 +200,71 @@ impl fmt::Display for Integrity {
 /// How two SRI metadata strings compare over the hash algorithms both name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SriComparison {
-    /// They share at least one algorithm, and every shared digest is equal.
+    /// They share at least one algorithm, and for each one they share, a
+    /// digest on one side equals a digest on the other.
     Agree,
-    /// A digest of an algorithm both name differs.
+    /// For an algorithm both name, no digest on one side equals any on the
+    /// other.
     Disagree,
     /// No algorithm appears in both, so nothing can be compared.
     NoCommonAlgorithm,
 }
 
-/// Compares two SRI metadata strings, each one or more space-separated
-/// `algorithm-base64` hashes with optional `?options`. Tokens that don't
+/// The hashes in SRI metadata: one or more space-separated
+/// `algorithm-base64` tokens with optional `?options`. Tokens that don't
 /// parse are ignored, as SRI ignores them.
+fn sri_hashes(sri: &str) -> impl Iterator<Item = Integrity> + '_ {
+    sri.split_ascii_whitespace().filter_map(|token| {
+        Integrity::parse(token.split_once('?').map_or(token, |(hash, _)| hash)).ok()
+    })
+}
+
+/// Compares two SRI metadata strings. Several digests of one algorithm are
+/// alternatives, as SRI treats them, so one match among them is enough.
 pub fn compare_sri(left: &str, right: &str) -> SriComparison {
-    fn hashes(sri: &str) -> impl Iterator<Item = Integrity> + '_ {
-        sri.split_ascii_whitespace().filter_map(|token| {
-            Integrity::parse(token.split_once('?').map_or(token, |(hash, _)| hash)).ok()
-        })
-    }
-    let right: Vec<Integrity> = hashes(right).collect();
+    let right: Vec<Integrity> = sri_hashes(right).collect();
+    let left: Vec<Integrity> = sri_hashes(left).collect();
     let mut shared = false;
-    for left in hashes(left) {
-        for right in right
+    for algorithm in [
+        HashAlgorithm::Sha512,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Sha1,
+    ] {
+        let mut on_right = right
             .iter()
-            .filter(|right| right.algorithm == left.algorithm)
-        {
-            shared = true;
-            if !bool::from(left.hash.ct_eq(&right.hash)) {
-                return SriComparison::Disagree;
-            }
+            .filter(|hash| hash.algorithm == algorithm)
+            .peekable();
+        if on_right.peek().is_none() || !left.iter().any(|hash| hash.algorithm == algorithm) {
+            continue;
+        }
+        shared = true;
+        let matched = on_right.any(|right| {
+            left.iter()
+                .filter(|left| left.algorithm == algorithm)
+                .any(|left| bool::from(left.hash.ct_eq(&right.hash)))
+        });
+        if !matched {
+            return SriComparison::Disagree;
         }
     }
     if shared {
         SriComparison::Agree
     } else {
         SriComparison::NoCommonAlgorithm
+    }
+}
+
+impl Integrity {
+    /// The hash of the strongest algorithm in SRI metadata, the first such
+    /// when it lists several, or `None` when no token parses.
+    pub fn strongest_in(sri: &str) -> Option<Self> {
+        sri_hashes(sri).reduce(|strongest, hash| {
+            if hash.algorithm > strongest.algorithm {
+                hash
+            } else {
+                strongest
+            }
+        })
     }
 }
 
@@ -260,6 +292,11 @@ mod tests {
             "one disagreeing shared algorithm is enough"
         );
         assert_eq!(
+            compare_sri(&format!("{other_sha512} {sha512}"), &sha512),
+            SriComparison::Agree,
+            "alternatives of one algorithm agree when any one matches"
+        );
+        assert_eq!(
             compare_sri(&sha1, &sha512),
             SriComparison::NoCommonAlgorithm
         );
@@ -267,6 +304,19 @@ mod tests {
             compare_sri("garbage", &sha512),
             SriComparison::NoCommonAlgorithm
         );
+    }
+
+    #[test]
+    fn the_strongest_hash_in_sri_metadata_is_chosen() {
+        let sha1 = Integrity::from_bytes(HashAlgorithm::Sha1, b"package");
+        let sha256 = Integrity::from_bytes(HashAlgorithm::Sha256, b"package");
+        let sha512 = Integrity::from_bytes(HashAlgorithm::Sha512, b"package");
+        assert_eq!(
+            Integrity::strongest_in(&format!("{sha1} {sha512}?x {sha256}")),
+            Some(sha512)
+        );
+        assert_eq!(Integrity::strongest_in(&sha1.to_string()), Some(sha1));
+        assert_eq!(Integrity::strongest_in("garbage"), None);
     }
 
     #[test]

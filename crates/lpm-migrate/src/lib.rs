@@ -28,6 +28,10 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::Path;
 
+/// The `resolved-with` a lockfile `lpm migrate` writes records. No install
+/// replays such a lockfile; the next one resolves every package again.
+pub const MIGRATED_LOCKFILE_RESOLVER: &str = "migrate";
+
 /// Maximum accepted size of a foreign lockfile snapshot.
 pub const FOREIGN_LOCKFILE_SIZE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -173,19 +177,50 @@ pub struct MigratedPackage {
     pub is_optional: bool,
     /// Whether this is a dev dependency.
     pub is_dev: bool,
+    /// Where the source package manager fetched the package from.
+    pub fetched_from: FetchedFrom,
+}
+
+impl MigratedPackage {
+    /// The name the package is published under on its registry, or `None`
+    /// for a package fetched from its dependency spec.
+    #[inline]
+    pub fn registry_name(&self) -> Option<&str> {
+        match &self.fetched_from {
+            FetchedFrom::Registry => Some(&self.name),
+            FetchedFrom::RegistryAs(name) => Some(name),
+            FetchedFrom::DependencySpec => None,
+        }
+    }
+}
+
+/// Where a package manager fetched a package from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FetchedFrom {
+    /// A registry, under the package's own name.
+    #[default]
+    Registry,
+    /// A registry, under the name an npm alias (`npm:<name>@<range>`)
+    /// gives: the package installed as [`MigratedPackage::name`] is
+    /// published as this one.
+    RegistryAs(String),
+    /// The tarball URL or Git host a dependency spec names. LPM fetches the
+    /// package from that spec too, so no registry routes it.
+    DependencySpec,
 }
 
 /// A migrated package that the source package manager fetched from a
 /// registry other than npm's and LPM's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomRegistryPackage {
+    /// The name the package is published under on that registry.
     pub name: String,
     pub version: String,
     /// The tarball URL, without credentials, query or fragment: where the
     /// lockfile says the package came from or, for a lockfile that records
     /// none, where the package manager's registry configuration placed it.
-    /// A configured registry that isn't a URL, such as one naming an
-    /// environment variable, appears as written.
+    /// A configured registry LPM can't read as a URL is described by where
+    /// it's set instead, never by its value.
     pub tarball_url: String,
 }
 
@@ -296,6 +331,7 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
     let selected = detect::detect_lockfile(project_dir)?.ok_or_else(|| LpmError::Script(
         "no lockfile found. Expected package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb, or bun.lock".into(),
     ))?;
+    let mut yarn_berry = false;
     let (version, mut packages) = if selected.kind == SourceKind::Bun
         && selected
             .path
@@ -311,7 +347,10 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
         } else {
             let version = detect::snapshot_version(&snapshot, &selected.path, selected.kind)?;
             let packages = match selected.kind {
-                SourceKind::Yarn => yarn::parse_str(&snapshot)?,
+                SourceKind::Yarn => {
+                    yarn_berry = yarn::is_berry_lockfile(&snapshot);
+                    yarn::parse_str(&snapshot)?
+                }
                 SourceKind::Pnpm => pnpm::parse_str(&snapshot)?,
                 SourceKind::Bun => bun::parse_json_str(&snapshot)?,
                 SourceKind::Npm => unreachable!("npm snapshot was parsed above"),
@@ -338,10 +377,14 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
     // Detect workspace members
     let workspace_members = detect_workspace_members(project_dir)?;
 
+    // Yarn v1 and npm record a URL for every registry package, and pnpm
+    // takes its registries from `.npmrc`, as LPM does.
     let configured = match source.kind {
-        SourceKind::Yarn => registry_config::ConfiguredRegistries::yarn(project_dir)?,
+        SourceKind::Yarn if yarn_berry => {
+            registry_config::ConfiguredRegistries::yarn_berry(project_dir)?
+        }
         SourceKind::Bun => registry_config::ConfiguredRegistries::bun(project_dir)?,
-        SourceKind::Npm | SourceKind::Pnpm => None,
+        SourceKind::Yarn | SourceKind::Npm | SourceKind::Pnpm => None,
     };
     let unreadable_registries = configured
         .map(|registries| registry_config::place_unrecorded(&mut packages, &registries))
@@ -349,13 +392,19 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
 
     // Normalize to LPM lockfile
     let (lockfile, skipped, mut custom_registry_packages) =
-        normalize::to_lockfile_with_registries(packages);
-    custom_registry_packages.extend(unreadable_registries.into_iter().filter(|package| {
-        lockfile
+        normalize::to_lockfile_with_registries(packages)?;
+    if !unreadable_registries.is_empty() {
+        let locked: std::collections::HashSet<(&str, &str)> = lockfile
             .packages
             .iter()
-            .any(|locked| locked.name == package.name && locked.version == package.version)
-    }));
+            .map(|package| (package.name.as_str(), package.version.as_str()))
+            .collect();
+        custom_registry_packages.extend(
+            unreadable_registries.into_iter().filter(|package| {
+                locked.contains(&(package.name.as_str(), package.version.as_str()))
+            }),
+        );
+    }
 
     // Validate
     let warnings = validate::validate(&lockfile, project_dir);

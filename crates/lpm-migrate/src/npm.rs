@@ -9,13 +9,14 @@
 //! the package-specific `node_modules` scopes visible from those paths.
 
 use crate::{
-    BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, read_lockfile_snapshot,
+    BoundedMap, FetchedFrom, MAX_PACKAGES, MigratedPackage, enforce_package_limit,
+    read_lockfile_snapshot,
 };
 use lpm_common::LpmError;
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use tracing::warn;
@@ -332,6 +333,11 @@ fn invalid_package_path(raw: &str) -> LpmError {
 struct RawEntry {
     name: String,
     version: String,
+    /// The name the registry publishes the package as, when an npm alias
+    /// installs it under `name`.
+    registry_name: Option<String>,
+    /// Whether npm fetched the package from a URL a dependency spec names.
+    fetched_from_spec: bool,
     resolved: Option<String>,
     integrity: Option<String>,
     is_optional: bool,
@@ -373,6 +379,7 @@ fn parse_packages_block(
     enforce_package_limit(packages.len())?;
     let mut entries = Vec::with_capacity(packages.len().min(1024));
     let mut dependency_edge_count = 0usize;
+    let url_specs = declared_url_specs(packages);
 
     for (key, value) in packages {
         let Some((name, version)) = registry_package_identity(key, value)? else {
@@ -384,6 +391,14 @@ fn parse_packages_block(
             .get("resolved")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let fetched_from_spec = resolved
+            .as_deref()
+            .is_some_and(|resolved| url_specs.contains(without_fragment(resolved)));
+        let registry_name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|registry_name| *registry_name != name)
+            .map(str::to_owned);
 
         let integrity = value
             .get("integrity")
@@ -400,6 +415,8 @@ fn parse_packages_block(
         entries.push(RawEntry {
             name,
             version,
+            registry_name,
+            fetched_from_spec,
             resolved,
             integrity,
             is_optional,
@@ -410,6 +427,48 @@ fn parse_packages_block(
     }
 
     finalize_entries(entries)
+}
+
+/// Every `http(s)` URL a package row declares as a dependency spec. npm
+/// records such a dependency's `resolved` as that URL and fetches it from
+/// there, not from a registry.
+fn declared_url_specs(packages: &serde_json::Map<String, Value>) -> HashSet<&str> {
+    const SPEC_FIELDS: [&str; 4] = [
+        "dependencies",
+        "optionalDependencies",
+        "devDependencies",
+        "peerDependencies",
+    ];
+    packages
+        .values()
+        .flat_map(|package| {
+            SPEC_FIELDS
+                .iter()
+                .filter_map(|field| package.get(*field).and_then(Value::as_object))
+                .flat_map(serde_json::Map::values)
+        })
+        .filter_map(Value::as_str)
+        .filter(|spec| spec.starts_with("https://") || spec.starts_with("http://"))
+        .map(without_fragment)
+        .collect()
+}
+
+#[inline]
+fn without_fragment(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(url, _)| url)
+}
+
+/// A v1 lockfile records an aliased package's version as
+/// `npm:<name>@<version>`: the version, and the name its registry
+/// publishes it as.
+fn split_v1_alias(version: &str) -> (String, Option<String>) {
+    version
+        .strip_prefix("npm:")
+        .and_then(|target| {
+            let at = target.rfind('@').filter(|&at| at > 0)?;
+            Some((target[at + 1..].to_owned(), Some(target[..at].to_owned())))
+        })
+        .unwrap_or_else(|| (version.to_owned(), None))
 }
 
 fn dependency_names(
@@ -586,6 +645,14 @@ fn finalize_entries(entries: Vec<RawEntry>) -> Result<Vec<MigratedPackage>, LpmE
 }
 
 fn migrated_package(entry: RawEntry, dependencies: Vec<(String, String)>) -> MigratedPackage {
+    let fetched_from = if entry.fetched_from_spec {
+        FetchedFrom::DependencySpec
+    } else {
+        entry
+            .registry_name
+            .filter(|registry_name| *registry_name != entry.name)
+            .map_or(FetchedFrom::Registry, FetchedFrom::RegistryAs)
+    };
     MigratedPackage {
         lockfile_key: Some(entry.key),
         name: entry.name,
@@ -595,6 +662,7 @@ fn migrated_package(entry: RawEntry, dependencies: Vec<(String, String)>) -> Mig
         dependencies,
         is_optional: entry.is_optional,
         is_dev: entry.is_dev,
+        fetched_from,
     }
 }
 
@@ -839,9 +907,12 @@ impl<'de> Visitor<'de> for V1PackageVisitor<'_> {
         }
 
         if let (Some(version), Some(resolved)) = (version, resolved) {
+            let (version, registry_name) = split_v1_alias(&version);
             self.state.entries.push(RawEntry {
                 name: self.name,
                 version,
+                registry_name,
+                fetched_from_spec: false,
                 resolved: Some(resolved),
                 integrity,
                 is_optional,
@@ -1022,9 +1093,12 @@ fn collect_v1_entries(
                 )));
             }
 
+            let (version, registry_name) = split_v1_alias(version);
             entries.push(RawEntry {
                 name: name.clone(),
-                version: version.to_string(),
+                version,
+                registry_name,
+                fetched_from_spec: false,
                 resolved: Some(resolved.to_string()),
                 integrity: value
                     .get("integrity")
@@ -1078,6 +1152,86 @@ fn validate_v1_package_name(name: &str) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_aliased_v3_row_names_the_package_its_registry_publishes() {
+        let json = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "dependencies": { "utils": "npm:@corp/utils@^1.0.0" } },
+                "node_modules/utils": {
+                    "name": "@corp/utils",
+                    "version": "1.0.0",
+                    "resolved": "https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz"
+                },
+                "node_modules/ms": {
+                    "version": "2.1.3",
+                    "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+                }
+            }
+        });
+        let packages = parse_value(&json, 3).unwrap();
+        let utils = packages
+            .iter()
+            .find(|package| package.name == "utils")
+            .unwrap();
+        assert_eq!(
+            utils.fetched_from,
+            FetchedFrom::RegistryAs("@corp/utils".to_owned())
+        );
+        let ms = packages
+            .iter()
+            .find(|package| package.name == "ms")
+            .unwrap();
+        assert_eq!(ms.fetched_from, FetchedFrom::Registry);
+    }
+
+    #[test]
+    fn a_v3_row_resolved_to_a_url_a_dependency_spec_names_was_fetched_from_that_spec() {
+        let tarball = "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz";
+        let json = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "dependencies": { "xlsx": tarball, "corp-utils": "^1.0.0" } },
+                "node_modules/xlsx": { "version": "0.20.3", "resolved": tarball },
+                "node_modules/corp-utils": {
+                    "version": "1.0.0",
+                    "resolved": "https://npm.corp.example/corp-utils/-/corp-utils-1.0.0.tgz"
+                }
+            }
+        });
+        let packages = parse_value(&json, 3).unwrap();
+        let fetched_from = |name: &str| {
+            packages
+                .iter()
+                .find(|package| package.name == name)
+                .unwrap()
+                .fetched_from
+                .clone()
+        };
+        assert_eq!(fetched_from("xlsx"), FetchedFrom::DependencySpec);
+        assert_eq!(fetched_from("corp-utils"), FetchedFrom::Registry);
+    }
+
+    #[test]
+    fn an_aliased_v1_entry_records_its_version_and_the_package_its_registry_publishes() {
+        let json = serde_json::json!({
+            "lockfileVersion": 1,
+            "dependencies": {
+                "utils": {
+                    "version": "npm:@corp/utils@1.0.0",
+                    "resolved": "https://npm.corp.example/@corp/utils/-/utils-1.0.0.tgz"
+                }
+            }
+        });
+        let packages = parse_value(&json, 1).unwrap();
+        assert_eq!(packages[0].name, "utils");
+        assert_eq!(packages[0].version, "1.0.0");
+        assert_eq!(
+            packages[0].fetched_from,
+            FetchedFrom::RegistryAs("@corp/utils".to_owned())
+        );
+    }
 
     #[test]
     fn parse_minimal_v3() {

@@ -28,8 +28,10 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) npm_firewall_policy_profile:
         lpm_registry::client::NpmFirewallPolicyProfile,
     pub(in crate::commands::install) npm_firewall_chunk_size: usize,
-    pub(in crate::commands::install) policy_extension_configs:
-        &'a [policy_extensions::PolicyExtensionConfig],
+    /// Whether tarballs wait for the checks that run after resolution, as
+    /// policy extensions and a migrated lockfile's recorded integrities
+    /// require, rather than downloading while it runs.
+    pub(in crate::commands::install) tarball_prefetch_held: bool,
     pub(in crate::commands::install) force: bool,
     pub(in crate::commands::install) offline: bool,
     pub(in crate::commands::install) omit_policy: InstallOmitPolicy,
@@ -112,7 +114,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
         npm_firewall_chunk_size,
-        policy_extension_configs,
+        tarball_prefetch_held,
         force,
         offline,
         omit_policy,
@@ -273,9 +275,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         force,
                         omit_policy.dev || omit_policy.optional,
                     );
-                    let preflight_disables_tarball_prefetch = npm_firewall_mode
-                        .disables_tarball_prefetch()
-                        || policy_extensions_disable_tarball_prefetch(policy_extension_configs);
+                    let preflight_disables_tarball_prefetch =
+                        npm_firewall_mode.disables_tarball_prefetch() || tarball_prefetch_held;
                     let fetch_overlap_downloads_during_resolve = fetch_overlap_allowed_local
                         && !resolve_ahead
                         && !preflight_disables_tarball_prefetch;
@@ -312,7 +313,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         if resolve_ahead
                             || omit_policy.optional
                             || npm_firewall_mode.disables_tarball_prefetch()
-                            || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
+                            || tarball_prefetch_held
                         {
                             HashMap::new()
                         } else {
@@ -325,8 +326,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         fetch_extract_limiter.clone(),
                         install_accounting,
                     );
-                    let selected_package_fetch_overlap_allowed = fetch_overlap_allowed_local
-                        && !policy_extensions_disable_tarball_prefetch(policy_extension_configs);
+                    let selected_package_fetch_overlap_allowed =
+                        fetch_overlap_allowed_local && !tarball_prefetch_held;
                     let serialize_fetch_after_workspace_firewall =
                         resolve_ahead && npm_firewall_mode.disables_tarball_prefetch();
                     let selected_package_tx = if selected_package_fetch_overlap_allowed {
@@ -530,7 +531,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         if resolve_ahead
                             || omit_policy.optional
                             || npm_firewall_mode.disables_tarball_prefetch()
-                            || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
+                            || tarball_prefetch_held
                         {
                             HashMap::new()
                         } else {
@@ -690,7 +691,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         && !workspace_resolution::active()
         && lockfile_fetch_overlap_enabled(force)
         && !npm_firewall_mode.is_enabled()
-        && !policy_extensions_disable_tarball_prefetch(policy_extension_configs)
+        && !tarball_prefetch_held
     {
         // Packages without an engine requirement download while Node is
         // probed; one left unreachable by a skipped optional parent stays

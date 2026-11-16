@@ -1050,6 +1050,7 @@ where
             dependencies,
             is_optional,
             is_dev,
+            fetched_from: _,
         } = package;
         let (path, scan_mode) = match selected_path {
             SelectedPackagePath::Validate(path) => {
