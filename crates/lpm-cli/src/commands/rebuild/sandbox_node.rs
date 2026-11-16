@@ -44,25 +44,28 @@ impl StuckNode {
     }
 
     /// The host's `node` on the script environment's `PATH`, when it is
-    /// affected. It is asked once per process, the way a toolchain probe
-    /// is, so a `node` the project controls is never run here. A script
-    /// that finds another `node` first, one a dependency supplies, runs
-    /// that one instead, and this says nothing about it.
+    /// affected. It is asked the way a toolchain probe is, so a `node` the
+    /// project controls is never run here, and its answer is kept for the
+    /// process. A `node` that gave none, one too slow to start in the
+    /// probe's time for example, is asked again by the next rebuild. A
+    /// script that finds another `node` first, one a dependency supplies,
+    /// runs that one instead, and this says nothing about it.
     #[cfg(windows)]
     pub(super) fn on_host(
         environment: &super::sandbox_env::ChildEnvironment,
         project_dir: &std::path::Path,
     ) -> Option<&'static Self> {
         static HOST: std::sync::OnceLock<Option<StuckNode>> = std::sync::OnceLock::new();
-        HOST.get_or_init(|| {
-            Self::from_versions(&super::build_cache::trusted_host_output(
-                "node.exe",
-                &["-p", "process.version + ' ' + process.versions.uv"],
-                environment,
-                project_dir,
-            )?)
-        })
-        .as_ref()
+        if let Some(answered) = HOST.get() {
+            return answered.as_ref();
+        }
+        let printed = super::build_cache::trusted_host_output(
+            "node.exe",
+            &["-p", "process.version + ' ' + process.versions.uv"],
+            environment,
+            project_dir,
+        )?;
+        HOST.get_or_init(|| Self::from_versions(&printed)).as_ref()
     }
 
     /// What a process is told once, before the first scripts it runs
@@ -75,7 +78,7 @@ impl StuckNode {
 
     fn warning(&self, timeout: std::time::Duration) -> String {
         format!(
-            "The Node on PATH ({}) bundles libuv {}, which can't create a child process's output pipes inside the Windows sandbox. An install script that starts a child process and reads its output stops responding until its time limit ({}s). libuv {} fixes this, and no Node release includes it yet.",
+            "The Node on PATH ({}) bundles libuv {}, which can't create a child process's output pipes inside the Windows sandbox. An install script that starts a child process and reads its output stops responding until its time limit ({}s). A Node that bundles libuv {} or later doesn't have this problem.",
             self.node,
             self.libuv,
             timeout.as_secs(),
@@ -103,7 +106,10 @@ mod tests {
         for printed in ["v22.23.5 1.51.0\n", "v24.11.0 1.52.1", "v20.0.0 1.44.2-dev"] {
             let stuck = StuckNode::from_versions(printed).expect(printed);
             let warning = stuck.warning(std::time::Duration::from_secs(300));
-            assert!(warning.contains("libuv 1.53.0 fixes this"), "{printed}");
+            assert!(
+                warning.contains("bundles libuv 1.53.0 or later"),
+                "{printed}"
+            );
             assert!(warning.contains("its time limit (300s)"), "{printed}");
             assert!(stuck.timeout_hint().contains("Node v2"), "{printed}");
         }
