@@ -970,9 +970,13 @@ mod tests {
         let peak = AtomicUsize::new(0);
         let finished = std::sync::Mutex::new(Vec::new());
         let (quick_done, quick_finished) = std::sync::mpsc::channel();
+        // The quick members ask for a slot only once the slow one counts as
+        // running, or all three could pass through before it does.
+        let slow_is_running = std::sync::Barrier::new(4);
 
         std::thread::scope(|scope| {
             let (slots, running, peak, finished) = (&slots, &running, &peak, &finished);
+            let slow_is_running = &slow_is_running;
             let enter = move || {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
@@ -980,6 +984,7 @@ mod tests {
             scope.spawn(move || {
                 let _slot = slots.acquire(0);
                 enter();
+                slow_is_running.wait();
                 // It holds its slot until every quick member has run through
                 // the other one, so no timing decides the order.
                 for _ in 0..3 {
@@ -993,6 +998,7 @@ mod tests {
             for (turn, name) in ["a", "b", "c"].into_iter().enumerate() {
                 let quick_done = quick_done.clone();
                 scope.spawn(move || {
+                    slow_is_running.wait();
                     let _slot = slots.acquire(turn + 1);
                     enter();
                     finished.lock().unwrap().push(name);
