@@ -2017,6 +2017,9 @@ async fn run_with_options_under_store_lock(
         fast_path_lockfile,
         fresh_urls: &fresh_urls,
         proven_pins: &proven_pins,
+        unrecordable_tarball_hints: gate_stats
+            .query_string
+            .load(std::sync::atomic::Ordering::Relaxed),
         obsolete_binary_lockfile,
         json_output,
     })?;

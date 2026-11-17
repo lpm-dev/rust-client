@@ -3451,6 +3451,55 @@ impl MockRegistry {
         self
     }
 
+    /// Mount a package whose metadata names its tarball by a URL that
+    /// carries `query`, as a registry that signs each download URL does,
+    /// and serve the tarball only at that URL. Returns the URL.
+    pub async fn with_package_at_a_url_with_query(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+        query: &str,
+    ) -> String {
+        let tarball_url = format!("{}?{query}", self.tarball_url(name, version));
+        let integrity = compute_integrity(tarball_bytes);
+        self.register_tarball_integrity(name, version, integrity.clone());
+        let metadata = serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "dist": { "tarball": tarball_url, "integrity": integrity },
+                    "dependencies": {}
+                }
+            },
+            "time": { version: "2025-01-01T00:00:00.000Z" }
+        });
+        for metadata_path in [format!("/api/registry/{name}"), format!("/{name}")] {
+            Mock::given(method("GET"))
+                .and(path(metadata_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+                .mount(self.server())
+                .await;
+        }
+        let mut tarball = Mock::given(method("GET")).and(path(Self::tarball_path(name, version)));
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            tarball = tarball.and(query_param(key, value));
+        }
+        tarball
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball_bytes.to_vec())
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(self.server())
+            .await;
+        tarball_url
+    }
+
     /// Mount a single-version package whose `time[version]` is the
     /// caller-supplied ISO-8601 timestamp. Used by the cooldown gate
     /// (release-age) tests where the publication time must be a fixed

@@ -1123,6 +1123,20 @@ fn find_package_by_name() {
 }
 
 #[test]
+fn a_tarball_url_with_a_query_or_fragment_is_not_a_recordable_hint() {
+    assert!(crate::is_recordable_tarball_hint(
+        "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+    ));
+    for url in [
+        "https://cdn.example/lodash/-/lodash-4.17.21.tgz?sig=value",
+        "https://cdn.example/lodash/-/lodash-4.17.21.tgz?",
+        "https://cdn.example/lodash/-/lodash-4.17.21.tgz#value",
+    ] {
+        assert!(!crate::is_recordable_tarball_hint(url), "{url}");
+    }
+}
+
+#[test]
 fn tarball_roundtrips_when_present() {
     let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {

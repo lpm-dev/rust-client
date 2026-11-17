@@ -155,6 +155,11 @@ pub enum GateDecision {
     /// otherwise attach the bearer to a non-registry endpoint.
     /// Non-zero counter = BUG signal — investigate the writer.
     RejectedShape,
+    /// The URL has a query or a fragment, where a registry that signs its
+    /// download URLs puts the signature. A lockfile written by an older
+    /// LPM may hold one; it isn't reused, since it may have expired and
+    /// isn't one a lockfile should keep.
+    RejectedQuery,
     /// URL's origin is not in the set this client is configured
     /// to talk to (`{base_url, npm_registry_url}`). Expected to
     /// be non-zero after `LPM_REGISTRY_URL` switches: stored
@@ -194,6 +199,9 @@ pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
     let path = parsed.path();
     if !path.ends_with(".tgz") || !path.contains("/-/") {
         return GateDecision::RejectedShape;
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return GateDecision::RejectedQuery;
     }
 
     // Origin — must match one of the origins this client talks to.

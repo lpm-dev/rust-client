@@ -168,7 +168,7 @@ pub async fn run(
             "success": true,
             "package": package_name,
             "version": version_key,
-            "tarball_url": tarball_url,
+            "tarball_url": with_query_values_masked(tarball_url),
             "integrity": integrity_str,
             "integrity_verified": integrity_verified,
             "size_bytes": size,
@@ -262,4 +262,88 @@ fn short_integrity(integrity: &str) -> String {
         .rev()
         .collect();
     format!("{prefix}…{suffix}")
+}
+
+/// `url` with each query value, and any fragment, replaced by `<redacted>`,
+/// keeping the query's keys: a registry that signs its download URLs puts
+/// the signature there.
+fn with_query_values_masked(url: &str) -> std::borrow::Cow<'_, str> {
+    const MASK: &str = "<redacted>";
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (url, None),
+    };
+    let (base, query) = match before_fragment.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (before_fragment, None),
+    };
+    if query.is_none() && fragment.is_none() {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let mut masked = String::with_capacity(url.len());
+    masked.push_str(base);
+    if let Some(query) = query {
+        masked.push('?');
+        let mut pairs = query.split('&').filter(|pair| !pair.is_empty()).peekable();
+        while let Some(pair) = pairs.next() {
+            match pair.split_once('=') {
+                Some((key, _)) => {
+                    masked.push_str(key);
+                    masked.push('=');
+                    masked.push_str(MASK);
+                }
+                None => masked.push_str(MASK),
+            }
+            if pairs.peek().is_some() {
+                masked.push('&');
+            }
+        }
+    }
+    if fragment.is_some_and(|fragment| !fragment.is_empty()) {
+        masked.push('#');
+        masked.push_str(MASK);
+    }
+    std::borrow::Cow::Owned(masked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_query_values_masked;
+
+    #[test]
+    fn a_tarball_url_without_a_query_is_shown_as_it_is() {
+        let url = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
+        assert!(matches!(
+            with_query_values_masked(url),
+            std::borrow::Cow::Borrowed(shown) if shown == url
+        ));
+    }
+
+    #[test]
+    fn a_tarball_url_shows_its_query_keys_but_not_their_values() {
+        for (url, shown) in [
+            (
+                "https://cdn.example/pkg/-/pkg-1.0.0.tgz?X-Amz-Signature=abc&X-Amz-Expires=600",
+                "https://cdn.example/pkg/-/pkg-1.0.0.tgz?X-Amz-Signature=<redacted>&X-Amz-Expires=<redacted>",
+            ),
+            (
+                "https://cdn.example/pkg.tgz?token&&sig=a=b",
+                "https://cdn.example/pkg.tgz?<redacted>&sig=<redacted>",
+            ),
+            (
+                "https://cdn.example/pkg.tgz?sig=abc#frag?ment",
+                "https://cdn.example/pkg.tgz?sig=<redacted>#<redacted>",
+            ),
+            (
+                "https://cdn.example/pkg.tgz#value",
+                "https://cdn.example/pkg.tgz#<redacted>",
+            ),
+            (
+                "https://cdn.example/pkg.tgz?",
+                "https://cdn.example/pkg.tgz?",
+            ),
+        ] {
+            assert_eq!(with_query_values_masked(url), shown, "{url}");
+        }
+    }
 }
