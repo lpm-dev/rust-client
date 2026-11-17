@@ -164,7 +164,16 @@ async fn v1_install_proves_an_alternate_pin_once(env: &[(&str, &str)]) {
     assert!(locked.contains(&sha512), "{locked}");
     let pinned = locked.replace(&sha512, &sha256);
 
-    for _ in 0..2 {
+    for (recorded, why) in [
+        (
+            &sha512,
+            "the install records the sha512 of the archive it fetched",
+        ),
+        (
+            &sha256,
+            "an install that fetches nothing replays the lockfile's pin",
+        ),
+    ] {
         remove_install_output(&project);
         project.write_file("lpm.lock", &pinned);
         lpm_v1_with_registry(&project, &mock.url())
@@ -173,10 +182,7 @@ async fn v1_install_proves_an_alternate_pin_once(env: &[(&str, &str)]) {
             .assert()
             .success();
         assert_eq!(installed_marker(&project).unwrap(), b"original");
-        assert!(
-            project.read_file("lpm.lock").contains(&sha256),
-            "the install replays the lockfile's pin"
-        );
+        assert!(project.read_file("lpm.lock").contains(recorded), "{why}");
     }
 
     assert_eq!(
