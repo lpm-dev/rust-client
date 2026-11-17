@@ -586,9 +586,10 @@ mod tests {
         assert_eq!(error, ERROR_SUCCESS, "{}", path.display());
         let _descriptor = LocalAllocGuard(descriptor as *mut _);
         // SAFETY: both SIDs are valid for the comparison.
-        let (_, matching) =
+        let matching =
             dacl_without_allowed_aces_where(path, dacl, |ace| unsafe { EqualSid(ace, sid) != 0 })
-                .unwrap();
+                .unwrap()
+                .removed;
         matching > 0
     }
 
@@ -1133,11 +1134,12 @@ mod tests {
         };
         assert_eq!(error, ERROR_SUCCESS, "{}", path.display());
         let _descriptor = LocalAllocGuard(descriptor as *mut _);
-        let (_, matching) = dacl_without_aces_where(path, dacl, ACCESS_DENIED_ACE_TYPE, |ace| {
+        let matching = dacl_without_aces_where(path, dacl, ACCESS_DENIED_ACE_TYPE, |ace| {
             // SAFETY: both SIDs are valid for the comparison.
             unsafe { EqualSid(ace, sid) != 0 }
         })
-        .unwrap();
+        .unwrap()
+        .removed;
         matching > 0
     }
 
