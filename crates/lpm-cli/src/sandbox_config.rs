@@ -128,6 +128,103 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
     json_output: bool,
     global_config: &crate::commands::config::GlobalConfig,
 ) -> Result<(SandboxOptions, ResolvedSandboxMode), LpmError> {
+    resolve_chain(
+        project_dir,
+        no_sandbox_flag,
+        strict_sandbox_flag,
+        json_output,
+        global_config,
+        &mut Unapproved::Stop,
+    )
+}
+
+/// The approvals a run with these flags would stop for, in the order it
+/// asks for them. Nothing is asked and nothing is recorded.
+pub(crate) fn sandbox_approvals_a_run_needs(
+    project_dir: &Path,
+    no_sandbox_flag: bool,
+    strict_sandbox_flag: bool,
+    json_output: bool,
+    global_config: &crate::commands::config::GlobalConfig,
+) -> Result<Vec<lpm_common::SecurityApprovalRequiredErrorContext>, LpmError> {
+    let mut needed = Vec::new();
+    resolve_chain(
+        project_dir,
+        no_sandbox_flag,
+        strict_sandbox_flag,
+        json_output,
+        global_config,
+        &mut Unapproved::Note(&mut needed),
+    )?;
+    let mut distinct: Vec<lpm_common::SecurityApprovalRequiredErrorContext> = Vec::new();
+    for need in needed {
+        if !distinct.contains(&need) {
+            distinct.push(need);
+        }
+    }
+    Ok(distinct)
+}
+
+/// What a resolution does about a weakening this machine hasn't approved.
+enum Unapproved<'a> {
+    /// A run asks for the approval and stops without it.
+    Stop,
+    /// A preview notes what the run will stop for, and resolves on as that
+    /// run does once it is approved.
+    Note(&'a mut Vec<lpm_common::SecurityApprovalRequiredErrorContext>),
+}
+
+impl Unapproved<'_> {
+    /// A weakening an unlock of the project settles.
+    fn project_unlock(
+        &mut self,
+        scope: crate::security_approval::ApprovalScope,
+        project_dir: &Path,
+        json_output: bool,
+        source: crate::security_approval::ApprovalSource,
+        message: &str,
+    ) -> Result<(), LpmError> {
+        match self {
+            Self::Stop => crate::security_approval::ensure_project_unlock(
+                scope,
+                project_dir,
+                json_output,
+                source,
+                message,
+                None,
+                &[],
+            ),
+            Self::Note(needed) => {
+                needed.extend(crate::security_approval::project_unlock_a_run_needs(
+                    scope,
+                    project_dir,
+                )?);
+                Ok(())
+            }
+        }
+    }
+
+    /// A weakening the user's own saved settings hold, which only changing
+    /// them through the command `refusal` names settles.
+    fn saved_setting(&mut self, refusal: LpmError) -> Result<(), LpmError> {
+        match (self, refusal) {
+            (Self::Note(needed), LpmError::SecurityApprovalRequired(need)) => {
+                needed.push(*need);
+                Ok(())
+            }
+            (_, refusal) => Err(refusal),
+        }
+    }
+}
+
+fn resolve_chain(
+    project_dir: &Path,
+    no_sandbox_flag: bool,
+    strict_sandbox_flag: bool,
+    json_output: bool,
+    global_config: &crate::commands::config::GlobalConfig,
+    unapproved: &mut Unapproved<'_>,
+) -> Result<(SandboxOptions, ResolvedSandboxMode), LpmError> {
     let project_path = project_dir.join("lpm.toml");
     let mut project = read_sandbox_keys_from_file(&project_path)?;
 
@@ -143,14 +240,12 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
 
     let cli_unlock_authorized =
         if no_sandbox_flag && !matches!(authorized_mode, ResolvedSandboxMode::None) {
-            crate::security_approval::ensure_project_unlock(
+            unapproved.project_unlock(
                 crate::security_approval::ApprovalScope::SandboxNone,
                 project_dir,
                 json_output,
                 crate::security_approval::ApprovalSource::CliFlag,
                 "This install request disables the sandbox for this project.",
-                None,
-                &[],
             )?;
             true
         } else {
@@ -160,14 +255,12 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
     let project_mode_unlock_authorized = if let Some(mode) = project.mode
         && mode.loosens(authorized_mode_key)
     {
-        crate::security_approval::ensure_project_unlock(
+        unapproved.project_unlock(
             crate::security_approval::ApprovalScope::SandboxNone,
             project_dir,
             json_output,
             crate::security_approval::ApprovalSource::ProjectConfig,
             "lpm.toml requests a weaker sandbox mode than this machine has approved.",
-            None,
-            &[],
         )?;
         true
     } else {
@@ -177,7 +270,7 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
     if let Some(mode) = global.mode
         && mode.loosens(authorized_mode_key)
     {
-        return Err(crate::security_approval::approval_required_error(
+        unapproved.saved_setting(crate::security_approval::approval_required_error(
             "the persisted global sandbox mode is weaker than this machine has approved",
             vec![
                 crate::security_approval::ApprovalScope::SandboxNone
@@ -189,10 +282,10 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
                 "lpm config sandbox --set {}",
                 sandbox_mode_key_name(mode)
             )),
-        ));
+        ))?;
     }
     if global.allow_degraded == Some(true) && !authorized_allow_degraded {
-        return Err(crate::security_approval::approval_required_error(
+        unapproved.saved_setting(crate::security_approval::approval_required_error(
             "the persisted global sandbox.allow-degraded value is weaker than this machine has approved",
             vec![
                 crate::security_approval::ApprovalScope::SandboxAllowDegraded
@@ -201,18 +294,16 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
             ],
             None,
             Some("lpm config sandbox --set default".to_string()),
-        ));
+        ))?;
     }
     let project_allow_degraded_unlock_authorized =
         if project.allow_degraded == Some(true) && !authorized_allow_degraded {
-            crate::security_approval::ensure_project_unlock(
+            unapproved.project_unlock(
                 crate::security_approval::ApprovalScope::SandboxAllowDegraded,
                 project_dir,
                 json_output,
                 crate::security_approval::ApprovalSource::ProjectConfig,
                 "lpm.toml enables sandbox.allow-degraded beyond this machine's approved posture.",
-                None,
-                &[],
             )?;
             true
         } else {
@@ -1254,6 +1345,63 @@ allow-degraded = "maybe"
         assert!(
             strict_banner_for_runtime(SandboxMode::LogOnly, ResolvedSandboxMode::None).is_none(),
         );
+    }
+
+    fn needs(env: &Env, no_sandbox: bool) -> Vec<(Vec<String>, Option<String>)> {
+        let global = crate::commands::config::GlobalConfig::load_checked().unwrap();
+        sandbox_approvals_a_run_needs(&env.project, no_sandbox, false, true, &global)
+            .unwrap()
+            .into_iter()
+            .map(|need| (need.requested_scopes, need.suggested_command))
+            .collect()
+    }
+
+    #[test]
+    fn a_preview_names_each_approval_a_run_would_stop_for_once_and_in_its_order() {
+        let env = fixture(Some("[sandbox]\nmode = \"none\"\nallow-degraded = true\n"));
+        let home = scoped_home_dir();
+        let unlock =
+            |scope: &str| Some(format!("lpm security unlock {scope} --project . --ttl 10m"));
+
+        assert_eq!(
+            needs(&env, true),
+            [
+                (vec!["sandbox-none".to_string()], unlock("sandbox-none")),
+                (
+                    vec!["sandbox-allow-degraded".to_string()],
+                    unlock("sandbox-allow-degraded")
+                ),
+            ],
+            "the flag and lpm.toml ask for the same unlock"
+        );
+
+        write_global_config(home.path(), "[sandbox]\nmode = \"none\"\n");
+        assert_eq!(
+            needs(&env, false)[1],
+            (
+                vec!["sandbox-none".to_string()],
+                Some("lpm config sandbox --set none".to_string())
+            ),
+            "a saved setting is settled by the command that saves it"
+        );
+    }
+
+    #[test]
+    fn a_preview_needs_nothing_the_machine_already_approved() {
+        let env = fixture(None);
+        let home = scoped_home_dir();
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+        assert_eq!(needs(&env, false), []);
+
+        write_authorized_sandbox_mode(ResolvedSandboxMode::None);
+        assert_eq!(needs(&env, true), []);
+
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",
+        );
+        assert_eq!(needs(&env, true), []);
+        crate::security_floor::clear_recorded_suppressions_for_tests();
     }
 
     #[test]

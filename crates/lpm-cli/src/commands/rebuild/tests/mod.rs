@@ -1775,6 +1775,25 @@ fn rebuild_package_failure_message_names_package_and_error() {
 }
 
 #[test]
+fn a_run_reaches_its_sandbox_for_a_build_or_for_a_native_build_s_marker() {
+    let unbuilt = synthetic_scriptable("unbuilt", false, true);
+    let built = synthetic_scriptable("built", true, true);
+    let mut native = synthetic_scriptable("native", true, true);
+    native.scripts = HashMap::from([("install".into(), "node-gyp rebuild".into())]);
+    native.build_marker_key = Some("sha256-key".into());
+
+    assert!(run_reaches_the_sandbox(&[&built, &unbuilt], false));
+    assert!(!run_reaches_the_sandbox(&[&built], false));
+    assert!(run_reaches_the_sandbox(&[&built], true));
+    assert!(!run_reaches_the_sandbox(&[], true));
+    // Native builds are told apart, and so checked, where they are cached.
+    assert_eq!(
+        run_reaches_the_sandbox(&[&native], false),
+        cfg!(any(target_os = "macos", target_os = "linux"))
+    );
+}
+
+#[test]
 fn the_summary_names_each_failure_with_its_script_reason_and_hints() {
     let pkg = synthetic_scriptable("green-native", false, true);
     let quiet = FailureOutput {

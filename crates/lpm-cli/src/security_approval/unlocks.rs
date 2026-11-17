@@ -548,6 +548,39 @@ pub fn ensure_project_unlock(
     ))
 }
 
+/// The approval [`ensure_project_unlock`] would stop a run for, or `None`
+/// where an unlock already covers it. It asks nobody and records nothing,
+/// so a preview can name what the run itself will need.
+pub fn project_unlock_a_run_needs(
+    scope: ApprovalScope,
+    project_dir: &Path,
+) -> Result<Option<lpm_common::SecurityApprovalRequiredErrorContext>, LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
+        return Err(err);
+    }
+    let global = project_dir_is_global_install(project_dir);
+    let covered = if global {
+        find_active_global_unlock(scope, &[])?.is_some()
+    } else {
+        find_active_project_unlock(scope, project_dir, None, &[])?.is_some()
+    };
+    if covered {
+        return Ok(None);
+    }
+    let target = if global {
+        UnlockTargetKind::Global
+    } else {
+        UnlockTargetKind::Project
+    };
+    Ok(Some(lpm_common::SecurityApprovalRequiredErrorContext {
+        message: format!("{} requires explicit approval", scope.as_str()),
+        requested_scopes: vec![scope.as_str().to_string()],
+        project_root: (!global).then(|| canonical_project_root(project_dir)),
+        suggested_command: Some(suggested_unlock_command(scope.as_str(), target, &[])),
+    }))
+}
+
 fn prompt_for_global_unlock(
     scope: ApprovalScope,
     ttl_secs: u64,

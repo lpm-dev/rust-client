@@ -259,8 +259,40 @@ pub(super) fn select_named_packages<'a>(
         .collect())
 }
 
+/// Whether a run of `selected` gets as far as choosing its sandbox. It
+/// does with nothing to build too, when a native build's marker has to be
+/// checked against the build's key first.
+pub(super) fn run_reaches_the_sandbox(selected: &[&ScriptablePackage], force: bool) -> bool {
+    selected.iter().any(|package| {
+        force || !package.is_built || super::build_cache::marker_requires_key_validation(package)
+    })
+}
+
+/// Says what the run itself will stop for and the dry run didn't ask for.
+pub(super) fn print_approvals_a_dry_run_left(
+    approvals: &[lpm_common::SecurityApprovalRequiredErrorContext],
+) {
+    for approval in approvals {
+        eprintln!();
+        install_ui::warn_untrusted(&format!(
+            "The run itself needs approval for {}, which a dry run doesn't ask for.",
+            approval.requested_scopes.join(", "),
+        ));
+        if let Some(command) = &approval.suggested_command {
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {} {}",
+                install_ui::dim("approve first:"),
+                lpm_common::sanitize_terminal_inline(command),
+            ));
+        }
+    }
+}
+
+/// `approvals` are what the run itself would stop for and the preview
+/// didn't ask for.
 pub(super) fn rebuild_dry_run_envelope(
     packages: &[&ScriptablePackage],
+    approvals: &[lpm_common::SecurityApprovalRequiredErrorContext],
     force_security_floor: bool,
 ) -> serde_json::Value {
     let mut json = serde_json::json!({
@@ -273,6 +305,14 @@ pub(super) fn rebuild_dry_run_envelope(
                 "version": p.version,
                 "scripts": p.scripts,
                 "trusted": p.is_trusted,
+            })
+        }).collect::<Vec<_>>(),
+        "approvals_required": approvals.iter().map(|approval| {
+            serde_json::json!({
+                "message": approval.message,
+                "requested_scopes": approval.requested_scopes,
+                "project_root": approval.project_root,
+                "suggested_command": approval.suggested_command,
             })
         }).collect::<Vec<_>>(),
     });

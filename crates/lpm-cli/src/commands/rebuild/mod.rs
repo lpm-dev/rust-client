@@ -79,9 +79,10 @@ pub(in crate::commands) use self::script_execution::{
 use self::scripts::toposort_packages;
 use self::scripts::{
     BUILD_MARKER, BuildCacheMetrics, FailureOutput, PackageFailure, ScriptablePackage,
-    count_untrusted_unbuilt, package_build_layers, read_lifecycle_scripts,
-    rebuild_dry_run_envelope, rebuild_package_label, rebuild_summary_envelope, scripts_word,
-    select_named_packages, warn_stale_trusted_deps, widen_to_build_by_policy,
+    count_untrusted_unbuilt, package_build_layers, print_approvals_a_dry_run_left,
+    read_lifecycle_scripts, rebuild_dry_run_envelope, rebuild_package_label,
+    rebuild_summary_envelope, run_reaches_the_sandbox, scripts_word, select_named_packages,
+    warn_stale_trusted_deps, widen_to_build_by_policy,
 };
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
 pub(crate) use self::trust::TrustReason;
@@ -300,7 +301,7 @@ async fn run_under_store_lock(
                 .get_bool("force-security-floor")
                 .unwrap_or(false);
             let mut report = if dry_run {
-                rebuild_dry_run_envelope(&[], force_floor)
+                rebuild_dry_run_envelope(&[], &[], force_floor)
             } else {
                 rebuild_summary_envelope(0, &[], force_floor, &BuildCacheMetrics::default())
             };
@@ -539,7 +540,7 @@ async fn run_under_store_lock(
     if scriptable_packages.is_empty() && specific_packages.is_empty() {
         if json_output {
             let result = if dry_run {
-                rebuild_dry_run_envelope(&[], force_security_floor)
+                rebuild_dry_run_envelope(&[], &[], force_security_floor)
             } else {
                 rebuild_summary_envelope(
                     0,
@@ -608,6 +609,8 @@ async fn run_under_store_lock(
         })
         .collect::<Vec<_>>();
 
+    let run_reaches_sandbox = run_reaches_the_sandbox(&selected_for_policy, force);
+
     // Filter out already-built (unless --force)
     let to_build: Vec<&ScriptablePackage> = if force {
         selected_for_policy
@@ -625,10 +628,24 @@ async fn run_under_store_lock(
         .copied()
         .collect::<Vec<_>>();
 
+    // The sandbox is chosen only once scripts are about to run, so a
+    // preview says what that choice will need.
+    let dry_run_approvals = if dry_run && run_reaches_sandbox {
+        crate::sandbox_config::sandbox_approvals_a_run_needs(
+            policy_project_dir,
+            no_sandbox,
+            strict_sandbox,
+            json_output,
+            &global_config,
+        )?
+    } else {
+        Vec::new()
+    };
+
     if to_build.is_empty() {
         if json_output {
             let result = if dry_run {
-                rebuild_dry_run_envelope(&to_build, force_security_floor)
+                rebuild_dry_run_envelope(&to_build, &dry_run_approvals, force_security_floor)
             } else {
                 rebuild_summary_envelope(
                     0,
@@ -701,6 +718,7 @@ async fn run_under_store_lock(
                     eprintln!("  Use {} to rebuild.", "--force".dimmed());
                 }
             }
+            print_approvals_a_dry_run_left(&dry_run_approvals);
         }
         return Ok(RebuildRunReport {
             covered_packages,
@@ -713,7 +731,8 @@ async fn run_under_store_lock(
     // Dry run — show what would be executed
     if dry_run {
         if json_output {
-            let json = rebuild_dry_run_envelope(&to_build, force_security_floor);
+            let json =
+                rebuild_dry_run_envelope(&to_build, &dry_run_approvals, force_security_floor);
             if emit_summary {
                 println!("{}", serde_json::to_string_pretty(&json).unwrap());
             }
@@ -763,6 +782,7 @@ async fn run_under_store_lock(
                     );
                 }
             }
+            print_approvals_a_dry_run_left(&dry_run_approvals);
         }
         return Ok(RebuildRunReport {
             covered_packages,
