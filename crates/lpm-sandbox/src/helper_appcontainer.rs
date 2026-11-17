@@ -7,8 +7,8 @@
 //!    while holding a cross-process creation lock; on
 //!    `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` fall back to
 //!    [`DeriveAppContainerSidFromAppContainerName`] for the same
-//!    name. Production supplies a unique name for each invocation
-//!    and deletes the profile after the child exits.
+//!    name. Production supplies one stable name for each project and
+//!    package and keeps the profile between runs.
 //! 2. **DACL policy.** Walk each readable/writable tree, opening every
 //!    entry relative to the tree root's handle without passing through
 //!    a reparse point. `SET_ACCESS` grants the invocation SID access.
@@ -25,30 +25,36 @@
 //!    capability SID. Both carry the `lpm.filesystem.v1.*`
 //!    capabilities of tool directories an administrator approved,
 //!    which grant file access only.
-//! 4. **Job Object + spawn + wait.** Create a Job Object with
-//!    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `CreateProcessW` with
+//! 4. **Job Object + spawn + wait.** Open the Job the caller made with
+//!    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, or make one, `CreateProcessW` with
 //!    `CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT |
-//!    CREATE_NEW_PROCESS_GROUP`, assign the suspended child to the
-//!    job BEFORE resuming (kill-tree parity), `ResumeThread`,
-//!    `WaitForSingleObject(INFINITE)`, propagate the child's exit
-//!    code.
+//!    CREATE_NEW_PROCESS_GROUP` and the Job in the attribute list, so
+//!    the child is in the Job from its creation, `ResumeThread`,
+//!    `WaitForSingleObject(INFINITE)`, end what the child left running
+//!    in the Job and wait until the Job holds no process, propagate the
+//!    child's exit code.
 //!
 //! ## Cleanup-on-crash story
 //!
-//! Helper death — including a crash partway through DACL setup —
-//! triggers `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` once the Job
-//! Object handle is the last reference, which the helper's RAII
-//! guard ensures on every exit path. The lifecycle child cannot
-//! outlive the helper.
+//! The Job ends its processes when its last handle closes. A helper
+//! that made its own Job holds the only handle, so its death, including
+//! a crash partway through DACL setup, ends the lifecycle child. Where
+//! the helper's caller made the Job and named it with `--job`, the caller
+//! holds it too: the child then outlives a stopped helper until the
+//! caller ends the Job's processes, which the Job tells it for certain,
+//! or goes itself.
 //!
 //! Nor does it outlive the process that started the helper. Windows
 //! ends no child with its parent, so the helper waits on that process
 //! beside the child, ends the child's whole Job when it goes first, and
 //! then takes back what the run set, as after any other exit.
 //!
-//! Secret-file DACLs are restored byte-for-byte after the child exits.
-//! Production also deletes the invocation-specific AppContainer profile,
-//! so its SID cannot accumulate readable paths across lifecycle runs.
+//! Secret-file DACLs are restored byte-for-byte once no process of the
+//! run is left: the helper waits for its Job to empty first. A later run
+//! or cleanup of the identity first ends the Jobs the grant record names
+//! for runs that were stopped, and then waits until no process is found
+//! running as the identity. The identity's cleanup, once its package
+//! leaves the project, revokes its trees and deletes its profile.
 
 #![cfg(target_os = "windows")]
 
@@ -63,7 +69,8 @@ use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasi
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_SUCCESS,
     FILETIME, GetHandleInformation, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL,
-    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0,
+    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, SetLastError, WAIT_ABANDONED,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
@@ -87,8 +94,9 @@ use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
@@ -96,16 +104,17 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ReleaseMutex, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForMultipleObjects,
-    WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
 
 /// Explicit setup for Windows sandbox filesystem permissions.
 mod identity;
+mod processes;
 pub mod setup;
 
 /// `SE_GROUP_ENABLED` from winnt.h. The Attributes field of every
@@ -122,6 +131,10 @@ const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 // feature namespace.
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+// WinNT's JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY and
+// JOB_OBJECT_TERMINATE, inlined for the same reason: what a run does with
+// a Job its caller made. Creating a process in a Job needs the first.
+const JOB_ACCESS: u32 = 0x0001 | 0x0004 | 0x0008;
 const PROFILE_CREATION_MUTEX_NAME: &str = r"Local\LpmSandboxAppContainerProfileCreation";
 
 // ── Error type ───────────────────────────────────────────────────────
@@ -216,7 +229,7 @@ pub enum AppContainerError {
     },
     /// Reading or writing a record of an AppContainer's grants, or of the
     /// trees already swept, failed.
-    #[error("failed to update the AppContainer grant record {path}: {source}")]
+    #[error("failed to read or update the AppContainer grant record {path}: {source}")]
     GrantRecord {
         /// The record.
         path: PathBuf,
@@ -264,6 +277,14 @@ pub enum AppContainerError {
         /// `GetLastError` reading.
         last_error: u32,
     },
+    /// `OpenJobObjectW` failed for the Job the helper's caller named.
+    #[error("OpenJobObjectW({name}) failed with Win32 error {last_error}")]
+    OpenJob {
+        /// The Job's name.
+        name: String,
+        /// `GetLastError` reading.
+        last_error: u32,
+    },
     /// `SetInformationJobObject` failed configuring KILL_ON_JOB_CLOSE.
     #[error("SetInformationJobObject(KILL_ON_JOB_CLOSE) failed with Win32 error {last_error}")]
     ConfigureJob {
@@ -286,11 +307,10 @@ pub enum AppContainerError {
         /// Filesystem error or shell path limitation.
         source: std::io::Error,
     },
-    /// `AssignProcessToJobObject` failed (the lifecycle child is
-    /// still suspended at this point, so we'll terminate it via the
-    /// process-info handle in the error path).
-    #[error("AssignProcessToJobObject failed with Win32 error {last_error}")]
-    AssignJob {
+    /// `ResumeThread` failed starting the suspended lifecycle child,
+    /// which ends with its Job.
+    #[error("ResumeThread failed with Win32 error {last_error}")]
+    Resume {
         /// `GetLastError` reading.
         last_error: u32,
     },
@@ -311,12 +331,46 @@ pub enum AppContainerError {
         /// `WaitForMultipleObjects`.
         wait_result: u32,
     },
-    /// `TerminateJobObject` failed ending a lifecycle child whose caller
-    /// had ended.
+    /// `TerminateJobObject` failed ending the processes a run's Job
+    /// still held.
     #[error("TerminateJobObject failed with Win32 error {last_error}")]
     EndJob {
         /// Win32 error code from `GetLastError()`.
         last_error: u32,
+    },
+    /// `QueryInformationJobObject` failed counting the processes a run's
+    /// Job still held.
+    #[error("QueryInformationJobObject failed with Win32 error {last_error}")]
+    QueryJob {
+        /// Win32 error code from `GetLastError()`.
+        last_error: u32,
+    },
+    /// A run's Job still held processes after the wait for them to end.
+    /// The run's read denials stay set for the identity's next run.
+    #[error(
+        "{active} of the script's processes did not end within {waited_secs} seconds; what the run set stays until the package's next run"
+    )]
+    JobNotEmpty {
+        /// Processes the Job still counted as active.
+        active: u32,
+        /// How long the helper waited.
+        waited_secs: u64,
+    },
+    /// The running processes couldn't be listed, so none could be shown
+    /// to run as the identity.
+    #[error("listing the running processes failed with Win32 error {last_error}")]
+    ListProcesses {
+        /// Win32 error code from `GetLastError()`.
+        last_error: u32,
+    },
+    /// Processes of the identity outlasted the wait for them. Its read
+    /// denials stay set, and no run of the identity starts, until they end.
+    #[error(
+        "an earlier run of this package left processes running ({processes}); end them and retry"
+    )]
+    IdentityInUse {
+        /// Ids of the processes that still run as the identity.
+        processes: processes::ProcessIds,
     },
     /// `GetExitCodeProcess` failed extracting the lifecycle child's
     /// exit code after it terminated.
@@ -474,12 +528,15 @@ impl Drop for AppContainerProfileCleanup {
 }
 
 /// A read denial on one project secret for this run's AppContainer SID,
-/// released when the run ends, by [`SecretDenial::remove`] or on drop.
+/// released when the run ends, by [`SecretDenial::remove`]. Dropping it
+/// releases it too, until [`SecretDenial::leave_set`] says a script may
+/// be running.
 struct SecretDenial {
     path: PathBuf,
     /// Owned by the caller's `SidGuard`, which outlives every denial.
     sid: PSID,
-    active: bool,
+    set: bool,
+    removed_on_drop: bool,
 }
 
 /// Fails for a listed secret that exists and this user can't change,
@@ -520,21 +577,34 @@ impl SecretDenial {
         Ok(Some(Self {
             path: path.to_path_buf(),
             sid,
-            active: true,
+            set: true,
+            removed_on_drop: true,
         }))
     }
 
     fn remove(&mut self) -> Result<(), AppContainerError> {
-        if self.active {
+        if self.set {
             setup::remove_appcontainer_read_deny(&self.path, self.sid)?;
-            self.active = false;
+            self.set = false;
         }
         Ok(())
+    }
+
+    /// Keeps the denial unless [`SecretDenial::remove`] is called: a
+    /// return or a panic that drops it no longer takes it off. Where the
+    /// run has a grant record, the record still names the denial, and the
+    /// identity's next run or its cleanup takes it back. A run without
+    /// one leaves it for good.
+    fn leave_set(&mut self) {
+        self.removed_on_drop = false;
     }
 }
 
 impl Drop for SecretDenial {
     fn drop(&mut self) {
+        if !self.removed_on_drop {
+            return;
+        }
         if let Err(error) = self.remove() {
             tracing::error!(target: "lpm_sandbox::helper_appcontainer", "{error}");
         }
@@ -553,6 +623,8 @@ struct AttrListGuard {
     list: LPPROC_THREAD_ATTRIBUTE_LIST,
     /// The handle list's array, which the list points into.
     inherited: Box<[HANDLE]>,
+    /// The Job list's array, which the list points into as well.
+    jobs: Box<[HANDLE]>,
 }
 
 impl AttrListGuard {
@@ -604,10 +676,11 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
     // What a run of this identity that was stopped before it ended left
-    // set comes off first, then the trees the identity was granted before
-    // and no longer is. Revoking one of those takes every entry of the
-    // identity off it and what is inside it, so it comes before this run
-    // sets its own entries there.
+    // set comes off first, once none of the identity's processes is left,
+    // then the trees the identity was granted before and no longer is.
+    // Revoking one of those takes every entry of the identity off it and
+    // what is inside it, so it comes before this run sets its own entries
+    // there.
     let granted: Vec<PathBuf> = args
         .best_effort_readable_dirs
         .iter()
@@ -633,6 +706,10 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
             &identity::RunAccess {
                 traversed: traversed.to_vec(),
                 denied: args.secret_read_denied_paths.clone(),
+                // A Job the caller holds keeps the script running after
+                // this helper is stopped, so whoever takes this run's
+                // entries back must end it first.
+                jobs: args.job.iter().cloned().collect(),
             },
         )
     })?;
@@ -750,15 +827,17 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     //    GetStdHandle. Null → open NUL with inheritable flag.
     let stdio = open_stdio_handles(&args)?;
 
-    // 5. Allocate the attribute list: SECURITY_CAPABILITIES and the
-    //    stdio handles as the only ones the child inherits.
-    let attr_list = init_attribute_list(&mut sec_caps, stdio.inherited_handles())?;
+    // 5. The Job the script is created in. A script that joined it only
+    //    after it was created would, were this helper stopped in between,
+    //    stay suspended in no Job for good.
+    let job = match &args.job {
+        Some(name) => ScriptJob::open(name)?,
+        None => ScriptJob::create(None)?,
+    };
 
-    // 6. Create the Job Object now so it exists before we spawn —
-    //    the suspended child gets assigned to it BEFORE we resume,
-    //    so a misbehaving child can't fork off descendants outside
-    //    the job's kill-tree.
-    let job = create_kill_on_close_job()?;
+    // 6. Allocate the attribute list: SECURITY_CAPABILITIES and the
+    //    stdio handles as the only ones the child inherits.
+    let attr_list = init_attribute_list(&mut sec_caps, stdio.inherited_handles(), &job)?;
 
     // 7. Render the command line + environment + working dir. We
     //    deliberately do NOT pass `lpApplicationName` (kept NULL)
@@ -771,7 +850,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     //    Quoting the executable ensures the first token
     //    is unambiguously the program path even when it contains
     //    spaces.
-    let cmdline_wide = build_command_line_wide(&args.program, &args.program_args);
+    let mut cmdline_wide = build_command_line_wide(&args.program, &args.program_args);
     let env_wide = build_environment_block(&args.envs, args.env_clear);
     let working_dir_wide = args
         .working_dir
@@ -791,37 +870,98 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     startup.StartupInfo.hStdError = stdio.stderr;
     startup.lpAttributeList = attr_list.list();
 
-    // 9. CreateProcessW + AssignProcessToJobObject + ResumeThread + wait.
+    // A script may run from here on, so a denial comes off only once the
+    // Job is seen empty below, and no longer when it is dropped.
+    secret_denials.iter_mut().for_each(SecretDenial::leave_set);
+    let outcome = run_script(
+        &job,
+        &caller,
+        &args.program,
+        &mut cmdline_wide,
+        &env_wide,
+        working_dir_wide.as_deref(),
+        &startup,
+        attr_list.inherits_handles(),
+    );
+    // The identity keeps its trees between runs, so a secret inside one
+    // is readable for it again once its denial comes off. Nothing of the
+    // run comes off while one of its processes is left.
+    if let Err(not_ended) = job.end_every_process(JOB_END_WAIT) {
+        // The error that says the denials stay is the one reported.
+        if let Err(error) = outcome {
+            tracing::error!(target: "lpm_sandbox::helper_appcontainer", "{error}");
+        }
+        return Err(not_ended);
+    }
+    if matches!(outcome, Ok(exit_code) if exit_code != 0) {
+        // A reader gone from the other end of stderr mustn't change the
+        // exit code the script's caller sees.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            unreadable_tools_report(&unreadable_tools).as_bytes(),
+        );
+    }
+    // A script that couldn't be started leaves the run's entries no more
+    // than one that ran.
+    for denial in secret_denials.iter_mut().rev() {
+        denial.remove()?;
+    }
+    let taken_back = identity::RunAccess {
+        traversed: prepared_access.release(),
+        denied: args.secret_read_denied_paths.clone(),
+        jobs: args.job.iter().cloned().collect(),
+    };
+    if let Some(record) = &args.grant_record
+        && let Err(error) = identity::forget_run_access(record, &taken_back)
+    {
+        // The record then names access this run no longer holds, which the
+        // next run finds already taken back.
+        tracing::warn!(target: "lpm_sandbox::helper_appcontainer", "{error}");
+    }
+    let exit_code = outcome?;
+    profile_cleanup.delete()?;
+    // Exit codes >= 0x80000000 are Windows STATUS_* values
+    // (signaling crashes, access violations, etc.); cast through
+    // the u32→i32 reinterpretation so the helper's caller can
+    // observe the same numeric value the lifecycle child saw.
+    Ok(exit_code as i32)
+}
+
+/// Starts the script in `job` and waits until it exits or the helper's
+/// caller ends, which ends the script. Returns the script's exit code.
+#[allow(clippy::too_many_arguments)]
+fn run_script(
+    job: &ScriptJob,
+    caller: &Caller,
+    program: &OsStr,
+    command_line: &mut [u16],
+    environment: &[u16],
+    working_dir: Option<&[u16]>,
+    startup: &STARTUPINFOEXW,
+    inherits_handles: bool,
+) -> Result<u32, AppContainerError> {
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let creation_flags = CREATE_SUSPENDED
         | EXTENDED_STARTUPINFO_PRESENT
         | CREATE_NEW_PROCESS_GROUP
         | CREATE_UNICODE_ENVIRONMENT;
-    // SAFETY: All pointer arguments live for the duration of the
-    // call: cmdline_wide, env_wide, working_dir_wide are owned
-    // `Vec<u16>` in this stack frame; startup is a stack local
-    // with a valid attribute list; pi is a freshly-zeroed out
-    // param.
+    // SAFETY: every pointer argument is to a null-terminated buffer or a
+    // structure the caller keeps alive for the call, and `startup` holds
+    // a valid attribute list. `pi` is a freshly-zeroed out param.
     let ok = unsafe {
         CreateProcessW(
-            // lpApplicationName = NULL — see comment at
-            // `build_command_line_wide` call above. Windows parses
-            // argv[0] from the cmdline AND walks PATH for it.
+            // lpApplicationName = NULL, so Windows parses argv[0] from
+            // the command line and walks PATH for it.
             ptr::null(),
-            // lpCommandLine is documented as `LPWSTR` (mutable) —
-            // Win32 may write into it. We give it ownership-of-a-
-            // mutable-slice via `as_ptr() as *mut _` because our
-            // Vec<u16> outlives the call.
-            cmdline_wide.as_ptr() as *mut _,
+            // Win32 may write into the command line.
+            command_line.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
             // Limited to the attribute list's handle list.
-            i32::from(attr_list.inherits_handles()),
+            i32::from(inherits_handles),
             creation_flags,
-            env_wide.as_ptr() as *const _,
-            working_dir_wide
-                .as_ref()
-                .map_or(ptr::null(), |v| v.as_ptr()),
+            environment.as_ptr() as *const _,
+            working_dir.map_or(ptr::null(), <[u16]>::as_ptr),
             &startup.StartupInfo,
             &mut pi,
         )
@@ -829,7 +969,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     if ok == 0 {
         let last = unsafe { GetLastError() };
         return Err(AppContainerError::CreateProcess {
-            program: args.program,
+            program: program.to_os_string(),
             last_error: last,
         });
     }
@@ -837,16 +977,6 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // early-return path closes them.
     let child_proc = HandleGuard(pi.hProcess);
     let child_thread = HandleGuard(pi.hThread);
-
-    // Assign to the job BEFORE resuming so any descendants the
-    // child spawns are inside the job's kill-tree from the start.
-    // SAFETY: child_proc holds a valid handle; job is alive on
-    // this stack frame.
-    let ok = unsafe { AssignProcessToJobObject(job.as_raw(), child_proc.as_raw()) };
-    if ok == 0 {
-        let last = unsafe { GetLastError() };
-        return Err(AppContainerError::AssignJob { last_error: last });
-    }
 
     // A caller that ended while the trees were being granted gets no
     // script started for it: the child stays suspended until its Job ends.
@@ -856,11 +986,8 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         // SAFETY: child_thread holds a valid suspended-thread handle.
         let prev = unsafe { ResumeThread(child_thread.as_raw()) };
         if prev == u32::MAX {
-            // ResumeThread returning -1 indicates failure. The job
-            // still owns the suspended child, so dropping `job` will
-            // KILL_ON_JOB_CLOSE-fire and reap it.
             let last = unsafe { GetLastError() };
-            return Err(AppContainerError::AssignJob { last_error: last });
+            return Err(AppContainerError::Resume { last_error: last });
         }
         caller.ends_before(child_proc.as_raw())?
     };
@@ -871,57 +998,24 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
             &mut std::io::stderr(),
             b"lpm-sandbox-helper: the process that started this run has ended, so its script is stopped\n",
         );
-        // SAFETY: the job handle is alive on this stack frame.
-        if unsafe { TerminateJobObject(job.as_raw(), 1) } == 0 {
-            let last = unsafe { GetLastError() };
-            return Err(AppContainerError::EndJob { last_error: last });
-        }
+        job.tell_every_process_to_end()?;
+        let wait_ms = u32::try_from(JOB_END_WAIT.as_millis()).unwrap_or(u32::MAX - 1);
         // SAFETY: child_proc handle is open for the wait.
-        let wait_result = unsafe { WaitForSingleObject(child_proc.as_raw(), INFINITE) };
+        let wait_result = unsafe { WaitForSingleObject(child_proc.as_raw(), wait_ms) };
         if wait_result != WAIT_OBJECT_0 {
             return Err(AppContainerError::Wait { wait_result });
         }
     }
 
-    // SAFETY: child_proc handle is still open; we just observed its
-    // signal state so the exit code is finalized.
+    // SAFETY: child_proc handle is still open, and the child has exited,
+    // so its exit code is final.
     let mut exit_code: u32 = 0;
     let ok = unsafe { GetExitCodeProcess(child_proc.as_raw(), &mut exit_code) };
     if ok == 0 {
         let last = unsafe { GetLastError() };
         return Err(AppContainerError::ExitCode { last_error: last });
     }
-    // The script's descendants are told to end before secret permissions
-    // are restored.
-    drop(job);
-    if exit_code != 0 {
-        // A reader gone from the other end of stderr mustn't change the
-        // exit code the script's caller sees.
-        let _ = std::io::Write::write_all(
-            &mut std::io::stderr(),
-            unreadable_tools_report(&unreadable_tools).as_bytes(),
-        );
-    }
-    for denial in secret_denials.iter_mut().rev() {
-        denial.remove()?;
-    }
-    let taken_back = identity::RunAccess {
-        traversed: prepared_access.release(),
-        denied: args.secret_read_denied_paths.clone(),
-    };
-    if let Some(record) = &args.grant_record
-        && let Err(error) = identity::forget_run_access(record, &taken_back)
-    {
-        // The record then names access this run no longer holds, which the
-        // next run finds already taken back.
-        tracing::warn!(target: "lpm_sandbox::helper_appcontainer", "{error}");
-    }
-    profile_cleanup.delete()?;
-    // Exit codes >= 0x80000000 are Windows STATUS_* values
-    // (signaling crashes, access violations, etc.); cast through
-    // the u32→i32 reinterpretation so the helper's caller can
-    // observe the same numeric value the lifecycle child saw.
-    Ok(exit_code as i32)
+    Ok(exit_code)
 }
 
 // ── The helper's caller ──────────────────────────────────────────────
@@ -1151,6 +1245,14 @@ pub fn run_take_back_run(args: &HelperArgs) -> Result<i32, AppContainerError> {
     let sid = derive_appcontainer_sid(&args.appcontainer_name)?;
     identity::take_back_stopped_run(record, sid.0)?;
     Ok(0)
+}
+
+/// Whether the grant record `record` still names the run whose script is
+/// in the Job `job`, which a helper that ended as it should never leaves.
+/// A record that can't be read is an error: no run or cleanup of the
+/// identity gets past it either.
+pub(crate) fn record_names_the_run_in(record: &Path, job: &str) -> Result<bool, AppContainerError> {
+    identity::names_the_run_in(record, job)
 }
 
 fn acquire_profile_creation_lock() -> Result<ProfileCreationLock, AppContainerError> {
@@ -1665,8 +1767,9 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 fn init_attribute_list(
     sec_caps: &mut SECURITY_CAPABILITIES,
     inherited: Box<[HANDLE]>,
+    job: &ScriptJob,
 ) -> Result<AttrListGuard, AppContainerError> {
-    let count = if inherited.is_empty() { 1 } else { 2 };
+    let count = if inherited.is_empty() { 2 } else { 3 };
     // Two-call idiom: first call with NULL list + 0 size returns
     // the required size via *out; second call allocates the buffer
     // and initializes.
@@ -1697,6 +1800,7 @@ fn init_attribute_list(
         _buf: buf,
         list,
         inherited,
+        jobs: Box::new([job.as_raw()]),
     };
     // SAFETY: sec_caps is borrowed for the lifetime of the
     // attribute list; the caller keeps both alive together.
@@ -1707,6 +1811,23 @@ fn init_attribute_list(
             PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
             sec_caps as *mut _ as *const _,
             std::mem::size_of::<SECURITY_CAPABILITIES>(),
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    };
+    if ok == 0 {
+        let last = unsafe { GetLastError() };
+        return Err(AppContainerError::UpdateAttrList { last_error: last });
+    }
+    // SAFETY: the handle array lives in the guard as long as the list,
+    // and the Job it names is open through the process's creation.
+    let ok = unsafe {
+        UpdateProcThreadAttribute(
+            guard.list,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            guard.jobs.as_ptr().cast(),
+            std::mem::size_of_val(&*guard.jobs),
             ptr::null_mut(),
             ptr::null(),
         )
@@ -1738,36 +1859,153 @@ fn init_attribute_list(
 
 // ── Job Object ───────────────────────────────────────────────────────
 
-/// Create a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-/// When the helper exits — for any reason — the job handle drops,
-/// which fires KILL_ON_JOB_CLOSE and reaps every descendant of the
-/// lifecycle child. The lifecycle child cannot outlive the helper.
-fn create_kill_on_close_job() -> Result<HandleGuard, AppContainerError> {
-    // SAFETY: NULL attributes + NULL name produces an unnamed
-    // anonymous job; documented call shape.
-    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-    if job.is_null() {
-        let last = unsafe { GetLastError() };
-        return Err(AppContainerError::CreateJob { last_error: last });
-    }
-    let job_guard = HandleGuard(job);
+/// How long a run waits for the processes of its Job to end, once told to.
+const JOB_END_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    // SAFETY: info is stack-local and lives for the call.
-    let ok = unsafe {
-        SetInformationJobObject(
-            job_guard.as_raw(),
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if ok == 0 {
-        let last = unsafe { GetLastError() };
-        return Err(AppContainerError::ConfigureJob { last_error: last });
+/// The Job a run's script and everything it starts belong to. Closing
+/// its last handle ends them, so they outlive neither the helper nor,
+/// where the helper's caller made the Job, the two of them.
+pub(crate) struct ScriptJob(std::os::windows::io::OwnedHandle);
+
+impl ScriptJob {
+    /// Makes a Job whose processes end with its last handle. One with a
+    /// `name` can be opened by another process of the session; a name
+    /// already in use is an error, as that Job is somebody else's.
+    pub(crate) fn create(name: Option<&str>) -> Result<Self, AppContainerError> {
+        use std::os::windows::io::FromRawHandle as _;
+
+        let wide_name = name.map(str_to_wide_with_nul);
+        // SAFETY: the name is null-terminated and lives through the call,
+        // or is NULL for an unnamed Job. The error is cleared first so
+        // that what is read afterwards is this call's.
+        let (job, last) = unsafe {
+            SetLastError(ERROR_SUCCESS);
+            let job = CreateJobObjectW(
+                ptr::null(),
+                wide_name.as_ref().map_or(ptr::null(), |name| name.as_ptr()),
+            );
+            (job, GetLastError())
+        };
+        if job.is_null() {
+            return Err(AppContainerError::CreateJob { last_error: last });
+        }
+        // SAFETY: the call returned a handle nothing else owns.
+        let job = Self(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job.cast()) });
+        if name.is_some() && last == ERROR_ALREADY_EXISTS {
+            return Err(AppContainerError::CreateJob { last_error: last });
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: info is stack-local and lives for the call.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.as_raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            let last = unsafe { GetLastError() };
+            return Err(AppContainerError::ConfigureJob { last_error: last });
+        }
+        Ok(job)
     }
-    Ok(job_guard)
+
+    /// Opens the Job another process made under `name` and still holds.
+    pub(crate) fn open(name: &str) -> Result<Self, AppContainerError> {
+        use std::os::windows::io::FromRawHandle as _;
+
+        let wide_name = str_to_wide_with_nul(name);
+        // SAFETY: the name is null-terminated and lives through the call.
+        let job = unsafe { OpenJobObjectW(JOB_ACCESS, 0, wide_name.as_ptr()) };
+        if job.is_null() {
+            let last = unsafe { GetLastError() };
+            return Err(AppContainerError::OpenJob {
+                name: name.to_owned(),
+                last_error: last,
+            });
+        }
+        // SAFETY: the call returned a handle nothing else owns.
+        Ok(Self(unsafe {
+            std::os::windows::io::OwnedHandle::from_raw_handle(job.cast())
+        }))
+    }
+
+    pub(crate) fn as_raw(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle as _;
+
+        self.0.as_raw_handle().cast()
+    }
+
+    pub(crate) fn active_processes(&self) -> Result<u32, AppContainerError> {
+        Ok(self.counted()?.ActiveProcesses)
+    }
+
+    /// How many processes the Job has held in all, those that ended
+    /// among them.
+    pub(crate) fn processes_ever(&self) -> Result<u32, AppContainerError> {
+        Ok(self.counted()?.TotalProcesses)
+    }
+
+    fn counted(&self) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, AppContainerError> {
+        let mut counted: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `counted` is a stack-local of the size passed.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.as_raw(),
+                JobObjectBasicAccountingInformation,
+                &mut counted as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let last = unsafe { GetLastError() };
+            return Err(AppContainerError::QueryJob { last_error: last });
+        }
+        Ok(counted)
+    }
+
+    /// Starts the end of every process the Job holds now.
+    fn tell_every_process_to_end(&self) -> Result<(), AppContainerError> {
+        // SAFETY: the job handle is open.
+        if unsafe { TerminateJobObject(self.as_raw(), 1) } == 0 {
+            let last = unsafe { GetLastError() };
+            return Err(AppContainerError::EndJob { last_error: last });
+        }
+        Ok(())
+    }
+
+    /// Ends every process the Job still holds and returns once none is
+    /// left, or fails when one still is after `limit`. Ending a process
+    /// only starts its end, so the Job is asked until it counts none. It
+    /// is told again each time: a process that was being created while
+    /// the Job ended its others joins it afterwards. A process that has
+    /// exited keeps the exit code it had.
+    pub(crate) fn end_every_process(
+        &self,
+        limit: std::time::Duration,
+    ) -> Result<(), AppContainerError> {
+        let started = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            self.tell_every_process_to_end()?;
+            let active = self.active_processes()?;
+            if active == 0 {
+                return Ok(());
+            }
+            if started.elapsed() >= limit {
+                return Err(AppContainerError::JobNotEmpty {
+                    active,
+                    waited_secs: limit.as_secs() + u64::from(limit.subsec_nanos() > 0),
+                });
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
 }
 
 // ── Stdio handles ────────────────────────────────────────────────────

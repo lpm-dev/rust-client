@@ -818,6 +818,11 @@ fn a_run_and_its_cleanup_leave_how_each_folder_and_file_inherits() {
 struct StoppedRun {
     helper: std::process::Child,
     identity: Vec<String>,
+    /// The run's Job, where the test holds it as `lpm` does.
+    job: Option<HeldJob>,
+    /// The folder a script in a held Job writes to once it has read the
+    /// secret.
+    outside: Option<tempfile::TempDir>,
 }
 
 impl StoppedRun {
@@ -831,12 +836,88 @@ impl StoppedRun {
     fn clean_up(&self) -> std::process::Output {
         cleanup_of(&self.identity).output().expect("spawn cleanup")
     }
+
+    /// Whether the script of a run in a held Job got to read the secret.
+    /// It tries without pause for as long as it runs.
+    fn script_read_the_secret(&self) -> bool {
+        let outside = self.outside.as_ref().expect("a run in a held Job");
+        outside.path().join(SECRET_WAS_READ).exists()
+    }
 }
+
+const SECRET_WAS_READ: &str = "secret-was-read";
 
 impl Drop for StoppedRun {
     fn drop(&mut self) {
         self.stop();
+        // Closing a held Job ends the script, which the cleanup waits for.
+        self.job = None;
         let _ = cleanup_of(&self.identity).output();
+    }
+}
+
+/// A Job the test made and holds, as `lpm` holds the Job of a run it
+/// started: the script in it outlives the helper until the Job is closed.
+struct HeldJob {
+    name: String,
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+impl HeldJob {
+    fn create(name: String) -> Self {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let wide_name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: the name is null-terminated and lives through the call.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), wide_name.as_ptr()) };
+        assert!(!job.is_null(), "create the Job");
+        // SAFETY: the call returned a handle nothing else owns.
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job.cast()) };
+        // SAFETY: the structure accepts the all-zero state.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is a stack-local of the size passed.
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle.as_raw_handle().cast(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        assert_ne!(
+            configured, 0,
+            "end the Job's processes with its last handle"
+        );
+        Self { name, handle }
+    }
+
+    fn active_processes(&self) -> u32 {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        // SAFETY: the structure accepts the all-zero state.
+        let mut counted: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `counted` is a stack-local of the size passed.
+        let asked = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut counted).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(asked, 0, "ask the Job how many processes it holds");
+        counted.ActiveProcesses
     }
 }
 
@@ -849,6 +930,19 @@ fn start_a_run_that_sleeps(
     record: &std::path::Path,
     secret: &std::path::Path,
 ) -> (StoppedRun, String) {
+    start_a_run_that_sleeps_in(profile, project, record, secret, None)
+}
+
+/// As [`start_a_run_that_sleeps`]. Where a `job` is given the script is in
+/// it, and instead of sleeping it tries to read `secret` without pause,
+/// and says so in a folder of its own once it could.
+fn start_a_run_that_sleeps_in(
+    profile: &str,
+    project: &std::path::Path,
+    record: &std::path::Path,
+    secret: &std::path::Path,
+    job: Option<HeldJob>,
+) -> (StoppedRun, String) {
     let identity = vec![
         "--protocol-version".to_string(),
         lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
@@ -857,26 +951,49 @@ fn start_a_run_that_sleeps(
         "--grant-record".into(),
         record.to_string_lossy().into_owned(),
     ];
-    let helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+    let outside = job
+        .is_some()
+        .then(|| tempfile::tempdir().expect("folder for the script's own file"));
+    let quoted = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
+    let script = match &outside {
+        Some(outside) => format!(
+            "while ($true) {{ try {{ [System.IO.File]::ReadAllText('{}') | Out-Null; [System.IO.File]::WriteAllText('{}', 'read') }} catch {{ }} }}",
+            quoted(secret),
+            quoted(&outside.path().join(SECRET_WAS_READ)),
+        ),
+        None => "Start-Sleep -Seconds 300".to_owned(),
+    };
+    let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
+    helper
         .args(&identity)
+        .args(job.iter().flat_map(|job| ["--job", job.name.as_str()]))
         .args(["--stdio-stdin", "null"])
         .args(["--stdio-stdout", "null"])
         .args(["--stdio-stderr", "null"])
         .arg("--readable-dir")
         .arg(project)
         .arg("--secret-read-deny")
-        .arg(secret)
+        .arg(secret);
+    if let Some(outside) = &outside {
+        helper.arg("--writable-dir").arg(outside.path());
+    }
+    let helper = helper
         .args([
             "--",
             POWERSHELL,
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Start-Sleep -Seconds 300",
         ])
+        .arg(script)
         .spawn()
         .expect("spawn helper");
-    let mut run = StoppedRun { helper, identity };
+    let mut run = StoppedRun {
+        helper,
+        identity,
+        job,
+        outside,
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let sid = loop {
         if let Some(sid) = denied_app_containers(secret).pop() {
@@ -897,10 +1014,19 @@ fn start_a_run_that_sleeps(
 
 /// The directories `record` says a run passes through until it ends.
 fn recorded_traversal(record: &std::path::Path) -> Vec<std::path::PathBuf> {
+    recorded_run_paths(record, "traversed")
+}
+
+/// The secrets `record` says a run denies its identity until it ends.
+fn recorded_denials(record: &std::path::Path) -> Vec<std::path::PathBuf> {
+    recorded_run_paths(record, "denied")
+}
+
+fn recorded_run_paths(record: &std::path::Path, part: &str) -> Vec<std::path::PathBuf> {
     let recorded: serde_json::Value =
         serde_json::from_slice(&fs::read(record).expect("the run recorded what it set"))
             .expect("the record is JSON");
-    recorded["run"]["traversed"]
+    recorded["run"][part]
         .as_array()
         .map(|paths| {
             paths
@@ -996,6 +1122,374 @@ fn taking_back_a_stopped_run_leaves_the_identity_its_trees_and_its_record() {
         names_trustee(project.path(), &sid),
         "the identity keeps the tree it was granted, for its next run"
     );
+}
+
+/// Starts a run whose script is in a Job the test holds, stops its
+/// helper once the script runs, and returns the run with its identity's
+/// SID. The script is then still running, denied `secret`.
+fn stop_the_helper_of_a_run_in_a_held_job(
+    profile: &str,
+    project: &std::path::Path,
+    record: &std::path::Path,
+    secret: &std::path::Path,
+) -> (StoppedRun, String) {
+    let job = HeldJob::create(format!(r"Global\{profile}-{}", std::process::id()));
+    let (mut run, sid) = start_a_run_that_sleeps_in(profile, project, record, secret, Some(job));
+    let job = run.job.as_ref().expect("the run's Job");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while job.active_processes() == 0 {
+        assert!(
+            run.helper.try_wait().expect("poll helper").is_none(),
+            "the run ended before its script started"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never started its script"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    run.stop();
+    let job = run.job.as_ref().expect("the run's Job");
+    assert!(
+        job.active_processes() >= 1,
+        "the script outlives its helper while the Job is held"
+    );
+    assert_eq!(
+        denied_app_containers(secret),
+        std::slice::from_ref(&sid),
+        "a stopped run can't take its denial back itself"
+    );
+    assert!(!run.script_read_the_secret());
+    (run, sid)
+}
+
+#[test]
+fn a_take_back_ends_what_is_left_of_the_script_in_the_run_s_job_first() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let (run, _) = stop_the_helper_of_a_run_in_a_held_job(
+        "LpmFilesystemHeldJob",
+        project.path(),
+        &record,
+        &secret,
+    );
+    let job = run.job.as_ref().expect("the run's Job");
+
+    let taken_back = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&run.identity)
+        .arg("--take-back-run")
+        .output()
+        .expect("spawn the take-back");
+
+    assert!(taken_back.status.success(), "{taken_back:?}");
+    assert_eq!(job.active_processes(), 0, "the script is ended");
+    assert!(
+        !run.script_read_the_secret(),
+        "and it was ended before the denial came off"
+    );
+    assert!(
+        denied_app_containers(&secret).is_empty(),
+        "the denial comes off once the script is gone"
+    );
+    assert!(recorded_denials(&record).is_empty());
+}
+
+#[test]
+fn the_identity_s_next_run_ends_what_a_stopped_run_left_in_its_job_first() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let created = project.path().join("created-by-child.txt");
+    let (run, _) = stop_the_helper_of_a_run_in_a_held_job(
+        "LpmFilesystemNextRun",
+        project.path(),
+        &record,
+        &secret,
+    );
+    let job = run.job.as_ref().expect("the run's Job");
+
+    let next = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&run.identity)
+        .args(["--stdio-stdin", "null"])
+        .args(["--stdio-stdout", "piped"])
+        .args(["--stdio-stderr", "piped"])
+        .arg("--writable-dir")
+        .arg(project.path())
+        .args([
+            "--",
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+        ])
+        .arg(ps_write_file(&created.to_string_lossy()))
+        .output()
+        .expect("spawn the next run");
+
+    assert!(next.status.success(), "{next:?}");
+    assert_eq!(
+        job.active_processes(),
+        0,
+        "the stopped run's script is ended"
+    );
+    assert!(
+        !run.script_read_the_secret(),
+        "and it was ended before its denial came off"
+    );
+    assert!(created.exists());
+    assert!(
+        denied_app_containers(&secret).is_empty(),
+        "the next run listed no secret, and took the stopped run's denial back"
+    );
+}
+
+#[test]
+fn a_run_whose_job_can_t_be_opened_starts_no_script() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let created = project.path().join("created-by-child.txt");
+    let mut argv = helper_argv_base();
+    argv.extend(
+        [
+            "--job",
+            r"Local\LpmFilesystemNoSuchJob",
+            "--writable-dir",
+            &project.path().to_string_lossy(),
+            "--",
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &ps_write_file(&created.to_string_lossy()),
+        ]
+        .map(String::from),
+    );
+
+    let output = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("cargo bin")
+        .args(&argv)
+        .output()
+        .expect("spawn helper");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("OpenJobObjectW"),
+        "{output:?}"
+    );
+    assert!(!created.exists());
+}
+
+/// A script that runs as an identity outside any run that holds it: its
+/// helper has no grant record, so it doesn't hold the identity. It stands
+/// in for processes that outlasted their run: the script the helper
+/// started, and one that script started in turn. Both end once told to,
+/// so the helper takes back what it set as after any other run.
+struct OutlastingScript {
+    helper: std::process::Child,
+    folder: tempfile::TempDir,
+}
+
+impl OutlastingScript {
+    /// Starts the script as the identity `identity` names, and returns
+    /// once the script it starts in turn runs.
+    fn start(identity: &[String]) -> Self {
+        let folder = tempfile::tempdir().expect("folder for the outlasting script");
+        let started = folder.path().join("second-script-started");
+        let quoted = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
+        let name = identity
+            .iter()
+            .skip_while(|argument| *argument != "--appcontainer-name")
+            .nth(1)
+            .expect("the identity names its profile");
+        let script = format!(
+            "$env:LPM_TEST_STARTED = '{}'\n$env:LPM_TEST_TOLD_TO_END = '{}'\n& '{POWERSHELL}' -NoProfile -NonInteractive -Command 'New-Item -ItemType File -Path $env:LPM_TEST_STARTED | Out-Null; while (-not (Test-Path -LiteralPath $env:LPM_TEST_TOLD_TO_END)) {{ Start-Sleep -Milliseconds 100 }}'",
+            quoted(&started),
+            quoted(&folder.path().join("told-to-end")),
+        );
+        let helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .arg("--protocol-version")
+            .arg(lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string())
+            .arg("--appcontainer-name")
+            .arg(name)
+            .args(["--stdio-stdin", "null"])
+            .args(["--stdio-stdout", "null"])
+            .args(["--stdio-stderr", "null"])
+            .arg("--writable-dir")
+            .arg(folder.path())
+            .args([
+                "--",
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+            ])
+            .arg(script)
+            .spawn()
+            .expect("spawn helper");
+        let mut script = Self { helper, folder };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !started.exists() {
+            assert!(
+                script.helper.try_wait().expect("poll helper").is_none(),
+                "the outlasting script ended before it started"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the outlasting script never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        script
+    }
+
+    /// Tells both scripts to end and waits for the helper, which then
+    /// takes back what it set. A helper that doesn't end is stopped.
+    fn end(&mut self) {
+        let _ = fs::write(self.folder.path().join("told-to-end"), "");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if matches!(self.helper.try_wait(), Ok(Some(_)) | Err(_)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = self.helper.kill();
+        let _ = self.helper.wait();
+    }
+}
+
+impl Drop for OutlastingScript {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// The ids of the processes `output` says an earlier run left running.
+fn processes_left_running(output: &std::process::Output) -> Vec<u32> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .split_once("left processes running (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(ids, _)| {
+            ids.split(", ")
+                .map(|id| id.parse().expect("a process id"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_stopped_run_s_denial_stays_set_while_a_process_still_runs_as_its_identity() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let (mut run, sid) =
+        start_a_run_that_sleeps("LpmFilesystemOutlasted", project.path(), &record, &secret);
+    run.stop();
+    let take_back = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .args(&run.identity)
+            .arg("--take-back-run")
+            .output()
+            .expect("spawn the take-back")
+    };
+    let mut outlasting = OutlastingScript::start(&run.identity);
+
+    let refused = take_back();
+
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        processes_left_running(&refused).len() >= 2,
+        "the script and the one it started both run as the identity: {refused:?}"
+    );
+    assert_eq!(
+        denied_app_containers(&secret),
+        std::slice::from_ref(&sid),
+        "the identity stays denied the secret while a process runs as it"
+    );
+    assert_eq!(
+        recorded_denials(&record),
+        std::slice::from_ref(&secret),
+        "the record still names the denial, for whoever takes it back later"
+    );
+
+    outlasting.end();
+    let taken_back = take_back();
+
+    assert!(taken_back.status.success(), "{taken_back:?}");
+    assert!(
+        denied_app_containers(&secret).is_empty(),
+        "the denial is taken back once no process runs as the identity"
+    );
+    assert!(recorded_denials(&record).is_empty());
+}
+
+#[test]
+fn no_run_or_cleanup_of_an_identity_starts_while_a_process_still_runs_as_it() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let created = project.path().join("created-by-child.txt");
+    let identity = RunIdentity(vec![
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        format!("LpmFilesystemInUse-{}", std::process::id()),
+        "--grant-record".into(),
+        records
+            .path()
+            .join("grants.json")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .args(&identity.0)
+            .args(["--stdio-stdin", "null"])
+            .args(["--stdio-stdout", "piped"])
+            .args(["--stdio-stderr", "piped"])
+            .arg("--writable-dir")
+            .arg(project.path())
+            .args([
+                "--",
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+            ])
+            .arg(ps_write_file(&created.to_string_lossy()))
+            .output()
+            .expect("spawn helper")
+    };
+    let mut outlasting = OutlastingScript::start(&identity.0);
+
+    let refused_run = run();
+    let refused_cleanup = identity.clean_up();
+
+    assert!(!refused_run.status.success(), "{refused_run:?}");
+    assert!(
+        !processes_left_running(&refused_run).is_empty(),
+        "{refused_run:?}"
+    );
+    assert!(!created.exists(), "the refused run started no script");
+    assert!(!refused_cleanup.status.success(), "{refused_cleanup:?}");
+    assert!(
+        !processes_left_running(&refused_cleanup).is_empty(),
+        "{refused_cleanup:?}"
+    );
+
+    outlasting.end();
+    let ran = run();
+
+    assert!(ran.status.success(), "{ran:?}");
+    assert!(created.exists());
+    let cleanup = identity.clean_up();
+    assert!(cleanup.status.success(), "{cleanup:?}");
 }
 
 #[test]

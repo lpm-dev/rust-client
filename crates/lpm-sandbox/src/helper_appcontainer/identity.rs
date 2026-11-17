@@ -48,24 +48,30 @@ pub(super) struct RunAccess {
     /// Secrets the identity is denied reading.
     #[serde(default)]
     pub(super) denied: Vec<PathBuf>,
+    /// The Jobs, by name, that the scripts of runs not yet taken back
+    /// belong to, where the helper's caller made and named them. Such a
+    /// Job outlives a stopped helper, and its script with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) jobs: Vec<String>,
 }
 
 impl RunAccess {
     fn is_empty(&self) -> bool {
-        self.traversed.is_empty() && self.denied.is_empty()
+        self.traversed.is_empty() && self.denied.is_empty() && self.jobs.is_empty()
     }
 
     /// Names `other`'s entries too, each once.
     fn add(&mut self, other: &Self) {
-        let add = |held: &mut Vec<PathBuf>, more: &[PathBuf]| {
-            for path in more {
-                if !held.contains(path) {
-                    held.push(path.clone());
+        fn add<T: Clone + PartialEq>(held: &mut Vec<T>, more: &[T]) {
+            for entry in more {
+                if !held.contains(entry) {
+                    held.push(entry.clone());
                 }
             }
-        };
+        }
         add(&mut self.traversed, &other.traversed);
         add(&mut self.denied, &other.denied);
+        add(&mut self.jobs, &other.jobs);
     }
 
     /// Stops naming `other`'s entries.
@@ -73,6 +79,7 @@ impl RunAccess {
         self.traversed
             .retain(|path| !other.traversed.contains(path));
         self.denied.retain(|path| !other.denied.contains(path));
+        self.jobs.retain(|name| !other.jobs.contains(name));
     }
 }
 
@@ -92,9 +99,9 @@ impl TreeRecord {
     }
 }
 
-/// What `path` records; nothing when it doesn't exist yet. One that
-/// can't be read is logged and read as naming nothing: the run then
-/// revokes nothing it doesn't grant again, and writes a new record.
+/// What the sweep record `path` holds; nothing when it doesn't exist
+/// yet. One that can't be read is logged and read as naming nothing: its
+/// trees are then swept once more.
 fn read_record(path: &Path) -> TreeRecord {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<TreeRecord>(&bytes) {
@@ -129,14 +136,18 @@ fn read_record(path: &Path) -> TreeRecord {
     }
 }
 
-/// What `path` records, as a cleanup must have it: a record it can't
-/// read, or that another release wrote, may name access still set, so it
-/// is an error rather than nothing. A record that doesn't exist names
+/// What the grant record `path` holds. A record that can't be read, or
+/// that another release wrote, may name access still set and the Job of
+/// a script still running, so it is an error rather than nothing, and
+/// nothing of the identity is changed. A record that doesn't exist names
 /// nothing.
 fn read_record_strictly(path: &Path) -> Result<TreeRecord, AppContainerError> {
     let unreadable = |source: std::io::Error| AppContainerError::GrantRecord {
         path: path.to_path_buf(),
-        source,
+        source: std::io::Error::other(format!(
+            "{source}; what this package's sandbox holds can't be told from it, so nothing \
+             was changed. Delete the file to start its record over"
+        )),
     };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -211,7 +222,7 @@ pub(super) fn revoke_stale_grants(
     current: &[PathBuf],
     sid: PSID,
 ) -> Result<(), AppContainerError> {
-    let previous = read_record(record);
+    let previous = read_record_strictly(record)?;
     let covering: Vec<String> = current.iter().map(|tree| comparable(tree)).collect();
     let stale: Vec<PathBuf> = previous
         .trees
@@ -236,7 +247,7 @@ pub(super) fn revoke_stale_grants(
 
 /// Records that the identity holds `granted`, once a run granted it.
 pub(super) fn record_grants(record: &Path, granted: &[PathBuf]) -> Result<(), AppContainerError> {
-    let run = read_record(record).run;
+    let run = read_record_strictly(record)?.run;
     write_record(record, &TreeRecord::naming(granted.to_vec(), run))
 }
 
@@ -249,7 +260,7 @@ pub(super) fn record_run_access(
     if access.is_empty() {
         return Ok(());
     }
-    let mut recorded = read_record(record);
+    let mut recorded = read_record_strictly(record)?;
     recorded.run.add(access);
     write_record(record, &recorded)
 }
@@ -259,7 +270,7 @@ pub(super) fn forget_run_access(
     record: &Path,
     access: &RunAccess,
 ) -> Result<(), AppContainerError> {
-    let mut recorded = read_record(record);
+    let mut recorded = read_record_strictly(record)?;
     if recorded.run.is_empty() {
         return Ok(());
     }
@@ -268,10 +279,12 @@ pub(super) fn forget_run_access(
 }
 
 /// Takes back what an earlier run of the identity set for as long as it
-/// lasted and was stopped before taking back. What it can't take back
-/// stays in the record for the run after this one.
+/// lasted and was stopped before taking back, once none of the
+/// identity's processes is left: a run starts with none. What it can't
+/// take back stays in the record for the run after this one.
 pub(super) fn take_back_run_access(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    let mut recorded = read_record(record);
+    let mut recorded = read_record_strictly(record)?;
+    end_what_stopped_runs_left_running(&recorded.run, sid)?;
     if recorded.run.is_empty() {
         return Ok(());
     }
@@ -289,10 +302,49 @@ pub(super) fn take_back_stopped_run(record: &Path, sid: PSID) -> Result<(), AppC
     if recorded.run.is_empty() {
         return Ok(());
     }
+    end_what_stopped_runs_left_running(&recorded.run, sid)?;
     let (left, failed) = take_back(&recorded.run, sid);
     recorded.run = left;
     write_record(record, &recorded)?;
     failed.map_or(Ok(()), Err)
+}
+
+/// Whether `record` still names the run whose script is in the Job
+/// `job`: the run's helper then ended before it took back what the run
+/// set. A record that can't be read is the error it is for a run.
+pub(super) fn names_the_run_in(record: &Path, job: &str) -> Result<bool, AppContainerError> {
+    let recorded = read_record_strictly(record)?;
+    Ok(recorded.run.jobs.iter().any(|name| name == job))
+}
+
+/// Returns once no process of the runs `access` names is left, so that a
+/// read denial of theirs can come off: the identity reads its trees again
+/// without it.
+///
+/// A Job the record names is ended and counted, which is certain. One
+/// that can't be opened any more lost its last handle, and with it Windows
+/// ended its processes. After that, and for runs whose helper made its
+/// own Job, the running processes are looked through for one still on
+/// its way out.
+fn end_what_stopped_runs_left_running(
+    access: &RunAccess,
+    sid: PSID,
+) -> Result<(), AppContainerError> {
+    // One wait for all of it: whoever asked gives the answer a time of
+    // its own, which many Jobs mustn't outlast.
+    let deadline = std::time::Instant::now() + processes::LAST_PROCESS_WAIT;
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    for name in &access.jobs {
+        match ScriptJob::open(name) {
+            Ok(job) => job.end_every_process(left())?,
+            Err(AppContainerError::OpenJob {
+                last_error: ERROR_FILE_NOT_FOUND,
+                ..
+            }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    processes::wait_until_none_runs_as(sid, left())
 }
 
 /// Removes the identity's traversal of each directory `access` names and
@@ -336,14 +388,20 @@ fn take_back(access: &RunAccess, sid: PSID) -> (RunAccess, Option<AppContainerEr
 /// package leaves the project.
 pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let recorded = read_record_strictly(record)?;
+    // The trees come first: revoking one only takes access away, so it
+    // doesn't wait for the identity's last process.
     let mut failed = None;
     for tree in &recorded.trees {
         if let Err(error) = revoke_tree(tree, sid, true) {
             failed.get_or_insert(error);
         }
     }
-    if let (_, Some(error)) = take_back(&recorded.run, sid) {
-        failed.get_or_insert(error);
+    // While a tree still grants the identity, nothing its runs set is
+    // taken back.
+    if failed.is_none() {
+        failed = end_what_stopped_runs_left_running(&recorded.run, sid)
+            .err()
+            .or_else(|| take_back(&recorded.run, sid).1);
     }
     if let Some(error) = failed {
         return Err(error);
@@ -1113,6 +1171,7 @@ mod tests {
         let run = RunAccess {
             traversed: vec![PathBuf::from(r"C:\")],
             denied: vec![PathBuf::from(r"C:\one\.env")],
+            jobs: vec![r"Global\LpmSandboxRun-1".to_owned()],
         };
         write_record(&record, &TreeRecord::naming(trees.clone(), run.clone())).unwrap();
         let read = read_record(&record);
@@ -1175,6 +1234,7 @@ mod tests {
         let access = RunAccess {
             traversed: vec![passed.to_path_buf()],
             denied: vec![secret.to_path_buf()],
+            jobs: Vec::new(),
         };
         record_run_access(record, &access).unwrap();
         setup::update_ace(passed, sid, Some((setup::METADATA_ACCESS, 0))).unwrap();
@@ -1206,6 +1266,88 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_run_s_job_is_ended_before_its_denial_is_taken_back_and_one_that_is_gone_is_passed()
+    {
+        let name = unique_name("LpmIdentityJobs");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let record = root.path().join("grants.json");
+        stopped_run(&record, root.path(), &secret, sid.0);
+        let held_name = format!(r"Local\{name}-held");
+        let held = ScriptJob::create(Some(&held_name)).unwrap();
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let sleeper = std::process::Command::new("cmd.exe")
+            .args(["/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            // SAFETY: both handles are open.
+            let assigned =
+                unsafe { AssignProcessToJobObject(held.as_raw(), sleeper.as_raw_handle().cast()) };
+            assert_ne!(assigned, 0);
+        }
+        record_run_access(
+            &record,
+            &RunAccess {
+                jobs: vec![held_name, format!(r"Local\{name}-gone")],
+                ..RunAccess::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(held.active_processes().unwrap(), 1);
+
+        take_back_run_access(&record, sid.0).unwrap();
+
+        assert_eq!(held.active_processes().unwrap(), 0);
+        assert!(!denies(&secret, sid.0));
+        assert!(read_record(&record).run.is_empty());
+        let mut sleeper = sleeper;
+        let _ = sleeper.wait();
+    }
+
+    #[test]
+    fn a_stopped_run_s_job_that_can_t_be_asked_keeps_the_run_s_denial_set() {
+        let name = unique_name("LpmIdentityNoJob");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let record = root.path().join("grants.json");
+        let left = stopped_run(&record, root.path(), &secret, sid.0);
+        // A name that opens as something other than a Job stands in for a
+        // Job this user may not open.
+        let taken = format!(r"Local\{name}-not-a-job");
+        let _held = setup::lock_named(&taken).unwrap();
+        record_run_access(
+            &record,
+            &RunAccess {
+                jobs: vec![taken.clone()],
+                ..RunAccess::default()
+            },
+        )
+        .unwrap();
+
+        let refused = take_back_run_access(&record, sid.0);
+
+        assert!(
+            matches!(refused, Err(AppContainerError::OpenJob { .. })),
+            "{refused:?}"
+        );
+        assert!(denies(&secret, sid.0));
+        let recorded = read_record(&record).run;
+        assert_eq!(recorded.denied, left.denied);
+        assert_eq!(recorded.jobs, [taken]);
+    }
+
+    #[test]
     fn revoking_a_stale_tree_keeps_what_a_stopped_run_left_recorded() {
         let name = unique_name("LpmIdentityStaleRun");
         let sid = derive_appcontainer_sid(&name).unwrap();
@@ -1217,6 +1359,7 @@ mod tests {
         let left = RunAccess {
             traversed: vec![root.path().to_path_buf()],
             denied: vec![root.path().join(".env")],
+            jobs: Vec::new(),
         };
         record_run_access(&record, &left).unwrap();
 
@@ -1232,10 +1375,12 @@ mod tests {
         let kept = RunAccess {
             traversed: vec![PathBuf::from(r"C:\kept")],
             denied: Vec::new(),
+            jobs: Vec::new(),
         };
         let ended = RunAccess {
             traversed: vec![PathBuf::from(r"C:\Users")],
             denied: vec![PathBuf::from(r"C:\Users\me\.env")],
+            jobs: Vec::new(),
         };
         record_run_access(&record, &kept).unwrap();
         record_run_access(&record, &ended).unwrap();
@@ -1259,6 +1404,7 @@ mod tests {
             &RunAccess {
                 traversed: vec![root.path().join("removed")],
                 denied: vec![root.path().join("removed").join(".env")],
+                jobs: Vec::new(),
             },
         )
         .unwrap();
