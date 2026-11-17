@@ -64,6 +64,23 @@ const SEMANTIC_MAX_STACK: usize = 256 * 1024 * 1024;
 const RESOLUTION_LOOKUPS_PER_BYTE: u64 = 16;
 const RESOLUTION_LOOKUPS_FLOOR: u64 = 1 << 20;
 
+/// Work the parser may spend on speculative parses, per byte of source and
+/// for any source: the bytes it reads again after rewinds, and the lexer
+/// diagnostics it copies into checkpoints. A parenthesized list that may be
+/// arrow parameters, or a `<` that may open type arguments, is parsed one
+/// way and, when that fails, parsed again the other way with all it holds,
+/// so nested speculation, or speculation after many diagnostics, can make
+/// parsing quadratic. Real code spends under one per byte, and none copies
+/// a diagnostic.
+const PARSE_SPECULATION_PER_BYTE: u64 = 2;
+const PARSE_SPECULATION_FLOOR: u64 = 64 * 1024;
+
+fn parse_speculation_budget(source: &str) -> u64 {
+    (source.len() as u64)
+        .saturating_mul(PARSE_SPECULATION_PER_BYTE)
+        .max(PARSE_SPECULATION_FLOOR)
+}
+
 /// A visitor stopped at the stack floor.
 struct StackExhausted;
 
@@ -278,6 +295,9 @@ enum Unparsed {
     /// Resolving its names would take more lookups than a source its size
     /// is given.
     TooManyNestedReferences,
+    /// Parsing it would take more speculative work than
+    /// [`PARSE_SPECULATION_PER_BYTE`] allows.
+    OverSpeculationBudget,
 }
 
 /// Parses `source` and runs the syntax passes over it, masking its comments
@@ -296,9 +316,13 @@ fn parse_above(
         .with_options(ParseOptions {
             allow_return_outside_function: true,
             stack_floor,
+            speculation_budget: parse_speculation_budget(source),
             ..ParseOptions::default()
         })
         .parse();
+    if parsed.speculation_budget_exhausted {
+        return Err(Unparsed::OverSpeculationBudget);
+    }
     if parsed.stack_exhausted {
         return Err(Unparsed::OutOfStack);
     }
@@ -391,7 +415,11 @@ fn parse(
     if let Some(floor) = current_stack_floor() {
         match parse_above(source, source_type, stripped, complete_input, floor) {
             Ok(parsed) => return Some(parsed),
-            Err(Unparsed::TooDeep | Unparsed::TooManyNestedReferences) => return None,
+            Err(
+                Unparsed::TooDeep
+                | Unparsed::TooManyNestedReferences
+                | Unparsed::OverSpeculationBudget,
+            ) => return None,
             Err(Unparsed::OutOfStack) => {}
         }
     }
@@ -445,9 +473,13 @@ fn inspect_above<T, F: FnOnce(&oxc_ast::ast::Program<'_>, bool) -> T>(
     let parsed = Parser::new(&allocator, source, source_type)
         .with_options(ParseOptions {
             stack_floor,
+            speculation_budget: parse_speculation_budget(source),
             ..ParseOptions::default()
         })
         .parse();
+    if parsed.speculation_budget_exhausted {
+        return Ok(None);
+    }
     if parsed.stack_exhausted {
         return Err(());
     }

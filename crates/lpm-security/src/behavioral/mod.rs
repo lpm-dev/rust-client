@@ -2533,6 +2533,10 @@ mod tests {
             ("index.js", format!("x={}eval(y);", "a=>".repeat(2_500))),
             (
                 "index.js",
+                format!("x={}eval(y){};", "(a=".repeat(3_000), ")".repeat(3_000)),
+            ),
+            (
+                "index.js",
                 format!("{}eval(y);", "if(a)x;else ".repeat(3_000)),
             ),
             ("index.js", format!("{}eval(y);", "a:".repeat(5_000))),
@@ -2704,6 +2708,91 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn parenthesized_lists_nested_in_defaults_are_read_without_parsing_in_linear_time() {
+        // A parenthesized list that may be arrow parameters is parsed as
+        // parameters and, when it turns out not to be, parsed again as an
+        // expression, with every list nested in it.
+        for (filename, open) in [
+            ("index.js", "([,],a=y,b="),
+            ("index.js", "({a=1}=y,b="),
+            ("index.ts", "(a=y,b="),
+        ] {
+            let source = format!("x={};eval(y);", nested(open, "0", ")", 3_000));
+            let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+            let started = std::time::Instant::now();
+            let flat_result = analyze_on_a_worker_stack(filename, flat);
+            let flat_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let result = analyze_on_a_worker_stack(filename, source);
+            let nested_time = started.elapsed();
+            assert_eq!(flat_result.unparsed_files, 0);
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, 1, "{filename} {open}");
+            assert!(
+                nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+                "{filename} {open}: nested {nested_time:?}, flat {flat_time:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_heads_after_many_lexer_errors_are_analyzed_in_linear_time() {
+        // Each parenthesized list that may be arrow parameters takes a
+        // checkpoint that copies every diagnostic the lexer has recorded.
+        for (filename, head) in [
+            ("index.js", "(a,b)=>0;"),
+            ("index.js", "(a,b);"),
+            ("index.ts", "(a,b);"),
+        ] {
+            let source = format!(
+                "{}{}eval(y);",
+                "\"\\xZ\";".repeat(16_000),
+                head.repeat(16_000)
+            );
+            let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+            let started = std::time::Instant::now();
+            let flat_result = analyze_on_a_worker_stack(filename, flat);
+            let flat_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let result = analyze_on_a_worker_stack(filename, source);
+            let errors_time = started.elapsed();
+            assert_eq!(flat_result.unparsed_files, 0);
+            assert!(result.source.eval);
+            assert!(
+                errors_time < flat_time * 5 + std::time::Duration::from_millis(200),
+                "{filename} {head}: lexer errors {errors_time:?}, flat {flat_time:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_read_ahead_inside_nested_lists_count_toward_the_parse_budget() {
+        // Deciding whether a parenthesized list is arrow parameters reads a
+        // few tokens ahead and rewinds the lexer, and each enclosing list
+        // parsed again reads them again.
+        for filename in ["index.js", "index.ts"] {
+            let source = format!(
+                "x={}(] \"{}\" 0",
+                "(a=".repeat(2_000),
+                "a".repeat(256 * 1024)
+            );
+            let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+            let started = std::time::Instant::now();
+            let flat_result = analyze_on_a_worker_stack(filename, flat);
+            let flat_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let result = analyze_on_a_worker_stack(filename, source);
+            let nested_time = started.elapsed();
+            assert_eq!(flat_result.unparsed_files, 0);
+            assert_eq!(result.unparsed_files, 1, "{filename}");
+            assert!(
+                nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+                "{filename}: nested {nested_time:?}, flat {flat_time:?}"
+            );
+        }
     }
 
     #[test]

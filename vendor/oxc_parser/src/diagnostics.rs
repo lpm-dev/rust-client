@@ -96,6 +96,11 @@ parser_diagnostics! {
             .with_label(span)
     };
 
+    speculation_budget_exhausted(span: Span) => {
+        OxcDiagnostic::error("Parsing source took more speculative work than the parser's budget allows")
+            .with_label(span)
+    };
+
     file_appears_to_be_binary() => {
         ts_error("1490", "File appears to be binary.")
     };

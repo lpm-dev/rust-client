@@ -120,6 +120,13 @@ pub struct Lexer<'a, C: Config> {
 
     /// Config
     pub(crate) config: C,
+
+    /// Bytes the lexer has moved back over by rewinding.
+    bytes_rewound: u64,
+
+    /// Bytes the lexer has skipped without reading, by moving to the end of
+    /// the source after a fatal error.
+    bytes_skipped: u64,
 }
 
 impl<'a, C: Config> Lexer<'a, C> {
@@ -168,6 +175,8 @@ impl<'a, C: Config> Lexer<'a, C> {
             multi_line_comment_end_finder: None,
             tokens,
             config,
+            bytes_rewound: 0,
+            bytes_skipped: 0,
         }
     }
 
@@ -248,8 +257,17 @@ impl<'a, C: Config> Lexer<'a, C> {
         }
 
         self.tokens.truncate(checkpoint.tokens_len);
+        let from = self.offset();
         self.source.set_position(checkpoint.source_position);
+        self.bytes_rewound += u64::from(from.saturating_sub(self.offset()));
         self.trivia_builder.annotation_comments = checkpoint.annotation_comments;
+    }
+
+    /// Bytes the lexer has read beyond its current position: those it read
+    /// and then rewound over, less those it skipped without reading. In all
+    /// it has read at most its position plus this many bytes.
+    pub(crate) fn bytes_read_ahead(&self) -> u64 {
+        self.bytes_rewound.saturating_sub(self.bytes_skipped)
     }
 
     pub fn peek_token(&mut self) -> Token {
@@ -405,7 +423,9 @@ impl<'a, C: Config> Lexer<'a, C> {
     /// Advance source cursor to end of file.
     #[inline]
     pub fn advance_to_end(&mut self) {
+        let from = self.offset();
         self.source.advance_to_end();
+        self.bytes_skipped += u64::from(self.offset() - from);
     }
 
     // ---------- Private Methods ---------- //
