@@ -75,7 +75,7 @@ console.log('ancestor boundaries verified');
     ]);
     let output = Command::cargo_bin("lpm-sandbox-helper")
         .unwrap()
-        .args(argv)
+        .args(&argv)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -106,7 +106,7 @@ fn helper_preserves_an_extended_drive_working_directory() {
     ]);
     let output = Command::cargo_bin("lpm-sandbox-helper")
         .unwrap()
-        .args(argv)
+        .args(&argv)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -174,7 +174,7 @@ fn a_failed_script_is_told_which_path_directories_it_could_not_read() {
         ]);
         let output = Command::cargo_bin("lpm-sandbox-helper")
             .unwrap()
-            .args(argv)
+            .args(&argv)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
@@ -233,7 +233,7 @@ fn a_path_directory_through_a_link_in_a_writable_root_is_not_reported() {
     ]);
     let output = Command::cargo_bin("lpm-sandbox-helper")
         .unwrap()
-        .args(argv)
+        .args(&argv)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(3), "{output:?}");
@@ -247,9 +247,42 @@ fn a_path_directory_through_a_link_in_a_writable_root_is_not_reported() {
     );
 }
 
-fn helper_argv_base() -> Vec<String> {
-    vec![
-        "--protocol-version".into(),
+/// The arguments of a run under an identity of the test's own. Dropping
+/// them revokes what the identity was granted and deletes its profile, so
+/// a test leaves neither on the machine it ran on.
+struct OwnIdentityArgv {
+    argv: Vec<String>,
+    _identity: RunIdentity,
+    _records: tempfile::TempDir,
+}
+
+impl std::ops::Deref for OwnIdentityArgv {
+    type Target = Vec<String>;
+
+    fn deref(&self) -> &Vec<String> {
+        &self.argv
+    }
+}
+
+impl std::ops::DerefMut for OwnIdentityArgv {
+    fn deref_mut(&mut self) -> &mut Vec<String> {
+        &mut self.argv
+    }
+}
+
+impl<'a> IntoIterator for &'a OwnIdentityArgv {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.argv.iter()
+    }
+}
+
+fn helper_argv_base() -> OwnIdentityArgv {
+    let records = tempfile::tempdir().expect("record tempdir");
+    let identity = vec![
+        "--protocol-version".to_string(),
         lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
         "--appcontainer-name".into(),
         format!(
@@ -257,13 +290,30 @@ fn helper_argv_base() -> Vec<String> {
             std::process::id(),
             NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ),
-        "--stdio-stdin".into(),
-        "null".into(),
-        "--stdio-stdout".into(),
-        "piped".into(),
-        "--stdio-stderr".into(),
-        "piped".into(),
-    ]
+        "--grant-record".into(),
+        records
+            .path()
+            .join("grants.json")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let mut argv = identity.clone();
+    argv.extend(
+        [
+            "--stdio-stdin",
+            "null",
+            "--stdio-stdout",
+            "piped",
+            "--stdio-stderr",
+            "piped",
+        ]
+        .map(String::from),
+    );
+    OwnIdentityArgv {
+        argv,
+        _identity: RunIdentity(identity),
+        _records: records,
+    }
 }
 
 /// PowerShell one-liner that writes one line to a target file +
@@ -641,19 +691,27 @@ fn names_trustee(path: &std::path::Path, sid: &str) -> bool {
 /// when dropped.
 struct RunIdentity(Vec<String>);
 
+/// The helper run that revokes what `identity` was granted and deletes
+/// its profile.
+fn cleanup_of(identity: &[String]) -> std::process::Command {
+    let mut cleanup = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
+    cleanup
+        .args(identity)
+        .args(["--revoke-only", "--delete-appcontainer-profile"]);
+    cleanup
+}
+
 impl RunIdentity {
     fn clean_up(&self) -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
-            .args(&self.0)
-            .args(["--revoke-only", "--delete-appcontainer-profile"])
-            .output()
-            .expect("spawn cleanup")
+        cleanup_of(&self.0).output().expect("spawn cleanup")
     }
 }
 
 impl Drop for RunIdentity {
     fn drop(&mut self) {
-        let _ = self.clean_up();
+        // A test that failed is unwinding here, and a second panic would
+        // end the whole test process.
+        let _ = cleanup_of(&self.0).output();
     }
 }
 
@@ -771,18 +829,14 @@ impl StoppedRun {
     }
 
     fn clean_up(&self) -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
-            .args(&self.identity)
-            .args(["--revoke-only", "--delete-appcontainer-profile"])
-            .output()
-            .expect("spawn cleanup")
+        cleanup_of(&self.identity).output().expect("spawn cleanup")
     }
 }
 
 impl Drop for StoppedRun {
     fn drop(&mut self) {
         self.stop();
-        let _ = self.clean_up();
+        let _ = cleanup_of(&self.identity).output();
     }
 }
 

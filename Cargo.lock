@@ -4508,6 +4508,7 @@ dependencies = [
  "lpm-registry",
  "lpm-runner",
  "lpm-runtime",
+ "lpm-sandbox",
  "lpm-security",
  "lpm-store",
  "lpm-tunnel",

@@ -188,6 +188,68 @@ pub struct TempProject {
     npm_registry: std::sync::Mutex<Option<String>>,
 }
 
+/// On Windows a sandboxed script runs under an identity the machine keeps,
+/// with access to folders outside the project and its home, such as
+/// Node's. The home records what each identity was given, and nothing
+/// takes it back once the home is deleted, so it is taken back first.
+#[cfg(target_os = "windows")]
+impl Drop for TempProject {
+    fn drop(&mut self) {
+        let records = self
+            .home()
+            .join(".lpm")
+            .join("sandbox")
+            .join("appcontainers");
+        let Ok(entries) = std::fs::read_dir(&records) else {
+            return;
+        };
+        let Some(helper) = locate_test_sandbox_helper() else {
+            return;
+        };
+        // An identity is recorded before its helper starts, and its grants
+        // once the helper has made its profile, so either file names one.
+        let names: std::collections::BTreeSet<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_str()?;
+                file_name
+                    .strip_suffix(".grants.json")
+                    .or_else(|| file_name.strip_suffix(".identity.json"))
+                    .map(str::to_owned)
+            })
+            .collect();
+        for name in names {
+            let cleanup = std::process::Command::new(&helper)
+                .arg("--protocol-version")
+                .arg(lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string())
+                .arg("--appcontainer-name")
+                .arg(&name)
+                .arg("--grant-record")
+                .arg(records.join(format!("{name}.grants.json")))
+                .args(["--revoke-only", "--delete-appcontainer-profile"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let Ok(mut cleanup) = cleanup else {
+                continue;
+            };
+            // A helper the test left running holds its identity, and the
+            // cleanup waits for it. The test ends all the same.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while matches!(cleanup.try_wait(), Ok(None)) {
+                if std::time::Instant::now() >= deadline {
+                    let _ = cleanup.kill();
+                    let _ = cleanup.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 impl TempProject {
     /// Create a new TempProject by copying a fixture directory.
     ///
