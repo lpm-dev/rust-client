@@ -314,6 +314,12 @@ impl TempProject {
         self.dir.path()
     }
 
+    /// The npm global configuration file every command for the project
+    /// reads. It doesn't exist until a test writes it.
+    pub fn npm_global_config(&self) -> PathBuf {
+        self.home.path().join("global.npmrc")
+    }
+
     fn use_npm_registry(&self, registry_url: &str) {
         *self
             .npm_registry
@@ -850,6 +856,16 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
         cmd.remove_env("NPM_CONFIG_USERCONFIG");
         cmd.remove_env("npm_config_userconfig");
     }
+
+    // npm's global configuration is otherwise the file below the Node
+    // prefix, which belongs to the machine. The one named here exists
+    // only where a test writes it. The other spelling is removed first:
+    // Windows holds both under one name.
+    cmd.remove_env("npm_config_globalconfig");
+    cmd.set_env(
+        "NPM_CONFIG_GLOBALCONFIG",
+        project.npm_global_config().as_os_str(),
+    );
 
     // Isolate XDG dirs to prevent leaking desktop state
     cmd.set_env(
