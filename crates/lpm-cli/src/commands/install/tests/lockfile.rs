@@ -2599,6 +2599,26 @@ fn a_signed_package_keeps_the_integrity_its_signature_covers() {
 }
 
 #[test]
+fn the_store_is_told_the_pin_of_a_signed_package_too_unless_packages_disagree_on_it() {
+    let stored = sha512_of(b"archive");
+    let mut signed = installing(PROVEN_SHA1);
+    signed.registry_signatures = vec![signature()];
+    let fetched = fetched_as(&signed, &stored);
+
+    let checked = checked_weaker_pins(std::slice::from_ref(&signed), &fetched);
+    assert_eq!(
+        checked.get(&install_pkg_key(&signed)),
+        Some(&ProvenPin {
+            pin: PROVEN_SHA1.to_owned(),
+            sha512: stored,
+        })
+    );
+
+    let other = installing("sha1-AAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    assert!(checked_weaker_pins(&[signed, other], &fetched).is_empty());
+}
+
+#[test]
 fn only_a_served_url_other_than_the_locked_one_is_written_back() {
     let locked = |name: &str, tarball: Option<&str>| lpm_lockfile::LockedPackage {
         name: name.into(),

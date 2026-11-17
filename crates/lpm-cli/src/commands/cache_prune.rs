@@ -350,6 +350,11 @@ fn run_all_virtual_stores_locked(
             true,
             directories[1].as_ref().expect("apply opens v3 store"),
         )?;
+        for store in stores {
+            if let Err(error) = store.sweep_checked_pins() {
+                tracing::debug!("left the records of checked pins as they are: {error}");
+            }
+        }
     }
     let mut summary = merge_prune_summaries(v2, v3);
     summary.observed_physical_bytes_freed = free_before.and_then(|before| {

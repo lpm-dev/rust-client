@@ -844,6 +844,51 @@ async fn registry_signatures_are_checked_against_the_published_integrity_when_th
     );
 }
 
+/// The install held the download to the hash the lockfile recorded. The
+/// registry's own, weaker hash was never checked against those bytes, so
+/// the store must not remember it as naming them.
+#[tokio::test]
+async fn the_store_records_no_check_of_a_published_integrity_the_download_was_not_held_to() {
+    let public = MockRegistry::start().await;
+    let tarball = make_tarball_with_files("corp-utils", "1.0.0", &[("origin.txt", b"recorded")]);
+    let published = lpm_common::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha1,
+        b"another archive",
+    )
+    .to_string();
+    let mut metadata = public.package_metadata("corp-utils", "1.0.0", &tarball);
+    metadata["versions"]["1.0.0"]["dist"]["integrity"] = serde_json::json!(published);
+    if let Some(dist) = metadata["versions"]["1.0.0"]["dist"].as_object_mut() {
+        dist.remove("shasum");
+    }
+    public
+        .with_package_metadata("corp-utils", "1.0.0", &tarball, metadata.clone())
+        .await;
+    public.with_batch_metadata(vec![metadata]).await;
+    let project = TempProject::empty(PROJECT);
+    project.write_file(
+        "package-lock.json",
+        &package_lock(
+            &public.tarball_url("corp-utils", "1.0.0"),
+            &compute_integrity(&tarball),
+        ),
+    );
+    project.write_file(".npmrc", &format!("registry={}/\n", public.url()));
+
+    let output = migrate(&project, &public, &[]);
+
+    assert!(output.status.success(), "{}", report(&output));
+    assert_eq!(
+        project.read_file("node_modules/corp-utils/origin.txt"),
+        "recorded"
+    );
+    let records = project.store_dir().join("v2").join("checked-pins");
+    let recorded: Vec<_> = std::fs::read_dir(&records)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(recorded.is_empty(), "{recorded:?}");
+}
+
 #[tokio::test]
 async fn migrate_names_the_destination_registry_without_values_npmrc_expanded_into_it() {
     let registries = registries().await;
