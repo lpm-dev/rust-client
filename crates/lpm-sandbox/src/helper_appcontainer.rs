@@ -466,6 +466,26 @@ struct SecretDenial {
     active: bool,
 }
 
+/// Fails for a listed secret that exists and this user can't change,
+/// before anything is recorded or set. The run couldn't deny it, and a
+/// cleanup that can't read it couldn't tell that it holds nothing of the
+/// run.
+fn refuse_secrets_that_cannot_be_denied(listed: &[PathBuf]) -> Result<(), AppContainerError> {
+    for path in listed {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => setup::require_changeable(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AppContainerError::InspectDaclPath {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SecretDenial {
     /// Denies `sid` reading `path`. A secret removed since it was listed
     /// needs no denial.
@@ -564,11 +584,11 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
-    let prepared_access = setup::prepare(&args, &sid)?;
-
-    // What this run grants, minus what the identity was granted before
-    // and no longer is; and once, grants that profiles of earlier
-    // releases, one per run, left on these trees.
+    // What a run of this identity that was stopped before it ended left
+    // set comes off first, then the trees the identity was granted before
+    // and no longer is. Revoking one of those takes every entry of the
+    // identity off it and what is inside it, so it comes before this run
+    // sets its own entries there.
     let granted: Vec<PathBuf> = args
         .best_effort_readable_dirs
         .iter()
@@ -577,8 +597,29 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         .cloned()
         .collect();
     if let Some(record) = &args.grant_record {
+        identity::take_back_run_access(record, sid.0)?;
         identity::revoke_stale_grants(record, &granted, sid.0)?;
     }
+    // What this run sets until it ends is recorded before any of it is
+    // set, and nothing is set that the record doesn't name. A listed
+    // secret that doesn't exist yet is named too: one that appears while
+    // the trees are granted is still denied.
+    refuse_secrets_that_cannot_be_denied(&args.secret_read_denied_paths)?;
+    let mut prepared_access = setup::prepare(&args, &sid, |traversed| {
+        let Some(record) = &args.grant_record else {
+            return Ok(());
+        };
+        identity::record_run_access(
+            record,
+            &identity::RunAccess {
+                traversed: traversed.to_vec(),
+                denied: args.secret_read_denied_paths.clone(),
+            },
+        )
+    })?;
+
+    // Once, grants that profiles of earlier releases, one per run, left on
+    // this run's trees.
     if let Some(record) = &args.sweep_record {
         let owned: Vec<PathBuf> = args
             .readable_dirs
@@ -826,6 +867,17 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     }
     for denial in secret_denials.iter_mut().rev() {
         denial.remove()?;
+    }
+    let taken_back = identity::RunAccess {
+        traversed: prepared_access.release(),
+        denied: args.secret_read_denied_paths.clone(),
+    };
+    if let Some(record) = &args.grant_record
+        && let Err(error) = identity::forget_run_access(record, &taken_back)
+    {
+        // The record then names access this run no longer holds, which the
+        // next run finds already taken back.
+        tracing::warn!(target: "lpm_sandbox::helper_appcontainer", "{error}");
     }
     profile_cleanup.delete()?;
     // Exit codes >= 0x80000000 are Windows STATUS_* values
@@ -1771,8 +1823,8 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-/// Makes `path`, a directory, one the test process can read but not change
-/// while it runs [`without_privileges`], as `C:\Program Files` is to an
+/// Makes `path` one the test process can read but not change while it
+/// runs [`without_privileges`], as `C:\Program Files` is to an
 /// administrator. Entries it inherits become its own, a grant among them;
 /// the Administrators, SYSTEM and the user then lose theirs; and only
 /// reading is left, to the user and, through OWNER RIGHTS, to the owner,
@@ -1799,15 +1851,18 @@ fn lock_directory_for_test(path: &Path) {
     assert!(!without_privileges(|| setup::can_change_permissions(path)));
 }
 
-/// Runs `run` on this thread with every privilege disabled. Hosted CI
-/// administrators hold backup and restore privileges that let them open
-/// any directory to change its DACL, so a test that needs one it can't
-/// change runs its check here. Other threads keep the process token.
+/// Runs `run` on this thread with every privilege disabled but the one
+/// every account holds. Hosted CI administrators hold backup and restore
+/// privileges that let them open any directory to change its DACL, so a
+/// test that needs one it can't change runs its check here. Other threads
+/// keep the process token.
 #[cfg(test)]
 fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Foundation::LUID;
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
-        TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        AdjustTokenPrivileges, ImpersonateSelf, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+        RevertToSelf, SE_PRIVILEGE_ENABLED, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES,
+        TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
@@ -1849,17 +1904,76 @@ fn without_privileges<T>(run: impl FnOnce() -> T) -> T {
         },
         0
     );
+    // Without "bypass traverse checking" Windows gives no handle its final
+    // path, so no path could be made canonical, whatever its permissions.
+    let name = str_to_wide_with_nul("SeChangeNotifyPrivilege");
+    let mut traverse = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: the name is terminated and `traverse` is an initialized output slot.
+    assert_ne!(
+        unsafe { LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut traverse) },
+        0
+    );
+    let kept = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: traverse,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    // SAFETY: `kept` is a one-entry list that outlives the call, and no
+    // previous state is asked for.
+    assert_ne!(
+        unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw(),
+                0,
+                &kept,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        0
+    );
+    // The call succeeds for a token that doesn't hold the privilege, and
+    // says so only here.
+    assert_eq!(
+        unsafe { GetLastError() },
+        ERROR_SUCCESS,
+        "the test's token holds no bypass-traverse privilege to keep"
+    );
     run()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows_sys::Win32::Security::GetLengthSid;
     use windows_sys::Win32::Security::{
         GetFileSecurityW, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
     };
+
+    #[test]
+    fn a_run_stops_at_a_secret_it_cannot_deny_and_at_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join(".env");
+        std::fs::write(&secret, "TOKEN=1").unwrap();
+        let listed = [secret.clone(), tmp.path().join(".env.local")];
+
+        refuse_secrets_that_cannot_be_denied(&listed).unwrap();
+
+        lock_directory_for_test(&secret);
+        let stopped = without_privileges(|| refuse_secrets_that_cannot_be_denied(&listed));
+        assert!(
+            matches!(&stopped, Err(AppContainerError::WriteDacl { path, .. }) if *path == secret),
+            "{stopped:?}"
+        );
+    }
 
     /// `path`'s self-relative security descriptor with its DACL, as stored.
     fn security_descriptor(path: &Path) -> Vec<u32> {
