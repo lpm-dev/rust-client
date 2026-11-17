@@ -923,6 +923,7 @@ pub(crate) fn write_vault_file_env(
 pub fn delete_vault_file(vault_id: &str) -> Result<(), String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
         companion::delete_project_unlocked(directory, vault_id)?;
+        crate::forget_listed(vault_id);
         crate::links::forget_in_files(directory, vault_id)
     })
 }

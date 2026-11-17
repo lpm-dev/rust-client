@@ -5,6 +5,6 @@ expression: "redacted(&project, &envelope)"
 {
   "schema_version": 1,
   "success": false,
-  "error": "This folder isn't linked to env project [VAULT_ID], which its lpm.json names: [PROJECT]/other-checkout. Run `lpm env link` in that folder to let it use the project's values on this machine.",
+  "error": "This folder isn't linked to env project [VAULT_ID], which its lpm.json names: [OTHER_CHECKOUT]. Run `lpm env link` in that folder to let it use the project's values on this machine.",
   "error_code": "env_project_refused"
 }

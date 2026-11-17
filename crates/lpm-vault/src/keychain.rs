@@ -2001,6 +2001,7 @@ pub fn delete_vault(vault_id: &str) -> Result<(), String> {
 
 fn delete_vault_unlocked(vault_id: &str) -> Result<(), String> {
     delete_vault_with_storage_after_recovery(&mut KeychainProjectStorage, vault_id)?;
+    crate::forget_listed(vault_id);
     crate::links::forget_in_keychain(vault_id)
 }
 

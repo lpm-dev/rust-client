@@ -267,7 +267,7 @@ fn remember_listed(vault_id: &str, folder: PathBuf) {
     }
 }
 
-fn forget_listed(vault_id: &str) {
+pub(crate) fn forget_listed(vault_id: &str) {
     listed_folders().retain(|(listed_vault, _)| listed_vault != vault_id);
 }
 

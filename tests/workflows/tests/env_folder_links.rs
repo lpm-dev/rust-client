@@ -343,6 +343,10 @@ fn redacted(project: &TempProject, value: &serde_json::Value) -> serde_json::Val
             root.join("second-checkout").display().to_string(),
             "[CHECKOUT]",
         ),
+        (
+            root.join("other-checkout").display().to_string(),
+            "[OTHER_CHECKOUT]",
+        ),
         (root.display().to_string(), "[PROJECT]"),
     ];
     fn redact(value: &serde_json::Value, replacements: &[(String, &str)]) -> serde_json::Value {

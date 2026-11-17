@@ -405,7 +405,8 @@ pub(crate) fn require_for_write(
             (FolderLink::Unlinked(unlinked), _) => Err(unlinked.refusal()),
             (FolderLink::Linked, Some(_)) => Ok(()),
             (FolderLink::Linked, None) => {
-                insert(store, project_dir, vault_id, BTreeSet::new()).map(drop)
+                let first = first_record(store, vault_id);
+                insert(store, project_dir, vault_id, first).map(drop)
             }
         }
     })
@@ -436,9 +437,25 @@ pub(crate) fn add(
     vault_id: &str,
 ) -> Result<bool, String> {
     with_store(directory, |store| {
-        let folders = resolve(store, vault_id)?.folders.unwrap_or_default();
+        let folders = match resolve(store, vault_id)?.folders {
+            Some(folders) => folders,
+            None => first_record(store, vault_id),
+        };
         insert(store, project_dir, vault_id, folders)
     })
+}
+
+/// What a vault's first link list starts from: the folder its records
+/// name, when they name one by an absolute path, as LPM Vault's first list
+/// does.
+fn first_record(store: &mut dyn LinkStore, vault_id: &str) -> BTreeSet<String> {
+    recorded_project(store, vault_id)
+        .map(|(_, path)| PathBuf::from(path))
+        .filter(|path| path.is_absolute())
+        .map(|path| link_folder_path(&path))
+        .and_then(|folder| folder_key(&folder).map(str::to_owned))
+        .into_iter()
+        .collect()
 }
 
 /// Writes `folders` with `project_dir` added; whether it was added.
@@ -469,10 +486,12 @@ pub(crate) fn remove(
     with_store(directory, |store| remove_in(store, folder, vault_id))
 }
 
+/// A vault that keeps no folder out lists none, so there is nothing to
+/// unlink; writing an empty list would refuse the folder that first stores
+/// values in it.
 fn remove_in(store: &mut dyn LinkStore, folder: &Path, vault_id: &str) -> Result<bool, String> {
     let Some(mut folders) = resolve(store, vault_id)?.folders else {
-        store.write(vault_id, &record_of(BTreeSet::new()))?;
-        return Ok(true);
+        return Ok(false);
     };
     let resolved = folder_key(&link_folder_path(folder)).is_some_and(|key| folders.remove(key));
     let given = folder_key(folder).is_some_and(|key| folders.remove(key));
@@ -760,16 +779,35 @@ mod tests {
     }
 
     #[test]
-    fn unlinking_a_folder_of_a_vault_that_kept_none_out_leaves_it_unlinked() {
-        let (_root, paths) = make_folders(&["any"]);
+    fn unlinking_a_folder_of_a_vault_that_keeps_none_out_changes_nothing() {
+        let (_root, paths) = make_folders(&["own", "other"]);
         let mut store = MemoryLinkStore::default();
 
-        assert!(remove_in(&mut store, &paths[0], "vault").unwrap());
+        assert!(!remove_in(&mut store, &paths[1], "vault").unwrap());
 
-        assert!(matches!(
+        assert_eq!(store.writes, 0);
+        assert_eq!(
             check_in(&mut store, &paths[0], "vault").unwrap().0,
-            FolderLink::Unlinked(_)
-        ));
+            FolderLink::Linked
+        );
+    }
+
+    #[test]
+    fn a_first_link_keeps_the_folder_the_vault_records() {
+        let (_root, paths) = make_folders(&["recorded", "new"]);
+        let mut store = MemoryLinkStore::default();
+        store.projects.insert(
+            "vault".into(),
+            ("proj-a".into(), paths[0].display().to_string()),
+        );
+
+        let first = first_record(&mut store, "vault");
+        insert(&mut store, &paths[1], "vault", first).unwrap();
+
+        assert_eq!(
+            store.records["vault"].folders,
+            BTreeSet::from_iter(paths.iter().map(|path| path.display().to_string()))
+        );
     }
 
     #[cfg(unix)]
