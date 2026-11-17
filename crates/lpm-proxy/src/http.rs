@@ -799,8 +799,9 @@ fn is_forwardable_upgrade_request_header(name: &str) -> bool {
 /// it connected. A client can send any of them, so none of its values reach
 /// the dev server: the proxy sends only what it saw itself.
 ///
-/// `_` counts as `-`: servers that expose headers as CGI-style variables,
-/// such as `HTTP_X_FORWARDED_FOR`, read both spellings as one header.
+/// Any separator counts as `-`: servers that expose headers as CGI-style
+/// variables, such as `HTTP_X_FORWARDED_FOR`, read `x_forwarded_for` and
+/// `x.forwarded.for` as the same header.
 pub(crate) fn is_forwarding_identity_header(name: &str) -> bool {
     const PREFIX: &str = "x-forwarded-";
     name.get(..PREFIX.len())
