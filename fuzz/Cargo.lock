@@ -277,7 +277,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -934,7 +933,6 @@ dependencies = [
  "base64",
  "cap-fs-ext",
  "cap-std",
- "chrono",
  "dirs",
  "fd-lock",
  "getrandom",
@@ -951,6 +949,7 @@ dependencies = [
  "smallvec",
  "subtle",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tracing",
  "unicode-normalization",
@@ -1050,7 +1049,9 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tempfile",
+ "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1769,6 +1770,7 @@ dependencies = [
  "powerfmt",
  "serde_core",
  "time-core",
+ "time-macros",
 ]
 
 [[package]]
@@ -1776,6 +1778,16 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "time-macros"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
+dependencies = [
+ "num-conv",
+ "time-core",
+]
 
 [[package]]
 name = "tinystr"

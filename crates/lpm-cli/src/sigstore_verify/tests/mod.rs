@@ -2,9 +2,9 @@ use super::*;
 use crate::sigstore::{DsseEnvelope, DsseSignature};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, Utc};
 use ecdsa::signature::Signer;
 use ecdsa::signature::hazmat::PrehashSigner;
+use lpm_common::Timestamp;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::Generate;
 use p256::pkcs8::DecodePrivateKey;
@@ -591,10 +591,7 @@ fn rejects_bundle_with_canonicalized_body_not_json() {
 // ── TrustRoot — ─────────────────────────────────────
 
 fn ts(rfc3339: &str) -> SystemTime {
-    DateTime::parse_from_rfc3339(rfc3339)
-        .unwrap()
-        .with_timezone(&Utc)
-        .into()
+    Timestamp::parse_rfc3339(rfc3339).unwrap().into()
 }
 
 #[test]
@@ -906,9 +903,7 @@ fn trust_root_next_role_retirement_at_returns_soonest_per_role_max() {
     let anchor = root.next_role_retirement_at(now).unwrap();
     assert_eq!(
         anchor,
-        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap(),
     );
 }
 
@@ -1009,9 +1004,7 @@ fn trust_root_parse_rejects_empty_cert_chain() {
 #[test]
 fn validity_window_open_ended_contains_anything_after_start() {
     let window = ValidityWindow {
-        start: DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        start: Timestamp::parse_rfc3339("2020-01-01T00:00:00Z").unwrap(),
         end: None,
     };
     assert!(!window.contains(ts("2019-12-31T23:59:59Z")));
@@ -1022,14 +1015,8 @@ fn validity_window_open_ended_contains_anything_after_start() {
 #[test]
 fn validity_window_closed_excludes_end_exclusively() {
     let window = ValidityWindow {
-        start: DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
-        end: Some(
-            DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        ),
+        start: Timestamp::parse_rfc3339("2020-01-01T00:00:00Z").unwrap(),
+        end: Some(Timestamp::parse_rfc3339("2024-01-01T00:00:00Z").unwrap()),
     };
     assert!(window.contains(ts("2020-01-01T00:00:00Z")));
     assert!(window.contains(ts("2023-12-31T23:59:59Z")));
@@ -1096,8 +1083,8 @@ fn synth_tlog_entry_with_set(
 }
 
 fn rekor_key_active_around(log_id: Vec<u8>, spki_der: Vec<u8>, around_secs: i64) -> RekorKey {
-    let start = DateTime::<Utc>::from_timestamp(around_secs - 365 * 86400, 0).unwrap();
-    let end = DateTime::<Utc>::from_timestamp(around_secs + 365 * 86400, 0).unwrap();
+    let start = Timestamp::from_unix_seconds(around_secs - 365 * 86400).unwrap();
+    let end = Timestamp::from_unix_seconds(around_secs + 365 * 86400).unwrap();
     RekorKey {
         log_id,
         spki_der,
@@ -1307,14 +1294,8 @@ fn rejects_bundle_with_rekor_key_outside_validity_at_integrated_time() {
         log_id: log_id_bytes,
         spki_der,
         valid_for: ValidityWindow {
-            start: DateTime::parse_from_rfc3339("2010-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            end: Some(
-                DateTime::parse_from_rfc3339("2015-01-01T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            ),
+            start: Timestamp::parse_rfc3339("2010-01-01T00:00:00Z").unwrap(),
+            end: Some(Timestamp::parse_rfc3339("2015-01-01T00:00:00Z").unwrap()),
         },
     };
     let err = verify_rekor_set(
@@ -2191,46 +2172,34 @@ fn cert_params_validity(mid_year: i32) -> rcgen::CertificateParams {
     p
 }
 
+fn start_of_day(year: i32, month: u8, day: u8) -> lpm_common::Timestamp {
+    use lpm_common::timestamp::{Date, Month};
+
+    let date = Date::from_calendar_date(year, Month::try_from(month).unwrap(), day).unwrap();
+    lpm_common::Timestamp::at_start_of(date).unwrap()
+}
+
+#[test]
+fn an_integrated_time_after_the_year_9999_is_refused() {
+    let refused = rekor_set::parse_integrated_time("300000000000");
+
+    assert!(
+        matches!(&refused, Err(VerifyError::RekorSet(why)) if why.contains("after the year 9999")),
+        "{refused:?}"
+    );
+    assert!(rekor_set::parse_integrated_time("253402300799").is_ok());
+}
+
 fn ts_year(year: i32) -> SystemTime {
-    DateTime::from_timestamp(
-        chrono::NaiveDate::from_ymd_opt(year, 6, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp(),
-        0,
-    )
-    .unwrap()
-    .into()
+    start_of_day(year, 6, 1).into()
 }
 
 fn fulcio_root_active_at(year: i32, root_der: Vec<u8>) -> FulcioRoot {
     FulcioRoot {
         cert_chain_der: vec![root_der],
         valid_for: ValidityWindow {
-            start: DateTime::from_timestamp(
-                chrono::NaiveDate::from_ymd_opt(year - 10, 1, 1)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc()
-                    .timestamp(),
-                0,
-            )
-            .unwrap(),
-            end: Some(
-                DateTime::from_timestamp(
-                    chrono::NaiveDate::from_ymd_opt(year + 10, 1, 1)
-                        .unwrap()
-                        .and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc()
-                        .timestamp(),
-                    0,
-                )
-                .unwrap(),
-            ),
+            start: start_of_day(year - 10, 1, 1),
+            end: Some(start_of_day(year + 10, 1, 1)),
         },
     }
 }
@@ -2716,26 +2685,8 @@ fn synth_ct_log_key(at_year: i32) -> (SigningKey, CtLogKey) {
         .as_bytes()
         .to_vec();
     let log_id = Sha256::digest(&spki_der).to_vec();
-    let start = chrono::DateTime::<Utc>::from_timestamp(
-        chrono::NaiveDate::from_ymd_opt(at_year - 5, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp(),
-        0,
-    )
-    .unwrap();
-    let end = chrono::DateTime::<Utc>::from_timestamp(
-        chrono::NaiveDate::from_ymd_opt(at_year + 5, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp(),
-        0,
-    )
-    .unwrap();
+    let start = start_of_day(at_year - 5, 1, 1);
+    let end = start_of_day(at_year + 5, 1, 1);
     let ct_log_key = CtLogKey {
         log_id,
         spki_der,

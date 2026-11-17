@@ -1,6 +1,6 @@
 use super::prepare::{StagedUpgrade, UpgradePrep};
 use super::rollback::{abort_upgrade_in_manifest, restore_prior_shims_after_aborted_upgrade};
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot};
 use lpm_global::{
     CommandCollision, GlobalManifest, InstallRootStatus, PackageEntry, Shim, WalRecord, WalWriter,
@@ -297,7 +297,7 @@ fn apply_upgrade_commit(
         resolved: prep.new_version.to_string(),
         integrity: prep.new_integrity.clone(),
         source: prep.source,
-        installed_at: Utc::now(),
+        installed_at: Timestamp::now(),
         root: staged.install_root_relative.clone(),
         // `final_commands` excludes aliased-away bins per the manifest
         // invariant (PackageEntry.commands holds only directly-exposed
@@ -319,7 +319,7 @@ fn apply_upgrade_commit(
 
     let record = WalRecord::Commit {
         tx_id: staged.tx_id.clone(),
-        committed_at: Utc::now(),
+        committed_at: Timestamp::now(),
     };
 
     Ok((
@@ -358,7 +358,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-old".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: prior_relative.into(),
             commands: Vec::new(),
         };
@@ -373,7 +373,7 @@ mod tests {
                 resolved: "2.0.0".into(),
                 integrity: "sha512-new".into(),
                 source: lpm_global::PackageSource::UpstreamNpm,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: "installs/foo@2.0.0".into(),
                 commands: Vec::new(),
                 replaces_version: Some("1.0.0".into()),
@@ -475,7 +475,7 @@ mod tests {
                 resolved: prep.new_version.to_string(),
                 integrity: prep.new_integrity.clone(),
                 source: prep.source,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: "installs/foo@2.0.0".into(),
                 commands: Vec::new(),
                 replaces_version: Some("1.0.0".into()),
@@ -583,7 +583,7 @@ mod tests {
                 resolved: prep.new_version.to_string(),
                 integrity: prep.new_integrity.clone(),
                 source: prep.source,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: "installs/foo@2.0.0".into(),
                 commands: Vec::new(),
                 replaces_version: Some("1.0.0".into()),

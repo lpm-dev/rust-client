@@ -109,7 +109,7 @@ fn seed_v2_link_entry(
     content: &str,
     create_object: bool,
 ) {
-    use chrono::Utc;
+    use lpm_common::Timestamp;
     use lpm_store::v2::{LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaPlatform, Store};
 
     let store = Store::at(project.store_dir().join("v2"));
@@ -156,8 +156,8 @@ fn seed_v2_link_entry(
             cpu: "test".into(),
             libc: None,
         }),
-        created_at: Utc::now(),
-        last_referenced_at: Utc::now(),
+        created_at: Timestamp::now(),
+        last_referenced_at: Timestamp::now(),
     }
     .write_to(&link_dir)
     .unwrap();

@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, Duration, Utc};
+use lpm_common::Timestamp;
+use lpm_common::timestamp::Duration;
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -59,10 +60,10 @@ pub struct CtLogKey {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidityWindow {
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     /// `None` means open-ended — entry is still in service per
     /// Sigstore; no announced retirement date.
-    pub end: Option<DateTime<Utc>>,
+    pub end: Option<Timestamp>,
 }
 
 impl ValidityWindow {
@@ -70,7 +71,7 @@ impl ValidityWindow {
     /// window contains every `t >= start`.
     #[allow(dead_code)]
     pub fn contains(&self, t: SystemTime) -> bool {
-        let t: DateTime<Utc> = t.into();
+        let t: Timestamp = t.into();
         t >= self.start && self.end.is_none_or(|end| t < end)
     }
 }
@@ -130,9 +131,9 @@ struct TrustedRootKey {
 
 #[derive(Debug, serde::Deserialize)]
 struct TrustedRootValidFor {
-    start: DateTime<Utc>,
+    start: Timestamp,
     #[serde(default)]
-    end: Option<DateTime<Utc>>,
+    end: Option<Timestamp>,
 }
 
 impl From<TrustedRootValidFor> for ValidityWindow {
@@ -260,12 +261,12 @@ impl TrustRoot {
     /// Returns `None` when at least one currently-active key for
     /// every role is open-ended — no announced retirement, so no
     /// warn anchor.
-    pub fn next_role_retirement_at(&self, now: SystemTime) -> Option<DateTime<Utc>> {
-        fn latest_active_end<'a, I>(windows: I, now: SystemTime) -> Option<DateTime<Utc>>
+    pub fn next_role_retirement_at(&self, now: SystemTime) -> Option<Timestamp> {
+        fn latest_active_end<'a, I>(windows: I, now: SystemTime) -> Option<Timestamp>
         where
             I: IntoIterator<Item = &'a ValidityWindow>,
         {
-            let mut latest: Option<DateTime<Utc>> = None;
+            let mut latest: Option<Timestamp> = None;
             let mut saw_active = false;
             for w in windows {
                 if !w.contains(now) {
@@ -288,9 +289,9 @@ impl TrustRoot {
     /// `TRUST_ROOT_EXPIRY_WARN_DAYS` of `now`. Used by [`trust_root`]'s
     /// startup `tracing::warn`. Returns `None` when no anchor or
     /// when the anchor is further out than the warn window.
-    pub fn within_warn_window(&self, now: SystemTime) -> Option<DateTime<Utc>> {
+    pub fn within_warn_window(&self, now: SystemTime) -> Option<Timestamp> {
         let soonest = self.next_role_retirement_at(now)?;
-        let now_dt: DateTime<Utc> = now.into();
+        let now_dt: Timestamp = now.into();
         let warn_at = soonest - Duration::days(TRUST_ROOT_EXPIRY_WARN_DAYS);
         if now_dt > warn_at && now_dt <= soonest {
             Some(soonest)
@@ -351,7 +352,7 @@ pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
         if let Some(expires) = parsed.within_warn_window(now) {
             tracing::warn!(
                 target: "lpm_cli::sigstore_verify",
-                expires_at = %expires,
+                expires_at = %expires.to_plain_utc(),
                 "vendored Sigstore trust root expires within {} days; update lpm to refresh",
                 TRUST_ROOT_EXPIRY_WARN_DAYS,
             );

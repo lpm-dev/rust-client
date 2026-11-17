@@ -107,7 +107,7 @@ pub fn create_snapshot(
     Snapshot {
         version: 1,
         metadata: SnapshotMetadata {
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: lpm_common::Timestamp::now().to_rfc3339(),
             description,
             count: exported.len(),
             providers,
@@ -145,7 +145,7 @@ pub fn import_snapshot(json: &str) -> Result<Snapshot, SnapshotError> {
     if let Some(position) = snapshot
         .webhooks
         .iter()
-        .position(|webhook| chrono::DateTime::parse_from_rfc3339(&webhook.timestamp).is_err())
+        .position(|webhook| lpm_common::Timestamp::parse_rfc3339(&webhook.timestamp).is_err())
     {
         return Err(SnapshotError::InvalidFormat(format!(
             "request {} has a timestamp that isn't an RFC 3339 time",

@@ -24,7 +24,6 @@ futures-util = "0.3"
 base64 = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { version = "0.41", features = ["backup", "bundled", "fallible_uint", "limits"] }
-chrono = { workspace = true }
 rand = { workspace = true }
 subtle = "2"
 thiserror = { workspace = true }

@@ -232,13 +232,22 @@ fn store_builtin_token(
         auth::set_otp_required(registry_display, true);
     }
 
-    if let Some(days) = metadata.expiry_days {
-        let expires_date = chrono::Utc::now() + chrono::Duration::days(days as i64);
-        let expires_iso = expires_date.format("%Y-%m-%d").to_string();
+    let reminder = metadata.expiry_days.and_then(|days| {
+        lpm_common::Timestamp::now()
+            .checked_add(lpm_common::timestamp::Duration::days(i64::from(days)))
+    });
+    if let Some(expires_date) = reminder {
+        let expires_on = expires_date.date();
+        let expires_iso = expires_on.to_string();
         auth::set_token_expiry(registry_display, &expires_iso);
 
         if !json_output {
-            let expires_human = expires_date.format("%B %-d, %Y").to_string();
+            let expires_human = format!(
+                "{} {}, {}",
+                expires_on.month(),
+                expires_on.day(),
+                expires_on.year()
+            );
             let otp_note = if metadata.otp_required {
                 ", 2FA enabled"
             } else {

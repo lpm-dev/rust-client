@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use chrono::{DateTime, Local, TimeZone as _, Utc};
 use lpm_common::LpmError;
+use lpm_common::Timestamp;
 use lpm_vault::history::{
     Action, Choices, ChosenSide, Device, EntryInfo, EnvironmentInfo, EnvironmentKindInfo,
     EnvironmentName, EnvironmentPlan, Filter, HistoryError, HistoryState, KeyKindInfo, KeyMatch,
@@ -14,6 +14,7 @@ use lpm_vault::history::{
     TargetValue, Timeline, TimelineRow, UnknownReason,
 };
 use serde::Serialize;
+use time::{OffsetDateTime, UtcOffset};
 
 use super::arguments::HistoryAction;
 use crate::{install_ui, output};
@@ -148,31 +149,56 @@ fn confirm(question: &str, yes: bool, json_output: bool) -> Result<Option<bool>,
         .map_err(|error| LpmError::Env(format!("prompt failed: {error}")))
 }
 
-fn local_time(ms: i64) -> DateTime<Local> {
-    Local
-        .timestamp_millis_opt(ms)
-        .single()
-        .unwrap_or_else(|| Local.timestamp_millis_opt(0).single().expect("the epoch"))
+/// Returns `ms` on this computer's clock. An offset the system won't tell
+/// is taken as UTC.
+fn local_time(ms: i64) -> OffsetDateTime {
+    let time = Timestamp::from_unix_milliseconds(ms)
+        .unwrap_or_else(|| Timestamp::from_unix_seconds(0).expect("the epoch"));
+    let utc = time.at_offset(UtcOffset::UTC);
+    time.at_offset(UtcOffset::local_offset_at(utc).unwrap_or(UtcOffset::UTC))
 }
 
 fn utc(ms: i64) -> String {
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .map_or_else(String::new, |time| {
-            time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        })
+    Timestamp::from_unix_milliseconds(ms)
+        .map_or_else(String::new, Timestamp::to_rfc3339_milliseconds)
+}
+
+/// Formats the month and day as `Jan 2`.
+fn month_and_day(time: OffsetDateTime) -> String {
+    let month = time.month().to_string();
+    format!("{} {}", &month[..3], time.day())
+}
+
+fn day_of(time: OffsetDateTime) -> String {
+    format!("{}, {:04}", month_and_day(time), time.year())
+}
+
+fn clock_of(time: OffsetDateTime) -> String {
+    format!("{:02}:{:02}", time.hour(), time.minute())
 }
 
 fn day(ms: i64) -> String {
-    local_time(ms).format("%b %-d, %Y").to_string()
+    day_of(local_time(ms))
 }
 
 fn clock(ms: i64) -> String {
-    local_time(ms).format("%H:%M").to_string()
+    clock_of(local_time(ms))
 }
 
 fn moment(ms: i64) -> String {
-    local_time(ms).format("%b %-d, %H:%M").to_string()
+    let time = local_time(ms);
+    format!("{}, {}", month_and_day(time), clock_of(time))
+}
+
+/// Formats `ms` as `Jan 2, 2026 at 03:04:05`.
+fn day_and_second(ms: i64) -> String {
+    let time = local_time(ms);
+    format!(
+        "{} at {}:{:02}",
+        day_of(time),
+        clock_of(time),
+        time.second()
+    )
 }
 
 fn platform_name(platform: Platform) -> &'static str {
@@ -828,7 +854,7 @@ fn history_show(
     println!(
         "{}  {}  {}",
         install_ui::bold(&hex::encode(info.id)),
-        local_time(info.time).format("%b %-d, %Y at %H:%M:%S"),
+        day_and_second(info.time),
         describe(info)
     );
     for environment in &info.environments {

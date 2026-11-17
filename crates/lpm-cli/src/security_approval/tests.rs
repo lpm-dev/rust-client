@@ -350,7 +350,7 @@ fn unlock_scopes_command_accepts_year_long_ttl() {
 
         assert_eq!(grant.scopes, ApprovalScope::default_unlock_scopes());
         assert_eq!(
-            (grant.expires_at - grant.issued_at).num_seconds(),
+            (grant.expires_at - grant.issued_at).whole_seconds(),
             MAX_UNLOCK_TTL_SECS as i64
         );
     });
@@ -1446,7 +1446,7 @@ fn audit_log_truncation_is_detected_by_signed_head() {
     with_test_env(temp.path(), || {
         let event = AuditEvent {
             schema_version: AUDIT_EVENT_SCHEMA_VERSION,
-            occurred_at: Utc::now(),
+            occurred_at: Timestamp::now(),
             event: "guarded-attempt".into(),
             allowed: false,
             scopes: vec![ApprovalScope::SandboxNone.as_str().to_string()],
@@ -1471,7 +1471,7 @@ fn audit_event_persists_signed_audit_head_file() {
     with_test_env(temp.path(), || {
         let event = AuditEvent {
             schema_version: AUDIT_EVENT_SCHEMA_VERSION,
-            occurred_at: Utc::now(),
+            occurred_at: Timestamp::now(),
             event: "unlock-granted".into(),
             allowed: true,
             scopes: vec![ApprovalScope::CooldownBypass.as_str().to_string()],
@@ -1505,7 +1505,7 @@ fn audit_log_concurrent_appends_preserve_jsonl_and_hash_chain() {
             handles.push(std::thread::spawn(move || {
                 let event = AuditEvent {
                     schema_version: AUDIT_EVENT_SCHEMA_VERSION,
-                    occurred_at: Utc::now(),
+                    occurred_at: Timestamp::now(),
                     event: "guarded-attempt".into(),
                     allowed: false,
                     scopes: vec![ApprovalScope::CooldownBypass.as_str().to_string()],
@@ -1537,7 +1537,7 @@ fn audit_log_appends_after_unsigned_legacy_entries() {
     with_test_env(temp.path(), || {
         let event = AuditEvent {
             schema_version: AUDIT_EVENT_SCHEMA_VERSION,
-            occurred_at: Utc::now(),
+            occurred_at: Timestamp::now(),
             event: "guarded-attempt".into(),
             allowed: false,
             scopes: vec![ApprovalScope::TrustBulkApprove.as_str().to_string()],
@@ -1569,7 +1569,7 @@ fn audit_log_appends_after_legacy_signed_entries() {
     with_test_env(temp.path(), || {
         let event = AuditEvent {
             schema_version: AUDIT_EVENT_SCHEMA_VERSION,
-            occurred_at: Utc::now(),
+            occurred_at: Timestamp::now(),
             event: "guarded-attempt".into(),
             allowed: false,
             scopes: vec![ApprovalScope::SandboxNone.as_str().to_string()],
@@ -1633,7 +1633,7 @@ fn diagnostic_sigstore_posture_honors_unlocks_and_managed_policy_without_mutatio
             None,
             &[],
         );
-        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        expired.expires_at = Timestamp::now() - lpm_common::timestamp::Duration::seconds(1);
         persist_unlock_grant(&expired).unwrap();
         let expired_path = unlocks_dir().unwrap().join(format!("{}.json", expired.id));
         assert!(check_runtime_sigstore_posture(&project, EnforceMode::Off).is_err());

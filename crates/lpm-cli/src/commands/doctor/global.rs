@@ -769,8 +769,8 @@ mod tests {
 
     // ─── global-installs health checks ─────────────────
 
-    use chrono::Utc;
     use lpm_common::LpmRoot;
+    use lpm_common::Timestamp;
     use lpm_global::{
         GlobalManifest, InstallReadyMarker, PackageEntry, PackageSource, PendingEntry, write_marker,
     };
@@ -781,7 +781,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-z".into(),
             source: PackageSource::UpstreamNpm,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: rel_root.into(),
             commands: vec!["bin-a".into()],
         }
@@ -793,7 +793,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-z".into(),
             source: PackageSource::UpstreamNpm,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: rel_root.into(),
             commands,
             replaces_version: None,
@@ -1033,7 +1033,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 // Poisoned shape — `..` traversal must be refused.
                 root: "../escape".into(),
                 commands: vec!["bin-a".into()],

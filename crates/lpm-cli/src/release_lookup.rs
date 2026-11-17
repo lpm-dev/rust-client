@@ -918,7 +918,7 @@ pub fn github_release_download_url(version: &str, file: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubRelease {
     /// Anchors the Sigstore replay window.
-    pub published_at: chrono::DateTime<chrono::Utc>,
+    pub published_at: lpm_common::Timestamp,
     /// The commitish the release tag was created from. LPM's release
     /// workflow always records the full 40-character source commit here.
     pub target_commitish: Option<String>,
@@ -1015,13 +1015,11 @@ pub async fn fetch_github_release(version: &str) -> Result<GithubRelease, Lookup
             ))
         })?;
 
-    let published_at = chrono::DateTime::parse_from_rfc3339(published_at_str)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| {
-            LookupError::MalformedResponse(format!(
-                "release v{version} `published_at` not RFC 3339: {e}"
-            ))
-        })?;
+    let published_at = lpm_common::Timestamp::parse_rfc3339(published_at_str).map_err(|e| {
+        LookupError::MalformedResponse(format!(
+            "release v{version} `published_at` not RFC 3339: {e}"
+        ))
+    })?;
 
     let target_commitish = match body.get("target_commitish") {
         None | Some(serde_json::Value::Null) => None,

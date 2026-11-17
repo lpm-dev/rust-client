@@ -694,7 +694,7 @@ fn sorted_package_labels(packages: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use lpm_common::Timestamp;
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use lpm_security::behavioral::manifest::ManifestTags;
     use lpm_security::behavioral::source::SourceTags;
@@ -1048,8 +1048,8 @@ mod tests {
                 cpu: "arm64".to_string(),
                 libc: None,
             }),
-            created_at: Utc::now(),
-            last_referenced_at: Utc::now(),
+            created_at: Timestamp::now(),
+            last_referenced_at: Timestamp::now(),
         }
         .write_to(&link_dir)
         .unwrap();

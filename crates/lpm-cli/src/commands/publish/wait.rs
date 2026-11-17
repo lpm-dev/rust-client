@@ -637,10 +637,13 @@ mod tests {
     async fn expired_oidc_wait_credential_preserves_successful_upload_state() {
         let oidc_token = OidcToken {
             token: "publish-token".into(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+            expires_at: Some(
+                lpm_common::Timestamp::now() + lpm_common::timestamp::Duration::minutes(15),
+            ),
             publication_status: Some(OidcPublicationStatusToken {
                 token: "status-token".into(),
-                expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+                expires_at: lpm_common::Timestamp::now()
+                    - lpm_common::timestamp::Duration::seconds(1),
             }),
         };
         let client = RegistryClient::new().with_base_url("http://127.0.0.1:1");

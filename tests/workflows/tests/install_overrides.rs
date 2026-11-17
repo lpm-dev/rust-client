@@ -413,18 +413,16 @@ async fn workspace_member_inherits_root_override() {
 
 #[tokio::test]
 async fn install_override_does_not_bypass_minimum_release_age() {
-    use chrono::SecondsFormat;
-
     let mock = MockRegistry::start().await;
     let package = "override-policy-target";
     let forced_version = "2.0.0";
     let natural_version = "1.0.0";
     let forced_tarball = make_tarball(package, forced_version);
     let natural_tarball = make_tarball(package, natural_version);
-    let fresh = (chrono::Utc::now() - chrono::Duration::hours(212))
-        .to_rfc3339_opts(SecondsFormat::Millis, true);
-    let old = (chrono::Utc::now() - chrono::Duration::hours(400))
-        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let fresh = (lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::hours(212))
+        .to_rfc3339_milliseconds();
+    let old = (lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::hours(400))
+        .to_rfc3339_milliseconds();
     let metadata = serde_json::json!({
         "name": package,
         "dist-tags": { "latest": forced_version },

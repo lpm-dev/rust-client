@@ -54,6 +54,7 @@ pub mod test_network_path;
 // The 64-bit system call's groups are 32-bit; 32-bit systems have two calls.
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub mod thread_identity;
+pub mod timestamp;
 mod utf8_bom;
 pub mod volume;
 
@@ -140,6 +141,7 @@ pub use terminal::{
     sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
     sanitize_terminal_multiline,
 };
+pub use timestamp::Timestamp;
 pub use utf8_bom::{strip_utf8_bom_bytes, strip_utf8_bom_str};
 
 /// The LPM scope prefix. All LPM packages live under this scope.

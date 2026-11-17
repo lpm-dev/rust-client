@@ -26,7 +26,7 @@
 //! complete?", not "was step 2 correct?". Content correctness lives
 //! in the extractor + content-addressable store layers.
 
-use chrono::{DateTime, Utc};
+use lpm_common::Timestamp;
 use lpm_common::{
     INSTALL_READY_MARKER, LpmError, STATE_FILE_SIZE_CAP_BYTES, as_extended_path,
     read_capped_state_file,
@@ -44,7 +44,7 @@ pub struct InstallReadyMarker {
     /// pipeline's manifest entry. Recovery cross-checks each name's
     /// bin target via [`validate_install_root`] before rolling forward.
     pub commands: Vec<String>,
-    pub written_at: DateTime<Utc>,
+    pub written_at: Timestamp,
 }
 
 impl InstallReadyMarker {
@@ -52,7 +52,7 @@ impl InstallReadyMarker {
         InstallReadyMarker {
             schema_version: MARKER_SCHEMA_VERSION,
             commands,
-            written_at: Utc::now(),
+            written_at: Timestamp::now(),
         }
     }
 }

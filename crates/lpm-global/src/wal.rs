@@ -277,7 +277,7 @@ pub enum WalRecord {
     /// fsynced. The `tx_id` matches the originating Intent.
     Commit {
         tx_id: String,
-        committed_at: chrono::DateTime<chrono::Utc>,
+        committed_at: lpm_common::Timestamp,
     },
 
     /// `validate_install_root` rejected the pending install; recovery
@@ -285,7 +285,7 @@ pub enum WalRecord {
     Abort {
         tx_id: String,
         reason: String,
-        aborted_at: chrono::DateTime<chrono::Utc>,
+        aborted_at: lpm_common::Timestamp,
     },
 }
 

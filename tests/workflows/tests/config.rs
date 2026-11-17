@@ -2425,7 +2425,8 @@ fn config_list_honors_only_matching_project_script_unlocks() {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             if scenario == "expired" {
                 envelope["payload"]["expires_at"] = serde_json::json!(
-                    (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                    (lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::minutes(1))
+                        .to_rfc3339()
                 );
             } else {
                 envelope["payload"]["project_root"] =

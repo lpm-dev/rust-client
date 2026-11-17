@@ -1549,9 +1549,7 @@ pub fn format_triage_summary_line(blocked: &[BlockedPackage]) -> String {
 }
 
 fn current_rfc3339() -> String {
-    // Use `chrono` for the timestamp (already a workspace dep in lpm-cli;
-    // lpm-security uses `time` but that's not depended on here).
-    chrono::Utc::now().to_rfc3339()
+    lpm_common::Timestamp::now().to_rfc3339()
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

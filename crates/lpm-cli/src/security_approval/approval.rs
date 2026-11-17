@@ -1115,7 +1115,7 @@ pub(crate) fn check_runtime_sigstore_posture(
     let dir = unlocks_dir()?;
     let root = canonical_project_root(project_dir);
     if dir.try_exists()? {
-        let now = Utc::now();
+        let now = Timestamp::now();
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {

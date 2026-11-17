@@ -106,6 +106,11 @@ pub(super) fn parse_integrated_time(s: &str) -> Result<SystemTime, VerifyError> 
             "TlogEntry.integratedTime `{secs}` is negative; expected a unix timestamp"
         )));
     }
+    if lpm_common::Timestamp::from_unix_seconds(secs).is_none() {
+        return Err(VerifyError::RekorSet(format!(
+            "TlogEntry.integratedTime `{secs}` is after the year 9999"
+        )));
+    }
     Ok(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
 }
 

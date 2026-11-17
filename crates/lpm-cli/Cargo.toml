@@ -55,6 +55,7 @@ oxc_ast_visit = "=0.158.0"
 oxc_parser = "=0.158.0"
 oxc_span = "=0.158.0"
 clap = { workspace = true, features = ["string"] }
+time = { workspace = true, features = ["local-offset"] }
 clap_complete = { workspace = true }
 cvss = { workspace = true }
 tokio = { workspace = true }
@@ -105,7 +106,6 @@ crypto_box = { workspace = true }
 hex = { workspace = true }
 subtle = { workspace = true }
 secrecy = { workspace = true }
-chrono = { workspace = true }
 
 # Config
 toml = { workspace = true }

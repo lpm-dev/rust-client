@@ -2572,8 +2572,8 @@ async fn lpm_command_skips_recovery_when_another_lpm_holds_global_tx_lock() {
 /// docstring for the broader contract.
 #[tokio::test]
 async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
-    use chrono::Utc;
     use lpm_common::LpmRoot;
+    use lpm_common::Timestamp;
     use lpm_global::manifest::{
         GlobalManifest, PackageSource, PendingEntry, write_for as write_manifest_for,
     };
@@ -2604,7 +2604,7 @@ async fn lpm_command_with_orphan_pending_tx_emits_recovery_banner() {
             resolved: "1.0.0".into(),
             integrity: "sha512-x".into(),
             source: PackageSource::LpmDev,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: relative_root.into(),
             commands: vec!["pkg-orphan".into()],
             replaces_version: None,

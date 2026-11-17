@@ -47,7 +47,7 @@
 use crate::install_root::{InstallRootStatus, validate_install_root};
 use crate::manifest::{GlobalManifest, read_for, write_for};
 use crate::wal::{IntentPayload, ScanStop, TxKind, WalReader, WalRecord, WalWriter};
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot, as_extended_path, try_with_exclusive_lock};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -320,7 +320,7 @@ fn reconcile_one(
             // out of date.
             wal.append(&WalRecord::Commit {
                 tx_id: intent.tx_id.clone(),
-                committed_at: Utc::now(),
+                committed_at: Timestamp::now(),
             })?;
             return Ok(ReconciliationOutcome::AlreadyCommitted);
         }
@@ -383,7 +383,7 @@ fn reconcile_one(
         wal.append(&WalRecord::Abort {
             tx_id: intent.tx_id.clone(),
             reason: "no matching pending row and active row does not match new_row".into(),
-            aborted_at: Utc::now(),
+            aborted_at: Timestamp::now(),
         })?;
         return Ok(ReconciliationOutcome::NothingToDo);
     }

@@ -190,41 +190,10 @@ pub fn delete_state(project_dir: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
-/// RFC 3339 timestamp for `captured_at`. Uses the same tiny formatter
-/// as `overrides_state.rs` so we don't pull in chrono just for one
-/// timestamp.
+/// Returns the RFC 3339 timestamp for `captured_at`, in the form
+/// `overrides_state.rs` writes.
 fn rfc3339_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    format_rfc3339(secs)
-}
-
-/// Convert a Unix epoch second count into a `YYYY-MM-DDTHH:MM:SSZ`
-/// string. Mirror of the helper in `overrides_state.rs`. Handles years
-/// 1970..=2099.
-fn format_rfc3339(epoch_secs: u64) -> String {
-    const SECS_PER_DAY: u64 = 86_400;
-    let days = epoch_secs / SECS_PER_DAY;
-    let time_of_day = epoch_secs % SECS_PER_DAY;
-    let h = (time_of_day / 3600) as u32;
-    let m = ((time_of_day % 3600) / 60) as u32;
-    let s = (time_of_day % 60) as u32;
-
-    // Civil-from-days algorithm (Howard Hinnant).
-    let z = days as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m_civil = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y_civil = if m_civil <= 2 { y + 1 } else { y };
-
-    format!("{y_civil:04}-{m_civil:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    lpm_common::Timestamp::now().to_rfc3339_seconds()
 }
 
 #[cfg(test)]
@@ -419,10 +388,4 @@ mod tests {
     }
 
     // ── Format helpers ───────────────────────────────────────────────
-
-    #[test]
-    fn format_rfc3339_known_epoch() {
-        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(format_rfc3339(946_684_800), "2000-01-01T00:00:00Z");
-    }
 }

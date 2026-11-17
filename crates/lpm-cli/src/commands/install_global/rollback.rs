@@ -1,5 +1,5 @@
 use super::prepare::PrepResult;
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{WalRecord, WalWriter, read_for, remove_shim, write_for};
 
@@ -78,7 +78,7 @@ pub(super) fn rollback_aborted_commit(
     wal.append(&WalRecord::Abort {
         tx_id: prep.tx_id.clone(),
         reason: format!("commit-time validation failed: {reason}"),
-        aborted_at: Utc::now(),
+        aborted_at: Timestamp::now(),
     })?;
     Ok(())
 }
@@ -107,7 +107,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: "installs/pkg@1.0.0".into(),
                 commands: vec![],
                 replaces_version: None,
@@ -159,7 +159,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-pending".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: relative.into(),
                 commands: Vec::new(),
                 replaces_version: None,
@@ -172,7 +172,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-current".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                installed_at: chrono::Utc::now(),
+                installed_at: lpm_common::Timestamp::now(),
                 root: relative.into(),
                 commands: Vec::new(),
             },
@@ -227,7 +227,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: "installs/pkg@1.0.0".into(),
                 commands: vec![],
                 replaces_version: None,

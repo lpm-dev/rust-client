@@ -210,7 +210,7 @@ pathdiff = "0.2"
 signal-hook = "0.4"
 parking_lot = "0.13"
 dashmap = "6"
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["parsing"] }
 crc32fast = "1.4"
 hex = "0.4"
 subtle = "2"

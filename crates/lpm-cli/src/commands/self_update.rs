@@ -1832,8 +1832,10 @@ const ASSET_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// 1-hour pre-window absorbs the GitHub Actions run minting the
 /// attestation before the Release object is finalized; the 24-hour
 /// post-window allows for late asset publication / re-uploads.
-const REPLAY_PRE_WINDOW: chrono::Duration = chrono::Duration::hours(1);
-const REPLAY_POST_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+const REPLAY_PRE_WINDOW: lpm_common::timestamp::Duration =
+    lpm_common::timestamp::Duration::hours(1);
+const REPLAY_POST_WINDOW: lpm_common::timestamp::Duration =
+    lpm_common::timestamp::Duration::hours(24);
 
 /// Captured trail of attestation metadata, surfaced into the
 /// `--json` self-update output so audit pipelines can pin which
@@ -1843,7 +1845,7 @@ struct AttestationAudit {
     publisher: Option<String>,
     workflow_path: Option<String>,
     workflow_ref: Option<String>,
-    integrated_time: chrono::DateTime<chrono::Utc>,
+    integrated_time: lpm_common::Timestamp,
     log_index: i64,
     log_id: String,
     leaf_cert_sha256: String,
@@ -2109,7 +2111,7 @@ struct VerifiedReleaseManifest {
     publisher: Option<String>,
     workflow_path: Option<String>,
     workflow_ref: Option<String>,
-    integrated_time: chrono::DateTime<chrono::Utc>,
+    integrated_time: lpm_common::Timestamp,
     log_index: i64,
     log_id: String,
     leaf_cert_sha256: String,
@@ -2148,14 +2150,25 @@ fn verify_release_manifest(
     )?;
 
     let published_at = release.published_at;
-    let integrated_time_utc: chrono::DateTime<chrono::Utc> = integrated_time.into();
-    let earliest = published_at - REPLAY_PRE_WINDOW;
-    let latest = published_at + REPLAY_POST_WINDOW;
+    let integrated_time_utc: lpm_common::Timestamp = integrated_time.into();
+    let (Some(earliest), Some(latest)) = (
+        published_at.checked_sub(REPLAY_PRE_WINDOW),
+        published_at.checked_add(REPLAY_POST_WINDOW),
+    ) else {
+        return Err(LpmError::SelfUpdate(format!(
+            "release v{version} has a publication time ({}) that no replay window fits around",
+            published_at.to_plain_utc()
+        )));
+    };
     if integrated_time_utc < earliest || integrated_time_utc > latest {
         return Err(LpmError::SelfUpdate(format!(
-            "Sigstore bundle integratedTime ({integrated_time_utc}) is outside the replay window \
-             [{earliest}, {latest}] for release v{version} (published_at = {published_at}). \
-             The bundle may be a replayed attestation from a different release."
+            "Sigstore bundle integratedTime ({}) is outside the replay window \
+             [{}, {}] for release v{version} (published_at = {}). \
+             The bundle may be a replayed attestation from a different release.",
+            integrated_time_utc.to_plain_utc(),
+            earliest.to_plain_utc(),
+            latest.to_plain_utc(),
+            published_at.to_plain_utc()
         )));
     }
 
@@ -2360,7 +2373,7 @@ async fn run_standalone_update(
         publisher = assets.audit.publisher.as_deref().unwrap_or("<absent>"),
         workflow_path = assets.audit.workflow_path.as_deref().unwrap_or("<absent>"),
         workflow_ref = assets.audit.workflow_ref.as_deref().unwrap_or("<absent>"),
-        integrated_time = %assets.audit.integrated_time,
+        integrated_time = %assets.audit.integrated_time.to_plain_utc(),
         log_index = assets.audit.log_index,
         log_id = %assets.audit.log_id,
         leaf_cert_sha256 = %assets.audit.leaf_cert_sha256,
@@ -3345,7 +3358,7 @@ async fn verify_and_stage_for_standalone(
             "Verified Sigstore attestation for {} ({}, integratedTime {})",
             binary_name,
             lpm_common::format_bytes(staged.byte_len as u64),
-            audit.integrated_time
+            audit.integrated_time.to_plain_utc()
         ));
     }
 
@@ -4646,9 +4659,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     fn github_release(published_at: &str, target_commitish: Option<&str>) -> GithubRelease {
         GithubRelease {
-            published_at: chrono::DateTime::parse_from_rfc3339(published_at)
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            published_at: lpm_common::Timestamp::parse_rfc3339(published_at).unwrap(),
             target_commitish: target_commitish.map(str::to_owned),
         }
     }
@@ -4709,9 +4720,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             publisher: Some("github:lpm-dev/rust-client".to_string()),
             workflow_path: Some(".github/workflows/release.yml".to_string()),
             workflow_ref: Some("refs/tags/v1.2.3".to_string()),
-            integrated_time: chrono::DateTime::parse_from_rfc3339("2026-05-19T12:34:56Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            integrated_time: lpm_common::Timestamp::parse_rfc3339("2026-05-19T12:34:56Z").unwrap(),
             log_index: 9876543210,
             log_id: "c0d23d6ad406973f9559f3ba2d1ca01f8.. (truncated)".to_string(),
             leaf_cert_sha256: "feedface".to_string(),

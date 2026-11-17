@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
 
 use super::ReconciliationOutcome;
@@ -149,7 +149,7 @@ pub(super) fn roll_forward(
         resolved: pending.resolved,
         integrity: pending.integrity,
         source: pending.source,
-        installed_at: Utc::now(),
+        installed_at: Timestamp::now(),
         root: pending.root,
         // use `final_commands` (marker minus aliased-away origs),
         // not marker_commands. The invariant says
@@ -173,7 +173,7 @@ pub(super) fn roll_forward(
     // 6. Append COMMIT.
     wal.append(&WalRecord::Commit {
         tx_id: intent.tx_id.clone(),
-        committed_at: Utc::now(),
+        committed_at: Timestamp::now(),
     })?;
 
     Ok(ReconciliationOutcome::RolledForward)
@@ -391,7 +391,7 @@ pub(super) fn roll_forward_uninstall(
     // 7. Append Commit.
     wal.append(&WalRecord::Commit {
         tx_id: intent.tx_id.clone(),
-        committed_at: Utc::now(),
+        committed_at: Timestamp::now(),
     })?;
 
     Ok(ReconciliationOutcome::RolledForward)

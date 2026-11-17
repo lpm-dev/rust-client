@@ -18,8 +18,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use lpm_common::LpmError;
+use lpm_common::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::v2::graph_key::GraphKey;
@@ -110,10 +110,10 @@ pub struct LinkMeta {
     /// re-imaged from arm64 → x64 with a shared `$HOME`).
     pub platform: Arc<LinkMetaPlatform>,
     /// First-write timestamp.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Updated on every install that resolves to this graph-key.
     /// Drives `lpm cache prune --max-age <duration>` semantics.
-    pub last_referenced_at: DateTime<Utc>,
+    pub last_referenced_at: Timestamp,
 }
 
 impl LinkMeta {
@@ -129,7 +129,7 @@ impl LinkMeta {
         deps: Vec<LinkMetaDep>,
         platform: Arc<LinkMetaPlatform>,
     ) -> Self {
-        let now = Utc::now();
+        let now = Timestamp::now();
         Self {
             schema: LINK_META_SCHEMA_VERSION,
             graph_key: graph_key.dir_name().to_owned(),
@@ -156,7 +156,7 @@ impl LinkMeta {
     /// `lpm cache prune --max-age` distinguishes warm graph-keys from
     /// abandoned ones.
     pub fn touch(&mut self) {
-        self.last_referenced_at = Utc::now();
+        self.last_referenced_at = Timestamp::now();
     }
 
     /// Refresh the sidecar's "last touched" signal via one
@@ -187,10 +187,10 @@ impl LinkMeta {
     /// retained for compatibility with older sidecars and as a fallback
     /// when mtime is unreadable (permission/EIO) — that keeps prune
     /// from over-aggressively expiring entries.
-    pub fn effective_last_referenced_at(&self, sidecar_path: &Path) -> DateTime<Utc> {
+    pub fn effective_last_referenced_at(&self, sidecar_path: &Path) -> Timestamp {
         match std::fs::metadata(sidecar_path).and_then(|m| m.modified()) {
             Ok(mtime) => {
-                let mtime_utc: DateTime<Utc> = mtime.into();
+                let mtime_utc: Timestamp = mtime.into();
                 if mtime_utc > self.last_referenced_at {
                     mtime_utc
                 } else {
@@ -492,7 +492,7 @@ mod tests {
         let mut meta = sample_meta();
         let before = meta.last_referenced_at;
         // Touch is monotonic non-decreasing on UTC; on fast machines
-        // the chrono::Utc::now() resolution is sub-microsecond so the
+        // the lpm_common::Timestamp::now() resolution is sub-microsecond so the
         // bump should happen on the same call.
         std::thread::sleep(std::time::Duration::from_millis(2));
         meta.touch();

@@ -1,5 +1,5 @@
-use chrono::{DateTime, Utc};
 use ecdsa::signature::Verifier;
+use lpm_common::Timestamp;
 use p256::ecdsa::{Signature, VerifyingKey};
 use std::time::SystemTime;
 use x509_parser::prelude::*;
@@ -73,7 +73,7 @@ pub fn verify_cert_chain(
         ));
     }
 
-    let at_time_dt: DateTime<Utc> = at_time.into();
+    let at_time_dt: Timestamp = at_time.into();
 
     // Parse every cert in the bundle's chain once up-front. Reject
     // any malformed DER before any signature work runs.
@@ -302,17 +302,20 @@ fn anchor_contains_der(fulcio_roots: &[&FulcioRoot], top_der: &[u8]) -> bool {
 
 fn check_cert_validity_at(
     cert: &X509Certificate<'_>,
-    at_time: DateTime<Utc>,
+    at_time: Timestamp,
     label: &str,
 ) -> Result<(), VerifyError> {
     let validity = cert.validity();
-    let not_before = DateTime::from_timestamp(validity.not_before.timestamp(), 0)
+    let not_before = Timestamp::from_unix_seconds(validity.not_before.timestamp())
         .ok_or_else(|| VerifyError::Chain(format!("{label} notBefore is unrepresentable")))?;
-    let not_after = DateTime::from_timestamp(validity.not_after.timestamp(), 0)
+    let not_after = Timestamp::from_unix_seconds(validity.not_after.timestamp())
         .ok_or_else(|| VerifyError::Chain(format!("{label} notAfter is unrepresentable")))?;
     if at_time < not_before || at_time > not_after {
         return Err(VerifyError::Chain(format!(
-            "{label} validity window [{not_before}, {not_after}] does not contain integratedTime {at_time}"
+            "{label} validity window [{}, {}] does not contain integratedTime {}",
+            not_before.to_plain_utc(),
+            not_after.to_plain_utc(),
+            at_time.to_plain_utc()
         )));
     }
     Ok(())

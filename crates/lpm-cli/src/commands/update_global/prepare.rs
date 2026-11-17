@@ -1,4 +1,4 @@
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{GlobalInstallsDirectory, LpmError, LpmRoot};
 use lpm_global::{
     GlobalManifest, IntentPayload, PackageEntry, PackageSource, PendingEntry, TxKind, WalRecord,
@@ -129,7 +129,7 @@ fn prepare_upgrade_in_manifest(
         "resolved": prep.new_version.to_string(),
         "integrity": prep.new_integrity,
         "source": serde_json::to_value(prep.source).unwrap(),
-        "started_at": Utc::now().to_rfc3339(),
+        "started_at": Timestamp::now().to_rfc3339(),
         "root": install_root_relative,
         // commands: discovered post-extract (marker-as-authority).
         "commands": Vec::<String>::new(),
@@ -164,7 +164,7 @@ fn prepare_upgrade_in_manifest(
             resolved: prep.new_version.to_string(),
             integrity: prep.new_integrity.clone(),
             source: prep.source,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: install_root_relative.clone(),
             commands: Vec::new(),
             replaces_version: Some(prep.current_version.clone()),
@@ -256,7 +256,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-old".into(),
             source: PackageSource::LpmDev,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: "installs/pkg@1.0.0".into(),
             commands: vec![],
         };
@@ -303,7 +303,7 @@ mod tests {
             resolved: "9.24.0".into(),
             integrity: "sha512-x".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/eslint@9.24.0".into(),
             commands: vec!["eslint".into()],
         };
@@ -328,7 +328,7 @@ mod tests {
             resolved: "9.25.0".into(),
             integrity: "sha512-newer".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/eslint@9.25.0".into(),
             commands: vec!["eslint".into()],
         };
@@ -354,7 +354,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-x".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/x@1.0.0".into(),
             commands: vec![],
         };

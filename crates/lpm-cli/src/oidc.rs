@@ -30,14 +30,14 @@ const REGISTRY_OIDC_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[derive(Debug, Clone)]
 pub struct OidcToken {
     pub token: String,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<lpm_common::Timestamp>,
     pub publication_status: Option<OidcPublicationStatusToken>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OidcPublicationStatusToken {
     pub token: String,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: lpm_common::Timestamp,
 }
 
 impl OidcToken {
@@ -45,17 +45,17 @@ impl OidcToken {
         &self,
         timeout: std::time::Duration,
     ) -> Result<Option<&str>, LpmError> {
-        self.publication_status_token_for_wait_at(timeout, chrono::Utc::now())
+        self.publication_status_token_for_wait_at(timeout, lpm_common::Timestamp::now())
     }
 
     fn publication_status_token_for_wait_at(
         &self,
         timeout: std::time::Duration,
-        now: chrono::DateTime<chrono::Utc>,
+        now: lpm_common::Timestamp,
     ) -> Result<Option<&str>, LpmError> {
-        let timeout = chrono::Duration::from_std(timeout)
+        let timeout = lpm_common::timestamp::Duration::try_from(timeout)
             .map_err(|_| LpmError::Registry("publication wait timeout is out of range".into()))?;
-        let required_until = now + timeout + chrono::Duration::seconds(5);
+        let required_until = now + timeout + lpm_common::timestamp::Duration::seconds(5);
 
         if let Some(credential) = &self.publication_status {
             if credential.expires_at < required_until {
@@ -550,7 +550,7 @@ pub(crate) fn validate_registry_exchange_url(registry_url: &str) -> Result<(), L
 fn parse_optional_oidc_timestamp(
     response: &serde_json::Value,
     key: &str,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, LpmError> {
+) -> Result<Option<lpm_common::Timestamp>, LpmError> {
     let Some(value) = response.get(key) else {
         return Ok(None);
     };
@@ -559,8 +559,8 @@ fn parse_optional_oidc_timestamp(
             "OIDC response field {key} must be an RFC 3339 timestamp"
         )));
     };
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| Some(timestamp.with_timezone(&chrono::Utc)))
+    lpm_common::Timestamp::parse_rfc3339(value)
+        .map(Some)
         .map_err(|error| {
             LpmError::Registry(format!(
                 "OIDC response field {key} is not a valid RFC 3339 timestamp: {error}"
@@ -634,10 +634,13 @@ mod tests {
     fn publication_wait_prefers_a_sufficient_status_credential() {
         let oidc_token = OidcToken {
             token: "publish-token".into(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+            expires_at: Some(
+                lpm_common::Timestamp::now() + lpm_common::timestamp::Duration::minutes(15),
+            ),
             publication_status: Some(OidcPublicationStatusToken {
                 token: "status-token".into(),
-                expires_at: chrono::Utc::now() + chrono::Duration::minutes(65),
+                expires_at: lpm_common::Timestamp::now()
+                    + lpm_common::timestamp::Duration::minutes(65),
             }),
         };
 
@@ -653,10 +656,13 @@ mod tests {
     fn publication_wait_rejects_a_status_credential_that_expires_too_soon() {
         let oidc_token = OidcToken {
             token: "publish-token".into(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+            expires_at: Some(
+                lpm_common::Timestamp::now() + lpm_common::timestamp::Duration::minutes(15),
+            ),
             publication_status: Some(OidcPublicationStatusToken {
                 token: "status-token".into(),
-                expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
+                expires_at: lpm_common::Timestamp::now()
+                    + lpm_common::timestamp::Duration::seconds(30),
             }),
         };
 
@@ -669,15 +675,13 @@ mod tests {
 
     #[test]
     fn publication_wait_rechecks_credential_coverage_after_publish_work() {
-        let exchange_time = chrono::DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let exchange_time = lpm_common::Timestamp::parse_rfc3339("2026-08-11T12:00:00Z").unwrap();
         let oidc_token = OidcToken {
             token: "publish-token".into(),
-            expires_at: Some(exchange_time + chrono::Duration::minutes(15)),
+            expires_at: Some(exchange_time + lpm_common::timestamp::Duration::minutes(15)),
             publication_status: Some(OidcPublicationStatusToken {
                 token: "status-token".into(),
-                expires_at: exchange_time + chrono::Duration::seconds(75),
+                expires_at: exchange_time + lpm_common::timestamp::Duration::seconds(75),
             }),
         };
         let timeout = std::time::Duration::from_secs(60);
@@ -691,7 +695,7 @@ mod tests {
             oidc_token
                 .publication_status_token_for_wait_at(
                     timeout,
-                    exchange_time + chrono::Duration::seconds(11),
+                    exchange_time + lpm_common::timestamp::Duration::seconds(11),
                 )
                 .is_err()
         );
@@ -701,7 +705,9 @@ mod tests {
     fn publication_wait_uses_a_legacy_publish_credential_only_when_it_is_sufficient() {
         let oidc_token = OidcToken {
             token: "publish-token".into(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+            expires_at: Some(
+                lpm_common::Timestamp::now() + lpm_common::timestamp::Duration::minutes(15),
+            ),
             publication_status: None,
         };
 

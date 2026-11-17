@@ -154,12 +154,8 @@ impl TrustSnapshot {
     }
 }
 
-/// Current wall-clock time as RFC 3339 string. Matches the
-/// `chrono::Utc::now().to_rfc3339()` pattern used by
-/// `build_state::current_rfc3339` — lpm-cli uses `chrono` for
-/// timestamps; `time` is only a transitive dep via lpm-security.
 fn current_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+    lpm_common::Timestamp::now().to_rfc3339()
 }
 
 /// Absolute path to `<project_dir>/.lpm/trust-snapshot.json`.

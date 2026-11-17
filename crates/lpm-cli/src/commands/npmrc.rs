@@ -390,8 +390,8 @@ pub async fn run(
     };
     if replaced.token_id != pending.token_id
         || replaced.scope != "read"
-        || !chrono::DateTime::parse_from_rfc3339(&replaced.expires_at)
-            .is_ok_and(|expires| expires > chrono::Utc::now())
+        || !lpm_common::Timestamp::parse_rfc3339(&replaced.expires_at)
+            .is_ok_and(|expires| expires > lpm_common::Timestamp::now())
     {
         return Err(pending_recovery_error(
             "invalid project token replacement response: expected the requested read-only token ID and a future expiry",

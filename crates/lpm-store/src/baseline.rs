@@ -1145,7 +1145,7 @@ mod tests {
     #[test]
     fn for_project_resolves_to_the_link_entry_this_project_uses() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
-        use chrono::Utc;
+        use lpm_common::Timestamp;
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
@@ -1198,8 +1198,8 @@ mod tests {
                     cpu: "arm64".into(),
                     libc: None,
                 }),
-                created_at: Utc::now(),
-                last_referenced_at: Utc::now(),
+                created_at: Timestamp::now(),
+                last_referenced_at: Timestamp::now(),
             };
             meta.write_to(link_dir).unwrap();
         }
@@ -1255,7 +1255,7 @@ mod tests {
     #[test]
     fn every_baseline_lookup_drops_access_left_on_the_store_tiers() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
-        use chrono::Utc;
+        use lpm_common::Timestamp;
 
         for route in [
             "project index",
@@ -1303,8 +1303,8 @@ mod tests {
                     cpu: "arm64".into(),
                     libc: None,
                 }),
-                created_at: Utc::now(),
-                last_referenced_at: Utc::now(),
+                created_at: Timestamp::now(),
+                last_referenced_at: Timestamp::now(),
             }
             .write_to(&link_dir)
             .unwrap();
@@ -1362,7 +1362,7 @@ mod tests {
     #[test]
     fn for_project_maps_compatibility_root_symlink_to_owning_link_entry() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
-        use chrono::Utc;
+        use lpm_common::Timestamp;
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
@@ -1407,8 +1407,8 @@ mod tests {
                 cpu: "arm64".into(),
                 libc: None,
             }),
-            created_at: Utc::now(),
-            last_referenced_at: Utc::now(),
+            created_at: Timestamp::now(),
+            last_referenced_at: Timestamp::now(),
         };
         meta.write_to(&entry).unwrap();
 
@@ -1452,7 +1452,7 @@ mod tests {
     #[test]
     fn for_project_reaches_transitive_via_link_meta_deps() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaDep, LinkMetaPlatform};
-        use chrono::Utc;
+        use lpm_common::Timestamp;
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
@@ -1500,8 +1500,8 @@ mod tests {
                 cpu: "arm64".into(),
                 libc: None,
             }),
-            created_at: Utc::now(),
-            last_referenced_at: Utc::now(),
+            created_at: Timestamp::now(),
+            last_referenced_at: Timestamp::now(),
         };
         tslib_meta.write_to(&tslib_entry).unwrap();
 
@@ -1551,8 +1551,8 @@ mod tests {
                 cpu: "arm64".into(),
                 libc: None,
             }),
-            created_at: Utc::now(),
-            last_referenced_at: Utc::now(),
+            created_at: Timestamp::now(),
+            last_referenced_at: Timestamp::now(),
         };
         consumer_meta.write_to(&consumer_entry).unwrap();
 
@@ -1596,7 +1596,7 @@ mod tests {
     #[test]
     fn for_project_includes_scoped_direct_dependencies() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
-        use chrono::Utc;
+        use lpm_common::Timestamp;
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
@@ -1640,8 +1640,8 @@ mod tests {
                 cpu: "arm64".into(),
                 libc: None,
             }),
-            created_at: Utc::now(),
-            last_referenced_at: Utc::now(),
+            created_at: Timestamp::now(),
+            last_referenced_at: Timestamp::now(),
         };
         meta.write_to(&entry).unwrap();
 

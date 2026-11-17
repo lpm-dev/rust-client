@@ -43,9 +43,8 @@ pub(super) fn parse_canonical_release_version(raw: &str) -> Result<String, Strin
     Ok(canonical)
 }
 
-pub(super) fn parse_rfc3339_utc(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+pub(super) fn parse_rfc3339_utc(raw: &str) -> Result<lpm_common::Timestamp, String> {
+    lpm_common::Timestamp::parse_rfc3339(raw)
         .map_err(|error| format!("expected an RFC 3339 timestamp: {error}"))
 }
 

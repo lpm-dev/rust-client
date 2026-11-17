@@ -685,20 +685,20 @@ pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
 pub fn write_signed_unlock_for(project: &TempProject, project_dir: &Path, scopes: &[&str]) {
     use hmac::{KeyInit, Mac};
 
-    let now = chrono::Utc::now();
+    let now = lpm_common::Timestamp::now();
     let project_root = std::fs::canonicalize(project_dir)
         .expect("canonicalize temp project")
         .to_string_lossy()
         .to_string();
     let payload = serde_json::json!({
         "schema_version": 1,
-        "id": format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        "id": format!("unl_{}", now.unix_nanoseconds()),
         "target": "project",
         "project_root": project_root,
         "scopes": scopes,
         "limits": {},
         "issued_at": now.to_rfc3339(),
-        "expires_at": (now + chrono::Duration::minutes(10)).to_rfc3339(),
+        "expires_at": (now + lpm_common::timestamp::Duration::minutes(10)).to_rfc3339(),
         "issuer": "user-presence",
     });
 
@@ -765,7 +765,7 @@ fn write_signed_posture(project: &TempProject, typosquat_guard: &str, exclusions
 
     let payload = serde_json::json!({
         "schema_version": 1,
-        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "updated_at": lpm_common::Timestamp::now().to_rfc3339(),
         "script_policy": "deny",
         "minimum_release_age_secs": 86400,
         "minimum_release_age_exclude": exclusions,

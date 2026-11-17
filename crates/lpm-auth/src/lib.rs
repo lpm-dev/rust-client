@@ -1769,28 +1769,28 @@ pub(crate) fn set_session_access_token_expiry_checked(
     })
 }
 
-fn session_access_token_expiry(registry: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+fn session_access_token_expiry(registry: &str) -> Option<lpm_common::Timestamp> {
     let expiries = read_token_expiries();
     let expiry = expiries
         .get(registry_key(registry))?
         .session_access_expires_at
         .as_deref()?;
 
-    chrono::DateTime::parse_from_rfc3339(expiry)
-        .ok()
-        .map(|value| value.with_timezone(&chrono::Utc))
+    lpm_common::Timestamp::parse_rfc3339(expiry).ok()
 }
 
 /// Returns true when a stored session access token is already expired.
 pub fn is_session_access_token_expired(registry: &str) -> bool {
-    session_access_token_expiry(registry).is_some_and(|expiry| expiry <= chrono::Utc::now())
+    session_access_token_expiry(registry)
+        .is_some_and(|expiry| expiry <= lpm_common::Timestamp::now())
 }
 
 /// Returns true when a stored session access token should be refreshed.
 /// Missing metadata is treated as refresh-needed so older stored sessions self-heal.
 pub fn should_refresh_session_access_token(registry: &str) -> bool {
-    session_access_token_expiry(registry)
-        .is_none_or(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5))
+    session_access_token_expiry(registry).is_none_or(|expiry| {
+        expiry <= lpm_common::Timestamp::now() + lpm_common::timestamp::Duration::minutes(5)
+    })
 }
 
 /// Returns true if the local session-expiry metadata exists but cannot be read
@@ -1821,12 +1821,12 @@ pub fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
 /// Check token expiries and return warnings for tokens expiring soon.
 pub fn check_token_expiry_warnings() -> Vec<String> {
     let expiries = read_token_expiries();
-    let now = chrono::Utc::now().date_naive();
+    let now = lpm_common::Timestamp::now().date();
     let mut warnings = Vec::new();
 
     for (registry, expiry) in &expiries {
-        if let Ok(exp_date) = chrono::NaiveDate::parse_from_str(&expiry.expires, "%Y-%m-%d") {
-            let days_left = (exp_date - now).num_days();
+        if let Some(exp_date) = lpm_common::timestamp::parse_date(&expiry.expires) {
+            let days_left = (exp_date - now).whole_days();
             if days_left < 0 {
                 warnings.push(format!(
                     "{registry} token expired {} days ago — run `lpm login --{}`",
@@ -1950,10 +1950,9 @@ pub fn validate_refresh_backed_session(
     if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
         return Err("session response contained an empty credential".to_string());
     }
-    let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)
-        .map_err(|error| format!("invalid session access-token expiry: {error}"))?
-        .with_timezone(&chrono::Utc);
-    if expiry <= chrono::Utc::now() {
+    let expiry = lpm_common::Timestamp::parse_rfc3339(expires_at)
+        .map_err(|error| format!("invalid session access-token expiry: {error}"))?;
+    if expiry <= lpm_common::Timestamp::now() {
         return Err("session access-token expiry is not in the future".to_string());
     }
     Ok(())
@@ -2014,7 +2013,7 @@ pub async fn store_rotated_access_token_if_current(
     expires_at: Option<&str>,
 ) -> Result<AuthStorageStatus, lpm_common::LpmError> {
     let parsed_expiry = expires_at
-        .map(chrono::DateTime::parse_from_rfc3339)
+        .map(lpm_common::Timestamp::parse_rfc3339)
         .transpose()
         .map_err(|_| lpm_common::LpmError::Registry("invalid token rotation expiry".into()))?;
     if replacement.trim().is_empty() {
@@ -2046,7 +2045,7 @@ pub async fn store_rotated_access_token_if_current(
                     entry.expires.clear();
                     entry.session_access_expires_at = expires_at.map(str::to_owned);
                 } else {
-                    entry.expires = parsed_expiry.map(|expiry| expiry.date_naive().to_string()).unwrap_or_default();
+                    entry.expires = parsed_expiry.map(|expiry| expiry.date().to_string()).unwrap_or_default();
                     entry.session_access_expires_at = None;
                 }
                 true
@@ -5187,7 +5186,9 @@ mod tests {
     #[test]
     fn session_access_token_does_not_refresh_when_still_valid() {
         with_temp_home(|_| {
-            let future_expiry = (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+            let future_expiry = (lpm_common::Timestamp::now()
+                + lpm_common::timestamp::Duration::minutes(30))
+            .to_rfc3339();
             set_session_access_token_expiry("http://localhost:3000", &future_expiry);
 
             assert!(!should_refresh_session_access_token(
