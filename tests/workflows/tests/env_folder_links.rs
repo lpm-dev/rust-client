@@ -53,6 +53,7 @@ fn output_of(output: &std::process::Output) -> String {
 fn a_folder_that_isn_t_linked_uses_none_of_the_project_s_values() {
     let project = project_with_a_value();
     let other = copied_checkout(&project, "other-checkout");
+    std::fs::write(other.join("local.env"), "A_SECRET=OVERWRITTEN\n").unwrap();
 
     for args in [
         &["run", "dev"][..],
@@ -67,6 +68,10 @@ fn a_folder_that_isn_t_linked_uses_none_of_the_project_s_values() {
             "-e",
             "console.log('VALUE=' + process.env.A_SECRET)",
         ],
+        &["env", "copy", "default", "staging"],
+        &["env", "import", "local.env"],
+        &["env", "rollback", "--to", "1", "--yes"],
+        &["env", "repair", "--yes"],
     ] {
         let output = lpm_in(&project, &other, args);
 
@@ -323,7 +328,8 @@ fn a_folder_that_names_a_vault_this_machine_holds_no_values_for_is_not_refused()
     assert_eq!(report["this_folder_linked"], true, "{report}");
 }
 
-/// `value` with the project's folders and vault ID replaced by placeholders.
+/// `value` with the project's folders and vault ID replaced by placeholders
+/// in its strings, before any escaping a serializer adds.
 fn redacted(project: &TempProject, value: &serde_json::Value) -> serde_json::Value {
     let vault_id = std::fs::read_to_string(project.path().join("lpm.json"))
         .ok()
@@ -331,15 +337,37 @@ fn redacted(project: &TempProject, value: &serde_json::Value) -> serde_json::Val
         .and_then(|config| config["vault"].as_str().map(str::to_owned))
         .expect("the project names its vault");
     let root = project.path().canonicalize().unwrap();
-    let text = value
-        .to_string()
-        .replace(&vault_id, "[VAULT_ID]")
-        .replace(
-            &root.join("second-checkout").display().to_string(),
+    let replacements = [
+        (vault_id, "[VAULT_ID]"),
+        (
+            root.join("second-checkout").display().to_string(),
             "[CHECKOUT]",
-        )
-        .replace(&root.display().to_string(), "[PROJECT]");
-    serde_json::from_str(&text).unwrap()
+        ),
+        (root.display().to_string(), "[PROJECT]"),
+    ];
+    fn redact(value: &serde_json::Value, replacements: &[(String, &str)]) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(text) => serde_json::Value::String(
+                replacements
+                    .iter()
+                    .fold(text.clone(), |text, (from, to)| text.replace(from, to)),
+            ),
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| redact(item, replacements))
+                    .collect(),
+            ),
+            serde_json::Value::Object(fields) => serde_json::Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, field)| (key.clone(), redact(field, replacements)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    redact(value, &replacements)
 }
 
 fn json_of(output: &std::process::Output) -> serde_json::Value {
@@ -380,4 +408,115 @@ fn env_link_links_and_unlink_report_json_envelopes() {
     insta::assert_json_snapshot!("env_link_json_envelope", redacted(&project, &link));
     insta::assert_json_snapshot!("env_links_json_envelope", redacted(&project, &links));
     insta::assert_json_snapshot!("env_unlink_json_envelope", redacted(&project, &unlink));
+}
+
+#[test]
+fn env_unlink_resolves_a_relative_folder_from_where_it_runs() {
+    let project = project_with_a_value();
+    let checkout = copied_checkout(&project, "second-checkout");
+    assert!(
+        lpm_in(&project, &checkout, &["env", "link", "--yes"])
+            .status
+            .success()
+    );
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let unlink = json_of(&lpm_in(
+        &project,
+        &src,
+        &["--json", "env", "unlink", "../second-checkout"],
+    ));
+
+    assert_eq!(unlink["unlinked"], true, "{unlink}");
+    let links = json_of(&lpm_in(
+        &project,
+        project.path(),
+        &["--json", "env", "links"],
+    ));
+    assert_eq!(links["folders"].as_array().unwrap().len(), 1, "{links}");
+}
+
+#[test]
+fn every_way_to_run_a_script_refuses_a_folder_that_isn_t_linked_as_a_refusal() {
+    let project = project_with_a_value();
+    let other = copied_checkout(&project, "other-checkout");
+    std::fs::write(
+        other.join("show.js"),
+        "console.log('VALUE=' + process.env.A_SECRET)\n",
+    )
+    .unwrap();
+    let mut root: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    root["workspaces"] = serde_json::json!(["other-checkout"]);
+    root["private"] = serde_json::json!(true);
+    project.write_file("package.json", &root.to_string());
+
+    for (folder, args) in [
+        (other.as_path(), &["--json", "dev"][..]),
+        (other.as_path(), &["--json", "show.js"]),
+        (project.path(), &["--json", "run", "dev", "--all"]),
+    ] {
+        let output = lpm_in(&project, folder, args);
+
+        let text = output_of(&output);
+        assert!(!output.status.success(), "{args:?}: {text}");
+        assert!(!text.contains(MARKER), "{args:?}: {text}");
+        assert!(text.contains("env_project_refused"), "{args:?}: {text}");
+    }
+}
+
+#[test]
+fn a_run_checks_its_folder_s_link_once() {
+    let project = project_with_a_value();
+    let log = project.path().join("vault-transactions.log");
+
+    let run = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["run", "dev"])
+        .output()
+        .unwrap();
+
+    assert!(run.status.success(), "{}", output_of(&run));
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        log.lines().filter(|line| *line == "link check").count(),
+        1,
+        "{log}"
+    );
+}
+
+#[test]
+fn env_link_replaces_folder_links_that_can_t_be_read() {
+    let project = project_with_a_value();
+    let vaults = project.home().join(".lpm").join("vaults");
+    let links = std::fs::read_dir(&vaults)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "links")
+        })
+        .expect("the project's folder links");
+    std::fs::write(&links, "{not json").unwrap();
+
+    let refused = lpm_in(
+        &project,
+        project.path(),
+        &["--json", "env", "get", "A_SECRET", "--reveal"],
+    );
+    let refusal = output_of(&refused);
+    assert!(!refused.status.success(), "{refusal}");
+    assert!(refusal.contains("env_project_refused"), "{refusal}");
+    assert!(refusal.contains("lpm env link --yes"), "{refusal}");
+
+    let link = lpm_in(&project, project.path(), &["env", "link", "--yes"]);
+    let get = lpm_in(
+        &project,
+        project.path(),
+        &["env", "get", "A_SECRET", "--reveal"],
+    );
+
+    assert!(link.status.success(), "{}", output_of(&link));
+    assert!(output_of(&get).contains(MARKER), "{}", output_of(&get));
 }

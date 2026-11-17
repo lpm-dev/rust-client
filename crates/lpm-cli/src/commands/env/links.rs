@@ -14,7 +14,7 @@ use crate::output;
 /// linked: at a terminal, asks whether to link it; elsewhere refuses with
 /// the command that links it.
 pub(crate) fn ensure_folder_linked(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    match lpm_vault::folder_link(project_dir).map_err(LpmError::Env)? {
+    match lpm_vault::folder_link(project_dir).map_err(vault_error)? {
         Some(FolderLink::Unlinked(unlinked)) => ask_to_link(project_dir, &unlinked, json_output),
         Some(FolderLink::Linked) | None => Ok(()),
     }
@@ -27,7 +27,7 @@ pub(super) fn ensure_folder_linked_to(
     vault_id: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    match lpm_vault::folder_link_for_vault_id(project_dir, vault_id).map_err(LpmError::Env)? {
+    match lpm_vault::folder_link_for_vault_id(project_dir, vault_id).map_err(vault_error)? {
         FolderLink::Unlinked(unlinked) => ask_to_link(project_dir, &unlinked, json_output),
         FolderLink::Linked => Ok(()),
     }
@@ -54,7 +54,7 @@ fn ask_to_link(
     }
     lpm_vault::link_folder_to_vault_id(project_dir, &unlinked.vault_id)
         .map(drop)
-        .map_err(LpmError::Env)
+        .map_err(vault_error)
 }
 
 /// What the user is asked to link: the project as the vault records it and
@@ -83,27 +83,55 @@ fn describe(unlinked: &lpm_vault::UnlinkedFolder) -> String {
 
 pub(super) fn env_link(project_dir: &Path, yes: bool, json_output: bool) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(no_project)?;
-    let link =
-        lpm_vault::folder_link_for_vault_id(project_dir, &vault_id).map_err(LpmError::Env)?;
+    let link = match lpm_vault::folder_link_for_vault_id(project_dir, &vault_id) {
+        Ok(link) => link,
+        Err(reason) if lpm_vault::folder_links_are_damaged(&reason) => {
+            confirm_link(yes, json_output, &reason, "Replace them with this folder?")?;
+            lpm_vault::replace_damaged_folder_links(project_dir, &vault_id).map_err(vault_error)?;
+            report_link(project_dir, &vault_id, true, json_output);
+            return Ok(());
+        }
+        Err(reason) => return Err(vault_error(reason)),
+    };
     if let FolderLink::Unlinked(unlinked) = &link
         && !yes
     {
-        if json_output || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            return Err(LpmError::Env(
-                "linking a folder asks first; pass --yes to link it without asking".to_owned(),
-            ));
-        }
-        output::warn(&describe(unlinked));
-        let confirmed = cliclack::confirm("Link this folder?")
-            .initial_value(false)
-            .interact()
-            .map_err(|error| LpmError::Env(format!("prompt failed: {error}")))?;
-        if !confirmed {
-            return Err(LpmError::ExitCode(1));
-        }
+        confirm_link(yes, json_output, &describe(unlinked), "Link this folder?")?;
     }
-    let added =
-        lpm_vault::link_folder_to_vault_id(project_dir, &vault_id).map_err(LpmError::Env)?;
+    let added = lpm_vault::link_folder_to_vault_id(project_dir, &vault_id).map_err(vault_error)?;
+    report_link(project_dir, &vault_id, added, json_output);
+    Ok(())
+}
+
+/// Asks before a folder is linked, unless `yes`; without a terminal, or
+/// with `--json`, it needs `yes`.
+fn confirm_link(
+    yes: bool,
+    json_output: bool,
+    warning: &str,
+    question: &str,
+) -> Result<(), LpmError> {
+    if yes {
+        return Ok(());
+    }
+    if json_output || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(LpmError::Env(
+            "linking a folder asks first; pass --yes to link it without asking".to_owned(),
+        ));
+    }
+    output::warn(warning);
+    let confirmed = cliclack::confirm(question)
+        .initial_value(false)
+        .interact()
+        .map_err(|error| LpmError::Env(format!("prompt failed: {error}")))?;
+    if confirmed {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(1))
+    }
+}
+
+fn report_link(project_dir: &Path, vault_id: &str, added: bool, json_output: bool) {
     let folder = resolved(project_dir);
     if json_output {
         print_json(&serde_json::json!({
@@ -117,7 +145,12 @@ pub(super) fn env_link(project_dir: &Path, yes: bool, json_output: bool) -> Resu
     } else {
         output::success(&format!("{} is already linked", shown(&folder)));
     }
-    Ok(())
+}
+
+/// An error from the vault's links: an env project's refusal as itself, so
+/// it keeps its code, anything else as an env error.
+fn vault_error(reason: String) -> LpmError {
+    lpm_runner::dotenv::vault_error(LpmError::Env)(reason)
 }
 
 pub(super) fn env_unlink(
@@ -125,16 +158,15 @@ pub(super) fn env_unlink(
     folder: Option<&Path>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    // A folder to unlink is usually another checkout, outside this project,
+    // so a relative one is taken from where the command runs, as a shell
+    // takes it.
     let folder = match folder {
-        Some(folder) => crate::project_fs::project_relative_path(
-            &std::env::current_dir().map_err(LpmError::Io)?,
-            project_dir,
-            folder,
-        ),
+        Some(folder) => std::env::current_dir().map_err(LpmError::Io)?.join(folder),
         None => project_dir.to_path_buf(),
     };
     let (vault_id, removed) = lpm_vault::unlink_folder(project_dir, &folder)
-        .map_err(LpmError::Env)?
+        .map_err(vault_error)?
         .ok_or_else(no_project)?;
     let folder = resolved(&folder);
     if json_output {
@@ -161,13 +193,18 @@ pub(super) fn env_links(project_dir: &Path, json_output: bool) -> Result<(), Lpm
         folders,
         this_folder_linked,
     } = lpm_vault::linked_folders(project_dir)
-        .map_err(LpmError::Env)?
+        .map_err(vault_error)?
         .ok_or_else(no_project)?;
+    // A link names a path, so a folder deleted since keeps its link until
+    // it is unlinked, and a folder made there later would inherit it.
+    let missing: Vec<&std::path::PathBuf> =
+        folders.iter().filter(|folder| !folder.exists()).collect();
     if json_output {
         print_json(&serde_json::json!({
             "success": true,
             "vault_id": vault_id,
             "folders": folders,
+            "missing_folders": missing,
             "this_folder_linked": this_folder_linked,
         }));
         return Ok(());
@@ -185,6 +222,8 @@ pub(super) fn env_links(project_dir: &Path, json_output: bool) -> Result<(), Lpm
     for folder in &folders {
         let marker = if *folder == current {
             " (this folder)"
+        } else if missing.contains(&folder) {
+            " (missing: unlink it with `lpm env unlink <folder>`)"
         } else {
             ""
         };

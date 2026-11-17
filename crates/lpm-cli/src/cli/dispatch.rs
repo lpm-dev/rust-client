@@ -2281,6 +2281,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::env::links::ensure_folder_linked(&cwd, cli.json)?;
             if watch {
                 commands::run::run_file_watch(
                     &cwd,

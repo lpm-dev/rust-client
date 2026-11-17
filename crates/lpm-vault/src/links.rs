@@ -17,8 +17,10 @@ const LINKS_SCHEMA_VERSION: u8 = 1;
 #[cfg(target_os = "macos")]
 const LINKS_SERVICE: &str = "dev.lpm.vault.links";
 
+/// A field a later version adds is read past, so it doesn't stop this one;
+/// a change it can't read past comes with a new schema version.
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct LinkRecord {
     schema_version: u8,
     folders: BTreeSet<String>,
@@ -107,7 +109,12 @@ fn unlinkable(folder: &Path, vault_id: &str) -> String {
 
 /// Where a vault's link list lives.
 trait LinkStore {
-    fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String>;
+    fn read_bytes(&mut self, vault_id: &str) -> Result<Option<Vec<u8>>, String>;
+    fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
+        self.read_bytes(vault_id)?
+            .map(|bytes| decode(&bytes))
+            .transpose()
+    }
     fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String>;
     /// Whether this machine holds values for the vault, found without
     /// reading them, which could ask for the user's presence.
@@ -118,16 +125,45 @@ trait LinkStore {
     fn note_linked(&mut self, _vault_id: &str, _folder: &Path) {}
 }
 
-fn decode(bytes: &[u8], vault_id: &str) -> Result<LinkRecord, String> {
-    let record: LinkRecord = serde_json::from_slice(bytes)
-        .map_err(|error| format!("the folder links of vault {vault_id} are invalid: {error}"))?;
+/// How the refusal for a link list that can't be read begins. Like the
+/// gate's refusals it starts "This env project", so it is one.
+const DAMAGED_PREFIX: &str = "This env project's folder links on this machine can't be read";
+
+fn decode(bytes: &[u8]) -> Result<LinkRecord, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Version {
+        schema_version: u64,
+    }
+    let damaged = |error: serde_json::Error| {
+        format!(
+            "{DAMAGED_PREFIX} ({error}). Run `lpm env link --yes` in a folder that may use the \
+             project to replace them."
+        )
+    };
+    let version: Version = serde_json::from_slice(bytes).map_err(damaged)?;
+    if version.schema_version > u64::from(LINKS_SCHEMA_VERSION) {
+        return Err(
+            "This env project's folder links on this machine were written by a newer LPM CLI or \
+             LPM Vault, which this LPM CLI can't read. Update the LPM CLI: lpm self-update"
+                .to_owned(),
+        );
+    }
+    let record: LinkRecord = serde_json::from_slice(bytes).map_err(damaged)?;
     if record.schema_version != LINKS_SCHEMA_VERSION {
         return Err(format!(
-            "the folder links of vault {vault_id} have unsupported schema version {}",
+            "{DAMAGED_PREFIX} (schema version {}). Run `lpm env link --yes` in a folder that may \
+             use the project to replace them.",
             record.schema_version
         ));
     }
     Ok(record)
+}
+
+/// Whether `message` is the refusal for a link list that can't be read,
+/// which linking a folder may replace.
+pub(crate) fn is_damaged(message: &str) -> bool {
+    message.starts_with(DAMAGED_PREFIX)
 }
 
 fn encode(record: &LinkRecord) -> Result<Vec<u8>, String> {
@@ -153,12 +189,9 @@ struct FileLinkStore<'directory> {
 }
 
 impl LinkStore for FileLinkStore<'_> {
-    fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
+    fn read_bytes(&mut self, vault_id: &str) -> Result<Option<Vec<u8>>, String> {
         let vaults = self.directory.open_or_create_directory("vaults")?;
-        vaults
-            .read_owner_only_file(&file_name(vault_id), "vault folder links")?
-            .map(|bytes| decode(&bytes, vault_id))
-            .transpose()
+        vaults.read_owner_only_file(&file_name(vault_id), "vault folder links")
     }
 
     fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String> {
@@ -186,10 +219,8 @@ struct KeychainLinkStore<'directory> {
 
 #[cfg(target_os = "macos")]
 impl LinkStore for KeychainLinkStore<'_> {
-    fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
-        crate::macos_keychain::read_bytes(&lpm_common::credential_service(LINKS_SERVICE), vault_id)?
-            .map(|bytes| decode(&bytes, vault_id))
-            .transpose()
+    fn read_bytes(&mut self, vault_id: &str) -> Result<Option<Vec<u8>>, String> {
+        crate::macos_keychain::read_bytes(&lpm_common::credential_service(LINKS_SERVICE), vault_id)
     }
 
     fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String> {
@@ -262,7 +293,7 @@ fn resolve(store: &mut dyn LinkStore, vault_id: &str) -> Result<Resolved, String
             recorded: None,
         });
     }
-    let recorded = store.recorded_project(vault_id)?;
+    let recorded = recorded_project(store, vault_id);
     let first = recorded
         .as_ref()
         .map(|(_, path)| Path::new(path))
@@ -279,14 +310,30 @@ fn resolve(store: &mut dyn LinkStore, vault_id: &str) -> Result<Resolved, String
     })
 }
 
-/// Whether `project_dir` may use the vault `vault_id`.
+/// The project name and folder the vault's records name. A record that
+/// can't be read names neither: it labels the prompt and seeds a first
+/// link, and isn't worth refusing a folder over.
+fn recorded_project(store: &mut dyn LinkStore, vault_id: &str) -> Option<(String, String)> {
+    store
+        .recorded_project(vault_id)
+        .inspect_err(|error| {
+            tracing::warn!("the project record of vault {vault_id} can't be read: {error}");
+        })
+        .ok()
+        .flatten()
+}
+
+/// Whether `project_dir` may use the vault `vault_id`, and whether the
+/// vault's link list names it, rather than letting every folder use a vault
+/// that holds no values here.
 pub(crate) fn check(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<FolderLink, String> {
+) -> Result<(FolderLink, bool), String> {
     with_store(directory, |store| {
-        check_in(store, project_dir, vault_id).map(|(link, _)| link)
+        let (link, folders) = check_in(store, project_dir, vault_id)?;
+        Ok((link, folders.is_some()))
     })
 }
 
@@ -299,19 +346,19 @@ fn check_in(
     vault_id: &str,
 ) -> Result<(FolderLink, Option<BTreeSet<String>>), String> {
     let folder = link_folder_path(project_dir);
-    let key = folder_key(&folder).ok_or_else(|| unlinkable(&folder, vault_id))?;
     let Resolved { folders, recorded } = resolve(store, vault_id)?;
     let Some(folders) = folders else {
         store.note_linked(vault_id, &folder);
         return Ok((FolderLink::Linked, None));
     };
+    let key = folder_key(&folder).ok_or_else(|| unlinkable(&folder, vault_id))?;
     if folders.contains(key) {
         store.note_linked(vault_id, &folder);
         return Ok((FolderLink::Linked, Some(folders)));
     }
     let recorded = match recorded {
         Some(recorded) => recorded,
-        None => store.recorded_project(vault_id)?,
+        None => recorded_project(store, vault_id),
     };
     Ok((unlinked(vault_id, folder, recorded, folders), None))
 }
@@ -332,15 +379,16 @@ fn unlinked(
     })
 }
 
-/// Fails unless `project_dir` may use the vault `vault_id`.
+/// Fails unless `project_dir` may use the vault `vault_id`; whether the
+/// vault's link list names it.
 pub(crate) fn require(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     match check(directory, project_dir, vault_id)? {
-        FolderLink::Linked => Ok(()),
-        FolderLink::Unlinked(unlinked) => Err(unlinked.refusal()),
+        (FolderLink::Linked, listed) => Ok(listed),
+        (FolderLink::Unlinked(unlinked), _) => Err(unlinked.refusal()),
     }
 }
 
@@ -360,6 +408,23 @@ pub(crate) fn require_for_write(
                 insert(store, project_dir, vault_id, BTreeSet::new()).map(drop)
             }
         }
+    })
+}
+
+/// Links `project_dir` to the vault `vault_id` in place of a link list
+/// that can't be read. A list from a later version is still refused.
+pub(crate) fn replace_damaged(
+    directory: &VaultStorageDirectory,
+    project_dir: &Path,
+    vault_id: &str,
+) -> Result<(), String> {
+    with_store(directory, |store| {
+        let folders = match resolve(store, vault_id) {
+            Ok(resolved) => resolved.folders.unwrap_or_default(),
+            Err(error) if is_damaged(&error) => BTreeSet::new(),
+            Err(error) => return Err(error),
+        };
+        insert(store, project_dir, vault_id, folders).map(drop)
     })
 }
 
@@ -466,6 +531,7 @@ mod tests {
     #[derive(Default)]
     struct MemoryLinkStore {
         records: HashMap<String, LinkRecord>,
+        raw: HashMap<String, Vec<u8>>,
         values: BTreeSet<String>,
         projects: HashMap<String, (String, String)>,
         writes: usize,
@@ -475,16 +541,17 @@ mod tests {
     }
 
     impl LinkStore for MemoryLinkStore {
-        fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
+        fn read_bytes(&mut self, vault_id: &str) -> Result<Option<Vec<u8>>, String> {
             self.reads += 1;
-            Ok(self.records.get(vault_id).map(|record| LinkRecord {
-                schema_version: record.schema_version,
-                folders: record.folders.clone(),
-            }))
+            if let Some(bytes) = self.raw.get(vault_id) {
+                return Ok(Some(bytes.clone()));
+            }
+            self.records.get(vault_id).map(encode).transpose()
         }
 
         fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String> {
             self.writes += 1;
+            self.raw.remove(vault_id);
             self.records.insert(
                 vault_id.to_owned(),
                 LinkRecord {
@@ -768,6 +835,86 @@ mod tests {
         let Resolved { folders, .. } = resolve(&mut store, "vault").unwrap();
 
         assert!(folders.is_none());
+        assert_eq!(
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
+            FolderLink::Linked
+        );
+    }
+
+    #[test]
+    fn a_link_list_with_a_field_this_version_doesn_t_know_still_reads() {
+        let record =
+            decode(br#"{"schemaVersion":1,"folders":["/work/app"],"updatedAt":"2026-11-17"}"#)
+                .unwrap();
+
+        assert_eq!(record.folders, BTreeSet::from(["/work/app".to_owned()]));
+    }
+
+    #[test]
+    fn a_link_list_from_a_later_version_is_refused_with_how_to_update() {
+        let refusal = decode(br#"{"schemaVersion":2,"folders":[],"devices":{}}"#).unwrap_err();
+
+        assert!(refusal.contains("lpm self-update"), "{refusal}");
+        assert!(crate::is_env_project_refusal(&refusal), "{refusal}");
+        assert!(!is_damaged(&refusal), "{refusal}");
+    }
+
+    #[test]
+    fn a_link_list_that_can_t_be_read_is_refused_and_replaced_by_linking() {
+        let (_root, paths) = make_folders(&["own", "other"]);
+        let mut store = MemoryLinkStore::default();
+        store.values.insert("vault".into());
+        store.raw.insert("vault".into(), b"{not json".to_vec());
+
+        let refusal = check_in(&mut store, &paths[0], "vault").unwrap_err();
+        assert!(is_damaged(&refusal), "{refusal}");
+        assert!(crate::is_env_project_refusal(&refusal), "{refusal}");
+
+        let folders = match resolve(&mut store, "vault") {
+            Err(error) if is_damaged(&error) => BTreeSet::new(),
+            other => panic!("{:?}", other.map(|resolved| resolved.folders)),
+        };
+        insert(&mut store, &paths[0], "vault", folders).unwrap();
+
+        assert_eq!(
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
+            FolderLink::Linked
+        );
+        assert!(matches!(
+            check_in(&mut store, &paths[1], "vault").unwrap().0,
+            FolderLink::Unlinked(_)
+        ));
+    }
+
+    #[test]
+    fn a_project_record_that_can_t_be_read_seeds_no_link_and_names_no_project() {
+        struct UnreadableProject(MemoryLinkStore);
+        impl LinkStore for UnreadableProject {
+            fn read_bytes(&mut self, vault_id: &str) -> Result<Option<Vec<u8>>, String> {
+                self.0.read_bytes(vault_id)
+            }
+            fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String> {
+                self.0.write(vault_id, record)
+            }
+            fn holds_values(&mut self, vault_id: &str) -> Result<bool, String> {
+                self.0.holds_values(vault_id)
+            }
+            fn recorded_project(&mut self, _: &str) -> Result<Option<(String, String)>, String> {
+                Err("the project index is damaged".into())
+            }
+        }
+        let (_root, paths) = make_folders(&["any"]);
+        let mut inner = MemoryLinkStore::default();
+        inner.values.insert("vault".into());
+        let mut store = UnreadableProject(inner);
+
+        let (FolderLink::Unlinked(unlinked), _) = check_in(&mut store, &paths[0], "vault").unwrap()
+        else {
+            panic!("a vault with values and no readable record links no folder");
+        };
+
+        assert!(unlinked.project_name.is_none());
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
         assert_eq!(
             check_in(&mut store, &paths[0], "vault").unwrap().0,
             FolderLink::Linked

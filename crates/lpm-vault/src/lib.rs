@@ -240,15 +240,61 @@ fn with_project_vault_transaction<T>(
 
 pub use links::{FolderLink, UnlinkedFolder};
 
+/// Folders this process found named in a vault's link list. A command's
+/// access is decided when it starts, so its later checks of the same folder
+/// don't take the vault's lock again; one that unlinks forgets the vault.
+static LISTED_FOLDERS: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+fn listed_folders() -> std::sync::MutexGuard<'static, Vec<(String, PathBuf)>> {
+    LISTED_FOLDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn is_listed(vault_id: &str, folder: &Path) -> bool {
+    listed_folders()
+        .iter()
+        .any(|(listed_vault, listed_folder)| listed_vault == vault_id && listed_folder == folder)
+}
+
+fn remember_listed(vault_id: &str, folder: PathBuf) {
+    let mut listed = listed_folders();
+    if !listed
+        .iter()
+        .any(|(listed_vault, listed_folder)| listed_vault == vault_id && *listed_folder == folder)
+    {
+        listed.push((vault_id.to_owned(), folder));
+    }
+}
+
+fn forget_listed(vault_id: &str) {
+    listed_folders().retain(|(listed_vault, _)| listed_vault != vault_id);
+}
+
+/// A vault transaction for a folder's links, logged apart from the
+/// transactions that read and write values.
+fn with_link_transaction<T>(
+    operation: impl FnOnce(&storage_transaction::VaultStorageDirectory) -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(debug_assertions)]
+    record_transaction_for_test("link check");
+    storage_transaction::with_vault_transaction(operation)
+}
+
 /// The vault ID `project_dir`'s lpm.json names, when this machine lets the
 /// folder use that vault. See [`links`].
 fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
-    storage_transaction::with_vault_transaction(|directory| {
-        links::require(directory, project_dir, &vault_id)
-    })?;
+    let folder = links::link_folder_path(project_dir);
+    if !is_listed(&vault_id, &folder) {
+        let listed =
+            with_link_transaction(|directory| links::require(directory, project_dir, &vault_id))?;
+        if listed {
+            remember_listed(&vault_id, folder);
+        }
+    }
     Ok(Some(vault_id))
 }
 
@@ -256,9 +302,13 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
 /// names none, when this machine lets the folder store values in it.
 fn linked_vault_id_for_write(project_dir: &Path) -> Result<String, String> {
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
-    storage_transaction::with_vault_transaction(|directory| {
-        links::require_for_write(directory, project_dir, &vault_id)
-    })?;
+    let folder = links::link_folder_path(project_dir);
+    if !is_listed(&vault_id, &folder) {
+        with_link_transaction(|directory| {
+            links::require_for_write(directory, project_dir, &vault_id)
+        })?;
+        remember_listed(&vault_id, folder);
+    }
     Ok(vault_id)
 }
 
@@ -268,28 +318,52 @@ pub fn folder_link(project_dir: &Path) -> Result<Option<FolderLink>, String> {
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
-    storage_transaction::with_vault_transaction(|directory| {
-        links::check(directory, project_dir, &vault_id)
-    })
-    .map(Some)
+    checked_folder_link(project_dir, &vault_id).map(Some)
 }
 
 /// [`folder_link`] for the vault `vault_id`, which the caller read from the
 /// folder's lpm.json.
 pub fn folder_link_for_vault_id(project_dir: &Path, vault_id: &str) -> Result<FolderLink, String> {
     validate_explicit_vault_id(vault_id)?;
-    storage_transaction::with_vault_transaction(|directory| {
-        links::check(directory, project_dir, vault_id)
-    })
+    checked_folder_link(project_dir, vault_id)
+}
+
+fn checked_folder_link(project_dir: &Path, vault_id: &str) -> Result<FolderLink, String> {
+    let folder = links::link_folder_path(project_dir);
+    if is_listed(vault_id, &folder) {
+        return Ok(FolderLink::Linked);
+    }
+    let (link, listed) =
+        with_link_transaction(|directory| links::check(directory, project_dir, vault_id))?;
+    if listed {
+        remember_listed(vault_id, folder);
+    }
+    Ok(link)
 }
 
 /// Links `project_dir` to the vault `vault_id`; whether it wasn't linked
 /// before.
 pub fn link_folder_to_vault_id(project_dir: &Path, vault_id: &str) -> Result<bool, String> {
     validate_explicit_vault_id(vault_id)?;
-    storage_transaction::with_vault_transaction(|directory| {
-        links::add(directory, project_dir, vault_id)
-    })
+    let added = with_link_transaction(|directory| links::add(directory, project_dir, vault_id))?;
+    remember_listed(vault_id, links::link_folder_path(project_dir));
+    Ok(added)
+}
+
+/// Whether `message` refuses an env project whose folder links on this
+/// machine can't be read, which [`replace_damaged_folder_links`] replaces.
+pub fn folder_links_are_damaged(message: &str) -> bool {
+    links::is_damaged(message)
+}
+
+/// Links `project_dir` to the vault `vault_id` in place of folder links
+/// that can't be read.
+pub fn replace_damaged_folder_links(project_dir: &Path, vault_id: &str) -> Result<(), String> {
+    validate_explicit_vault_id(vault_id)?;
+    forget_listed(vault_id);
+    with_link_transaction(|directory| links::replace_damaged(directory, project_dir, vault_id))?;
+    remember_listed(vault_id, links::link_folder_path(project_dir));
+    Ok(())
 }
 
 /// Unlinks `folder` from the vault `project_dir`'s lpm.json names, and
@@ -299,9 +373,8 @@ pub fn unlink_folder(project_dir: &Path, folder: &Path) -> Result<Option<(String
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
-    let removed = storage_transaction::with_vault_transaction(|directory| {
-        links::remove(directory, folder, &vault_id)
-    })?;
+    forget_listed(&vault_id);
+    let removed = with_link_transaction(|directory| links::remove(directory, folder, &vault_id))?;
     Ok(Some((vault_id, removed)))
 }
 
@@ -320,9 +393,8 @@ pub fn linked_folders(project_dir: &Path) -> Result<Option<LinkedFolders>, Strin
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
-    let (folders, this_folder_linked) = storage_transaction::with_vault_transaction(|directory| {
-        links::listing(directory, project_dir, &vault_id)
-    })?;
+    let (folders, this_folder_linked) =
+        with_link_transaction(|directory| links::listing(directory, project_dir, &vault_id))?;
     Ok(Some(LinkedFolders {
         vault_id,
         folders,
@@ -334,6 +406,11 @@ pub fn linked_folders(project_dir: &Path) -> Result<Option<LinkedFolders>, Strin
 /// transaction, so workflow tests can count how often a command reads it.
 #[cfg(debug_assertions)]
 fn record_vault_transaction_for_test() {
+    record_transaction_for_test("transaction");
+}
+
+#[cfg(debug_assertions)]
+fn record_transaction_for_test(kind: &str) {
     use std::io::Write as _;
     let Some(log_path) = std::env::var_os("LPM_TEST_VAULT_TRANSACTION_LOG") else {
         return;
@@ -343,7 +420,7 @@ fn record_vault_transaction_for_test() {
         .append(true)
         .open(log_path)
     {
-        let _ = writeln!(log, "transaction");
+        let _ = writeln!(log, "{kind}");
     }
 }
 

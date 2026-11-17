@@ -9,5 +9,6 @@ expression: "redacted(&project, &links)"
     "[PROJECT]",
     "[CHECKOUT]"
   ],
+  "missing_folders": [],
   "this_folder_linked": true
 }
