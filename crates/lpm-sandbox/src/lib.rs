@@ -1026,11 +1026,13 @@ fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
 /// process. This calls `TerminateJobObject`, which ends every member of
 /// the tree, then closes the handle. A sandboxed lifecycle child is the
 /// AppContainer helper, which holds its script's Job Object itself:
-/// killing the helper closes that Job and ends the tree.
+/// ending the helper closes that Job and ends the tree. An ended helper
+/// can't take back what it set for the run, so this ends it and then has
+/// another helper process take that back.
 ///
 /// Idempotent: PIDs without a tracked entry (Linux; Windows children
-/// that exited normally; sandboxed Windows lifecycle children) are
-/// silent no-ops. Always pair with `Child::kill()`.
+/// that exited normally) are silent no-ops. Always pair with
+/// `Child::kill()`.
 ///
 /// # Errors
 ///
@@ -1038,7 +1040,10 @@ fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
 /// still running after every sweep.
 pub fn terminate_sandbox_tree(_pid: u32) -> Result<(), SurvivingProcesses> {
     #[cfg(target_os = "windows")]
-    windows::terminate_sandbox_tree(_pid);
+    {
+        windows::terminate_sandbox_tree(_pid);
+        windows_appcontainer::end_run(_pid);
+    }
     #[cfg(target_os = "macos")]
     return seatbelt_tree::terminate_sandbox_tree(_pid);
     #[cfg(not(target_os = "macos"))]
@@ -1050,8 +1055,9 @@ pub fn terminate_sandbox_tree(_pid: u32) -> Result<(), SurvivingProcesses> {
 /// this is a no-op. On macOS it ends every process still running under
 /// the child's Seatbelt profile, as [`terminate_sandbox_tree`] does. On
 /// Windows it closes the cached Job Object handle of a
-/// [`spawn_tracked_command`] child; without it the tracker keeps one
-/// open HANDLE per tracked command for the parent's lifetime. The
+/// [`spawn_tracked_command`] child, or the process handle kept for a
+/// sandboxed lifecycle child; without it the tracker keeps one open
+/// HANDLE per child for the parent's lifetime. The
 /// timeout-kill path uses [`terminate_sandbox_tree`] instead, which also
 /// releases the entry.
 ///
@@ -1063,7 +1069,10 @@ pub fn terminate_sandbox_tree(_pid: u32) -> Result<(), SurvivingProcesses> {
 /// should then count as failed: its processes outlived it.
 pub fn release_sandbox_tracker(_pid: u32) -> Result<(), SurvivingProcesses> {
     #[cfg(target_os = "windows")]
-    windows::release_sandbox_tracker_entry(_pid);
+    {
+        windows::release_sandbox_tracker_entry(_pid);
+        windows_appcontainer::forget_run(_pid);
+    }
     #[cfg(target_os = "macos")]
     return seatbelt_tree::terminate_sandbox_tree(_pid);
     #[cfg(not(target_os = "macos"))]
