@@ -1,3 +1,5 @@
+#[cfg(any(unix, windows))]
+use super::output_wait::{Looked, wait_for_output};
 use super::process_tree::{wait_with_timeout, wait_with_timeout_or_cancel};
 use lpm_common::sanitize_terminal_multiline;
 use lpm_sandbox::SandboxMode;
@@ -525,7 +527,7 @@ where
     let mut buf = [0_u8; 8192];
     let mut post_finish_bytes = 0_usize;
     loop {
-        if !wait_for_output(reader.as_raw_fd(), process_finished) {
+        if !wait_for_unix_output(reader.as_raw_fd(), process_finished) {
             break;
         }
         let read = match reader.read(&mut buf) {
@@ -551,33 +553,39 @@ where
 }
 
 #[cfg(unix)]
-fn wait_for_output(fd: std::os::fd::RawFd, process_finished: &AtomicBool) -> bool {
+fn wait_for_unix_output(fd: std::os::fd::RawFd, process_finished: &AtomicBool) -> bool {
+    wait_for_output(process_finished, |may_wait| {
+        look_at_unix_output(fd, may_wait)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn look_at_unix_output(fd: std::os::fd::RawFd, may_wait: bool) -> std::io::Result<Looked> {
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
-    loop {
-        // SAFETY: poll_fd points to one initialized pollfd for the duration of
-        // the call. The descriptor remains owned by the reader thread.
-        let timeout_ms = if process_finished.load(Ordering::Acquire) {
-            0
+    let timeout_ms = if may_wait { 50 } else { 0 };
+    // SAFETY: poll_fd points to one initialized pollfd for the duration of
+    // the call. The descriptor remains owned by the reader thread.
+    let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if result > 0 {
+        return Ok(if poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            Looked::Readable
         } else {
-            50
-        };
-        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-        if result > 0 {
-            return poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0;
-        }
-        if result == 0 {
-            if process_finished.load(Ordering::Acquire) {
-                return false;
-            }
-            continue;
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return false;
-        }
+            Looked::Closed
+        });
+    }
+    if result == 0 {
+        return Ok(Looked::Nothing);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        Ok(Looked::Interrupted)
+    } else {
+        Err(error)
     }
 }
 
@@ -620,33 +628,42 @@ fn wait_for_windows_output(
     handle: std::os::windows::io::RawHandle,
     process_finished: &AtomicBool,
 ) -> bool {
+    wait_for_output(process_finished, |may_wait| {
+        look_at_windows_output(handle, may_wait)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn look_at_windows_output(
+    handle: std::os::windows::io::RawHandle,
+    may_wait: bool,
+) -> std::io::Result<Looked> {
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
-    loop {
-        let mut available = 0_u32;
-        // SAFETY: handle belongs to the reader thread and remains valid for the
-        // call. The null buffer requests only the available-byte count.
-        let result = unsafe {
-            PeekNamedPipe(
-                handle as _,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if result == 0 {
-            return false;
-        }
-        if available > 0 {
-            return true;
-        }
-        if process_finished.load(Ordering::Acquire) {
-            return false;
-        }
+    let mut available = 0_u32;
+    // SAFETY: handle belongs to the reader thread and remains valid for the
+    // call. The null buffer requests only the available-byte count.
+    let result = unsafe {
+        PeekNamedPipe(
+            handle as _,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if available > 0 {
+        return Ok(Looked::Readable);
+    }
+    if may_wait {
         std::thread::sleep(Duration::from_millis(10));
     }
+    Ok(Looked::Nothing)
 }
 
 #[cfg(not(any(unix, windows)))]
