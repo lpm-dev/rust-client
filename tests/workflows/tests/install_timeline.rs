@@ -353,14 +353,34 @@ async fn assert_install_fetch_ancestry(route: &str) {
 
     let registry = MockRegistry::start().await;
     let mut dependencies = serde_json::Map::new();
-    for index in 0..if policy || route == "experimental" {
+    let packages = if policy || route == "experimental" {
         1
     } else {
         8
-    } {
+    };
+    for index in 0..packages {
         let name = format!("timeline-overlap-{index}");
         let tarball = make_tarball(&name, "1.0.0");
         registry.with_package(&name, "1.0.0", &tarball).await;
+        // The fetch phase starts when resolution ends and fetches whatever
+        // the dispatcher hasn't started on by then, which on a busy machine
+        // can be every package. The last package's metadata comes late, so
+        // the dispatcher fetches the others while resolution waits for it.
+        if packages > 1 && index == packages - 1 {
+            let metadata = registry.package_metadata(&name, "1.0.0", &tarball);
+            for metadata_path in [format!("/api/registry/{name}"), format!("/{name}")] {
+                Mock::given(method("GET"))
+                    .and(path(metadata_path))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(metadata.clone())
+                            .set_delay(std::time::Duration::from_millis(500)),
+                    )
+                    .with_priority(1)
+                    .mount(registry.server())
+                    .await;
+            }
+        }
         Mock::given(method("GET"))
             .and(path(MockRegistry::tarball_path(&name, "1.0.0")))
             .respond_with(
