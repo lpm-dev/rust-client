@@ -19,14 +19,7 @@ fn project() -> TempProject {
 }
 
 fn command(project: &TempProject, registry: &MockRegistry) -> assert_cmd::Command {
-    let mut command = lpm_with_registry(project, &registry.url());
-    command
-        .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
-        .env(
-            "NPM_CONFIG_GLOBALCONFIG",
-            project.home().join("global.npmrc"),
-        );
-    command
+    lpm_with_registry(project, &registry.url())
 }
 
 fn npmrc(project: &TempProject, text: &str) {
