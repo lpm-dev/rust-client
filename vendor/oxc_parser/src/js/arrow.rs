@@ -537,6 +537,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         &mut self,
         pattern: BindingPattern<'a>,
     ) -> Option<Expression<'a>> {
+        // This reads no token, so it checks the stack floor itself. Below it,
+        // the caller parses the source again as an expression, which checks
+        // the floor per token.
+        if self.below_stack_floor() {
+            return None;
+        }
         Some(match pattern {
             BindingPattern::BindingIdentifier(ident) => {
                 if ident.name == "await" && !self.ctx.has_await() {

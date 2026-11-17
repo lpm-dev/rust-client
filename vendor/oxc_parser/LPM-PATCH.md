@@ -23,10 +23,22 @@ registry's release scan.
   The default, `0`, never stops, so every other user of the parser behaves
   exactly as upstream.
 - Before reading each token, the parser compares the stack pointer with the
-  floor. Every level of nesting reads at least one token, so the parser can't
-  go deeper than the frames between two tokens past it. Below the floor it
-  records a fatal error, which moves the lexer to the end of the source, so
-  every caller unwinds without reading more.
+  floor. Every level of nesting in the source reads at least one token, so
+  the parser can't go deeper than the frames between two tokens past it.
+  Below the floor it records a fatal error, which moves the lexer to the end
+  of the source, so every caller unwinds without reading more.
+- Two recursions run over nodes already parsed and read no token, so they
+  check the floor once per level themselves:
+  - the cover grammar, which turns an expression into a destructuring
+    assignment target (`AssignmentTarget::cover` in `js/grammar.rs`), stops
+    with the same fatal error;
+  - turning parenthesized arrow parameters back into an expression when no
+    `=>` follows (`cover_binding_as_expression` in `js/arrow.rs`, new in
+    0.158) gives up instead, and the parser reads the source again as an
+    expression, which checks the floor per token.
+  Either can go deeper than the parse that built its nodes, because its
+  frames per level can be larger. In 0.158, parsing `x=([[…a…]]);` to just
+  above the floor and converting it overflowed a 2 MiB stack.
 - Once the floor is reached, every later token read records the fatal error
   again. A speculative parse, such as an arrow function's parameters, rewinds
   the fatal error away, and the parser then reads the other interpretation.
@@ -44,12 +56,19 @@ reads one that runs out of that too without parsing it.
 
 ## Upgrading oxc
 
-1. Copy the new `oxc_parser` release over this directory, keeping
-   `LICENSE`, this file and the patch.
+1. Copy the new `oxc_parser` release over this directory, without its
+   `.cargo_vcs_info.json` and `Cargo.lock`, keeping `LICENSE`, this file
+   and the patch.
 2. `patch -p1 < lpm-stack-floor.patch`, and resolve any rejects by hand.
 3. Regenerate the patch from a pristine copy of the release:
-   `diff -ruN <pristine> . -x LICENSE -x LPM-PATCH.md -x lpm-stack-floor.patch`.
-4. Bump the other `oxc_*` dependencies of `lpm-security` to the same release
+   `diff -ruN <pristine> . -x LICENSE -x LPM-PATCH.md -x lpm-stack-floor.patch
+   -x .cargo_vcs_info.json -x Cargo.lock`, with `a/` and `b/` file headers.
+4. Look for new recursion that reads no token, such as conversions between
+   AST shapes after a parse, and give it a floor check like the ones above.
+   `lpm-security`'s
+   `patterns_parsed_to_just_above_the_floor_turn_into_expressions_without_overflowing`
+   test parses each shape it lists to the deepest nesting that fits.
+5. Bump the other `oxc_*` dependencies of `lpm-security` to the same release
    and run `cargo test -p lpm-security`, whose deep-nesting tests cover the
    parser, the AST visitors and semantic analysis.
 

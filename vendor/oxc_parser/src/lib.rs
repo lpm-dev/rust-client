@@ -276,11 +276,12 @@ pub struct ParseOptions {
     /// Lowest address on the parsing thread's stack the parser may use.
     ///
     /// The parser recurses once per level of nesting. Before reading each
-    /// token it compares the stack pointer with this address, and below it
-    /// stops with a fatal error and [`ParserReturn::stack_exhausted`] set,
-    /// instead of overflowing the stack. Every level of nesting reads at
-    /// least one token, so the parser never goes deeper than the frames
-    /// between two tokens past this address: leave room for them below it.
+    /// token, and at each level of a recursion that reads none, it compares
+    /// the stack pointer with this address, and below it stops with a fatal
+    /// error and [`ParserReturn::stack_exhausted`] set, instead of
+    /// overflowing the stack. The parser never goes deeper than the frames
+    /// between two of those checks past this address: leave room for them
+    /// below it.
     ///
     /// Default: `0`, no limit
     pub stack_floor: usize,
