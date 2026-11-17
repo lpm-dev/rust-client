@@ -30,6 +30,7 @@ mod fallback;
 #[cfg(all(test, not(miri)))]
 mod freed_memory_probe;
 pub mod history;
+mod links;
 mod selected_environment;
 pub mod signature;
 pub mod sync;
@@ -122,17 +123,18 @@ pub mod acceptance {
 }
 
 /// Whether `message` is an env project's refusal of an operation, by a
-/// feature this client doesn't support or by damage, rather than a storage
-/// failure. Refusals say what the person can do.
+/// feature this client doesn't support, by damage, or because the folder
+/// isn't linked to it, rather than a storage failure. Refusals say what the
+/// person can do.
 pub fn is_env_project_refusal(message: &str) -> bool {
-    companion::gate::GateError::describes(message)
+    companion::gate::GateError::describes(message) || links::is_refusal(message)
 }
 
 /// What's damaged in the newer data of the env project at `project_dir`,
 /// after any interrupted step was finished, or `None` when the directory has
 /// no env project.
 pub fn review_companion_data(project_dir: &Path) -> Result<Option<CompanionReview>, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Ok(None);
     };
     #[cfg(target_os = "macos")]
@@ -152,7 +154,7 @@ pub fn repair_companion_data(
     project_dir: &Path,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Err("this directory has no env project".to_owned());
     };
     #[cfg(target_os = "macos")]
@@ -174,7 +176,7 @@ pub fn plant_debug_companion_state(
     project_dir: &Path,
     state: &DebugCompanionState,
 ) -> Result<String, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Err("this directory has no env project".to_owned());
     };
     #[cfg(target_os = "macos")]
@@ -236,6 +238,81 @@ fn with_project_vault_transaction<T>(
     })
 }
 
+pub use links::{FolderLink, UnlinkedFolder};
+
+/// The vault ID `project_dir`'s lpm.json names, when this machine lets the
+/// folder use that vault. See [`links`].
+fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(None);
+    };
+    storage_transaction::with_vault_transaction(|directory| {
+        links::require(directory, project_dir, &vault_id)
+    })?;
+    Ok(Some(vault_id))
+}
+
+/// The vault ID `project_dir` stores values under, created when lpm.json
+/// names none, when this machine lets the folder store values in it.
+fn linked_vault_id_for_write(project_dir: &Path) -> Result<String, String> {
+    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    storage_transaction::with_vault_transaction(|directory| {
+        links::require_for_write(directory, project_dir, &vault_id)
+    })?;
+    Ok(vault_id)
+}
+
+/// Whether `project_dir` may use the vault its lpm.json names; `None` when
+/// it names none.
+pub fn folder_link(project_dir: &Path) -> Result<Option<FolderLink>, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(None);
+    };
+    storage_transaction::with_vault_transaction(|directory| {
+        links::check(directory, project_dir, &vault_id)
+    })
+    .map(Some)
+}
+
+/// [`folder_link`] for the vault `vault_id`, which the caller read from the
+/// folder's lpm.json.
+pub fn folder_link_for_vault_id(project_dir: &Path, vault_id: &str) -> Result<FolderLink, String> {
+    validate_explicit_vault_id(vault_id)?;
+    storage_transaction::with_vault_transaction(|directory| {
+        links::check(directory, project_dir, vault_id)
+    })
+}
+
+/// Links `project_dir` to the vault `vault_id`.
+pub fn link_folder_to_vault_id(project_dir: &Path, vault_id: &str) -> Result<(), String> {
+    validate_explicit_vault_id(vault_id)?;
+    storage_transaction::with_vault_transaction(|directory| {
+        links::add(directory, project_dir, vault_id)
+    })
+}
+
+/// Unlinks `folder` from the vault `project_dir`'s lpm.json names, and
+/// returns that vault's ID and whether the folder was linked; `None` when it
+/// names none.
+pub fn unlink_folder(project_dir: &Path, folder: &Path) -> Result<Option<(String, bool)>, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(None);
+    };
+    let removed = storage_transaction::with_vault_transaction(|directory| {
+        links::remove(directory, folder, &vault_id)
+    })?;
+    Ok(Some((vault_id, removed)))
+}
+
+/// The vault `project_dir`'s lpm.json names and the folders linked to it.
+pub fn linked_folders(project_dir: &Path) -> Result<Option<(String, Vec<PathBuf>)>, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(None);
+    };
+    storage_transaction::with_vault_transaction(|directory| links::folders(directory, &vault_id))
+        .map(|folders| Some((vault_id, folders)))
+}
+
 /// Appends a line to `LPM_TEST_VAULT_TRANSACTION_LOG` for each vault
 /// transaction, so workflow tests can count how often a command reads it.
 #[cfg(debug_assertions)]
@@ -263,7 +340,7 @@ pub enum VaultStorageBackend {
     Unavailable { message: String },
 }
 
-fn force_file_vault_backend() -> bool {
+pub(crate) fn force_file_vault_backend() -> bool {
     if !cfg!(debug_assertions) && !acceptance_file_storage_enabled() {
         return false;
     }
@@ -357,7 +434,7 @@ pub fn try_get_all(project_dir: &Path) -> Result<HashMap<String, String>, String
 pub fn try_get_all_environments(
     project_dir: &Path,
 ) -> Result<HashMap<String, HashMap<String, String>>, String> {
-    let vault_id = match vault_id::read_vault_id(project_dir) {
+    let vault_id = match linked_vault_id(project_dir)? {
         Some(id) => id,
         None => return Ok(HashMap::new()),
     };
@@ -382,7 +459,7 @@ pub fn try_get_run_environment(
     project_dir: &Path,
     env: Option<&str>,
 ) -> Result<RunEnvironment, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Ok(RunEnvironment::default());
     };
     try_get_run_environment_for_vault_id(&vault_id, env)
@@ -439,7 +516,7 @@ impl AllRunEnvironments {
 
 /// [`AllRunEnvironments`] for the project's vault; empty when it has none.
 pub fn try_get_all_run_environments(project_dir: &Path) -> Result<AllRunEnvironments, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Ok(AllRunEnvironments::default());
     };
     let (values, overrides) = try_get_all_run_environments_for_vault_id(&vault_id)?;
@@ -522,7 +599,7 @@ fn read_run_environment_unlocked(
 
 /// Get all vault secrets for a specific environment.
 pub fn try_get_all_env(project_dir: &Path, env: &str) -> Result<HashMap<String, String>, String> {
-    let vault_id = match vault_id::read_vault_id(project_dir) {
+    let vault_id = match linked_vault_id(project_dir)? {
         Some(id) => id,
         None => return Ok(HashMap::new()),
     };
@@ -535,7 +612,7 @@ pub fn try_get_all_env_with_default_fallback(
     project_dir: &Path,
     env: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let vault_id = match vault_id::read_vault_id(project_dir) {
+    let vault_id = match linked_vault_id(project_dir)? {
         Some(id) => id,
         None => return Ok(HashMap::new()),
     };
@@ -569,7 +646,7 @@ pub fn set(
 ) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
 
-    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let vault_id = linked_vault_id_for_write(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -600,7 +677,7 @@ pub fn set_env(
 ) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
 
-    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let vault_id = linked_vault_id_for_write(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -804,6 +881,9 @@ fn load_environment_initialization_vault<'a>(
 ) -> Result<&'a mut EnvironmentInitializationVault, String> {
     if state.is_none() {
         let vault_id = vault_id::read_vault_id(project_dir);
+        if let Some(vault_id) = vault_id.as_deref() {
+            links::require(directory, project_dir, vault_id)?;
+        }
         let project_name = vault_id::read_project_name(project_dir);
         let project_path = project_dir
             .canonicalize()
@@ -916,6 +996,9 @@ fn initialize_environments_from_files_inner(
 
     with_project_vault_transaction(|directory| {
         let current_vault_id = vault_id::read_vault_id(project_dir);
+        if let Some(vault_id) = current_vault_id.as_deref() {
+            links::require(directory, project_dir, vault_id)?;
+        }
         let mut state = match snapshot {
             Some(snapshot) if snapshot.vault_id == current_vault_id => {
                 let current_digest = match current_vault_id.as_deref() {
@@ -987,7 +1070,11 @@ fn initialize_environments_from_files_inner(
         if let Some(vault) = state.filter(|vault| vault.changed) {
             let vault_id = match vault.vault_id {
                 Some(vault_id) => vault_id,
-                None => vault_id::get_or_create_vault_id(project_dir)?,
+                None => {
+                    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+                    links::require_for_write(directory, project_dir, &vault_id)?;
+                    vault_id
+                }
             };
             let recording = history::scope::begin(&vault_id, source);
             write_all_environments_unlocked(
@@ -1017,7 +1104,7 @@ pub fn copy_environment(
     if source == target {
         return Err("source and target environments are the same".to_owned());
     }
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Ok(None);
     };
     validate_explicit_vault_id(&vault_id)?;
@@ -1077,7 +1164,7 @@ pub fn replace_all_environments(
             .flat_map(|m| m.keys().map(String::as_str)),
     )?;
 
-    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let vault_id = linked_vault_id_for_write(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -1255,6 +1342,7 @@ fn commit_remote_environments_inner(
         },
     );
     with_project_vault_transaction(|directory| {
+        links::require_for_write(directory, project_dir, expected_vault_id)?;
         let recording = history::scope::begin(expected_vault_id, &source);
         let mut latest =
             Some(read_all_environments_unlocked(directory, expected_vault_id)?.unwrap_or_default());
@@ -1446,7 +1534,7 @@ pub fn delete_env(
     keys: &[&str],
     source: &history::Source,
 ) -> Result<Vec<String>, String> {
-    let vault_id = match vault_id::read_vault_id(project_dir) {
+    let vault_id = match linked_vault_id(project_dir)? {
         Some(id) => id,
         None => return Err("no vault configured for this project".to_string()),
     };
@@ -1493,7 +1581,7 @@ pub fn import_env_file(
         return Ok(EnvFileImport::default());
     }
 
-    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let vault_id = linked_vault_id_for_write(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -1531,7 +1619,7 @@ pub fn import_env_file_to_env(
         return Ok(EnvFileImport::default());
     }
 
-    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
+    let vault_id = linked_vault_id_for_write(project_dir)?;
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()

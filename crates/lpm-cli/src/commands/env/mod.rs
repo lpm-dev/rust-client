@@ -10,6 +10,7 @@ mod generate;
 mod github;
 mod history;
 mod inventory;
+pub(crate) mod links;
 mod local;
 mod oidc;
 mod pairing;
@@ -79,10 +80,14 @@ async fn run_action(
 ) -> Result<(), LpmError> {
     let args: Vec<&str> = extra.iter().map(String::as_str).collect();
     if args.is_empty() {
+        links::ensure_folder_linked(project_dir, json_output)?;
         return local::env_list(None, false, project_dir, json_output);
     }
     if let Some(action) = arguments::parse(&args, json_output)? {
         use arguments::LocalAction;
+        if action.uses_project_values() {
+            links::ensure_folder_linked(project_dir, json_output)?;
+        }
         let result = match action {
             LocalAction::Set {
                 environment,
@@ -240,6 +245,11 @@ async fn run_action(
                 json_output,
             ),
             LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
+            LocalAction::Link { yes } => links::env_link(project_dir, yes, json_output),
+            LocalAction::Unlink { folder } => {
+                links::env_unlink(project_dir, folder.as_deref(), json_output)
+            }
+            LocalAction::Links => links::env_links(project_dir, json_output),
             LocalAction::Log => remote::env_log(client, project_dir, json_output).await,
             LocalAction::Unpair => pairing::env_unpair(client, json_output).await,
             LocalAction::Diff { environments } => {
@@ -255,6 +265,9 @@ async fn run_action(
         return reported(result);
     }
 
+    if matches!(args[0], "connect" | "status") {
+        links::ensure_folder_linked(project_dir, json_output)?;
+    }
     let result = match args[0] {
         "push" => push::vars_push(client, &args, project_dir, json_output).await,
         "pull" => pull::vars_pull(client, &args, project_dir, json_output).await,
@@ -274,7 +287,7 @@ async fn run_action(
         }
         "pair" => pairing::env_pair(client, &args[1..], json_output).await,
         unknown => Err(LpmError::Env(format!(
-            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, repair"
+            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, repair, link, unlink, links"
         ))),
     };
     reported(result)

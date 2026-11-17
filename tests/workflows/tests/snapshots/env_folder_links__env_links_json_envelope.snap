@@ -1,0 +1,13 @@
+---
+source: tests/workflows/tests/env_folder_links.rs
+expression: "redacted(&project, &links)"
+---
+{
+  "success": true,
+  "vault_id": "[VAULT_ID]",
+  "folders": [
+    "[PROJECT]",
+    "[CHECKOUT]"
+  ],
+  "this_folder_linked": true
+}

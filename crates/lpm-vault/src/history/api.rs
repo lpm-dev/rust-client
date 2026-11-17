@@ -361,7 +361,9 @@ fn marker_history(
 }
 
 fn project_vault_id(project_dir: &Path) -> Result<String, HistoryError> {
-    crate::vault_id::read_vault_id(project_dir).ok_or(HistoryError::NoProject)
+    crate::linked_vault_id(project_dir)
+        .map_err(HistoryError::Storage)?
+        .ok_or(HistoryError::NoProject)
 }
 
 /// The timeline of the env project at `project_dir`, with the values of the

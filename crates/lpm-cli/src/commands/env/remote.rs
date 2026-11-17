@@ -9,6 +9,7 @@ pub(super) async fn env_log(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let vault_id = manifest
         .vault
         .vault_id()
@@ -137,6 +138,7 @@ pub(super) async fn env_share(
     let recreate_missing = args.contains(&"--force");
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let schema_value = std::sync::Arc::new(super::sync_payload::checked_push_schema_value(
         manifest.config.as_ref(),
     )?);
@@ -513,6 +515,7 @@ pub(super) async fn vars_diff(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let vault_id = manifest
         .vault
         .vault_id()

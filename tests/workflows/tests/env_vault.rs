@@ -597,7 +597,11 @@ fn doctor_check<'a>(json: &'a serde_json::Value, code: &str) -> &'a serde_json::
         .unwrap_or_else(|| panic!("doctor output must include `{code}`: {json}"))
 }
 
-fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serde_json::Value) {
+/// Writes the project's file-backed vault as LPM would have, linked to the
+/// project's folder.
+fn write_file_backed_vault(project: &TempProject, vault_id: &str, payload: serde_json::Value) {
+    let home = project.home();
+    support::link_vault_folder(home, vault_id, project.path());
     let lpm_dir = home.join(".lpm");
     let vaults_dir = lpm_dir.join("vaults");
     std::fs::create_dir_all(&vaults_dir).expect("failed to create test vault directory");
@@ -1700,7 +1704,7 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
         .to_string(),
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({
             "environments": {
@@ -1842,7 +1846,7 @@ async fn env_pull_joined_org_selector_never_falls_back_to_personal_scope() {
         &serde_json::json!({ "vault": vault_id }).to_string(),
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({
             "environments": {
@@ -1921,7 +1925,7 @@ async fn env_pull_rejects_a_different_bound_account_before_local_overwrite() {
         .to_string(),
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({
             "environments": {
@@ -1991,7 +1995,7 @@ async fn env_pull_rejects_semantically_invalid_lpm_json_before_network_or_local_
         }],
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         "vault-invalid-pull",
         serde_json::json!({
             "environments": {
@@ -4043,7 +4047,7 @@ async fn env_push_uses_bound_checkpoint_without_a_version_preflight() {
         .to_string(),
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({"environments": {"default": {"API_KEY": "secret"}}}),
     );
@@ -4173,7 +4177,7 @@ async fn env_force_push_recreates_a_deleted_bound_vault_above_its_checkpoint() {
         .to_string(),
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({"environments": {"default": {"API_KEY": "secret"}}}),
     );
@@ -6308,7 +6312,7 @@ async fn env_share_rejects_semantically_invalid_lpm_json_before_registering_a_sh
         r#"{"vault":"vault-invalid-share","env":{"prod":123}}"#,
     );
     write_file_backed_vault(
-        project.home(),
+        &project,
         "vault-invalid-share",
         serde_json::json!({
             "environments": {
@@ -6729,7 +6733,7 @@ fn prepare_org_share_project(
 ) -> ([u8; 32], String, String) {
     project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
     write_file_backed_vault(
-        project.home(),
+        project,
         vault_id,
         serde_json::json!({
             "environments": {
@@ -9230,7 +9234,7 @@ async fn assert_personal_push_environments(all_empty: bool) {
         "vaultSync": {"authorityCheckpoints":{"personal":{(origin.clone()):{"account-1":{"version":7,"syncedAt":"2026-09-05T00:00:00Z"}}}}},
     }).to_string());
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({"environments":environments}),
     );
@@ -9369,7 +9373,7 @@ async fn assert_org_share_environments(all_empty: bool) {
         "staging": {},
     });
     write_file_backed_vault(
-        project.home(),
+        &project,
         vault_id,
         serde_json::json!({"environments":environments}),
     );

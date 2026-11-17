@@ -2191,6 +2191,9 @@ async fn async_main(cli: Cli) -> Result<()> {
             } else {
                 project_root_for(&invocation_dir, cli.json)
             };
+            if !workspace_mode {
+                commands::env::links::ensure_folder_linked(&cwd, cli.json)?;
+            }
             if workspace_concurrency.is_some() && !workspace_mode {
                 return Err(lpm_common::LpmError::Script(
                     "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected"
@@ -2264,6 +2267,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 args,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::env::links::ensure_folder_linked(&cwd, cli.json)?;
             commands::run::exec(&cwd, &command, &args, env.as_deref(), no_env_check).await
         }
         Commands::RunFile(args) => {
@@ -2988,6 +2992,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
                 cli.json,
             )?;
+            commands::env::links::ensure_folder_linked(&cwd, cli.json)?;
             let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd)
                 .map_err(lpm_common::LpmError::Script)?;
             let runtime_spec = |runtime| {

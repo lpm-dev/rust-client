@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/env_folder_links.rs
+expression: "redacted(&project, &unlink)"
+---
+{
+  "success": true,
+  "vault_id": "[VAULT_ID]",
+  "folder": "[CHECKOUT]",
+  "unlinked": true
+}

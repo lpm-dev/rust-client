@@ -82,6 +82,7 @@ pub(super) async fn vars_pull(
     };
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     // A pull reads the cloud copy of the vault `lpm.json` names. Without one
     // there is nothing to read, and a new random ID written here would be
     // left in `lpm.json` by a pull that fails.

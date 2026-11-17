@@ -206,6 +206,20 @@ pub(super) enum LocalAction {
     Ls,
     Log,
     Unpair,
+    /// Let this folder use the env project its lpm.json names, on this
+    /// machine.
+    Link {
+        /// Link without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Stop a folder from using this env project on this machine.
+    Unlink {
+        /// The folder to unlink; this one when omitted.
+        folder: Option<std::path::PathBuf>,
+    },
+    /// Show the folders linked to this env project on this machine.
+    Links,
     Diff {
         #[arg(num_args = 0..=2)]
         environments: Vec<String>,
@@ -269,6 +283,43 @@ pub(super) enum HistoryAction {
     },
 }
 
+impl LocalAction {
+    /// Whether the action reads or writes the values of the env project
+    /// the folder names, which needs the folder to be linked to it. Actions
+    /// that read lpm.json once into a snapshot (`init`, `ls`, `log`, `diff`)
+    /// check the snapshot's env project themselves.
+    pub(super) fn uses_project_values(&self) -> bool {
+        match self {
+            Self::Set { .. }
+            | Self::Get { .. }
+            | Self::List { .. }
+            | Self::Delete { .. }
+            | Self::Import { .. }
+            | Self::Export { .. }
+            | Self::Print { .. }
+            | Self::Check { .. }
+            | Self::Validate { .. }
+            | Self::Repair { .. }
+            | Self::History { .. }
+            | Self::Rollback { .. }
+            | Self::Copy { .. } => true,
+            #[cfg(debug_assertions)]
+            Self::DebugCompanion { .. } => true,
+            Self::Example { .. }
+            | Self::Init { .. }
+            | Self::Ls
+            | Self::Log
+            | Self::Diff { .. }
+            | Self::Schema
+            | Self::Generate { .. }
+            | Self::Unpair
+            | Self::Link { .. }
+            | Self::Unlink { .. }
+            | Self::Links => false,
+        }
+    }
+}
+
 fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> {
     lpm_vault::history::SourceGroup::from_name(value).ok_or_else(|| {
         "source must be app, cli, import, restore, pull, rollback, or outside".into()
@@ -303,6 +354,9 @@ pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalActi
                     | "rollback"
                     | "unpair"
                     | "diff"
+                    | "link"
+                    | "unlink"
+                    | "links"
             )
         )
     {
