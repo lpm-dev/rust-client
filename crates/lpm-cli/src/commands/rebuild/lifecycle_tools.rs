@@ -4,7 +4,15 @@ use lpm_security::static_gate::{GREEN_TOOLS, GreenTool, green_tool, green_tools_
 use lpm_store::v2::LinkMeta;
 use lpm_store::v2::link_meta::LinkMetaDep;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+use super::bundled_node_gyp::BundledNodeGyp;
+
+const NODE_GYP: &str = "node-gyp";
+
+/// What a failed build is told when [`LifecycleTools::lacks_node_gyp`].
+pub(super) const NODE_GYP_MISSING: &str = "this build needs node-gyp and none was found: add node-gyp to the project's devDependencies, or put a Node on PATH that has npm installed beside it (a version manager's shim has none)";
 
 /// The registry packages of an install, as its lockfile pins them. A
 /// dependency reached through a tarball URL, a git repository or a directory
@@ -123,6 +131,21 @@ pub(super) struct LifecycleTools {
     /// `node_modules/.bin` and the caller's own entries follow `bin_dir`.
     /// Otherwise only the caller's entries outside any package follow it.
     pub(super) project_bins: bool,
+    /// npm's own `node-gyp`, when the script may need one and no installed
+    /// package supplies it.
+    pub(super) node_gyp: Option<OfferedNodeGyp>,
+}
+
+/// npm's own `node-gyp` as a script gets it: a command in a directory of
+/// its own, which goes on `PATH` after every command a package supplies.
+pub(super) struct OfferedNodeGyp {
+    pub(super) command_dir: PathBuf,
+    /// What npm names to scripts as `npm_config_node_gyp`.
+    pub(super) script: PathBuf,
+    /// npm's modules, which hold the command's code and what it requires.
+    pub(super) modules: PathBuf,
+    /// What a sandboxed script must read to run the command.
+    pub(super) read_dirs: Vec<PathBuf>,
 }
 
 struct Provider {
@@ -138,6 +161,7 @@ impl LifecycleTools {
         links_root: &Path,
         scratch: &Path,
         scope: ToolScope<'_>,
+        host_tools: Option<&OsStr>,
     ) -> Result<Self, String> {
         let bin_dir = scratch
             .canonicalize()
@@ -150,8 +174,19 @@ impl LifecycleTools {
             graph_identities: Vec::new(),
             has_nested_dependency: false,
             project_bins: matches!(scope, ToolScope::Dependencies),
+            node_gyp: None,
+        };
+        // An approved script may start `node-gyp` from anywhere in what it
+        // runs. A script that runs on its green tier starts only the tools
+        // its commands name.
+        let may_need_node_gyp = match &scope {
+            ToolScope::Dependencies => true,
+            ToolScope::GreenTools { scripts, .. } => tools_a_run_needs(scripts)
+                .iter()
+                .any(|tool| tool.command == NODE_GYP),
         };
         let Some(graph_digest) = graph_digest else {
+            tools.offer_node_gyp(may_need_node_gyp, host_tools)?;
             return Ok(tools);
         };
         let root = links_root.canonicalize().map_err(|e| e.to_string())?;
@@ -262,7 +297,79 @@ impl LifecycleTools {
         tools.read_dirs.push(tools.bin_dir.clone());
         tools.read_dirs.sort_unstable();
         tools.graph_identities.sort_unstable();
+        tools.offer_node_gyp(may_need_node_gyp, host_tools)?;
         Ok(tools)
+    }
+
+    /// Offers the `node-gyp` of the npm beside the host's `node`, as npm
+    /// does for the scripts it runs, unless a dependency supplies one.
+    /// `host_tools` is the caller's `PATH` without the entries that hold a
+    /// package's commands.
+    fn offer_node_gyp(&mut self, may_need: bool, host_tools: Option<&OsStr>) -> Result<(), String> {
+        if !may_need || self.bins.iter().any(|bin| bin.name == NODE_GYP) {
+            return Ok(());
+        }
+        let Some(bundled) = host_tools.and_then(BundledNodeGyp::beside_node_on) else {
+            return Ok(());
+        };
+        let command_dir = self.bin_dir.with_file_name("node-gyp-bin");
+        self.bins.push(
+            bundled
+                .write_command(&command_dir)
+                .map_err(|error| format!("cannot offer npm's node-gyp: {error}"))?,
+        );
+        let mut read_dirs = vec![command_dir.clone()];
+        // On Windows npm sits inside the directory that holds `node.exe`,
+        // which a sandboxed script reads as a tool directory already.
+        if !cfg!(windows) {
+            read_dirs.push(bundled.modules.clone());
+        }
+        self.node_gyp = Some(OfferedNodeGyp {
+            command_dir,
+            script: bundled.script,
+            modules: bundled.modules,
+            read_dirs,
+        });
+        Ok(())
+    }
+
+    /// Whether `scripts` lead to `node-gyp` and nothing supplies it: no
+    /// dependency, no npm beside `node`, and no command where the script
+    /// looks, which for a script with npm's `PATH` includes the project's
+    /// own commands.
+    pub(super) fn lacks_node_gyp(
+        &self,
+        scripts: &HashMap<String, String>,
+        project_dir: &Path,
+        host_path: Option<&OsStr>,
+    ) -> bool {
+        let commands: &[&str] = if cfg!(windows) {
+            &["node-gyp.cmd", "node-gyp.exe", "node-gyp.bat"]
+        } else {
+            &[NODE_GYP]
+        };
+        let project_bin = self
+            .project_bins
+            .then(|| project_dir.join("node_modules").join(".bin"));
+        let mut searched = project_bin
+            .into_iter()
+            .chain(host_path.into_iter().flat_map(std::env::split_paths));
+        tools_a_run_needs(scripts)
+            .iter()
+            .any(|tool| tool.command == NODE_GYP)
+            && !self.bins.iter().any(|bin| bin.name == NODE_GYP)
+            && !searched.any(|directory| {
+                commands
+                    .iter()
+                    .any(|command| directory.join(command).is_file())
+            })
+    }
+
+    /// Every directory a sandboxed script reads to run the commands it is
+    /// given.
+    pub(super) fn sandbox_read_dirs(&self) -> Vec<PathBuf> {
+        let offered = self.node_gyp.iter().flat_map(|offered| &offered.read_dirs);
+        self.read_dirs.iter().chain(offered).cloned().collect()
     }
 
     fn record_dependency(&mut self, directory: &Path, metadata: &LinkMeta) {

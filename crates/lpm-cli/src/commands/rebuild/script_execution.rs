@@ -43,6 +43,8 @@ pub(super) fn execute_script(
         tmpdir,
         Some(&tools.bin_dir),
         tools.project_bins,
+        tools.node_gyp.as_ref(),
+        sandboxed_headers_dir(sandbox_mode, sandbox_options, home_dir).as_deref(),
     )
     .into_iter()
     .collect();
@@ -72,7 +74,7 @@ pub(super) fn execute_script(
         sandbox_options,
         extra_write_dirs,
         extra_secret_read_allow,
-        &tools.read_dirs,
+        &tools.sandbox_read_dirs(),
         store_root,
         home_dir,
         tmpdir,
@@ -118,6 +120,31 @@ const NESTED_INSTALL_SCRIPT_GUARD: [(&str, &str); 3] = [
     ("YARN_ENABLE_SCRIPTS", "false"),
 ];
 
+/// Where node-pre-gyp and other build tools look for `node-gyp` before
+/// they search `PATH`, as npm sets it.
+pub(super) const NPM_CONFIG_NODE_GYP: &str = "npm_config_node_gyp";
+
+/// The settings node-gyp reads its headers folder from, the one LPM sets
+/// first. A caller that set either keeps its choice.
+const NODE_GYP_HEADERS_DIR: [&str; 2] = ["npm_config_devdir", "npm_package_config_node_gyp_devdir"];
+
+/// Where a script that runs in the sandbox is told to keep the Node
+/// headers node-gyp downloads. node-gyp's own choice on macOS and Windows
+/// is a per-user cache folder the sandbox doesn't let a script write;
+/// `~/.node-gyp` is one it does. A script without the network downloads
+/// nothing and one outside the sandbox can write node-gyp's folder, so
+/// both keep it, with the headers it may already hold.
+pub(super) fn sandboxed_headers_dir(
+    sandbox_mode: SandboxMode,
+    sandbox_options: &lpm_sandbox::SandboxOptions,
+    home_dir: &Path,
+) -> Option<PathBuf> {
+    (matches!(sandbox_mode, SandboxMode::Enforce)
+        && !sandbox_options.deny_outbound_network
+        && cfg!(any(target_os = "macos", windows)))
+    .then(|| home_dir.join(".node-gyp"))
+}
+
 /// Makes cmd.exe leave the current directory, which is the package's, out of
 /// its search for commands named without a path.
 const NO_CURRENT_DIRECTORY_SEARCH: (&str, &str) = ("NoDefaultCurrentDirectoryInExePath", "1");
@@ -127,34 +154,51 @@ const NO_CURRENT_DIRECTORY_SEARCH: (&str, &str) = ("NoDefaultCurrentDirectoryInE
 /// supplies commands through `bin_dir` alone: the caller's entries that could
 /// hold a package's commands are dropped, and cmd.exe doesn't search the
 /// package's directory.
+///
+/// npm's own `node-gyp`, when offered, follows every command a package
+/// supplies and precedes the caller's entries, as npm orders it.
 pub(super) fn build_lifecycle_environment(
     env: &super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
     tmpdir: &Path,
     bin_dir: Option<&Path>,
     project_bins: bool,
+    node_gyp: Option<&super::lifecycle_tools::OfferedNodeGyp>,
+    headers_dir: Option<&Path>,
 ) -> Vec<(OsString, OsString)> {
-    let parent_path = find_env_case_insensitive(env, "PATH");
-    let mut path_value = if project_bins {
-        build_lifecycle_path(project_dir, parent_path)
-    } else {
-        host_path(inherited_path(parent_path), project_dir)
+    let parent_path = inherited_path(find_env_case_insensitive(env, "PATH"));
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let mut path_value = OsString::new();
+    let mut push_entry = |entry: &OsStr| {
+        if !path_value.is_empty() {
+            path_value.push(separator);
+        }
+        path_value.push(entry);
     };
+    // cmd.exe hands a command found through a `\\?\` entry that prefix as
+    // its own folder (`%~dp0`), and Node can't start the script a command
+    // shim then names with it.
     if let Some(bin_dir) = bin_dir {
-        // cmd.exe hands a command found through a `\\?\` entry that prefix as
-        // its own folder (`%~dp0`), and Node can't start the script a command
-        // shim then names with it.
-        let mut prefixed = lpm_common::symlink::windows_plain_path(bin_dir).into_os_string();
-        prefixed.push(if cfg!(windows) { ";" } else { ":" });
-        prefixed.push(&path_value);
-        path_value = prefixed;
+        push_entry(lpm_common::symlink::windows_plain_path(bin_dir).as_os_str());
+    }
+    if project_bins {
+        push_entry(project_bin_dir(project_dir).as_os_str());
+    }
+    if let Some(node_gyp) = node_gyp {
+        push_entry(lpm_common::symlink::windows_plain_path(&node_gyp.command_dir).as_os_str());
+    }
+    if project_bins {
+        push_entry(parent_path);
+    } else {
+        push_entry(&host_path(parent_path, project_dir));
     }
     let mut envs: Vec<(OsString, OsString)> =
-        Vec::with_capacity(env.len() + 5 + NESTED_INSTALL_SCRIPT_GUARD.len());
+        Vec::with_capacity(env.len() + 6 + NESTED_INSTALL_SCRIPT_GUARD.len());
     envs.extend(
         env.iter()
             .filter(|(k, _)| {
                 !k.eq_ignore_ascii_case("PATH")
+                    && (node_gyp.is_none() || !k.eq_ignore_ascii_case(NPM_CONFIG_NODE_GYP))
                     && !k.eq_ignore_ascii_case("INIT_CWD")
                     && !k.eq_ignore_ascii_case("TMPDIR")
                     && !k.eq_ignore_ascii_case("TMP")
@@ -168,6 +212,21 @@ pub(super) fn build_lifecycle_environment(
     );
     envs.push(("INIT_CWD".into(), project_dir.as_os_str().to_owned()));
     envs.push(("PATH".into(), path_value));
+    if let Some(node_gyp) = node_gyp {
+        envs.push((
+            NPM_CONFIG_NODE_GYP.into(),
+            node_gyp.script.as_os_str().to_owned(),
+        ));
+    }
+    let caller_chose = NODE_GYP_HEADERS_DIR
+        .iter()
+        .any(|name| find_env_case_insensitive(env, name).is_some());
+    if !caller_chose && let Some(headers_dir) = headers_dir {
+        envs.push((
+            NODE_GYP_HEADERS_DIR[0].into(),
+            headers_dir.as_os_str().to_owned(),
+        ));
+    }
     let tmp = tmpdir.as_os_str();
     envs.push(("TMPDIR".into(), tmp.to_owned()));
     envs.push(("TMP".into(), tmp.to_owned()));
@@ -196,7 +255,7 @@ pub(super) fn build_lifecycle_environment(
 ///
 /// When no entry is left the system directories stand in, because the
 /// shell reads an empty `PATH` component as the current directory.
-fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
+pub(super) fn host_path(path: &OsStr, project_dir: &Path) -> OsString {
     let lpm_state = project_dir.join(".lpm");
     let resolved_lpm_state = lpm_state.canonicalize().ok();
     let host = std::env::split_paths(path).filter(|entry| {
@@ -771,7 +830,7 @@ time.sleep(4)
 /// `"PATH"`. Without this helper, lifecycle scripts on Windows ran
 /// with the System32-only fallback PATH because the parent PATH
 /// pass-through was silently missed.
-fn find_env_case_insensitive<'a>(
+pub(super) fn find_env_case_insensitive<'a>(
     env: &'a super::sandbox_env::ChildEnvironment,
     target: &str,
 ) -> Option<&'a OsStr> {
@@ -780,47 +839,27 @@ fn find_env_case_insensitive<'a>(
         .map(|(_, v)| v.as_os_str())
 }
 
-/// Compose the `PATH` env var passed to a lifecycle script. Prepends
-/// the project's `node_modules/.bin` so locally-installed binaries
-/// shadow system ones (matches npm/yarn/pnpm), then appends either
-/// the inherited PATH if the caller provided one or a minimal
-/// platform-appropriate fallback.
-///
-/// Platform-aware on both axes:
-/// - **Separator**: `:` on POSIX, `;` on Windows.
-/// - **`.bin` shape**: `node_modules/.bin` resolves identically on
-///   both platforms (Windows accepts forward slashes), but we render
-///   via `Path::join` + `Path::display` so the produced string uses
-///   the host's native separator.
-/// - **Fallback**: `/usr/bin:/bin` on POSIX is the long-standing
-///   minimum. Windows gets `C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem`
-///   — System32 for `cmd.exe` / `where.exe` / OS DLLs, the bare
-///   Windows dir for the small set of binaries that live one level
-///   up, and `Wbem` for `wmic` (rarely used but harmless to keep).
-///   Lifecycle scripts that need PowerShell or Git Bash should
-///   declare them via the existing PATH passthrough, not rely on
-///   this fallback.
-///
-/// Pre-this was inlined with hardcoded POSIX separators
-/// and fallback. The Windows sandbox spawn would then succeed but
-/// produce a malformed PATH (`node_modules\.bin:<parent-path>`),
-/// rendering local shims invisible to scripts even though the
-/// sandbox itself was working correctly.
+/// The `PATH` a script of the project itself runs with: the project's
+/// `node_modules/.bin`, then the caller's entries, or the system
+/// directories when the caller has none.
 pub(in crate::commands) fn build_lifecycle_path(
     project_dir: &Path,
     parent_path: Option<&OsStr>,
 ) -> OsString {
-    let mut path = lpm_common::symlink::windows_plain_path(project_dir)
-        .join("node_modules")
-        .join(".bin")
-        .into_os_string();
+    let mut path = project_bin_dir(project_dir).into_os_string();
     path.push(if cfg!(windows) { ";" } else { ":" });
     path.push(inherited_path(parent_path));
     path
 }
 
+fn project_bin_dir(project_dir: &Path) -> PathBuf {
+    lpm_common::symlink::windows_plain_path(project_dir)
+        .join("node_modules")
+        .join(".bin")
+}
+
 /// The caller's `PATH`, or the system directories when it has none.
-fn inherited_path(parent_path: Option<&OsStr>) -> &OsStr {
+pub(super) fn inherited_path(parent_path: Option<&OsStr>) -> &OsStr {
     #[cfg(windows)]
     let fallback = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
     #[cfg(not(windows))]
@@ -879,6 +918,7 @@ mod cancellation_tests {
                 root.path(),
                 root.path(),
                 super::super::lifecycle_tools::ToolScope::Dependencies,
+                None,
             )
             .unwrap(),
             "cancel-probe",

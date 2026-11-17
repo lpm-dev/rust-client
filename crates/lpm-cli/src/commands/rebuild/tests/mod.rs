@@ -596,6 +596,8 @@ fn lifecycle_environment_disables_nested_install_scripts_over_inherited_values()
         Path::new("/tmp"),
         None,
         true,
+        None,
+        None,
     );
     let policy: Vec<(String, String)> = envs
         .iter()
@@ -3712,6 +3714,8 @@ fn cmd_exe_finds_a_lifecycle_tool_through_a_path_entry_node_can_run() {
             scratch.path(),
             Some(&bin_dir),
             project_bins,
+            None,
+            None,
         );
         let path = envs
             .iter()
@@ -3995,6 +3999,8 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         machine.path(),
         Some(&scratch_bin),
         false,
+        None,
+        None,
     );
     assert_eq!(
         path_of(&green),
@@ -4013,6 +4019,8 @@ fn a_green_run_keeps_only_the_machines_entries_of_an_inherited_path() {
         machine.path(),
         Some(&scratch_bin),
         true,
+        None,
+        None,
     );
     let approved_path = path_of(&approved);
     assert_eq!(approved_path[..2], [scratch_bin, project_bin]);
@@ -4043,6 +4051,8 @@ fn a_green_run_whose_inherited_path_names_no_machine_directory_searches_no_empty
             scratch.path(),
             Some(scratch.path()),
             false,
+            None,
+            None,
         );
         let path = green
             .iter()
@@ -4103,4 +4113,214 @@ fn a_binding_gyp_package_keeps_the_install_script_it_names() {
             "node-gyp-build".to_string()
         )]))
     );
+}
+
+/// What `scope` offers a script whose `PATH` leads to a Node with npm.
+fn tools_beside_a_node_with_npm(
+    scope: lifecycle_tools::ToolScope<'_>,
+) -> (tempfile::TempDir, lifecycle_tools::LifecycleTools) {
+    let root = tempfile::tempdir().unwrap();
+    let node_bin = bundled_node_gyp::tests::node_with_npm(&root.path().join("node"), "11.2.0", "");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let tools = lifecycle_tools::LifecycleTools::prepare(
+        root.path(),
+        None,
+        root.path(),
+        &scratch,
+        scope,
+        Some(node_bin.as_os_str()),
+    )
+    .unwrap();
+    (root, tools)
+}
+
+fn green_scope<'a>(
+    registry_packages: &'a RegistryPackages,
+    scripts: &'a HashMap<String, String>,
+) -> lifecycle_tools::ToolScope<'a> {
+    lifecycle_tools::ToolScope::GreenTools {
+        registry_packages,
+        project_publishers: &[],
+        scripts,
+    }
+}
+
+#[test]
+fn an_approved_script_is_offered_the_node_gyp_of_the_npm_beside_node() {
+    let (_root, tools) = tools_beside_a_node_with_npm(lifecycle_tools::ToolScope::Dependencies);
+
+    let offered = tools.node_gyp.as_ref().expect("npm's node-gyp is offered");
+    assert!(offered.script.ends_with("node-gyp/bin/node-gyp.js"));
+    assert!(tools.bins.iter().any(|bin| bin.name == "node-gyp"));
+    assert!(tools.sandbox_read_dirs().contains(&offered.command_dir));
+    assert_ne!(offered.command_dir, tools.bin_dir);
+}
+
+#[test]
+fn a_green_script_is_offered_node_gyp_only_when_its_commands_lead_to_it() {
+    let registry_packages = RegistryPackages::default();
+    for (script, offered) in [
+        ("node-gyp rebuild", true),
+        ("node-gyp-build", true),
+        ("tsc", false),
+    ] {
+        let scripts = HashMap::from([("install".to_string(), script.to_string())]);
+
+        let (_root, tools) =
+            tools_beside_a_node_with_npm(green_scope(&registry_packages, &scripts));
+
+        assert_eq!(tools.node_gyp.is_some(), offered, "{script}");
+    }
+}
+
+/// The value of each variable named `name`, as a script's environment
+/// lists them: one that is set twice shows twice.
+fn values_of(envs: &[(std::ffi::OsString, std::ffi::OsString)], name: &str) -> Vec<PathBuf> {
+    envs.iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| PathBuf::from(value))
+        .collect()
+}
+
+#[test]
+fn the_offered_node_gyp_follows_every_package_command_and_precedes_the_callers_path() {
+    let (root, tools) = tools_beside_a_node_with_npm(lifecycle_tools::ToolScope::Dependencies);
+    let project = root.path().join("project");
+    let caller = root.path().join("caller-bin");
+    let parent = HashMap::from([
+        ("PATH".into(), caller.clone().into_os_string()),
+        (
+            "npm_config_node_gyp".into(),
+            "/elsewhere/node-gyp.js".into(),
+        ),
+    ]);
+    let offered = tools.node_gyp.as_ref().unwrap();
+    // A script's `PATH` names LPM's own directories without the prefix a
+    // resolved path carries on Windows.
+    let plain = |path: &Path| lpm_common::symlink::windows_plain_path(path);
+    let environment = |project_bins| {
+        super::script_execution::build_lifecycle_environment(
+            &parent,
+            &project,
+            Path::new("/tmp"),
+            Some(&tools.bin_dir),
+            project_bins,
+            tools.node_gyp.as_ref(),
+            None,
+        )
+    };
+
+    let approved = environment(true);
+    let path: Vec<_> = std::env::split_paths(&values_of(&approved, "PATH")[0]).collect();
+    assert_eq!(
+        path,
+        [
+            plain(&tools.bin_dir),
+            project.join("node_modules").join(".bin"),
+            plain(&offered.command_dir),
+            caller.clone(),
+        ]
+    );
+    assert_eq!(
+        values_of(&approved, "npm_config_node_gyp"),
+        std::slice::from_ref(&offered.script),
+        "the caller's own setting is replaced, not kept beside it"
+    );
+
+    let green = environment(false);
+    let path: Vec<_> = std::env::split_paths(&values_of(&green, "PATH")[0]).collect();
+    assert_eq!(
+        path,
+        [plain(&tools.bin_dir), plain(&offered.command_dir), caller]
+    );
+}
+
+#[test]
+fn a_sandboxed_script_that_can_download_keeps_node_headers_where_it_may_write() {
+    let home = Path::new("/home/builder");
+    let online = lpm_sandbox::SandboxOptions::default();
+    let offline = lpm_sandbox::SandboxOptions::with_deny_outbound_network(true);
+    let chosen =
+        |mode, options| super::script_execution::sandboxed_headers_dir(mode, options, home);
+
+    let redirected = cfg!(any(target_os = "macos", windows)).then(|| home.join(".node-gyp"));
+    assert_eq!(
+        chosen(lpm_sandbox::SandboxMode::Enforce, &online),
+        redirected
+    );
+    assert_eq!(chosen(lpm_sandbox::SandboxMode::Enforce, &offline), None);
+    assert_eq!(chosen(lpm_sandbox::SandboxMode::Disabled, &online), None);
+    assert_eq!(chosen(lpm_sandbox::SandboxMode::LogOnly, &online), None);
+}
+
+#[test]
+fn the_headers_folder_is_set_whoever_supplies_node_gyp_unless_the_caller_chose_one() {
+    let root = tempfile::tempdir().unwrap();
+    let headers_dir = root.path().join(".node-gyp");
+    let environment = |parent: &HashMap<std::ffi::OsString, std::ffi::OsString>, headers| {
+        super::script_execution::build_lifecycle_environment(
+            parent,
+            root.path(),
+            Path::new("/tmp"),
+            None,
+            true,
+            None,
+            headers,
+        )
+    };
+
+    assert_eq!(
+        values_of(
+            &environment(&HashMap::new(), Some(&headers_dir)),
+            "npm_config_devdir"
+        ),
+        std::slice::from_ref(&headers_dir)
+    );
+    assert!(values_of(&environment(&HashMap::new(), None), "npm_config_devdir").is_empty());
+
+    for name in ["NPM_CONFIG_DEVDIR", "npm_package_config_node_gyp_devdir"] {
+        let parent = HashMap::from([(name.into(), "/elsewhere".into())]);
+        let set = environment(&parent, Some(&headers_dir));
+        assert_eq!(values_of(&set, name), [PathBuf::from("/elsewhere")]);
+        assert_eq!(
+            values_of(&set, "npm_config_devdir").len(),
+            usize::from(name == "NPM_CONFIG_DEVDIR")
+        );
+    }
+}
+
+#[test]
+fn a_build_that_leads_to_node_gyp_lacks_it_only_when_nothing_supplies_one() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let host_bin = root.path().join("host-bin");
+    let scratch = root.path().join("scratch");
+    for directory in [&host_bin, &scratch] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let registry_packages = RegistryPackages::default();
+    let native = HashMap::from([("install".to_string(), "node-gyp rebuild".to_string())]);
+    let other = HashMap::from([("install".to_string(), "tsc".to_string())]);
+    let tools = lifecycle_tools::LifecycleTools::prepare(
+        root.path(),
+        None,
+        root.path(),
+        &scratch,
+        green_scope(&registry_packages, &native),
+        Some(host_bin.as_os_str()),
+    )
+    .unwrap();
+    let lacks = |scripts| tools.lacks_node_gyp(scripts, &project, Some(host_bin.as_os_str()));
+
+    assert!(lacks(&native));
+    assert!(!lacks(&other));
+
+    let command = if cfg!(windows) {
+        "node-gyp.cmd"
+    } else {
+        "node-gyp"
+    };
+    std::fs::write(host_bin.join(command), "").unwrap();
+    assert!(!lacks(&native), "the caller's own node-gyp answers");
 }
