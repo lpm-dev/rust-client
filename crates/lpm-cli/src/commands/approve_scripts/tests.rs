@@ -3204,6 +3204,8 @@ fn a_package_from_outside_a_registry_is_told_apart_from_one_whose_registry_is_un
         ),
         locked("no-source", None),
         locked("from-registry", Some("registry+https://registry.npmjs.org")),
+        locked("mixed", Some("tarball+https://example.test/mixed.tgz")),
+        locked("mixed", Some("registry+https://registry.npmjs.org")),
     ];
     let key = |name: &str| {
         (
@@ -3214,11 +3216,21 @@ fn a_package_from_outside_a_registry_is_told_apart_from_one_whose_registry_is_un
     };
 
     let outside = installed_from_outside_a_registry(
-        &[key("from-tarball"), key("no-source"), key("from-registry")].into(),
+        &[
+            key("from-tarball"),
+            key("no-source"),
+            key("from-registry"),
+            key("mixed"),
+        ]
+        .into(),
         rows.iter(),
     );
 
-    assert_eq!(outside, [key("from-tarball")].into());
+    assert_eq!(
+        outside,
+        [key("from-tarball")].into(),
+        "a package a registry row also names isn't outside every registry"
+    );
 }
 
 #[test]

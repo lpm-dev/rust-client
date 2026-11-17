@@ -386,34 +386,36 @@ pub(super) fn unchecked_packages(
         .collect())
 }
 
-/// Those of `candidates` a lockfile row says came from outside a registry:
-/// a tarball, a git repository or a directory. No registry speaks for them,
-/// unlike a row whose source is unknown.
+/// Those of `candidates` every matching lockfile row says came from
+/// outside a registry: a tarball, a git repository or a directory. No
+/// registry speaks for them. One a registry row, or a row whose source is
+/// unknown, also names isn't among them.
 pub(super) fn installed_from_outside_a_registry<'a>(
     candidates: &std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
     rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
 ) -> std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey> {
     let mut outside = std::collections::HashSet::new();
+    let mut from_a_registry = std::collections::HashSet::new();
     for row in rows {
-        if !matches!(row.source_kind(), Some(Ok(source)) if !matches!(source, lpm_lockfile::Source::Registry { .. }))
-        {
-            continue;
-        }
-        outside.extend(
-            candidates
-                .iter()
-                .filter(|(name, version, integrity)| {
-                    *name == row.name
-                        && *version == row.version
-                        && !matches!(
-                            (&row.integrity, integrity),
-                            (Some(pinned), Some(known))
-                                if lpm_common::integrity::contradict(pinned, known)
-                        )
-                })
-                .cloned(),
+        let is_outside = matches!(
+            row.source_kind(),
+            Some(Ok(source)) if !matches!(source, lpm_lockfile::Source::Registry { .. })
         );
+        let matching = candidates.iter().filter(|(name, version, integrity)| {
+            *name == row.name
+                && *version == row.version
+                && !matches!(
+                    (&row.integrity, integrity),
+                    (Some(pinned), Some(known)) if lpm_common::integrity::contradict(pinned, known)
+                )
+        });
+        if is_outside {
+            outside.extend(matching.cloned());
+        } else {
+            from_a_registry.extend(matching.cloned());
+        }
     }
+    outside.retain(|candidate| !from_a_registry.contains(candidate));
     outside
 }
 

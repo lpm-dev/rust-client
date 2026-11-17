@@ -573,6 +573,8 @@ mod provenance_status_tests {
 
     #[test]
     fn a_status_keeps_the_colour_that_says_what_it_means() {
+        // The colour switch is process-wide; the gate's nextest runs each
+        // test in its own process.
         let previous = lpm_common::color::enabled();
         lpm_common::color::set_enabled(true);
         let rejected = ProvenanceStatus::VerificationRejected {
