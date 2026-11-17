@@ -52,7 +52,9 @@ fn ask_to_link(
     if !link {
         return Err(LpmError::EnvProjectRefused(unlinked.refusal()));
     }
-    lpm_vault::link_folder_to_vault_id(project_dir, &unlinked.vault_id).map_err(LpmError::Env)
+    lpm_vault::link_folder_to_vault_id(project_dir, &unlinked.vault_id)
+        .map(drop)
+        .map_err(LpmError::Env)
 }
 
 /// What the user is asked to link: the project as the vault records it and
@@ -100,20 +102,20 @@ pub(super) fn env_link(project_dir: &Path, yes: bool, json_output: bool) -> Resu
             return Err(LpmError::ExitCode(1));
         }
     }
-    lpm_vault::link_folder_to_vault_id(project_dir, &vault_id).map_err(LpmError::Env)?;
+    let added =
+        lpm_vault::link_folder_to_vault_id(project_dir, &vault_id).map_err(LpmError::Env)?;
     let folder = resolved(project_dir);
-    let already = link == FolderLink::Linked;
     if json_output {
         print_json(&serde_json::json!({
             "success": true,
             "vault_id": vault_id,
             "folder": folder,
-            "already_linked": already,
+            "already_linked": !added,
         }));
-    } else if already {
-        output::success(&format!("{} is already linked", folder.display()));
+    } else if added {
+        output::success(&format!("Linked {}", shown(&folder)));
     } else {
-        output::success(&format!("Linked {}", folder.display()));
+        output::success(&format!("{} is already linked", shown(&folder)));
     }
     Ok(())
 }
@@ -143,49 +145,64 @@ pub(super) fn env_unlink(
             "unlinked": removed,
         }));
     } else if removed {
-        output::success(&format!("Unlinked {}", folder.display()));
+        output::success(&format!("Unlinked {}", shown(&folder)));
     } else {
-        output::info(&format!("{} wasn't linked", folder.display()));
+        output::info(&format!(
+            "{} wasn't linked; `lpm env links` lists the linked folders",
+            shown(&folder)
+        ));
     }
     Ok(())
 }
 
 pub(super) fn env_links(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let (vault_id, folders) = lpm_vault::linked_folders(project_dir)
+    let lpm_vault::LinkedFolders {
+        vault_id,
+        folders,
+        this_folder_linked,
+    } = lpm_vault::linked_folders(project_dir)
         .map_err(LpmError::Env)?
         .ok_or_else(no_project)?;
-    let current = resolved(project_dir);
     if json_output {
         print_json(&serde_json::json!({
             "success": true,
             "vault_id": vault_id,
             "folders": folders,
-            "this_folder_linked": folders.contains(&current),
+            "this_folder_linked": this_folder_linked,
         }));
         return Ok(());
     }
     if folders.is_empty() {
-        output::info("No folder on this machine is linked to this env project.");
+        output::info(if this_folder_linked {
+            "No folder on this machine is linked to this env project yet. It holds no values \
+             here, so the first folder to store one is linked."
+        } else {
+            "No folder on this machine is linked to this env project."
+        });
         return Ok(());
     }
+    let current = resolved(project_dir);
     for folder in &folders {
         let marker = if *folder == current {
             " (this folder)"
         } else {
             ""
         };
-        println!(
-            "{}{marker}",
-            lpm_common::sanitize_terminal_inline(&folder.display().to_string())
-        );
+        println!("{}{marker}", shown(folder));
     }
     Ok(())
 }
 
-/// `folder` as a link names it, or as given when it no longer exists.
+fn shown(folder: &Path) -> String {
+    lpm_common::sanitize_terminal_inline(&folder.display().to_string()).into_owned()
+}
+
+/// `folder` as a link names it, or as an absolute path when it no longer
+/// exists.
 fn resolved(folder: &Path) -> std::path::PathBuf {
     folder
         .canonicalize()
+        .or_else(|_| std::path::absolute(folder))
         .unwrap_or_else(|_| folder.to_path_buf())
 }
 

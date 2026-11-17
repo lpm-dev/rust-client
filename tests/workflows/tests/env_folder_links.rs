@@ -12,7 +12,7 @@ const MARKER: &str = "MARKER_A_123";
 
 fn manifest(name: &str) -> String {
     format!(
-        r#"{{"name":"{name}","version":"1.0.0","scripts":{{"dev":"node -e \"console.log('LEAK=' + process.env.A_SECRET)\""}}}}"#
+        r#"{{"name":"{name}","version":"1.0.0","scripts":{{"dev":"node -e \"console.log('VALUE=' + process.env.A_SECRET)\""}}}}"#
     )
 }
 
@@ -61,6 +61,12 @@ fn a_folder_that_isn_t_linked_uses_none_of_the_project_s_values() {
         &["env", "print"],
         &["env", "history", "--reveal"],
         &["env", "set", "A_SECRET=OVERWRITTEN"],
+        &[
+            "exec",
+            "node",
+            "-e",
+            "console.log('VALUE=' + process.env.A_SECRET)",
+        ],
     ] {
         let output = lpm_in(&project, &other, args);
 
@@ -114,8 +120,12 @@ fn an_unlinked_folder_s_refusal_has_its_own_json_error_code() {
 
     assert!(!output.status.success());
     let text = output_of(&output);
-    assert!(text.contains("env_project_refused"), "{text}");
     assert!(!text.contains(MARKER), "{text}");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(
+        "env_unlinked_folder_refusal_json_envelope",
+        redacted(&project, &envelope)
+    );
 }
 
 #[test]
@@ -130,7 +140,7 @@ fn a_linked_checkout_of_the_same_project_uses_its_values() {
     assert!(output_of(&get).contains(MARKER), "{}", output_of(&get));
     let run = lpm_in(&project, &checkout, &["run", "dev"]);
     assert!(
-        output_of(&run).contains(&format!("LEAK={MARKER}")),
+        output_of(&run).contains(&format!("VALUE={MARKER}")),
         "{}",
         output_of(&run)
     );
@@ -222,6 +232,74 @@ fn a_vault_from_before_links_lets_no_folder_use_it_until_one_is_linked() {
 }
 
 #[test]
+fn env_init_in_a_fresh_clone_links_the_folder_it_imports_into() {
+    let project = TempProject::empty(&manifest("fresh-clone"));
+    project.write_file(
+        "lpm.json",
+        r#"{"vault":"0f2a2f6e-6f2b-4b8e-9d55-2f6c0c1b7a10"}"#,
+    );
+    project.write_file(".env", &format!("A_SECRET={MARKER}\n"));
+
+    let init = lpm(&project).args(["env", "init"]).output().unwrap();
+    let list = lpm(&project)
+        .args(["env", "list", "--reveal"])
+        .output()
+        .unwrap();
+
+    assert!(init.status.success(), "{}", output_of(&init));
+    assert!(output_of(&list).contains(MARKER), "{}", output_of(&list));
+}
+
+#[test]
+fn a_workspace_run_refuses_a_member_that_isn_t_linked() {
+    let project = project_with_a_value();
+    let mut root: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    root["workspaces"] = serde_json::json!(["packages/*"]);
+    root["private"] = serde_json::json!(true);
+    project.write_file("package.json", &root.to_string());
+    let member = copied_checkout(&project, "packages/member");
+
+    let run = lpm(&project)
+        .args(["run", "dev", "--all"])
+        .output()
+        .unwrap();
+
+    let text = output_of(&run);
+    assert!(!run.status.success(), "{text}");
+    assert!(!text.contains(&format!("VALUE={MARKER}")), "{text}");
+    assert!(text.contains("lpm env link"), "{text}");
+    assert!(member.exists());
+}
+
+#[test]
+fn a_deleted_folder_can_be_unlinked_by_its_path() {
+    let project = project_with_a_value();
+    let checkout = copied_checkout(&project, "second-checkout");
+    assert!(
+        lpm_in(&project, &checkout, &["env", "link", "--yes"])
+            .status
+            .success()
+    );
+    std::fs::remove_dir_all(&checkout).unwrap();
+
+    let unlink = lpm_in(
+        &project,
+        project.path(),
+        &["--json", "env", "unlink", "second-checkout"],
+    );
+
+    let report = json_of(&unlink);
+    assert_eq!(report["unlinked"], true, "{report}");
+    let links = json_of(&lpm_in(
+        &project,
+        project.path(),
+        &["--json", "env", "links"],
+    ));
+    assert_eq!(links["folders"].as_array().unwrap().len(), 1, "{links}");
+}
+
+#[test]
 fn a_folder_that_names_a_vault_this_machine_holds_no_values_for_is_not_refused() {
     let project = TempProject::empty(&manifest("fresh-clone"));
     project.write_file(
@@ -284,6 +362,21 @@ fn env_link_links_and_unlink_report_json_envelopes() {
 
     assert_eq!(link["already_linked"], false);
     assert_eq!(unlink["unlinked"], true);
+    let relink = json_of(&lpm_in(
+        &project,
+        &checkout,
+        &["--json", "env", "link", "--yes"],
+    ));
+    let again = json_of(&lpm_in(
+        &project,
+        &checkout,
+        &["--json", "env", "link", "--yes"],
+    ));
+    assert_eq!(relink["already_linked"], false, "{relink}");
+    assert_eq!(again["already_linked"], true, "{again}");
+    let other = copied_checkout(&project, "never-linked");
+    let not_linked = json_of(&lpm_in(&project, &other, &["--json", "env", "unlink"]));
+    assert_eq!(not_linked["unlinked"], false, "{not_linked}");
     insta::assert_json_snapshot!("env_link_json_envelope", redacted(&project, &link));
     insta::assert_json_snapshot!("env_links_json_envelope", redacted(&project, &links));
     insta::assert_json_snapshot!("env_unlink_json_envelope", redacted(&project, &unlink));

@@ -265,9 +265,6 @@ async fn run_action(
         return reported(result);
     }
 
-    if matches!(args[0], "connect" | "status") {
-        links::ensure_folder_linked(project_dir, json_output)?;
-    }
     let result = match args[0] {
         "push" => push::vars_push(client, &args, project_dir, json_output).await,
         "pull" => pull::vars_pull(client, &args, project_dir, json_output).await,

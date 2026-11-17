@@ -79,7 +79,10 @@ fn prompt_project(vault_id: &str, project_name: Option<&str>) -> String {
     lpm_common::sanitize_terminal_inline(&quoted).into_owned()
 }
 
-/// The folder as the prompt names it, with the home folder as `~`.
+const PROMPT_FOLDER_CHARS: usize = 72;
+
+/// The folder as the prompt names it: quoted, with the home folder as `~`,
+/// and a long path cut short in the middle, where it says least.
 fn prompt_folder(folder: &std::path::Path) -> String {
     let shown = dirs::home_dir()
         .and_then(|home| folder.strip_prefix(home).ok())
@@ -92,7 +95,17 @@ fn prompt_folder(folder: &std::path::Path) -> String {
                     .to_string()
             },
         );
-    lpm_common::sanitize_terminal_inline(&shown).into_owned()
+    let length = shown.chars().count();
+    let shown = if length > PROMPT_FOLDER_CHARS {
+        let head = PROMPT_FOLDER_CHARS / 3;
+        let tail = PROMPT_FOLDER_CHARS - head - 1;
+        let start: String = shown.chars().take(head).collect();
+        let end: String = shown.chars().skip(length - tail).collect();
+        format!("{start}…{end}")
+    } else {
+        shown
+    };
+    lpm_common::sanitize_terminal_inline(&format!("{shown:?}")).into_owned()
 }
 
 /// Run `run` with every approval prompt saying it's for the project's
@@ -1046,7 +1059,7 @@ mod tests {
 
         assert_eq!(
             operation_prompt(vault_id),
-            "Allow LPM CLI in /srv/checkouts/proj-a to access env project \"proj-a\""
+            "Allow LPM CLI in \"/srv/checkouts/proj-a\" to access env project \"proj-a\""
         );
         assert_eq!(
             operation_prompt(&crate::companion::account::record_account(
@@ -1054,7 +1067,7 @@ mod tests {
                 vault_id,
                 None
             )),
-            "Allow LPM CLI in /srv/checkouts/proj-a to access env project \"proj-a\"'s personal overrides"
+            "Allow LPM CLI in \"/srv/checkouts/proj-a\" to access env project \"proj-a\"'s personal overrides"
         );
         assert_eq!(
             operation_prompt("another-vault"),
@@ -1087,7 +1100,7 @@ mod tests {
 
         assert_eq!(
             operation_prompt("vault"),
-            "Allow LPM CLI in /srv/own to access env project vault"
+            "Allow LPM CLI in \"/srv/own\" to access env project vault"
         );
     }
 
@@ -1112,8 +1125,21 @@ mod tests {
 
         assert_eq!(
             prompt_folder(&home.join("code").join("proj-a")),
-            "~/code/proj-a"
+            "\"~/code/proj-a\""
         );
+    }
+
+    #[test]
+    fn a_folder_in_the_prompt_is_quoted_and_a_long_one_cut_short_in_the_middle() {
+        let deep = std::path::Path::new("/srv")
+            .join("a".repeat(100))
+            .join("x to access env project \"other\" and");
+
+        let shown = prompt_folder(&deep);
+
+        assert!(shown.starts_with("\"/srv/aaa"), "{shown}");
+        assert!(shown.ends_with("\\\"other\\\" and\""), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
     }
 
     #[test]

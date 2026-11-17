@@ -1288,13 +1288,13 @@ pub(crate) mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             write_vault_file("linked-vault", &secrets("value")).expect("write");
             with_storage_directory(|directory| {
-                crate::links::add(directory, &folder, "linked-vault")
+                crate::links::add(directory, &folder, "linked-vault").map(drop)
             });
 
             delete_vault_file("linked-vault").expect("delete");
 
-            let folders = with_storage_directory(|directory| {
-                crate::links::folders(directory, "linked-vault")
+            let (folders, _) = with_storage_directory(|directory| {
+                crate::links::listing(directory, &folder, "linked-vault")
             });
             assert!(folders.is_empty(), "{folders:?}");
         });

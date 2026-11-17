@@ -5,9 +5,8 @@
 //! item on macOS, an owner-only file beside the vault elsewhere. A folder
 //! that isn't linked gets none of the vault's values until it's linked here.
 //!
-//! Code already running as the user can change the list the way LPM CLI
-//! does; only CLI approval, which asks the operating system for the user's
-//! presence, holds against that.
+//! The list isn't a boundary against other code running as the user; CLI
+//! approval, which asks the operating system for the user's presence, is.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -70,25 +69,46 @@ pub(crate) fn is_refusal(message: &str) -> bool {
 }
 
 /// The folder a link names: the project folder with symbolic links resolved,
-/// so two spellings of one folder are one link.
+/// so two spellings of one folder are one link. A folder that no longer
+/// exists is resolved through its nearest existing ancestor, so a link made
+/// under another spelling still matches it.
 pub(crate) fn link_folder_path(project_dir: &Path) -> PathBuf {
-    project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
+    if let Ok(resolved) = project_dir.canonicalize() {
+        return resolved;
+    }
+    let Ok(absolute) = std::path::absolute(project_dir) else {
+        return project_dir.to_path_buf();
+    };
+    let mut missing = Vec::new();
+    let mut current = absolute.as_path();
+    while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+        missing.push(name);
+        if let Ok(mut resolved) = parent.canonicalize() {
+            resolved.extend(missing.iter().rev());
+            return resolved;
+        }
+        current = parent;
+    }
+    absolute
 }
 
-fn folder_key(folder: &Path) -> Result<String, String> {
-    folder
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{} is not a UTF-8 path", folder.display()))
+fn folder_key(folder: &Path) -> Option<&str> {
+    folder.to_str()
+}
+
+/// The refusal for a folder a link can't name.
+fn unlinkable(folder: &Path, vault_id: &str) -> String {
+    format!(
+        "{REFUSAL_PREFIX}{vault_id}, and can't be: a link names a folder by a UTF-8 path, and \
+         {} isn't one",
+        folder.display()
+    )
 }
 
 /// Where a vault's link list lives.
 trait LinkStore {
     fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String>;
     fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String>;
-    fn delete(&mut self, vault_id: &str) -> Result<(), String>;
     /// Whether this machine holds values for the vault, found without
     /// reading them, which could ask for the user's presence.
     fn holds_values(&mut self, vault_id: &str) -> Result<bool, String>;
@@ -114,42 +134,36 @@ fn encode(record: &LinkRecord) -> Result<Vec<u8>, String> {
     serde_json::to_vec(record).map_err(|error| format!("failed to encode folder links: {error}"))
 }
 
+fn record_of(folders: BTreeSet<String>) -> LinkRecord {
+    LinkRecord {
+        schema_version: LINKS_SCHEMA_VERSION,
+        folders,
+    }
+}
+
+fn file_name(vault_id: &str) -> String {
+    let vault_file = crate::fallback::vault_file_name(vault_id);
+    let digest = vault_file.trim_end_matches(".vault");
+    format!("{digest}.links")
+}
+
 /// The link list beside the vault's file, for the file backend.
 struct FileLinkStore<'directory> {
     directory: &'directory VaultStorageDirectory,
-}
-
-impl FileLinkStore<'_> {
-    fn file_name(vault_id: &str) -> String {
-        let vault_file = crate::fallback::vault_file_name(vault_id);
-        let digest = vault_file.trim_end_matches(".vault");
-        format!("{digest}.links")
-    }
 }
 
 impl LinkStore for FileLinkStore<'_> {
     fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
         let vaults = self.directory.open_or_create_directory("vaults")?;
         vaults
-            .read_owner_only_file(&Self::file_name(vault_id), "vault folder links")?
+            .read_owner_only_file(&file_name(vault_id), "vault folder links")?
             .map(|bytes| decode(&bytes, vault_id))
             .transpose()
     }
 
     fn write(&mut self, vault_id: &str, record: &LinkRecord) -> Result<(), String> {
         let vaults = self.directory.open_or_create_directory("vaults")?;
-        vaults.write_owner_only_file(
-            &Self::file_name(vault_id),
-            &encode(record)?,
-            "vault folder links",
-        )
-    }
-
-    fn delete(&mut self, vault_id: &str) -> Result<(), String> {
-        if let Some(vaults) = self.directory.open_existing_directory("vaults")? {
-            vaults.remove_file(&Self::file_name(vault_id), "vault folder links")?;
-        }
-        Ok(())
+        vaults.write_owner_only_file(&file_name(vault_id), &encode(record)?, "vault folder links")
     }
 
     fn holds_values(&mut self, vault_id: &str) -> Result<bool, String> {
@@ -165,10 +179,13 @@ impl LinkStore for FileLinkStore<'_> {
 /// the macOS Keychain backend. It needs no approval to read, so checking a
 /// folder never asks for the user's presence.
 #[cfg(target_os = "macos")]
-struct KeychainLinkStore;
+struct KeychainLinkStore<'directory> {
+    /// Where values the Keychain backend still reads from a file live.
+    directory: &'directory VaultStorageDirectory,
+}
 
 #[cfg(target_os = "macos")]
-impl LinkStore for KeychainLinkStore {
+impl LinkStore for KeychainLinkStore<'_> {
     fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
         crate::macos_keychain::read_bytes(&lpm_common::credential_service(LINKS_SERVICE), vault_id)?
             .map(|bytes| decode(&bytes, vault_id))
@@ -183,13 +200,11 @@ impl LinkStore for KeychainLinkStore {
         )
     }
 
-    fn delete(&mut self, vault_id: &str) -> Result<(), String> {
-        crate::macos_keychain::delete(&lpm_common::credential_service(LINKS_SERVICE), vault_id)
-            .map(drop)
-    }
-
+    /// The Keychain backend falls back to a vault file it hasn't moved into
+    /// the Keychain, so either holds the vault's values.
     fn holds_values(&mut self, vault_id: &str) -> Result<bool, String> {
-        crate::keychain::holds_vault_values(vault_id)
+        Ok(crate::keychain::holds_vault_values(vault_id)?
+            || crate::fallback::vault_file_exists(self.directory, vault_id)?)
     }
 
     fn recorded_project(&mut self, vault_id: &str) -> Result<Option<(String, String)>, String> {
@@ -216,63 +231,89 @@ fn with_store<T>(
 ) -> Result<T, String> {
     #[cfg(target_os = "macos")]
     if !crate::force_file_vault_backend() {
-        return operation(&mut KeychainLinkStore);
+        return operation(&mut KeychainLinkStore { directory });
     }
     operation(&mut FileLinkStore { directory })
 }
 
+/// The folders a vault's link list names, and the project record read on
+/// the way, if any.
+struct Resolved {
+    /// `None` for a vault with neither a list nor values on this machine,
+    /// which keeps nothing from any folder.
+    folders: Option<BTreeSet<String>>,
+    recorded: Option<Option<(String, String)>>,
+}
+
+/// The vault's link list. A vault without one predates links: with no
+/// values here it keeps nothing from any folder; otherwise the folder its
+/// records name, when they name one by an absolute path, becomes its first
+/// link, and the list is written so later changes start from it.
+fn resolve(store: &mut dyn LinkStore, vault_id: &str) -> Result<Resolved, String> {
+    if let Some(record) = store.read(vault_id)? {
+        return Ok(Resolved {
+            folders: Some(record.folders),
+            recorded: None,
+        });
+    }
+    if !store.holds_values(vault_id)? {
+        return Ok(Resolved {
+            folders: None,
+            recorded: None,
+        });
+    }
+    let recorded = store.recorded_project(vault_id)?;
+    let first = recorded
+        .as_ref()
+        .map(|(_, path)| Path::new(path))
+        .filter(|path| path.is_absolute())
+        .map(link_folder_path)
+        .and_then(|folder| folder_key(&folder).map(str::to_owned));
+    let folders = BTreeSet::from_iter(first);
+    if !folders.is_empty() {
+        store.write(vault_id, &record_of(folders.clone()))?;
+    }
+    Ok(Resolved {
+        folders: Some(folders),
+        recorded: Some(recorded),
+    })
+}
+
 /// Whether `project_dir` may use the vault `vault_id`.
-///
-/// A vault with no link list predates links. When this machine holds none
-/// of its values, there is nothing to keep from the folder. Otherwise the
-/// folder the vault's records name is its first link, and any other folder
-/// isn't linked yet.
 pub(crate) fn check(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
 ) -> Result<FolderLink, String> {
-    with_store(directory, |store| check_in(store, project_dir, vault_id))
+    with_store(directory, |store| {
+        check_in(store, project_dir, vault_id).map(|(link, _)| link)
+    })
 }
 
-/// Reads the vault's project record only when the folder isn't linked or the
-/// vault predates links, so a linked folder's check reads just the list.
+/// [`check`] in `store`, with the vault's list when it has one. Reads the
+/// project record only when the folder isn't linked or the vault predates
+/// links, so a linked folder's check reads just the list.
 fn check_in(
     store: &mut dyn LinkStore,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<FolderLink, String> {
+) -> Result<(FolderLink, Option<BTreeSet<String>>), String> {
     let folder = link_folder_path(project_dir);
-    let key = folder_key(&folder)?;
-    let (linked, recorded) = match store.read(vault_id)? {
-        Some(record) => (record.folders, None),
-        None if !store.holds_values(vault_id)? => (BTreeSet::from([key.clone()]), None),
-        None => {
-            let recorded = store.recorded_project(vault_id)?;
-            let Some(path) = recorded
-                .as_ref()
-                .map(|(_, path)| path.as_str())
-                .filter(|path| !path.is_empty())
-            else {
-                return Ok(unlinked(vault_id, folder, recorded, BTreeSet::new()));
-            };
-            let record = LinkRecord {
-                schema_version: LINKS_SCHEMA_VERSION,
-                folders: BTreeSet::from([folder_key(&link_folder_path(Path::new(path)))?]),
-            };
-            store.write(vault_id, &record)?;
-            (record.folders, Some(recorded))
-        }
-    };
-    if linked.contains(&key) {
+    let key = folder_key(&folder).ok_or_else(|| unlinkable(&folder, vault_id))?;
+    let Resolved { folders, recorded } = resolve(store, vault_id)?;
+    let Some(folders) = folders else {
         store.note_linked(vault_id, &folder);
-        return Ok(FolderLink::Linked);
+        return Ok((FolderLink::Linked, None));
+    };
+    if folders.contains(key) {
+        store.note_linked(vault_id, &folder);
+        return Ok((FolderLink::Linked, Some(folders)));
     }
     let recorded = match recorded {
         Some(recorded) => recorded,
         None => store.recorded_project(vault_id)?,
     };
-    Ok(unlinked(vault_id, folder, recorded, linked))
+    Ok((unlinked(vault_id, folder, recorded, folders), None))
 }
 
 fn unlinked(
@@ -313,61 +354,68 @@ pub(crate) fn require_for_write(
 ) -> Result<(), String> {
     with_store(directory, |store| {
         match check_in(store, project_dir, vault_id)? {
-            FolderLink::Unlinked(unlinked) => Err(unlinked.refusal()),
-            FolderLink::Linked => {
-                if store.read(vault_id)?.is_none() {
-                    add_in(store, project_dir, vault_id)?;
-                }
-                Ok(())
+            (FolderLink::Unlinked(unlinked), _) => Err(unlinked.refusal()),
+            (FolderLink::Linked, Some(_)) => Ok(()),
+            (FolderLink::Linked, None) => {
+                insert(store, project_dir, vault_id, BTreeSet::new()).map(drop)
             }
         }
     })
 }
 
-/// Links `project_dir` to the vault `vault_id`.
+/// Links `project_dir` to the vault `vault_id`; whether it wasn't listed
+/// before.
 pub(crate) fn add(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<(), String> {
-    with_store(directory, |store| add_in(store, project_dir, vault_id))
+) -> Result<bool, String> {
+    with_store(directory, |store| {
+        let folders = resolve(store, vault_id)?.folders.unwrap_or_default();
+        insert(store, project_dir, vault_id, folders)
+    })
 }
 
-fn add_in(store: &mut dyn LinkStore, project_dir: &Path, vault_id: &str) -> Result<(), String> {
-    let mut record = store.read(vault_id)?.unwrap_or(LinkRecord {
-        schema_version: LINKS_SCHEMA_VERSION,
-        folders: BTreeSet::new(),
-    });
-    if record
-        .folders
-        .insert(folder_key(&link_folder_path(project_dir))?)
-    {
-        store.write(vault_id, &record)?;
+/// Writes `folders` with `project_dir` added; whether it was added.
+fn insert(
+    store: &mut dyn LinkStore,
+    project_dir: &Path,
+    vault_id: &str,
+    mut folders: BTreeSet<String>,
+) -> Result<bool, String> {
+    let folder = link_folder_path(project_dir);
+    let key = folder_key(&folder).ok_or_else(|| unlinkable(&folder, vault_id))?;
+    let added = folders.insert(key.to_owned());
+    if added {
+        store.write(vault_id, &record_of(folders))?;
     }
-    Ok(())
+    store.note_linked(vault_id, &folder);
+    Ok(added)
 }
 
-/// Unlinks `folder` from the vault `vault_id`; whether it was linked.
+/// Unlinks `folder` from the vault `vault_id`; whether it was linked. A
+/// vault from before links is resolved first, and one that kept nothing
+/// from any folder gets an empty list, so the folder stays unlinked.
 pub(crate) fn remove(
     directory: &VaultStorageDirectory,
     folder: &Path,
     vault_id: &str,
 ) -> Result<bool, String> {
-    with_store(directory, |store| {
-        let Some(mut record) = store.read(vault_id)? else {
-            return Ok(false);
-        };
-        // A folder that no longer exists can't be resolved, so it is also
-        // matched as given.
-        let resolved = record
-            .folders
-            .remove(&folder_key(&link_folder_path(folder))?);
-        let removed = record.folders.remove(&folder_key(folder)?) || resolved;
-        if removed {
-            store.write(vault_id, &record)?;
-        }
-        Ok(removed)
-    })
+    with_store(directory, |store| remove_in(store, folder, vault_id))
+}
+
+fn remove_in(store: &mut dyn LinkStore, folder: &Path, vault_id: &str) -> Result<bool, String> {
+    let Some(mut folders) = resolve(store, vault_id)?.folders else {
+        store.write(vault_id, &record_of(BTreeSet::new()))?;
+        return Ok(true);
+    };
+    let resolved = folder_key(&link_folder_path(folder)).is_some_and(|key| folders.remove(key));
+    let given = folder_key(folder).is_some_and(|key| folders.remove(key));
+    let removed = resolved || given;
+    if removed {
+        store.write(vault_id, &record_of(folders))?;
+    }
+    Ok(removed)
 }
 
 /// Removes the link list of the deleted file-backed vault `vault_id`.
@@ -375,25 +423,38 @@ pub(crate) fn forget_in_files(
     directory: &VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<(), String> {
-    FileLinkStore { directory }.delete(vault_id)
+    if let Some(vaults) = directory.open_existing_directory("vaults")? {
+        vaults.remove_file(&file_name(vault_id), "vault folder links")?;
+    }
+    Ok(())
 }
 
 /// Removes the link list of the deleted Keychain vault `vault_id`.
 #[cfg(target_os = "macos")]
 pub(crate) fn forget_in_keychain(vault_id: &str) -> Result<(), String> {
-    KeychainLinkStore.delete(vault_id)
+    crate::macos_keychain::delete(&lpm_common::credential_service(LINKS_SERVICE), vault_id)
+        .map(drop)
 }
 
-/// The folders linked to the vault `vault_id`.
-pub(crate) fn folders(
+/// The folders linked to the vault `vault_id`, and whether `project_dir`
+/// may use it.
+pub(crate) fn listing(
     directory: &VaultStorageDirectory,
+    project_dir: &Path,
     vault_id: &str,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, bool), String> {
     with_store(directory, |store| {
-        Ok(store
-            .read(vault_id)?
-            .map(|record| record.folders.into_iter().map(PathBuf::from).collect())
-            .unwrap_or_default())
+        let folders = resolve(store, vault_id)?.folders;
+        let folder = link_folder_path(project_dir);
+        let this_folder = folders
+            .as_ref()
+            .is_none_or(|folders| folder_key(&folder).is_some_and(|key| folders.contains(key)));
+        let folders = folders
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        Ok((folders, this_folder))
     })
 }
 
@@ -408,12 +469,14 @@ mod tests {
         values: BTreeSet<String>,
         projects: HashMap<String, (String, String)>,
         writes: usize,
+        reads: usize,
         project_reads: usize,
         noted: Vec<(String, PathBuf)>,
     }
 
     impl LinkStore for MemoryLinkStore {
         fn read(&mut self, vault_id: &str) -> Result<Option<LinkRecord>, String> {
+            self.reads += 1;
             Ok(self.records.get(vault_id).map(|record| LinkRecord {
                 schema_version: record.schema_version,
                 folders: record.folders.clone(),
@@ -429,11 +492,6 @@ mod tests {
                     folders: record.folders.clone(),
                 },
             );
-            Ok(())
-        }
-
-        fn delete(&mut self, vault_id: &str) -> Result<(), String> {
-            self.records.remove(vault_id);
             Ok(())
         }
 
@@ -469,13 +527,13 @@ mod tests {
         let (_root, paths) = make_folders(&["own", "copy"]);
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
-        add_in(&mut store, &paths[0], "vault").unwrap();
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
 
         assert_eq!(
-            check_in(&mut store, &paths[0], "vault").unwrap(),
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
             FolderLink::Linked
         );
-        let FolderLink::Unlinked(unlinked) = check_in(&mut store, &paths[1], "vault").unwrap()
+        let (FolderLink::Unlinked(unlinked), _) = check_in(&mut store, &paths[1], "vault").unwrap()
         else {
             panic!("a copy that names the vault must not be linked");
         };
@@ -489,7 +547,7 @@ mod tests {
         let mut store = MemoryLinkStore::default();
 
         assert_eq!(
-            check_in(&mut store, &paths[0], "vault").unwrap(),
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
             FolderLink::Linked
         );
         assert_eq!(store.writes, 0);
@@ -505,14 +563,14 @@ mod tests {
             ("proj-a".into(), paths[0].display().to_string()),
         );
 
-        let FolderLink::Unlinked(unlinked) = check_in(&mut store, &paths[1], "vault").unwrap()
+        let (FolderLink::Unlinked(unlinked), _) = check_in(&mut store, &paths[1], "vault").unwrap()
         else {
             panic!("only the recorded folder is linked");
         };
         assert_eq!(unlinked.project_name.as_deref(), Some("proj-a"));
         assert_eq!(unlinked.linked_folders, [paths[0].clone()]);
         assert_eq!(
-            check_in(&mut store, &paths[0], "vault").unwrap(),
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
             FolderLink::Linked
         );
     }
@@ -523,7 +581,7 @@ mod tests {
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
 
-        let FolderLink::Unlinked(unlinked) = check_in(&mut store, &paths[0], "vault").unwrap()
+        let (FolderLink::Unlinked(unlinked), _) = check_in(&mut store, &paths[0], "vault").unwrap()
         else {
             panic!("a vault with values and no links links no folder");
         };
@@ -544,7 +602,7 @@ mod tests {
             .projects
             .insert("vault".into(), ("proj-a".into(), "/elsewhere".into()));
 
-        let FolderLink::Unlinked(unlinked) = check_in(&mut store, &paths[0], "vault").unwrap()
+        let (FolderLink::Unlinked(unlinked), _) = check_in(&mut store, &paths[0], "vault").unwrap()
         else {
             panic!("a folder the vault doesn't record isn't linked");
         };
@@ -569,7 +627,7 @@ mod tests {
             "vault".into(),
             ("proj-a".into(), paths[0].display().to_string()),
         );
-        add_in(&mut store, &paths[0], "vault").unwrap();
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
 
         for _ in 0..3 {
             check_in(&mut store, &paths[0], "vault").unwrap();
@@ -583,8 +641,9 @@ mod tests {
         let (_root, paths) = make_folders(&["own", "copy"]);
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
-        add_in(&mut store, &paths[0], "vault").unwrap();
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
 
+        store.noted.clear();
         check_in(&mut store, &paths[1], "vault").unwrap();
         check_in(&mut store, &paths[0], "vault").unwrap();
 
@@ -596,10 +655,121 @@ mod tests {
         let (root, paths) = make_folders(&["own"]);
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
-        add_in(&mut store, &root.path().join("own/../own"), "vault").unwrap();
+        insert(
+            &mut store,
+            &root.path().join("own/../own"),
+            "vault",
+            BTreeSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(
-            check_in(&mut store, &paths[0], "vault").unwrap(),
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
+            FolderLink::Linked
+        );
+    }
+
+    fn legacy_store(recorded: &Path) -> MemoryLinkStore {
+        let mut store = MemoryLinkStore::default();
+        store.values.insert("vault".into());
+        store.projects.insert(
+            "vault".into(),
+            ("proj-a".into(), recorded.display().to_string()),
+        );
+        store
+    }
+
+    #[test]
+    fn unlinking_the_folder_a_vault_from_before_links_records_keeps_it_unlinked() {
+        let (_root, paths) = make_folders(&["own"]);
+        let mut store = legacy_store(&paths[0]);
+
+        assert!(remove_in(&mut store, &paths[0], "vault").unwrap());
+
+        assert!(matches!(
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
+            FolderLink::Unlinked(_)
+        ));
+    }
+
+    #[test]
+    fn unlinking_a_folder_of_a_vault_that_kept_none_out_leaves_it_unlinked() {
+        let (_root, paths) = make_folders(&["any"]);
+        let mut store = MemoryLinkStore::default();
+
+        assert!(remove_in(&mut store, &paths[0], "vault").unwrap());
+
+        assert!(matches!(
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
+            FolderLink::Unlinked(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_folder_is_unlinked_under_another_spelling_of_its_parent() {
+        let (root, paths) = make_folders(&["parent/own"]);
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(root.path().join("parent"), &alias).unwrap();
+        let mut store = MemoryLinkStore::default();
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        std::fs::remove_dir(&paths[0]).unwrap();
+
+        assert!(remove_in(&mut store, &alias.join("own"), "vault").unwrap());
+
+        assert!(store.records["vault"].folders.is_empty());
+    }
+
+    #[test]
+    fn a_relative_folder_in_a_vault_s_records_links_no_folder() {
+        let (_root, paths) = make_folders(&["own"]);
+        let mut store = legacy_store(Path::new("."));
+
+        assert!(matches!(
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
+            FolderLink::Unlinked(_)
+        ));
+        assert_eq!(store.writes, 0);
+    }
+
+    #[test]
+    fn linking_a_folder_names_it_in_the_approval_prompt() {
+        let (_root, paths) = make_folders(&["own"]);
+        let mut store = MemoryLinkStore::default();
+
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+
+        assert_eq!(store.noted, [("vault".to_owned(), paths[0].clone())]);
+    }
+
+    #[test]
+    fn a_linked_folder_s_check_before_a_write_reads_the_list_once() {
+        let (_root, paths) = make_folders(&["own"]);
+        let mut store = MemoryLinkStore::default();
+        store.values.insert("vault".into());
+        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        store.reads = 0;
+
+        let (link, folders) = check_in(&mut store, &paths[0], "vault").unwrap();
+
+        assert_eq!(link, FolderLink::Linked);
+        assert!(
+            folders.is_some(),
+            "a write that knows the list doesn't read it again"
+        );
+        assert_eq!(store.reads, 1);
+    }
+
+    #[test]
+    fn every_folder_may_use_a_vault_that_keeps_none_out() {
+        let (_root, paths) = make_folders(&["any"]);
+        let mut store = MemoryLinkStore::default();
+
+        let Resolved { folders, .. } = resolve(&mut store, "vault").unwrap();
+
+        assert!(folders.is_none());
+        assert_eq!(
+            check_in(&mut store, &paths[0], "vault").unwrap().0,
             FolderLink::Linked
         );
     }

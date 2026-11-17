@@ -283,8 +283,9 @@ pub fn folder_link_for_vault_id(project_dir: &Path, vault_id: &str) -> Result<Fo
     })
 }
 
-/// Links `project_dir` to the vault `vault_id`.
-pub fn link_folder_to_vault_id(project_dir: &Path, vault_id: &str) -> Result<(), String> {
+/// Links `project_dir` to the vault `vault_id`; whether it wasn't linked
+/// before.
+pub fn link_folder_to_vault_id(project_dir: &Path, vault_id: &str) -> Result<bool, String> {
     validate_explicit_vault_id(vault_id)?;
     storage_transaction::with_vault_transaction(|directory| {
         links::add(directory, project_dir, vault_id)
@@ -304,13 +305,29 @@ pub fn unlink_folder(project_dir: &Path, folder: &Path) -> Result<Option<(String
     Ok(Some((vault_id, removed)))
 }
 
-/// The vault `project_dir`'s lpm.json names and the folders linked to it.
-pub fn linked_folders(project_dir: &Path) -> Result<Option<(String, Vec<PathBuf>)>, String> {
+/// The vault a folder's lpm.json names, the folders linked to it on this
+/// machine, and whether the folder may use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedFolders {
+    pub vault_id: String,
+    pub folders: Vec<PathBuf>,
+    pub this_folder_linked: bool,
+}
+
+/// The [`LinkedFolders`] of `project_dir`; `None` when its lpm.json names
+/// no vault.
+pub fn linked_folders(project_dir: &Path) -> Result<Option<LinkedFolders>, String> {
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
-    storage_transaction::with_vault_transaction(|directory| links::folders(directory, &vault_id))
-        .map(|folders| Some((vault_id, folders)))
+    let (folders, this_folder_linked) = storage_transaction::with_vault_transaction(|directory| {
+        links::listing(directory, project_dir, &vault_id)
+    })?;
+    Ok(Some(LinkedFolders {
+        vault_id,
+        folders,
+        this_folder_linked,
+    }))
 }
 
 /// Appends a line to `LPM_TEST_VAULT_TRANSACTION_LOG` for each vault
@@ -1070,12 +1087,9 @@ fn initialize_environments_from_files_inner(
         if let Some(vault) = state.filter(|vault| vault.changed) {
             let vault_id = match vault.vault_id {
                 Some(vault_id) => vault_id,
-                None => {
-                    let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
-                    links::require_for_write(directory, project_dir, &vault_id)?;
-                    vault_id
-                }
+                None => vault_id::get_or_create_vault_id(project_dir)?,
             };
+            links::require_for_write(directory, project_dir, &vault_id)?;
             let recording = history::scope::begin(&vault_id, source);
             write_all_environments_unlocked(
                 directory,
