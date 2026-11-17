@@ -214,20 +214,23 @@ pub(super) fn run_online_lockfile_write_phase(
 
     if !input.frozen_lockfile_active
         && let Some(lockfile) = input.fast_path_lockfile
-        && let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
+    {
+        let refreshed_urls =
+            refreshed_tarball_urls(&lockfile, input.lockfile_path, input.fresh_urls)?;
+        if let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
             lockfile,
             input.lockfile_path,
             input.current_lockfile_patches,
             input.current_importer_snapshot,
             FetchWritebacks {
-                tarball_urls: input.fresh_urls,
+                tarball_urls: &refreshed_urls,
                 proven_pins: input.proven_pins,
             },
             input.obsolete_binary_lockfile,
             input.json_output,
-        )?
-    {
-        result.record_write(write_ms);
+        )? {
+            result.record_write(write_ms);
+        }
     }
 
     Ok(result)
@@ -605,15 +608,63 @@ impl FastPathLockfileRewriteReasons {
     }
 }
 
+/// The served URLs that aren't the ones their packages are locked with:
+/// what a replay writes back and reports. A replay sets a locked URL aside
+/// when it won't use it as given, for a package from a registry an
+/// `.npmrc` names for example, and then downloads from the same URL once
+/// the registry names it again; that isn't a change.
+///
+/// A workspace replay holds no package rows, so they are read from the
+/// lockfile it replays.
+fn refreshed_tarball_urls(
+    lockfile: &lpm_lockfile::Lockfile,
+    lockfile_path: &Path,
+    served: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, LpmError> {
+    if served.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if !workspace_lockfile::active() {
+        return Ok(urls_other_than_locked(lockfile.packages.iter(), served));
+    }
+    workspace_lockfile::with_package_rows(lockfile_path, |_, rows| {
+        urls_other_than_locked(rows.iter().copied(), served)
+    })
+    .map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to read workspace lockfile packages for writeback: {error}"
+        ))
+    })
+}
+
+pub(super) fn urls_other_than_locked<'a>(
+    rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
+    served: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    rows.filter(|package| records_tarball_url(package))
+        .filter_map(|package| {
+            let (key, url) = served.get_key_value(&locked_package_key(package))?;
+            (package.tarball.as_deref() != Some(url.as_str())).then(|| (key.clone(), url.clone()))
+        })
+        .collect()
+}
+
+/// Whether the lockfile keeps the URL that serves `package`: it does for
+/// a package from a registry, and for one whose row names no source.
+fn records_tarball_url(package: &lpm_lockfile::LockedPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+    )
+}
+
 fn patch_fresh_tarball_urls(
     lockfile: &mut lpm_lockfile::Lockfile,
     fresh_urls: &HashMap<String, String>,
 ) {
     for package in &mut lockfile.packages {
-        if matches!(
-            package.source_kind(),
-            Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
-        ) && let Some(url) = fresh_urls.get(&locked_package_key(package))
+        if records_tarball_url(package)
+            && let Some(url) = fresh_urls.get(&locked_package_key(package))
         {
             package.tarball = Some(url.clone());
         }
