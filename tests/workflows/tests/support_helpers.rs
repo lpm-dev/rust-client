@@ -40,6 +40,53 @@ fn verdaccio_startup_log_accepts_current_config_and_listen_url() {
     ));
 }
 
+/// `Command` starts no `npm` by that name on Windows, where it is a
+/// script, so the fixture that publishes with it runs on Unix only.
+#[cfg(unix)]
+#[test]
+fn the_registry_fixture_s_npm_reads_no_configuration_below_a_node_prefix() {
+    let home = tempfile::tempdir().unwrap();
+    let node_prefix = tempfile::tempdir().unwrap();
+    std::fs::create_dir(node_prefix.path().join("etc")).unwrap();
+    std::fs::write(
+        node_prefix.path().join("etc").join("npmrc"),
+        "tag=from-the-machine\n",
+    )
+    .unwrap();
+    let user_config = home.path().join(".npmrc");
+    // Nothing but the file below the prefix may decide the setting: not a
+    // project's configuration above the working directory, nor what the
+    // process that runs the tests has in its environment.
+    let tag_read_by = |mut npm: std::process::Command| {
+        let output = npm
+            .current_dir(home.path())
+            .env_remove("npm_config_tag")
+            .env_remove("NPM_CONFIG_TAG")
+            .env_remove("npm_config_prefix")
+            .env("NPM_CONFIG_PREFIX", node_prefix.path())
+            .args(["config", "get", "tag"])
+            .output()
+            .expect("run npm");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let mut reads_the_machine_s = std::process::Command::new("npm");
+    reads_the_machine_s
+        .env_remove("npm_config_userconfig")
+        .env_remove("npm_config_globalconfig")
+        .env_remove("NPM_CONFIG_GLOBALCONFIG")
+        .env("NPM_CONFIG_USERCONFIG", &user_config);
+    assert_eq!(
+        tag_read_by(reads_the_machine_s),
+        "from-the-machine",
+        "an npm that names no global configuration reads the one below its prefix"
+    );
+
+    let fixture_s = support::verdaccio::npm_configured_by(&user_config, home.path());
+
+    assert_eq!(tag_read_by(fixture_s), "latest");
+}
+
 /// The harness gives every command its own home, npm configuration and
 /// registry. A command a test builds for itself gets the account's. So a
 /// test file neither looks the binary up itself nor starts a command at
