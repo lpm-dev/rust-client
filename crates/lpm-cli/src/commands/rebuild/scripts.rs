@@ -282,14 +282,15 @@ pub(super) fn rebuild_dry_run_envelope(
 
 pub(super) fn rebuild_summary_envelope(
     successes: usize,
-    failures: usize,
+    failures: &[PackageFailure],
     force_security_floor: bool,
     build_cache: &BuildCacheMetrics,
 ) -> serde_json::Value {
     let mut json = serde_json::json!({
-        "success": failures == 0,
+        "success": failures.is_empty(),
         "built": successes,
-        "failed": failures,
+        "failed": failures.len(),
+        "failures": failures,
         "build_cache": build_cache.to_json(),
     });
     crate::security_floor::attach_security_posture(&mut json, force_security_floor);
@@ -314,6 +315,118 @@ pub(super) fn rebuild_package_failure_message(
         rebuild_package_label(pkg),
         lpm_common::sanitize_terminal_inline(&error)
     )
+}
+
+/// A package whose build failed, as the summary names it.
+#[derive(Debug, serde::Serialize)]
+pub(super) struct PackageFailure {
+    name: String,
+    version: String,
+    /// The lifecycle script that failed. `None` for a build that stopped
+    /// before its scripts began or after they ended.
+    script: Option<&'static str>,
+    reason: String,
+    /// What the user can do about it, where LPM knows.
+    hints: Vec<String>,
+}
+
+impl PackageFailure {
+    /// A package whose build a stop of the whole run ended. The run
+    /// reports the stop itself, so this one is said nowhere else.
+    pub(super) fn interrupted(pkg: &ScriptablePackage) -> Self {
+        Self {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            script: None,
+            reason: "interrupted".to_string(),
+            hints: Vec::new(),
+        }
+    }
+}
+
+/// Where a run says that a package failed: a row under the package's
+/// label, or, beside a JSON summary, one line on stderr.
+pub(super) struct FailureOutput {
+    pub(super) json: bool,
+    pub(super) label_width: usize,
+}
+
+impl FailureOutput {
+    /// A build that failed outside its scripts.
+    pub(super) fn package(
+        &self,
+        pkg: &ScriptablePackage,
+        reason: &impl std::fmt::Display,
+    ) -> PackageFailure {
+        let reason = reason.to_string();
+        if self.json {
+            install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &reason));
+        } else {
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {} {}  {}",
+                install_ui::red("✗"),
+                self.label(pkg),
+                lpm_common::sanitize_terminal_inline(&reason),
+            ));
+        }
+        PackageFailure {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            script: None,
+            reason,
+            hints: Vec::new(),
+        }
+    }
+
+    /// A lifecycle script that failed, with what may help.
+    pub(super) fn script(
+        &self,
+        pkg: &ScriptablePackage,
+        phase: &'static str,
+        reason: &str,
+        hints: Vec<String>,
+    ) -> PackageFailure {
+        if self.json {
+            // A caller that prints no summary has only this line, so it
+            // carries what may help as well.
+            let mut line = format!("{} {phase} failed: {reason}", rebuild_package_label(pkg));
+            for hint in &hints {
+                line.push_str(" (");
+                line.push_str(hint);
+                line.push(')');
+            }
+            install_ui::failed_untrusted(&line);
+        } else {
+            install_ui::detail_line(crate::install_ui::terminal_line!(
+                "  {} {}  {} failed: {}",
+                install_ui::red("✗"),
+                self.label(pkg),
+                install_ui::dim(phase),
+                lpm_common::sanitize_terminal_inline(reason),
+            ));
+            for hint in &hints {
+                install_ui::detail_line(crate::install_ui::terminal_line!(
+                    "    {}",
+                    install_ui::dim(hint),
+                ));
+            }
+        }
+        PackageFailure {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            script: Some(phase),
+            reason: reason.to_string(),
+            hints,
+        }
+    }
+
+    fn label(&self, pkg: &ScriptablePackage) -> String {
+        format!(
+            "{:<width$}",
+            rebuild_package_label(pkg),
+            width = self.label_width
+        )
+    }
 }
 
 pub(super) fn scripts_word(count: usize) -> &'static str {

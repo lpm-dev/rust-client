@@ -1765,12 +1765,59 @@ fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> Scripta
 #[test]
 fn rebuild_package_failure_message_names_package_and_error() {
     let pkg = synthetic_scriptable("green-native", false, true);
-    let message = rebuild_package_failure_message(&pkg, &"live package directory missing");
+    let message =
+        super::scripts::rebuild_package_failure_message(&pkg, &"live package directory missing");
 
     assert_eq!(
         message,
         "green-native@1.0.0 failed: live package directory missing"
     );
+}
+
+#[test]
+fn the_summary_names_each_failure_with_its_script_reason_and_hints() {
+    let pkg = synthetic_scriptable("green-native", false, true);
+    let quiet = FailureOutput {
+        json: true,
+        label_width: 0,
+    };
+    let failures = [
+        quiet.package(&pkg, &"live package directory missing"),
+        quiet.script(
+            &pkg,
+            "install",
+            "exit code 1",
+            vec!["add node-gyp to devDependencies".to_string()],
+        ),
+    ];
+
+    let summary = rebuild_summary_envelope(3, &failures, false, &BuildCacheMetrics::default());
+
+    assert_eq!(summary["success"], false);
+    assert_eq!(summary["built"], 3);
+    assert_eq!(summary["failed"], 2);
+    assert_eq!(
+        summary["failures"],
+        serde_json::json!([
+            {
+                "name": "green-native",
+                "version": "1.0.0",
+                "script": null,
+                "reason": "live package directory missing",
+                "hints": [],
+            },
+            {
+                "name": "green-native",
+                "version": "1.0.0",
+                "script": "install",
+                "reason": "exit code 1",
+                "hints": ["add node-gyp to devDependencies"],
+            },
+        ])
+    );
+    let clean = rebuild_summary_envelope(1, &[], false, &BuildCacheMetrics::default());
+    assert_eq!(clean["success"], true);
+    assert_eq!(clean["failures"], serde_json::json!([]));
 }
 
 #[test]

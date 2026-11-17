@@ -822,6 +822,78 @@ fn rebuild_fails_when_the_success_marker_cannot_be_written() {
 }
 
 #[test]
+fn rebuild_json_names_each_package_that_failed_and_why() {
+    let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none", "scripts-allow"]);
+    write_policy_manifest(&project, "rebuild-json-failures", None, &[]);
+    for (name, script) in [
+        ("builds-pkg", "exit 0"),
+        ("fails-pkg", "exit 7"),
+        ("unlinked-pkg", "exit 0"),
+    ] {
+        let store_pkg = seed_scripted_package(&project, name, "1.0.0", script);
+        if name != "unlinked-pkg" {
+            seed_wrapper(&project, &store_pkg, name, "1.0.0");
+        }
+    }
+    write_lockfile_for_packages(
+        &project,
+        &[
+            ("builds-pkg", "1.0.0"),
+            ("fails-pkg", "1.0.0"),
+            ("unlinked-pkg", "1.0.0"),
+        ],
+    );
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--force", "--no-sandbox", "--json"])
+        .output()
+        .expect("run rebuild --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("{error}\n{stdout}\n{stderr}"));
+    assert_eq!(summary["success"], false, "{summary}");
+    assert_eq!(summary["built"], 1, "{summary}");
+    assert_eq!(summary["failed"], 2, "{summary}");
+    let mut failures = summary["failures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{summary}"))
+        .clone();
+    failures.sort_by_key(|failure| failure["name"].as_str().unwrap().to_owned());
+    assert_eq!(failures.len(), 2, "{summary}");
+    assert_eq!(
+        failures[0],
+        serde_json::json!({
+            "name": "fails-pkg",
+            "version": "1.0.0",
+            "script": "postinstall",
+            "reason": "exit code 7",
+            "hints": [],
+        })
+    );
+    assert_eq!(failures[1]["name"], "unlinked-pkg", "{summary}");
+    assert_eq!(failures[1]["version"], "1.0.0", "{summary}");
+    assert_eq!(failures[1]["script"], serde_json::Value::Null, "{summary}");
+    assert!(
+        failures[1]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{summary}"
+    );
+    for name in ["fails-pkg@1.0.0", "unlinked-pkg@1.0.0"] {
+        assert_eq!(
+            stderr.lines().filter(|line| line.contains(name)).count(),
+            1,
+            "each failure is one line beside the summary:\n{stderr}"
+        );
+    }
+    assert!(!stderr.contains("builds-pkg"), "{stderr}");
+}
+
+#[test]
 fn standalone_rebuild_waits_for_the_project_install_lock() {
     let project = TempProject::empty("");
     write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
