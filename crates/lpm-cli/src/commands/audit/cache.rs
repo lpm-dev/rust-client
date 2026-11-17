@@ -244,6 +244,13 @@ impl CacheContext {
     fn for_project(project_root: &Path) -> Option<Self> {
         let canonical = project_root.canonicalize().ok()?;
         let project_id = hex::encode(Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
+        // The cache of a unit test goes where the test says, never into
+        // the home of the account that runs it.
+        #[cfg(test)]
+        assert!(
+            std::env::var_os("LPM_HOME").is_some(),
+            "a test that reaches the audit cache sets LPM_HOME"
+        );
         let lpm_root = lpm_common::LpmRoot::from_env().ok()?;
         let root = lpm_root.cache_metadata().join("audit");
         Some(Self {

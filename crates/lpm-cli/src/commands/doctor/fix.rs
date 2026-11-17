@@ -477,6 +477,8 @@ mod tests {
     #[tokio::test]
     async fn one_failed_project_install_is_not_retried_for_duplicate_findings() {
         let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().into())]);
         let checks = [
             Check::fail(&doctor_catalog::NODE_MODULES_MISSING, "missing"),
             Check::warn(&doctor_catalog::LOCKFILE_MISSING, "missing"),
