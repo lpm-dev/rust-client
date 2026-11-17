@@ -71,6 +71,10 @@ mod windows_main {
     pub(crate) const EXIT_HELPER_FAILED: i32 = 66;
 
     pub fn run() -> ! {
+        // Nothing else in this process installs one, so this can't fail.
+        let _ = tracing::subscriber::set_global_default(lpm_sandbox::helper_log::Warnings::to(
+            std::io::stderr(),
+        ));
         let argv = std::env::args_os().skip(1).collect::<Vec<_>>();
         if let [flag] = argv.as_slice()
             && flag == lpm_sandbox::helper_protocol::RELEASE_FLAG
@@ -115,7 +119,11 @@ mod windows_main {
     fn say_why(reason: std::fmt::Arguments<'_>) {
         use std::io::Write as _;
 
-        let _ = writeln!(std::io::stderr(), "lpm-sandbox-helper: {reason}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}{reason}",
+            lpm_sandbox::helper_log::PREFIX
+        );
     }
 
     /// AppContainer setup / spawn / wait. Returns the lifecycle

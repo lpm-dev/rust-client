@@ -112,6 +112,8 @@ mod windows;
 // crate-doc preamble.
 pub mod helper_protocol;
 
+pub mod helper_log;
+
 // AppContainer launcher invoked from
 // `lpm-sandbox-helper.exe` on Windows. The Win32 surface (SID,
 // DACL, STARTUPINFOEXW, Job Object) is reachable only on Windows;

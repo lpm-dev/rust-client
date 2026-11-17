@@ -324,7 +324,13 @@ pub(super) fn take_back_run_access(record: &Path, sid: PSID) -> Result<(), AppCo
     if recorded.run.is_empty() {
         return Ok(());
     }
-    let (left, _) = take_back(&recorded.run, sid, held);
+    let (left, failed) = take_back(&recorded.run, sid, held);
+    if let Some(error) = failed {
+        tracing::warn!(
+            target: "lpm_sandbox::helper_appcontainer",
+            "couldn't take back an earlier run's access: {error}",
+        );
+    }
     recorded.run = left;
     write_record(record, &recorded)
 }
@@ -410,13 +416,17 @@ fn take_back(
     let mut left = RunAccess::default();
     let mut first = None;
     let mut keep = |held: &mut Vec<PathBuf>, path: &Path, error: AppContainerError| {
-        tracing::warn!(
-            target: "lpm_sandbox::helper_appcontainer",
-            "couldn't take back an earlier run's access to {}: {error}",
-            path.display(),
-        );
         held.push(path.to_path_buf());
-        first.get_or_insert(error);
+        // The first is returned, and whoever gets it says it.
+        if first.is_none() {
+            first = Some(error);
+        } else {
+            tracing::warn!(
+                target: "lpm_sandbox::helper_appcontainer",
+                "couldn't take back an earlier run's access to {}: {error}",
+                path.display(),
+            );
+        }
     };
     let sid_address = sid as usize;
     // SAFETY: both SIDs are valid for the comparison.
