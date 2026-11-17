@@ -3107,12 +3107,14 @@ fn forwarded_for_names_a_peer_by_its_bare_address_and_an_ipv4_mapped_one_as_ipv4
 }
 
 #[test]
-fn forwarding_identity_headers_match_in_any_case_and_with_underscores() {
+fn forwarding_identity_headers_match_in_any_case_and_with_any_separator() {
     for name in [
         "x-forwarded-for",
         "X-Forwarded-For",
         "x_forwarded_for",
         "x-forwarded_proto",
+        "x.forwarded.for",
+        "x-forwarded.proto",
         "x-forwarded-anything",
         "forwarded",
         "FORWARDED",
@@ -3147,6 +3149,12 @@ fn forwarding_identity_headers_match_in_any_case_and_with_underscores() {
         "x-scheme",
         "x-https",
         "x-arr-ssl",
+        "x-original-for",
+        "x-original-proto",
+        "proxy-client-ip",
+        "wl-proxy-client-ip",
+        "x-proxyuser-ip",
+        "WL_Proxy_Client_IP",
     ] {
         assert!(is_forwarding_identity_header(name), "{name}");
     }
@@ -3159,6 +3167,7 @@ fn forwarding_identity_headers_match_in_any_case_and_with_underscores() {
         "authorization",
         "x-hostname",
         "accept",
+        "xforwardedfor",
     ] {
         assert!(!is_forwarding_identity_header(name), "{name}");
     }

@@ -837,18 +837,24 @@ pub(crate) fn is_forwarding_identity_header(name: &str) -> bool {
             "x-scheme",
             "x-https",
             "x-arr-ssl",
+            "x-original-for",
+            "x-original-proto",
+            "proxy-client-ip",
+            "wl-proxy-client-ip",
+            "x-proxyuser-ip",
         ]
         .iter()
         .any(|identity| same_header_name(name, identity))
 }
 
-/// Whether two header names match, ignoring ASCII case and treating `_` as
-/// `-`. `canonical` is lowercase and uses `-`.
+/// Whether two header names match, ignoring ASCII case and treating any
+/// separator as `-`, as servers that turn header names into variable names
+/// do. `canonical` is lowercase and uses `-`.
 fn same_header_name(name: &str, canonical: &str) -> bool {
     name.len() == canonical.len()
         && name.bytes().zip(canonical.bytes()).all(|(byte, expected)| {
             let byte = byte.to_ascii_lowercase();
-            byte == expected || (byte == b'_' && expected == b'-')
+            byte == expected || (expected == b'-' && !byte.is_ascii_alphanumeric())
         })
 }
 
