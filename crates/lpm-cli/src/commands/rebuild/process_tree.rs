@@ -2,8 +2,24 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-/// How the error of a script stopped at its time limit begins.
-pub(super) const TIMEOUT_ERROR: &str = "timeout after";
+const TIMEOUT_ERROR: &str = "timeout after";
+const BEFORE_THE_SCRIPT: &str = "before the script started";
+
+/// A Windows run's time limit also covers what its helper does before
+/// it starts the script, so reaching it doesn't mean a script ran.
+fn time_limit_error(timeout: &Duration, script_started: bool) -> String {
+    let limit = timeout.as_secs();
+    if script_started {
+        format!("{TIMEOUT_ERROR} {limit}s — process group killed")
+    } else {
+        format!("{TIMEOUT_ERROR} {limit}s {BEFORE_THE_SCRIPT}")
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn is_of_a_script_out_of_time(error: &str) -> bool {
+    error.starts_with(TIMEOUT_ERROR) && !error.contains(BEFORE_THE_SCRIPT)
+}
 
 pub(in crate::commands) fn kill_process_tree(
     child: &mut std::process::Child,
@@ -418,16 +434,40 @@ fn finish_wait_with_cleanup(
             Ok(status)
         }
         Ok(None) => {
+            let script_started = !lpm_sandbox::sandboxed_script_is_yet_to_start(pid);
             let cleanup = kill_process_tree(&mut child);
             let _ = child.wait();
             Err(with_survivors(
-                format!(
-                    "{TIMEOUT_ERROR} {}s — process group killed",
-                    timeout.as_secs()
-                ),
+                time_limit_error(timeout, script_started),
                 cleanup,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod time_limit_error_tests {
+    use super::{is_of_a_script_out_of_time, time_limit_error, with_survivors};
+    use std::time::Duration;
+
+    #[test]
+    fn a_run_stopped_before_its_script_started_does_not_blame_a_script() {
+        let limit = Duration::from_secs(30);
+        let of_a_script = time_limit_error(&limit, true);
+        let before_a_script = time_limit_error(&limit, false);
+
+        assert_eq!(of_a_script, "timeout after 30s — process group killed");
+        assert_eq!(
+            before_a_script,
+            "timeout after 30s before the script started"
+        );
+        assert!(is_of_a_script_out_of_time(&of_a_script));
+        assert!(!is_of_a_script_out_of_time(&before_a_script));
+        assert!(!is_of_a_script_out_of_time(&with_survivors(
+            before_a_script,
+            Err(lpm_sandbox::SurvivingProcesses { count: 1 }),
+        )));
+        assert!(!is_of_a_script_out_of_time("wait error: access denied"));
     }
 }
 

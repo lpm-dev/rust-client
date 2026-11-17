@@ -752,8 +752,8 @@ fn a_script_stopped_at_its_time_limit_leaves_nothing_of_its_run_set() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !out.status.success() && combined.contains("timeout after 20s"),
-        "the script should be stopped at its time limit; output:\n{combined}",
+        !out.status.success() && combined.contains("timeout after 20s — process group killed"),
+        "the script should be stopped at its time limit, after it started; output:\n{combined}",
     );
     let started = project
         .path()

@@ -1083,6 +1083,17 @@ pub fn release_sandbox_tracker(_pid: u32) -> Result<(), SurvivingProcesses> {
     Ok(())
 }
 
+/// Whether the sandboxed child `_pid` is still to start the script it was
+/// spawned for. Only a Windows child can be: its helper first waits for
+/// another run of the package's scripts in the project to end, and then
+/// sets the sandbox up. Elsewhere the child starts as its script.
+pub fn sandboxed_script_is_yet_to_start(_pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    return windows_appcontainer::script_is_yet_to_start(_pid);
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
 /// Processes a sandboxed spawn started that were still running when
 /// cleanup gave up on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
