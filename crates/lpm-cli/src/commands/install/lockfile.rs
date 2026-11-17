@@ -1250,10 +1250,21 @@ pub(super) async fn run_offline_install_phase(
             security_analysis_policy,
         )
     });
+    let checked_pins = store_v2
+        .as_ref()
+        .map(|store_v2| checked_pins_in_store(&locked, store_v2))
+        .unwrap_or_default();
     let mut missing = Vec::new();
     for p in &locked {
-        // Source-aware lookup prevents registry cache hits from satisfying local/tarball entries.
-        if !p.store_has_for_install_layout(&store, store_v2.as_ref(), project_dir) {
+        let stored = checked_pins.get(&install_pkg_key(p)).zip(store_v2.as_ref());
+        let in_store = match stored {
+            Some((stored, store_v2)) => store_v2
+                .reusable_object_dir(stored)
+                .is_ok_and(|object_dir| object_dir.is_some()),
+            // Source-aware lookup prevents registry cache hits from satisfying local/tarball entries.
+            None => p.store_has_for_install_layout(&store, store_v2.as_ref(), project_dir),
+        };
+        if !in_store {
             missing.push(format!("{}@{}", p.name, p.version));
         }
     }
@@ -1316,6 +1327,14 @@ pub(super) async fn run_offline_install_phase(
         &mut omitted_patch_targets,
         locked.iter().chain(ephemeral_packages.iter()),
     );
+    // The checks above read each package's pin as the lockfile and its
+    // signature spell it. Linking finds the object by what it is stored
+    // under.
+    for p in &mut locked {
+        if let Some(stored) = checked_pins.get(&install_pkg_key(p)) {
+            p.integrity = Some(stored.clone());
+        }
+    }
     run_link_and_finish(
         client,
         project_dir,

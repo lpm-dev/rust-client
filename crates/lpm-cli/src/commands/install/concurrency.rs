@@ -228,8 +228,13 @@ pub(super) fn spawn_cached_v2_link_tasks(
     Ok(dispatched as u64)
 }
 
+/// Checks which packages' objects the store can reuse. `checked_pins`
+/// gives, by package key, the integrity an object is stored under for a
+/// package pinned by one that names no object, and the hit is then found
+/// under that.
 pub(super) async fn prevalidate_v2_reusable_objects(
     packages: &[InstallPackage],
+    checked_pins: &HashMap<String, String>,
     store_v2: Arc<lpm_store::v2::Store>,
 ) -> Result<V2ReusablePrevalidation, LpmError> {
     let candidates: Vec<&str> = packages
@@ -240,7 +245,17 @@ pub(super) async fn prevalidate_v2_reusable_objects(
                 Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
             )
         })
-        .filter_map(|package| package.integrity.as_deref())
+        .filter_map(|package| {
+            let pin = package.integrity.as_deref()?;
+            if checked_pins.is_empty() {
+                return Some(pin);
+            }
+            Some(
+                checked_pins
+                    .get(&install_pkg_key(package))
+                    .map_or(pin, String::as_str),
+            )
+        })
         .collect();
 
     if candidates.is_empty() {

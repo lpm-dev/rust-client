@@ -3854,5 +3854,7 @@ fn record_local_source_fingerprint(
     }
 }
 
+mod checked_pins;
+
 #[cfg(test)]
 mod tests;

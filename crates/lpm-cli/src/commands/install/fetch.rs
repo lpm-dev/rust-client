@@ -552,11 +552,30 @@ pub(super) struct ProvenPin {
 /// integrity as the registry spelled it. Replacing the integrity of a
 /// signed package would leave a signature that no longer verifies, so a
 /// signed package proves nothing here and keeps its pin. The store finds
-/// a package by its sha512, so one that is both signed and pinned by a
-/// weaker hash is downloaded by every install that links it.
+/// it through [`checked_weaker_pins`] instead.
 pub(super) fn proven_weaker_pins(
     packages: &[InstallPackage],
     fetched: &HashMap<String, String>,
+) -> HashMap<String, ProvenPin> {
+    weaker_pins(packages, fetched, |package| {
+        package.registry_signatures.is_empty()
+    })
+}
+
+/// [`proven_weaker_pins`] with the signed packages as well: every pin the
+/// store can record beside the sha512 its object is kept under, so that an
+/// install whose lockfile keeps the pin finds the object by it.
+pub(super) fn checked_weaker_pins(
+    packages: &[InstallPackage],
+    fetched: &HashMap<String, String>,
+) -> HashMap<String, ProvenPin> {
+    weaker_pins(packages, fetched, |_| true)
+}
+
+fn weaker_pins(
+    packages: &[InstallPackage],
+    fetched: &HashMap<String, String>,
+    counts: impl Fn(&InstallPackage) -> bool,
 ) -> HashMap<String, ProvenPin> {
     let mut proven = HashMap::new();
     if fetched.is_empty() {
@@ -566,7 +585,7 @@ pub(super) fn proven_weaker_pins(
         let Some(pin) = package.integrity.as_deref() else {
             continue;
         };
-        if names_stored_object(pin) || !package.registry_signatures.is_empty() {
+        if names_stored_object(pin) || !counts(package) {
             continue;
         }
         let key = install_pkg_key(package);
@@ -1035,10 +1054,24 @@ pub(super) async fn run_online_fetch_phase(
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
     fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
     let v2_prevalidate_start = Instant::now();
+    let checked_pins = match store_v2_handle.as_deref() {
+        Some(store_v2) if !force && v2_mode => checked_pins_in_store(&packages, store_v2),
+        _ => HashMap::new(),
+    };
+    // What the store holds for the packages found through `checked_pins`,
+    // by package key. No bytes were checked against their pins by this
+    // install, so they stay apart from `integrity_map` and out of the
+    // lockfile.
+    let mut stored_integrities: HashMap<String, String> = HashMap::new();
     let v2_reusable_prevalidation = if !force && v2_mode {
         match store_v2_handle.as_ref() {
             Some(store_v2) => {
-                prevalidate_v2_reusable_objects(&packages, std::sync::Arc::clone(store_v2)).await?
+                prevalidate_v2_reusable_objects(
+                    &packages,
+                    &checked_pins,
+                    std::sync::Arc::clone(store_v2),
+                )
+                .await?
             }
             None => V2ReusablePrevalidation::empty(),
         }
@@ -1164,17 +1197,22 @@ pub(super) async fn run_online_fetch_phase(
         // wastes network on every package. Mock-registry workflow tests also
         // expect one tarball request per package.
         let package_key = install_pkg_key(p);
+        let pin = p.integrity.as_deref();
+        let stored_sri = pin.map(|pin| checked_pins.get(&package_key).map_or(pin, String::as_str));
         if !force
             && v2_mode
             && !is_local_source
-            && let Some(reusable_object) = p
-                .integrity
-                .as_deref()
-                .and_then(|source_sri| v2_reusable_prevalidation.reusable(source_sri))
+            && let Some(reusable_object) =
+                stored_sri.and_then(|source_sri| v2_reusable_prevalidation.reusable(source_sri))
         {
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             spec_tracker.mark_consumed_if_completed(&package_key);
+            if let Some(stored_sri) = stored_sri
+                && pin != Some(stored_sri)
+            {
+                stored_integrities.insert(package_key.clone(), stored_sri.to_owned());
+            }
             if v2_event_driven
                 && let Some(target) = p
                     .instance_id
@@ -2581,10 +2619,18 @@ pub(super) async fn run_online_fetch_phase(
         }
     }
 
-    let apply_fetch_writebacks = |packages: &mut [InstallPackage]| {
+    // A lockfile row keeps the integrity its registry signature covers,
+    // when that names no stored object: the store finds the package by
+    // its record of the pin.
+    let apply_fetch_writebacks = |packages: &mut [InstallPackage], lockfile_rows: bool| {
         for p in packages {
             let key = install_pkg_key(p);
-            if let Some(sri) = integrity_map.get(&key) {
+            let keeps_signed_pin = lockfile_rows
+                && !p.registry_signatures.is_empty()
+                && p.integrity
+                    .as_deref()
+                    .is_some_and(|pin| !names_stored_object(pin));
+            if !keeps_signed_pin && let Some(sri) = integrity_map.get(&key) {
                 p.integrity = Some(sri.clone());
             }
             if let Some(url) = fresh_urls.get(&key) {
@@ -2593,8 +2639,34 @@ pub(super) async fn run_online_fetch_phase(
         }
     };
     let proven_pins = proven_weaker_pins(&packages_for_lockfile, &integrity_map);
-    apply_fetch_writebacks(&mut packages);
-    apply_fetch_writebacks(&mut packages_for_lockfile);
+    // The packages to install carry the integrities their fetches checked,
+    // which for one held to a migrated lockfile's record is that record
+    // and not the pin its lockfile row gets.
+    if let Some(store_v2) = store_v2_handle.as_deref() {
+        let mut checked = checked_weaker_pins(&packages, &integrity_map);
+        for p in &packages {
+            if checked.is_empty() {
+                break;
+            }
+            if let Some(checked) = checked.remove(&install_pkg_key(p))
+                && let Err(error) =
+                    store_v2.record_checked_pin(&p.name, &p.version, &checked.pin, &checked.sha512)
+            {
+                tracing::debug!("the store didn't record a checked integrity: {error}");
+            }
+        }
+    }
+    apply_fetch_writebacks(&mut packages, false);
+    apply_fetch_writebacks(&mut packages_for_lockfile, true);
+    // Linking finds an object by what it is stored under.
+    for p in &mut packages {
+        if stored_integrities.is_empty() {
+            break;
+        }
+        if let Some(stored) = stored_integrities.get(&install_pkg_key(p)) {
+            p.integrity = Some(stored.clone());
+        }
+    }
 
     let fetch_ms = fetch_start.elapsed().as_millis();
     let wf_fetch_end_ms = start.elapsed().as_millis();
@@ -3652,7 +3724,7 @@ pub(super) fn spawn_speculation_dispatcher(
                     (store_v2_spec.as_deref(), integrity.as_deref())
                 {
                     store_v2
-                        .reusable_object_dir(sri)
+                        .reusable_object_dir_for_pin(&name, &version, sri)
                         .is_ok_and(|object_dir| object_dir.is_some())
                 } else {
                     store_spec.has_package(&name, &version)
@@ -3909,7 +3981,7 @@ pub(super) async fn speculative_download_and_store(
     let already_present = if let Some(v2) = store_v2 {
         match integrity {
             Some(sri) => v2
-                .reusable_object_dir(sri)
+                .reusable_object_dir_for_pin(name, version, sri)
                 .is_ok_and(|object_dir| object_dir.is_some()),
             None => store.has_package(name, version),
         }

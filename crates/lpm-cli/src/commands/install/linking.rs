@@ -130,6 +130,36 @@ pub(super) fn names_stored_object(sri: &str) -> bool {
         .is_ok_and(|integrity| integrity.algorithm == lpm_common::integrity::HashAlgorithm::Sha512)
 }
 
+/// The integrity the store keeps a package's object under, by package
+/// key, for each package pinned by an integrity that names no object
+/// itself and that an earlier fetch checked against the object's bytes. A
+/// lockfile that can't take the sha512 keeps such a pin: a frozen one, or
+/// a row whose registry signature covers it.
+pub(super) fn checked_pins_in_store(
+    packages: &[InstallPackage],
+    store: &lpm_store::v2::Store,
+) -> HashMap<String, String> {
+    let mut stored = HashMap::new();
+    let mut asked = HashSet::new();
+    for package in packages {
+        let Some(pin) = package.integrity.as_deref() else {
+            continue;
+        };
+        if pin.starts_with("sha512-") {
+            continue;
+        }
+        let key = install_pkg_key(package);
+        if asked.contains(&key) {
+            continue;
+        }
+        if let Some(object) = store.checked_pin(&package.name, &package.version, pin) {
+            stored.insert(key.clone(), object);
+        }
+        asked.insert(key);
+    }
+    stored
+}
+
 pub(super) fn build_v2_targets(
     packages: &[InstallPackage],
     link_targets: &[LinkTarget],
