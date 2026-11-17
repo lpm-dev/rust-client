@@ -664,14 +664,11 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // Looked up before anything else: the id that names the caller can
     // name another process soon after the caller ends.
     let caller = Caller::of_this_process();
-    // 1. Derive (or create) the AppContainer SID. Production supplies
-    //    the project and package's stable name and holds it until the
-    //    child exits, so no other run of it changes its grants meanwhile.
-    let _identity = args
-        .grant_record
-        .as_ref()
-        .map(|_| identity::lock(&args.appcontainer_name))
-        .transpose()?;
+    // 1. Derive (or create) the AppContainer SID. The run holds the
+    //    identity until its script's last process is gone, so no other
+    //    run of it changes its entries meanwhile. One without a grant
+    //    record sets and removes them just the same.
+    let _identity = identity::lock(&args.appcontainer_name)?;
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
