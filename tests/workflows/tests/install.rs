@@ -6780,6 +6780,42 @@ async fn mount_ms_2_1_3(mock: &MockRegistry) {
     mock.with_batch_metadata(vec![batch_meta]).await;
 }
 
+/// The harness names npm's global configuration, so a command reads the
+/// test's own file and not the machine's.
+#[tokio::test]
+async fn a_command_reads_no_npm_configuration_below_a_node_prefix() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "own-npm-configuration",
+  "version": "1.0.0",
+  "dependencies": {}
+}"#,
+    );
+    let prefix = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(prefix.path().join("etc")).unwrap();
+    std::fs::write(
+        prefix.path().join("etc").join("npmrc"),
+        "registry=http://127.0.0.1:9/\n",
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("NPM_CONFIG_PREFIX", prefix.path())
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
+        .output()
+        .expect("run the install");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assertions::assert_in_node_modules(project.path(), "ms");
+}
+
 #[tokio::test]
 async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date() {
     let mock = MockRegistry::start().await;
