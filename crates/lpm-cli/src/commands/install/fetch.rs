@@ -1651,8 +1651,9 @@ pub(super) async fn run_online_fetch_phase(
     //
     // **Override short-circuit:** `--ignore-provenance-drift-all`
     // skips the entire gate (no trusted-dependencies read, no
-    // per-package fetch). `--ignore-provenance-drift <pkg>` skips
-    // the per-package fetch for the named entries. Both paths emit a
+    // per-package fetch), and `--ignore-provenance-drift <pkg>` skips
+    // the per-package fetch for the named entries, unless strict
+    // availability still needs each package's evidence. Both paths emit a
     // concise advisory to stderr so the waived drift is auditable
     // (users explicitly asked for the opt-out; silent skip would
     // hide that they're accepting a non-zero-risk identity).
