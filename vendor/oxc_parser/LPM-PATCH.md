@@ -68,8 +68,10 @@ reads one that runs out of that too without parsing it.
    `lpm-security`'s
    `patterns_parsed_to_just_above_the_floor_turn_into_expressions_without_overflowing`
    test parses each shape it lists to the deepest nesting that fits.
-5. Bump the other `oxc_*` dependencies of `lpm-security` to the same release
-   and run `cargo test -p lpm-security`, whose deep-nesting tests cover the
+5. Bump every `oxc_*` dependency in the workspace to the same release:
+   `lpm-cli`, `lpm-runner` and `lpm-security` pin them exactly, the crates
+   share AST types, and the patch replaces `oxc_parser` for all of them.
+   Then run `cargo test -p lpm-security`, whose deep-nesting tests cover the
    parser, the AST visitors and semantic analysis.
 
 If oxc gains a depth or stack limit of its own, switch to it and drop this
