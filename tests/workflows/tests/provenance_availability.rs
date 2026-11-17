@@ -410,3 +410,32 @@ async fn approve_scripts_refuses_under_strict_availability_a_package_now_routed_
     )
     .await;
 }
+
+#[tokio::test]
+async fn waiving_provenance_drift_doesn_t_waive_strict_availability() {
+    let mock = MockRegistry::start().await;
+    let project = installed_and_blocked(&mock, Attestation::Absent, "best-effort").await;
+    let approval = approve(&project, &mock);
+    assert!(approval.status.success(), "{}", output_of(&approval));
+    write_availability(&project, "strict");
+    write_signed_unlock(&project, &["trust-bulk-approve", "provenance-ignore-drift"]);
+
+    for waiver in [
+        &["--ignore-provenance-drift-all"][..],
+        &["--ignore-provenance-drift", PACKAGE],
+    ] {
+        for installed in ["node_modules", ".lpm"] {
+            let _ = std::fs::remove_dir_all(project.path().join(installed));
+        }
+
+        let refused = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--no-skills", "--no-security-summary"])
+            .args(waiver)
+            .output()
+            .unwrap();
+
+        let output = output_of(&refused);
+        assert!(!refused.status.success(), "{waiver:?}: {output}");
+        assert!(output.contains(MISSING_EVIDENCE), "{waiver:?}: {output}");
+    }
+}

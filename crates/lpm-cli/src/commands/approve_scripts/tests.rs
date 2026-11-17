@@ -3231,44 +3231,113 @@ fn strict_availability_refuses_an_approval_whose_registry_it_cannot_tell() {
     ]);
     let outside = std::collections::HashSet::from([key("from-tarball")]);
     let vouched = [key("vouched")];
-    let check = |availability, read, requested: &[_]| {
-        require_checkable(
+    let check = |availability, read, requested: &[_], scope| {
+        unchecked_packages(
             availability,
             read,
             &recorded,
             &outside,
             &vouched,
             requested,
+            scope,
+        )
+    };
+
+    assert_eq!(
+        check(
+            Strict,
+            true,
+            &[key("vouched"), key("from-tarball")],
+            ApprovalScope::Project
+        )
+        .unwrap(),
+        []
+    );
+    for (requested, reason) in [
+        (key("rerouted"), "another registry"),
+        (key("no-source"), "doesn't record one registry"),
+    ] {
+        let unchecked = check(
+            Strict,
+            true,
+            std::slice::from_ref(&requested),
+            ApprovalScope::Project,
+        )
+        .unwrap();
+        assert_eq!(unchecked.len(), 1);
+        assert!(unchecked[0].1.contains(reason), "{}", unchecked[0].1);
+        assert_eq!(
+            check(BestEffort, true, &[requested], ApprovalScope::Project).unwrap(),
+            []
+        );
+    }
+    let unreadable = check(Strict, false, &[key("vouched")], ApprovalScope::Project).unwrap_err();
+    assert!(
+        matches!(unreadable, LpmError::ProvenanceUnavailable(_)),
+        "{unreadable:?}"
+    );
+    assert!(
+        unreadable.to_string().contains("can't be read"),
+        "{unreadable}"
+    );
+    let global = check(Strict, false, &[key("vouched")], ApprovalScope::Global)
+        .unwrap_err()
+        .to_string();
+    assert!(global.contains("lpm install -g"), "{global}");
+}
+
+#[test]
+fn a_row_without_a_source_is_recorded_from_npm_as_install_reads_it() {
+    let row = lpm_lockfile::LockedPackage {
+        name: "legacy".into(),
+        version: "1.0.0".into(),
+        source: None,
+        integrity: Some("sha512-legacy".into()),
+        ..Default::default()
+    };
+    let installed = (
+        "legacy".to_string(),
+        "1.0.0".to_string(),
+        Some("sha512-legacy".to_string()),
+    );
+
+    let recorded = recorded_registries([installed.clone()].into(), std::iter::once(&row));
+
+    assert_eq!(
+        recorded,
+        HashMap::from([(installed, "https://registry.npmjs.org".to_string())])
+    );
+}
+
+#[test]
+fn a_review_skips_only_the_packages_strict_availability_cannot_check() {
+    let key = |name: &str| (name.to_string(), "1.0.0".to_string(), None);
+    let recorded = HashMap::from([
+        (key("vouched"), "https://registry.npmjs.org".to_string()),
+        (key("rerouted"), "https://registry.npmjs.org".to_string()),
+    ]);
+    let requested = [key("vouched"), key("rerouted"), key("from-tarball")];
+    let unchecked = |read| {
+        unchecked_packages(
+            crate::provenance_fetch::AvailabilityMode::Strict,
+            read,
+            &recorded,
+            &[key("from-tarball")].into(),
+            &[key("vouched")],
+            &requested,
             ApprovalScope::Project,
         )
     };
 
-    assert!(check(Strict, true, &[key("vouched"), key("from-tarball")]).is_ok());
-    for (read, requested, reason) in [
-        (true, key("rerouted"), "another registry"),
-        (true, key("no-source"), "doesn't record one registry"),
-        (false, key("vouched"), "can't be read"),
-    ] {
-        let refusal = check(Strict, read, std::slice::from_ref(&requested)).unwrap_err();
-        assert!(
-            matches!(refusal, LpmError::ProvenanceUnavailable(_)),
-            "{refusal:?}"
-        );
-        assert!(refusal.to_string().contains(reason), "{refusal}");
-        assert!(check(BestEffort, read, &[requested]).is_ok());
-    }
-    let global = require_checkable(
-        Strict,
-        false,
-        &recorded,
-        &outside,
-        &vouched,
-        &[key("vouched")],
-        ApprovalScope::Global,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(global.contains("lpm install -g"), "{global}");
+    let skipped = unchecked(true).unwrap();
+
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].0, key("rerouted"));
+    assert!(skipped[0].1.contains("rerouted@1.0.0"), "{}", skipped[0].1);
+    assert!(
+        unchecked(false).is_err(),
+        "a lockfile that can't be read leaves no package checkable"
+    );
 }
 
 #[test]

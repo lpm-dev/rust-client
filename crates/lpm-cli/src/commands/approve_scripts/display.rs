@@ -572,6 +572,24 @@ mod provenance_status_tests {
     }
 
     #[test]
+    fn a_status_keeps_the_colour_that_says_what_it_means() {
+        let previous = lpm_common::color::enabled();
+        lpm_common::color::set_enabled(true);
+        let rejected = ProvenanceStatus::VerificationRejected {
+            reason: "bad signature".into(),
+        };
+
+        let absent = provenance_status(CardProvenance::Read(Some(&ProvenanceStatus::Absent)));
+        let failed = provenance_status(CardProvenance::Read(Some(&rejected)));
+
+        lpm_common::color::set_enabled(previous);
+        let absent = absent.unwrap();
+        let failed = failed.unwrap();
+        assert!(absent.contains("\x1b[33m"), "{absent:?}");
+        assert!(failed.contains("\x1b[31m"), "{failed:?}");
+    }
+
+    #[test]
     fn a_card_without_provenance_shows_no_line() {
         assert!(provenance_status(CardProvenance::Omitted).is_none());
     }

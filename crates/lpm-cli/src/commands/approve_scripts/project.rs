@@ -686,8 +686,8 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             runtime_sigstore_source,
         )?;
     }
-    let provenance_by_pkg = if dry_run {
-        HashMap::new()
+    let (provenance_by_pkg, unchecked) = if dry_run {
+        (HashMap::new(), Vec::new())
     } else {
         ProjectProvenance::prepare(
             registry,
@@ -696,12 +696,13 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             availability,
             json_output,
         )?
-        .fetch(
+        .review(
             effective_state.blocked_packages.iter().map(artifact_key),
             &verify_policy,
         )
         .await?
     };
+    let unchecked: HashMap<_, _> = unchecked.into_iter().collect();
 
     // Walk one at a time. Quit aborts WITHOUT writing in-progress entries
     // (atomic). The accumulator only gets flushed to disk after the loop.
@@ -719,14 +720,20 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             blocked,
             card_provenance(&provenance_by_pkg, blocked, dry_run),
         );
-        if let Some(refusal) = approval_refusal(
-            &provenance_by_pkg,
-            &blocked.name,
-            &blocked.version,
-            blocked.integrity.as_deref(),
-            runtime_enforce,
-            availability,
-        ) {
+        let refusal = unchecked
+            .get(&artifact_key(blocked))
+            .map(|reason| LpmError::ProvenanceUnavailable(reason.clone()))
+            .or_else(|| {
+                approval_refusal(
+                    &provenance_by_pkg,
+                    &blocked.name,
+                    &blocked.version,
+                    blocked.integrity.as_deref(),
+                    runtime_enforce,
+                    availability,
+                )
+            });
+        if let Some(refusal) = refusal {
             output::warn(&format!("Skipped: {refusal}"));
             skipped.push(blocked);
             println!();

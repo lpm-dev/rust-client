@@ -1692,7 +1692,12 @@ pub(super) async fn run_online_fetch_phase(
     let availability_mode = crate::provenance_fetch::AvailabilityMode::from_config(
         global_config.get_sigstore_availability().as_deref(),
     )?;
-    if !drift_ignore_policy.ignores_all() || verification_scope.verifies_all() || trust_no_downgrade
+    // Waiving drift waives the comparison with an approval's provenance,
+    // not strict availability, which still needs each package's evidence.
+    if !drift_ignore_policy.ignores_all()
+        || verification_scope.verifies_all()
+        || trust_no_downgrade
+        || availability_mode.is_strict()
     {
         let trusted = lpm_security::SecurityPolicy::from_package_json(
             &policy_project_dir.join("package.json"),
@@ -1788,7 +1793,11 @@ pub(super) async fn run_online_fetch_phase(
                 } else {
                     false
                 };
-                if drift_waived && !verification_scope.verifies_all() && !trust_no_downgrade {
+                if drift_waived
+                    && !verification_scope.verifies_all()
+                    && !trust_no_downgrade
+                    && !availability_mode.is_strict()
+                {
                     continue;
                 }
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if used_lockfile {

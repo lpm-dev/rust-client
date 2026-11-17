@@ -72,6 +72,30 @@ impl<'a> ApprovalProvenanceContext<'a> {
         artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
     ) -> Result<HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>, LpmError>
     {
+        let (statuses, unchecked) = self.read(artifacts, false).await?;
+        match unchecked.into_iter().next() {
+            Some((_, reason)) => Err(LpmError::ProvenanceUnavailable(reason)),
+            None => Ok(statuses),
+        }
+    }
+
+    /// [`Self::fetch`] for a review that asks about each package: one strict
+    /// availability can't check is returned with why, to be skipped.
+    pub(super) async fn review(
+        &self,
+        artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    ) -> Result<super::metadata::ApprovalProvenance, LpmError> {
+        self.read(artifacts, true).await
+    }
+
+    /// The provenance of `artifacts` a registry can speak for, and those
+    /// strict availability can't check. Unless `each`, a package that can't
+    /// be checked stops the read before any registry is asked.
+    async fn read(
+        &self,
+        artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
+        each: bool,
+    ) -> Result<super::metadata::ApprovalProvenance, LpmError> {
         let registries = install_registries(
             self.registry,
             &self.root.global_root(),
@@ -94,7 +118,7 @@ impl<'a> ApprovalProvenanceContext<'a> {
         let recorded = recorded_registries(keys, rows());
         let vouched =
             installed_from_their_registry(&registries, &recorded, artifacts.iter().cloned());
-        super::metadata::require_checkable(
+        let unchecked = super::metadata::unchecked_packages(
             self.availability,
             lockfiles.len() == install_roots.len(),
             &recorded,
@@ -103,13 +127,17 @@ impl<'a> ApprovalProvenanceContext<'a> {
             artifacts,
             super::metadata::ApprovalScope::Global,
         )?;
-        Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
+        if !each && !unchecked.is_empty() {
+            return Ok((HashMap::new(), unchecked));
+        }
+        let statuses = crate::provenance_fetch::fetch_provenance_for_artifacts(
             &registries.client,
             &registries.route_table,
             &vouched,
             self.verify_policy,
         )
-        .await)
+        .await;
+        Ok((statuses, unchecked))
     }
 }
 
@@ -1140,13 +1168,14 @@ pub(super) async fn run_global_interactive(
 
     // The provenance is read before the walk so each card can show it,
     // and so an approval the policy refuses isn't asked for.
-    let provenance = if dry_run {
-        HashMap::new()
+    let (provenance, unchecked) = if dry_run {
+        (HashMap::new(), Vec::new())
     } else {
         let artifacts: Vec<crate::provenance_fetch::ProvenanceArtifactKey> =
             aggregate.rows.iter().map(row_artifact).collect();
-        provenance_context.fetch(&artifacts).await?
+        provenance_context.review(&artifacts).await?
     };
+    let unchecked: HashMap<_, _> = unchecked.into_iter().collect();
     let card_provenance = |row: &crate::global_blocked_set::AggregateBlockedRow| {
         if dry_run {
             CardProvenance::NotRead
@@ -1155,6 +1184,9 @@ pub(super) async fn run_global_interactive(
         }
     };
     let refusal = |row: &crate::global_blocked_set::AggregateBlockedRow| {
+        if let Some(reason) = unchecked.get(&row_artifact(row)) {
+            return Some(LpmError::ProvenanceUnavailable(reason.clone()));
+        }
         let (name, version, integrity) = row_artifact(row);
         approval_refusal(
             &provenance,
