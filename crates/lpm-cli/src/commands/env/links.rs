@@ -165,10 +165,13 @@ pub(super) fn env_unlink(
         Some(folder) => std::env::current_dir().map_err(LpmError::Io)?.join(folder),
         None => project_dir.to_path_buf(),
     };
-    let (vault_id, removed) = lpm_vault::unlink_folder(project_dir, &folder)
+    let lpm_vault::UnlinkedFolderResult {
+        vault_id,
+        folder,
+        removed,
+    } = lpm_vault::unlink_folder(project_dir, &folder)
         .map_err(vault_error)?
         .ok_or_else(no_project)?;
-    let folder = resolved(&folder);
     if json_output {
         print_json(&serde_json::json!({
             "success": true,

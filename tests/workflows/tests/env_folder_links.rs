@@ -308,6 +308,15 @@ fn a_deleted_folder_can_be_unlinked_by_its_path() {
 
     let report = json_of(&unlink);
     assert_eq!(report["unlinked"], true, "{report}");
+    assert_eq!(
+        PathBuf::from(report["folder"].as_str().unwrap()),
+        project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("second-checkout"),
+        "the folder as linked, not as typed"
+    );
     let links = json_of(&lpm_in(
         &project,
         project.path(),

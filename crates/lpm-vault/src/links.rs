@@ -282,6 +282,10 @@ struct Resolved {
 /// values here it keeps nothing from any folder; otherwise the folder its
 /// records name, when they name one by an absolute path, becomes its first
 /// link, and the list is written so later changes start from it.
+///
+/// The recorded folder is resolved in the transaction lock, which LPM Vault
+/// shares. That happens once per vault, when its first list is written, so a
+/// folder on a volume that stalls delays only that write.
 fn resolve(store: &mut dyn LinkStore, vault_id: &str) -> Result<Resolved, String> {
     if let Some(record) = store.read(vault_id)? {
         return Ok(Resolved {

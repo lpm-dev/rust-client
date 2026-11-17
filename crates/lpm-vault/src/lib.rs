@@ -369,13 +369,30 @@ pub fn replace_damaged_folder_links(project_dir: &Path, vault_id: &str) -> Resul
 /// Unlinks `folder` from the vault `project_dir`'s lpm.json names, and
 /// returns that vault's ID and whether the folder was linked; `None` when it
 /// names none.
-pub fn unlink_folder(project_dir: &Path, folder: &Path) -> Result<Option<(String, bool)>, String> {
+/// The result of [`unlink_folder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlinkedFolderResult {
+    pub vault_id: String,
+    /// The folder as a link names it, which may be spelled otherwise than
+    /// the folder given.
+    pub folder: PathBuf,
+    pub removed: bool,
+}
+
+pub fn unlink_folder(
+    project_dir: &Path,
+    folder: &Path,
+) -> Result<Option<UnlinkedFolderResult>, String> {
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
     forget_listed(&vault_id);
     let removed = with_link_transaction(|directory| links::remove(directory, folder, &vault_id))?;
-    Ok(Some((vault_id, removed)))
+    Ok(Some(UnlinkedFolderResult {
+        vault_id,
+        folder: links::link_folder_path(folder),
+        removed,
+    }))
 }
 
 /// The vault a folder's lpm.json names, the folders linked to it on this
