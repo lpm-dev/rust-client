@@ -581,24 +581,8 @@ fn find_v3_blob_with_contents(project: &TempProject, expected: &[u8]) -> std::pa
 
 #[test]
 fn install_without_package_json_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-
-    let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").unwrap();
-    cmd.current_dir(dir.path());
-    cmd.env("HOME", home.path());
-    cmd.env("LPM_HOME", home.path().join(".lpm"));
-    cmd.env("NO_COLOR", "1");
-    cmd.env("LPM_NO_UPDATE_CHECK", "1");
-    cmd.env("LPM_DISABLE_TELEMETRY", "1");
-    cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_FORCE_FILE_VAULT", "1");
-    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
-    cmd.env(
-        "LPM_SECURITY_POLICY_PATH",
-        home.path().join(".lpm/security-policy.toml"),
-    );
-    cmd.env_remove("LPM_TOKEN");
+    let project = TempProject::without_package_json();
+    let mut cmd = lpm(&project);
 
     let output = cmd
         .args(["install"])
@@ -1606,32 +1590,9 @@ async fn install_add_walks_up_to_parent_package_json() {
     std::fs::create_dir_all(&child_dir).unwrap();
 
     // Invoke `lpm i ms` from the child subdir (no package.json there).
-    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
-    let mut cmd = assert_cmd::Command::new(bin);
+    let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.current_dir(&child_dir);
-    // Mirror lpm_with_registry's env isolation + mock-registry pointer.
-    cmd.env("HOME", project.home());
-    cmd.env("LPM_HOME", project.home().join(".lpm"));
-    cmd.env("LPM_NO_UPDATE_CHECK", "1");
-    cmd.env("LPM_DISABLE_TELEMETRY", "1");
-    cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_FORCE_FILE_VAULT", "1");
-    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
-    cmd.env(
-        "LPM_SECURITY_POLICY_PATH",
-        project.home().join(".lpm/security-policy.toml"),
-    );
-    cmd.env("NO_COLOR", "1");
-    cmd.env_remove("LPM_TOKEN");
-    cmd.args([
-        "--registry",
-        &mock.url(),
-        "--insecure",
-        "install",
-        "ms",
-        "--no-security-summary",
-        "--no-skills",
-    ]);
+    cmd.args(["install", "ms", "--no-security-summary", "--no-skills"]);
     let output = cmd.output().expect("failed to run lpm install");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1890,30 +1851,9 @@ async fn install_bare_walks_up_to_parent_package_json() {
     let child_dir = project.path().join("nested").join("deeper");
     std::fs::create_dir_all(&child_dir).unwrap();
 
-    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
-    let mut cmd = assert_cmd::Command::new(bin);
+    let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.current_dir(&child_dir);
-    cmd.env("HOME", project.home());
-    cmd.env("LPM_HOME", project.home().join(".lpm"));
-    cmd.env("LPM_NO_UPDATE_CHECK", "1");
-    cmd.env("LPM_DISABLE_TELEMETRY", "1");
-    cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_FORCE_FILE_VAULT", "1");
-    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
-    cmd.env(
-        "LPM_SECURITY_POLICY_PATH",
-        project.home().join(".lpm/security-policy.toml"),
-    );
-    cmd.env("NO_COLOR", "1");
-    cmd.env_remove("LPM_TOKEN");
-    cmd.args([
-        "--registry",
-        &mock.url(),
-        "--insecure",
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-    ]);
+    cmd.args(["install", "--no-security-summary", "--no-skills"]);
     let output = cmd.output().expect("failed to run lpm install");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

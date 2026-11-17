@@ -1282,7 +1282,7 @@ execFileSync(process.env.FIXTURE_LPM_BINARY, ['rebuild', '--dry-run'], { timeout
 require('node:fs').writeFileSync('hook-complete', 'ok');
 "#);
     lpm(&project)
-        .env("FIXTURE_LPM_BINARY", assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .env("FIXTURE_LPM_BINARY", support::lpm_binary())
         .args([
             "migrate",
             "--skip-verify",
@@ -1338,7 +1338,7 @@ assert.equal(other.status, 0);
 require('node:fs').writeFileSync('hook-complete', 'ok');
 "#);
             let mut invocation = lpm(&project);
-            invocation.env("FIXTURE_LPM_BINARY", assert_cmd::cargo::cargo_bin("lpm-rs"));
+            invocation.env("FIXTURE_LPM_BINARY", support::lpm_binary());
             invocation.env("FIXTURE_OTHER_PROJECT", other.path());
             if json_output {
                 invocation.arg("--json");
@@ -1432,7 +1432,7 @@ assert.match(result.stderr + result.stdout, /parent installation/);
 require('node:fs').writeFileSync('ancestor-checked', 'ok');
 "#);
     lpm(&outer)
-        .env("FIXTURE_LPM_BINARY", assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .env("FIXTURE_LPM_BINARY", support::lpm_binary())
         .env("FIXTURE_INNER_PROJECT", inner.path())
         .env("FIXTURE_OUTER_PROJECT", outer.path())
         .args([

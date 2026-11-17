@@ -1559,27 +1559,8 @@ fn run_missing_script_suggestions_omit_hidden_package_json_scripts() {
 
 #[test]
 fn run_without_package_json_fails() {
-    let _project = TempProject::empty("{}");
-    // Remove the package.json we just created, leaving an empty dir with
-    // an invalid package.json (no scripts field)
-    let dir = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-
-    let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").unwrap();
-    cmd.current_dir(dir.path());
-    cmd.env("HOME", home.path());
-    cmd.env("LPM_HOME", home.path().join(".lpm"));
-    cmd.env("NO_COLOR", "1");
-    cmd.env("LPM_NO_UPDATE_CHECK", "1");
-    cmd.env("LPM_DISABLE_TELEMETRY", "1");
-    cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_FORCE_FILE_VAULT", "1");
-    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
-    cmd.env(
-        "LPM_SECURITY_POLICY_PATH",
-        home.path().join(".lpm/security-policy.toml"),
-    );
-    cmd.env_remove("LPM_TOKEN");
+    let project = TempProject::without_package_json();
+    let mut cmd = lpm(&project);
 
     let output = cmd
         .args(["run", "build"])
@@ -1776,7 +1757,7 @@ process.exit(result.status === null ? 1 : result.status);
     );
 
     let output = lpm(&project)
-        .env("LPM_TEST_BIN", assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .env("LPM_TEST_BIN", support::lpm_binary())
         .args(["run", "build"])
         .output()
         .expect("failed to run lpm run build");
@@ -5526,7 +5507,7 @@ fn run_workspace_revalidates_the_root_contract_before_a_later_cache_hit() {
         .success();
     std::fs::remove_dir_all(project.path().join("packages/app/dist")).unwrap();
 
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "wait", "build", "--filter", "@test/app"]);
     let mut child = command.spawn().expect("start a blocked workspace run");
@@ -5589,7 +5570,7 @@ fn run_workspace_does_not_publish_with_a_stale_member_output_contract() {
         "const fs=require('fs'); fs.mkdirSync('old',{recursive:true}); fs.mkdirSync('new',{recursive:true}); fs.writeFileSync('old/value.txt','old'); fs.writeFileSync('new/value.txt','new'); fs.appendFileSync('executions.txt','run\\n');",
     );
 
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "wait", "build", "--filter", "@test/app"]);
     let mut child = command.spawn().expect("start a blocked workspace run");
@@ -5667,10 +5648,8 @@ fn run_workspace_does_not_publish_output_under_a_changed_root_contract() {
     );
     project.write_file("lpm.lock", "root-resolution-v1\n");
 
-    let binary = std::env::var_os("LPM_CACHE_RACE_TEST_BINARY").map_or_else(
-        || assert_cmd::cargo::cargo_bin("lpm-rs"),
-        std::path::PathBuf::from,
-    );
+    let binary = std::env::var_os("LPM_CACHE_RACE_TEST_BINARY")
+        .map_or_else(support::lpm_binary, std::path::PathBuf::from);
     support::warm_binary(&binary);
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
@@ -5754,10 +5733,8 @@ fn run_workspace_does_not_publish_output_when_member_inputs_change_during_execut
         "const fs=require('fs'); const source=fs.readFileSync('source.txt','utf8'); fs.writeFileSync('read.marker',source); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',source); fs.appendFileSync('executions.txt','run\\n');",
     );
 
-    let binary = std::env::var_os("LPM_CACHE_RACE_TEST_BINARY").map_or_else(
-        || assert_cmd::cargo::cargo_bin("lpm-rs"),
-        std::path::PathBuf::from,
-    );
+    let binary = std::env::var_os("LPM_CACHE_RACE_TEST_BINARY")
+        .map_or_else(support::lpm_binary, std::path::PathBuf::from);
     support::warm_binary(&binary);
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
@@ -5854,7 +5831,7 @@ fn run_workspace_does_not_publish_output_when_a_local_dependency_output_changes(
         "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const value=fs.readFileSync('generated/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
     );
 
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     support::warm_binary(&binary);
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
@@ -5950,7 +5927,7 @@ fn run_workspace_rechecks_transitive_local_dependency_outputs_before_publication
         "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const value=fs.readFileSync('generated/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
     );
 
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
     let mut child = command.spawn().expect("start the blocked dependent task");
@@ -6031,7 +6008,7 @@ fn run_workspace_rechecks_upstream_outputs_before_downstream_publication() {
         "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const value=fs.readFileSync('../utils/dist/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
     );
 
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/core"]);
     let mut child = command.spawn().expect("start the blocked workspace task");
@@ -6102,7 +6079,7 @@ fn task_cache_rejects_an_input_aba_change_during_execution() {
         "const fs=require('fs'); let value; if(fs.existsSync('coordinate.marker')) { fs.writeFileSync('ready.marker','ready'); const changeDeadline=Date.now()+10000; while(fs.readFileSync('source.txt','utf8')!=='source-b'&&Date.now()<changeDeadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); value=fs.readFileSync('source.txt','utf8'); fs.writeFileSync('read.marker','read'); const releaseDeadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<releaseDeadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); } else { value=fs.readFileSync('source.txt','utf8'); } fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
     );
 
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build"]);
     let mut child = command.spawn().expect("start the ABA task");

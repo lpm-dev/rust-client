@@ -779,7 +779,7 @@ fn deploy_selects_a_large_workspace_closure_within_a_small_descriptor_limit() {
     // Fewer descriptors than the closure has packages.
     let output = support::lpm_from_path(&project, std::path::Path::new("/bin/sh"))
         .args(["-c", r#"ulimit -n 96 && exec "$0" "$@""#])
-        .arg(assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .arg(support::lpm_binary())
         .args([
             "deploy",
             out.path().to_str().unwrap(),

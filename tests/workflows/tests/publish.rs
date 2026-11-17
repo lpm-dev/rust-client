@@ -1616,24 +1616,8 @@ fn publish_check_with_authored_skills_leaves_project_files_unchanged() {
 
 #[test]
 fn publish_without_package_json_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-
-    let mut cmd = assert_cmd::Command::cargo_bin("lpm-rs").unwrap();
-    cmd.current_dir(dir.path());
-    cmd.env("HOME", home.path());
-    cmd.env("LPM_HOME", home.path().join(".lpm"));
-    cmd.env("NO_COLOR", "1");
-    cmd.env("LPM_NO_UPDATE_CHECK", "1");
-    cmd.env("LPM_DISABLE_TELEMETRY", "1");
-    cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_FORCE_FILE_VAULT", "1");
-    cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
-    cmd.env(
-        "LPM_SECURITY_POLICY_PATH",
-        home.path().join(".lpm/security-policy.toml"),
-    );
-    cmd.env_remove("LPM_TOKEN");
+    let project = TempProject::without_package_json();
+    let mut cmd = lpm(&project);
 
     let output = cmd
         .args(["publish", "--dry-run", "--yes"])

@@ -51,7 +51,7 @@ fn fast_lane_install_through_sudo_fails_before_project_reads() {
 #[test]
 fn lpx_through_sudo_is_rejected() {
     let project = project();
-    let source = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let source = support::lpm_binary();
     let lpx = project.home().join("lpx");
     std::fs::copy(source, &lpx).expect("copy lpm binary as lpx");
     let mut command = lpm_from_path(&project, &lpx);
