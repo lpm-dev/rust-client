@@ -786,18 +786,20 @@ impl Drop for StoppedRun {
     }
 }
 
-#[test]
-fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
-    let project = tempfile::tempdir().expect("project tempdir");
-    let records = tempfile::tempdir().expect("record tempdir");
-    let secret = project.path().join(".env");
-    fs::write(&secret, "protected-content").expect("seed protected file");
-    let record = records.path().join("grants.json");
+/// Starts a run of the identity `profile` that reads `project`, is denied
+/// `secret` and sleeps, and returns it with the identity's SID once the
+/// denial is set.
+fn start_a_run_that_sleeps(
+    profile: &str,
+    project: &std::path::Path,
+    record: &std::path::Path,
+    secret: &std::path::Path,
+) -> (StoppedRun, String) {
     let identity = vec![
         "--protocol-version".to_string(),
         lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
         "--appcontainer-name".into(),
-        format!("LpmFilesystemStopped-{}", std::process::id()),
+        format!("{profile}-{}", std::process::id()),
         "--grant-record".into(),
         record.to_string_lossy().into_owned(),
     ];
@@ -807,12 +809,12 @@ fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
         .args(["--stdio-stdout", "null"])
         .args(["--stdio-stderr", "null"])
         .arg("--readable-dir")
-        .arg(project.path())
+        .arg(project)
         .arg("--secret-read-deny")
-        .arg(&secret)
+        .arg(secret)
         .args([
             "--",
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            POWERSHELL,
             "-NoProfile",
             "-NonInteractive",
             "-Command",
@@ -823,7 +825,7 @@ fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
     let mut run = StoppedRun { helper, identity };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let sid = loop {
-        if let Some(sid) = denied_app_containers(&secret).pop() {
+        if let Some(sid) = denied_app_containers(secret).pop() {
             break sid;
         }
         assert!(
@@ -836,17 +838,15 @@ fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    (run, sid)
+}
 
-    run.stop();
-    assert_eq!(
-        denied_app_containers(&secret),
-        std::slice::from_ref(&sid),
-        "a stopped run can't take its denial back itself"
-    );
+/// The directories `record` says a run passes through until it ends.
+fn recorded_traversal(record: &std::path::Path) -> Vec<std::path::PathBuf> {
     let recorded: serde_json::Value =
-        serde_json::from_slice(&fs::read(&record).expect("the run recorded what it set"))
+        serde_json::from_slice(&fs::read(record).expect("the run recorded what it set"))
             .expect("the record is JSON");
-    let traversed: Vec<std::path::PathBuf> = recorded["run"]["traversed"]
+    recorded["run"]["traversed"]
         .as_array()
         .map(|paths| {
             paths
@@ -855,7 +855,26 @@ fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
                 .map(std::path::PathBuf::from)
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let (mut run, sid) =
+        start_a_run_that_sleeps("LpmFilesystemStopped", project.path(), &record, &secret);
+
+    run.stop();
+    assert_eq!(
+        denied_app_containers(&secret),
+        std::slice::from_ref(&sid),
+        "a stopped run can't take its denial back itself"
+    );
+    let traversed = recorded_traversal(&record);
     for directory in &traversed {
         assert!(
             names_trustee(directory, &sid),
@@ -882,6 +901,46 @@ fn a_cleanup_takes_back_what_a_run_that_was_stopped_left_set() {
     assert_eq!(
         fs::read_to_string(&secret).expect("the host user keeps access to the secret"),
         "protected-content"
+    );
+}
+
+#[test]
+fn taking_back_a_stopped_run_leaves_the_identity_its_trees_and_its_record() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let (mut run, sid) =
+        start_a_run_that_sleeps("LpmFilesystemTakenBack", project.path(), &record, &secret);
+    run.stop();
+    let traversed = recorded_traversal(&record);
+
+    let taken_back = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&run.identity)
+        .arg("--take-back-run")
+        .output()
+        .expect("spawn the take-back");
+
+    assert!(taken_back.status.success(), "{taken_back:?}");
+    assert!(
+        denied_app_containers(&secret).is_empty(),
+        "the denial the stopped run left is taken back"
+    );
+    for directory in &traversed {
+        assert!(
+            !names_trustee(directory, &sid),
+            "the run's way through {} is taken back",
+            directory.display()
+        );
+    }
+    assert!(
+        recorded_traversal(&record).is_empty(),
+        "the record names nothing the run still holds"
+    );
+    assert!(
+        names_trustee(project.path(), &sid),
+        "the identity keeps the tree it was granted, for its next run"
     );
 }
 

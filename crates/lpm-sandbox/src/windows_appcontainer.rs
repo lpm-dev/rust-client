@@ -29,7 +29,7 @@ use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::helper_protocol::{APPCONTAINER_NAME, PROTOCOL_VERSION, StdioMode};
 use crate::{
@@ -227,6 +227,129 @@ fn release_identity(
     }
 }
 
+// ── Runs the parent may have to end ──────────────────────────────────
+
+/// A sandboxed run that is still going: its helper's process, and what
+/// names its identity to a cleanup.
+struct TrackedRun {
+    helper: std::os::windows::io::OwnedHandle,
+    helper_path: PathBuf,
+    name: String,
+    record: PathBuf,
+}
+
+/// Runs by their helper's PID. An entry holds the helper's process open,
+/// so Windows gives its PID to no other process meanwhile.
+static RUNS: LazyLock<Mutex<HashMap<u32, TrackedRun>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long the cleanup after an ended run may take before the process
+/// that ended the run stops waiting for it.
+const CLEANUP_WAIT_MS: u32 = 10_000;
+
+fn track_run(child: &Child, helper_path: &Path, name: &str, record: PathBuf) {
+    use std::os::windows::io::AsHandle as _;
+
+    match child.as_handle().try_clone_to_owned() {
+        Ok(helper) => {
+            let run = TrackedRun {
+                helper,
+                helper_path: helper_path.to_path_buf(),
+                name: name.to_owned(),
+                record,
+            };
+            RUNS.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(child.id(), run);
+        }
+        Err(error) => tracing::warn!(
+            "couldn't keep the sandbox helper's process open, so ending this run early leaves \
+             what it set until the next run or `lpm cache clean`: {error}"
+        ),
+    }
+}
+
+/// Forgets the run of the helper `pid`, which ended by itself and took
+/// back what it set.
+pub(crate) fn forget_run(pid: u32) {
+    RUNS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&pid);
+}
+
+/// Ends the helper `pid`, and with it the script in the Job the helper
+/// holds, then has a helper take back what the run set until it ended:
+/// the read denials on the project's secrets and its way through the
+/// folders above. An ended helper can't do that itself.
+pub(crate) fn end_run(pid: u32) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{INFINITE, TerminateProcess, WaitForSingleObject};
+
+    let run = RUNS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&pid);
+    let Some(run) = run else {
+        return;
+    };
+    let later = "the next run of the package or `lpm cache clean` takes it back";
+    let helper = run.helper.as_raw_handle();
+    // The helper holds its identity until it is gone, and the cleanup
+    // leaves an identity that is held alone.
+    // SAFETY: `run` owns the handle, which names the helper's process for
+    // both calls. Ending a process that already ended fails and changes
+    // nothing.
+    let gone = unsafe {
+        TerminateProcess(helper.cast(), 1);
+        WaitForSingleObject(helper.cast(), INFINITE) == WAIT_OBJECT_0
+    };
+    if !gone {
+        tracing::warn!("couldn't wait for a stopped sandbox run's helper to end; {later}");
+        return;
+    }
+    let cleanup = Command::new(&run.helper_path)
+        .arg("--protocol-version")
+        .arg(PROTOCOL_VERSION.to_string())
+        .arg("--appcontainer-name")
+        .arg(&run.name)
+        .arg("--grant-record")
+        .arg(&run.record)
+        .arg("--take-back-run")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut cleanup = match cleanup {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            tracing::warn!("couldn't take back what a stopped sandbox run set; {later}: {error}");
+            return;
+        }
+    };
+    // SAFETY: `cleanup` owns its process handle for the call.
+    let ended = unsafe { WaitForSingleObject(cleanup.as_raw_handle().cast(), CLEANUP_WAIT_MS) }
+        == WAIT_OBJECT_0;
+    if !ended {
+        let _ = cleanup.kill();
+        let _ = cleanup.wait();
+        tracing::warn!(
+            "taking back what a stopped sandbox run set took too long and was given up; {later}"
+        );
+        return;
+    }
+    match cleanup.wait_with_output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            "couldn't take back what a stopped sandbox run set; {later}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => {
+            tracing::warn!("couldn't take back what a stopped sandbox run set; {later}: {error}")
+        }
+    }
+}
+
 // ── Backend struct ───────────────────────────────────────────────────
 
 /// AppContainer backend, the one Windows backend.
@@ -331,16 +454,17 @@ impl Sandbox for AppContainerSandbox {
             .arg(PROTOCOL_VERSION.to_string());
         let name = appcontainer_name_for(&self.spec.project_dir, &self.spec.package_name);
         helper_cmd.arg("--appcontainer-name").arg(&name);
-        if let Some(records) = identity_records() {
+        let record = identity_records().map(|records| {
             record_identity(
                 &records,
                 &name,
                 &self.spec.project_dir,
                 &self.spec.package_name,
             );
-            helper_cmd
-                .arg("--grant-record")
-                .arg(grant_record_path(&records, &name));
+            grant_record_path(&records, &name)
+        });
+        if let Some(record) = &record {
+            helper_cmd.arg("--grant-record").arg(record);
         }
         if let Some(record) = sweep_record() {
             helper_cmd.arg("--sweep-record").arg(record);
@@ -490,12 +614,16 @@ impl Sandbox for AppContainerSandbox {
         helper_cmd.stderr(std::process::Stdio::from(cmd.stderr));
         helper_cmd.stdin(std::process::Stdio::from(cmd.stdin));
 
-        helper_cmd.spawn().map_err(|e| SandboxError::SpawnFailed {
+        let child = helper_cmd.spawn().map_err(|e| SandboxError::SpawnFailed {
             reason: format!(
                 "failed to spawn lpm-sandbox-helper at {}: {e}",
                 self.helper_path.display(),
             ),
-        })
+        })?;
+        if let Some(record) = record {
+            track_run(&child, &self.helper_path, &name, record);
+        }
+        Ok(child)
     }
 
     fn backend_name(&self) -> &'static str {

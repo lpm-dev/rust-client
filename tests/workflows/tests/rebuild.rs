@@ -670,6 +670,141 @@ fn rebuild_lifecycle_output_sanitizes_terminal_controls() {
     );
 }
 
+/// The entries of `path`'s permissions that deny an AppContainer access,
+/// in the form `icacls /save` writes them, which names each by its SID
+/// whatever language Windows runs in.
+#[cfg(windows)]
+fn entries_denying_an_app_container(path: &std::path::Path) -> Vec<String> {
+    let directory = tempfile::tempdir().expect("directory for the saved permissions");
+    let saved = directory.path().join("permissions");
+    let listing = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/save")
+        .arg(&saved)
+        .output()
+        .expect("icacls saves the permissions");
+    assert!(listing.status.success(), "{listing:?}");
+    let bytes = std::fs::read(&saved).expect("read the saved permissions");
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    String::from_utf16_lossy(&units)
+        .split('(')
+        .skip(1)
+        .filter_map(|entry| entry.split(')').next())
+        .filter(|entry| {
+            entry.starts_with("D;")
+                && entry
+                    .rsplit(';')
+                    .next()
+                    .is_some_and(|trustee| trustee.starts_with("S-1-15-2-"))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// An ended helper can't take back what it set for the run, so `lpm` has
+/// another one do it once it has ended the first.
+#[cfg(windows)]
+#[test]
+fn a_script_stopped_at_its_time_limit_leaves_nothing_of_its_run_set() {
+    let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
+    write_policy_manifest(&project, "rebuild-time-limit", None, &[]);
+    project.write_file(".env", "TOKEN=kept-from-scripts\n");
+    let name = "sleeps-pkg";
+    let version = "1.0.0";
+    // The script starts once the run has set everything, so the file it
+    // writes says there was something to take back.
+    let script =
+        r#"node -e "require('fs').writeFileSync('started', ''); setInterval(() => {}, 1000)""#;
+    let store_pkg = project
+        .store_dir()
+        .join("v1")
+        .join(format!("{name}@{version}"));
+    std::fs::create_dir_all(&store_pkg).unwrap();
+    std::fs::write(
+        store_pkg.join("package.json"),
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "version": version,
+            "scripts": { "postinstall": script }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(store_pkg.join(".integrity"), "sha512-fixture-skip-verify").unwrap();
+    seed_wrapper(&project, &store_pkg, name, version);
+    write_lockfile_for_packages(&project, &[(name, version)]);
+
+    let out = lpm(&project)
+        .args(["rebuild", "--all", "--timeout", "20"])
+        .output()
+        .expect("spawn lpm rebuild --all --timeout 20");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && combined.contains("timeout after 20s"),
+        "the script should be stopped at its time limit; output:\n{combined}",
+    );
+    let started = project
+        .path()
+        .join(".lpm")
+        .join("wrappers")
+        .join(format!("{name}@{version}"))
+        .join("node_modules")
+        .join(name)
+        .join("started");
+    assert!(
+        started.is_file(),
+        "the script never started, so its run set nothing to take back; output:\n{combined}",
+    );
+    let denials = entries_denying_an_app_container(&project.path().join(".env"));
+    assert!(
+        denials.is_empty(),
+        "the stopped run's identity is still denied the secret: {denials:?}"
+    );
+    let records = project
+        .home()
+        .join(".lpm")
+        .join("sandbox")
+        .join("appcontainers");
+    let recorded: Vec<serde_json::Value> = std::fs::read_dir(&records)
+        .unwrap_or_else(|error| panic!("{}: {error}\n{combined}", records.display()))
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".grants.json")
+        })
+        .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(recorded.len(), 1, "one identity ran: {recorded:?}");
+    let record = &recorded[0];
+    assert!(
+        record["trees"]
+            .as_array()
+            .is_some_and(|trees| !trees.is_empty()),
+        "the identity keeps its trees for the next run: {record}"
+    );
+    for held in ["traversed", "denied"] {
+        assert!(
+            record["run"][held]
+                .as_array()
+                .is_none_or(|paths| paths.is_empty()),
+            "the stopped run still holds what it set ({held}): {record}"
+        );
+    }
+}
+
 #[test]
 fn rebuild_named_missing_package_fails_in_json_mode() {
     let project = TempProject::empty("");

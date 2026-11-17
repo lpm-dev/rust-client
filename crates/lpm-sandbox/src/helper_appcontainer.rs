@@ -891,7 +891,8 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         let last = unsafe { GetLastError() };
         return Err(AppContainerError::ExitCode { last_error: last });
     }
-    // Descendants must stop before secret permissions are restored.
+    // The script's descendants are told to end before secret permissions
+    // are restored.
     drop(job);
     if exit_code != 0 {
         // A reader gone from the other end of stderr mustn't change the
@@ -1127,6 +1128,28 @@ pub fn run_revoke_only(args: &HelperArgs) -> Result<i32, AppContainerError> {
             });
         }
     }
+    Ok(0)
+}
+
+/// Takes back what a run of the identity that was stopped left set for as
+/// long as it lasted, as the identity's next run does before its own. The
+/// process that ended the run asks for it, so a time limit leaves no more
+/// behind than a script that exits.
+pub fn run_take_back_run(args: &HelperArgs) -> Result<i32, AppContainerError> {
+    let Some(record) = args.grant_record.as_deref() else {
+        return Err(AppContainerError::GrantRecord {
+            path: PathBuf::new(),
+            source: std::io::Error::other("--take-back-run needs --grant-record"),
+        });
+    };
+    // Whoever holds the identity is a run or a cleanup of it, and each of
+    // those takes back what an earlier run left before anything else. A
+    // run still waiting for it when it was stopped had set nothing.
+    let Some(_identity) = identity::lock_if_free(&args.appcontainer_name)? else {
+        return Ok(0);
+    };
+    let sid = derive_appcontainer_sid(&args.appcontainer_name)?;
+    identity::take_back_stopped_run(record, sid.0)?;
     Ok(0)
 }
 

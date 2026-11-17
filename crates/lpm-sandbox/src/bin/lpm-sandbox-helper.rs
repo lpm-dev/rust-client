@@ -111,6 +111,10 @@ mod windows_main {
             return lpm_sandbox::helper_appcontainer::run_revoke_only(&args)
                 .map_err(|e| e.to_string());
         }
+        if args.take_back_run {
+            return lpm_sandbox::helper_appcontainer::run_take_back_run(&args)
+                .map_err(|e| e.to_string());
+        }
         lpm_sandbox::helper_appcontainer::run_appcontainer_spawn(args).map_err(|e| e.to_string())
     }
 }

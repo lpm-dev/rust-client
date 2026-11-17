@@ -189,7 +189,17 @@ fn is_covered(path: &Path, trees: &[String]) -> bool {
 /// Holds the identity `name` for the rest of a run, against other runs
 /// of the same project and package, in any process or session.
 pub(super) fn lock(name: &str) -> Result<ProfileCreationLock, AppContainerError> {
-    setup::lock_named(&format!(r"Global\LpmSandboxIdentity-{name}"))
+    setup::lock_named(&lock_name(name))
+}
+
+/// Holds the identity `name` as [`lock`] does, unless a run or a cleanup
+/// of it holds it now.
+pub(super) fn lock_if_free(name: &str) -> Result<Option<ProfileCreationLock>, AppContainerError> {
+    setup::lock_named_within(&lock_name(name), 0)
+}
+
+fn lock_name(name: &str) -> String {
+    format!(r"Global\LpmSandboxIdentity-{name}")
 }
 
 /// Revokes the trees the identity was last granted that `current`
@@ -268,6 +278,21 @@ pub(super) fn take_back_run_access(record: &Path, sid: PSID) -> Result<(), AppCo
     let (left, _) = take_back(&recorded.run, sid);
     recorded.run = left;
     write_record(record, &recorded)
+}
+
+/// Takes back what a run of the identity that was stopped left set, for
+/// the process that stopped it. A record it can't read, or anything it
+/// can't take back, is a failure, and what is left stays in the record
+/// for the identity's next run.
+pub(super) fn take_back_stopped_run(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let mut recorded = read_record_strictly(record)?;
+    if recorded.run.is_empty() {
+        return Ok(());
+    }
+    let (left, failed) = take_back(&recorded.run, sid);
+    recorded.run = left;
+    write_record(record, &recorded)?;
+    failed.map_or(Ok(()), Err)
 }
 
 /// Removes the identity's traversal of each directory `access` names and
