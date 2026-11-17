@@ -798,7 +798,7 @@ fn fast_path_lockfile_rewrite_notices(
     }
     if url_changes.removed > 0 {
         notices.push(format!(
-            "Removed {} tarball URL(s) from lockfile: a URL with a query isn't kept",
+            "Removed {} tarball URL(s) from lockfile: a URL with a query or a fragment isn't kept",
             url_changes.removed,
         ));
     }
@@ -3858,7 +3858,7 @@ mod rewrite_notice_tests {
             notices,
             [
                 "Refreshed 1 stale tarball URL(s) in lockfile",
-                "Removed 3 tarball URL(s) from lockfile: a URL with a query isn't kept",
+                "Removed 3 tarball URL(s) from lockfile: a URL with a query or a fragment isn't kept",
             ]
         );
     }

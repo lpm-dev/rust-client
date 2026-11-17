@@ -1,6 +1,6 @@
 use crate::commands::install::{
     NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
-    prepare_npm_firewall_materialization_preflight,
+    prepare_npm_firewall_materialization_preflight, registry_materialization_route_is_public_npm,
 };
 use crate::install_ui;
 use futures::{StreamExt, TryStreamExt};
@@ -176,7 +176,7 @@ pub async fn run(
     let store = PackageStore::from_root(&lpm_root);
     let store_v2 = v2_store_for_fetch(&lpm_root)?;
 
-    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
+    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client, &route_table);
     let firewall_preflight = prepare_npm_firewall_materialization_preflight(
         project_dir,
         &firewall_packages,
@@ -582,6 +582,7 @@ fn cached_targets(
 fn npm_firewall_packages_for_fetch_targets(
     targets: &[FetchTarget],
     client: &RegistryClient,
+    route_table: &RouteTable,
 ) -> Vec<NpmFirewallMaterializationPackage> {
     let mut packages = Vec::with_capacity(targets.len());
     for target in targets {
@@ -595,6 +596,7 @@ fn npm_firewall_packages_for_fetch_targets(
                 registry_url,
                 tarball_url.as_deref(),
                 client,
+                route_table,
             ) =>
             {
                 packages.push(NpmFirewallMaterializationPackage::new(
@@ -626,16 +628,20 @@ fn registry_source_is_public_npm_package(
     registry_url: &str,
     tarball_url: Option<&str>,
     client: &RegistryClient,
+    route_table: &RouteTable,
 ) -> bool {
     if lpm_common::package_name::is_lpm_package(name) {
         return false;
     }
-    // A row from before lockfiles recorded sources names the default
-    // registry. With no kept URL to tell otherwise, it is checked as npm's.
+    // A row from before lockfiles recorded sources is fetched from its kept
+    // URL, or, without one, from the registry its name routes to.
     crate::npm_public_source::is_public_npm_origin(registry_url)
         || crate::npm_public_source::is_lpm_registry_origin(registry_url, client)
         || (registry_url == "legacy"
-            && tarball_url.is_none_or(|url| is_canonical_public_npm_tarball(name, version, url)))
+            && match tarball_url {
+                Some(url) => is_canonical_public_npm_tarball(name, version, url),
+                None => registry_materialization_route_is_public_npm(route_table, client, name),
+            })
 }
 
 fn is_canonical_public_npm_tarball(name: &str, version: &str, url: &str) -> bool {
@@ -982,10 +988,41 @@ mod tests {
             },
         }];
         let client = RegistryClient::new();
+        let routes = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
 
-        let packages = npm_firewall_packages_for_fetch_targets(&targets, &client);
+        let packages = npm_firewall_packages_for_fetch_targets(&targets, &client, &routes);
 
         assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn a_row_without_a_source_or_a_url_goes_to_the_firewall_only_when_npm_serves_it() {
+        let targets = vec![FetchTarget {
+            name: "corp-utils".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: "sha512-test".to_string(),
+            source: FetchSource::Registry {
+                registry_url: "legacy".to_string(),
+                tarball_url: None,
+            },
+        }];
+        let client = RegistryClient::new();
+        let custom = RouteTable::new(
+            lpm_registry::RouteMode::Direct,
+            lpm_registry::NpmrcConfig::parse(
+                "registry=https://registry.example.test/\n",
+                "test",
+                &|_| None,
+            ),
+        )
+        .unwrap();
+        let direct = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+
+        assert!(npm_firewall_packages_for_fetch_targets(&targets, &client, &custom).is_empty());
+        assert_eq!(
+            npm_firewall_packages_for_fetch_targets(&targets, &client, &direct).len(),
+            1
+        );
     }
 
     #[test]

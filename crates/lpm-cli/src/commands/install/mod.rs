@@ -740,6 +740,7 @@ async fn run_with_options_under_store_lock(
         policy_extension_configs: &policy_extension_configs,
         force,
         offline,
+        frozen_lockfile: frozen_lockfile_active,
         no_skills,
         restore_managed_skills,
         omit_policy,

@@ -583,6 +583,58 @@ async fn a_locked_tarball_url_with_a_query_but_no_registry_shape_is_removed() {
     assert!(!locked.contains("dummy-signature"), "{locked}");
 }
 
+/// Installs `project` with a locked URL that carries a query, through
+/// `--frozen-lockfile`, which records the install without rewriting the
+/// lockfile.
+async fn frozen_install_with_a_locked_url_query(project: &TempProject, registry: &MockRegistry) {
+    stored_with_a_locked_url_query(project, registry, with_signed_query).await;
+    lpm_with_registry(project, &registry.url())
+        .args(INSTALL)
+        .arg("--frozen-lockfile")
+        .assert()
+        .success();
+    assert!(project.read_file("lpm.lock").contains("dummy-signature"));
+}
+
+fn install_json(
+    project: &TempProject,
+    registry: &MockRegistry,
+    extra: &[&str],
+) -> serde_json::Value {
+    let output = lpm_with_registry(project, &registry.url())
+        .args(INSTALL)
+        .arg("--json")
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_of(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn an_install_after_a_frozen_one_removes_the_locked_url_query_it_kept() {
+    let registry = MockRegistry::start().await;
+    let project = single_project();
+    frozen_install_with_a_locked_url_query(&project, &registry).await;
+
+    let report = install_json(&project, &registry, &[]);
+
+    assert_ne!(report["up_to_date"], true, "{report:#}");
+    let locked = project.read_file("lpm.lock");
+    assert!(!locked.contains("dummy-signature"), "{locked}");
+}
+
+#[tokio::test]
+async fn a_repeated_frozen_install_is_up_to_date_with_a_locked_url_query() {
+    let registry = MockRegistry::start().await;
+    let project = single_project();
+    frozen_install_with_a_locked_url_query(&project, &registry).await;
+
+    let report = install_json(&project, &registry, &["--frozen-lockfile"]);
+
+    assert_eq!(report["up_to_date"], true, "{report:#}");
+}
+
 #[tokio::test]
 async fn an_install_of_one_workspace_member_removes_every_member_s_locked_url_with_a_query() {
     let registry = MockRegistry::start().await;

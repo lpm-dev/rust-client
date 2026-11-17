@@ -168,6 +168,8 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) force: bool,
     pub(super) offline: bool,
+    /// The lockfile can't be rewritten, so a URL it no longer keeps stays.
+    pub(super) frozen_lockfile: bool,
     pub(super) no_skills: bool,
     pub(super) restore_managed_skills: bool,
     pub(super) omit_policy: InstallOmitPolicy,
@@ -310,11 +312,13 @@ pub(super) async fn run_install_freshness_phase(
                             let expected = crate::workspace_discovery_cache::
                         root_provider_fingerprint_for_locked_member(input.project_dir, locked);
                             // A lockfile holding a URL it no longer keeps
-                            // needs an install to remove it.
-                            let keeps_only_recordable_urls = gate_stats
-                                .query_string
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                == 0;
+                            // needs an install to remove it, unless it's
+                            // frozen.
+                            let keeps_only_recordable_urls = input.frozen_lockfile
+                                || gate_stats
+                                    .query_string
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    == 0;
                             if expected.as_deref().map(AsRef::as_ref) == locked
                                 && keeps_only_recordable_urls
                             {
