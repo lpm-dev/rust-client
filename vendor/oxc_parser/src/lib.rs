@@ -218,6 +218,10 @@ pub struct ParserReturn<'a> {
     /// nests too deeply to parse on the stack the parser was given.
     /// [`fatal_error`](ParserReturn::fatal_error) is set too.
     pub stack_exhausted: bool,
+
+    /// Whether parsing stopped at [`ParseOptions::speculation_budget`].
+    /// [`fatal_error`](ParserReturn::fatal_error) is set too.
+    pub speculation_budget_exhausted: bool,
 }
 
 /// Parse options
@@ -285,6 +289,21 @@ pub struct ParseOptions {
     ///
     /// Default: `0`, no limit
     pub stack_floor: usize,
+
+    /// How much work the parser may spend on speculative parses.
+    ///
+    /// A speculative parse, such as of a parenthesized list that may be
+    /// arrow parameters, takes a checkpoint and rewinds to it when it fails,
+    /// and a lookahead reads a few tokens and rewinds the lexer. Each byte the
+    /// lexer has read beyond its position after such rewinds costs one, and
+    /// each lexer diagnostic copied into a checkpoint that can restore them
+    /// costs 16. When the total passes this budget, the parser stops with a
+    /// fatal error and [`ParserReturn::speculation_budget_exhausted`] set. A
+    /// budget proportional to the source's length keeps the work spent on
+    /// speculation proportional to it too.
+    ///
+    /// Default: `0`, no limit
+    pub speculation_budget: u64,
 }
 
 impl Default for ParseOptions {
@@ -297,6 +316,7 @@ impl Default for ParseOptions {
             allow_v8_intrinsics: false,
             enable_ident_hashes: true,
             stack_floor: 0,
+            speculation_budget: 0,
         }
     }
 }
@@ -692,6 +712,15 @@ struct ParserImpl<'a, C: ParserConfig> {
 
     /// Parsing reached [`ParseOptions::stack_floor`].
     stack_exhausted: bool,
+
+    /// [`ParseOptions::speculation_budget`], with `u64::MAX` for no limit.
+    speculation_limit: u64,
+
+    /// Lexer diagnostics copied into checkpoints so far.
+    diagnostics_copied: u64,
+
+    /// Parsing reached [`ParseOptions::speculation_budget`].
+    speculation_budget_exhausted: bool,
 }
 
 impl<'a, C: ParserConfig> ParserImpl<'a, C> {
@@ -725,6 +754,13 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             module_record_builder: ModuleRecordBuilder::new(allocator, source_type),
             is_ts: source_type.is_typescript(),
             stack_exhausted: false,
+            speculation_limit: if options.speculation_budget == 0 {
+                u64::MAX
+            } else {
+                options.speculation_budget
+            },
+            diagnostics_copied: 0,
+            speculation_budget_exhausted: false,
         }
     }
 
@@ -819,6 +855,7 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             fatal_error: has_fatal_error,
             is_flow_language,
             stack_exhausted: self.stack_exhausted,
+            speculation_budget_exhausted: self.speculation_budget_exhausted,
         }
     }
 

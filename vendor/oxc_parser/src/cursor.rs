@@ -12,6 +12,10 @@ use crate::{
     lexer::{Kind, LexerCheckpoint, Token, cold_branch},
 };
 
+/// Speculation budget spent on each lexer diagnostic copied into a
+/// checkpoint, in bytes read.
+const DIAGNOSTIC_COPY_COST: u64 = 16;
+
 pub struct ParserCheckpoint<'a> {
     lexer: LexerCheckpoint<'a>,
     cur_token: Token,
@@ -108,19 +112,20 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         if self.token.escaped() && kind.is_any_keyword() {
             self.report_escaped_keyword(self.token.span());
         }
-        self.check_stack_floor();
+        self.check_parse_limits();
         self.prev_token_end = self.token.end();
         self.token = self.lexer.next_token();
     }
 
     /// Stop with a fatal error once the stack pointer is below
-    /// `ParseOptions::stack_floor`, and on every token read after that. The
-    /// fatal error moves the lexer to the end of the source, so every caller
-    /// unwinds without reading more tokens.
+    /// `ParseOptions::stack_floor` or speculative parses have spent more
+    /// than `ParseOptions::speculation_budget` allows, and on every token
+    /// read after that. The fatal error moves the lexer to the end of the source,
+    /// so every caller unwinds without reading more tokens.
     #[inline]
-    fn check_stack_floor(&mut self) {
-        if self.stack_exhausted || self.below_stack_floor() {
-            self.stop_at_stack_floor();
+    fn check_parse_limits(&mut self) {
+        if self.stack_exhausted || self.speculation_budget_exhausted || self.below_stack_floor() {
+            self.stop_at_parse_limit();
         }
     }
 
@@ -132,13 +137,24 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         (&raw const marker).addr() < self.options.stack_floor
     }
 
-    /// A speculative parse that reaches the floor rewinds its fatal error
-    /// away. Were the error only set below the floor, each level of
-    /// speculation would parse its other reading back down to the floor,
-    /// quadratic in time and in arena memory, so it is set again on every
-    /// token read once the floor was reached. `stack_exhausted` stays set:
-    /// the speculation's outcome, and so the AST, may differ from what a
-    /// deeper stack would have produced, and callers discard the parse.
+    /// A speculative parse that reaches a limit rewinds its fatal error
+    /// away. Were the error only set past the limit, each level of
+    /// speculation would parse its other reading back down to it, quadratic
+    /// in time and in arena memory, so it is set again on every token read
+    /// once a limit was reached. `stack_exhausted` and
+    /// `speculation_budget_exhausted` stay set: the speculation's outcome, and so
+    /// the AST, may differ from what a parse without the limit would have
+    /// produced, and callers discard the parse.
+    #[cold]
+    #[inline(never)]
+    fn stop_at_parse_limit(&mut self) {
+        if self.speculation_budget_exhausted && !self.stack_exhausted {
+            self.set_fatal_error(diagnostics::speculation_budget_exhausted(self.token.span()));
+        } else {
+            self.stop_at_stack_floor();
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn stop_at_stack_floor(&mut self) {
@@ -158,7 +174,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// Move to the next `JSXChild`
     /// Checks if the current token is escaped if it is a keyword
     pub(crate) fn advance_for_jsx_child(&mut self) {
-        self.check_stack_floor();
+        self.check_parse_limits();
         self.prev_token_end = self.token.end();
         self.token = self.lexer.next_jsx_child();
     }
@@ -277,7 +293,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
     /// Move to the next token, lexing it as a JSX attribute value.
     pub(crate) fn advance_for_jsx_attribute_value(&mut self) {
-        self.check_stack_floor();
+        self.check_parse_limits();
         self.prev_token_end = self.token.end();
         self.token = self.lexer.next_jsx_attribute_value();
     }
@@ -368,6 +384,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     pub(crate) fn checkpoint_with_error_recovery(&mut self) -> ParserCheckpoint<'a> {
+        // The lexer's checkpoint copies every diagnostic it has recorded.
+        self.diagnostics_copied += self.lexer.errors.len() as u64;
+        self.check_speculation_budget();
         ParserCheckpoint {
             lexer: self.lexer.checkpoint_with_error_recovery(),
             cur_token: self.token,
@@ -382,10 +401,27 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             checkpoint;
 
         self.lexer.rewind(lexer);
+        self.check_speculation_budget();
         self.token = cur_token;
         self.prev_token_end = prev_token_end;
         self.errors.truncate(errors_pos);
         self.fatal_error = fatal_error;
+    }
+
+    /// Sets the budget's stop once the work spent on speculation passes it:
+    /// the bytes the lexer has read beyond its position, which a rewind made
+    /// it read or will make it read again, and the diagnostics copied into
+    /// checkpoints, each an allocation of about a hundred bytes, at
+    /// [`DIAGNOSTIC_COPY_COST`] each. A parse already stopped at the stack
+    /// floor is unwinding, and reads nothing again.
+    #[inline]
+    fn check_speculation_budget(&mut self) {
+        let work = self.lexer.bytes_read_ahead().saturating_add(
+            self.diagnostics_copied.saturating_mul(DIAGNOSTIC_COPY_COST),
+        );
+        if !self.stack_exhausted && work > self.speculation_limit {
+            self.speculation_budget_exhausted = true;
+        }
     }
 
     pub(crate) fn lookahead<U>(&mut self, predicate: impl Fn(&mut ParserImpl<'a, C>) -> U) -> U {
