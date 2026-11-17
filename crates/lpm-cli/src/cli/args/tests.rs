@@ -2169,10 +2169,52 @@ fn why_top_level_command_parses_package_name() {
     let cli = Cli::try_parse_from(["lpm", "--json", "why", "zod"]).unwrap();
     assert!(cli.json);
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Why(lifecycle::WhyArgs { package }) => {
+        Commands::Why(lifecycle::WhyArgs {
+            package,
+            depth,
+            paths,
+        }) => {
             assert_eq!(package, "zod");
+            assert_eq!(depth, None);
+            assert_eq!(paths.limit(), Some(1_000));
         }
         _ => panic!("expected Why command"),
+    }
+}
+
+#[test]
+fn why_commands_parse_their_path_limit_and_depth() {
+    let cli = Cli::try_parse_from(["lpm", "why", "zod", "--depth", "3", "--limit", "5"]).unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Why(lifecycle::WhyArgs { depth, paths, .. }) => {
+            assert_eq!(depth.map(NonZeroUsize::get), Some(3));
+            assert_eq!(paths.limit(), Some(5));
+        }
+        _ => panic!("expected Why command"),
+    }
+    let cli = Cli::try_parse_from(["lpm", "graph", "--why", "zod", "--all-paths"]).unwrap();
+    match cli.command.expect("test parse missing subcommand") {
+        Commands::Graph(lifecycle::GraphArgs {
+            limit, all_paths, ..
+        }) => {
+            assert_eq!(
+                lifecycle::WhyPathLimitArgs { limit, all_paths }.limit(),
+                None
+            );
+        }
+        _ => panic!("expected Graph command"),
+    }
+}
+
+#[test]
+fn why_path_limits_are_refused_where_they_mean_nothing() {
+    for args in [
+        &["lpm", "graph", "--limit", "5"][..],
+        &["lpm", "graph", "--all-paths"],
+        &["lpm", "why", "zod", "--limit", "5", "--all-paths"],
+        &["lpm", "why", "zod", "--limit", "0"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
     }
 }
 

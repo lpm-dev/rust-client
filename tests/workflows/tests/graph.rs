@@ -576,9 +576,31 @@ fn write_simple_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])
 }
 
 fn dense_why_project(depth: usize) -> TempProject {
-    let project = TempProject::empty(
-        r#"{"name":"dense-why","version":"1.0.0","dependencies":{"branch-0-a":"1.0.0","branch-0-b":"1.0.0"}}"#,
-    );
+    dense_why_project_with(depth, DenseWhyExtras::default())
+}
+
+/// What a dense why fixture adds to its reconverging chain.
+#[derive(Default)]
+struct DenseWhyExtras {
+    /// A direct dependency beside the chain, which no chain package reaches.
+    lone_direct: bool,
+    /// An edge from the chain's last level back to its first, which makes
+    /// the graph cyclic without adding a path to `target`.
+    back_edge: bool,
+}
+
+/// A chain of `depth` levels in which every level has two packages that
+/// both depend on the next level's shared package, so `target` below the
+/// chain is reached by 2^`depth` paths.
+fn dense_why_project_with(depth: usize, extras: DenseWhyExtras) -> TempProject {
+    let lone = if extras.lone_direct {
+        r#","lone":"1.0.0""#
+    } else {
+        ""
+    };
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"dense-why","version":"1.0.0","dependencies":{{"branch-0-a":"1.0.0","branch-0-b":"1.0.0"{lone}}}}}"#
+    ));
     let mut lockfile = String::with_capacity(depth.saturating_mul(512));
     lockfile.push_str("[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n");
 
@@ -591,8 +613,13 @@ fn dense_why_project(depth: usize) -> TempProject {
         }
 
         if level + 1 == depth {
+            let back_edge = if extras.back_edge {
+                "\"branch-0-a@1.0.0\", "
+            } else {
+                ""
+            };
             packages.push(format!(
-                "[[packages]]\nname = \"shared-{level}\"\nversion = \"1.0.0\"\ndependencies = [\"target@1.0.0\"]\n"
+                "[[packages]]\nname = \"shared-{level}\"\nversion = \"1.0.0\"\ndependencies = [{back_edge}\"target@1.0.0\"]\n"
             ));
         } else {
             packages.push(format!(
@@ -604,6 +631,9 @@ fn dense_why_project(depth: usize) -> TempProject {
     }
 
     packages.push("[[packages]]\nname = \"target\"\nversion = \"1.0.0\"\n".to_string());
+    if extras.lone_direct {
+        packages.push("[[packages]]\nname = \"lone\"\nversion = \"1.0.0\"\n".to_string());
+    }
     packages.sort_unstable();
     for package in packages {
         lockfile.push_str(&package);
@@ -881,6 +911,171 @@ fn why_commands_return_every_dense_graph_path_in_json_output() {
         ),
         (Some(EXPECTED_PATHS as u64), Some(EXPECTED_PATHS))
     );
+}
+
+/// How long a why command may take on a graph whose paths it must not try
+/// one by one. Trying them all would take far longer.
+const WHY_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn run_why(project: &TempProject, args: &[&str]) -> std::process::Output {
+    let output = lpm(project)
+        .args(args)
+        .timeout(WHY_TIME_LIMIT)
+        .output()
+        .expect("run a why command");
+    assert!(
+        output.status.success(),
+        "{args:?} must succeed in time ({:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+fn rendered_why_paths(stdout: &str, target: &str) -> usize {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("  ") && line.ends_with(target))
+        .count()
+}
+
+#[test]
+fn why_on_a_direct_dependency_ignores_an_unrelated_dense_subgraph() {
+    let project = dense_why_project_with(
+        40,
+        DenseWhyExtras {
+            lone_direct: true,
+            ..DenseWhyExtras::default()
+        },
+    );
+
+    for args in [&["why", "lone"][..], &["graph", "--why", "lone"]] {
+        let output = run_why(&project, args);
+
+        let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+        assert!(stdout.contains("required by 1 path(s)"), "{stdout}");
+        assert_eq!(rendered_why_paths(&stdout, "lone@1.0.0"), 1, "{stdout}");
+    }
+}
+
+#[test]
+fn why_shows_the_first_thousand_paths_and_the_exact_total_of_a_dense_graph() {
+    const TOTAL: u64 = 1 << 40;
+    let project = dense_why_project(40);
+
+    let human = run_why(&project, &["why", "target"]);
+    let json = run_why(&project, &["--json", "why", "target"]);
+
+    let stdout = strip_ansi(&String::from_utf8_lossy(&human.stdout));
+    // 1,000 paths of 82 packages each.
+    assert!(human.stdout.len() < 4 << 20, "{} bytes", human.stdout.len());
+    assert!(
+        stdout.contains(&format!("required by {TOTAL} path(s)")),
+        "{stdout}"
+    );
+    assert_eq!(rendered_why_paths(&stdout, "target@1.0.0"), 1_000);
+    assert!(
+        stdout.contains(&format!(
+            "… and {} more path(s). Use --limit <N> or --all-paths to show more.",
+            TOTAL - 1_000
+        )),
+        "{stdout}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["path_count"], TOTAL);
+    assert_eq!(report["path_count_exact"], true);
+    assert_eq!(report["paths_truncated"], true);
+    assert_eq!(report["paths"].as_array().map(Vec::len), Some(1_000));
+    assert_eq!(report["path_keys"], report["paths"]);
+}
+
+#[test]
+fn why_limit_and_all_paths_choose_how_many_paths_are_shown() {
+    const TOTAL: usize = 1 << 7;
+    let project = dense_why_project(7);
+
+    for command in [&["why", "target"][..], &["graph", "--why", "target"]] {
+        let limited = run_why(&project, &[command, &["--limit", "5"]].concat());
+        let every = run_why(&project, &[command, &["--all-paths"]].concat());
+        let limited_json = run_why(
+            &project,
+            &[&["--json"], command, &["--limit", "5"]].concat(),
+        );
+
+        let limited = strip_ansi(&String::from_utf8_lossy(&limited.stdout));
+        assert_eq!(rendered_why_paths(&limited, "target@1.0.0"), 5, "{limited}");
+        assert!(
+            limited.contains(&format!("… and {} more path(s).", TOTAL - 5)),
+            "{limited}"
+        );
+        let every = strip_ansi(&String::from_utf8_lossy(&every.stdout));
+        assert_eq!(rendered_why_paths(&every, "target@1.0.0"), TOTAL, "{every}");
+        assert!(!every.contains("more path(s)"), "{every}");
+        let report: serde_json::Value = serde_json::from_slice(&limited_json.stdout).unwrap();
+        assert_eq!(report["path_count"], TOTAL);
+        assert_eq!(report["paths"].as_array().map(Vec::len), Some(5));
+        assert_eq!(report["paths_truncated"], true);
+    }
+}
+
+#[test]
+fn why_reports_a_lower_bound_when_a_graph_with_a_cycle_has_more_paths_than_it_shows() {
+    let project = dense_why_project_with(
+        12,
+        DenseWhyExtras {
+            back_edge: true,
+            ..DenseWhyExtras::default()
+        },
+    );
+
+    let limited = run_why(&project, &["--json", "why", "target"]);
+    let every = run_why(&project, &["--json", "why", "target", "--all-paths"]);
+    let human = run_why(&project, &["why", "target"]);
+
+    let limited: serde_json::Value = serde_json::from_slice(&limited.stdout).unwrap();
+    assert_eq!(limited["path_count"], 1_001);
+    assert_eq!(limited["path_count_exact"], false);
+    assert_eq!(limited["paths_truncated"], true);
+    assert_eq!(limited["paths"].as_array().map(Vec::len), Some(1_000));
+    let every: serde_json::Value = serde_json::from_slice(&every.stdout).unwrap();
+    assert_eq!(every["path_count"], 1 << 12);
+    assert_eq!(every["path_count_exact"], true);
+    assert_eq!(every["paths_truncated"], false);
+    let human = strip_ansi(&String::from_utf8_lossy(&human.stdout));
+    assert!(
+        human.contains("required by at least 1001 path(s)"),
+        "{human}"
+    );
+    assert!(human.contains("… and at least 1 more path(s)."), "{human}");
+}
+
+#[test]
+fn why_depth_traces_only_the_levels_it_names() {
+    let project = TempProject::empty(
+        r#"{"name":"why-depth","version":"1.0.0","dependencies":{"near":"1.0.0","far":"1.0.0"}}"#,
+    );
+    write_simple_lockfile(
+        &project,
+        &[
+            ("deep", "1.0.0", &["target@1.0.0"]),
+            ("far", "1.0.0", &["middle@1.0.0"]),
+            ("middle", "1.0.0", &["deep@1.0.0"]),
+            ("near", "1.0.0", &["target@1.0.0"]),
+            ("target", "1.0.0", &[]),
+        ],
+    );
+
+    let shallow = run_why(&project, &["why", "target", "--depth", "3"]);
+    let deep = run_why(&project, &["why", "target"]);
+    let graph = run_why(&project, &["graph", "--why", "target", "--depth", "3"]);
+
+    let shallow = strip_ansi(&String::from_utf8_lossy(&shallow.stdout));
+    assert!(shallow.contains("required by 1 path(s)"), "{shallow}");
+    assert!(shallow.contains("near@1.0.0 → target@1.0.0"), "{shallow}");
+    let deep = strip_ansi(&String::from_utf8_lossy(&deep.stdout));
+    assert!(deep.contains("required by 2 path(s)"), "{deep}");
+    assert_eq!(shallow, strip_ansi(&String::from_utf8_lossy(&graph.stdout)));
 }
 
 #[test]

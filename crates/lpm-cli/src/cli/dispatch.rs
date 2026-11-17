@@ -3109,6 +3109,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                 package,
                 format,
                 why,
+                limit,
+                all_paths,
                 depth,
                 filter,
                 prod,
@@ -3116,10 +3118,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 no_open,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let why_path_limit = lifecycle_args::WhyPathLimitArgs { limit, all_paths }.limit();
             commands::graph::run(
                 &cwd,
                 package.as_deref(),
                 why.as_deref(),
+                why_path_limit,
                 &format,
                 depth.map(std::num::NonZeroUsize::get),
                 filter.as_deref(),
@@ -3133,14 +3137,17 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Why(args) => {
             let lifecycle_args::WhyArgs {
                 package,
+                depth,
+                paths,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::graph::run(
                 &cwd,
                 None,
                 Some(package.as_str()),
+                paths.limit(),
                 "tree",
-                None,
+                depth.map(std::num::NonZeroUsize::get),
                 None,
                 false,
                 false,
