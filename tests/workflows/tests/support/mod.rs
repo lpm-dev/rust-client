@@ -278,15 +278,18 @@ impl TempProject {
 
     /// Create an empty project with just a package.json.
     pub fn empty(package_json: &str) -> Self {
-        let dir = TempDir::new().expect("failed to create temp project dir");
-        let home = TempDir::new().expect("failed to create temp home dir");
-
-        std::fs::write(dir.path().join("package.json"), package_json)
+        let project = Self::without_package_json();
+        std::fs::write(project.path().join("package.json"), package_json)
             .expect("failed to write package.json");
+        project
+    }
 
+    /// Create a folder that holds no project, for a command that must say
+    /// it found none.
+    pub fn without_package_json() -> Self {
         TempProject {
-            dir,
-            home,
+            dir: TempDir::new().expect("failed to create temp project dir"),
+            home: TempDir::new().expect("failed to create temp home dir"),
             npm_registry: std::sync::Mutex::default(),
         }
     }
@@ -1057,9 +1060,17 @@ pub fn lpm_spawnable_from_path(project: &TempProject, binary: &Path) -> std::pro
 /// The `lpm-rs` under test, launched by [`warm_binary`] before the first
 /// command built for it.
 fn lpm_under_test() -> PathBuf {
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = lpm_binary();
     warm_binary(&binary);
     binary
+}
+
+/// Where the `lpm-rs` under test is, for a test that copies it or names
+/// it to another program. A command for it comes from [`lpm`],
+/// [`lpm_from_path`] or their siblings, never from this path directly:
+/// only they give it the test's own home, npm configuration and registry.
+pub fn lpm_binary() -> PathBuf {
+    assert_cmd::cargo::cargo_bin("lpm-rs")
 }
 
 /// Runs `binary --version` once per test process. macOS holds the first launch

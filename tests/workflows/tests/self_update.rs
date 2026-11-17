@@ -157,7 +157,7 @@ fn managed_lpm_path(
     project: &TempProject,
     relative_parent: std::path::PathBuf,
 ) -> std::path::PathBuf {
-    let source = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let source = support::lpm_binary();
     let file_name = if cfg!(windows) {
         "lpm-rs.exe"
     } else {
@@ -428,7 +428,7 @@ fn self_update_up_to_date_reports_the_sandbox_helper_beside_a_standalone_lpm() {
     let bin = project.home().join(".lpm").join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let standalone = bin.join("lpm.exe");
-    std::fs::copy(assert_cmd::cargo::cargo_bin("lpm-rs"), &standalone).unwrap();
+    std::fs::copy(support::lpm_binary(), &standalone).unwrap();
     std::fs::copy(&helper, bin.join("lpm-sandbox-helper.exe")).unwrap();
     std::fs::create_dir_all(cache_path(&project).parent().unwrap()).unwrap();
     let payload = serde_json::json!({ "latest": current, "lastCheck": now_secs() });
@@ -1390,7 +1390,7 @@ fn self_update_rejects_a_project_local_executable_before_manager_mutation() {
         .join("cli")
         .join("lpm-rs");
     std::fs::create_dir_all(local.parent().unwrap()).expect("create local package path");
-    std::fs::copy(assert_cmd::cargo::cargo_bin("lpm-rs"), &local).expect("copy project-local LPM");
+    std::fs::copy(support::lpm_binary(), &local).expect("copy project-local LPM");
     let tools = tempfile::tempdir().expect("create external manager tools");
     let marker = tools.path().join("installer-ran");
     let installer = tools.path().join("npm");

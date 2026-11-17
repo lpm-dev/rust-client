@@ -2884,7 +2884,7 @@ async fn audit_high_threshold_ignores_moderate_vulnerability() {
 
 #[tokio::test]
 async fn run_preserves_audit_fail_on_vuln_exit_status() {
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let binary = support::lpm_binary();
     let script = format!("\"{}\" audit --level high --fail-on vuln", binary.display());
     let project = TempProject::empty(
         &serde_json::json!({

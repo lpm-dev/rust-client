@@ -133,7 +133,7 @@ fn run_install(project: &TempProject) -> Output {
 #[cfg(unix)]
 fn run_install_under_time(project: &TempProject) -> (Output, Option<u64>) {
     use std::process::{Command, Stdio};
-    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let bin = support::lpm_binary();
     let time_path = Path::new("/usr/bin/time")
         .exists()
         .then_some("/usr/bin/time");
