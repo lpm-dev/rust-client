@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
+use crate::helper_appcontainer::ScriptJob;
 use crate::helper_protocol::{APPCONTAINER_NAME, PROTOCOL_VERSION, StdioMode};
 use crate::{
     Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec, SandboxStdio,
@@ -229,13 +230,21 @@ fn release_identity(
 
 // ── Runs the parent may have to end ──────────────────────────────────
 
-/// A sandboxed run that is still going: its helper's process, and what
-/// names its identity to a cleanup.
+/// A sandboxed run that is still going: its helper's process, and what a
+/// cleanup after it needs.
 struct TrackedRun {
     helper: std::os::windows::io::OwnedHandle,
+    started: StartedRun,
+}
+
+/// The Job a run's script runs in, and what names the run's identity to
+/// the helper that cleans up after it.
+struct StartedRun {
     helper_path: PathBuf,
     name: String,
     record: PathBuf,
+    job_name: String,
+    job: ScriptJob,
 }
 
 /// Runs by their helper's PID. An entry holds the helper's process open,
@@ -243,44 +252,106 @@ struct TrackedRun {
 static RUNS: LazyLock<Mutex<HashMap<u32, TrackedRun>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// How long the cleanup after an ended run may take before the process
-/// that ended the run stops waiting for it.
-const CLEANUP_WAIT_MS: u32 = 10_000;
+/// How long each step of the cleanup after an ended run may take before
+/// the process that ended the run stops waiting for it.
+const CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn track_run(child: &Child, helper_path: &Path, name: &str, record: PathBuf) {
+/// A name for a run's Job that no other run on the machine has. A later
+/// run of the identity opens the Job by it from any session, as it takes
+/// the identity's lock from any.
+fn run_job_name() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let unguessed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!(
+        r"Global\LpmSandboxRun-{}-{}-{unguessed:016x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+/// Keeps `started` for the run of the helper `child`. A run that can't be
+/// kept couldn't be ended at its time limit, so it is ended now instead.
+fn track_run(child: &mut Child, started: StartedRun) -> Result<(), SandboxError> {
     use std::os::windows::io::AsHandle as _;
 
     match child.as_handle().try_clone_to_owned() {
         Ok(helper) => {
-            let run = TrackedRun {
-                helper,
-                helper_path: helper_path.to_path_buf(),
-                name: name.to_owned(),
-                record,
-            };
             RUNS.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(child.id(), run);
+                .insert(child.id(), TrackedRun { helper, started });
+            Ok(())
         }
-        Err(error) => tracing::warn!(
-            "couldn't keep the sandbox helper's process open, so ending this run early leaves \
-             what it set until the next run or `lpm cache clean`: {error}"
-        ),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            clean_up_after(&started);
+            Err(SandboxError::SpawnFailed {
+                reason: format!("couldn't keep the sandbox helper's process open: {error}"),
+            })
+        }
     }
 }
 
-/// Forgets the run of the helper `pid`, which ended by itself and took
-/// back what it set.
-pub(crate) fn forget_run(pid: u32) {
-    RUNS.lock()
+const TAKEN_BACK_LATER: &str = "the next run of the package or `lpm cache clean` takes it back";
+
+/// Releases the run of the helper `pid`, which ended by itself. A helper
+/// that ended as it should has ended its script and taken back what the
+/// run set. One that was stopped from outside did neither: its script is
+/// still in the Job, or its record still names the run, and the run is
+/// cleaned up as one this process ended.
+///
+/// A record that can't be read names no run to clean up after. A helper
+/// that stopped at it before it started a script has said so. One whose
+/// script ran got past the record while it could be read, and can't have
+/// taken the run out of it since, so that is said here.
+pub(crate) fn finish_run(pid: u32) {
+    let run = RUNS
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&pid);
+    let Some(run) = run else {
+        return;
+    };
+    match AfterRun::of(&run.started) {
+        AfterRun::CleanUp => clean_up_after(&run.started),
+        AfterRun::Unknown(error) => {
+            tracing::warn!("couldn't tell whether a sandbox run took back what it set: {error}");
+        }
+        AfterRun::Nothing => {}
+    }
 }
 
-/// Ends the helper `pid`, and with it the script in the Job the helper
-/// holds, then has a helper take back what the run set until it ended:
-/// the read denials on the project's secrets and its way through the
-/// folders above. An ended helper can't do that itself.
+/// What is left to do for a run whose helper ended by itself.
+#[derive(Debug)]
+enum AfterRun {
+    CleanUp,
+    /// The record can't be read, and the run got as far as its script.
+    Unknown(crate::helper_appcontainer::AppContainerError),
+    Nothing,
+}
+
+impl AfterRun {
+    fn of(run: &StartedRun) -> Self {
+        let script_is_left = !matches!(run.job.active_processes(), Ok(0));
+        match crate::helper_appcontainer::record_names_the_run_in(&run.record, &run.job_name) {
+            _ if script_is_left => Self::CleanUp,
+            Ok(true) => Self::CleanUp,
+            Ok(false) => Self::Nothing,
+            Err(_) if matches!(run.job.processes_ever(), Ok(0)) => Self::Nothing,
+            Err(error) => Self::Unknown(error),
+        }
+    }
+}
+
+/// Ends the helper `pid`, then the script in the run's Job, then has a
+/// helper take back what the run set until it ended: the read denials on
+/// the project's secrets and its way through the folders above. An ended
+/// helper can't do that itself.
 pub(crate) fn end_run(pid: u32) {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -293,7 +364,6 @@ pub(crate) fn end_run(pid: u32) {
     let Some(run) = run else {
         return;
     };
-    let later = "the next run of the package or `lpm cache clean` takes it back";
     let helper = run.helper.as_raw_handle();
     // The helper holds its identity until it is gone, and the cleanup
     // leaves an identity that is held alone.
@@ -305,7 +375,35 @@ pub(crate) fn end_run(pid: u32) {
         WaitForSingleObject(helper.cast(), INFINITE) == WAIT_OBJECT_0
     };
     if !gone {
-        tracing::warn!("couldn't wait for a stopped sandbox run's helper to end; {later}");
+        tracing::warn!(
+            "couldn't wait for a stopped sandbox run's helper to end; {TAKEN_BACK_LATER}"
+        );
+        return;
+    }
+    clean_up_after(&run.started);
+}
+
+/// Ends what is left of `run`'s script, whose helper is gone, and has a
+/// helper take back what the run set. The Job is held here, so the script
+/// outlived the helper, and the Job says when its last process is gone.
+/// The read denials come off only after that: the take-back finds the Job
+/// in the run's record and asks it again.
+fn clean_up_after(run: &StartedRun) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let later = TAKEN_BACK_LATER;
+    if let Err(error) = run.job.end_every_process(CLEANUP_WAIT) {
+        tracing::warn!("couldn't end a stopped sandbox run's script; {later}: {error}");
+        return;
+    }
+    // Neither a take-back nor the next run gets past a record that can't
+    // be read, so nothing is promised of them.
+    if let Err(error) =
+        crate::helper_appcontainer::record_names_the_run_in(&run.record, &run.job_name)
+    {
+        tracing::warn!("couldn't take back what a stopped sandbox run set: {error}");
         return;
     }
     let cleanup = Command::new(&run.helper_path)
@@ -327,9 +425,10 @@ pub(crate) fn end_run(pid: u32) {
             return;
         }
     };
+    let wait_ms = u32::try_from(CLEANUP_WAIT.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: `cleanup` owns its process handle for the call.
-    let ended = unsafe { WaitForSingleObject(cleanup.as_raw_handle().cast(), CLEANUP_WAIT_MS) }
-        == WAIT_OBJECT_0;
+    let ended =
+        unsafe { WaitForSingleObject(cleanup.as_raw_handle().cast(), wait_ms) } == WAIT_OBJECT_0;
     if !ended {
         let _ = cleanup.kill();
         let _ = cleanup.wait();
@@ -463,9 +562,29 @@ impl Sandbox for AppContainerSandbox {
             );
             grant_record_path(&records, &name)
         });
-        if let Some(record) = &record {
-            helper_cmd.arg("--grant-record").arg(record);
-        }
+        // A run that records what it sets gets a Job this process holds
+        // too, so the script can be ended, and shown to be gone, after
+        // its helper is.
+        let started = match record {
+            Some(record) => {
+                let job_name = run_job_name();
+                let job = ScriptJob::create(Some(&job_name)).map_err(|error| {
+                    SandboxError::SpawnFailed {
+                        reason: format!("couldn't make the Job for the script: {error}"),
+                    }
+                })?;
+                helper_cmd.arg("--grant-record").arg(&record);
+                helper_cmd.arg("--job").arg(&job_name);
+                Some(StartedRun {
+                    helper_path: self.helper_path.clone(),
+                    name,
+                    record,
+                    job_name,
+                    job,
+                })
+            }
+            None => None,
+        };
         if let Some(record) = sweep_record() {
             helper_cmd.arg("--sweep-record").arg(record);
         }
@@ -614,14 +733,14 @@ impl Sandbox for AppContainerSandbox {
         helper_cmd.stderr(std::process::Stdio::from(cmd.stderr));
         helper_cmd.stdin(std::process::Stdio::from(cmd.stdin));
 
-        let child = helper_cmd.spawn().map_err(|e| SandboxError::SpawnFailed {
+        let mut child = helper_cmd.spawn().map_err(|e| SandboxError::SpawnFailed {
             reason: format!(
                 "failed to spawn lpm-sandbox-helper at {}: {e}",
                 self.helper_path.display(),
             ),
         })?;
-        if let Some(record) = record {
-            track_run(&child, &self.helper_path, &name, record);
+        if let Some(started) = started {
+            track_run(&mut child, started)?;
         }
         Ok(child)
     }
@@ -1446,6 +1565,103 @@ mod tests {
         );
         assert!(name.starts_with(APPCONTAINER_NAME));
         assert!(name.len() <= 64, "AppContainer profile name was {name:?}");
+    }
+
+    /// Finishes a run whose helper ended with an empty Job and left
+    /// `record` behind, and says whether a take-back was started after
+    /// it. The helper here is a script that only says it was started.
+    fn a_take_back_follows_a_run_that_left(record: impl FnOnce(&str) -> Vec<u8>) -> bool {
+        let folder = tempfile::tempdir().unwrap();
+        let helper_path = folder.path().join("helper.cmd");
+        std::fs::write(&helper_path, "@echo started> \"%~dp0started.txt\"\r\n").unwrap();
+        let job_name = run_job_name();
+        let record_path = folder.path().join("grants.json");
+        std::fs::write(&record_path, record(&job_name)).unwrap();
+        let job = ScriptJob::create(Some(&job_name)).expect("make the run's Job");
+        let mut helper = Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/d", "/c", "exit"])
+            .spawn()
+            .expect("start a process to stand in for the run's helper");
+        track_run(
+            &mut helper,
+            StartedRun {
+                helper_path,
+                name: "LpmFinishRunTest".to_owned(),
+                record: record_path,
+                job_name,
+                job,
+            },
+        )
+        .expect("keep the run");
+        helper.wait().expect("the stand-in ends");
+
+        finish_run(helper.id());
+
+        folder.path().join("started.txt").exists()
+    }
+
+    #[test]
+    fn a_run_that_stopped_at_an_unreadable_record_gets_no_take_back() {
+        let names_the_run = |job: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "trees": [],
+                "run": { "jobs": [job] },
+            }))
+            .unwrap()
+        };
+        assert!(
+            a_take_back_follows_a_run_that_left(names_the_run),
+            "a record that still names the run is what a take-back is for"
+        );
+
+        assert!(
+            !a_take_back_follows_a_run_that_left(|_| b"not a record".to_vec()),
+            "a take-back can read the record no better than the run that stopped at it"
+        );
+    }
+
+    #[test]
+    fn a_run_whose_script_ran_before_its_record_became_unreadable_is_told_of() {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let folder = tempfile::tempdir().unwrap();
+        let record = folder.path().join("grants.json");
+        std::fs::write(&record, b"not a record").unwrap();
+        let started = |job_name: String| StartedRun {
+            helper_path: folder.path().join("helper.cmd"),
+            name: "LpmFinishRunTest".to_owned(),
+            record: record.clone(),
+            job: ScriptJob::create(Some(&job_name)).expect("make the run's Job"),
+            job_name,
+        };
+        let stopped_at_the_record = started(run_job_name());
+        let ran_a_script = started(run_job_name());
+        // It waits for input, so that it is still there to join the Job.
+        let mut script = Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/d", "/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start a process to stand in for the script");
+        // SAFETY: both handles are open.
+        let joined = unsafe {
+            AssignProcessToJobObject(ran_a_script.job.as_raw(), script.as_raw_handle().cast())
+        };
+        drop(script.stdin.take());
+        script.wait().expect("the stand-in ends");
+        assert_ne!(joined, 0, "the stand-in joins the Job");
+        ran_a_script
+            .job
+            .end_every_process(CLEANUP_WAIT)
+            .expect("the Job counts the stand-in as ended");
+
+        let nothing = AfterRun::of(&stopped_at_the_record);
+        let told = AfterRun::of(&ran_a_script);
+
+        assert!(matches!(nothing, AfterRun::Nothing), "{nothing:?}");
+        assert!(matches!(told, AfterRun::Unknown(_)), "{told:?}");
     }
 
     #[test]

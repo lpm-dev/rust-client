@@ -138,6 +138,13 @@ pub struct HelperArgs {
     /// as long as it lasted, keep its trees and its profile, and exit
     /// without a program (`--take-back-run`).
     pub take_back_run: bool,
+    /// The named Job the run's script joins (`--job`). The process that
+    /// started the helper made it and keeps it open, so it can end and
+    /// count the script's processes once the helper is gone. The run
+    /// records the name, so a cleanup ends what is left in the Job before
+    /// it takes anything of the run back. Without it the helper makes a
+    /// Job of its own.
+    pub job: Option<String>,
     /// Trees already swept of grants to AppContainer profiles that no
     /// longer exist, as earlier releases' per-run profiles left behind
     /// (`--sweep-record`), so each tree is swept once.
@@ -244,6 +251,14 @@ pub enum ParseError {
     /// `--revoke-only` and `--take-back-run` are different cleanups.
     #[error("`--revoke-only` and `--take-back-run` were both given")]
     TwoCleanups,
+    /// A script in a Job the caller holds outlives a stopped helper, so
+    /// the run must have a record to name the Job in.
+    #[error("`--job` needs `--grant-record`")]
+    JobWithoutRecord,
+    /// A cleanup run starts no script, and finds the Jobs of earlier runs
+    /// in the grant record.
+    #[error("`{0}` starts no script, but `--job` names the Job of one")]
+    JobWithCleanup(&'static str),
     /// `--take-back-run` leaves the identity for its next run.
     #[error("`--take-back-run` keeps the profile `--delete-appcontainer-profile` would delete")]
     TakeBackDeletesProfile,
@@ -324,6 +339,7 @@ where
     let mut grant_record: Option<PathBuf> = None;
     let mut revoke_only = false;
     let mut take_back_run = false;
+    let mut job: Option<String> = None;
     let mut sweep_record: Option<PathBuf> = None;
     let mut readable_dirs: Vec<PathBuf> = Vec::new();
     let mut best_effort_readable_dirs: Vec<PathBuf> = Vec::new();
@@ -395,6 +411,13 @@ where
             "--take-back-run" => {
                 take_back_run = true;
             }
+            "--job" => {
+                let raw = next_value(&mut it, "--job")?;
+                let name = raw
+                    .to_str()
+                    .ok_or_else(|| ParseError::UnknownFlag("--job".to_string()))?;
+                job = Some(name.to_owned());
+            }
             "--sweep-record" => {
                 sweep_record = Some(absolute_value(&mut it, "--sweep-record")?);
             }
@@ -453,6 +476,9 @@ where
         return Err(ParseError::TakeBackDeletesProfile);
     }
     if let Some(cleanup) = cleanup {
+        if job.is_some() {
+            return Err(ParseError::JobWithCleanup(cleanup));
+        }
         if saw_separator {
             return Err(ParseError::ProgramWithCleanup(cleanup));
         }
@@ -461,6 +487,9 @@ where
         }
     } else if !saw_separator {
         return Err(ParseError::MissingSeparator);
+    }
+    if job.is_some() && grant_record.is_none() {
+        return Err(ParseError::JobWithoutRecord);
     }
     let program = match program {
         Some(program) => program,
@@ -495,6 +524,7 @@ where
         grant_record,
         revoke_only,
         take_back_run,
+        job,
         sweep_record,
         readable_dirs,
         best_effort_readable_dirs,
@@ -710,6 +740,46 @@ mod tests {
             parse_argv(make_argv(&deleting)).unwrap_err(),
             ParseError::TakeBackDeletesProfile
         );
+    }
+
+    #[test]
+    fn parse_argv_takes_a_job_for_a_run_and_for_no_cleanup() {
+        let identity = [
+            "--protocol-version",
+            "3",
+            "--appcontainer-name",
+            "LpmSandboxLifecycleChild-0123",
+            "--grant-record",
+            "C:/record.json",
+        ];
+        let job = ["--job", r"Global\LpmSandboxRun-1"];
+        let program = [
+            "--stdio-stdin",
+            "null",
+            "--stdio-stdout",
+            "null",
+            "--stdio-stderr",
+            "null",
+            "--",
+            "C:/Windows/System32/cmd.exe",
+        ];
+        let argv = |parts: &[&[&'static str]]| make_argv(&parts.concat());
+
+        assert_eq!(
+            parse_argv(argv(&[&identity, &job, &program])).unwrap().job,
+            Some(r"Global\LpmSandboxRun-1".to_string())
+        );
+        assert_eq!(parse_argv(argv(&[&identity, &program])).unwrap().job, None);
+        assert_eq!(
+            parse_argv(argv(&[&identity[..4], &job, &program])).unwrap_err(),
+            ParseError::JobWithoutRecord
+        );
+        for cleanup in ["--take-back-run", "--revoke-only"] {
+            assert_eq!(
+                parse_argv(argv(&[&identity, &job, &[cleanup]])).unwrap_err(),
+                ParseError::JobWithCleanup(cleanup)
+            );
+        }
     }
 
     #[test]
