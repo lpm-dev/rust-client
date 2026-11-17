@@ -33,6 +33,8 @@ mod build_cache;
 mod bundled_node_gyp;
 mod hints;
 mod lifecycle_tools;
+#[cfg(any(unix, windows))]
+pub(super) mod output_wait;
 mod package_dir;
 pub(super) mod process_tree;
 pub(in crate::commands) mod sandbox_env;

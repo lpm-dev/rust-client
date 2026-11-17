@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use lpm_common::LpmError;
 
+#[cfg(any(unix, windows))]
+use crate::commands::rebuild::output_wait::{Looked, wait_for_output};
+
 #[cfg(not(debug_assertions))]
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 // Debug binaries can spend tens of seconds in loader/linker work when the
@@ -1549,39 +1552,43 @@ fn wait_for_unix_output(
     if fd < 0 {
         return Err("version output reader has an invalid descriptor".to_string());
     }
+    wait_for_output(process_finished, |may_wait| {
+        look_at_unix_output(fd, may_wait)
+    })
+}
+
+#[cfg(unix)]
+fn look_at_unix_output(fd: std::os::fd::RawFd, may_wait: bool) -> Result<Looked, String> {
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
-    loop {
-        let timeout = if process_finished.load(Ordering::Acquire) {
-            0
+    let timeout = if may_wait { 50 } else { 0 };
+    // SAFETY: `poll_fd` is initialized and `fd` remains owned by the
+    // reader for the duration of this synchronous call.
+    let result = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
+    if result > 0 {
+        if poll_fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "version output poll failed with events 0x{:x}",
+                poll_fd.revents
+            ));
+        }
+        return Ok(if poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            Looked::Readable
         } else {
-            50
-        };
-        // SAFETY: `poll_fd` is initialized and `fd` remains owned by the
-        // reader for the duration of this synchronous call.
-        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
-        if result > 0 {
-            if poll_fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-                return Err(format!(
-                    "version output poll failed with events 0x{:x}",
-                    poll_fd.revents
-                ));
-            }
-            return Ok(poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0);
-        }
-        if result == 0 {
-            if process_finished.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            continue;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error.to_string());
-        }
+            Looked::Closed
+        });
+    }
+    if result == 0 {
+        return Ok(Looked::Nothing);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        Ok(Looked::Interrupted)
+    } else {
+        Err(error.to_string())
     }
 }
 
@@ -1626,44 +1633,52 @@ fn wait_for_windows_output(
     handle: std::os::windows::io::RawHandle,
     process_finished: &AtomicBool,
 ) -> Result<bool, String> {
+    wait_for_output(process_finished, |may_wait| {
+        look_at_windows_output(handle, may_wait)
+    })
+}
+
+#[cfg(windows)]
+fn look_at_windows_output(
+    handle: std::os::windows::io::RawHandle,
+    may_wait: bool,
+) -> Result<Looked, String> {
     use windows_sys::Win32::Foundation::{
         ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, GetLastError,
     };
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
-    loop {
-        let mut available = 0_u32;
-        // SAFETY: `handle` belongs to this reader and remains valid for the
-        // call. Null buffers request only the available-byte count.
-        let result = unsafe {
-            PeekNamedPipe(
-                handle as _,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if result == 0 {
-            // SAFETY: `PeekNamedPipe` just failed on this thread.
-            let error = unsafe { GetLastError() };
-            if matches!(
-                error,
-                ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
-            ) {
-                return Ok(false);
-            }
-            return Err(std::io::Error::from_raw_os_error(error as i32).to_string());
+    let mut available = 0_u32;
+    // SAFETY: `handle` belongs to this reader and remains valid for the
+    // call. Null buffers request only the available-byte count.
+    let result = unsafe {
+        PeekNamedPipe(
+            handle as _,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        // SAFETY: `PeekNamedPipe` just failed on this thread.
+        let error = unsafe { GetLastError() };
+        if matches!(
+            error,
+            ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
+        ) {
+            return Ok(Looked::Closed);
         }
-        if available > 0 {
-            return Ok(true);
-        }
-        if process_finished.load(Ordering::Acquire) {
-            return Ok(false);
-        }
+        return Err(std::io::Error::from_raw_os_error(error as i32).to_string());
+    }
+    if available > 0 {
+        return Ok(Looked::Readable);
+    }
+    if may_wait {
         std::thread::sleep(Duration::from_millis(10));
     }
+    Ok(Looked::Nothing)
 }
 
 #[cfg(not(any(unix, windows)))]
