@@ -586,7 +586,10 @@ async fn fetch_audit_fix_metadata(
         client.get_package_metadata(&package_name).await
     } else {
         match npm_source {
-            Some(NpmMetadataSource::PublicNpm) => client.get_npm_package_metadata(name).await,
+            Some(NpmMetadataSource::PublicNpm) => client
+                .revalidate_npm_metadata_direct_with_timings(name)
+                .await
+                .map(|revalidated| revalidated.metadata),
             Some(NpmMetadataSource::ConfiguredRegistry) => {
                 client.get_npm_package_metadata_proxy_only(name).await
             }
@@ -1537,5 +1540,51 @@ mod tests {
         assert_eq!(shared.current_range, "1.0.1");
         assert_eq!(shared.dependency_key, "optionalDependencies");
         assert!(shared.is_optional);
+    }
+
+    #[tokio::test]
+    async fn a_dependency_locked_from_public_npm_is_looked_up_there() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let lpm = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(410)
+                    .set_body_json(serde_json::json!({ "code": "npm_metadata_proxy_disabled" })),
+            )
+            .mount(&lpm)
+            .await;
+        let npm = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lodash"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "lodash",
+                "dist-tags": { "latest": "4.17.21" },
+                "versions": {
+                    "4.17.21": {
+                        "name": "lodash",
+                        "version": "4.17.21",
+                        "dist": {
+                            "tarball": format!("{}/lodash/-/lodash-4.17.21.tgz", npm.uri()),
+                            "integrity": "sha512-lodash",
+                        },
+                    },
+                },
+            })))
+            .mount(&npm)
+            .await;
+        let client = RegistryClient::new()
+            .with_base_url(lpm.uri())
+            .with_npm_registry_url(npm.uri())
+            .with_cache_dir(None);
+
+        let metadata =
+            fetch_audit_fix_metadata(&client, "lodash", Some(NpmMetadataSource::PublicNpm))
+                .await
+                .unwrap();
+
+        assert!(metadata.versions.contains_key("4.17.21"));
+        assert!(lpm.received_requests().await.unwrap().is_empty());
     }
 }

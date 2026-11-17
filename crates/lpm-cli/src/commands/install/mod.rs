@@ -111,6 +111,7 @@ use resolve::*;
 pub(crate) use setup::validate_dependency_free_dev_config;
 use setup::*;
 use skills::*;
+pub(crate) use source_resolution::registry_source_url_for;
 use source_resolution::*;
 use state::*;
 use swift::*;

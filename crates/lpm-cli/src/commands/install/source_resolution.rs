@@ -631,7 +631,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
 /// - npmrc-mapped (scope-mapped or default-registry) → `target.base_url`
 /// - Otherwise → the active client's npm registry URL, including when
 ///   the LPM Worker is the selected transport proxy
-pub(super) fn registry_source_url_for(
+pub(crate) fn registry_source_url_for(
     name: &str,
     route_table: &RouteTable,
     client: &RegistryClient,

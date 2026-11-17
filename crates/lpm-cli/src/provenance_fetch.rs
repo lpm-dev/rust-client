@@ -946,14 +946,16 @@ pub(crate) fn map_fetch_result_to_status(
 /// there is nothing to enforce against. The two axes are
 /// independent on purpose (see [`SkipPolicy`] doc).
 ///
-/// The lpm-vs-npm metadata-fetch dispatch by `@lpm.dev/` name prefix
-/// mirrors `install.rs::build_blocked_set_metadata`. The 5-min metadata
-/// cache absorbs the typical "install then immediately approve-scripts"
-/// case (no network call); the on-disk attestation cache under
-/// `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
+/// A package's metadata and attestation come from the registry `routes`
+/// selects for it, the one an install of the same project resolves it
+/// from and whose attestation its drift gate later compares against. The
+/// 5-min metadata cache absorbs the typical "install then immediately
+/// approve-scripts" case (no network call); the on-disk attestation cache
+/// under `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
 /// approvals across runs.
 pub async fn fetch_provenance_for_artifacts(
     registry: &lpm_registry::RegistryClient,
+    routes: &lpm_registry::RouteTable,
     pkgs: &[ProvenanceArtifactKey],
     verify_policy: &VerifyPolicy,
 ) -> HashMap<ProvenanceArtifactKey, ProvenanceStatus> {
@@ -989,14 +991,14 @@ pub async fn fetch_provenance_for_artifacts(
         .into_iter()
         .map(move |(name, version, expected_integrity)| async move {
             let artifact_key = || (name.clone(), version.clone(), expected_integrity.clone());
-            // lpm vs npm dispatch by name prefix mirrors
-            // `install.rs::build_blocked_set_metadata`.
-            let (meta_result, registry_url) = if name.starts_with("@lpm.dev/") {
+            let registry_url =
+                crate::commands::install::registry_source_url_for(&name, routes, registry);
+            let registry_url = registry_url.as_str();
+            let route = routes.route_for_package(&name);
+            let from_configured_registry = matches!(route, lpm_registry::UpstreamRoute::Custom { .. });
+            let meta_result = if name.starts_with("@lpm.dev/") {
                 match lpm_common::PackageName::parse(&name) {
-                    Ok(pkg_name) => (
-                        registry.get_package_metadata(&pkg_name).await,
-                        registry.base_url(),
-                    ),
+                    Ok(pkg_name) => registry.get_package_metadata(&pkg_name).await,
                     Err(error) => {
                         tracing::warn!(
                             pkg = %name,
@@ -1007,10 +1009,7 @@ pub async fn fetch_provenance_for_artifacts(
                     }
                 }
             } else {
-                (
-                    registry.get_npm_package_metadata(&name).await,
-                    registry.npm_registry_url(),
-                )
+                registry.get_npm_metadata_routed(&name, route).await
             };
             let meta = match meta_result {
                 Ok(meta) => meta,
@@ -1035,7 +1034,7 @@ pub async fn fetch_provenance_for_artifacts(
                     .map(std::borrow::Cow::into_owned);
             if let (Some(expected), Some(registry_value)) =
                 (expected_integrity.as_deref(), registry_integrity.as_deref())
-                && expected != registry_value
+                && lpm_common::integrity::contradict(expected, registry_value)
             {
                 return (
                     artifact_key(),
@@ -1048,6 +1047,25 @@ pub async fn fetch_provenance_for_artifacts(
             let verification_integrity = expected_integrity
                 .as_deref()
                 .or(registry_integrity.as_deref());
+
+            // A registry an `.npmrc` names can be a mirror that hands on the
+            // attestation URL of the registry it mirrors, or one that isn't
+            // served over HTTPS. An attestation is fetched only from the
+            // registry that served the package, so there is none to read
+            // here. That says nothing about the publisher, so it is no
+            // reason to refuse the approval.
+            if from_configured_registry
+                && let Some(url) = attestation_ref.as_ref().and_then(|a| a.url.as_deref())
+                && !AttestationUrlPolicy::for_registry(registry_url)
+                    .is_ok_and(|policy| policy.validate(url).is_ok())
+            {
+                tracing::warn!(
+                    pkg = %name,
+                    version = %version,
+                    "the attestation is not served by the package's configured registry; no provenance recorded"
+                );
+                return (artifact_key(), ProvenanceStatus::TransportDegraded);
+            }
 
             // Skip path: operator opted out of cryptographic
             // verification for this name (CLI flag) OR fleet-wide
