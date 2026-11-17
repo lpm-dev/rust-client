@@ -40,6 +40,57 @@ fn verdaccio_startup_log_accepts_current_config_and_listen_url() {
     ));
 }
 
+/// The harness gives every command its own home, npm configuration and
+/// registry. A command a test builds for itself gets the account's. So a
+/// test file neither looks the binary up itself nor starts a command at
+/// the path the harness gives it.
+#[test]
+fn no_workflow_test_builds_the_lpm_command_itself() {
+    fn sources(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let harness = tests.join("support").join("mod.rs");
+    let this_file = tests.join("support_helpers.rs");
+    let mut found = Vec::new();
+    sources(&tests, &mut found);
+    assert!(found.contains(&harness), "{}", harness.display());
+    assert!(found.contains(&this_file), "{}", this_file.display());
+    let lookups = [
+        concat!("cargo_bin(", "\"lpm-rs\")"),
+        concat!("cargo_bin!(", "\"lpm-rs\")"),
+        concat!("CARGO_BIN_EXE_", "lpm-rs"),
+    ];
+
+    let mut offenders = Vec::new();
+    for path in found
+        .iter()
+        .filter(|path| **path != harness && **path != this_file)
+    {
+        let source = std::fs::read_to_string(path).unwrap();
+        for (index, line) in source.lines().enumerate() {
+            let looks_it_up = lookups.iter().any(|lookup| line.contains(lookup));
+            let starts_it = line.contains("Command::new(") && line.contains("lpm_binary");
+            if looks_it_up || starts_it {
+                offenders.push(format!("{}:{}", path.display(), index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "find the binary with `support::lpm_binary` and build its command with `support::lpm` \
+         or `support::lpm_from_path`: {offenders:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn commands_launch_the_lpm_under_test_once_and_a_staged_binary_only_when_warmed() {

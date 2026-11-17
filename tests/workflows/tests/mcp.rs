@@ -65,9 +65,9 @@ fn mcp_setup_pins_the_launcher_before_project_path_lookup() {
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
-    let result = std::process::Command::new(server["command"].as_str().unwrap())
+    let launcher = std::path::Path::new(server["command"].as_str().unwrap());
+    let result = support::lpm_from_path(&project, launcher)
         .args(["mcp", "serve", "--help"])
-        .current_dir(project.path())
         .env("PATH", std::env::join_paths(paths).unwrap())
         .output()
         .unwrap();
@@ -378,9 +378,7 @@ fn mcp_setup_writes_the_lpm_launcher_to_both_container_shapes_idempotently() {
         serde_json::from_slice(&std::fs::read(&claude_path).unwrap()).unwrap();
     let vscode: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vscode_path).unwrap()).unwrap();
-    let executable = assert_cmd::cargo::cargo_bin("lpm-rs")
-        .canonicalize()
-        .unwrap();
+    let executable = support::lpm_binary().canonicalize().unwrap();
     for server in [
         &claude["mcpServers"]["lpm-registry"],
         &vscode["servers"]["lpm-registry"],
