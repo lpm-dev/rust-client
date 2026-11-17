@@ -18,6 +18,10 @@
 #   3. merging via the normal CI gate (only after green).
 #
 # `target-branch` is implicitly the default branch.
+#
+# Each ecosystem's security updates come as one grouped pull request.
+# `main` requires branches to be up to date, so every separate pull
+# request would cost its own CI round.
 
 version: 2
 updates:
@@ -43,6 +47,10 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      gha-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "cargo"
     directory: "/"
@@ -76,6 +84,10 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      rust-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/npm/cli"
@@ -99,6 +111,10 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/crates/lpm-cli/dashboard-ui"
@@ -120,3 +136,50 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      dashboard-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # The fuzz harness has a lockfile of its own. It gets grouped security
+  # updates and no version updates.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "rust"
+    groups:
+      fuzz-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Test and bench fixtures are inputs that tests read exactly as committed,
+  # and a vendored crate's Cargo.lock is its upstream copy, which the
+  # workspace build never reads. `ignore` governs security updates too, so
+  # Dependabot opens no pull requests that rewrite these files. Their alerts
+  # still show on the Security tab.
+  - package-ecosystem: "npm"
+    directories:
+      - "/bench/**"
+      - "/tests/fixtures/**"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "*"
+
+  - package-ecosystem: "cargo"
+    directories:
+      - "/vendor/*"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "*"

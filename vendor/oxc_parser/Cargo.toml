@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.97.0"
 name = "oxc_parser"
-version = "0.157.0"
+version = "0.158.0"
 authors = [
     "Boshen <boshenc@gmail.com>",
     "Oxc contributors",
@@ -89,13 +89,13 @@ version = "0.5.0"
 version = "0.2.19"
 
 [dependencies.oxc_allocator]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.oxc_ast]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.oxc_data_structures]
-version = "0.157.0"
+version = "0.158.0"
 features = [
     "assert_unchecked",
     "branch_hints",
@@ -103,23 +103,23 @@ features = [
 ]
 
 [dependencies.oxc_diagnostics]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.oxc_ecmascript]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.oxc_regular_expression]
-version = "0.157.0"
+version = "0.158.0"
 optional = true
 
 [dependencies.oxc_span]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.oxc_str]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.oxc_syntax]
-version = "0.157.0"
+version = "0.158.0"
 
 [dependencies.rustc-hash]
 version = "2"
@@ -128,11 +128,11 @@ version = "2"
 version = "0.3.6"
 
 [dev-dependencies.oxc_ast]
-version = "0.157.0"
+version = "0.158.0"
 features = ["serialize"]
 
 [dev-dependencies.oxc_ast_visit]
-version = "0.157.0"
+version = "0.158.0"
 features = ["serialize"]
 
 [dev-dependencies.pico-args]

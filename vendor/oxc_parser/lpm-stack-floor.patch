@@ -1,6 +1,14 @@
 --- a/src/cursor.rs
 +++ b/src/cursor.rs
-@@ -108,13 +108,41 @@
+@@ -1,6 +1,6 @@
+ //! Code related to navigating `Token`s from the lexer
+ 
+-use oxc_allocator::{ArenaBox, ArenaVec};
++use oxc_allocator::{ArenaBox, ArenaVec, Dummy, GetAllocator};
+ use oxc_ast::ast::{BindingRestElement, RegExpFlags};
+ use oxc_span::{GetSpan, Span};
+ use oxc_str::JSStr;
+@@ -108,13 +108,57 @@
          if self.token.escaped() && kind.is_any_keyword() {
              self.report_escaped_keyword(self.token.span());
          }
@@ -15,10 +23,17 @@
 +    /// unwinds without reading more tokens.
 +    #[inline]
 +    fn check_stack_floor(&mut self) {
-+        let marker = 0u8;
-+        if self.stack_exhausted || (&raw const marker).addr() < self.options.stack_floor {
++        if self.stack_exhausted || self.below_stack_floor() {
 +            self.stop_at_stack_floor();
 +        }
++    }
++
++    /// Whether the stack pointer is below `ParseOptions::stack_floor`.
++    /// Recursion that reads no token checks this once per level itself.
++    #[inline]
++    pub(crate) fn below_stack_floor(&self) -> bool {
++        let marker = 0u8;
++        (&raw const marker).addr() < self.options.stack_floor
 +    }
 +
 +    /// A speculative parse that reaches the floor rewinds its fatal error
@@ -35,6 +50,15 @@
 +        self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
 +    }
 +
++    /// [`Self::stop_at_stack_floor`] for a recursion that reads no token,
++    /// with a placeholder for the node it was building.
++    #[cold]
++    #[inline(never)]
++    pub(crate) fn stopped_at_stack_floor<T: Dummy<'a>>(&mut self) -> T {
++        self.stop_at_stack_floor();
++        Dummy::dummy(self.allocator())
++    }
++
      /// Move to the next `JSXChild`
      /// Checks if the current token is escaped if it is a keyword
      pub(crate) fn advance_for_jsx_child(&mut self) {
@@ -42,7 +66,7 @@
          self.prev_token_end = self.token.end();
          self.token = self.lexer.next_jsx_child();
      }
-@@ -233,6 +261,7 @@
+@@ -233,6 +277,7 @@
  
      /// Move to the next token, lexing it as a JSX attribute value.
      pub(crate) fn advance_for_jsx_attribute_value(&mut self) {
@@ -64,6 +88,35 @@
      file_appears_to_be_binary() => {
          ts_error("1490", "File appears to be binary.")
      };
+--- a/src/js/arrow.rs
++++ b/src/js/arrow.rs
+@@ -537,6 +537,12 @@
+         &mut self,
+         pattern: BindingPattern<'a>,
+     ) -> Option<Expression<'a>> {
++        // This reads no token, so it checks the stack floor itself. Below it,
++        // the caller parses the source again as an expression, which checks
++        // the floor per token.
++        if self.below_stack_floor() {
++            return None;
++        }
+         Some(match pattern {
+             BindingPattern::BindingIdentifier(ident) => {
+                 if ident.name == "await" && !self.ctx.has_await() {
+--- a/src/js/grammar.rs
++++ b/src/js/grammar.rs
+@@ -12,6 +12,11 @@
+ 
+ impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for AssignmentTarget<'a> {
+     fn cover(expr: Expression<'a>, p: &mut ParserImpl<'a, C>) -> Self {
++        // Cover conversion reads no token, so it checks the stack floor
++        // itself. Nested targets pass through here once per level.
++        if p.below_stack_floor() {
++            return p.stopped_at_stack_floor();
++        }
+         match expr {
+             Expression::ArrayExpression(array_expr) => {
+                 let pat = ArrayAssignmentTarget::cover(array_expr.unbox(), p);
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -213,6 +213,11 @@
@@ -78,7 +131,7 @@
  }
  
  /// Parse options
-@@ -267,6 +272,18 @@
+@@ -267,6 +272,19 @@
      ///
      /// Default: `true`
      pub enable_ident_hashes: bool,
@@ -86,18 +139,19 @@
 +    /// Lowest address on the parsing thread's stack the parser may use.
 +    ///
 +    /// The parser recurses once per level of nesting. Before reading each
-+    /// token it compares the stack pointer with this address, and below it
-+    /// stops with a fatal error and [`ParserReturn::stack_exhausted`] set,
-+    /// instead of overflowing the stack. Every level of nesting reads at
-+    /// least one token, so the parser never goes deeper than the frames
-+    /// between two tokens past this address: leave room for them below it.
++    /// token, and at each level of a recursion that reads none, it compares
++    /// the stack pointer with this address, and below it stops with a fatal
++    /// error and [`ParserReturn::stack_exhausted`] set, instead of
++    /// overflowing the stack. The parser never goes deeper than the frames
++    /// between two of those checks past this address: leave room for them
++    /// below it.
 +    ///
 +    /// Default: `0`, no limit
 +    pub stack_floor: usize,
  }
  
  impl Default for ParseOptions {
-@@ -278,6 +295,7 @@
+@@ -278,6 +296,7 @@
              preserve_parens: true,
              allow_v8_intrinsics: false,
              enable_ident_hashes: true,
@@ -105,7 +159,7 @@
          }
      }
  }
-@@ -670,6 +688,9 @@
+@@ -670,6 +689,9 @@
  
      /// Precomputed typescript detection
      is_ts: bool,
@@ -115,7 +169,7 @@
  }
  
  impl<'a, C: ParserConfig> ParserImpl<'a, C> {
-@@ -702,6 +723,7 @@
+@@ -702,6 +724,7 @@
              ast: ParserAstBuilder::new(allocator),
              module_record_builder: ModuleRecordBuilder::new(allocator, source_type),
              is_ts: source_type.is_typescript(),
@@ -123,7 +177,7 @@
          }
      }
  
-@@ -795,6 +817,7 @@
+@@ -795,6 +818,7 @@
              tokens,
              fatal_error: has_fatal_error,
              is_flow_language,

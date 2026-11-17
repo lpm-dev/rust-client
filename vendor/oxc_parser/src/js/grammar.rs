@@ -12,6 +12,11 @@ pub trait CoverGrammar<'a, T, C: Config>: Sized {
 
 impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for AssignmentTarget<'a> {
     fn cover(expr: Expression<'a>, p: &mut ParserImpl<'a, C>) -> Self {
+        // Cover conversion reads no token, so it checks the stack floor
+        // itself. Nested targets pass through here once per level.
+        if p.below_stack_floor() {
+            return p.stopped_at_stack_floor();
+        }
         match expr {
             Expression::ArrayExpression(array_expr) => {
                 let pat = ArrayAssignmentTarget::cover(array_expr.unbox(), p);

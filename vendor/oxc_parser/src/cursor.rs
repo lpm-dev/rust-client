@@ -1,6 +1,6 @@
 //! Code related to navigating `Token`s from the lexer
 
-use oxc_allocator::{ArenaBox, ArenaVec};
+use oxc_allocator::{ArenaBox, ArenaVec, Dummy, GetAllocator};
 use oxc_ast::ast::{BindingRestElement, RegExpFlags};
 use oxc_span::{GetSpan, Span};
 use oxc_str::JSStr;
@@ -119,10 +119,17 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// unwinds without reading more tokens.
     #[inline]
     fn check_stack_floor(&mut self) {
-        let marker = 0u8;
-        if self.stack_exhausted || (&raw const marker).addr() < self.options.stack_floor {
+        if self.stack_exhausted || self.below_stack_floor() {
             self.stop_at_stack_floor();
         }
+    }
+
+    /// Whether the stack pointer is below `ParseOptions::stack_floor`.
+    /// Recursion that reads no token checks this once per level itself.
+    #[inline]
+    pub(crate) fn below_stack_floor(&self) -> bool {
+        let marker = 0u8;
+        (&raw const marker).addr() < self.options.stack_floor
     }
 
     /// A speculative parse that reaches the floor rewinds its fatal error
@@ -137,6 +144,15 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     fn stop_at_stack_floor(&mut self) {
         self.stack_exhausted = true;
         self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
+    }
+
+    /// [`Self::stop_at_stack_floor`] for a recursion that reads no token,
+    /// with a placeholder for the node it was building.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn stopped_at_stack_floor<T: Dummy<'a>>(&mut self) -> T {
+        self.stop_at_stack_floor();
+        Dummy::dummy(self.allocator())
     }
 
     /// Move to the next `JSXChild`

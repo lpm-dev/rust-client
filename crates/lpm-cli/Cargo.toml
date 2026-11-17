@@ -49,11 +49,11 @@ lpm-dashboard = { workspace = true }
 lpm-migrate = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
-oxc_allocator = "=0.157.0"
-oxc_ast = "=0.157.0"
-oxc_ast_visit = "=0.157.0"
-oxc_parser = "=0.157.0"
-oxc_span = "=0.157.0"
+oxc_allocator = "=0.158.0"
+oxc_ast = "=0.158.0"
+oxc_ast_visit = "=0.158.0"
+oxc_parser = "=0.158.0"
+oxc_span = "=0.158.0"
 clap = { workspace = true, features = ["string"] }
 clap_complete = { workspace = true }
 cvss = { workspace = true }
@@ -150,7 +150,7 @@ ecdsa = { workspace = true }
 # Phase 46 P4: x509 cert parsing for Sigstore attestation SAN extraction
 # (identity-only, not full Sigstore verification — see plan §7.1 / D5).
 x509-parser = "0.18"
-jsonschema = { version = "0.60", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
 
 # Typed errors for the C1 Sigstore verifier (`sigstore_verify.rs`).
 # Matches the workspace-wide convention (`lpm_common::LpmError`).

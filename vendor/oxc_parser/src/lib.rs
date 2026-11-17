@@ -276,11 +276,12 @@ pub struct ParseOptions {
     /// Lowest address on the parsing thread's stack the parser may use.
     ///
     /// The parser recurses once per level of nesting. Before reading each
-    /// token it compares the stack pointer with this address, and below it
-    /// stops with a fatal error and [`ParserReturn::stack_exhausted`] set,
-    /// instead of overflowing the stack. Every level of nesting reads at
-    /// least one token, so the parser never goes deeper than the frames
-    /// between two tokens past this address: leave room for them below it.
+    /// token, and at each level of a recursion that reads none, it compares
+    /// the stack pointer with this address, and below it stops with a fatal
+    /// error and [`ParserReturn::stack_exhausted`] set, instead of
+    /// overflowing the stack. The parser never goes deeper than the frames
+    /// between two of those checks past this address: leave room for them
+    /// below it.
     ///
     /// Default: `0`, no limit
     pub stack_floor: usize,
@@ -1229,6 +1230,43 @@ mod test {
             let Expression::TemplateLiteral(template) = expr else { panic!("{source}") };
             let cooked = template.quasis[0].value.cooked.and_then(oxc_str::JSStr::as_str);
             assert_eq!(cooked, Some("😀"), "{source}");
+        }
+    }
+
+    #[test]
+    fn template_raw_normalizes_line_terminators() {
+        // `(raw, cooked)` of each quasi, as `strings.raw` and `strings` in a tag function (V8).
+        type Quasis = &'static [(&'static str, Option<&'static str>)];
+        let allocator = Allocator::default();
+        let source_type = SourceType::default();
+        let cases: &[(&str, Quasis)] = &[
+            ("tag`\\unicode\r\n`", &[("\\unicode\n", None)]),
+            ("tag`\\xZ\r`", &[("\\xZ\n", None)]),
+            ("tag`\\xZ\r\r\n`", &[("\\xZ\n\n", None)]),
+            ("tag`a\r\n\\u{}`", &[("a\n\\u{}", None)]),
+            ("tag`\\\r\n\\8`", &[("\\\n\\8", None)]),
+            (
+                "tag`h\\xZ\r\n${0}m\\u{}\r${1}t\\8\r\n`",
+                &[("h\\xZ\n", None), ("m\\u{}\n", None), ("t\\8\n", None)],
+            ),
+            ("tag`\\n\r\n`", &[("\\n\n", Some("\n\n"))]),
+            ("tag`a\\\rb`", &[("a\\\nb", Some("ab"))]),
+            ("tag`ok\r\n`", &[("ok\n", Some("ok\n"))]),
+            ("tag`ok\rx`", &[("ok\nx", Some("ok\nx"))]),
+        ];
+        for &(source, expected) in cases {
+            let expr = Parser::new(&allocator, source, source_type).parse_expression().unwrap();
+            let Expression::TaggedTemplateExpression(tagged) = expr else { panic!("{source:?}") };
+            let values = tagged
+                .quasi
+                .quasis
+                .iter()
+                .map(|quasi| {
+                    let cooked = quasi.value.cooked.map(|cooked| cooked.as_str().unwrap());
+                    (quasi.value.raw.as_str(), cooked)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected, "{source:?}");
         }
     }
 

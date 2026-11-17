@@ -535,6 +535,66 @@ impl<'s> SourceContext<'s> {
 mod tests {
     use super::*;
 
+    /// Whether parsing `source` with the floor [`current_stack_floor`] sets
+    /// stopped at it.
+    fn parse_reaches_the_floor(source: &str) -> bool {
+        let allocator = Allocator::default();
+        Parser::new(&allocator, source, SourceType::cjs())
+            .with_options(ParseOptions {
+                stack_floor: current_stack_floor().unwrap(),
+                ..ParseOptions::default()
+            })
+            .parse()
+            .stack_exhausted
+    }
+
+    #[test]
+    fn patterns_parsed_to_just_above_the_floor_turn_into_expressions_without_overflowing() {
+        // A parenthesized list that parses as arrow parameters, with no `=>`
+        // after it, is turned back into an expression by recursing through its
+        // patterns without reading a token. At the deepest nesting the parse
+        // fits above the floor, that recursion must fit too.
+        let shapes: [(&str, &str, &str, &str, &str); 6] = [
+            ("x=(", "[", "a", "]", ");"),
+            ("x=(", "[", "a", "]", "=0);"),
+            ("x=(", "{a:", "b", "}", ");"),
+            ("x=(", "{a:", "b", "}", "=0);"),
+            ("x=(", "[a=", "0", "]", ");"),
+            ("x=(", "[", "a", "]", ",b);"),
+        ];
+        for stack in [2 * 1024 * 1024, DEEP_PARSE_STACK] {
+            for (prefix, open, middle, close, suffix) in shapes {
+                let deepest = std::thread::Builder::new()
+                    .stack_size(stack)
+                    .spawn(move || {
+                        let source = |depth: usize| {
+                            format!(
+                                "{prefix}{}{middle}{}{suffix}",
+                                open.repeat(depth),
+                                close.repeat(depth)
+                            )
+                        };
+                        let (mut fits, mut too_deep) = (1, 8_000_000);
+                        assert!(!parse_reaches_the_floor(&source(fits)));
+                        assert!(parse_reaches_the_floor(&source(too_deep)));
+                        while too_deep - fits > 1 {
+                            let depth = fits + (too_deep - fits) / 2;
+                            if parse_reaches_the_floor(&source(depth)) {
+                                too_deep = depth;
+                            } else {
+                                fits = depth;
+                            }
+                        }
+                        fits
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                assert!(deepest >= 100, "{prefix}{open}{close}{suffix}: {deepest}");
+            }
+        }
+    }
+
     /// Visits `source` with the floor `room` bytes below where the visit
     /// starts, on a stack deep enough to parse it, and returns whether the
     /// visitor stopped at the floor and whether it unwound.
