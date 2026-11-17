@@ -45,6 +45,19 @@ mod trust;
 #[cfg(test)]
 mod tests;
 
+/// `bin/node-gyp.js` of the npm installed beside the `node` a script finds
+/// first on `path`, when that `node` belongs to no package.
+pub(crate) fn npm_node_gyp_beside_node_on(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    bundled_node_gyp::BundledNodeGyp::beside_node_on(path).map(|bundled| bundled.script)
+}
+
+/// A Node installation under `prefix` whose npm ships `node-gyp`, and the
+/// directory to put on `PATH` for it.
+#[cfg(test)]
+pub(crate) fn node_with_npm_for_test(prefix: &Path) -> PathBuf {
+    bundled_node_gyp::tests::node_with_npm(prefix, "11.2.0", "")
+}
+
 use self::build_cache::{
     BuildCacheInvocation, BuildCacheScratch, BuildMarkerState, build_key_for_package,
     is_cacheable_native_build, marker_matches_scripts, marker_requires_key_validation,
@@ -57,6 +70,7 @@ pub(crate) use self::lifecycle_tools::{RegistryPackages, script_reach};
 use self::package_dir::prepare_live_package_dir;
 #[cfg(test)]
 use self::sandbox_env::build_sanitized_env;
+pub(crate) use self::script_execution::NPM_CONFIG_NODE_GYP;
 use self::script_execution::execute_script;
 pub(in crate::commands) use self::script_execution::{
     build_lifecycle_path as publish_lifecycle_path, execute_publish_lifecycle_script,

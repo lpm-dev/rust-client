@@ -95,6 +95,10 @@ pub struct PackageJson {
     /// Scripts defined in package.json (e.g., "build": "tsup", "dev": "vite dev").
     pub scripts: HashMap<String, String>,
 
+    /// `gypfile`: `false` says the `binding.gyp` beside the manifest isn't
+    /// to be built by an install that names no `install` script.
+    pub gypfile: Option<bool>,
+
     /// Binary executables exposed by this package.
     pub bin: Option<BinConfig>,
 
@@ -164,6 +168,7 @@ pub fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson,
         cpu: lossy_string_vec_from_value(obj.get("cpu")),
         libc: lossy_string_vec_from_value(obj.get("libc")),
         scripts: lossy_string_map_from_value(obj.get("scripts")),
+        gypfile: obj.get("gypfile").and_then(serde_json::Value::as_bool),
         bin: obj.get("bin").and_then(bin_config_from_value),
         catalogs: lossy_nested_string_map_from_value(obj.get("catalogs")),
         pnpm: optional_typed_field(obj, "pnpm")?,
