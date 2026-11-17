@@ -1,7 +1,7 @@
-# oxc_parser 0.157.0, patched
+# oxc_parser 0.158.0, patched
 
-This is `oxc_parser` 0.157.0 from crates.io (oxc commit
-`f799f174b5db10f1fa9e136594e53de82d4f4f83`, `crates/oxc_parser`), MIT
+This is `oxc_parser` 0.158.0 from crates.io (oxc commit
+`74e5e665ab8227c3d43abf3ce0e4383830e80c12`, `crates/oxc_parser`), MIT
 licensed (see `LICENSE`), with one change: the parser can stop at a stack
 floor instead of overflowing its thread's stack. The workspace uses it
 through `[patch.crates-io]` in the root `Cargo.toml`.
