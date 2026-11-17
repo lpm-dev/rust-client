@@ -206,7 +206,7 @@ fn run_clean(
             // Windows keeps the sandbox access a package's scripts had in a
             // project with an AppContainer identity of the project's.
             let released_identities = if category.is_none() {
-                let (released, failed) = lpm_sandbox::release_identities_of_removed_projects();
+                let (released, failed) = lpm_sandbox::release_identities_left_behind();
                 for error in failed {
                     install_ui::warn_untrusted(&error.to_string());
                 }
@@ -220,10 +220,7 @@ fn run_clean(
             } else {
                 emit_clean_human(&cleaned, &skipped);
                 if released_identities > 0 {
-                    install_ui::done_untrusted(&format!(
-                        "Removed the sandbox access of {released_identities} package{} in projects that no longer exist",
-                        if released_identities == 1 { "" } else { "s" }
-                    ));
+                    install_ui::done_untrusted(&released_identities_line(released_identities));
                 }
             }
 
@@ -237,6 +234,13 @@ fn run_clean(
 
             Ok(())
         },
+    )
+}
+
+fn released_identities_line(released: usize) -> String {
+    format!(
+        "Removed the sandbox access that {released} package{} left behind",
+        if released == 1 { "" } else { "s" }
     )
 }
 
@@ -643,6 +647,18 @@ mod tests {
         for name in files {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
+    }
+
+    #[test]
+    fn the_line_for_released_sandbox_access_counts_packages() {
+        assert_eq!(
+            released_identities_line(1),
+            "Removed the sandbox access that 1 package left behind"
+        );
+        assert_eq!(
+            released_identities_line(3),
+            "Removed the sandbox access that 3 packages left behind"
+        );
     }
 
     #[test]

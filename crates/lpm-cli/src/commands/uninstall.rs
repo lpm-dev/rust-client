@@ -129,10 +129,10 @@ pub(crate) fn cleanup_removed_packages(
 
 /// Removes the sandbox access `package`'s scripts had in the project, as
 /// Windows keeps it with the package's AppContainer identity; a failure
-/// leaves it to `lpm cache clean` once the project is gone, and is told.
+/// leaves it to `lpm cache clean`, and is told.
 fn release_sandbox_identity(project_dir: &Path, package: &str) {
-    if let Err(error) = lpm_sandbox::release_package_identity(project_dir, package) {
-        tracing::warn!("{error}. `lpm cache clean` removes that access once the project is gone");
+    if let Err(left_behind) = lpm_sandbox::release_package_identity(project_dir, package) {
+        tracing::warn!("{left_behind}");
     }
 }
 
