@@ -1,5 +1,8 @@
 use super::*;
 
+const LOOPBACK_PEER: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50_000);
+
 fn route(host: &str, upstream_port: u16) -> Route {
     Route {
         host: host.to_string(),
@@ -2190,7 +2193,7 @@ async fn http_proxy_routes_registered_host_to_upstream() {
     let body = response.text().await.unwrap();
     assert_eq!(
         body,
-        "POST /hello?x=1 payload host=app.localhost proto=http"
+        "POST /hello?x=1 payload host=app.localhost proto=http for=127.0.0.1"
     );
     proxy.shutdown();
 }
@@ -2286,7 +2289,7 @@ async fn http_proxy_times_out_when_upstream_never_sends_response_headers() {
 
     let response = tokio::time::timeout(
         Duration::from_millis(250),
-        proxy_http_request_inner(Arc::new(state), request),
+        proxy_http_request_inner(Arc::new(state), request, LOOPBACK_PEER),
     )
     .await
     .expect("proxy retained a request after its upstream-header deadline")
@@ -2318,7 +2321,7 @@ async fn http_proxy_rejects_an_upgrade_when_the_tunnel_limit_is_exhausted() {
         .body(axum::body::Body::empty())
         .unwrap();
 
-    let response = proxy_http_request_inner(Arc::new(state), request)
+    let response = proxy_http_request_inner(Arc::new(state), request, LOOPBACK_PEER)
         .await
         .unwrap_err();
 
@@ -2597,7 +2600,7 @@ async fn tls_proxy_routes_registered_host_to_upstream_and_marks_https() {
     assert_eq!(
         body,
         format!(
-            "POST /hello payload host=app.localhost:{} proto=https",
+            "POST /hello payload host=app.localhost:{} proto=https for=127.0.0.1",
             proxy.port()
         )
     );
@@ -2625,6 +2628,7 @@ async fn tls_frontend_terminates_https_for_a_plain_http_upstream() {
         .build()
         .unwrap()
         .get(format!("https://localhost:{}/secure", frontend.port()))
+        .header("x-forwarded-for", "203.0.113.7")
         .send()
         .await
         .unwrap();
@@ -2633,6 +2637,7 @@ async fn tls_frontend_terminates_https_for_a_plain_http_upstream() {
     let body = response.text().await.unwrap();
     assert!(body.contains("GET /secure"));
     assert!(body.contains("proto=https"));
+    assert!(body.ends_with(" for=127.0.0.1"), "{body}");
     frontend.shutdown();
 }
 
@@ -2791,7 +2796,7 @@ async fn tls_frontend_serves_http2_to_a_browser_that_offers_it() {
     assert_eq!(
         response.text().await.unwrap(),
         format!(
-            "GET /module.js?v=1  host=localhost:{} proto=https",
+            "GET /module.js?v=1  host=localhost:{} proto=https for=127.0.0.1",
             frontend.port()
         )
     );
@@ -2959,6 +2964,131 @@ async fn http_proxy_tunnels_websocket_upgrade_bytes_to_upstream() {
 
     upstream_task.await.unwrap();
     proxy.shutdown();
+}
+
+const CLIENT_SET_FORWARDING_HEADERS: &str = "x-forwarded-for: 203.0.113.7\r\n\
+     x-real-ip: 203.0.113.7\r\n\
+     forwarded: for=203.0.113.7;proto=https;host=other.example\r\n\
+     true-client-ip: 203.0.113.7\r\n\
+     cf-connecting-ip: 203.0.113.7\r\n\
+     x-client-ip: 203.0.113.7\r\n\
+     x-original-forwarded-for: 203.0.113.7\r\n\
+     x-forwarded-port: 8443\r\n\
+     x-forwarded-server: other.example\r\n\
+     x-forwarded-ssl: on\r\n\
+     x-keep-me: visible\r\n";
+
+/// Accepts `connections` connections, sends each request head it reads, and
+/// answers an upgrade with 101 and anything else with 200.
+async fn spawn_request_head_recorder(
+    connections: usize,
+) -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (heads, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        for _ in 0..connections {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let head = String::from_utf8_lossy(&read_raw_http_head(&mut stream).await)
+                .to_ascii_lowercase();
+            let reply: &[u8] = if head.contains("\r\nupgrade: websocket\r\n") {
+                b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n"
+            } else {
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+            };
+            heads.send(head).unwrap();
+            stream.write_all(reply).await.unwrap();
+        }
+    });
+    (port, received)
+}
+
+#[tokio::test]
+async fn http_proxy_names_the_real_peer_and_drops_client_forwarding_headers_on_both_paths() {
+    use tokio::io::AsyncWriteExt;
+
+    let (upstream_port, mut heads) = spawn_request_head_recorder(2).await;
+    let registry = Arc::new(tokio::sync::Mutex::new(RouteRegistry::new()));
+    registry
+        .lock()
+        .await
+        .register_routes(123, vec![route("app.localhost", upstream_port)])
+        .unwrap();
+    let proxy = start_http_proxy(Arc::clone(&registry), 0).await.unwrap();
+    let ordinary =
+        format!("GET /page HTTP/1.1\r\nhost: app.localhost\r\n{CLIENT_SET_FORWARDING_HEADERS}\r\n");
+    let upgrade = format!(
+        "GET /hmr HTTP/1.1\r\nhost: app.localhost\r\nconnection: Upgrade\r\nupgrade: websocket\r\n\
+         sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\
+         {CLIENT_SET_FORWARDING_HEADERS}\r\n"
+    );
+
+    for (path, request) in [("ordinary", ordinary), ("upgrade", upgrade)] {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port()))
+            .await
+            .unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let response_head =
+            String::from_utf8_lossy(&read_raw_http_head(&mut stream).await).into_owned();
+        assert!(
+            response_head.starts_with("HTTP/1.1 101") || response_head.starts_with("HTTP/1.1 200"),
+            "{path}: {response_head:?}"
+        );
+        let head = heads.recv().await.unwrap();
+
+        assert_eq!(
+            head.matches("\r\nx-forwarded-for:").count(),
+            1,
+            "{path}: {head:?}"
+        );
+        assert!(
+            head.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"),
+            "{path}: {head:?}"
+        );
+        for client_value in ["203.0.113.7", "other.example"] {
+            assert!(
+                !head.contains(client_value),
+                "{path} kept {client_value}: {head:?}"
+            );
+        }
+        for dropped in [
+            "x-real-ip",
+            "forwarded",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-client-ip",
+            "x-original-forwarded-for",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-ssl",
+        ] {
+            assert!(
+                !head.contains(&format!("\r\n{dropped}:")),
+                "{path} kept {dropped}: {head:?}"
+            );
+        }
+        assert!(
+            head.contains("\r\nx-keep-me: visible\r\n"),
+            "{path}: {head:?}"
+        );
+        assert!(
+            head.contains("\r\nx-forwarded-host: app.localhost\r\n"),
+            "{path}: {head:?}"
+        );
+    }
+    proxy.shutdown();
+}
+
+#[test]
+fn forwarded_for_names_a_peer_by_its_bare_address_and_an_ipv4_mapped_one_as_ipv4() {
+    let mapped: SocketAddr = "[::ffff:192.0.2.10]:4000".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::1]:4000".parse().unwrap();
+
+    assert_eq!(forwarded_for(LOOPBACK_PEER), "127.0.0.1");
+    assert_eq!(forwarded_for(mapped), "192.0.2.10");
+    assert_eq!(forwarded_for(ipv6), "2001:db8::1");
 }
 
 #[tokio::test]
@@ -3151,6 +3281,13 @@ async fn echo_upstream(request: axum::extract::Request) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("-");
     let proto = proto.to_string();
+    let forwarded_for = request
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
     let method = request.method().clone();
     let path = request
         .uri()
@@ -3160,7 +3297,7 @@ async fn echo_upstream(request: axum::extract::Request) -> String {
         .await
         .unwrap();
     format!(
-        "{method} {path} {} host={host} proto={proto}",
+        "{method} {path} {} host={host} proto={proto} for={forwarded_for}",
         String::from_utf8_lossy(&body)
     )
 }

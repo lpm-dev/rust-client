@@ -86,7 +86,7 @@ pub use types::{
 #[cfg(all(test, unix, debug_assertions))]
 pub(crate) use client::{LeaseConnection, register_lease_to_path};
 #[cfg(test)]
-pub(crate) use http::find_header_end;
+pub(crate) use http::{find_header_end, forwarded_for};
 pub(crate) use http::{format_loopback_bind_error, proxy_http_request_inner, start_http_redirect};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use platform::parse_linux_status_effective_uid;
