@@ -90,7 +90,7 @@ pub fn run(
         }
         if apply || remove {
             if !setup::is_elevated().map_err(|error| LpmError::Script(error.to_string()))? {
-                return Err(LpmError::Script("Open an administrator terminal to apply or remove permissions. Keep publishing in your normal terminal.".into()));
+                return Err(LpmError::Script("Open an administrator terminal to apply or remove permissions. Keep running everything else in your normal terminal.".into()));
             }
             if !yes {
                 if json || !std::io::stdin().is_terminal() {

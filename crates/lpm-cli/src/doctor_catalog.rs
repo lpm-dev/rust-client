@@ -1756,7 +1756,7 @@ pub static SANDBOX_SETUP_REQUIRED: CheckEntry = CheckEntry {
     tier: Tier::Extended,
     description: "Windows AppContainer scripts need directory metadata permissions that the current user cannot grant.",
     when_fires: "A protected ancestor of the project or temporary directory has no usable sandbox metadata grant.",
-    remediation: "Preview with `lpm doctor sandbox-setup`. Include --tool-dir for protected tools. Apply from an administrator terminal for the normal user's SID, then publish without elevation.",
+    remediation: "Preview with `lpm doctor sandbox-setup`. Include --tool-dir for protected tools. Apply from an administrator terminal for the normal user's SID, then retry without elevation.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
