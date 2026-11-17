@@ -78,9 +78,9 @@ pub(in crate::commands) use self::script_execution::{
 #[cfg(test)]
 use self::scripts::toposort_packages;
 use self::scripts::{
-    BUILD_MARKER, BuildCacheMetrics, ScriptablePackage, count_untrusted_unbuilt,
-    package_build_layers, read_lifecycle_scripts, rebuild_dry_run_envelope,
-    rebuild_package_failure_message, rebuild_package_label, rebuild_summary_envelope, scripts_word,
+    BUILD_MARKER, BuildCacheMetrics, FailureOutput, PackageFailure, ScriptablePackage,
+    count_untrusted_unbuilt, package_build_layers, read_lifecycle_scripts,
+    rebuild_dry_run_envelope, rebuild_package_label, rebuild_summary_envelope, scripts_word,
     select_named_packages, warn_stale_trusted_deps, widen_to_build_by_policy,
 };
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
@@ -106,7 +106,7 @@ const MAX_CONCURRENT_LIFECYCLE_BUILDS: usize = 4;
 #[derive(Default)]
 struct PackageExecutionResult {
     successes: usize,
-    failures: usize,
+    failures: Vec<PackageFailure>,
     completed_scripts: usize,
     built_packages: Vec<RebuildPackageIdentity>,
     build_cache: BuildCacheMetrics,
@@ -302,7 +302,7 @@ async fn run_under_store_lock(
             let mut report = if dry_run {
                 rebuild_dry_run_envelope(&[], force_floor)
             } else {
-                rebuild_summary_envelope(0, 0, force_floor, &BuildCacheMetrics::default())
+                rebuild_summary_envelope(0, &[], force_floor, &BuildCacheMetrics::default())
             };
             report["denied_all"] = serde_json::json!(true);
             if emit_summary {
@@ -541,7 +541,12 @@ async fn run_under_store_lock(
             let result = if dry_run {
                 rebuild_dry_run_envelope(&[], force_security_floor)
             } else {
-                rebuild_summary_envelope(0, 0, force_security_floor, &BuildCacheMetrics::default())
+                rebuild_summary_envelope(
+                    0,
+                    &[],
+                    force_security_floor,
+                    &BuildCacheMetrics::default(),
+                )
             };
             if emit_summary {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -625,7 +630,12 @@ async fn run_under_store_lock(
             let result = if dry_run {
                 rebuild_dry_run_envelope(&to_build, force_security_floor)
             } else {
-                rebuild_summary_envelope(0, 0, force_security_floor, &BuildCacheMetrics::default())
+                rebuild_summary_envelope(
+                    0,
+                    &[],
+                    force_security_floor,
+                    &BuildCacheMetrics::default(),
+                )
             };
             if emit_summary {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -861,7 +871,7 @@ async fn run_under_store_lock(
 
     // Execute scripts
     let mut successes = 0usize;
-    let mut failures = 0usize;
+    let mut failures = Vec::new();
     let mut completed_scripts = 0usize;
     let mut build_cache_metrics = BuildCacheMetrics::default();
     let mut built_packages = Vec::with_capacity(to_build.len());
@@ -870,6 +880,10 @@ async fn run_under_store_lock(
         .map(|pkg| rebuild_package_label(pkg).len())
         .max()
         .unwrap_or(0);
+    let failed = FailureOutput {
+        json: json_output,
+        label_width: package_label_width,
+    };
 
     // Sandbox backend setup
     // : resolve the full sandbox-mode precedence chain
@@ -1198,10 +1212,10 @@ async fn run_under_store_lock(
                     let pkg = *pkg;
                     let mut result = PackageExecutionResult::default();
                     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                        result.failures = 1;
+                        result.failures.push(PackageFailure::interrupted(pkg));
                         return result;
                     }
-        let mut pkg_success = true;
+        let mut script_failure = None;
 
         let package_store_version = match rebuild_store_version(
             &pkg.store_path,
@@ -1211,20 +1225,7 @@ async fn run_under_store_lock(
         ) {
             Ok(version) => version,
             Err(error) => {
-                if !json_output {
-                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    let error = error.to_string();
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} {}  {}",
-                        install_ui::red("✗"),
-                        label,
-                        lpm_common::sanitize_terminal_inline(&error),
-                    ));
-                }
-                if json_output {
-                    install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error));
-                }
-                result.failures += 1;
+                result.failures.push(failed.package(pkg, &error));
                 return result;
             }
         };
@@ -1234,20 +1235,10 @@ async fn run_under_store_lock(
             match virtual_store.acquire_build_entry_lock(graph_key_digest) {
                 Ok(lock) => Some(lock),
                 Err(error) => {
-                    if !json_output {
-                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                        let error = error.to_string();
-                        install_ui::detail_line(crate::install_ui::terminal_line!(
-                            "  {} {}  failed to lock package build state: {}",
-                            install_ui::red("✗"),
-                            label,
-                            lpm_common::sanitize_terminal_inline(&error),
-                        ));
-                    }
-                    if json_output {
-                        install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error));
-                    }
-                    result.failures += 1;
+                    result.failures.push(failed.package(
+                        pkg,
+                        &format_args!("failed to lock package build state: {error}"),
+                    ));
                     return result;
                 }
             }
@@ -1279,19 +1270,7 @@ async fn run_under_store_lock(
         ) {
             Ok(d) => d,
             Err(e) => {
-                if !json_output {
-                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} {}  {}",
-                        install_ui::red("✗"),
-                        label,
-                        lpm_common::sanitize_terminal_inline(&e),
-                    ));
-                }
-                if json_output {
-                    install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &e));
-                }
-                result.failures += 1;
+                result.failures.push(failed.package(pkg, &e));
                 return result;
             }
         };
@@ -1304,13 +1283,13 @@ async fn run_under_store_lock(
         let package_tmpdir = if build_cache_scratch.is_none() {
             match tempfile::Builder::new().prefix("lpm-rebuild-").tempdir_in(&tmpdir) {
                 Ok(directory) => Some(directory),
-                Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }
+                Err(error) => { result.failures.push(failed.package(pkg, &error)); return result; }
             }
         } else { None };
         let scratch_path = match (build_cache_scratch.as_ref(), package_tmpdir.as_ref()) {
             (Some(scratch), _) => scratch.path(),
             (_, Some(scratch)) => scratch.path(),
-            _ => { result.failures += 1; return result; }
+            _ => { result.failures.push(failed.package(pkg, &"no scratch directory for its build")); return result; }
         };
         let script_tmpdir = scratch_path.join("tmp");
         let tools = match std::fs::create_dir(&script_tmpdir).map_err(|e| e.to_string()).and_then(|()| {
@@ -1322,7 +1301,7 @@ async fn run_under_store_lock(
             lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path, scope, Some(&host_tools))
         }) {
             Ok(tools) => tools,
-            Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }
+            Err(error) => { result.failures.push(failed.package(pkg, &error)); return result; }
         };
         let key_start = std::time::Instant::now();
         let mut build_key = build_cache_invocation
@@ -1359,10 +1338,9 @@ async fn run_under_store_lock(
             match lpm_security::script_hash::compute_script_hash(&pkg.store_path) {
                 Some(hash) => Some(hash),
                 None => {
-                    install_ui::failed_untrusted(&rebuild_package_failure_message(
-                        pkg, &"cannot fingerprint installed lifecycle scripts",
-                    ));
-                    result.failures += 1;
+                    result.failures.push(
+                        failed.package(pkg, &"cannot fingerprint installed lifecycle scripts"),
+                    );
                     return result;
                 }
             }
@@ -1373,16 +1351,7 @@ async fn run_under_store_lock(
         let current_marker = match read_build_marker(&marker_path) {
             Ok(marker) => marker,
             Err(error) => {
-                if !json_output {
-                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} {}  {}",
-                        install_ui::red("✗"),
-                        label,
-                        lpm_common::sanitize_terminal_inline(&error.to_string()),
-                    ));
-                }
-                result.failures += 1;
+                result.failures.push(failed.package(pkg, &error));
                 return result;
             }
         };
@@ -1390,16 +1359,9 @@ async fn run_under_store_lock(
             if matches!(current_marker, BuildMarkerState::Present { .. })
                 && let Err(error) = remove_build_marker_durably(&marker_path)
             {
-                if !json_output {
-                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} {}  failed to clear build marker: {}",
-                        install_ui::red("✗"),
-                        label,
-                        lpm_common::sanitize_terminal_inline(&error.to_string()),
-                    ));
-                }
-                result.failures += 1;
+                result.failures.push(
+                    failed.package(pkg, &format_args!("failed to clear build marker: {error}")),
+                );
                 return result;
             }
         } else if let BuildMarkerState::Present {
@@ -1414,17 +1376,10 @@ async fn run_under_store_lock(
                 (Some(marker_key), None) if Some(marker_key) == lifecycle_hash.as_deref() => return result,
                 _ => {
                     if let Err(error) = remove_build_marker_durably(&marker_path) {
-                        if !json_output {
-                            let label =
-                                format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                            install_ui::detail_line(crate::install_ui::terminal_line!(
-                                "  {} {}  failed to clear stale build marker: {}",
-                                install_ui::red("✗"),
-                                label,
-                                lpm_common::sanitize_terminal_inline(&error.to_string()),
-                            ));
-                        }
-                        result.failures += 1;
+                        result.failures.push(failed.package(
+                            pkg,
+                            &format_args!("failed to clear stale build marker: {error}"),
+                        ));
                         return result;
                     }
                 }
@@ -1447,19 +1402,12 @@ async fn run_under_store_lock(
                                 artifact.manifest.lifecycle_duration_ms;
                             if let Err(error) = write_build_marker(&marker_path, Some(key.as_str()))
                             {
-                                if !json_output {
-                                    let label = format!(
-                                        "{:<package_label_width$}",
-                                        rebuild_package_label(pkg)
-                                    );
-                                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                                        "  {} {}  failed to persist restored build marker: {}",
-                                        install_ui::red("✗"),
-                                        label,
-                                        lpm_common::sanitize_terminal_inline(&error.to_string()),
-                                    ));
-                                }
-                                result.failures += 1;
+                                result.failures.push(failed.package(
+                                    pkg,
+                                    &format_args!(
+                                        "failed to persist restored build marker: {error}"
+                                    ),
+                                ));
                                 return result;
                             }
                             if !json_output {
@@ -1516,17 +1464,10 @@ async fn run_under_store_lock(
             {
                 result.build_cache.rematerialize_ms +=
                     elapsed_millis(rematerialize_start.elapsed());
-                if !json_output {
-                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    let error = error.to_string();
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} {}  failed to restore pristine source: {}",
-                        install_ui::red("✗"),
-                        label,
-                        lpm_common::sanitize_terminal_inline(&error),
-                    ));
-                }
-                result.failures += 1;
+                result.failures.push(failed.package(
+                    pkg,
+                    &format_args!("failed to restore pristine source: {error}"),
+                ));
                 return result;
             }
             result.build_cache.rematerialize_ms +=
@@ -1578,44 +1519,31 @@ async fn run_under_store_lock(
                     result.completed_scripts += 1;
                 }
                 Err(e) => {
-                    pkg_success = false;
-                    if !json_output {
-                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                        install_ui::detail_line(crate::install_ui::terminal_line!(
-                            "  {} {}  {} failed: {}",
-                            install_ui::red("✗"),
-                            label,
-                            install_ui::dim(phase),
-                            lpm_common::sanitize_terminal_inline(&e),
-                        ));
-                        #[cfg(windows)]
-                        if e.starts_with(process_tree::TIMEOUT_ERROR)
-                            && let Some(node) = stuck_node
-                        {
-                            install_ui::detail_line(crate::install_ui::terminal_line!(
-                                "    {}",
-                                install_ui::dim(&node.timeout_hint()),
-                            ));
-                        }
-                        let searched = if tools.project_bins {
-                            script_execution::find_env_case_insensitive(&sanitized_env, "PATH")
-                        } else {
-                            Some(host_tools.as_os_str())
-                        };
-                        if tools.lacks_node_gyp(&pkg.scripts, project_dir, searched) {
-                            install_ui::detail_line(crate::install_ui::terminal_line!(
-                                "    {}",
-                                install_ui::dim(lifecycle_tools::NODE_GYP_MISSING),
-                            ));
-                        }
+                    let mut hints = Vec::new();
+                    #[cfg(windows)]
+                    if e.starts_with(process_tree::TIMEOUT_ERROR)
+                        && let Some(node) = stuck_node
+                    {
+                        hints.push(node.timeout_hint());
                     }
+                    let searched = if tools.project_bins {
+                        script_execution::find_env_case_insensitive(&sanitized_env, "PATH")
+                    } else {
+                        Some(host_tools.as_os_str())
+                    };
+                    if tools.lacks_node_gyp(&pkg.scripts, project_dir, searched) {
+                        hints.push(lifecycle_tools::NODE_GYP_MISSING.to_string());
+                    }
+                    script_failure = Some(failed.script(pkg, phase, &e, hints));
                     break; // Don't run subsequent phases if one fails
                 }
             }
         }
 
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) { pkg_success = false; }
-        if pkg_success {
+        if script_failure.is_none() && cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            script_failure = Some(PackageFailure::interrupted(pkg));
+        }
+        let Some(script_failure) = script_failure else {
             if let Some(key) = build_key.as_ref() {
                 let publish_start = std::time::Instant::now();
                 if let Err(error) = virtual_store.publish_build_artifact(
@@ -1636,16 +1564,9 @@ async fn run_under_store_lock(
             if let Err(error) =
                 write_build_marker(&marker_path, build_key.as_ref().map(|key| key.as_str()).or(lifecycle_hash.as_deref()))
             {
-                if !json_output {
-                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} {}  failed to persist build marker: {}",
-                        install_ui::red("✗"),
-                        label,
-                        lpm_common::sanitize_terminal_inline(&error.to_string()),
-                    ));
-                }
-                result.failures += 1;
+                result.failures.push(
+                    failed.package(pkg, &format_args!("failed to persist build marker: {error}")),
+                );
                 return result;
             }
             result.successes += 1;
@@ -1655,9 +1576,9 @@ async fn run_under_store_lock(
                 pkg.integrity.clone(),
                 pkg.instance_id,
             ));
-        } else {
-            result.failures += 1;
-        }
+            return result;
+        };
+        result.failures.push(script_failure);
                     result
                 })
                 .collect::<Vec<_>>()
@@ -1672,7 +1593,7 @@ async fn run_under_store_lock(
         };
         for result in layer_results {
             successes += result.successes;
-            failures += result.failures;
+            failures.extend(result.failures);
             completed_scripts += result.completed_scripts;
             built_packages.extend(result.built_packages);
             build_cache_metrics.merge(result.build_cache);
@@ -1690,14 +1611,14 @@ async fn run_under_store_lock(
     if json_output {
         let json = rebuild_summary_envelope(
             successes,
-            failures,
+            &failures,
             force_security_floor,
             &build_cache_metrics,
         );
         if emit_summary {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
-    } else if failures == 0 {
+    } else if failures.is_empty() {
         eprintln!();
         install_ui::done_untrusted(&format!(
             "Completed {completed_scripts} {}",
@@ -1733,14 +1654,15 @@ async fn run_under_store_lock(
         ));
     } else {
         eprintln!();
-        install_ui::warn_untrusted(&format!("{successes} succeeded, {failures} failed"));
+        install_ui::warn_untrusted(&format!("{successes} succeeded, {} failed", failures.len()));
     }
 
-    if failures > 0 && json_output && emit_summary {
+    if !failures.is_empty() && json_output && emit_summary {
         Err(LpmError::ExitCode(1))
-    } else if failures > 0 {
+    } else if !failures.is_empty() {
         Err(LpmError::Registry(format!(
-            "{failures} package(s) failed to build"
+            "{} package(s) failed to build",
+            failures.len()
         )))
     } else {
         Ok(RebuildRunReport {
