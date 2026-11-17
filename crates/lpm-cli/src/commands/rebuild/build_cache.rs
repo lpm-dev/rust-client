@@ -794,6 +794,43 @@ fn toolchain_probe_environment(
     probe_environment
 }
 
+/// What the host's `executable` prints for `args`, run as a toolchain
+/// probe is: not at all when the project controls the executable, and
+/// otherwise with only data-bearing environment, a time limit and bounded
+/// output. `None` when it isn't found, isn't run, fails, or prints more
+/// than a probe keeps.
+#[cfg(windows)]
+pub(super) fn trusted_host_output(
+    executable: &str,
+    args: &[&str],
+    environment: &super::sandbox_env::ChildEnvironment,
+    project_dir: &Path,
+) -> Option<String> {
+    let invocation = resolve_executable(executable, environment)?;
+    let canonical = std::fs::canonicalize(&invocation).ok()?;
+    if is_project_controlled_path(&invocation, project_dir)
+        || is_project_controlled_path(&canonical, project_dir)
+    {
+        return None;
+    }
+    let mut probe_environment = toolchain_probe_environment(environment);
+    // Node aborts at startup on Windows when it can't find the system
+    // directory to load its random number provider from.
+    for name in ["SystemRoot", "windir"] {
+        if let Some((key, value)) = environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            probe_environment.insert(key.clone(), value.clone());
+        }
+    }
+    let output = run_bounded_toolchain_probe(&invocation, args, &probe_environment)?;
+    let complete = usize::try_from(output.stdout.total_bytes) == Ok(output.stdout.retained.len());
+    (output.status.success() && complete)
+        .then(|| String::from_utf8(output.stdout.retained).ok())
+        .flatten()
+}
+
 struct ProbeStream {
     retained: Vec<u8>,
     digest: [u8; 32],

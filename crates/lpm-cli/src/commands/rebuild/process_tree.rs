@@ -2,6 +2,9 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
+/// How the error of a script stopped at its time limit begins.
+pub(super) const TIMEOUT_ERROR: &str = "timeout after";
+
 pub(in crate::commands) fn kill_process_tree(
     child: &mut std::process::Child,
 ) -> Result<(), lpm_sandbox::SurvivingProcesses> {
@@ -419,7 +422,7 @@ fn finish_wait_with_cleanup(
             let _ = child.wait();
             Err(with_survivors(
                 format!(
-                    "timeout after {}s — process group killed",
+                    "{TIMEOUT_ERROR} {}s — process group killed",
                     timeout.as_secs()
                 ),
                 cleanup,
