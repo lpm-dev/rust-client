@@ -143,7 +143,8 @@ pub struct HelperArgs {
     /// count the script's processes once the helper is gone. The run
     /// records the name, so a cleanup ends what is left in the Job before
     /// it takes anything of the run back. Without it the helper makes a
-    /// Job of its own.
+    /// Job of its own. With `--take-back-run` it names the stopped run to
+    /// take back, by the Job its script was in.
     pub job: Option<String>,
     /// Trees already swept of grants to AppContainer profiles that no
     /// longer exist, as earlier releases' per-run profiles left behind
@@ -255,10 +256,10 @@ pub enum ParseError {
     /// the run must have a record to name the Job in.
     #[error("`--job` needs `--grant-record`")]
     JobWithoutRecord,
-    /// A cleanup run starts no script, and finds the Jobs of earlier runs
-    /// in the grant record.
-    #[error("`{0}` starts no script, but `--job` names the Job of one")]
-    JobWithCleanup(&'static str),
+    /// `--revoke-only` cleans up after every run of the identity, and finds
+    /// their Jobs in the grant record.
+    #[error("`--revoke-only` cleans up after every run, but `--job` names the Job of one")]
+    JobWithRevokeOnly,
     /// `--take-back-run` leaves the identity for its next run.
     #[error("`--take-back-run` keeps the profile `--delete-appcontainer-profile` would delete")]
     TakeBackDeletesProfile,
@@ -476,8 +477,8 @@ where
         return Err(ParseError::TakeBackDeletesProfile);
     }
     if let Some(cleanup) = cleanup {
-        if job.is_some() {
-            return Err(ParseError::JobWithCleanup(cleanup));
+        if job.is_some() && revoke_only {
+            return Err(ParseError::JobWithRevokeOnly);
         }
         if saw_separator {
             return Err(ParseError::ProgramWithCleanup(cleanup));
@@ -743,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_argv_takes_a_job_for_a_run_and_for_no_cleanup() {
+    fn parse_argv_takes_a_job_for_a_run_and_for_a_take_back_of_one() {
         let identity = [
             "--protocol-version",
             "3",
@@ -774,12 +775,13 @@ mod tests {
             parse_argv(argv(&[&identity[..4], &job, &program])).unwrap_err(),
             ParseError::JobWithoutRecord
         );
-        for cleanup in ["--take-back-run", "--revoke-only"] {
-            assert_eq!(
-                parse_argv(argv(&[&identity, &job, &[cleanup]])).unwrap_err(),
-                ParseError::JobWithCleanup(cleanup)
-            );
-        }
+        let taken_back = parse_argv(argv(&[&identity, &job, &["--take-back-run"]])).unwrap();
+        assert!(taken_back.take_back_run);
+        assert_eq!(taken_back.job, Some(r"Global\LpmSandboxRun-1".to_string()));
+        assert_eq!(
+            parse_argv(argv(&[&identity, &job, &["--revoke-only"]])).unwrap_err(),
+            ParseError::JobWithRevokeOnly
+        );
     }
 
     #[test]

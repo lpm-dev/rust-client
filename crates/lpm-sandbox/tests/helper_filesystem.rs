@@ -1608,36 +1608,41 @@ fn a_run_without_a_grant_record_waits_for_the_run_of_its_identity_before_it() {
         "--grant-record".into(),
         record.to_string_lossy().into_owned(),
     ]);
-    let run_without_a_record = |script: String, writable: Option<&std::path::Path>| {
-        let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
-        helper
-            .arg("--protocol-version")
-            .arg(lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string())
-            .arg("--appcontainer-name")
-            .arg(&name)
-            .args(["--stdio-stdin", "null"])
-            .args(["--stdio-stdout", "null"])
-            .args(["--stdio-stderr", "null"])
-            .arg("--readable-dir")
-            .arg(project.path())
-            .arg("--secret-read-deny")
-            .arg(&secret);
-        if let Some(writable) = writable {
-            helper.arg("--writable-dir").arg(writable);
-        }
-        helper
-            .args([
-                "--",
-                POWERSHELL,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-            ])
-            .arg(script)
-            .spawn()
-            .map(StoppedWithTheTest)
-            .expect("spawn helper")
-    };
+    // `says` is the file the helper's own stderr goes to.
+    let run_without_a_record =
+        |script: String, writable: Option<&std::path::Path>, says: Option<&std::path::Path>| {
+            let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
+            helper
+                .arg("--protocol-version")
+                .arg(lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string())
+                .arg("--appcontainer-name")
+                .arg(&name)
+                .args(["--stdio-stdin", "null"])
+                .args(["--stdio-stdout", "null"])
+                .args(["--stdio-stderr", "null"])
+                .arg("--readable-dir")
+                .arg(project.path())
+                .arg("--secret-read-deny")
+                .arg(&secret);
+            if let Some(writable) = writable {
+                helper.arg("--writable-dir").arg(writable);
+            }
+            if let Some(says) = says {
+                helper.stderr(fs::File::create(says).expect("file for the helper's stderr"));
+            }
+            helper
+                .args([
+                    "--",
+                    POWERSHELL,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                ])
+                .arg(script)
+                .spawn()
+                .map(StoppedWithTheTest)
+                .expect("spawn helper")
+        };
     let quoted = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
     let mut first = run_without_a_record(
         format!(
@@ -1648,6 +1653,7 @@ fn a_run_without_a_grant_record_waits_for_the_run_of_its_identity_before_it() {
             quoted(&secret_was_read),
         ),
         Some(scripts_own.path()),
+        None,
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !started.exists() {
@@ -1659,16 +1665,29 @@ fn a_run_without_a_grant_record_waits_for_the_run_of_its_identity_before_it() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    let mut second = run_without_a_record("exit 0".to_owned(), None);
-    let second_ended_early = ends_within(&mut second.0, std::time::Duration::from_secs(5));
+    // A run says that it waits once it has waited for the identity, so a
+    // second run that is only slow to start isn't taken for one that waits.
+    let second_says = records.path().join("second-run-says.txt");
+    let mut second = run_without_a_record("exit 0".to_owned(), None, Some(&second_says));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let second_waited = loop {
+        if fs::read_to_string(&second_says)
+            .is_ok_and(|said| said.contains("waiting for the process that holds"))
+        {
+            break true;
+        }
+        if second.0.try_wait().expect("poll helper").is_some()
+            || std::time::Instant::now() >= deadline
+        {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
     fs::write(&told_to_end, "").expect("tell the first script to end");
     let first_ended = ends_within(&mut first.0, std::time::Duration::from_secs(60));
     let second_ended = ends_within(&mut second.0, std::time::Duration::from_secs(120));
 
-    assert!(
-        !second_ended_early,
-        "the second run didn't wait for the first"
-    );
+    assert!(second_waited, "the second run didn't wait for the first");
     assert!(first_ended && second_ended);
     let second_run = second.0.wait().expect("the second run's exit status");
     assert!(second_run.success(), "{second_run:?}");
@@ -1680,6 +1699,347 @@ fn a_run_without_a_grant_record_waits_for_the_run_of_its_identity_before_it() {
         denied_app_containers(&secret).is_empty(),
         "each run takes its denial back once its own script is gone"
     );
+}
+
+/// The lock of a sandbox identity, held by name until dropped, as a
+/// process of any account can hold it without running the package.
+struct HeldIdentity {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    holder: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldIdentity {
+    fn hold(profile: &str) -> Self {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            CreateMutexExW, ReleaseMutex, WaitForSingleObject,
+        };
+
+        let name: Vec<u16> = format!(r"Global\LpmSandboxIdentity-{profile}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let (says_held, is_held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        // A mutex is let go by the thread that took it.
+        let holder = std::thread::spawn(move || {
+            // SAFETY: the name is null-terminated and lives through the
+            // call. The rights are the two a holder needs: to wait for the
+            // mutex and to release it.
+            let mutex = unsafe { CreateMutexExW(std::ptr::null(), name.as_ptr(), 0, 0x0010_0001) };
+            if mutex.is_null() {
+                let _ = says_held.send(false);
+                return;
+            }
+            // SAFETY: `mutex` is a handle this thread owns.
+            let taken = unsafe { WaitForSingleObject(mutex, 60_000) };
+            let held = taken == WAIT_OBJECT_0 || taken == WAIT_ABANDONED;
+            let _ = says_held.send(held);
+            if held {
+                // Ends when the test releases the lock or drops its end.
+                let _ = released.recv();
+                // SAFETY: this thread took the mutex above.
+                unsafe { ReleaseMutex(mutex) };
+            }
+            // SAFETY: the handle is closed once, here.
+            unsafe { CloseHandle(mutex) };
+        });
+        let held = is_held.recv().unwrap_or(false);
+        let mut identity = Self {
+            release: Some(release),
+            holder: Some(holder),
+        };
+        if !held {
+            identity.release();
+            panic!("couldn't hold the identity's lock");
+        }
+        identity
+    }
+
+    fn release(&mut self) {
+        self.release = None;
+        if let Some(holder) = self.holder.take() {
+            let _ = holder.join();
+        }
+    }
+}
+
+impl Drop for HeldIdentity {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// What `helper` printed and how it ended. One that hasn't ended by then is
+/// stopped and fails the test: it waited for a held identity without
+/// limit.
+fn output_within_half_a_minute(mut helper: std::process::Command) -> std::process::Output {
+    let mut helper = helper
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn helper");
+    let ended = ends_within(&mut helper, std::time::Duration::from_secs(30));
+    let _ = helper.kill();
+    let output = helper.wait_with_output().expect("the helper's output");
+    assert!(ended, "the helper had to be stopped: {output:?}");
+    output
+}
+
+fn profile_of(identity: &[String]) -> &str {
+    identity
+        .iter()
+        .skip_while(|argument| *argument != "--appcontainer-name")
+        .nth(1)
+        .expect("the identity names its profile")
+}
+
+#[test]
+fn a_take_back_fails_while_a_process_that_takes_nothing_back_holds_the_identity() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let (mut run, sid) =
+        start_a_run_that_sleeps("LpmFilesystemHeldLock", project.path(), &record, &secret);
+    run.stop();
+    let take_back = || {
+        let mut take_back = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
+        take_back.args(&run.identity).arg("--take-back-run");
+        output_within_half_a_minute(take_back)
+    };
+    let mut held = HeldIdentity::hold(profile_of(&run.identity));
+
+    let refused = take_back();
+
+    assert!(
+        !refused.status.success(),
+        "nothing was taken back, and the take-back said it had been: {refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("holds this package's sandbox identity"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        denied_app_containers(&secret),
+        std::slice::from_ref(&sid),
+        "the denial stays set"
+    );
+    assert_eq!(
+        recorded_denials(&record),
+        std::slice::from_ref(&secret),
+        "and the record still names it, for whoever takes it back later"
+    );
+
+    held.release();
+    let taken_back = take_back();
+
+    assert!(taken_back.status.success(), "{taken_back:?}");
+    assert!(denied_app_containers(&secret).is_empty());
+    assert!(recorded_denials(&record).is_empty());
+}
+
+#[test]
+fn a_take_back_ends_once_the_identity_s_holder_has_taken_the_stopped_run_back() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let record = records.path().join("grants.json");
+    let (run, sid) = stop_the_helper_of_a_run_in_a_held_job(
+        "LpmFilesystemHolderTakesBack",
+        project.path(),
+        &record,
+        &secret,
+    );
+    let job = run.job.as_ref().expect("the run's Job");
+    let _held = HeldIdentity::hold(profile_of(&run.identity));
+    let mut take_back = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&run.identity)
+        .args(["--job", job.name.as_str()])
+        .arg("--take-back-run")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the take-back");
+    let waits = !ends_within(&mut take_back, std::time::Duration::from_secs(1));
+
+    // The part of the identity's next run, which holds the identity: once
+    // it has taken the stopped run back, the record no longer names that
+    // run's Job. The run's entries stay recorded here, so that the test's
+    // cleanup takes them back.
+    let mut recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("the run recorded what it set"))
+            .expect("the record is JSON");
+    recorded["run"]["jobs"] = serde_json::json!([]);
+    fs::write(&record, serde_json::to_vec(&recorded).unwrap()).expect("rewrite the record");
+    let ended = ends_within(&mut take_back, std::time::Duration::from_secs(10));
+    let _ = take_back.kill();
+    let taken_back = take_back
+        .wait_with_output()
+        .expect("the take-back's output");
+
+    assert!(waits, "the record still named the run: {taken_back:?}");
+    assert!(ended && taken_back.status.success(), "{taken_back:?}");
+    assert_eq!(
+        denied_app_containers(&secret),
+        std::slice::from_ref(&sid),
+        "a take-back that doesn't hold the identity changes nothing itself"
+    );
+    assert!(!run.script_read_the_secret());
+}
+
+#[test]
+fn a_run_says_that_it_waits_for_the_process_that_holds_its_identity() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let created = project.path().join("created-by-child.txt");
+    let mut argv = helper_argv_base();
+    argv.extend(
+        [
+            "--writable-dir",
+            &project.path().to_string_lossy(),
+            "--",
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &ps_write_file(&created.to_string_lossy()),
+        ]
+        .map(String::from),
+    );
+    let mut held = HeldIdentity::hold(profile_of(&argv));
+    let mut run = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&argv)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn helper");
+
+    let ended_while_held = ends_within(&mut run, std::time::Duration::from_secs(8));
+    let started_its_script = created.exists();
+    held.release();
+    let ended = ends_within(&mut run, std::time::Duration::from_secs(120));
+    let _ = run.kill();
+    let output = run.wait_with_output().expect("the run's output");
+
+    assert!(
+        !ended_while_held && !started_its_script,
+        "the run didn't wait for the identity: {output:?}"
+    );
+    assert!(ended && output.status.success(), "{output:?}");
+    assert!(created.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("waiting for the process that holds"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its_identity() {
+    let records = tempfile::tempdir().expect("record tempdir");
+    let identity = RunIdentity(vec![
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        format!("LpmFilesystemBusy-{}", std::process::id()),
+        "--grant-record".into(),
+        records
+            .path()
+            .join("grants.json")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    let mut held = HeldIdentity::hold(profile_of(&identity.0));
+
+    let refused = output_within_half_a_minute(cleanup_of(&identity.0));
+
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("nothing of it was cleaned up"),
+        "{refused:?}"
+    );
+
+    held.release();
+    let cleaned_up = output_within_half_a_minute(cleanup_of(&identity.0));
+
+    assert!(cleaned_up.status.success(), "{cleaned_up:?}");
+}
+
+/// The run's helper is started by a `cmd.exe` the test can end, and what
+/// it writes to stderr comes back through that process's pipe, which
+/// closes once the helper has ended too.
+#[test]
+fn a_run_stops_waiting_for_its_identity_once_the_process_that_started_it_ends() {
+    use std::io::Read as _;
+    use std::os::windows::process::CommandExt as _;
+
+    let project = tempfile::tempdir().expect("project tempdir");
+    let created = project.path().join("created-by-child.txt");
+    let mut argv = helper_argv_base();
+    argv.extend(["--writable-dir", &project.path().to_string_lossy()].map(String::from));
+    let quoted: Vec<String> = argv
+        .iter()
+        .map(|argument| format!("\"{argument}\""))
+        .collect();
+    let mut held = HeldIdentity::hold(profile_of(&argv));
+    let mut caller = std::process::Command::new(r"C:\Windows\System32\cmd.exe");
+    caller
+        .raw_arg(format!(
+            "/d /s /c \"\"{}\" {} -- C:\\Windows\\System32\\cmd.exe /d /c mkdir \"{}\"\"",
+            env!("CARGO_BIN_EXE_lpm-sandbox-helper"),
+            quoted.join(" "),
+            created.display(),
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut caller = caller.spawn().expect("start the helper's caller");
+    let mut stderr = caller.stderr.take().expect("the caller's stderr");
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stderr.read(&mut buffer).unwrap_or(0);
+            if said.send(buffer[..read].to_vec()).is_err() || read == 0 {
+                return;
+            }
+        }
+    });
+    let mut printed = String::new();
+    let mut closed_before = |wanted: Option<&str>, limit: std::time::Duration| {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if wanted.is_some_and(|wanted| printed.contains(wanted)) {
+                return false;
+            }
+            match heard.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(bytes) if bytes.is_empty() => return true,
+                Ok(bytes) => printed.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(_) => return false,
+            }
+        }
+    };
+
+    let ended_before_it_waited = closed_before(
+        Some("waiting for the process that holds"),
+        std::time::Duration::from_secs(60),
+    );
+    let _ = caller.kill();
+    let _ = caller.wait();
+    let helper_ended = closed_before(None, std::time::Duration::from_secs(20));
+    held.release();
+
+    assert!(
+        !ended_before_it_waited && printed.contains("waiting for the process that holds"),
+        "the run never said that it waits: {printed}"
+    );
+    assert!(
+        helper_ended,
+        "the run went on waiting for its identity after the process that started it ended: {printed}"
+    );
+    assert!(!created.exists(), "and it started no script");
 }
 
 #[test]

@@ -132,7 +132,7 @@ pub(crate) fn cleanup_removed_packages(
 /// leaves it to `lpm cache clean` once the project is gone, and is told.
 fn release_sandbox_identity(project_dir: &Path, package: &str) {
     if let Err(error) = lpm_sandbox::release_package_identity(project_dir, package) {
-        tracing::warn!("{error}");
+        tracing::warn!("{error}. `lpm cache clean` removes that access once the project is gone");
     }
 }
 
