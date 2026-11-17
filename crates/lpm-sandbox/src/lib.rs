@@ -1205,8 +1205,9 @@ pub struct IdentityLeftBehind {
     pub unrecorded: Option<String>,
 }
 
-/// What [`release_identities_left_behind`] released, and what it
-/// couldn't.
+/// The identities [`release_identities_left_behind`] took access from,
+/// and what it couldn't release. One that had no access left is released
+/// without being counted.
 #[derive(Debug, Default)]
 pub struct ReleasedIdentities {
     /// Identities of projects that no longer exist.

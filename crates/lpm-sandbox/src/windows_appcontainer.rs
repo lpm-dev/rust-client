@@ -278,6 +278,10 @@ fn release_identities_left_behind_in(
         } else {
             (Released::Forgotten, &mut released.of_removed_projects)
         };
+        // An identity that was released keeps its identity record while its
+        // project is there, and has no grant record. Once the project is
+        // gone that identity record goes too, with no access left to remove.
+        let held_access = grant_record_path(records, &name).exists();
         match release_identity(
             records,
             &helper,
@@ -286,7 +290,8 @@ fn release_identities_left_behind_in(
             &record.package,
             then,
         ) {
-            Ok(()) => *count += 1,
+            Ok(()) if held_access => *count += 1,
+            Ok(()) => {}
             Err(error) => released.failed.push(error),
         }
     }
@@ -1851,8 +1856,8 @@ mod tests {
 
     /// A folder for identity records and a project beside it, with two
     /// scripts that stand in for the helper: one that fails as a cleanup
-    /// that found the identity held does, and one that succeeds and
-    /// writes down what it was started with.
+    /// that found the identity held does, and one that succeeds, writes
+    /// down what it was started with and removes the grant record.
     struct Releases {
         folder: tempfile::TempDir,
     }
@@ -1868,7 +1873,12 @@ mod tests {
             .unwrap();
             std::fs::write(
                 folder.path().join("works.cmd"),
-                "@echo %*>> \"%~dp0released.txt\"\r\n@exit /b 0\r\n",
+                "@echo %*>> \"%~dp0released.txt\"\r\n\
+                 :next\r\n\
+                 @if \"%~1\"==\"\" exit /b 0\r\n\
+                 @if \"%~1\"==\"--grant-record\" if exist \"%~2\" del \"%~2\"\r\n\
+                 @shift\r\n\
+                 @goto next\r\n",
             )
             .unwrap();
             Self { folder }
@@ -1882,11 +1892,13 @@ mod tests {
             self.folder.path().join("project")
         }
 
-        /// Records the identity of `package` in the project, as a run of
-        /// its scripts does, and says where.
+        /// Records the identity of `package` in the project and what it
+        /// was granted, as a run of its scripts does, and says where the
+        /// identity is recorded.
         fn run_of(&self, package: &str) -> PathBuf {
             let name = appcontainer_name_for(&self.project(), package);
             record_identity(&self.records(), &name, &self.project(), package);
+            std::fs::write(grant_record_path(&self.records(), &name), "{}").unwrap();
             identity_record_path(&self.records(), &name)
         }
 
@@ -1899,9 +1911,9 @@ mod tests {
             release_package_identity_in(&self.records(), || Ok(helper), &self.project(), package)
         }
 
-        /// Sweeps, and says how many identities it released of packages
-        /// that left the project, of projects that are gone, and what
-        /// failed.
+        /// Sweeps, and says how many identities it took access from of
+        /// packages that left the project, of projects that are gone, and
+        /// what failed.
         fn sweep(&self) -> (usize, usize, Vec<SandboxError>) {
             let helper = self.folder.path().join("works.cmd");
             let released = release_identities_left_behind_in(&self.records(), || Ok(helper));
@@ -2037,6 +2049,24 @@ mod tests {
         assert_eq!(after, 1, "{failures:?}");
         assert_eq!(of_left_packages, 0, "no uninstall left it behind");
         assert!(!of_a_gone_project.exists());
+    }
+
+    #[test]
+    fn an_identity_released_before_its_project_went_is_forgotten_without_being_counted() {
+        let releases = Releases::new();
+        let record = releases.run_of("left");
+        let failed = releases.uninstall_of("left", "fails.cmd");
+        let (released, _, _) = releases.sweep();
+
+        std::fs::remove_dir(releases.project()).unwrap();
+        let (of_left_packages, of_gone_projects, failures) = releases.sweep();
+
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(released, 1, "the retry removed its access");
+        assert_eq!(of_gone_projects, 0, "{failures:?}");
+        assert_eq!(of_left_packages, 0, "{failures:?}");
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!record.exists(), "a gone project's record goes");
     }
 
     #[test]
