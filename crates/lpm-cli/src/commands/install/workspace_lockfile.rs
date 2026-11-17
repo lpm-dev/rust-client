@@ -24,8 +24,9 @@ pub(super) struct WorkspaceLockfileCoordinator {
     projection_revision: AtomicU64,
     staged: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     non_persisting_importers: Mutex<BTreeSet<String>>,
-    /// An install in this transaction runs with a frozen lockfile, which no
-    /// commit may rewrite.
+    /// An install in this transaction runs with a frozen lockfile, so a
+    /// commit that stages nothing doesn't rewrite it to drop URLs it no
+    /// longer keeps.
     frozen: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     projection_materializations: AtomicUsize,
