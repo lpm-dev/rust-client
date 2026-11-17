@@ -248,7 +248,6 @@ async fn root_alias_configures_tls_for_its_target_instead_of_the_local_scope() {
     )
     .unwrap();
     let output = lpm_with_registry(&project, &mock.url())
-        .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
         .args(["resolve", "@unused/alias@npm:pkg", "--json"])
         .output()
         .unwrap();

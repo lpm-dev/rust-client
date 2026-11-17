@@ -481,18 +481,7 @@ async fn sbom_locked_registry_ignores_unrelated_current_route_tls_identity() {
         format!("//{authority}/:certfile=missing.pem\n//{authority}/:keyfile=missing.key\n"),
     )
     .unwrap();
-    let output = lpm(&project)
-        .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
-        .args(["sbom", "--json", "--registry-metadata"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document = sbom_json(&project, &["--registry-metadata"]);
     assert_eq!(document["components"][0]["description"], "locked");
 }
 

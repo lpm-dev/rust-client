@@ -2004,7 +2004,6 @@ async fn global_comparison_and_update_use_the_configured_private_registry() {
         vec!["global", "update", "--json"],
     ] {
         let result = lpm_with_registry(&project, &public.url())
-            .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
             .args(args)
             .output()
             .unwrap();
