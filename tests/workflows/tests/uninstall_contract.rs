@@ -185,8 +185,48 @@ fn uninstall_rejects_path_traversal_before_manifest_or_file_changes() {
     assert_eq!(project.read_file("victim/keep.txt"), "outside node_modules");
 }
 
+/// How a test links a cleanup parent to a folder outside the project.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+enum Link {
+    /// A symbolic link, or on Windows a junction where the account may
+    /// not create symbolic links.
+    Symlink,
+    /// The link every Windows account can create.
+    #[cfg(windows)]
+    Junction,
+}
+
+#[cfg(any(unix, windows))]
+impl Link {
+    fn create(self, target: &std::path::Path, link: &std::path::Path) {
+        match self {
+            Self::Symlink => lpm_common::create_dir_symlink_or_junction(target, link).unwrap(),
+            #[cfg(windows)]
+            Self::Junction => {
+                let made = std::process::Command::new("cmd")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .unwrap();
+                assert!(
+                    made.status.success(),
+                    "mklink /J failed: {}",
+                    String::from_utf8_lossy(&made.stderr)
+                );
+            }
+        }
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn assert_symlinked_cleanup_parent_rejected(parent: &str, package: &str) {
+    assert_linked_cleanup_parent_rejected(Link::Symlink, parent, package);
+}
+
+#[cfg(any(unix, windows))]
+fn assert_linked_cleanup_parent_rejected(link: Link, parent: &str, package: &str) {
     let project = TempProject::empty(
         &serde_json::json!({"name":"consumer","dependencies":{package:"1.0.0"}}).to_string(),
     );
@@ -202,15 +242,16 @@ fn assert_symlinked_cleanup_parent_rejected(parent: &str, package: &str) {
     if parent == "node_modules" {
         std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(outside.path(), project.path().join(parent)).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(outside.path(), project.path().join(parent)).unwrap();
+    // `mklink` reads a `/` in a path as the start of a switch.
+    let linked = parent
+        .split('/')
+        .fold(project.path().to_path_buf(), |path, part| path.join(part));
+    link.create(outside.path(), &linked);
     let before = project.read_file("package.json");
     let output = lpm(&project).args(["uninstall", package]).output().unwrap();
     assert!(
         !output.status.success(),
-        "cleanup must reject a symlinked {parent}"
+        "cleanup must reject a linked {parent}"
     );
     assert_eq!(project.read_file("package.json"), before);
     assert_eq!(
@@ -235,6 +276,14 @@ fn uninstall_rejects_a_symlinked_scope_directory() {
 #[test]
 fn uninstall_rejects_a_symlinked_bin_directory() {
     assert_symlinked_cleanup_parent_rejected("node_modules/.bin", "victim");
+}
+
+#[cfg(windows)]
+#[test]
+fn uninstall_rejects_a_junction_as_a_cleanup_parent() {
+    assert_linked_cleanup_parent_rejected(Link::Junction, "node_modules", "victim");
+    assert_linked_cleanup_parent_rejected(Link::Junction, "node_modules/@scope", "@scope/victim");
+    assert_linked_cleanup_parent_rejected(Link::Junction, "node_modules/.bin", "victim");
 }
 
 #[tokio::test]
