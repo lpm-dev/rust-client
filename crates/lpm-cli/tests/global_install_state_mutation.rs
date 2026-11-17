@@ -48,8 +48,13 @@ fn make_complete_install_root(install_root: &Path, commands: &[&str]) {
     let bin_dir = install_root.join("node_modules").join(".bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     for command in commands {
-        let target = bin_dir.join(command);
-        std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
+        let target = lpm_global::project_command_path(&bin_dir, command);
+        let body: &[u8] = if cfg!(windows) {
+            b"@echo ok\r\n"
+        } else {
+            b"#!/bin/sh\necho ok\n"
+        };
+        std::fs::write(&target, body).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -879,12 +884,10 @@ async fn cli_doctor_json_flags_broken_global_state_with_machine_readable_checks(
         &["broken-tool"],
         true,
     );
-    std::fs::remove_file(
-        install_root
-            .join("node_modules")
-            .join(".bin")
-            .join("broken-tool"),
-    )
+    std::fs::remove_file(lpm_global::project_command_path(
+        &install_root.join("node_modules").join(".bin"),
+        "broken-tool",
+    ))
     .unwrap();
     std::fs::write(root.bin_dir().join("ghost"), b"#!/bin/sh\necho ghost\n").unwrap();
 

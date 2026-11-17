@@ -629,7 +629,8 @@ fn rebuild_lifecycle_output_sanitizes_terminal_controls() {
     write_policy_manifest(&project, "rebuild-controls", None, &[]);
     let name = "control-script-pkg";
     let version = "1.0.0";
-    let script = "printf 'safe\\033[2J\\n'; printf 'err\\007\\n' >&2";
+    let script =
+        r#"node -e "process.stdout.write('safe\x1b[2J\n'); process.stderr.write('err\x07\n')""#;
     let store_pkg = project
         .store_dir()
         .join("v1")
