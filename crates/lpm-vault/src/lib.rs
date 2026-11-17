@@ -287,11 +287,10 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
     let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
         return Ok(None);
     };
-    let folder = links::link_folder_path(project_dir);
-    if !is_listed(&vault_id, &folder) {
+    if !is_listed(&vault_id, &links::link_folder_path(project_dir)) {
         let listed =
             with_link_transaction(|directory| links::require(directory, project_dir, &vault_id))?;
-        if listed {
+        if let Some(folder) = listed {
             remember_listed(&vault_id, folder);
         }
     }
@@ -302,9 +301,8 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
 /// names none, when this machine lets the folder store values in it.
 fn linked_vault_id_for_write(project_dir: &Path) -> Result<String, String> {
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
-    let folder = links::link_folder_path(project_dir);
-    if !is_listed(&vault_id, &folder) {
-        with_link_transaction(|directory| {
+    if !is_listed(&vault_id, &links::link_folder_path(project_dir)) {
+        let folder = with_link_transaction(|directory| {
             links::require_for_write(directory, project_dir, &vault_id)
         })?;
         remember_listed(&vault_id, folder);
@@ -329,13 +327,12 @@ pub fn folder_link_for_vault_id(project_dir: &Path, vault_id: &str) -> Result<Fo
 }
 
 fn checked_folder_link(project_dir: &Path, vault_id: &str) -> Result<FolderLink, String> {
-    let folder = links::link_folder_path(project_dir);
-    if is_listed(vault_id, &folder) {
+    if is_listed(vault_id, &links::link_folder_path(project_dir)) {
         return Ok(FolderLink::Linked);
     }
     let (link, listed) =
         with_link_transaction(|directory| links::check(directory, project_dir, vault_id))?;
-    if listed {
+    if let Some(folder) = listed {
         remember_listed(vault_id, folder);
     }
     Ok(link)
@@ -345,8 +342,9 @@ fn checked_folder_link(project_dir: &Path, vault_id: &str) -> Result<FolderLink,
 /// before.
 pub fn link_folder_to_vault_id(project_dir: &Path, vault_id: &str) -> Result<bool, String> {
     validate_explicit_vault_id(vault_id)?;
-    let added = with_link_transaction(|directory| links::add(directory, project_dir, vault_id))?;
-    remember_listed(vault_id, links::link_folder_path(project_dir));
+    let (added, folder) =
+        with_link_transaction(|directory| links::add(directory, project_dir, vault_id))?;
+    remember_listed(vault_id, folder);
     Ok(added)
 }
 
@@ -361,8 +359,10 @@ pub fn folder_links_are_damaged(message: &str) -> bool {
 pub fn replace_damaged_folder_links(project_dir: &Path, vault_id: &str) -> Result<(), String> {
     validate_explicit_vault_id(vault_id)?;
     forget_listed(vault_id);
-    with_link_transaction(|directory| links::replace_damaged(directory, project_dir, vault_id))?;
-    remember_listed(vault_id, links::link_folder_path(project_dir));
+    let folder = with_link_transaction(|directory| {
+        links::replace_damaged(directory, project_dir, vault_id)
+    })?;
+    remember_listed(vault_id, folder);
     Ok(())
 }
 

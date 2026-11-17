@@ -323,29 +323,32 @@ fn recorded_project(store: &mut dyn LinkStore, vault_id: &str) -> Option<(String
         .flatten()
 }
 
-/// Whether `project_dir` may use the vault `vault_id`, and whether the
-/// vault's link list names it, rather than letting every folder use a vault
-/// that holds no values here.
+/// Whether `project_dir` may use the vault `vault_id`, and the folder the
+/// vault's link list names when it names it, rather than letting every
+/// folder use a vault that holds no values here. The folder is resolved
+/// once, so a caller remembers the folder that was checked.
 pub(crate) fn check(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<(FolderLink, bool), String> {
+) -> Result<(FolderLink, Option<PathBuf>), String> {
+    let folder = link_folder_path(project_dir);
     with_store(directory, |store| {
-        let (link, folders) = check_in(store, project_dir, vault_id)?;
-        Ok((link, folders.is_some()))
+        let (link, folders) = check_in(store, &folder, vault_id)?;
+        Ok((link, folders.map(|_| folder.clone())))
     })
 }
 
-/// [`check`] in `store`, with the vault's list when it has one. Reads the
-/// project record only when the folder isn't linked or the vault predates
-/// links, so a linked folder's check reads just the list.
+/// [`check`] in `store` of `folder`, already resolved, with the vault's
+/// list when it has one. Reads the project record only when the folder
+/// isn't linked or the vault predates links, so a linked folder's check
+/// reads just the list.
 fn check_in(
     store: &mut dyn LinkStore,
-    project_dir: &Path,
+    folder: &Path,
     vault_id: &str,
 ) -> Result<(FolderLink, Option<BTreeSet<String>>), String> {
-    let folder = link_folder_path(project_dir);
+    let folder = folder.to_path_buf();
     let Resolved { folders, recorded } = resolve(store, vault_id)?;
     let Some(folders) = folders else {
         store.note_linked(vault_id, &folder);
@@ -379,13 +382,13 @@ fn unlinked(
     })
 }
 
-/// Fails unless `project_dir` may use the vault `vault_id`; whether the
-/// vault's link list names it.
+/// Fails unless `project_dir` may use the vault `vault_id`; the folder the
+/// vault's link list names, when it names it.
 pub(crate) fn require(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<bool, String> {
+) -> Result<Option<PathBuf>, String> {
     match check(directory, project_dir, vault_id)? {
         (FolderLink::Linked, listed) => Ok(listed),
         (FolderLink::Unlinked(unlinked), _) => Err(unlinked.refusal()),
@@ -394,55 +397,70 @@ pub(crate) fn require(
 
 /// Fails unless `project_dir` may store values in the vault `vault_id`. The
 /// first folder to store values in a vault with neither values nor links on
-/// this machine is linked to it.
+/// this machine is linked to it. Returns the folder, as linked.
 pub(crate) fn require_for_write(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
+    let folder = link_folder_path(project_dir);
     with_store(directory, |store| {
-        match check_in(store, project_dir, vault_id)? {
-            (FolderLink::Unlinked(unlinked), _) => Err(unlinked.refusal()),
-            (FolderLink::Linked, Some(_)) => Ok(()),
+        match check_in(store, &folder, vault_id)? {
+            (FolderLink::Unlinked(unlinked), _) => return Err(unlinked.refusal()),
+            (FolderLink::Linked, Some(_)) => {}
             (FolderLink::Linked, None) => {
                 let first = first_record(store, vault_id);
-                insert(store, project_dir, vault_id, first).map(drop)
+                insert(store, &folder, vault_id, first)?;
             }
         }
+        Ok(folder.clone())
     })
 }
 
 /// Links `project_dir` to the vault `vault_id` in place of a link list
 /// that can't be read. A list from a later version is still refused.
+/// Returns the folder, as linked.
 pub(crate) fn replace_damaged(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
+    let folder = link_folder_path(project_dir);
     with_store(directory, |store| {
-        let folders = match resolve(store, vault_id) {
-            Ok(resolved) => resolved.folders.unwrap_or_default(),
-            Err(error) if is_damaged(&error) => BTreeSet::new(),
-            Err(error) => return Err(error),
-        };
-        insert(store, project_dir, vault_id, folders).map(drop)
-    })
+        replace_damaged_in(store, &folder, vault_id)
+    })?;
+    Ok(folder)
+}
+
+fn replace_damaged_in(
+    store: &mut dyn LinkStore,
+    folder: &Path,
+    vault_id: &str,
+) -> Result<(), String> {
+    let folders = match resolve(store, vault_id) {
+        Ok(resolved) => resolved.folders.unwrap_or_default(),
+        Err(error) if is_damaged(&error) => BTreeSet::new(),
+        Err(error) => return Err(error),
+    };
+    insert(store, folder, vault_id, folders).map(drop)
 }
 
 /// Links `project_dir` to the vault `vault_id`; whether it wasn't listed
-/// before.
+/// before, and the folder, as linked.
 pub(crate) fn add(
     directory: &VaultStorageDirectory,
     project_dir: &Path,
     vault_id: &str,
-) -> Result<bool, String> {
-    with_store(directory, |store| {
+) -> Result<(bool, PathBuf), String> {
+    let folder = link_folder_path(project_dir);
+    let added = with_store(directory, |store| {
         let folders = match resolve(store, vault_id)?.folders {
             Some(folders) => folders,
             None => first_record(store, vault_id),
         };
-        insert(store, project_dir, vault_id, folders)
-    })
+        insert(store, &folder, vault_id, folders)
+    })?;
+    Ok((added, folder))
 }
 
 /// What a vault's first link list starts from: the folder its records
@@ -458,20 +476,20 @@ fn first_record(store: &mut dyn LinkStore, vault_id: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Writes `folders` with `project_dir` added; whether it was added.
+/// Writes `folders` with `folder`, already resolved, added; whether it was
+/// added.
 fn insert(
     store: &mut dyn LinkStore,
-    project_dir: &Path,
+    folder: &Path,
     vault_id: &str,
     mut folders: BTreeSet<String>,
 ) -> Result<bool, String> {
-    let folder = link_folder_path(project_dir);
-    let key = folder_key(&folder).ok_or_else(|| unlinkable(&folder, vault_id))?;
+    let key = folder_key(folder).ok_or_else(|| unlinkable(folder, vault_id))?;
     let added = folders.insert(key.to_owned());
     if added {
         store.write(vault_id, &record_of(folders))?;
     }
-    store.note_linked(vault_id, &folder);
+    store.note_linked(vault_id, folder);
     Ok(added)
 }
 
@@ -743,7 +761,7 @@ mod tests {
         store.values.insert("vault".into());
         insert(
             &mut store,
-            &root.path().join("own/../own"),
+            &link_folder_path(&root.path().join("own/../own")),
             "vault",
             BTreeSet::new(),
         )
@@ -908,11 +926,7 @@ mod tests {
         assert!(is_damaged(&refusal), "{refusal}");
         assert!(crate::is_env_project_refusal(&refusal), "{refusal}");
 
-        let folders = match resolve(&mut store, "vault") {
-            Err(error) if is_damaged(&error) => BTreeSet::new(),
-            other => panic!("{:?}", other.map(|resolved| resolved.folders)),
-        };
-        insert(&mut store, &paths[0], "vault", folders).unwrap();
+        replace_damaged_in(&mut store, &paths[0], "vault").unwrap();
 
         assert_eq!(
             check_in(&mut store, &paths[0], "vault").unwrap().0,

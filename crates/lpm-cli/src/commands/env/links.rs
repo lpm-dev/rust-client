@@ -195,8 +195,7 @@ pub(super) fn env_links(project_dir: &Path, json_output: bool) -> Result<(), Lpm
     } = lpm_vault::linked_folders(project_dir)
         .map_err(vault_error)?
         .ok_or_else(no_project)?;
-    // A link names a path, so a folder deleted since keeps its link until
-    // it is unlinked, and a folder made there later would inherit it.
+    // A link names a path, so a folder deleted since is marked for unlinking.
     let missing: Vec<&std::path::PathBuf> =
         folders.iter().filter(|folder| !folder.exists()).collect();
     if json_output {

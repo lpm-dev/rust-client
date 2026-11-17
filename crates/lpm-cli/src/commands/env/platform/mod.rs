@@ -1920,6 +1920,10 @@ pub(super) async fn vars_connect(
         }
     };
     validate_platform_connect_arguments(platform, &args[1..], USAGE)?;
+    // A folder that isn't linked is refused before it's asked for a token.
+    if let Some(vault_id) = lpm_vault::vault_id::read_vault_id(project_dir) {
+        super::links::ensure_folder_linked_to(project_dir, &vault_id, json_output)?;
+    }
     let platform_token = if let Some(token) = parse_flag(args, "--token") {
         token.to_owned()
     } else {

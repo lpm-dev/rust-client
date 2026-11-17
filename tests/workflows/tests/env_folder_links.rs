@@ -95,7 +95,8 @@ fn commands_that_sync_list_or_compare_values_refuse_an_unlinked_folder() {
     std::fs::write(other.join(".env.example"), "A_SECRET=\n").unwrap();
 
     for args in [
-        &["env", "ls"][..],
+        &["env", "connect", "vercel"][..],
+        &["env", "ls"],
         &["env", "init"],
         &["env", "diff", "default", "staging"],
         &["env", "log"],
@@ -287,11 +288,19 @@ fn a_deleted_folder_can_be_unlinked_by_its_path() {
             .success()
     );
     std::fs::remove_dir_all(&checkout).unwrap();
+    // Another spelling of the deleted folder's path, through a link to its
+    // parent.
+    let alias = project.path().join("alias");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(project.path(), &alias).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(project.path(), &alias).unwrap();
+    let spelled = alias.join("second-checkout");
 
     let unlink = lpm_in(
         &project,
         project.path(),
-        &["--json", "env", "unlink", "second-checkout"],
+        &["--json", "env", "unlink", spelled.to_str().unwrap()],
     );
 
     let report = json_of(&unlink);
