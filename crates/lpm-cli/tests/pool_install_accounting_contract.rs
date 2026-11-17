@@ -308,7 +308,9 @@ async fn failed_install_never_sends_a_pool_accounting_report() {
     Mock::given(method("GET"))
         .and(match_path("/broken.tgz"))
         .respond_with(ResponseTemplate::new(422).set_body_string("broken tarball"))
-        .expect(2)
+        // Once by the fetch phase, and once before it when a fetch started
+        // while the package was still being resolved.
+        .expect(1..=2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
