@@ -3189,6 +3189,89 @@ fn only_a_package_the_lockfile_records_from_a_registry_has_one_to_ask() {
 }
 
 #[test]
+fn a_package_from_outside_a_registry_is_told_apart_from_one_whose_registry_is_unknown() {
+    let locked = |name: &str, source: Option<&str>| lpm_lockfile::LockedPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        source: source.map(Into::into),
+        integrity: Some(format!("sha512-{name}-integrity")),
+        ..Default::default()
+    };
+    let rows = [
+        locked(
+            "from-tarball",
+            Some("tarball+https://example.test/from-tarball.tgz"),
+        ),
+        locked("no-source", None),
+        locked("from-registry", Some("registry+https://registry.npmjs.org")),
+    ];
+    let key = |name: &str| {
+        (
+            name.to_string(),
+            "1.0.0".to_string(),
+            Some(format!("sha512-{name}-integrity")),
+        )
+    };
+
+    let outside = installed_from_outside_a_registry(
+        &[key("from-tarball"), key("no-source"), key("from-registry")].into(),
+        rows.iter(),
+    );
+
+    assert_eq!(outside, [key("from-tarball")].into());
+}
+
+#[test]
+fn strict_availability_refuses_an_approval_whose_registry_it_cannot_tell() {
+    use crate::provenance_fetch::AvailabilityMode::{BestEffort, Strict};
+    let key = |name: &str| (name.to_string(), "1.0.0".to_string(), None);
+    let recorded = HashMap::from([
+        (key("vouched"), "https://registry.npmjs.org".to_string()),
+        (key("rerouted"), "https://registry.npmjs.org".to_string()),
+    ]);
+    let outside = std::collections::HashSet::from([key("from-tarball")]);
+    let vouched = [key("vouched")];
+    let check = |availability, read, requested: &[_]| {
+        require_checkable(
+            availability,
+            read,
+            &recorded,
+            &outside,
+            &vouched,
+            requested,
+            ApprovalScope::Project,
+        )
+    };
+
+    assert!(check(Strict, true, &[key("vouched"), key("from-tarball")]).is_ok());
+    for (read, requested, reason) in [
+        (true, key("rerouted"), "another registry"),
+        (true, key("no-source"), "doesn't record one registry"),
+        (false, key("vouched"), "can't be read"),
+    ] {
+        let refusal = check(Strict, read, std::slice::from_ref(&requested)).unwrap_err();
+        assert!(
+            matches!(refusal, LpmError::ProvenanceUnavailable(_)),
+            "{refusal:?}"
+        );
+        assert!(refusal.to_string().contains(reason), "{refusal}");
+        assert!(check(BestEffort, read, &[requested]).is_ok());
+    }
+    let global = require_checkable(
+        Strict,
+        false,
+        &recorded,
+        &outside,
+        &vouched,
+        &[key("vouched")],
+        ApprovalScope::Global,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(global.contains("lpm install -g"), "{global}");
+}
+
+#[test]
 fn a_package_the_lockfile_pins_by_another_hash_is_still_the_one_it_records() {
     let archive = b"native-addon archive";
     let hash =

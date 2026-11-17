@@ -396,7 +396,7 @@ async fn an_approval_that_can_t_be_checked_is_refused(
 async fn approve_scripts_refuses_under_strict_availability_when_the_lockfile_can_t_be_read() {
     an_approval_that_can_t_be_checked_is_refused(
         |project| std::fs::remove_file(project.path().join(lpm_lockfile::LOCKFILE_NAME)).unwrap(),
-        "can't check strict-provenance-pkg@1.0.0",
+        "can't check this approval",
     )
     .await;
 }

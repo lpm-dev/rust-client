@@ -198,6 +198,9 @@ pub(super) struct ProjectProvenance {
     /// The registry the lockfile records for each candidate that came
     /// from one.
     recorded: HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    /// The candidates the lockfile records from a tarball, a git
+    /// repository or a directory.
+    outside_a_registry: std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
     lockfile_read: bool,
     availability: crate::provenance_fetch::AvailabilityMode,
 }
@@ -222,13 +225,14 @@ impl ProjectProvenance {
         let lockfile = read_lockfile(project_dir, || {
             crate::commands::install::workspace_lockfile::read_project(project_dir)
         });
-        let recorded = recorded_registries(
-            candidates.iter().map(artifact_key).collect(),
-            lockfile.iter().flat_map(|lockfile| &lockfile.packages),
-        );
+        let keys: std::collections::HashSet<_> = candidates.iter().map(artifact_key).collect();
+        let rows = || lockfile.iter().flat_map(|lockfile| &lockfile.packages);
+        let outside_a_registry = installed_from_outside_a_registry(&keys, rows());
+        let recorded = recorded_registries(keys, rows());
         Ok(Self {
             registries,
             recorded,
+            outside_a_registry,
             lockfile_read: lockfile.is_some(),
             availability,
         })
@@ -254,8 +258,10 @@ impl ProjectProvenance {
             self.availability,
             self.lockfile_read,
             &self.recorded,
+            &self.outside_a_registry,
             &vouched,
             &requested,
+            ApprovalScope::Project,
         )?;
         Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
             &self.registries.client,
@@ -267,46 +273,102 @@ impl ProjectProvenance {
     }
 }
 
+/// Where an approval is recorded, which decides how to get a lockfile that
+/// records where its packages came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ApprovalScope {
+    Project,
+    Global,
+}
+
+impl ApprovalScope {
+    fn reinstall(self) -> &'static str {
+        match self {
+            Self::Project => "Run `lpm install`",
+            Self::Global => "Reinstall the global package with `lpm install -g`",
+        }
+    }
+}
+
 /// Under strict availability, refuses `requested` packages whose provenance
 /// can't be read here though a registry may speak for them: the lockfiles
-/// that say where they came from can't all be read, or a package's route
-/// now sends it to another registry than the one it was installed from.
-/// Packages from a tarball, a git repository or a directory have none to
-/// read.
+/// that say where they came from can't all be read, a package's route now
+/// sends it to another registry than the one it was installed from, or the
+/// lockfile doesn't record one registry for it. Packages from a tarball, a
+/// git repository or a directory, `outside_a_registry`, have none to read.
 pub(super) fn require_checkable(
     availability: crate::provenance_fetch::AvailabilityMode,
     lockfiles_read: bool,
     recorded: &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    outside_a_registry: &std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
     vouched: &[crate::provenance_fetch::ProvenanceArtifactKey],
     requested: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    scope: ApprovalScope,
 ) -> Result<(), LpmError> {
-    if !availability.is_strict() {
+    if !availability.is_strict() || requested.is_empty() {
         return Ok(());
     }
-    let unchecked = |(name, version, _): &crate::provenance_fetch::ProvenanceArtifactKey,
-                     reason: &str| {
-        LpmError::ProvenanceUnavailable(format!(
-            "strict provenance availability can't check {name}@{version}: {reason}. Run \
-             `lpm install`, then approve it again"
-        ))
-    };
-    if !lockfiles_read && let Some(first) = requested.first() {
-        return Err(unchecked(
-            first,
-            "the lockfile that records where it came from can't be read",
-        ));
+    let reinstall = scope.reinstall();
+    if !lockfiles_read {
+        return Err(LpmError::ProvenanceUnavailable(format!(
+            "strict provenance availability can't check this approval: a lockfile that records \
+             where its packages came from can't be read. {reinstall}, then approve again"
+        )));
     }
     let vouched: std::collections::HashSet<_> = vouched.iter().collect();
-    match requested
-        .iter()
-        .find(|package| recorded.contains_key(*package) && !vouched.contains(package))
-    {
-        Some(package) => Err(unchecked(
-            package,
-            "it now routes to another registry than the one it was installed from",
-        )),
+    let unchecked = requested.iter().find_map(|package| {
+        if vouched.contains(package) || outside_a_registry.contains(package) {
+            None
+        } else if recorded.contains_key(package) {
+            Some((
+                package,
+                "it now routes to another registry than the one it was installed from",
+            ))
+        } else {
+            Some((
+                package,
+                "the lockfile doesn't record one registry it came from",
+            ))
+        }
+    });
+    match unchecked {
+        Some(((name, version, _), reason)) => Err(LpmError::ProvenanceUnavailable(format!(
+            "strict provenance availability can't check {name}@{version}: {reason}. \
+             {reinstall}, then approve it again"
+        ))),
         None => Ok(()),
     }
+}
+
+/// Those of `candidates` a lockfile row says came from outside a registry:
+/// a tarball, a git repository or a directory. No registry speaks for them,
+/// unlike a row whose source is unknown.
+pub(super) fn installed_from_outside_a_registry<'a>(
+    candidates: &std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
+    rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
+) -> std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey> {
+    let mut outside = std::collections::HashSet::new();
+    for row in rows {
+        if !matches!(row.source_kind(), Some(Ok(source)) if !matches!(source, lpm_lockfile::Source::Registry { .. }))
+        {
+            continue;
+        }
+        outside.extend(
+            candidates
+                .iter()
+                .filter(|(name, version, integrity)| {
+                    *name == row.name
+                        && *version == row.version
+                        && !matches!(
+                            (&row.integrity, integrity),
+                            (Some(pinned), Some(known))
+                                if lpm_common::integrity::contradict(pinned, known)
+                        )
+                })
+                .cloned(),
+        );
+    }
+    outside
 }
 
 /// The lockfile of the install in `dir`, or `None` with a warning when it

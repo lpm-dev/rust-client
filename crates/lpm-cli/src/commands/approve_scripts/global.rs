@@ -88,18 +88,20 @@ impl<'a> ApprovalProvenanceContext<'a> {
                 })
             })
             .collect();
-        let recorded = recorded_registries(
-            artifacts.iter().cloned().collect(),
-            lockfiles.iter().flat_map(|lockfile| &lockfile.packages),
-        );
+        let keys: std::collections::HashSet<_> = artifacts.iter().cloned().collect();
+        let rows = || lockfiles.iter().flat_map(|lockfile| &lockfile.packages);
+        let outside_a_registry = super::metadata::installed_from_outside_a_registry(&keys, rows());
+        let recorded = recorded_registries(keys, rows());
         let vouched =
             installed_from_their_registry(&registries, &recorded, artifacts.iter().cloned());
         super::metadata::require_checkable(
             self.availability,
             lockfiles.len() == install_roots.len(),
             &recorded,
+            &outside_a_registry,
             &vouched,
             artifacts,
+            super::metadata::ApprovalScope::Global,
         )?;
         Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
             &registries.client,

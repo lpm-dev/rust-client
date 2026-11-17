@@ -68,12 +68,12 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::metadata::{
-        ProjectProvenance, SCHEMA_VERSION, approval_metadata_from_blocked,
+        ApprovalScope, ProjectProvenance, SCHEMA_VERSION, approval_metadata_from_blocked,
         approval_metadata_preserving_existing_provenance, approval_refusal, artifact_key,
         authorize_project_trust_write, commit_project_trust_write, install_registries,
-        installed_from_their_registry, read_lockfile, recorded_registries,
-        runtime_availability_mode, runtime_verify_policy_with_source,
-        snapshot_for_artifact_binding,
+        installed_from_outside_a_registry, installed_from_their_registry, read_lockfile,
+        recorded_registries, require_checkable, runtime_availability_mode,
+        runtime_verify_policy_with_source, snapshot_for_artifact_binding,
     };
     #[cfg(test)]
     pub(super) use super::metadata::{
