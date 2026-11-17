@@ -1364,30 +1364,37 @@ fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
         .all(|mask| mask & access_mask == access_mask)
 }
 
+/// A DACL with some of its ACEs left out, every other one copied
+/// unchanged and in order.
+struct FilteredDacl {
+    acl: Vec<u32>,
+    /// How many ACEs were left out.
+    removed: usize,
+    /// Whether one of them was inherited from the object's parent.
+    inherited: bool,
+}
+
 fn dacl_without_allowed_aces_for_sid(
     path: &Path,
     old_dacl: *const ACL,
     sid: PSID,
-) -> Result<Vec<u32>, AppContainerError> {
+) -> Result<FilteredDacl, AppContainerError> {
     // SAFETY: both SIDs are valid for the comparison.
     dacl_without_allowed_aces_where(path, old_dacl, |ace_sid| unsafe {
         EqualSid(ace_sid, sid) != 0
     })
-    .map(|(filtered, _)| filtered)
 }
 
-/// `old_dacl` without the access-allowed ACEs whose SID `drops` picks,
-/// every other ACE copied unchanged and in order, and how many it left out.
+/// `old_dacl` without the access-allowed ACEs whose SID `drops` picks.
 fn dacl_without_allowed_aces_where(
     path: &Path,
     old_dacl: *const ACL,
     drops: impl Fn(PSID) -> bool,
-) -> Result<(Vec<u32>, usize), AppContainerError> {
+) -> Result<FilteredDacl, AppContainerError> {
     dacl_without_aces_where(path, old_dacl, ACCESS_ALLOWED_ACE_TYPE, drops)
 }
 
-/// `old_dacl` without the ACEs of `ace_type` whose SID `drops` picks, every
-/// other ACE copied unchanged and in order, and how many it left out.
+/// `old_dacl` without the ACEs of `ace_type` whose SID `drops` picks.
 /// `ace_type` must be an allow or deny type: both share the
 /// `ACCESS_ALLOWED_ACE` layout.
 fn dacl_without_aces_where(
@@ -1395,7 +1402,7 @@ fn dacl_without_aces_where(
     old_dacl: *const ACL,
     ace_type: u8,
     drops: impl Fn(PSID) -> bool,
-) -> Result<(Vec<u32>, usize), AppContainerError> {
+) -> Result<FilteredDacl, AppContainerError> {
     // SAFETY: `old_dacl` is non-null and owned by the live security descriptor.
     let old_acl_size = unsafe { (*old_dacl).AclSize } as usize;
     // Preserve ACL_REVISION_DS when the existing DACL contains object-specific ACEs.
@@ -1419,6 +1426,7 @@ fn dacl_without_aces_where(
     // SAFETY: the ACL header belongs to the security descriptor and is readable.
     let ace_count = unsafe { (*old_dacl).AceCount } as u32;
     let mut removed = 0;
+    let mut inherited = false;
     for index in 0..ace_count {
         let mut ace: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: `index` is bounded by the ACL's AceCount.
@@ -1440,6 +1448,10 @@ fn dacl_without_aces_where(
         };
         if dropped {
             removed += 1;
+            // SAFETY: the header read above is still live.
+            inherited |= u32::from(unsafe { (*header).AceFlags })
+                & windows_sys::Win32::Security::INHERITED_ACE
+                != 0;
             continue;
         }
         // SAFETY: the complete ACE byte range is valid and copied unchanged into the new ACL.
@@ -1459,7 +1471,11 @@ fn dacl_without_aces_where(
             });
         }
     }
-    Ok((filtered, removed))
+    Ok(FilteredDacl {
+        acl: filtered,
+        removed,
+        inherited,
+    })
 }
 
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
@@ -1955,7 +1971,9 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows_sys::Win32::Security::GetLengthSid;
     use windows_sys::Win32::Security::{
-        GetFileSecurityW, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+        GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     #[test]
@@ -2421,7 +2439,74 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// Whether `path`'s DACL is protected from its parent's entries, and
+    /// whether Windows keeps its inherited entries in step with them.
+    fn inheritance_of(path: &Path) -> (bool, bool) {
+        let descriptor = security_descriptor(path);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: the descriptor is live and both outputs are correctly typed.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorControl(
+                    descriptor.as_ptr().cast_mut().cast(),
+                    &mut control,
+                    &mut revision,
+                )
+            },
+            0
+        );
+        (
+            control & SE_DACL_PROTECTED != 0,
+            control & SE_DACL_AUTO_INHERITED != 0,
+        )
+    }
+
+    #[test]
+    fn a_change_leaves_a_descriptor_windows_wrote_with_its_inheritance_and_entries() {
+        let sid = create_or_reuse_appcontainer_sid("LpmDescriptorKeptTest").unwrap();
+        for protection in ["D:AI", "D:PAI"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let directory = tmp.path().join("directory");
+            std::fs::create_dir(&directory).unwrap();
+            let file = directory.join(".env");
+            std::fs::write(&file, "private content").unwrap();
+            set_test_dacl(&directory, &format!("{protection}(A;OICI;FA;;;WD)"));
+            set_test_dacl(&file, &format!("{protection}(A;;FA;;;WD)"));
+            let written = (protection == "D:PAI", true);
+            assert_eq!(inheritance_of(&directory), written, "{protection}");
+            assert_eq!(inheritance_of(&file), written, "{protection}");
+            let entries = (aces(&directory), aces(&file));
+
+            setup::update_ace(&directory, sid.0, Some((FILE_GENERIC_READ, 0))).unwrap();
+            assert_eq!(inheritance_of(&directory), written, "{protection}: a grant");
+            assert_ne!(aces(&directory), entries.0);
+            setup::update_ace(&directory, sid.0, None).unwrap();
+            assert_eq!(
+                inheritance_of(&directory),
+                written,
+                "{protection}: its removal"
+            );
+
+            setup::deny_appcontainer_read(&file, sid.0).unwrap();
+            assert_eq!(inheritance_of(&file), written, "{protection}: a denial");
+            assert!(denies(&file, sid.0));
+            setup::remove_appcontainer_read_deny(&file, sid.0).unwrap();
+            assert_eq!(inheritance_of(&file), written, "{protection}: its removal");
+
+            assert_eq!((aces(&directory), aces(&file)), entries, "{protection}");
+        }
+    }
+
+    /// Replaces `path`'s DACL with `sddl`'s, as Windows' own tools write
+    /// one: protected from the parent's entries when `sddl` says `P`, and
+    /// with the parent's inheritable entries added when it doesn't.
     fn set_test_dacl(path: &Path, sddl: &str) {
+        let protection = if sddl.starts_with("D:P") {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
@@ -2451,7 +2536,7 @@ mod tests {
                 SetNamedSecurityInfoW(
                     to_wide_with_nul(path.as_os_str()).as_ptr(),
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    DACL_SECURITY_INFORMATION | protection,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     dacl,
