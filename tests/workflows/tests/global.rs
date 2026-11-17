@@ -20,7 +20,7 @@
 mod concurrency;
 mod support;
 
-use chrono::{SecondsFormat, Utc};
+use lpm_common::Timestamp;
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource, WalReader, WalRecord};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
@@ -130,8 +130,8 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
-    let dt = Utc::now() - chrono::Duration::seconds(n_secs);
-    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+    let dt = Timestamp::now() - lpm_common::timestamp::Duration::seconds(n_secs);
+    dt.to_rfc3339_milliseconds()
 }
 
 fn seed_global_package_with_source(
@@ -149,7 +149,7 @@ fn seed_global_package_with_source(
             resolved: "1.0.0".to_string(),
             integrity: "sha512-test".to_string(),
             source,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: format!("installs/{package}@1.0.0"),
             commands,
         },
@@ -584,7 +584,7 @@ async fn global_list_outdated_hydrates_release_times_in_bounded_parallel_waves()
                 resolved: "1.0.0".to_string(),
                 integrity: "sha512-test".to_string(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: format!("installs/{package}@1.0.0"),
                 commands: vec![package],
             },
@@ -1617,7 +1617,7 @@ async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
                 resolved: "1.0.0".to_string(),
                 integrity: "sha512-test".to_string(),
                 source: PackageSource::LpmDev,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: format!("installs/{package}@1.0.0"),
                 commands: vec![format!("parallel-update-{index}")],
             },
@@ -1687,7 +1687,7 @@ async fn bulk_global_update_installs_and_commits_in_bounded_parallel_batches() {
                 resolved: "1.0.0".to_string(),
                 integrity: "sha512-old".to_string(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: format!("installs/{package}@1.0.0"),
                 commands: vec![package.clone()],
             },
@@ -2222,7 +2222,7 @@ fn global_link_refuses_a_package_with_a_pending_registry_install() {
             resolved: "1.0.0".into(),
             integrity: "sha512-test".into(),
             source: PackageSource::UpstreamNpm,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: "installs/linked-tool@1.0.0".into(),
             commands: vec![],
             replaces_version: None,

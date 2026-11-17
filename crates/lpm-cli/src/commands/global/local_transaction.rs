@@ -428,7 +428,7 @@ pub(super) fn link(
             resolved: link.version.clone(),
             integrity: provenance_integrity(&provenance),
             source: PackageSource::LocalLink,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: link.root_relative.clone(),
             commands: link
                 .bins

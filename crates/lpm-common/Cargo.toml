@@ -20,7 +20,7 @@ miette = { workspace = true }
 dirs = { workspace = true }
 fd-lock = { workspace = true }
 tokio = { workspace = true }
-chrono = { workspace = true }
+time = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 getrandom = "0.4"

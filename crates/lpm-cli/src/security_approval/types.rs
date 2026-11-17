@@ -117,7 +117,7 @@ impl ApprovalSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthorizedPosture {
     pub schema_version: u32,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     pub script_policy: String,
     pub minimum_release_age_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -172,7 +172,7 @@ impl Default for AuthorizedPosture {
     fn default() -> Self {
         Self {
             schema_version: APPROVED_POSTURE_SCHEMA_VERSION,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
             script_policy: ScriptPolicy::default().as_str().to_string(),
             minimum_release_age_secs: DEFAULT_MIN_RELEASE_AGE_SECS,
             minimum_release_age_exclude: Vec::new(),
@@ -441,8 +441,8 @@ pub struct UnlockGrant {
     pub packages: Vec<String>,
     #[serde(default)]
     pub limits: UnlockLimits,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub issued_at: Timestamp,
+    pub expires_at: Timestamp,
     pub issuer: String,
 }
 
@@ -458,7 +458,7 @@ pub struct UnlockRevocation {
     pub remaining_scopes: Vec<ApprovalScope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<String>,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -477,7 +477,7 @@ pub struct RuntimeOverride {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ApprovedProjectPolicyState {
     pub schema_version: u32,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     pub project_root: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trusted_dependencies: BTreeMap<String, crate::trust_snapshot::SnapshotEntry>,
@@ -490,7 +490,7 @@ pub(super) struct ApprovedProjectPolicyState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ApprovedGlobalTrustState {
     pub schema_version: u32,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trusted_dependencies: BTreeMap<String, lpm_global::TrustedDependencyBinding>,
 }
@@ -498,7 +498,7 @@ pub(super) struct ApprovedGlobalTrustState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct AuditEvent {
     pub schema_version: u32,
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
     pub event: String,
     pub allowed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -518,7 +518,7 @@ pub(super) struct AuditEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct AuditHead {
     pub schema_version: u32,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     pub last_entry_hash: String,
     pub entry_count: u64,
 }

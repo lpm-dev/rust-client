@@ -74,8 +74,8 @@ fn assert_no_atomic_temp_files(directory: &std::path::Path) {
 }
 
 async fn mount_recent_packages(mock: &MockRegistry, names: &[&str]) {
-    let published_at = (chrono::Utc::now() - chrono::Duration::hours(1))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let published_at = (lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::hours(1))
+        .to_rfc3339_milliseconds();
     let mut batch = Vec::with_capacity(names.len());
 
     for name in names {

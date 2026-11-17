@@ -40,7 +40,11 @@ async fn fetch_approved_pins() -> Result<Vec<String>, LpmError> {
         .map_err(trust_error)?;
     let manifest = fetch_asset(&client, "relay-trust.json", MANIFEST_CAP).await?;
     let bundle = fetch_asset(&client, "relay-trust.json.sigstore", BUNDLE_CAP).await?;
-    verify_approved_pins(&manifest, &bundle, chrono::Utc::now().timestamp())
+    verify_approved_pins(
+        &manifest,
+        &bundle,
+        lpm_common::Timestamp::now().unix_seconds(),
+    )
 }
 
 async fn fetch_asset(
@@ -91,7 +95,7 @@ fn validate_approved_pins(
         ));
     }
     let manifest: RelayTrustManifest = serde_json::from_slice(bytes).map_err(trust_error)?;
-    let signed_at = chrono::DateTime::<chrono::Utc>::from(verified.integrated_time).timestamp();
+    let signed_at = lpm_common::Timestamp::from(verified.integrated_time).unix_seconds();
     // Short-lived authorization limits replay without trusting HTTP timestamps or unsigned metadata.
     if manifest.schema_version != 1 || manifest.host != lpm_tunnel::relay::DEFAULT_RELAY_HOST {
         return Err(trust_error(

@@ -815,7 +815,7 @@ fn activate_local_websocket(
                         FrameDirection::Outbound,
                         &bytes,
                         is_binary,
-                        chrono::Utc::now().to_rfc3339(),
+                        lpm_common::Timestamp::now().to_rfc3339(),
                     )
                 });
             }
@@ -863,7 +863,7 @@ fn activate_local_websocket(
                 WsEvent::Closed {
                     connection_id: reader_id,
                     reason: inspector_reason,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    timestamp: lpm_common::Timestamp::now().to_rfc3339(),
                 },
             )
             .await;
@@ -1526,7 +1526,7 @@ async fn forward_http_request(
         let (response_status, response_headers, response_body) = extract_response_data(&response);
         let mut captured = CapturedWebhook {
             id: id.clone(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: lpm_common::Timestamp::now().to_rfc3339(),
             method: method.clone(),
             path: url.clone(),
             request_headers: headers.clone(),
@@ -2211,7 +2211,7 @@ async fn try_connect_with_token(
                         if let Some(admission) = server_msg.admission()
                             && let Some(tracker) = &mut usage_tracker
                         {
-                            tracker.record_admission(admission.accepted_requests, chrono::Utc::now());
+                            tracker.record_admission(admission.accepted_requests, lpm_common::Timestamp::now());
                             on_usage(tracker.usage(), UsageUpdate::Admitted);
                         }
 
@@ -2584,7 +2584,7 @@ async fn try_connect_with_token(
                                                 FrameDirection::Inbound,
                                                 &decoded,
                                                 is_binary,
-                                                chrono::Utc::now().to_rfc3339(),
+                                                lpm_common::Timestamp::now().to_rfc3339(),
                                             )
                                         });
                                     }
@@ -2745,7 +2745,7 @@ async fn try_connect_with_token(
                                         connection_id: completed.id.clone(),
                                         url: completed.url,
                                         headers,
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        timestamp: lpm_common::Timestamp::now().to_rfc3339(),
                                     }),
                                 closed_tx: closed_local_ws_tx.clone(),
                             },

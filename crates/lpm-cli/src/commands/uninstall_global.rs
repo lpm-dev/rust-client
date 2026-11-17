@@ -47,7 +47,7 @@
 //! an over-broad prune could re-block scripts in unrelated installs.
 
 use super::uninstall_ui;
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{
     GlobalInstallsDirectory, LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock,
 };
@@ -254,7 +254,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
             wal.append(&WalRecord::Abort {
                 tx_id,
                 reason: reason.clone(),
-                aborted_at: Utc::now(),
+                aborted_at: Timestamp::now(),
             })?;
             return Err(LpmError::Script(format!(
                 "uninstall of '{package_safe}' failed: {reason}.\n\n\
@@ -350,7 +350,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     // ─── Step 5: append WAL Commit ─────────────────────────────────
     wal.append(&WalRecord::Commit {
         tx_id,
-        committed_at: Utc::now(),
+        committed_at: Timestamp::now(),
     })?;
 
     Ok(UninstallOutcome {
@@ -696,7 +696,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-x".into(),
             source: PackageSource::LpmDev,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: format!("installs/{name}@1.0.0"),
             commands: commands.iter().map(|s| s.to_string()).collect(),
         };
@@ -727,7 +727,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: PackageSource::LpmDev,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/pkg@1.0.0".into(),
                 commands: vec![],
             },
@@ -739,7 +739,7 @@ mod tests {
                 resolved: "2.0.0".into(),
                 integrity: "sha512-y".into(),
                 source: PackageSource::LpmDev,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 root: "installs/pkg@2.0.0".into(),
                 commands: vec![],
                 replaces_version: Some("1.0.0".into()),
@@ -843,7 +843,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-y".into(),
                 source: PackageSource::LpmDev,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/untouched@1.0.0".into(),
                 commands: vec!["u".into()],
             },
@@ -1184,7 +1184,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: PackageSource::LpmDev,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "../escape".into(),
                 commands: vec![],
             },
@@ -1296,7 +1296,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-b".into(),
                 source: PackageSource::LpmDev,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/pkgb@1.0.0".into(),
                 commands: vec![],
             },
@@ -1339,7 +1339,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-b".into(),
                 source: PackageSource::LpmDev,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/pkgb@1.0.0".into(),
                 commands: vec![],
             },

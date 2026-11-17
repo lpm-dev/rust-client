@@ -2833,7 +2833,7 @@ mod tests {
     }
 
     fn assert_integrity_passes_on_virtual_link_entry(store_version: &str, source_sri: &str) {
-        use chrono::Utc;
+        use lpm_common::Timestamp;
         use lpm_store::v2::{LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaPlatform};
 
         let home = tempfile::tempdir().unwrap();
@@ -2868,8 +2868,8 @@ mod tests {
                 cpu: "test".into(),
                 libc: None,
             }),
-            created_at: Utc::now(),
-            last_referenced_at: Utc::now(),
+            created_at: Timestamp::now(),
+            last_referenced_at: Timestamp::now(),
         };
         sidecar.write_to(&link_dir).unwrap();
 

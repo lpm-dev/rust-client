@@ -126,7 +126,7 @@ fn append_audit_event_locked(event: &AuditEvent) -> Result<(), LpmError> {
     writeln!(file, "{}", serde_json::to_string(&envelope)?)?;
     persist_audit_head(&AuditHead {
         schema_version: AUDIT_HEAD_SCHEMA_VERSION,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
         last_entry_hash: entry_hash,
         entry_count: entry_count + 1,
     })?;
@@ -187,7 +187,7 @@ impl AuditRecord {
 pub(super) fn record_audit_event(record: AuditRecord) {
     let event = AuditEvent {
         schema_version: AUDIT_EVENT_SCHEMA_VERSION,
-        occurred_at: Utc::now(),
+        occurred_at: Timestamp::now(),
         event: record.event,
         allowed: record.allowed,
         scopes: record.scopes,

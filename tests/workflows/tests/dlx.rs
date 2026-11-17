@@ -78,10 +78,8 @@ fn make_dlx_tool_tarball(name: &str, version: &str) -> Vec<u8> {
 }
 
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
-    use chrono::SecondsFormat;
-
-    let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
-    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+    let dt = lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::seconds(n_secs);
+    dt.to_rfc3339_milliseconds()
 }
 
 async fn mount_dlx_tool_versions(mock: &MockRegistry, name: &str) {

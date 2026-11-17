@@ -1341,7 +1341,7 @@ mod tests {
             resolved: "3.8.3".into(),
             integrity: "sha512-x".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/prettier@3.8.3".into(),
             commands: vec!["prettier".into()],
         };
@@ -1376,7 +1376,7 @@ mod tests {
             resolved: "3.8.3".into(),
             integrity: "sha512-x".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/prettier@3.8.3".into(),
             commands: vec!["prettier".into()],
         };
@@ -1391,7 +1391,7 @@ mod tests {
                 resolved: "4.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: lpm_global::PackageSource::UpstreamNpm,
-                installed_at: chrono::Utc::now(),
+                installed_at: lpm_common::Timestamp::now(),
                 root: "installs/prettier@4.0.0".into(),
                 commands: vec!["prettier".into()],
             },
@@ -1421,7 +1421,7 @@ mod tests {
             resolved: "3.8.3".into(),
             integrity: "sha512-old".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/prettier@3.8.3".into(),
             commands: vec!["prettier".into()],
         };
@@ -1434,7 +1434,7 @@ mod tests {
             resolved: "3.8.4".into(),
             integrity: "sha512-new".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/prettier@3.8.4".into(),
             commands: vec!["prettier".into()],
         };
@@ -1499,7 +1499,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: lpm_global::PackageSource::UpstreamNpm,
-                installed_at: chrono::Utc::now(),
+                installed_at: lpm_common::Timestamp::now(),
                 root: "installs/ghost@1.0.0".into(),
                 commands: vec![],
             },

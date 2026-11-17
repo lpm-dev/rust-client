@@ -232,7 +232,7 @@ mod unix {
         std::fs::create_dir(&security).unwrap();
         let secret = [42u8; 32];
         std::fs::write(security.join("signing-secret.hex"), hex::encode(secret)).unwrap();
-        let payload = serde_json::json!({"schema_version":1,"updated_at":chrono::Utc::now().to_rfc3339(),"script_policy":"allow","minimum_release_age_secs":0,"sandbox_mode":"default","sandbox_allow_degraded":false,"sigstore_verify":"deny"});
+        let payload = serde_json::json!({"schema_version":1,"updated_at":lpm_common::Timestamp::now().to_rfc3339(),"script_policy":"allow","minimum_release_age_secs":0,"sandbox_mode":"default","sandbox_allow_degraded":false,"sigstore_verify":"deny"});
         let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
         mac.update(&serde_json::to_vec(&payload).unwrap());
         let envelope = serde_json::json!({"payload":payload,"signature":hex::encode(mac.finalize().into_bytes())});

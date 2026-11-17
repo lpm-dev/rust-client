@@ -7,10 +7,10 @@ pub(super) fn create_unlock_grant_for_scopes(
     min_release_age_secs: Option<u64>,
     packages: &[String],
 ) -> UnlockGrant {
-    let now = Utc::now();
+    let now = Timestamp::now();
     UnlockGrant {
         schema_version: UNLOCK_SCHEMA_VERSION,
-        id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        id: format!("unl_{}", now.unix_nanoseconds()),
         target: UnlockTargetKind::Project,
         project_root: Some(canonical_project_root(project_dir)),
         scopes: normalized_scopes(scopes),
@@ -19,7 +19,7 @@ pub(super) fn create_unlock_grant_for_scopes(
             min_release_age_secs,
         },
         issued_at: now,
-        expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
+        expires_at: now + lpm_common::timestamp::Duration::seconds(ttl_secs as i64),
         issuer: "user-presence".to_string(),
     }
 }
@@ -45,17 +45,17 @@ pub(super) fn create_global_unlock_grant_for_scopes(
     ttl_secs: u64,
     packages: &[String],
 ) -> UnlockGrant {
-    let now = Utc::now();
+    let now = Timestamp::now();
     UnlockGrant {
         schema_version: UNLOCK_SCHEMA_VERSION,
-        id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        id: format!("unl_{}", now.unix_nanoseconds()),
         target: UnlockTargetKind::Global,
         project_root: None,
         scopes: normalized_scopes(scopes),
         packages: normalized_packages(packages),
         limits: UnlockLimits::default(),
         issued_at: now,
-        expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
+        expires_at: now + lpm_common::timestamp::Duration::seconds(ttl_secs as i64),
         issuer: "user-presence".to_string(),
     }
 }
@@ -81,7 +81,7 @@ fn read_active_unlock_entries() -> Result<Vec<StoredUnlockGrant>, LpmError> {
     }
 
     let mut grants = Vec::new();
-    let now = Utc::now();
+    let now = Timestamp::now();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();

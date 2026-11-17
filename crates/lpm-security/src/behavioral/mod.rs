@@ -1941,7 +1941,7 @@ impl PackageAnalyzer {
 
         PackageAnalysis {
             version: SCHEMA_VERSION,
-            analyzed_at: chrono::Utc::now().to_rfc3339(),
+            analyzed_at: lpm_common::Timestamp::now().to_rfc3339(),
             source: runtime.source,
             supply_chain: runtime.supply_chain,
             meta: AnalysisMeta {

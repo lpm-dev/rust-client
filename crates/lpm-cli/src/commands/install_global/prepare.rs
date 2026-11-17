@@ -1,5 +1,5 @@
 use super::resolve::ResolvedSpec;
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{GlobalInstallsDirectory, LpmError, LpmRoot};
 use lpm_global::{
     IntentPayload, PackageSource, PendingEntry, TxKind, WalRecord, WalWriter, read_for, write_for,
@@ -71,7 +71,7 @@ pub(super) fn prepare_locked(
         "resolved": resolved.version.to_string(),
         "integrity": resolved.integrity,
         "source": serde_json::to_value(resolved.source).unwrap(),
-        "started_at": Utc::now().to_rfc3339(),
+        "started_at": Timestamp::now().to_rfc3339(),
         "root": install_root_relative,
         // commands: discovered at step 2; the marker is authoritative.
         "commands": Vec::<String>::new(),
@@ -101,7 +101,7 @@ pub(super) fn prepare_locked(
             resolved: resolved.version.to_string(),
             integrity: resolved.integrity.clone(),
             source: resolved.source,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: install_root_relative.clone(),
             commands: Vec::new(),
             replaces_version: None,

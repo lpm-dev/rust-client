@@ -79,7 +79,7 @@ fn pending_install(root_relative: &str) -> PendingEntry {
         resolved: "1.0.0".into(),
         integrity: "sha512-recover".into(),
         source: PackageSource::UpstreamNpm,
-        started_at: chrono::Utc::now(),
+        started_at: lpm_common::Timestamp::now(),
         root: root_relative.into(),
         commands: Vec::new(),
         replaces_version: None,
@@ -128,7 +128,7 @@ fn seed_active_global_package(
             resolved: version.into(),
             integrity: format!("sha512-{package}-{version}"),
             source: PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: format!("installs/{package}@{version}"),
             commands: commands
                 .iter()
@@ -633,7 +633,7 @@ async fn cli_bulk_global_update_reports_mixed_success_skip_and_failure_in_single
             resolved: "1.0.0".into(),
             integrity: "sha512-missing-tool".into(),
             source: PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: "installs/missing-tool@1.0.0".into(),
             commands: vec!["missing-tool".into()],
         },

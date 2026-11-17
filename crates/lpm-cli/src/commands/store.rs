@@ -1089,8 +1089,8 @@ mod tests {
                 cpu: "arm64".to_string(),
                 libc: None,
             }),
-            created_at: chrono::Utc::now(),
-            last_referenced_at: chrono::Utc::now(),
+            created_at: lpm_common::Timestamp::now(),
+            last_referenced_at: lpm_common::Timestamp::now(),
         };
         meta.write_to(&link_dir).unwrap();
 

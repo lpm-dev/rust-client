@@ -60,7 +60,7 @@ fn seed_minimal_global_manifest(lpm_home: &std::path::Path, package: &str, versi
             resolved: version.into(),
             integrity: format!("sha512-{package}-{version}-fixture"),
             source: PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: format!("installs/{package}@{version}"),
             commands: vec![],
         },

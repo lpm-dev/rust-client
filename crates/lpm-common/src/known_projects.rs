@@ -59,7 +59,7 @@
 //! missing variant emits a fresh-machine-state warning.
 
 use crate::LpmError;
-use chrono::{DateTime, Utc};
+use crate::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -95,7 +95,7 @@ pub struct Entry {
     /// by `lpm cache prune --max-age` (that filter operates on link-
     /// entry sidecar timestamps); reserved for future registry-GC
     /// workflows.
-    pub last_seen: DateTime<Utc>,
+    pub last_seen: Timestamp,
 }
 
 impl Registry {
@@ -246,7 +246,7 @@ pub fn register(path: &Path, project_dir: &Path) -> Result<Entry, LpmError> {
                 )));
             }
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         if let Some(existing) = registry.projects.iter_mut().find(|e| e.path == canonical) {
             existing.last_seen = now;
             let entry = existing.clone();
@@ -369,7 +369,7 @@ mod tests {
         let mut r = Registry::new();
         r.projects.push(Entry {
             path: PathBuf::from("/dev/null/synthetic"),
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         write(&path, &r).unwrap();
 
@@ -393,11 +393,11 @@ mod tests {
         let mut r = Registry::new();
         r.projects.push(Entry {
             path: alive.clone(),
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         r.projects.push(Entry {
             path: dead,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         write(&path, &r).unwrap();
 
@@ -417,7 +417,7 @@ mod tests {
         let mut r = Registry::new();
         r.projects.push(Entry {
             path: alive,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         write(&path, &r).unwrap();
 
@@ -432,15 +432,15 @@ mod tests {
         let mut r = Registry::new();
         r.projects.push(Entry {
             path: PathBuf::from("/z/zeta"),
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         r.projects.push(Entry {
             path: PathBuf::from("/a/alpha"),
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         r.projects.push(Entry {
             path: PathBuf::from("/m/middle"),
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         write(&path, &r).unwrap();
 

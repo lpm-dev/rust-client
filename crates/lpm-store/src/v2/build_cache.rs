@@ -2,8 +2,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use lpm_common::LpmError;
+use lpm_common::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::fs_util::{
@@ -214,7 +214,7 @@ pub struct BuildArtifactManifest {
     /// Time spent executing lifecycle commands when this artifact was created.
     pub lifecycle_duration_ms: u64,
     /// Artifact publication time.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// A validated build artifact ready to restore.
@@ -452,7 +452,7 @@ fn manifest_from_tree(
         file_count: stats.file_count,
         unpacked_bytes: stats.unpacked_bytes,
         lifecycle_duration_ms,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     }
 }
 

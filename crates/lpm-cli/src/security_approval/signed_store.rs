@@ -525,7 +525,9 @@ fn quarantine_path_for(path: &Path) -> Result<PathBuf, LpmError> {
                 path.display()
             ))
         })?;
-    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let stamp = Timestamp::now()
+        .to_rfc3339_milliseconds()
+        .replace(['-', ':'], "");
     for index in 0..1000 {
         let suffix = if index == 0 {
             format!(".unverified-{stamp}")

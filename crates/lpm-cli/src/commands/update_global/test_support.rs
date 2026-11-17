@@ -40,7 +40,7 @@ pub(super) fn pre_upgrade_manifest_with_alias(
             resolved: "1.0.0".into(),
             integrity: "sha512-old".into(),
             source: lpm_global::PackageSource::UpstreamNpm,
-            installed_at: chrono::Utc::now(),
+            installed_at: lpm_common::Timestamp::now(),
             root: root_dir.into(),
             // commands excludes the aliased-away bin per the
             // manifest invariant.

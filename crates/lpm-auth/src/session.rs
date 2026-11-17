@@ -175,7 +175,7 @@ pub struct SessionManager {
 /// A rotated session a revocation keeps in memory instead of saving.
 struct UnsavedRotation {
     refresh_token: String,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<lpm_common::Timestamp>,
 }
 
 #[derive(Clone)]
@@ -701,9 +701,9 @@ impl SessionManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            Some(rotation) => rotation
-                .expires_at
-                .is_none_or(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5)),
+            Some(rotation) => rotation.expires_at.is_none_or(|expiry| {
+                expiry <= lpm_common::Timestamp::now() + lpm_common::timestamp::Duration::minutes(5)
+            }),
             None => crate::should_refresh_session_access_token(&self.registry_url),
         }
     }
@@ -798,9 +798,7 @@ impl SessionManager {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UnsavedRotation {
                     refresh_token: refreshed.refresh_token.clone(),
-                    expires_at: chrono::DateTime::parse_from_rfc3339(&refreshed.expires_at)
-                        .ok()
-                        .map(|expiry| expiry.with_timezone(&chrono::Utc)),
+                    expires_at: lpm_common::Timestamp::parse_rfc3339(&refreshed.expires_at).ok(),
                 });
             }
 

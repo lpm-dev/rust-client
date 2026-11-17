@@ -906,11 +906,9 @@ impl From<lpm_tunnel::webhook::CapturedWebhook> for RequestDetail {
 /// Compute a human-readable session duration from start/end timestamps.
 fn compute_session_duration(started: &str, ended: Option<&str>) -> Option<String> {
     let end_str = ended?;
-    let start = chrono::DateTime::parse_from_rfc3339(started).ok()?;
-    let end = chrono::DateTime::parse_from_rfc3339(end_str).ok()?;
-    let duration = end.signed_duration_since(start);
-
-    let secs = duration.num_seconds();
+    let start = lpm_common::Timestamp::parse_rfc3339(started).ok()?;
+    let end = lpm_common::Timestamp::parse_rfc3339(end_str).ok()?;
+    let secs = (end - start).whole_seconds();
     if secs < 0 {
         return None;
     }

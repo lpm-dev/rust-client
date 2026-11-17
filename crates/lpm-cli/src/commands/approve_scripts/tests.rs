@@ -2375,7 +2375,7 @@ async fn approve_scripts_yes_json_emits_warning_only_in_json_warnings_field() {
 
 use crate::build_state::compute_blocked_set_fingerprint;
 use crate::global_blocked_set::{AggregateBlockedRow, AggregateBlockedSet};
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
 
 fn scoped_lpm_home(path: &Path) -> crate::test_env::ScopedEnv {
@@ -2434,7 +2434,7 @@ fn seed_global_manifest_with_blocked(
     let state = BuildState {
         state_version: BUILD_STATE_VERSION,
         blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked_packages),
-        captured_at: Utc::now().to_rfc3339(),
+        captured_at: Timestamp::now().to_rfc3339(),
         blocked_packages,
         authentication_tag: None,
         drift_ignore_override: None,
@@ -2449,7 +2449,7 @@ fn seed_global_manifest_with_blocked(
             resolved: top_level_version.into(),
             integrity: "sha512-top-level".into(),
             source: PackageSource::UpstreamNpm,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: rel_root,
             commands: vec![],
         },

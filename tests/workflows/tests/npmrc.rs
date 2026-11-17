@@ -21,7 +21,7 @@ mod support;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::SecondsFormat;
+
 use sha2::{Digest, Sha512};
 use std::io::Write;
 use support::mock_registry::MockRegistry;
@@ -70,7 +70,8 @@ fn integrity(data: &[u8]) -> String {
 }
 
 fn iso8601_30_days_ago() -> String {
-    (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339_opts(SecondsFormat::Millis, true)
+    (lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::days(30))
+        .to_rfc3339_milliseconds()
 }
 
 // ─── Test ───────────────────────────────────────────────────────────────

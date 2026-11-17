@@ -1,4 +1,4 @@
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
 
 use super::ReconciliationOutcome;
@@ -245,7 +245,7 @@ pub(super) fn roll_back_with_authoritative_commands(
     wal.append(&WalRecord::Abort {
         tx_id: intent.tx_id.clone(),
         reason: format!("validate_install_root: {status:?}"),
-        aborted_at: Utc::now(),
+        aborted_at: Timestamp::now(),
     })?;
 
     Ok(ReconciliationOutcome::RolledBack {

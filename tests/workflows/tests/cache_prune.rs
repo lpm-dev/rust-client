@@ -583,7 +583,8 @@ fn seed_prune_package(
 fn age_prune_package(store: &lpm_store::v2::Store, key: &lpm_store::v2::GraphKey) {
     let dir = store.paths().link_dir(key);
     let mut meta = lpm_store::v2::LinkMeta::read_from(&dir).unwrap();
-    meta.last_referenced_at = chrono::Utc::now() - chrono::Duration::days(30);
+    meta.last_referenced_at =
+        lpm_common::Timestamp::now() - lpm_common::timestamp::Duration::days(30);
     let path = meta.write_to(&dir).unwrap();
     std::fs::File::options()
         .write(true)

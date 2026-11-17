@@ -147,7 +147,7 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
 pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), LpmError> {
     let mut normalized = posture.clone();
     normalized.schema_version = APPROVED_POSTURE_SCHEMA_VERSION;
-    normalized.updated_at = Utc::now();
+    normalized.updated_at = Timestamp::now();
     let transaction_active =
         AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| transaction.borrow().is_some());
     if !transaction_active {

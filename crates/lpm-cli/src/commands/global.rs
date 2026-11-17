@@ -820,7 +820,7 @@ fn emit_list_human(
             println!(
                 "        spec: {}    installed: {}    size: {}",
                 spec_safe.dimmed(),
-                entry.installed_at.format("%Y-%m-%d").to_string().dimmed(),
+                entry.installed_at.date().to_string().dimmed(),
                 format_bytes(bytes).dimmed()
             );
             let root_safe = sanitize_for_terminal(&install_root.display().to_string());
@@ -1396,7 +1396,7 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use lpm_common::Timestamp;
     use lpm_global::{AliasEntry, PackageSource, write_for};
     use tempfile::TempDir;
 
@@ -1413,7 +1413,7 @@ mod tests {
                 resolved: "9.24.0".into(),
                 integrity: "sha512-x".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/eslint@9.24.0".into(),
                 commands: vec!["eslint".into()],
             },
@@ -1539,7 +1539,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-z".into(),
             source: PackageSource::LpmDev,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: "installs/x@1.0.0".into(),
             commands: vec!["x".into()],
         };

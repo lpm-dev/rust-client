@@ -1,8 +1,8 @@
 use super::prepare::{StagedUpgrade, UpgradePrep};
-use chrono::Utc;
 #[cfg(all(test, unix))]
 use lpm_common::LpmError;
 use lpm_common::LpmRoot;
+use lpm_common::Timestamp;
 use lpm_global::{GlobalManifest, Shim, WalRecord, emit_shim, remove_shim};
 #[cfg(all(test, unix))]
 use lpm_global::{WalWriter, write_for};
@@ -132,7 +132,7 @@ pub(super) fn abort_upgrade_in_manifest(
     WalRecord::Abort {
         tx_id: staged.tx_id.clone(),
         reason: format!("commit-time validation failed: {reason}"),
-        aborted_at: Utc::now(),
+        aborted_at: Timestamp::now(),
     }
 }
 
@@ -158,7 +158,7 @@ mod tests {
                 resolved: "2.0.0".into(),
                 integrity: "sha512-pending".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: relative.into(),
                 commands: Vec::new(),
                 replaces_version: Some("1.0.0".into()),
@@ -171,7 +171,7 @@ mod tests {
                 resolved: "2.0.0".into(),
                 integrity: "sha512-current".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                installed_at: chrono::Utc::now(),
+                installed_at: lpm_common::Timestamp::now(),
                 root: relative.into(),
                 commands: Vec::new(),
             },
@@ -208,7 +208,7 @@ mod tests {
                 resolved: "2.0.0".into(),
                 integrity: "sha512-pending".into(),
                 source: lpm_global::PackageSource::LpmDev,
-                started_at: chrono::Utc::now(),
+                started_at: lpm_common::Timestamp::now(),
                 root: relative.into(),
                 commands: Vec::new(),
                 replaces_version: Some("1.0.0".into()),

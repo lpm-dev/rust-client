@@ -719,7 +719,7 @@ fn validate_sharing_key(
     match (timestamps_required, key.created_at, key.updated_at) {
         (true, OptionalField::Value(created_at), OptionalField::Value(updated_at)) => {
             for timestamp in [created_at, updated_at] {
-                chrono::DateTime::parse_from_rfc3339(&timestamp)
+                lpm_common::Timestamp::parse_rfc3339(&timestamp)
                     .map_err(|_| "authenticated response has an invalid sharing-key timestamp")?;
             }
         }
@@ -1089,7 +1089,7 @@ fn validate_vault_payload(
     validate_string(&data.wrapped_key, 4096, "wrapped key")?;
     validate_revision(data.revision, false, "revision")?;
     validate_crypto_version(data.crypto_version)?;
-    chrono::DateTime::parse_from_rfc3339(&data.updated_at)
+    lpm_common::Timestamp::parse_rfc3339(&data.updated_at)
         .map_err(|_| "authenticated sync envelope has an invalid updated timestamp")?;
     match expected_scope {
         SyncScope::Personal

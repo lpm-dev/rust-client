@@ -727,7 +727,9 @@ fn only_active_global_floor_edit_grants_authorize_persistent_weakening() {
                 payload["project_root"] = serde_json::Value::Null;
                 if scenario == "expired" {
                     payload["expires_at"] = serde_json::json!(
-                        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                        (lpm_common::Timestamp::now()
+                            - lpm_common::timestamp::Duration::minutes(1))
+                        .to_rfc3339()
                     );
                 }
             });
@@ -786,7 +788,9 @@ fn only_active_unrestricted_global_floor_edit_grants_can_remove_force_floor() {
                         payload["project_root"] = serde_json::Value::Null;
                         if scenario == "expired" {
                             payload["expires_at"] = serde_json::json!(
-                                (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                                (lpm_common::Timestamp::now()
+                                    - lpm_common::timestamp::Duration::minutes(1))
+                                .to_rfc3339()
                             );
                         }
                         if scenario == "package-scoped" {

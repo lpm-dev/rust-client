@@ -201,7 +201,7 @@ mod tests {
     async fn replay_rejects_an_https_child_without_disabling_certificate_verification() {
         let captured = CapturedWebhook {
             id: "test".into(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: lpm_common::Timestamp::now().to_rfc3339(),
             method: "POST".into(),
             path: "/api/webhook".into(),
             request_headers: std::collections::HashMap::new(),
@@ -250,7 +250,7 @@ mod tests {
 
         let captured = CapturedWebhook {
             id: "test".into(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: lpm_common::Timestamp::now().to_rfc3339(),
             method: "POST".into(),
             path: "/api/webhook".into(),
             request_headers: std::collections::HashMap::new(),
@@ -316,7 +316,7 @@ mod tests {
 
         let captured = CapturedWebhook {
             id: "test".into(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: lpm_common::Timestamp::now().to_rfc3339(),
             method: "POST".into(),
             path: "/api/webhook".into(),
             request_headers: std::collections::HashMap::new(),
@@ -376,7 +376,7 @@ mod tests {
         });
         let captured = CapturedWebhook {
             id: "replay-ipv6".into(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: lpm_common::Timestamp::now().to_rfc3339(),
             method: "POST".into(),
             path: "/hooks/stripe".into(),
             request_headers: std::collections::HashMap::from([(

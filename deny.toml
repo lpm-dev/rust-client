@@ -2,9 +2,7 @@
 yanked = "deny"
 unmaintained = "workspace"
 unsound = "all"
-ignore = [
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained and has no maintained release to move to. The advisory reports no vulnerability." },
-]
+ignore = []
 
 [licenses]
 allow = [

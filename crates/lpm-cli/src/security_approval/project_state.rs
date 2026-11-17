@@ -70,7 +70,7 @@ pub(super) fn candidate_project_policy_state(
     trusted_scopes.sort();
     Ok(ApprovedProjectPolicyState {
         schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
         project_root: canonical_project_root(project_dir),
         trusted_dependencies: trusted_dependencies_snapshot(trusted),
         trusted_scopes,
@@ -100,7 +100,7 @@ pub(super) fn load_approved_project_policy_state(
         read_signed_json(&project_policy_state_path(project_dir)?)?.unwrap_or_else(|| {
             ApprovedProjectPolicyState {
                 schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
-                updated_at: Utc::now(),
+                updated_at: Timestamp::now(),
                 project_root: canonical_project_root(project_dir),
                 trusted_dependencies: BTreeMap::new(),
                 trusted_scopes: Vec::new(),
@@ -116,7 +116,7 @@ pub(super) fn persist_project_policy_state(
 ) -> Result<(), LpmError> {
     let mut normalized = state.clone();
     normalized.schema_version = APPROVED_PROJECT_STATE_SCHEMA_VERSION;
-    normalized.updated_at = Utc::now();
+    normalized.updated_at = Timestamp::now();
     normalized.project_root = canonical_project_root(project_dir);
     normalized.trusted_scopes.sort();
     normalized.trusted_scopes.dedup();
@@ -135,7 +135,7 @@ pub(super) fn candidate_global_trust_state(
 ) -> ApprovedGlobalTrustState {
     ApprovedGlobalTrustState {
         schema_version: APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
         trusted_dependencies: trust.trusted.clone(),
     }
 }
@@ -144,7 +144,7 @@ pub(super) fn load_approved_global_trust_state() -> Result<ApprovedGlobalTrustSt
     Ok(
         read_signed_json(&approved_global_trust_path()?)?.unwrap_or(ApprovedGlobalTrustState {
             schema_version: APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
             trusted_dependencies: BTreeMap::new(),
         }),
     )
@@ -153,7 +153,7 @@ pub(super) fn load_approved_global_trust_state() -> Result<ApprovedGlobalTrustSt
 pub(super) fn persist_global_trust_state(state: &ApprovedGlobalTrustState) -> Result<(), LpmError> {
     let mut normalized = state.clone();
     normalized.schema_version = APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION;
-    normalized.updated_at = Utc::now();
+    normalized.updated_at = Timestamp::now();
     write_signed_json(&approved_global_trust_path()?, &normalized)
 }
 

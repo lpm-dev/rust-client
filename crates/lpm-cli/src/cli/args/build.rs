@@ -613,7 +613,7 @@ pub(crate) struct InternalVerifyReleaseArgs {
 
     /// When the GitHub release was, or is about to be, published.
     #[arg(long, value_name = "RFC3339", value_parser = parse_rfc3339_utc)]
-    pub(crate) published_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) published_at: lpm_common::Timestamp,
 
     /// The full commit SHA the GitHub release records as its
     /// `target_commitish`.

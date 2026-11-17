@@ -27,7 +27,7 @@ impl TokenRotationResponse {
             || response
                 .expires_at
                 .as_deref()
-                .is_some_and(|expiry| chrono::DateTime::parse_from_rfc3339(expiry).is_err())
+                .is_some_and(|expiry| lpm_common::Timestamp::parse_rfc3339(expiry).is_err())
         {
             return Err(LpmError::Registry(
                 "invalid token rotation response: expected a non-empty token and an RFC 3339 or null expiry"

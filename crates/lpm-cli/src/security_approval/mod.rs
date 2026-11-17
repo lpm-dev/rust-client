@@ -238,9 +238,9 @@ mod prelude {
     pub(super) use crate::release_age_config::{DEFAULT_MIN_RELEASE_AGE_SECS, ReleaseAgePolicy};
     pub(super) use crate::sandbox_config::ResolvedSandboxMode;
     pub(super) use crate::script_policy_config::ScriptPolicy;
-    pub(super) use chrono::{DateTime, Utc};
     pub(super) use hmac::{KeyInit, Mac};
     pub(super) use lpm_common::LpmError;
+    pub(super) use lpm_common::Timestamp;
     pub(super) use rand::Rng;
     pub(super) use serde::{Deserialize, Serialize};
     pub(super) use sha2::{Digest, Sha256};

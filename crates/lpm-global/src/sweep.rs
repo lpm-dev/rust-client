@@ -492,7 +492,7 @@ fn dir_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::manifest::{GlobalManifest, PackageEntry, PackageSource, PendingEntry, write_for};
-    use chrono::Utc;
+    use lpm_common::Timestamp;
     use std::fs;
 
     fn seed_manifest_with_tombstones(root: &LpmRoot, tombstones: &[&str]) {
@@ -522,7 +522,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-active".into(),
             source: PackageSource::LpmDev,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: root.into(),
             commands: vec!["pkg".into()],
         }
@@ -534,7 +534,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-pending".into(),
             source: PackageSource::LpmDev,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: root.into(),
             commands: vec!["pkg".into()],
             replaces_version: None,

@@ -47,7 +47,8 @@
 //!   on the next apply — the degraded path is the safety contract.
 
 use crate::install_ui;
-use chrono::{Duration as ChronoDuration, Utc};
+use lpm_common::Timestamp;
+use lpm_common::timestamp::Duration as Age;
 use lpm_common::{
     LpmError, LpmRoot, known_projects, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
 };
@@ -189,7 +190,7 @@ struct PruneLinkEntry {
     graph_key_digest_hex: String,
     dependency_graph_keys: Vec<String>,
     object_segment: String,
-    last_referenced_at: Option<chrono::DateTime<Utc>>,
+    last_referenced_at: Option<lpm_common::Timestamp>,
 }
 
 struct PruneDiscovery {
@@ -299,7 +300,7 @@ fn run_all_virtual_stores_locked(
     v2_store: &V2Store,
     v3_store: &V2Store,
     flags: &PruneFlags<'_>,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
 ) -> Result<PruneSummary, LpmError> {
     let free_before = flags
         .apply
@@ -448,7 +449,7 @@ fn run_locked(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
     handle_tombstones: bool,
     discovery: Option<StoreDiscovery>,
 ) -> Result<PruneSummary, LpmError> {
@@ -464,7 +465,7 @@ fn plan_locked(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
     discovery: Option<StoreDiscovery>,
 ) -> Result<PruneSummary, LpmError> {
     let mut summary = compute_prune(root, v2_store, flags, max_age, true, discovery)
@@ -872,7 +873,7 @@ pub fn compute_prune_plan(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
 ) -> Result<PruneSummary, LpmError> {
     compute_prune(root, v2_store, flags, max_age, true, None).map(|(summary, _)| summary)
 }
@@ -882,7 +883,7 @@ pub fn compute_prune_stats(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
 ) -> Result<PruneStats, LpmError> {
     compute_prune(root, v2_store, flags, max_age, false, None).map(|(_, stats)| stats)
 }
@@ -1019,7 +1020,7 @@ fn compute_prune(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
     build_full_plan: bool,
     discovery: Option<StoreDiscovery>,
 ) -> Result<(PruneSummary, PruneStats), LpmError> {
@@ -1191,7 +1192,7 @@ fn compute_prune(
     let mut reachable_count = 0usize;
     let mut frontier = root_link_indices;
     if let Some(max_age) = max_age {
-        let now = Utc::now();
+        let now = Timestamp::now();
         frontier.extend(
             all_link_entries
                 .iter()
@@ -1463,7 +1464,7 @@ fn add_canonical_if_link_descendant(
     }
 }
 
-fn parse_duration(s: &str) -> Result<ChronoDuration, LpmError> {
+fn parse_duration(s: &str) -> Result<Age, LpmError> {
     let (num_str, unit) = if let Some(stripped) = s.strip_suffix('d') {
         (stripped, 'd')
     } else if let Some(stripped) = s.strip_suffix('h') {
@@ -1482,10 +1483,11 @@ fn parse_duration(s: &str) -> Result<ChronoDuration, LpmError> {
         )));
     }
     match unit {
-        'd' => ChronoDuration::try_days(num),
-        'h' => ChronoDuration::try_hours(num),
+        'd' => num.checked_mul(86_400),
+        'h' => num.checked_mul(3_600),
         _ => unreachable!(),
     }
+    .map(Age::seconds)
     .ok_or_else(|| {
         LpmError::Registry(format!(
             "cache prune: --max-age {s} is too large to represent"
@@ -1520,7 +1522,7 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
 /// island.
 fn compute_compat_island_orphans(
     compat_root: &Path,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
 ) -> Result<(usize, Vec<PathBuf>), LpmError> {
     compute_lru_artifact_orphans(
         compat_root,
@@ -1531,7 +1533,7 @@ fn compute_compat_island_orphans(
 
 fn compute_build_artifact_orphans(
     builds_root: &Path,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
 ) -> Result<(usize, Vec<PathBuf>), LpmError> {
     compute_lru_artifact_orphans(
         builds_root,
@@ -1543,14 +1545,14 @@ fn compute_build_artifact_orphans(
 fn compute_lru_artifact_orphans(
     root: &Path,
     completion_sentinel: &str,
-    max_age: Option<ChronoDuration>,
+    max_age: Option<Age>,
 ) -> Result<(usize, Vec<PathBuf>), LpmError> {
     let read = match std::fs::read_dir(root) {
         Ok(read) => read,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
         Err(error) => return Err(prune_inspection_error(root, error)),
     };
-    let max_age_std = max_age.and_then(|d| d.to_std().ok());
+    let max_age_std = max_age.and_then(|age| Duration::try_from(age).ok());
     let mut total = 0usize;
     let mut orphaned = Vec::new();
     for entry in read {
@@ -1918,7 +1920,8 @@ fn emit_json(summary: &PruneSummary) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::DateTime;
+    #[cfg(unix)]
+    use lpm_common::Timestamp;
 
     #[cfg(unix)]
     use lpm_common::known_projects::{Entry, Registry};
@@ -1927,7 +1930,6 @@ mod tests {
         DepLink, GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
         PlatformTuple,
     };
-    use std::collections::HashMap;
     #[cfg(unix)]
     use std::sync::Arc;
 
@@ -2200,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_max_age_rejects_values_that_exceed_chronos_range() {
+    fn prune_max_age_rejects_values_too_large_to_represent() {
         for value in ["9223372036854775807d", "9223372036854775807h"] {
             let error =
                 parse_duration(value).expect_err("an overflowing duration must return an error");
@@ -2249,7 +2251,7 @@ mod tests {
 
         // --max-age 7d: incomplete + stale pruned; the fresh island is kept.
         let (total, mut orphans) =
-            compute_compat_island_orphans(&compat_root, Some(ChronoDuration::days(7))).unwrap();
+            compute_compat_island_orphans(&compat_root, Some(Age::days(7))).unwrap();
         assert_eq!(total, 3);
         orphans.sort();
         let mut expected = vec![incomplete, stale];
@@ -2295,7 +2297,7 @@ mod tests {
         assert_eq!(orphans, vec![incomplete.clone()]);
 
         let (total, mut orphans) =
-            compute_build_artifact_orphans(&builds_root, Some(ChronoDuration::days(7))).unwrap();
+            compute_build_artifact_orphans(&builds_root, Some(Age::days(7))).unwrap();
         assert_eq!(total, 3);
         orphans.sort();
         let mut expected = vec![incomplete, stale];
@@ -2516,13 +2518,8 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         known_projects::register(&root.known_projects(), &project).unwrap();
 
-        let summary = compute_prune_plan(
-            &root,
-            &store,
-            &PruneFlags::default(),
-            Some(ChronoDuration::days(30)),
-        )
-        .unwrap();
+        let summary =
+            compute_prune_plan(&root, &store, &PruneFlags::default(), Some(Age::days(30))).unwrap();
         assert_eq!(
             summary.link_entries_orphaned.len(),
             0,
@@ -2547,7 +2544,7 @@ mod tests {
         let mut r = Registry::new();
         r.projects.push(Entry {
             path: stale,
-            last_seen: Utc::now(),
+            last_seen: Timestamp::now(),
         });
         known_projects::write(&root.known_projects(), &r).unwrap();
 
@@ -2782,8 +2779,4 @@ mod tests {
 
         assert_eq!(value, serde_json::json!(["bad�"]));
     }
-
-    /// Avoid an `unused` warning on `HashMap` + `DateTime` re-exports
-    /// in test utilities — the helpers above use both transiently.
-    fn _force_use(_h: HashMap<(), ()>, _t: DateTime<Utc>) {}
 }

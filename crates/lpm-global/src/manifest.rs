@@ -37,7 +37,7 @@
 //! default) so additive changes don't break older binaries; bumps are
 //! reserved for breaking changes. Current format is v1.
 
-use chrono::{DateTime, Utc};
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -108,7 +108,7 @@ pub struct PackageEntry {
     /// intentionally skipped by registry update flows.
     pub source: PackageSource,
     /// When the install committed.
-    pub installed_at: DateTime<Utc>,
+    pub installed_at: Timestamp,
     /// Path relative to `~/.lpm/global/` — typically `"installs/<name>@<ver>"`.
     pub root: String,
     /// Command names this install owns on PATH, in declaration order.
@@ -129,7 +129,7 @@ pub struct PendingEntry {
     pub resolved: String,
     pub integrity: String,
     pub source: PackageSource,
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     pub root: String,
     pub commands: Vec<String>,
     /// `Some(prior_version)` for upgrades / reinstalls; `None` for fresh
@@ -573,7 +573,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-pending".into(),
                 source: PackageSource::LpmDev,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 root: "installs/pkg@1.0.0".into(),
                 commands: Vec::new(),
                 replaces_version: None,
@@ -625,7 +625,7 @@ mod tests {
             resolved: "1.0.0".into(),
             integrity: "sha512-pending".into(),
             source: PackageSource::LpmDev,
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             root: "installs/pkg@1.0.0".into(),
             commands: Vec::new(),
             replaces_version: None,

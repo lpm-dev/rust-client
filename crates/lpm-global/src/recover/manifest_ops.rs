@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
 use lpm_common::LpmRoot;
+use lpm_common::Timestamp;
 
 use crate::manifest::{AliasEntry, GlobalManifest, PackageEntry, PackageSource};
 use crate::shim::{Shim, emit_shim, remove_shim};
@@ -298,7 +298,7 @@ pub(super) fn parse_package_entry_from_json(value: &serde_json::Value) -> Option
     let resolved = value.get("resolved")?.as_str()?.to_string();
     let integrity = value.get("integrity")?.as_str()?.to_string();
     let source: PackageSource = serde_json::from_value(value.get("source")?.clone()).ok()?;
-    let installed_at: DateTime<Utc> =
+    let installed_at: Timestamp =
         serde_json::from_value(value.get("installed_at")?.clone()).ok()?;
     let root = value.get("root")?.as_str()?.to_string();
     let commands_arr = value.get("commands")?.as_array()?;

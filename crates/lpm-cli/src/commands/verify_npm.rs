@@ -197,10 +197,10 @@ fn explain_waiting_name(issued: &NpmVerificationToken, npm_username: &str) {
 /// name the version the CLI published.
 fn proof_version(issued_at: Option<&str>) -> String {
     let seconds = issued_at
-        .and_then(|issued| chrono::DateTime::parse_from_rfc3339(issued).ok())
-        .map(|issued| issued.timestamp())
+        .and_then(|issued| lpm_common::Timestamp::parse_rfc3339(issued).ok())
+        .map(|issued| issued.unix_seconds())
         .filter(|seconds| *seconds > 0)
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+        .unwrap_or_else(|| lpm_common::Timestamp::now().unix_seconds());
     format!("1.0.{seconds}")
 }
 

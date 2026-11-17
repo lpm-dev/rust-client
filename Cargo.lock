@@ -3503,7 +3503,6 @@ version = "0.86.0"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
- "chrono",
  "core-foundation 0.10.1",
  "dirs",
  "hex",
@@ -3569,7 +3568,6 @@ dependencies = [
  "block2",
  "cap-fs-ext",
  "cap-std",
- "chrono",
  "clap",
  "clap_complete",
  "cliclack",
@@ -3666,6 +3664,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -3692,7 +3691,6 @@ dependencies = [
  "base64 0.23.1",
  "cap-fs-ext",
  "cap-std",
- "chrono",
  "dirs",
  "fd-lock",
  "getrandom 0.4.3",
@@ -3711,6 +3709,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tracing",
  "unicode-normalization",
@@ -3877,7 +3876,6 @@ dependencies = [
 name = "lpm-global"
 version = "0.86.0"
 dependencies = [
- "chrono",
  "crc32fast",
  "libc",
  "lpm-common",
@@ -3913,7 +3911,6 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.23.1",
- "chrono",
  "futures-util",
  "libc",
  "lpm-common",
@@ -4257,7 +4254,6 @@ dependencies = [
  "bytecount",
  "cap-fs-ext",
  "cap-std",
- "chrono",
  "criterion",
  "flate2",
  "hex",
@@ -4330,7 +4326,6 @@ version = "0.86.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
- "chrono",
  "criterion",
  "filetime",
  "flate2",
@@ -4404,7 +4399,6 @@ name = "lpm-tunnel"
 version = "0.86.0"
 dependencies = [
  "base64 0.23.1",
- "chrono",
  "futures-util",
  "hex",
  "hmac 0.13.0",
@@ -4436,7 +4430,6 @@ dependencies = [
  "base64 0.23.1",
  "cap-fs-ext",
  "cap-std",
- "chrono",
  "core-foundation 0.10.1",
  "dirs",
  "ed25519-dalek",
@@ -4488,7 +4481,6 @@ dependencies = [
  "aes-gcm",
  "assert_cmd",
  "base64 0.23.1",
- "chrono",
  "flate2",
  "futures-util",
  "hex",

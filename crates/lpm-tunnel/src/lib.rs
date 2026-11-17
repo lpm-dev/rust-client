@@ -141,7 +141,7 @@ pub enum UsageUpdate {
 #[derive(Debug, Clone)]
 pub(crate) struct UsageTracker {
     usage: TunnelUsageMetadata,
-    period_end: Option<chrono::DateTime<chrono::Utc>>,
+    period_end: Option<lpm_common::Timestamp>,
 }
 
 impl UsageTracker {
@@ -149,8 +149,7 @@ impl UsageTracker {
         let period_end = usage
             .period_end
             .as_deref()
-            .and_then(|end| chrono::DateTime::parse_from_rfc3339(end).ok())
-            .map(|end| end.with_timezone(&chrono::Utc));
+            .and_then(|end| lpm_common::Timestamp::parse_rfc3339(end).ok());
         Self { usage, period_end }
     }
 
@@ -160,11 +159,7 @@ impl UsageTracker {
 
     /// Counts a request the relay admitted, given the account total it
     /// reported with the request, if any.
-    pub(crate) fn record_admission(
-        &mut self,
-        reported: Option<u64>,
-        now: chrono::DateTime<chrono::Utc>,
-    ) {
+    pub(crate) fn record_admission(&mut self, reported: Option<u64>, now: lpm_common::Timestamp) {
         if self.period_end.is_some_and(|end| now >= end) {
             // The relay's count starts over in a period it hasn't described yet.
             self.period_end = None;
@@ -238,7 +233,7 @@ mod usage_tracker_tests {
         }
     }
 
-    fn at(timestamp: &str) -> chrono::DateTime<chrono::Utc> {
+    fn at(timestamp: &str) -> lpm_common::Timestamp {
         timestamp.parse().unwrap()
     }
 

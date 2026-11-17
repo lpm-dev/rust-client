@@ -25,9 +25,6 @@ dirs = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
-# Token expiry timestamps
-chrono = { workspace = true }
-
 # Persistent token-expiry / OTP metadata
 serde = { workspace = true }
 serde_json = { workspace = true }

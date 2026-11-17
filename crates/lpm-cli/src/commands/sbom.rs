@@ -207,7 +207,7 @@ async fn build_document(
         .to_string();
     let root_metadata = extract_manifest_metadata(&root_json);
     let patch_metadata = read_patch_metadata(&lockfile);
-    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let generated_at = lpm_common::Timestamp::now().to_rfc3339_seconds();
 
     let local_metadata = read_installed_manifest_metadata(project_dir, &lockfile, &root_json)?;
     lockfile

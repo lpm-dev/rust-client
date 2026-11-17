@@ -290,7 +290,7 @@ pub fn build_state_path_for_install(install_root: &std::path::Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::build_state::{BUILD_STATE_VERSION, compute_blocked_set_fingerprint};
-    use chrono::Utc;
+    use lpm_common::Timestamp;
     use lpm_global::{PackageEntry, PackageSource};
 
     fn seed_install_with_blocked(
@@ -305,7 +305,7 @@ mod tests {
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked),
-            captured_at: Utc::now().to_rfc3339(),
+            captured_at: Timestamp::now().to_rfc3339(),
             blocked_packages: blocked,
             authentication_tag: None,
             drift_ignore_override: None,
@@ -320,7 +320,7 @@ mod tests {
             resolved: version.into(),
             integrity: "sha512-test".into(),
             source: PackageSource::UpstreamNpm,
-            installed_at: Utc::now(),
+            installed_at: Timestamp::now(),
             root: rel_root.into(),
             commands: vec![],
         }

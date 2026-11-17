@@ -8,7 +8,7 @@
 use super::collision_ux::{CollisionResolution, collision_error, format_collisions};
 use super::prepare::PrepResult;
 use super::rollback::rollback_aborted_commit;
-use chrono::Utc;
+use lpm_common::Timestamp;
 use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal};
 use lpm_global::{
     AliasEntry, CommandCollision, GlobalManifest, InstallRootStatus, IntentPayload,
@@ -248,7 +248,7 @@ pub(super) fn commit_locked(
         resolved: prep.version.to_string(),
         integrity: prep.integrity.clone(),
         source: prep.source,
-        installed_at: Utc::now(),
+        installed_at: Timestamp::now(),
         root: prep.install_root_relative.clone(),
         commands: plan.final_commands.clone(),
     };
@@ -262,7 +262,7 @@ pub(super) fn commit_locked(
 
     wal.append(&WalRecord::Commit {
         tx_id: prep.tx_id.clone(),
-        committed_at: Utc::now(),
+        committed_at: Timestamp::now(),
     })?;
 
     Ok(CommitOutput {
@@ -571,7 +571,7 @@ pub(crate) fn plan_resolution(
         resolved: "<planning>".to_string(),
         integrity: "<planning>".to_string(),
         source: PackageSource::LpmDev,
-        installed_at: Utc::now(),
+        installed_at: Timestamp::now(),
         root: "<planning>".to_string(),
         commands: Vec::new(),
     };
@@ -688,7 +688,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-test".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: format!("installs/{owner}@1.0.0"),
                 commands: owned_commands.iter().map(|s| (*s).to_string()).collect(),
             },
@@ -787,7 +787,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-test".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/other-pkg@1.0.0".into(),
                 commands: vec![],
             },
@@ -922,7 +922,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-test".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/b@1.0.0".into(),
                 commands: vec!["lint".into()],
             },
@@ -1067,7 +1067,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-other".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/http-server@1.0.0".into(),
                 commands: vec!["serve".into()],
             },
@@ -1079,7 +1079,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: PackageSource::LpmDev,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 root: "installs/foo@1.0.0".into(),
                 commands: vec![],
                 replaces_version: None,
@@ -1175,7 +1175,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-x".into(),
                 source: PackageSource::LpmDev,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 root: "installs/foo@1.0.0".into(),
                 commands: vec![],
                 replaces_version: None,
@@ -1280,7 +1280,7 @@ mod tests {
                 resolved: "1.0.0".into(),
                 integrity: "sha512-test".into(),
                 source: PackageSource::UpstreamNpm,
-                installed_at: Utc::now(),
+                installed_at: Timestamp::now(),
                 root: "installs/other2@1.0.0".into(),
                 commands: vec!["other-cmd".into()],
             },
