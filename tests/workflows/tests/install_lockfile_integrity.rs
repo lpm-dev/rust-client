@@ -635,6 +635,68 @@ async fn a_repeated_frozen_install_is_up_to_date_with_a_locked_url_query() {
     assert_eq!(report["up_to_date"], true, "{report:#}");
 }
 
+/// A two-member workspace, installed, whose lockfile then names every
+/// member's tarball by a URL with a query.
+async fn workspace_with_locked_url_queries(registry: &MockRegistry) -> TempProject {
+    registry
+        .with_package("pinned", "1.0.0", &make_tarball("pinned", "1.0.0"))
+        .await;
+    let project = workspace();
+    project.write_file(
+        "packages/lib/package.json",
+        r#"{"name":"lib","version":"1.0.0","private":true,"dependencies":{"pinned":"1.0.0"}}"#,
+    );
+    lpm_with_registry(&project, &registry.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .assert()
+        .success();
+    let path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_fast(&path).unwrap();
+    for importer in ["packages/app", "packages/lib"] {
+        let mut projection = lockfile.project_importer(importer).unwrap();
+        for package in &mut projection.packages {
+            let served = package.tarball.clone().unwrap();
+            package.tarball = Some(format!("{served}?{SIGNED_QUERY}"));
+        }
+        lockfile.replace_importer(importer, projection).unwrap();
+    }
+    lockfile.write_all(&path).unwrap();
+    assert!(project.read_file("lpm.lock").contains("dummy-signature"));
+    project
+}
+
+#[tokio::test]
+async fn a_frozen_workspace_install_leaves_a_locked_url_with_a_query_as_it_is() {
+    let registry = MockRegistry::start().await;
+    let project = workspace_with_locked_url_queries(&registry).await;
+    let locked = project.read_file("lpm.lock");
+
+    for (folder, args) in [
+        (
+            project.path().to_path_buf(),
+            &["install", "--recursive", "--frozen-lockfile"][..],
+        ),
+        (
+            project.path().join("packages/app"),
+            &["install", "--frozen-lockfile"],
+        ),
+    ] {
+        lpm_with_registry(&project, &registry.url())
+            .current_dir(folder)
+            .args(args)
+            .args(["--no-skills", "--no-security-summary"])
+            .assert()
+            .success();
+
+        assert_eq!(project.read_file("lpm.lock"), locked, "{args:?}");
+    }
+}
+
 #[tokio::test]
 async fn an_install_of_one_workspace_member_removes_every_member_s_locked_url_with_a_query() {
     let registry = MockRegistry::start().await;

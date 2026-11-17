@@ -24,6 +24,9 @@ pub(super) struct WorkspaceLockfileCoordinator {
     projection_revision: AtomicU64,
     staged: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     non_persisting_importers: Mutex<BTreeSet<String>>,
+    /// An install in this transaction runs with a frozen lockfile, which no
+    /// commit may rewrite.
+    frozen: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     projection_materializations: AtomicUsize,
 }
@@ -129,6 +132,7 @@ impl WorkspaceLockfileCoordinator {
             projection_revision: AtomicU64::new(0),
             staged: Mutex::new(BTreeMap::new()),
             non_persisting_importers: Mutex::new(BTreeSet::new()),
+            frozen: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             projection_materializations: AtomicUsize::new(0),
         })
@@ -297,6 +301,11 @@ impl WorkspaceLockfileCoordinator {
             .insert(importer.to_string());
     }
 
+    fn mark_frozen(&self) {
+        self.frozen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(super) fn commit(&self, required_importers: &[String]) -> Result<bool, LpmError> {
         let staged = self
             .staged
@@ -309,7 +318,8 @@ impl WorkspaceLockfileCoordinator {
         if staged.is_empty()
             && !self.migration_pending
             && let Some(existing) = &self.existing
-            && !holds_unrecordable_tarball_hint(existing.as_lockfile())
+            && (self.frozen.load(std::sync::atomic::Ordering::Relaxed)
+                || !holds_unrecordable_tarball_hint(existing.as_lockfile()))
             && existing
                 .as_lockfile()
                 .importers
@@ -1095,6 +1105,18 @@ pub(super) fn mark_active_importer_non_persisting() {
     let _ = ACTIVE_TARGET.try_with(|target| {
         target.coordinator.mark_non_persisting(&target.importer);
     });
+}
+
+/// Keeps the workspace lockfile this install shares as it is, as a frozen
+/// install must, even where a commit would otherwise drop URLs it no longer
+/// keeps.
+pub(super) fn mark_active_install_frozen() {
+    if ACTIVE_TARGET
+        .try_with(|target| target.coordinator.mark_frozen())
+        .is_err()
+    {
+        let _ = ACTIVE_TRANSACTION.try_with(|transaction| transaction.coordinator.mark_frozen());
+    }
 }
 
 pub(crate) fn write(
