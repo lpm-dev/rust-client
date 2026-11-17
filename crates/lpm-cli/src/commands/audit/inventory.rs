@@ -775,6 +775,10 @@ mod tests {
     #[test]
     fn reads_bundled_dependencies_but_not_the_packages_nested_in_a_package_or_local_installs() {
         let root = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            root.path().join("home/.lpm").into_os_string(),
+        )]);
         let project_root = root.path().join("project");
         let source_root = root.path().join("local-source");
         let files = [
