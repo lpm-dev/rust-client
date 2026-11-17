@@ -333,6 +333,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     // not touch security approval storage.
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
+    let availability = runtime_availability_mode()?;
 
     // ── <pkg> argument: handled BEFORE the empty-effective short-circuit ──
     //
@@ -384,9 +385,49 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             }
         };
 
+        // The provenance is read before the prompt so the card can show
+        // it, and so an approval the policy refuses isn't asked for.
+        if !dry_run {
+            crate::security_approval::ensure_runtime_sigstore_posture(
+                project_dir,
+                json_output,
+                runtime_enforce,
+                runtime_sigstore_source,
+            )?;
+        }
+        let provenance_by_pkg = if dry_run {
+            HashMap::new()
+        } else {
+            ProjectProvenance::prepare(
+                registry,
+                project_dir,
+                std::slice::from_ref(target),
+                json_output,
+            )?
+            .fetch(std::iter::once(artifact_key(target)), &verify_policy)
+            .await
+        };
         let reviewed_by_prompt = !json_output && is_tty();
+        if reviewed_by_prompt {
+            print_package_card(target, card_provenance(&provenance_by_pkg, target, dry_run));
+        }
+        // write-path: carry install-time provenance + behavioral-tag captures
+        // into the binding so subsequent installs can compare against them
+        // (drift rule + version diff).
+        //
+        // SILENT-DROP fix: `snapshot_for_artifact_binding` returns
+        // `Err(LpmError::ProvenanceVerification(_))` when the
+        // verifier rejected the bundle, refusing the approval
+        // rather than blanking `provenance_at_approval`.
+        let snap = snapshot_for_artifact_binding(
+            &provenance_by_pkg,
+            &target.name,
+            &target.version,
+            target.integrity.as_deref(),
+            runtime_enforce,
+            availability,
+        )?;
         let confirmed = if reviewed_by_prompt {
-            print_package_card(target);
             // surface the version diff card
             // alongside the regular card when this is an UPDATE
             // (prior binding under same name exists). No-op for
@@ -415,41 +456,6 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         };
 
         let provenance_by_pkg = if confirmed {
-            if !dry_run {
-                crate::security_approval::ensure_runtime_sigstore_posture(
-                    project_dir,
-                    json_output,
-                    runtime_enforce,
-                    runtime_sigstore_source,
-                )?;
-            }
-            let provenance_by_pkg = if dry_run {
-                HashMap::new()
-            } else {
-                ProjectProvenance::prepare(
-                    registry,
-                    project_dir,
-                    std::slice::from_ref(target),
-                    json_output,
-                )?
-                .fetch(std::iter::once(artifact_key(target)), &verify_policy)
-                .await
-            };
-            // write-path: carry install-time provenance + behavioral-tag captures
-            // into the binding so subsequent installs can compare against them
-            // (drift rule + version diff).
-            //
-            // SILENT-DROP fix: `snapshot_for_artifact_binding` returns
-            // `Err(LpmError::ProvenanceVerification(_))` when the
-            // verifier rejected the bundle, refusing the approval
-            // rather than blanking `provenance_at_approval`.
-            let snap = snapshot_for_artifact_binding(
-                &provenance_by_pkg,
-                &target.name,
-                &target.version,
-                target.integrity.as_deref(),
-                runtime_enforce,
-            )?;
             let meta = approval_metadata_preserving_existing_provenance(
                 &trusted,
                 target,
@@ -603,6 +609,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 &blocked.version,
                 blocked.integrity.as_deref(),
                 runtime_enforce,
+                availability,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
                 &trusted,
@@ -667,15 +674,30 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         ));
     }
 
-    let provenance = if dry_run {
-        None
+    // The provenance is read before the walk so each card can show it,
+    // and so an approval the policy refuses isn't asked for.
+    if !dry_run {
+        crate::security_approval::ensure_runtime_sigstore_posture(
+            project_dir,
+            json_output,
+            runtime_enforce,
+            runtime_sigstore_source,
+        )?;
+    }
+    let provenance_by_pkg = if dry_run {
+        HashMap::new()
     } else {
-        Some(ProjectProvenance::prepare(
+        ProjectProvenance::prepare(
             registry,
             project_dir,
             &effective_state.blocked_packages,
             json_output,
-        )?)
+        )?
+        .fetch(
+            effective_state.blocked_packages.iter().map(artifact_key),
+            &verify_policy,
+        )
+        .await
     };
 
     // Walk one at a time. Quit aborts WITHOUT writing in-progress entries
@@ -690,7 +712,18 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
 
     let mut quit_early = false;
     for blocked in &effective_state.blocked_packages {
-        print_package_card(blocked);
+        print_package_card(
+            blocked,
+            card_provenance(&provenance_by_pkg, blocked, dry_run),
+        );
+        if let Some(status) = provenance_by_pkg.get(&artifact_key(blocked))
+            && let Err(refusal) = availability.require(status, &blocked.name, &blocked.version)
+        {
+            output::warn(&format!("Skipped: {refusal}"));
+            skipped.push(blocked);
+            println!();
+            continue;
+        }
         // render the version-diff card for
         // updates (no-op when no prior binding exists for the same
         // package name).
@@ -802,33 +835,6 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    if !dry_run && !approved.is_empty() {
-        crate::security_approval::ensure_runtime_sigstore_posture(
-            project_dir,
-            json_output,
-            runtime_enforce,
-            runtime_sigstore_source,
-        )?;
-    }
-    let approved_pairs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = approved
-        .iter()
-        .map(|blocked| {
-            (
-                blocked.name.clone(),
-                blocked.version.clone(),
-                blocked.integrity.clone(),
-            )
-        })
-        .collect();
-    let provenance_by_pkg = match &provenance {
-        Some(provenance) if !approved_pairs.is_empty() => {
-            provenance
-                .fetch(approved_pairs.iter().cloned(), &verify_policy)
-                .await
-        }
-        _ => HashMap::new(),
-    };
-
     // Apply approvals (atomic single write)
     for blocked in &approved {
         // write-path — see the direct-approve branch earlier for the rationale.
@@ -846,6 +852,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             &blocked.version,
             blocked.integrity.as_deref(),
             runtime_enforce,
+            availability,
         )?;
         let meta = approval_metadata_preserving_existing_provenance(
             &trusted,
@@ -883,6 +890,21 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         Some(&provenance_by_pkg),
     );
     Ok(())
+}
+
+fn card_provenance<'a>(
+    provenance_by_pkg: &'a HashMap<
+        crate::provenance_fetch::ProvenanceArtifactKey,
+        ProvenanceStatus,
+    >,
+    blocked: &BlockedPackage,
+    dry_run: bool,
+) -> CardProvenance<'a> {
+    if dry_run {
+        CardProvenance::NotRead
+    } else {
+        CardProvenance::Read(provenance_by_pkg.get(&artifact_key(blocked)))
+    }
 }
 
 /// The interactive walk's per-package

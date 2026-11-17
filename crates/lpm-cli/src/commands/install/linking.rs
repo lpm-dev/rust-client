@@ -816,6 +816,7 @@ pub(super) async fn run_link_and_finish(
             None,
             false,
             None,
+            crate::commands::rebuild::ProvenanceCheck::CheckedByInstall,
         )
         .await
         {

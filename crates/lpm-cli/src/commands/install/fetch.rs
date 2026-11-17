@@ -1791,10 +1791,11 @@ pub(super) async fn run_online_fetch_phase(
                         // versions and sources that already coexisted in this lockfile. Only a
                         // fresh resolution may classify missing evidence as a downgrade.
                         if availability_mode.is_strict() {
-                            return Err(LpmError::ProvenanceVerification(format!(
-                                "strict provenance availability requires lockfile evidence for {}@{}",
-                                p.name, p.version
-                            )));
+                            return Err(
+                                crate::provenance_fetch::AvailabilityMode::missing_lockfile_evidence(
+                                    &p.name, &p.version,
+                                ),
+                            );
                         }
                         continue;
                     };
@@ -1937,12 +1938,11 @@ pub(super) async fn run_online_fetch_phase(
                                         "this version has no attestation",
                                     ));
                                 }
-                                if availability_mode.is_strict() {
-                                    return Err(LpmError::ProvenanceVerification(format!(
-                                        "strict provenance availability requires an attestation for {}@{}",
-                                        p.name, p.version
-                                    )));
-                                }
+                                availability_mode.require(
+                                    &lpm_common::ProvenanceStatus::Absent,
+                                    &p.name,
+                                    &p.version,
+                                )?;
                                 (
                                     Some(lpm_workspace::ProvenanceSnapshot {
                                         present: false,
@@ -1959,12 +1959,11 @@ pub(super) async fn run_online_fetch_phase(
                                         "this version's attestation could not be retrieved",
                                     ));
                                 }
-                                if availability_mode.is_strict() {
-                                    return Err(LpmError::ProvenanceVerification(format!(
-                                        "strict provenance availability could not verify {}@{} because the attestation was unavailable",
-                                        p.name, p.version
-                                    )));
-                                }
+                                availability_mode.require(
+                                    &lpm_common::ProvenanceStatus::TransportDegraded,
+                                    &p.name,
+                                    &p.version,
+                                )?;
                                 (None, lpm_common::ProvenanceStatus::TransportDegraded)
                             }
                             Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {

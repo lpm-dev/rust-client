@@ -248,6 +248,40 @@ impl AvailabilityMode {
     pub(crate) fn is_strict(self) -> bool {
         matches!(self, Self::Strict)
     }
+
+    /// Refuses, under strict availability, a fetch that established no
+    /// provenance for `name@version`: the registry served no attestation,
+    /// or the attestation couldn't be fetched. Install, approval and
+    /// rebuild share this so their refusals agree.
+    pub(crate) fn require(
+        self,
+        status: &lpm_common::ProvenanceStatus,
+        name: &str,
+        version: &str,
+    ) -> Result<(), LpmError> {
+        if !self.is_strict() {
+            return Ok(());
+        }
+        match status {
+            lpm_common::ProvenanceStatus::Absent => Err(LpmError::ProvenanceUnavailable(format!(
+                "strict provenance availability requires an attestation for {name}@{version}"
+            ))),
+            lpm_common::ProvenanceStatus::TransportDegraded => {
+                Err(LpmError::ProvenanceUnavailable(format!(
+                    "strict provenance availability could not verify {name}@{version} because the attestation was unavailable"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The refusal for a package whose lockfile records no provenance
+    /// evidence under strict availability.
+    pub(crate) fn missing_lockfile_evidence(name: &str, version: &str) -> LpmError {
+        LpmError::ProvenanceUnavailable(format!(
+            "strict provenance availability requires lockfile evidence for {name}@{version}"
+        ))
+    }
 }
 
 impl EnforceMode {

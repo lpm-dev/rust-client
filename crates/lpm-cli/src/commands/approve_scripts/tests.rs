@@ -2591,6 +2591,7 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -2668,6 +2669,7 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -2703,6 +2705,7 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -2710,6 +2713,21 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
     .expect_err("amber bulk approval must be refused");
 
     assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+}
+
+/// Reads the rows' provenance as the interactive walk does before its
+/// first prompt, then commits them.
+async fn fetch_and_commit_global_approvals(
+    root: &lpm_common::LpmRoot,
+    rows: &[&crate::global_blocked_set::AggregateBlockedRow],
+    provenance_context: ApprovalProvenanceContext<'_>,
+) -> Result<(), LpmError> {
+    let artifacts: Vec<_> = rows
+        .iter()
+        .map(|row| (row.name.clone(), row.version.clone(), row.integrity.clone()))
+        .collect();
+    let provenance = provenance_context.fetch(&artifacts).await?;
+    global::commit_global_approval_batch(root, rows, false, provenance_context, &provenance).await
 }
 
 #[tokio::test]
@@ -2729,8 +2747,10 @@ async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
+        &HashMap::new(),
     )
     .await
     .unwrap();
@@ -2754,11 +2774,17 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
     crate::provenance_fetch::reset_provenance_batch_call_count();
     global::reset_global_trust_write_count();
 
-    global::commit_global_approval_batch(
+    fetch_and_commit_global_approvals(
         &root,
         &row_refs,
-        false,
-        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
+            true,
+        ),
     )
     .await
     .unwrap();
@@ -3152,11 +3178,17 @@ async fn a_global_approval_asks_the_registry_its_install_got_the_package_from() 
 
     // The registry in this test publishes other bytes under the name, so
     // what the approval then decides is not what is being tested.
-    let _ = global::commit_global_approval_batch(
+    let _ = fetch_and_commit_global_approvals(
         &root,
         &[&blocked],
-        false,
-        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
+            true,
+        ),
     )
     .await;
 
@@ -3174,11 +3206,17 @@ async fn a_global_approval_asks_no_registry_about_a_package_installed_from_elsew
         seed_global_install_locking(&root, "tarball+https://example.test/esbuild-0.25.1.tgz");
     let policy = deny_verify_policy();
 
-    global::commit_global_approval_batch(
+    fetch_and_commit_global_approvals(
         &root,
         &[&blocked],
-        false,
-        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
+            true,
+        ),
     )
     .await
     .unwrap();
@@ -3214,6 +3252,7 @@ async fn run_global_named_approves_only_the_matched_row() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -3246,6 +3285,7 @@ async fn run_global_named_errors_for_unknown_package() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -3514,6 +3554,7 @@ async fn global_named_approvals_do_not_clobber_each_other() {
                 &root,
                 &policy,
                 EnforceMode::Deny,
+                crate::provenance_fetch::AvailabilityMode::BestEffort,
                 true,
             ),
         )
@@ -3533,6 +3574,7 @@ async fn global_named_approvals_do_not_clobber_each_other() {
                 &root,
                 &policy,
                 EnforceMode::Deny,
+                crate::provenance_fetch::AvailabilityMode::BestEffort,
                 true,
             ),
         )

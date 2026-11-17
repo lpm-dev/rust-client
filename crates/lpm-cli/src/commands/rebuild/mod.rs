@@ -200,6 +200,7 @@ pub async fn run(
             advisor_approvals,
             true,
             None,
+            ProvenanceCheck::Lockfile,
         ),
     )
     .await
@@ -225,6 +226,7 @@ pub(crate) async fn run_with_report(
     >,
     emit_summary: bool,
     policy_project_dir: Option<&Path>,
+    provenance_check: ProvenanceCheck,
 ) -> Result<RebuildRunReport, LpmError> {
     // hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
@@ -250,9 +252,22 @@ pub(crate) async fn run_with_report(
             advisor_approvals,
             emit_summary,
             policy_project_dir.unwrap_or(project_dir),
+            provenance_check,
         ),
     )
     .await
+}
+
+/// Where a rebuild's provenance requirement was already met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProvenanceCheck {
+    /// A standalone rebuild meets strict provenance availability the way
+    /// an install replaying its lockfile does: from the lockfile's
+    /// evidence.
+    Lockfile,
+    /// An install's own build: the install checked each package's
+    /// provenance while fetching it, honouring its own flags.
+    CheckedByInstall,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,6 +290,7 @@ async fn run_under_store_lock(
     >,
     emit_summary: bool,
     policy_project_dir: &Path,
+    provenance_check: ProvenanceCheck,
 ) -> Result<RebuildRunReport, LpmError> {
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     let cancelled = crate::install_recovery::cancellation_flag();
@@ -622,6 +638,22 @@ async fn run_under_store_lock(
             .filter(|p| !p.is_built || (!dry_run && marker_requires_key_validation(p)))
             .collect()
     };
+
+    if provenance_check == ProvenanceCheck::Lockfile
+        && crate::provenance_fetch::AvailabilityMode::from_config(
+            global_config.get_sigstore_availability().as_deref(),
+        )?
+        .is_strict()
+    {
+        trust::require_lockfile_provenance(
+            &to_build,
+            &lockfile,
+            &policy.trusted_dependencies,
+            crate::provenance_fetch::VerificationScope::from_config(
+                global_config.get_sigstore_scope().as_deref(),
+            )?,
+        )?;
+    }
 
     let to_build_layers = package_build_layers(to_build, &lockfile);
     let to_build = to_build_layers

@@ -38,6 +38,7 @@ pub(super) struct ApprovalProvenanceContext<'a> {
     root: &'a lpm_common::LpmRoot,
     verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
     runtime_enforce: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
     json_output: bool,
 }
 
@@ -47,6 +48,7 @@ impl<'a> ApprovalProvenanceContext<'a> {
         root: &'a lpm_common::LpmRoot,
         verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
         runtime_enforce: crate::provenance_fetch::EnforceMode,
+        availability: crate::provenance_fetch::AvailabilityMode,
         json_output: bool,
     ) -> Self {
         Self {
@@ -54,6 +56,7 @@ impl<'a> ApprovalProvenanceContext<'a> {
             root,
             verify_policy,
             runtime_enforce,
+            availability,
             json_output,
         }
     }
@@ -64,7 +67,7 @@ impl<'a> ApprovalProvenanceContext<'a> {
     /// root's `.npmrc` and the lockfiles are read here and not before, so
     /// a run that fetches nothing, such as a dry run, doesn't depend on
     /// them.
-    async fn fetch(
+    pub(super) async fn fetch(
         &self,
         artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
     ) -> Result<HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>, LpmError>
@@ -245,6 +248,7 @@ async fn run_global_under_store_lock(
         &root,
         &verify_policy,
         runtime_enforce,
+        runtime_availability_mode()?,
         json_output,
     );
     if !dry_run {
@@ -577,6 +581,7 @@ pub(super) async fn run_global_bulk_yes(
             &row.version,
             row.integrity.as_deref(),
             provenance_context.runtime_enforce,
+            provenance_context.availability,
         )?;
         row_snapshots.push((idx, snap));
     }
@@ -776,6 +781,7 @@ pub(super) async fn run_global_named(
         &row.version,
         row.integrity.as_deref(),
         provenance_context.runtime_enforce,
+        provenance_context.availability,
     )?;
 
     let lock_path = root.global_tx_lock();
@@ -1059,11 +1065,12 @@ pub(super) async fn commit_global_approval_batch(
     rows: &[&crate::global_blocked_set::AggregateBlockedRow],
     dry_run: bool,
     provenance_context: ApprovalProvenanceContext<'_>,
+    provenance: &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>,
 ) -> Result<(), LpmError> {
     if dry_run || rows.is_empty() {
         return Ok(());
     }
-    let snapshots = fetch_global_approval_snapshots(rows, provenance_context).await?;
+    let snapshots = global_approval_snapshots(rows, provenance_context, provenance)?;
     let lock_path = root.global_tx_lock();
     lpm_common::with_exclusive_lock_async(lock_path, async move {
         let mut trust = lpm_global::trusted_deps::read_for(root)?;
@@ -1089,23 +1096,20 @@ pub(super) async fn commit_global_approval_batch(
     .await
 }
 
-async fn fetch_global_approval_snapshots(
+fn global_approval_snapshots(
     rows: &[&crate::global_blocked_set::AggregateBlockedRow],
     provenance_context: ApprovalProvenanceContext<'_>,
+    provenance: &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>,
 ) -> Result<Vec<Option<lpm_common::ProvenanceSnapshot>>, LpmError> {
-    let pairs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = rows
-        .iter()
-        .map(|row| (row.name.clone(), row.version.clone(), row.integrity.clone()))
-        .collect();
-    let provenance = provenance_context.fetch(&pairs).await?;
     rows.iter()
         .map(|row| {
             snapshot_for_artifact_binding(
-                &provenance,
+                provenance,
                 &row.name,
                 &row.version,
                 row.integrity.as_deref(),
                 provenance_context.runtime_enforce,
+                provenance_context.availability,
             )
         })
         .collect()
@@ -1124,6 +1128,31 @@ pub(super) async fn run_global_interactive(
     provenance_context: ApprovalProvenanceContext<'_>,
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
+
+    // The provenance is read before the walk so each card can show it,
+    // and so an approval the policy refuses isn't asked for.
+    let provenance = if dry_run {
+        HashMap::new()
+    } else {
+        let artifacts: Vec<crate::provenance_fetch::ProvenanceArtifactKey> =
+            aggregate.rows.iter().map(row_artifact).collect();
+        provenance_context.fetch(&artifacts).await?
+    };
+    let card_provenance = |row: &crate::global_blocked_set::AggregateBlockedRow| {
+        if dry_run {
+            CardProvenance::NotRead
+        } else {
+            CardProvenance::Read(provenance.get(&row_artifact(row)))
+        }
+    };
+    let refusal = |row: &crate::global_blocked_set::AggregateBlockedRow| {
+        provenance.get(&row_artifact(row)).and_then(|status| {
+            provenance_context
+                .availability
+                .require(status, &row.name, &row.version)
+                .err()
+        })
+    };
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
@@ -1173,6 +1202,7 @@ pub(super) async fn run_global_interactive(
                             &pending_approvals,
                             dry_run,
                             provenance_context,
+                            &provenance,
                         )
                         .await?;
                         return Err(prompt_err(error));
@@ -1201,6 +1231,10 @@ pub(super) async fn run_global_interactive(
                             // pick Review individually instead.
                             continue;
                         }
+                        if let Some(refused) = rows.iter().find_map(|row| refusal(row)) {
+                            output::warn(&refused.to_string());
+                            continue;
+                        }
                         for row in &rows {
                             pending_approvals.push(*row);
                             approved.push(*row);
@@ -1222,7 +1256,13 @@ pub(super) async fn run_global_interactive(
                                 continue;
                             }
 
-                            print_aggregate_card(row);
+                            print_aggregate_card(row, card_provenance(row));
+                            if let Some(refused) = refusal(row) {
+                                output::warn(&format!("Skipped: {refused}"));
+                                skipped.push(row);
+                                decided.insert(key);
+                                continue;
+                            }
                             let prompt = install_ui::terminal_line!(
                                 "{} @ {} — approve?",
                                 &row.name,
@@ -1243,6 +1283,7 @@ pub(super) async fn run_global_interactive(
                                         &pending_approvals,
                                         dry_run,
                                         provenance_context,
+                                        &provenance,
                                     )
                                     .await?;
                                     return Err(prompt_err(error));
@@ -1280,7 +1321,14 @@ pub(super) async fn run_global_interactive(
             }
         }
 
-        commit_global_approval_batch(root, &pending_approvals, dry_run, provenance_context).await?;
+        commit_global_approval_batch(
+            root,
+            &pending_approvals,
+            dry_run,
+            provenance_context,
+            &provenance,
+        )
+        .await?;
         println!();
         if dry_run {
             output::info(&format!(
@@ -1322,7 +1370,12 @@ pub(super) async fn run_global_interactive(
     // `approve_all` shortcut which IS gated, and the project-level
     // interactive walk which is also per-row).
     for row in &aggregate.rows {
-        print_aggregate_card(row);
+        print_aggregate_card(row, card_provenance(row));
+        if let Some(refused) = refusal(row) {
+            output::warn(&format!("Skipped: {refused}"));
+            skipped.push(row);
+            continue;
+        }
         let prompt =
             install_ui::terminal_line!("{} @ {} — approve?", &row.name, &row.version).to_string();
         let choice = match cliclack::select(prompt)
@@ -1334,8 +1387,14 @@ pub(super) async fn run_global_interactive(
         {
             Ok(choice) => choice,
             Err(error) => {
-                commit_global_approval_batch(root, &pending_approvals, dry_run, provenance_context)
-                    .await?;
+                commit_global_approval_batch(
+                    root,
+                    &pending_approvals,
+                    dry_run,
+                    provenance_context,
+                    &provenance,
+                )
+                .await?;
                 return Err(prompt_err(error));
             }
         };
@@ -1350,7 +1409,14 @@ pub(super) async fn run_global_interactive(
             _ => unreachable!(),
         }
     }
-    commit_global_approval_batch(root, &pending_approvals, dry_run, provenance_context).await?;
+    commit_global_approval_batch(
+        root,
+        &pending_approvals,
+        dry_run,
+        provenance_context,
+        &provenance,
+    )
+    .await?;
     println!();
     if dry_run {
         output::info(&format!(
@@ -1379,7 +1445,16 @@ pub(super) async fn run_global_interactive(
     Ok(())
 }
 
-pub(super) fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
+fn row_artifact(
+    row: &crate::global_blocked_set::AggregateBlockedRow,
+) -> crate::provenance_fetch::ProvenanceArtifactKey {
+    (row.name.clone(), row.version.clone(), row.integrity.clone())
+}
+
+pub(super) fn print_aggregate_card(
+    row: &crate::global_blocked_set::AggregateBlockedRow,
+    provenance: CardProvenance<'_>,
+) {
     let drift = if row.binding_drift {
         install_ui::terminal_line!("  {}", install_ui::yellow("[binding drift]"))
     } else {
@@ -1418,5 +1493,6 @@ pub(super) fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlo
         );
     }
     super::display::print_reach_lines(row.reach.as_ref());
+    super::display::print_provenance_line(provenance);
     println!();
 }

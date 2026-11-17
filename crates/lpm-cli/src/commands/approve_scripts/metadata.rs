@@ -349,6 +349,17 @@ fn same_registry(recorded: &str, routed: &str) -> bool {
     recorded.trim_end_matches('/') == routed.trim_end_matches('/')
 }
 
+/// The operator's `[sigstore] availability`, which an approval meets as an
+/// install does.
+pub(super) fn runtime_availability_mode()
+-> Result<crate::provenance_fetch::AvailabilityMode, LpmError> {
+    crate::provenance_fetch::AvailabilityMode::from_config(
+        crate::commands::config::GlobalConfig::load()
+            .get_sigstore_availability()
+            .as_deref(),
+    )
+}
+
 pub(super) fn runtime_verify_policy_with_source() -> (
     crate::provenance_fetch::VerifyPolicy,
     crate::provenance_fetch::EnforceModeSource,
@@ -388,7 +399,8 @@ pub(super) fn runtime_verify_policy_with_source() -> (
 ///
 /// Non-rejection statuses (`Verified`, `Absent`, `TransportDegraded`)
 /// project identically under both modes — the mode only affects the
-/// rejection arm.
+/// rejection arm. Under strict `availability`, `Absent` and
+/// `TransportDegraded` refuse the approval as they refuse an install.
 /// Pure coordinate-keyed variant for unit tests of enforcement-mode behavior.
 #[cfg(test)]
 pub(super) fn snapshot_for_binding_with_mode(
@@ -402,6 +414,7 @@ pub(super) fn snapshot_for_binding_with_mode(
         name,
         version,
         mode,
+        crate::provenance_fetch::AvailabilityMode::BestEffort,
     )
 }
 
@@ -414,13 +427,20 @@ pub(super) fn snapshot_for_artifact_binding(
     version: &str,
     integrity: Option<&str>,
     mode: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
     let key = (
         name.to_string(),
         version.to_string(),
         integrity.map(ToOwned::to_owned),
     );
-    snapshot_status_for_binding(provenance_by_artifact.get(&key), name, version, mode)
+    snapshot_status_for_binding(
+        provenance_by_artifact.get(&key),
+        name,
+        version,
+        mode,
+        availability,
+    )
 }
 
 fn snapshot_status_for_binding(
@@ -428,10 +448,12 @@ fn snapshot_status_for_binding(
     name: &str,
     version: &str,
     mode: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
     let Some(status) = status.cloned() else {
         return Ok(None);
     };
+    availability.require(&status, name, version)?;
 
     // Warn / Off short-circuit on VerificationRejected: log loudly but
     // do NOT propagate as Err, so the approval proceeds and the

@@ -122,7 +122,19 @@ pub(super) fn emit_yes_warning_banner(count: usize, json_output: bool) {
     }
 }
 
-pub(super) fn print_package_card(blocked: &BlockedPackage) {
+/// What an approval card says about a package's provenance.
+#[derive(Clone, Copy)]
+pub(super) enum CardProvenance<'a> {
+    /// The card has no provenance line: a listing reads none.
+    Omitted,
+    /// A dry run reads no provenance.
+    NotRead,
+    /// What the registry the package came from says, or `None` when no
+    /// registry speaks for it.
+    Read(Option<&'a ProvenanceStatus>),
+}
+
+pub(super) fn print_package_card(blocked: &BlockedPackage, provenance: CardProvenance<'_>) {
     println!();
     println!(
         "{}",
@@ -177,6 +189,7 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     print_reach_lines(blocked.reach.as_ref());
+    print_provenance_line(provenance);
     if blocked.binding_drift {
         println!(
             "    {} {}",
@@ -185,6 +198,37 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     println!();
+}
+
+pub(super) fn print_provenance_line(provenance: CardProvenance<'_>) {
+    let status = match provenance {
+        CardProvenance::Omitted => return,
+        CardProvenance::NotRead => install_ui::dim("not read in a dry run").to_string(),
+        CardProvenance::Read(None) => {
+            install_ui::dim("not checked: no registry the project uses vouches for it").to_string()
+        }
+        CardProvenance::Read(Some(status)) => match status {
+            ProvenanceStatus::Verified(snapshot) => match &snapshot.publisher {
+                Some(publisher) => format!("{} · {publisher}", "verified".green()),
+                None => "verified".green(),
+            },
+            ProvenanceStatus::Unverified(_) => {
+                "not verified: verification is skipped for this package".yellow()
+            }
+            ProvenanceStatus::Disabled(_) => "not verified: verification is off".yellow(),
+            ProvenanceStatus::Absent => "none: the registry serves no attestation".yellow(),
+            ProvenanceStatus::TransportDegraded => {
+                "unavailable: the attestation couldn't be fetched".yellow()
+            }
+            ProvenanceStatus::VerificationRejected { reason } => {
+                format!("{} {reason}", "failed verification:".red())
+            }
+        },
+    };
+    println!(
+        "{}",
+        install_ui::terminal_line!("    {:<14}{}", install_ui::dim("Provenance:"), status)
+    );
 }
 
 /// `Reaches:` lines for an approval card. Nothing for a scan that found
@@ -341,7 +385,7 @@ pub(super) fn print_listing(
         state.blocked_packages.len()
     ));
     for blocked in &state.blocked_packages {
-        print_package_card(blocked);
+        print_package_card(blocked, CardProvenance::Omitted);
         // surface the version diff card
         // alongside each entry's regular card. No-op for entries
         // without a prior binding under the same name (first-time
