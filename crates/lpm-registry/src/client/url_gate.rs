@@ -196,12 +196,12 @@ pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return GateDecision::RejectedShape;
     };
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return GateDecision::RejectedQuery;
+    }
     let path = parsed.path();
     if !path.ends_with(".tgz") || !path.contains("/-/") {
         return GateDecision::RejectedShape;
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return GateDecision::RejectedQuery;
     }
 
     // Origin — must match one of the origins this client talks to.

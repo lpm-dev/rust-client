@@ -309,7 +309,15 @@ pub(super) async fn run_install_freshness_phase(
                             });
                             let expected = crate::workspace_discovery_cache::
                         root_provider_fingerprint_for_locked_member(input.project_dir, locked);
-                            if expected.as_deref().map(AsRef::as_ref) == locked {
+                            // A lockfile holding a URL it no longer keeps
+                            // needs an install to remove it.
+                            let keeps_only_recordable_urls = gate_stats
+                                .query_string
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                == 0;
+                            if expected.as_deref().map(AsRef::as_ref) == locked
+                                && keeps_only_recordable_urls
+                            {
                                 Some(fast.packages)
                             } else {
                                 None

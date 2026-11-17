@@ -499,8 +499,12 @@ async fn a_locked_tarball_url_with_a_query_is_not_downloaded_from() {
 }
 
 /// Installs `project` and leaves its package in the store with a lockfile
-/// that names its tarball by a URL with a query.
-async fn stored_with_a_locked_url_query(project: &TempProject, registry: &MockRegistry) {
+/// that names its tarball by the URL `locked_url` makes of the served one.
+async fn stored_with_a_locked_url_query(
+    project: &TempProject,
+    registry: &MockRegistry,
+    locked_url: impl Fn(&str) -> String,
+) {
     registry
         .with_package("pinned", "1.0.0", &make_tarball("pinned", "1.0.0"))
         .await;
@@ -511,7 +515,7 @@ async fn stored_with_a_locked_url_query(project: &TempProject, registry: &MockRe
     forget_install(project);
     let path = project.path().join("lpm.lock");
     let served = registry.tarball_url("pinned", "1.0.0");
-    let with_query = format!("{served}?{SIGNED_QUERY}");
+    let with_query = locked_url(&served);
     if project.file_exists("packages/app/package.json") {
         let mut lockfile = lpm_lockfile::Lockfile::read_fast(&path).unwrap();
         let mut app = lockfile.project_importer("packages/app").unwrap();
@@ -529,9 +533,13 @@ async fn stored_with_a_locked_url_query(project: &TempProject, registry: &MockRe
     assert!(project.read_file("lpm.lock").contains("dummy-signature"));
 }
 
+fn with_signed_query(served: &str) -> String {
+    format!("{served}?{SIGNED_QUERY}")
+}
+
 async fn a_locked_url_query_is_removed(project: TempProject, installed: &str) {
     let registry = MockRegistry::start().await;
-    stored_with_a_locked_url_query(&project, &registry).await;
+    stored_with_a_locked_url_query(&project, &registry, with_signed_query).await;
     let fetched = registry.tarball_request_count("pinned", "1.0.0").await;
 
     lpm_with_registry(&project, &registry.url())
@@ -557,4 +565,63 @@ async fn a_locked_tarball_url_with_a_query_is_removed_when_its_package_is_stored
 async fn a_locked_workspace_tarball_url_with_a_query_is_removed_when_its_package_is_stored() {
     a_locked_url_query_is_removed(workspace(), "packages/app/node_modules/pinned/package.json")
         .await;
+}
+
+#[tokio::test]
+async fn a_locked_tarball_url_with_a_query_but_no_registry_shape_is_removed() {
+    let registry = MockRegistry::start().await;
+    let project = single_project();
+    let blob = format!("{}/blobs/pinned-1.0.0?{SIGNED_QUERY}", registry.url());
+    stored_with_a_locked_url_query(&project, &registry, |_| blob.clone()).await;
+
+    lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    let locked = project.read_file("lpm.lock");
+    assert!(!locked.contains("dummy-signature"), "{locked}");
+}
+
+#[tokio::test]
+async fn an_install_of_one_workspace_member_removes_every_member_s_locked_url_with_a_query() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package("pinned", "1.0.0", &make_tarball("pinned", "1.0.0"))
+        .await;
+    let project = workspace();
+    project.write_file(
+        "packages/lib/package.json",
+        r#"{"name":"lib","version":"1.0.0","private":true,"dependencies":{"pinned":"1.0.0"}}"#,
+    );
+    lpm_with_registry(&project, &registry.url())
+        .args([
+            "install",
+            "--recursive",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .assert()
+        .success();
+    let path = project.path().join("lpm.lock");
+    let mut lockfile = lpm_lockfile::Lockfile::read_fast(&path).unwrap();
+    for importer in ["packages/app", "packages/lib"] {
+        let mut projection = lockfile.project_importer(importer).unwrap();
+        for package in &mut projection.packages {
+            let served = package.tarball.clone().unwrap();
+            package.tarball = Some(format!("{served}?{SIGNED_QUERY}"));
+        }
+        lockfile.replace_importer(importer, projection).unwrap();
+    }
+    lockfile.write_all(&path).unwrap();
+    assert!(project.read_file("lpm.lock").contains("dummy-signature"));
+
+    lpm_with_registry(&project, &registry.url())
+        .current_dir(project.path().join("packages/app"))
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    let locked = project.read_file("lpm.lock");
+    assert!(!locked.contains("dummy-signature"), "{locked}");
 }

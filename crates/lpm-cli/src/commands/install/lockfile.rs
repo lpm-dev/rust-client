@@ -522,10 +522,12 @@ mod unpacked_size_preservation_tests {
 /// already holds, by package key.
 #[derive(Clone, Copy)]
 struct FetchWritebacks<'a> {
-    /// The URL that served a package whose locked one no longer does.
-    tarball_urls: &'a HashMap<String, String>,
+    /// The URL to lock for a package whose locked one no longer serves it,
+    /// or `None` to lock none: the URL that served it has a query.
+    tarball_urls: &'a HashMap<String, Option<String>>,
     proven_pins: &'a HashMap<String, ProvenPin>,
-    /// Locked URLs the lockfile no longer keeps, which the rewrite drops.
+    /// How many locked URLs have a query or a fragment, which the lockfile
+    /// no longer keeps.
     unrecordable_tarball_hints: u64,
 }
 
@@ -539,7 +541,7 @@ fn rewrite_fast_path_lockfile_if_needed(
     json_output: bool,
 ) -> Result<Option<u128>, LpmError> {
     let reasons = FastPathLockfileRewriteReasons {
-        fresh_url_count: fetched.tarball_urls.len(),
+        tarball_url_change_count: fetched.tarball_urls.len(),
         unrecordable_hint_count: fetched.unrecordable_tarball_hints,
         proven_pin_count: fetched.proven_pins.len(),
         importer_snapshot_changed: lockfile.importers.get(".") != Some(current_importer_snapshot),
@@ -567,6 +569,7 @@ fn rewrite_fast_path_lockfile_if_needed(
     }
 
     let mut recorded_sha512_count = 0;
+    let mut url_changes = TarballUrlChanges::default();
     if reasons.importer_snapshot_changed
         || reasons.patch_records_changed
         || reasons.schema_version_changed
@@ -585,12 +588,12 @@ fn rewrite_fast_path_lockfile_if_needed(
                 .importers
                 .insert(".".to_string(), current_importer_snapshot.clone());
         }
-        patch_fresh_tarball_urls(lockfile, fetched.tarball_urls);
+        url_changes = patch_fresh_tarball_urls(lockfile, fetched.tarball_urls);
         recorded_sha512_count = record_proven_pins(lockfile, fetched.proven_pins);
     }
     let write_ms = write_lockfile_and_measure(&lockfile, lockfile_path, "rewrite")?;
     if !json_output {
-        for notice in fast_path_lockfile_rewrite_notices(reasons, recorded_sha512_count) {
+        for notice in fast_path_lockfile_rewrite_notices(url_changes, recorded_sha512_count) {
             output::info(&notice);
         }
     }
@@ -602,7 +605,7 @@ fn rewrite_fast_path_lockfile_if_needed(
 
 #[derive(Clone, Copy)]
 struct FastPathLockfileRewriteReasons {
-    fresh_url_count: usize,
+    tarball_url_change_count: usize,
     unrecordable_hint_count: u64,
     proven_pin_count: usize,
     importer_snapshot_changed: bool,
@@ -612,7 +615,7 @@ struct FastPathLockfileRewriteReasons {
 
 impl FastPathLockfileRewriteReasons {
     fn requires_write(self) -> bool {
-        self.fresh_url_count > 0
+        self.tarball_url_change_count > 0
             || self.unrecordable_hint_count > 0
             || self.proven_pin_count > 0
             || self.importer_snapshot_changed
@@ -633,7 +636,7 @@ fn refreshed_tarball_urls(
     lockfile: &lpm_lockfile::Lockfile,
     lockfile_path: &Path,
     served: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, LpmError> {
+) -> Result<HashMap<String, Option<String>>, LpmError> {
     if served.is_empty() {
         return Ok(HashMap::new());
     }
@@ -653,13 +656,12 @@ fn refreshed_tarball_urls(
 pub(super) fn urls_other_than_locked<'a>(
     rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
     served: &HashMap<String, String>,
-) -> HashMap<String, String> {
+) -> HashMap<String, Option<String>> {
     rows.filter(|package| records_tarball_url(package))
         .filter_map(|package| {
             let (key, url) = served.get_key_value(&locked_package_key(package))?;
-            (lpm_lockfile::is_recordable_tarball_hint(url)
-                && package.tarball.as_deref() != Some(url.as_str()))
-            .then(|| (key.clone(), url.clone()))
+            let kept = lpm_lockfile::is_recordable_tarball_hint(url).then_some(url.as_str());
+            (package.tarball.as_deref() != kept).then(|| (key.clone(), kept.map(str::to_owned)))
         })
         .collect()
 }
@@ -673,26 +675,49 @@ fn records_tarball_url(package: &lpm_lockfile::LockedPackage) -> bool {
     )
 }
 
-/// Records the URLs `fresh_urls` names, and drops every locked URL a
-/// lockfile no longer keeps.
+/// How a rewrite changed the lockfile's tarball URLs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TarballUrlChanges {
+    refreshed: usize,
+    removed: usize,
+}
+
+/// Locks the URLs `fresh_urls` names, drops those it maps to `None`, and
+/// drops every other locked URL a lockfile no longer keeps.
 fn patch_fresh_tarball_urls(
     lockfile: &mut lpm_lockfile::Lockfile,
-    fresh_urls: &HashMap<String, String>,
-) {
+    fresh_urls: &HashMap<String, Option<String>>,
+) -> TarballUrlChanges {
+    let mut changes = TarballUrlChanges::default();
     for package in &mut lockfile.packages {
-        if package
-            .tarball
-            .as_deref()
-            .is_some_and(|url| !lpm_lockfile::is_recordable_tarball_hint(url))
-        {
-            package.tarball = None;
-        }
-        if records_tarball_url(package)
-            && let Some(url) = fresh_urls.get(&locked_package_key(package))
-        {
-            package.tarball = Some(url.clone());
+        let fresh = records_tarball_url(package)
+            .then(|| fresh_urls.get(&locked_package_key(package)))
+            .flatten();
+        match fresh {
+            Some(Some(url)) => {
+                if package.tarball.as_ref() != Some(url) {
+                    package.tarball = Some(url.clone());
+                    changes.refreshed += 1;
+                }
+            }
+            Some(None) => {
+                if package.tarball.take().is_some() {
+                    changes.removed += 1;
+                }
+            }
+            None => {
+                if package
+                    .tarball
+                    .as_deref()
+                    .is_some_and(|url| !lpm_lockfile::is_recordable_tarball_hint(url))
+                {
+                    package.tarball = None;
+                    changes.removed += 1;
+                }
+            }
         }
     }
+    changes
 }
 
 /// Gives each package the lockfile pins by a proven integrity the sha512
@@ -761,20 +786,20 @@ fn write_lockfile_and_measure(
 /// What a fast-path rewrite tells the user: `recorded_sha512_count` is how
 /// many packages [`record_proven_pins`] changed.
 fn fast_path_lockfile_rewrite_notices(
-    reasons: FastPathLockfileRewriteReasons,
+    url_changes: TarballUrlChanges,
     recorded_sha512_count: usize,
 ) -> Vec<String> {
     let mut notices = Vec::new();
-    if reasons.fresh_url_count > 0 {
+    if url_changes.refreshed > 0 {
         notices.push(format!(
             "Refreshed {} stale tarball URL(s) in lockfile",
-            reasons.fresh_url_count,
+            url_changes.refreshed,
         ));
     }
-    if reasons.unrecordable_hint_count > 0 {
+    if url_changes.removed > 0 {
         notices.push(format!(
-            "Removed {} tarball URL(s) with a query from lockfile",
-            reasons.unrecordable_hint_count,
+            "Removed {} tarball URL(s) from lockfile: a URL with a query isn't kept",
+            url_changes.removed,
         ));
     }
     if recorded_sha512_count > 0 {
@@ -3296,6 +3321,12 @@ fn try_lockfile_fast_path_from_rows(
                 tarball_url: match lp.source_kind() {
                     Some(Ok(lpm_lockfile::Source::Git { url })) => github_archive_url(&url).ok(),
                     _ => lp.tarball.as_deref().and_then(|url| {
+                        if !lpm_lockfile::is_recordable_tarball_hint(url) {
+                            input
+                                .gate_stats
+                                .query_string
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         match evaluate_cached_url(url, input.client) {
                             GateDecision::Accepted => Some(url.to_string()),
                             GateDecision::RejectedScheme => {
@@ -3330,13 +3361,7 @@ fn try_lockfile_fast_path_from_rows(
                                 );
                                 None
                             }
-                            GateDecision::RejectedQuery => {
-                                input
-                                    .gate_stats
-                                    .query_string
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                None
-                            }
+                            GateDecision::RejectedQuery => None,
                             GateDecision::RejectedOrigin => {
                                 // Expected after `LPM_REGISTRY_URL` switch:
                                 // stored `@lpm.dev/*` URLs mismatch the new
@@ -3801,17 +3826,7 @@ mod rewrite_notice_tests {
 
     #[test]
     fn fast_path_lockfile_notice_is_absent_for_importer_only_rewrite() {
-        let notices = fast_path_lockfile_rewrite_notices(
-            FastPathLockfileRewriteReasons {
-                fresh_url_count: 0,
-                unrecordable_hint_count: 0,
-                proven_pin_count: 0,
-                importer_snapshot_changed: true,
-                patch_records_changed: false,
-                schema_version_changed: false,
-            },
-            0,
-        );
+        let notices = fast_path_lockfile_rewrite_notices(TarballUrlChanges::default(), 0);
 
         assert!(
             notices.is_empty(),
@@ -3821,17 +3836,7 @@ mod rewrite_notice_tests {
 
     #[test]
     fn a_rewrite_says_how_many_packages_got_their_sha512() {
-        let notices = fast_path_lockfile_rewrite_notices(
-            FastPathLockfileRewriteReasons {
-                fresh_url_count: 0,
-                unrecordable_hint_count: 0,
-                proven_pin_count: 1,
-                importer_snapshot_changed: false,
-                patch_records_changed: false,
-                schema_version_changed: false,
-            },
-            2,
-        );
+        let notices = fast_path_lockfile_rewrite_notices(TarballUrlChanges::default(), 2);
 
         assert_eq!(
             notices,
@@ -3840,22 +3845,86 @@ mod rewrite_notice_tests {
     }
 
     #[test]
-    fn a_rewrite_says_how_many_tarball_urls_with_a_query_it_removed() {
+    fn a_rewrite_says_how_many_tarball_urls_it_refreshed_and_removed() {
         let notices = fast_path_lockfile_rewrite_notices(
-            FastPathLockfileRewriteReasons {
-                fresh_url_count: 0,
-                unrecordable_hint_count: 3,
-                proven_pin_count: 0,
-                importer_snapshot_changed: false,
-                patch_records_changed: false,
-                schema_version_changed: false,
+            TarballUrlChanges {
+                refreshed: 1,
+                removed: 3,
             },
             0,
         );
 
         assert_eq!(
             notices,
-            ["Removed 3 tarball URL(s) with a query from lockfile"]
+            [
+                "Refreshed 1 stale tarball URL(s) in lockfile",
+                "Removed 3 tarball URL(s) from lockfile: a URL with a query isn't kept",
+            ]
+        );
+    }
+
+    fn registry_row(name: &str, tarball: Option<&str>) -> lpm_lockfile::LockedPackage {
+        lpm_lockfile::LockedPackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            source: Some(DEFAULT_REGISTRY_SOURCE.into()),
+            tarball: tarball.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_rewrite_drops_every_locked_url_with_a_query_and_counts_what_it_changed() {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.packages = vec![
+            registry_row(
+                "kept",
+                Some("https://registry.example.test/kept/-/kept-1.0.0.tgz"),
+            ),
+            registry_row(
+                "signed",
+                Some("https://cdn.example.test/blobs/signed?sig=value"),
+            ),
+            registry_row(
+                "moved",
+                Some("https://registry.example.test/moved/-/old.tgz"),
+            ),
+            registry_row(
+                "now-signed",
+                Some("https://registry.example.test/now/-/now.tgz"),
+            ),
+        ];
+        let key = |row: &lpm_lockfile::LockedPackage| locked_package_key(row);
+        let fresh = HashMap::from([
+            (
+                key(&lockfile.packages[2]),
+                Some("https://registry.example.test/moved/-/new.tgz".to_string()),
+            ),
+            (key(&lockfile.packages[3]), None),
+        ]);
+
+        let changes = patch_fresh_tarball_urls(&mut lockfile, &fresh);
+
+        assert_eq!(
+            changes,
+            TarballUrlChanges {
+                refreshed: 1,
+                removed: 2
+            }
+        );
+        let tarballs: Vec<_> = lockfile
+            .packages
+            .iter()
+            .map(|row| row.tarball.as_deref())
+            .collect();
+        assert_eq!(
+            tarballs,
+            [
+                Some("https://registry.example.test/kept/-/kept-1.0.0.tgz"),
+                None,
+                Some("https://registry.example.test/moved/-/new.tgz"),
+                None,
+            ]
         );
     }
 }

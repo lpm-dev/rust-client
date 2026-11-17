@@ -29,7 +29,9 @@ struct FetchPlatform {
 enum FetchSource {
     Registry {
         registry_url: String,
-        tarball_url: String,
+        /// The URL the lockfile keeps, or `None` when it keeps none this
+        /// command may use: the URL is then read from registry metadata.
+        tarball_url: Option<String>,
     },
     RemoteTarball {
         url: String,
@@ -40,11 +42,11 @@ enum FetchSource {
 }
 
 impl FetchSource {
-    fn url(&self) -> &str {
+    #[cfg(test)]
+    fn url(&self) -> Option<&str> {
         match self {
-            Self::Registry { tarball_url, .. } => tarball_url,
-            Self::RemoteTarball { url } => url,
-            Self::GitHub { url } => url,
+            Self::Registry { tarball_url, .. } => tarball_url.as_deref(),
+            Self::RemoteTarball { url } | Self::GitHub { url } => Some(url),
         }
     }
 
@@ -352,27 +354,38 @@ async fn fetch_artifact(
             .collect());
     }
 
-    let routing_name = targets
+    let first_target = targets
         .first()
-        .map(|target| target.name.as_str())
         .ok_or_else(|| LpmError::Registry("fetch artifact has no target packages".to_string()))?;
+    let routing_name = first_target.name.as_str();
     let downloaded = match &source {
         FetchSource::GitHub { url } => {
             crate::commands::install::download_github_archive_to_file(url, Some(&integrity)).await?
         }
-        FetchSource::Registry { .. } => {
+        FetchSource::Registry { tarball_url, .. } => {
+            let looked_up;
+            let url = match tarball_url {
+                Some(url) => url.as_str(),
+                None => {
+                    looked_up = crate::commands::install::metadata_tarball_url_for_package(
+                        &client,
+                        &route_table,
+                        routing_name,
+                        &first_target.version,
+                        routing_name.starts_with("@lpm.dev/"),
+                    )
+                    .await?
+                    .0;
+                    looked_up.as_str()
+                }
+            };
             client
-                .download_tarball_routed_with_integrity(
-                    &route_table,
-                    routing_name,
-                    source.url(),
-                    &integrity,
-                )
+                .download_tarball_routed_with_integrity(&route_table, routing_name, url, &integrity)
                 .await?
         }
-        FetchSource::RemoteTarball { .. } => {
+        FetchSource::RemoteTarball { url } => {
             client
-                .download_tarball_to_file_with_auth_and_integrity(source.url(), None, &integrity)
+                .download_tarball_to_file_with_auth_and_integrity(url, None, &integrity)
                 .await?
         }
     };
@@ -470,12 +483,10 @@ fn classify_package(
     match source {
         Source::Registry { url: registry_url } => {
             let integrity = required_integrity(package)?;
-            let tarball_url = package.tarball.clone().ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "lpm.lock package {}@{} is missing tarball URL; run `lpm install` to refresh the lockfile before `lpm fetch`",
-                    package.name, package.version
-                ))
-            })?;
+            let tarball_url = package
+                .tarball
+                .clone()
+                .filter(|url| lpm_lockfile::is_recordable_tarball_hint(url));
             Ok(FetchPlan::Fetch(FetchTarget {
                 name: package.name.clone(),
                 version: package.version.clone(),
@@ -582,7 +593,7 @@ fn npm_firewall_packages_for_fetch_targets(
                 &target.name,
                 &target.version,
                 registry_url,
-                tarball_url,
+                tarball_url.as_deref(),
                 client,
             ) =>
             {
@@ -613,15 +624,18 @@ fn registry_source_is_public_npm_package(
     name: &str,
     version: &str,
     registry_url: &str,
-    tarball_url: &str,
+    tarball_url: Option<&str>,
     client: &RegistryClient,
 ) -> bool {
     if lpm_common::package_name::is_lpm_package(name) {
         return false;
     }
+    // A row from before lockfiles recorded sources names the default
+    // registry. With no kept URL to tell otherwise, it is checked as npm's.
     crate::npm_public_source::is_public_npm_origin(registry_url)
         || crate::npm_public_source::is_lpm_registry_origin(registry_url, client)
-        || (registry_url == "legacy" && is_canonical_public_npm_tarball(name, version, tarball_url))
+        || (registry_url == "legacy"
+            && tarball_url.is_none_or(|url| is_canonical_public_npm_tarball(name, version, url)))
 }
 
 fn is_canonical_public_npm_tarball(name: &str, version: &str, url: &str) -> bool {
@@ -910,18 +924,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_package_requires_integrity_and_tarball_url() {
+    fn registry_package_requires_integrity_and_looks_up_a_url_the_lockfile_doesnt_keep() {
+        let platform = FetchPlatform::parse("linux/x64/glibc").unwrap();
         let mut package = locked_package();
         package.integrity = None;
-        let err = classify_package(&package, &FetchPlatform::parse("linux/x64/glibc").unwrap())
-            .unwrap_err();
+        let err = classify_package(&package, &platform).unwrap_err();
         assert!(err.to_string().contains("missing integrity"));
 
-        let mut package = locked_package();
-        package.tarball = None;
-        let err = classify_package(&package, &FetchPlatform::parse("linux/x64/glibc").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("missing tarball URL"));
+        for tarball in [
+            None,
+            Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?sig=value".to_string()),
+        ] {
+            let mut package = locked_package();
+            package.tarball = tarball;
+            let FetchPlan::Fetch(target) = classify_package(&package, &platform).unwrap() else {
+                panic!("a registry package must be fetched");
+            };
+            assert_eq!(target.source.url(), None);
+        }
     }
 
     #[test]
@@ -1007,7 +1027,7 @@ mod tests {
 
         assert_eq!(
             target.source.url(),
-            "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+            Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz")
         );
     }
 }

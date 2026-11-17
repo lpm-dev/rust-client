@@ -685,7 +685,7 @@ fn cyclonedx_component(component: &SbomComponent) -> Value {
     if let Some(integrity) = &component.package.integrity {
         properties.push(property("lpm:integrity", integrity));
     }
-    if let Some(tarball) = &component.package.tarball {
+    if let Some(tarball) = recorded_tarball_url(&component.package) {
         add_external_reference(&mut value, "distribution", tarball);
     }
     if let Some(patch) = &component.patch {
@@ -911,12 +911,21 @@ fn spdx_root_package(document: &SbomDocument, spdx_id: &str) -> Value {
     package
 }
 
+/// The package's locked tarball URL, unless it has a query or a fragment: a
+/// lockfile an older LPM CLI wrote can hold a signed download URL there.
+fn recorded_tarball_url(package: &lpm_lockfile::LockedPackage) -> Option<&str> {
+    package
+        .tarball
+        .as_deref()
+        .filter(|url| lpm_lockfile::is_recordable_tarball_hint(url))
+}
+
 fn spdx_package(component: &SbomComponent) -> Value {
     let mut package = json!({
         "name": component.package.name,
         "SPDXID": component.spdx_id,
         "versionInfo": component.package.version,
-        "downloadLocation": component.package.tarball.as_deref().unwrap_or("NOASSERTION"),
+        "downloadLocation": recorded_tarball_url(&component.package).unwrap_or("NOASSERTION"),
         "filesAnalyzed": false,
         "licenseConcluded": license_declared(&component.metadata),
         "licenseDeclared": license_declared(&component.metadata),

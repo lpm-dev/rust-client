@@ -421,6 +421,8 @@ impl WorkspaceLockfileCoordinator {
             union
         };
 
+        let mut union = union;
+        drop_unrecordable_tarball_hints(&mut union).map_err(lockfile_error)?;
         let path = self.root.join(lpm_lockfile::LOCKFILE_NAME);
         if !self.migration_pending
             && self
@@ -434,6 +436,44 @@ impl WorkspaceLockfileCoordinator {
         union.write_all(&path).map_err(lockfile_error)?;
         Ok(true)
     }
+}
+
+/// Drops, from every importer's rows, the tarball URLs a lockfile no longer
+/// keeps. An install rewrites only the importers it covers; this keeps the
+/// others from carrying such a URL on until they are installed.
+fn drop_unrecordable_tarball_hints(
+    union: &mut lpm_lockfile::Lockfile,
+) -> Result<(), lpm_lockfile::LockfileError> {
+    let unrecordable = |row: &lpm_lockfile::LockedPackage| {
+        row.tarball
+            .as_deref()
+            .is_some_and(|url| !lpm_lockfile::is_recordable_tarball_hint(url))
+    };
+    if !union
+        .packages
+        .iter()
+        .chain(union.workspace_packages.values())
+        .any(unrecordable)
+    {
+        return Ok(());
+    }
+    let importers: Vec<String> = union.importers.keys().cloned().collect();
+    for importer in importers {
+        let mut projection = union.project_importer(&importer)?;
+        let mut changed = false;
+        for row in projection
+            .packages
+            .iter_mut()
+            .filter(|row| unrecordable(row))
+        {
+            row.tarball = None;
+            changed = true;
+        }
+        if changed {
+            union.replace_importer(&importer, projection)?;
+        }
+    }
+    Ok(())
 }
 
 fn lockfile_error(error: lpm_lockfile::LockfileError) -> LpmError {

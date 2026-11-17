@@ -69,6 +69,7 @@ mod workspace_resolution;
 use accounting::*;
 use catalog::*;
 use concurrency::*;
+pub(crate) use fetch::metadata_tarball_url_for_package;
 use fetch::*;
 use fetch_overlap::*;
 use firewall::{

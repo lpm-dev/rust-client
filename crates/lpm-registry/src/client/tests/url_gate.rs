@@ -359,6 +359,7 @@ fn gate_rejects_a_stored_url_with_a_query_or_fragment() {
         "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?sig=value&expires=600",
         "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?",
         "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz#value",
+        "https://registry.npmjs.org/blobs/pkg-1.0.0?sig=value",
     ] {
         assert_eq!(
             evaluate_cached_url(url, &client),

@@ -168,7 +168,7 @@ pub async fn run(
             "success": true,
             "package": package_name,
             "version": version_key,
-            "tarball_url": with_query_values_masked(tarball_url),
+            "tarball_url": masked_tarball_url(tarball_url),
             "integrity": integrity_str,
             "integrity_verified": integrity_verified,
             "size_bytes": size,
@@ -264,10 +264,10 @@ fn short_integrity(integrity: &str) -> String {
     format!("{prefix}…{suffix}")
 }
 
-/// `url` with each query value, and any fragment, replaced by `<redacted>`,
-/// keeping the query's keys: a registry that signs its download URLs puts
-/// the signature there.
-fn with_query_values_masked(url: &str) -> std::borrow::Cow<'_, str> {
+/// `url` with any credentials, each query value, and any fragment replaced
+/// by `<redacted>`, keeping the query's keys: a registry that signs its
+/// download URLs puts the signature in the query.
+fn masked_tarball_url(url: &str) -> std::borrow::Cow<'_, str> {
     const MASK: &str = "<redacted>";
     let (before_fragment, fragment) = match url.split_once('#') {
         Some((before, fragment)) => (before, Some(fragment)),
@@ -277,11 +277,25 @@ fn with_query_values_masked(url: &str) -> std::borrow::Cow<'_, str> {
         Some((base, query)) => (base, Some(query)),
         None => (before_fragment, None),
     };
-    if query.is_none() && fragment.is_none() {
+    let authority_start = base.find("://").map_or(0, |scheme_end| scheme_end + 3);
+    let authority_end = base[authority_start..]
+        .find('/')
+        .map_or(base.len(), |offset| authority_start + offset);
+    let userinfo_end = base[authority_start..authority_end]
+        .rfind('@')
+        .map(|offset| authority_start + offset);
+    if query.is_none() && fragment.is_none() && userinfo_end.is_none() {
         return std::borrow::Cow::Borrowed(url);
     }
     let mut masked = String::with_capacity(url.len());
-    masked.push_str(base);
+    match userinfo_end {
+        Some(userinfo_end) => {
+            masked.push_str(&base[..authority_start]);
+            masked.push_str(MASK);
+            masked.push_str(&base[userinfo_end..]);
+        }
+        None => masked.push_str(base),
+    }
     if let Some(query) = query {
         masked.push('?');
         let mut pairs = query.split('&').filter(|pair| !pair.is_empty()).peekable();
@@ -308,13 +322,13 @@ fn with_query_values_masked(url: &str) -> std::borrow::Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::with_query_values_masked;
+    use super::masked_tarball_url;
 
     #[test]
     fn a_tarball_url_without_a_query_is_shown_as_it_is() {
         let url = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
         assert!(matches!(
-            with_query_values_masked(url),
+            masked_tarball_url(url),
             std::borrow::Cow::Borrowed(shown) if shown == url
         ));
     }
@@ -342,8 +356,20 @@ mod tests {
                 "https://cdn.example/pkg.tgz?",
                 "https://cdn.example/pkg.tgz?",
             ),
+            (
+                "https://user:token@cdn.example/pkg.tgz",
+                "https://<redacted>@cdn.example/pkg.tgz",
+            ),
+            (
+                "https://user:token@cdn.example/pkg.tgz?sig=abc",
+                "https://<redacted>@cdn.example/pkg.tgz?sig=<redacted>",
+            ),
+            (
+                "https://cdn.example/path@segment/pkg.tgz",
+                "https://cdn.example/path@segment/pkg.tgz",
+            ),
         ] {
-            assert_eq!(with_query_values_masked(url), shown, "{url}");
+            assert_eq!(masked_tarball_url(url), shown, "{url}");
         }
     }
 }
