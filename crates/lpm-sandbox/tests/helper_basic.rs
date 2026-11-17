@@ -321,6 +321,44 @@ fn helpers_started_together_for_one_new_profile_all_run_and_leave_it_to_be_delet
     );
 }
 
+/// The helper goes on after a sweep record it can't read, which it only
+/// logs. Its log goes to stderr, the one place its caller reads.
+#[test]
+fn helper_writes_what_it_warns_of_to_stderr() {
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let name = format!("LpmWarningTest{:x}{unique_suffix:x}", std::process::id());
+    let _profile = TemporaryAppContainerProfile::new(&name);
+    let folder = tempfile::tempdir().expect("make a folder");
+    let sweep_record = folder.path().join("swept-trees.json");
+    std::fs::write(&sweep_record, "not a record").expect("write the record");
+    let sweep_record = sweep_record.to_str().expect("a UTF-8 path");
+    let mut argv = minimal_argv();
+    argv[3] = &name;
+    argv.extend([
+        "--sweep-record",
+        sweep_record,
+        "--",
+        r"C:\Windows\System32\whoami.exe",
+    ]);
+
+    let assert = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate built helper")
+        .args(&argv)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("lpm-sandbox-helper: warning: ignoring unreadable")
+            && stderr.contains("swept-trees.json"),
+        "the helper should say that it ignored the record; got: {stderr}",
+    );
+}
+
 #[test]
 fn helper_propagates_nonzero_exit_code_from_lifecycle_child() {
     // cmd /c exit 7 — verifies that GetExitCodeProcess + the

@@ -216,16 +216,42 @@ fn release_identity(
         .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|error| failed(error.to_string()))?;
-    if !output.status.success() {
-        return Err(failed(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+    let removing = format!(
+        "removing the sandbox access {package}'s scripts had in {}",
+        project.display()
+    );
+    if let Some(reason) = heard_from(output.status, &output.stderr, &removing) {
+        return Err(failed(reason));
     }
     match std::fs::remove_file(identity_record_path(records, name)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(failed(error.to_string())),
     }
+}
+
+/// Passes on what a cleanup helper warned of on `stderr` while `doing`
+/// its work, and returns what else it said.
+fn pass_on_warnings(stderr: &[u8], doing: &str) -> String {
+    let said = crate::helper_log::Said::on(stderr);
+    for warning in &said.warnings {
+        tracing::warn!("{warning} (while {doing})");
+    }
+    said.reason
+}
+
+/// [`pass_on_warnings`] for a cleanup helper that ended with `status`,
+/// and why it failed, if it did.
+fn heard_from(status: std::process::ExitStatus, stderr: &[u8], doing: &str) -> Option<String> {
+    let reason = pass_on_warnings(stderr, doing);
+    if status.success() {
+        return None;
+    }
+    Some(if reason.is_empty() {
+        format!("the sandbox helper ended with {status}")
+    } else {
+        reason
+    })
 }
 
 // ── Runs the parent may have to end ──────────────────────────────────
@@ -443,6 +469,17 @@ fn clean_up_after(run: &StartedRun) {
             return;
         }
     };
+    let doing = "taking back what a stopped sandbox run set";
+    // A helper that has said more than its pipe holds waits for a reader,
+    // so what it says is read while it runs.
+    let said = cleanup.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut bytes);
+            bytes
+        })
+    });
+    let said = move || said.and_then(|said| said.join().ok()).unwrap_or_default();
     let wait_ms = u32::try_from(TAKE_BACK_WAIT.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: `cleanup` owns its process handle for the call.
     let ended =
@@ -450,17 +487,20 @@ fn clean_up_after(run: &StartedRun) {
     if !ended {
         let _ = cleanup.kill();
         let _ = cleanup.wait();
+        pass_on_warnings(&said(), doing);
         tracing::warn!(
             "taking back what a stopped sandbox run set took too long and was given up; {later}"
         );
         return;
     }
-    match cleanup.wait_with_output() {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => tracing::warn!(
-            "couldn't take back what a stopped sandbox run set; {later}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
+    match cleanup.wait() {
+        Ok(status) => {
+            if let Some(reason) = heard_from(status, &said(), doing) {
+                tracing::warn!(
+                    "couldn't take back what a stopped sandbox run set; {later}: {reason}"
+                );
+            }
+        }
         Err(error) => {
             tracing::warn!("couldn't take back what a stopped sandbox run set; {later}: {error}")
         }
@@ -1680,6 +1720,44 @@ mod tests {
 
         assert!(matches!(nothing, AfterRun::Nothing), "{nothing:?}");
         assert!(matches!(told, AfterRun::Unknown(_)), "{told:?}");
+    }
+
+    #[test]
+    fn what_a_cleanup_helper_warned_of_is_passed_on_apart_from_why_it_failed() {
+        use std::os::windows::process::ExitStatusExt as _;
+
+        let ended_with = std::process::ExitStatus::from_raw;
+        let ((failed, worked, said_nothing), passed_on) = crate::helper_log::written_while(|| {
+            (
+                heard_from(
+                    ended_with(66),
+                    b"lpm-sandbox-helper: warning: couldn't take back C:\\a: denied\n\
+                      lpm-sandbox-helper: the identity is held\n",
+                    "cleaning up",
+                ),
+                heard_from(
+                    ended_with(0),
+                    b"lpm-sandbox-helper: warning: the record was unreadable\n",
+                    "cleaning up",
+                ),
+                heard_from(ended_with(101), b"", "cleaning up"),
+            )
+        });
+
+        assert_eq!(
+            failed.as_deref(),
+            Some("lpm-sandbox-helper: the identity is held")
+        );
+        assert_eq!(worked, None);
+        assert_eq!(
+            said_nothing.as_deref(),
+            Some("the sandbox helper ended with exit code: 101")
+        );
+        assert_eq!(
+            passed_on,
+            "lpm-sandbox-helper: warning: couldn't take back C:\\a: denied (while cleaning up)\n\
+             lpm-sandbox-helper: warning: the record was unreadable (while cleaning up)\n"
+        );
     }
 
     /// A process that waits for input nobody sends, ended with the test.
