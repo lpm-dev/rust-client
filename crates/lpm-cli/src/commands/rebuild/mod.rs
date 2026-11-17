@@ -36,6 +36,8 @@ mod lifecycle_tools;
 mod package_dir;
 pub(super) mod process_tree;
 pub(in crate::commands) mod sandbox_env;
+#[cfg(any(windows, test))]
+mod sandbox_node;
 mod script_execution;
 mod scripts;
 mod trust;
@@ -1065,6 +1067,21 @@ async fn run_under_store_lock(
         drop(probe_sandbox);
     }
 
+    #[cfg(windows)]
+    let stuck_node = matches!(sandbox_mode, SandboxMode::Enforce)
+        .then(|| sandbox_node::StuckNode::on_host(&sanitized_env, project_dir))
+        .flatten();
+    #[cfg(windows)]
+    if let Some(node) = stuck_node
+        && let Some(warning) = node.warning_once(timeout)
+    {
+        if json_output {
+            tracing::warn!(target: "lpm_cli::sandbox", "{warning}");
+        } else {
+            crate::output::warn(&warning);
+        }
+    }
+
     let cache_preparation_start = std::time::Instant::now();
     let build_cache_invocation = BuildCacheInvocation::prepare(
         &lockfile,
@@ -1557,6 +1574,15 @@ async fn run_under_store_lock(
                             install_ui::dim(phase),
                             lpm_common::sanitize_terminal_inline(&e),
                         ));
+                        #[cfg(windows)]
+                        if e.starts_with(process_tree::TIMEOUT_ERROR)
+                            && let Some(node) = stuck_node
+                        {
+                            install_ui::detail_line(crate::install_ui::terminal_line!(
+                                "    {}",
+                                install_ui::dim(&node.timeout_hint()),
+                            ));
+                        }
                         let searched = if tools.project_bins {
                             script_execution::find_env_case_insensitive(&sanitized_env, "PATH")
                         } else {
