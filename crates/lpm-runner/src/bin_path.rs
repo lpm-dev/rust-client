@@ -262,13 +262,15 @@ impl Default for ManagedRuntimeHint {
     }
 }
 
-/// Build a PATH string with managed runtimes and `node_modules/.bin` directories prepended.
-///
-/// Thin wrapper around `build_path_with_bins_pre_resolved` with `Unknown` hint —
-/// preserves the silent-detect contract for callers that don't go through
-/// `ensure_runtime` first (rebuild, dlx, hooks, tools.rs, doctor, orchestrator).
+/// The `PATH` a script in `start_dir` searches, for a caller that only
+/// looks a command up on it, such as the check of which `node` a script
+/// will get. It is [`build_path_with_bins_pre_resolved`]'s without npm's
+/// `node-gyp`, whose commands that one may write, and it detects a managed
+/// runtime silently.
 pub fn build_path_with_bins(start_dir: &Path) -> lpm_runtime::detect::DetectionResult<String> {
-    build_path_with_bins_pre_resolved(start_dir, &ManagedRuntimeHint::Unknown)
+    let bin_dirs = find_bin_dirs(start_dir);
+    let host = host_path_entries(start_dir, &ManagedRuntimeHint::Unknown)?;
+    Ok(join_script_path(&bin_dirs, host, |_| None))
 }
 
 /// Build a PATH string, optionally skipping the managed-runtime detect when the
@@ -276,8 +278,9 @@ pub fn build_path_with_bins(start_dir: &Path) -> lpm_runtime::detect::DetectionR
 ///
 /// Order (highest priority first):
 /// 1. `node_modules/.bin` dirs (project-level, then workspace root)
-/// 2. Managed Node.js runtime bin dir, then managed Bun bin dir (per `hint`)
-/// 3. Existing system PATH
+/// 2. npm's `node-gyp`, where the program offers it (see [`crate::node_gyp`])
+/// 3. Managed Node.js runtime bin dir, then managed Bun bin dir (per `hint`)
+/// 4. Existing system PATH
 pub fn build_path_with_bins_pre_resolved(
     start_dir: &Path,
     hint: &ManagedRuntimeHint,
@@ -304,29 +307,66 @@ pub(crate) fn build_path_from_bin_dirs(
     bin_dirs: &[PathBuf],
     hint: &ManagedRuntimeHint,
 ) -> lpm_runtime::detect::DetectionResult<String> {
-    let separator = if cfg!(windows) { ";" } else { ":" };
+    let host = host_path_entries(start_dir, hint)?;
+    Ok(join_script_path(
+        bin_dirs,
+        host,
+        crate::node_gyp::command_directory,
+    ))
+}
 
-    let mut parts: Vec<String> = bin_dirs.iter().filter_map(|dir| path_entry(dir)).collect();
-
+/// What follows the project's own command directories on a script's
+/// `PATH`: the managed runtimes' directories, then the inherited `PATH`.
+fn host_path_entries(
+    start_dir: &Path,
+    hint: &ManagedRuntimeHint,
+) -> lpm_runtime::detect::DetectionResult<Vec<String>> {
+    let mut host: Vec<String> = Vec::new();
     match hint {
         ManagedRuntimeHint::Resolved(bins) => {
-            parts.extend(bins.iter().filter_map(|bin| path_entry(&bin.bin_dir)));
+            host.extend(bins.iter().filter_map(|bin| path_entry(&bin.bin_dir)));
         }
         ManagedRuntimeHint::Absent => {
             // Caller confirmed no managed runtime — skip the silent detect.
         }
         ManagedRuntimeHint::Unknown => {
-            parts.extend(detect_managed_runtime_bins(start_dir)?);
+            host.extend(detect_managed_runtime_bins(start_dir)?);
         }
     }
 
     if let Some(inherited) = std::env::var_os("PATH")
         && !inherited.is_empty()
     {
-        parts.extend(std::env::split_paths(&inherited).filter_map(|entry| path_entry(&entry)));
+        host.extend(std::env::split_paths(&inherited).filter_map(|entry| path_entry(&entry)));
     }
+    Ok(host)
+}
 
-    Ok(parts.join(separator))
+/// The project's own command directories, then the directory `offered`
+/// names for the rest, then the rest: `host`, as `PATH` entries. `offered`
+/// is asked about `host` without the project's own directories, which an
+/// lpm that runs inside a script finds in the `PATH` it inherited. That
+/// `PATH` holds the offered directory too, which is kept only in its
+/// place.
+fn join_script_path(
+    bin_dirs: &[PathBuf],
+    mut host: Vec<String>,
+    offered: impl FnOnce(&[PathBuf]) -> Option<PathBuf>,
+) -> String {
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let mut parts: Vec<String> = bin_dirs.iter().filter_map(|dir| path_entry(dir)).collect();
+    let outside_the_project: Vec<PathBuf> = host
+        .iter()
+        .flat_map(std::env::split_paths)
+        .filter(|directory| !bin_dirs.contains(directory))
+        .collect();
+    if let Some(entry) = offered(&outside_the_project).and_then(|directory| path_entry(&directory))
+    {
+        host.retain(|inherited| *inherited != entry);
+        parts.push(entry);
+    }
+    parts.extend(host);
+    parts.join(separator)
 }
 
 /// `dir` written as one PATH entry, quoted where Windows needs it, or `None`
@@ -400,6 +440,51 @@ fn detect_one_managed_runtime_bin(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn an_offered_directory_follows_the_project_s_commands_and_is_chosen_without_them() {
+        let project_bin = PathBuf::from(if cfg!(windows) {
+            r"C:\project\node_modules\.bin"
+        } else {
+            "/project/node_modules/.bin"
+        });
+        let host_bin = PathBuf::from(if cfg!(windows) {
+            r"C:\host\bin"
+        } else {
+            "/host/bin"
+        });
+        let offered = PathBuf::from(if cfg!(windows) {
+            r"C:\lpm\node-gyp-bin"
+        } else {
+            "/lpm/node-gyp-bin"
+        });
+        let entry = |directory: &PathBuf| directory.to_str().unwrap().to_owned();
+        // An lpm a script started inherits the project's directory in PATH,
+        // and what the lpm above it was offered.
+        let host = vec![entry(&project_bin), entry(&offered), entry(&host_bin)];
+        let mut asked = Vec::new();
+
+        let path = join_script_path(std::slice::from_ref(&project_bin), host.clone(), |host| {
+            asked = host.to_vec();
+            Some(offered.clone())
+        });
+
+        assert_eq!(asked, [offered.clone(), host_bin.clone()]);
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [
+                project_bin.clone(),
+                offered.clone(),
+                project_bin.clone(),
+                host_bin.clone()
+            ]
+        );
+        let unchanged = join_script_path(std::slice::from_ref(&project_bin), host, |_| None);
+        assert_eq!(
+            std::env::split_paths(&unchanged).collect::<Vec<_>>(),
+            [project_bin.clone(), project_bin, offered, host_bin]
+        );
+    }
 
     #[test]
     fn a_bin_directory_holding_the_path_separator_never_splits_into_two_path_entries() {

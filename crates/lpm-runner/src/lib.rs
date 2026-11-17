@@ -32,6 +32,7 @@ pub mod hooks;
 pub mod isolate;
 pub mod local_domains;
 pub mod lpm_json;
+pub mod node_gyp;
 pub mod npm_context;
 pub mod orchestrator;
 pub mod ports;
