@@ -1264,6 +1264,7 @@ fn install_scripts(context: &Context<'_>, json: &Value, results: &mut Results) {
     // npm runs `node-gyp rebuild` for a root binding.gyp when no install or
     // preinstall script replaces it.
     let implicit_gyp = context.archive.has("binding.gyp")
+        && json.get("gypfile") != Some(&Value::Bool(false))
         && !declared
             .iter()
             .any(|name| matches!(*name, "install" | "preinstall"));

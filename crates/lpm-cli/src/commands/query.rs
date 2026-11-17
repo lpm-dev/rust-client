@@ -1096,22 +1096,29 @@ fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, L
     let parsed: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
             .map_err(|error| LpmError::Script(format!("invalid package.json: {error}")))?;
-    Ok(parsed
+    let names_one = parsed
         .get("scripts")
         .and_then(serde_json::Value::as_object)
         .is_some_and(|scripts| {
             LIFECYCLE_SCRIPTS
                 .iter()
                 .any(|phase| scripts.contains_key(*phase))
-        }))
+        });
+    Ok(names_one
+        || lpm_security::native_build::leaves_install_to_binding_gyp(&parsed)
+            && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?)
 }
 
-fn has_regular_build_marker(package_dir: &cap_std::fs::Dir) -> Result<bool, LpmError> {
-    match package_dir.symlink_metadata(BUILD_MARKER) {
+fn has_regular_file(package_dir: &cap_std::fs::Dir, name: &str) -> Result<bool, LpmError> {
+    match package_dir.symlink_metadata(name) {
         Ok(metadata) => Ok(metadata.is_file() && !metadata.is_symlink()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn has_regular_build_marker(package_dir: &cap_std::fs::Dir) -> Result<bool, LpmError> {
+    has_regular_file(package_dir, BUILD_MARKER)
 }
 
 /// Output matching packages as a Mermaid dependency subgraph.
@@ -1347,6 +1354,25 @@ mod tests {
         let package_dir =
             cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
         assert!(check_has_lifecycle_scripts(&package_dir).unwrap());
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_counts_the_build_a_binding_gyp_implies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"native"}"#).unwrap();
+        let package_dir =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        assert!(!check_has_lifecycle_scripts(&package_dir).unwrap());
+
+        std::fs::write(dir.path().join("binding.gyp"), "{}").unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).unwrap());
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"native","gypfile":false}"#,
+        )
+        .unwrap();
+        assert!(!check_has_lifecycle_scripts(&package_dir).unwrap());
     }
 
     #[test]

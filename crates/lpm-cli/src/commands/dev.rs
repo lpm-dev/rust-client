@@ -6779,9 +6779,10 @@ mod tests {
         // With the shim format and store key schema this release links with,
         // as the install writes them.
         let file = format!(
-            "{hash}\ns:{}\nk:{}\n",
+            "{hash}\ns:{}\nk:{}\nr:{}\n",
             lpm_linker::BIN_SHIM_FORMAT,
-            lpm_store::v2::GraphKey::SCHEMA_VERSION
+            lpm_store::v2::GraphKey::SCHEMA_VERSION,
+            lpm_security::INSTALL_SCRIPT_RULES
         );
         fs::write(dir.path().join(".lpm/install-hash"), file).unwrap();
 
@@ -6938,8 +6939,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            10,
-            "install-hash MUST contain 10 lines (hash + m: + l: + i: + p: + a: + e: + n: + s: + k:), got:\n{on_disk}\n\
+            11,
+            "install-hash MUST contain 11 lines (hash + m: + l: + i: + p: + a: + e: + n: + s: + k: + r:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");

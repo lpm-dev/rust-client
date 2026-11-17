@@ -1289,11 +1289,15 @@ pub fn build_state_path(project_dir: &Path) -> PathBuf {
 /// two into one pass over the JSON avoids reading / re-parsing
 /// `package.json` twice per blocked candidate.
 ///
+/// A package that names no `install` script but gets a native build
+/// anyway has that build as its `install` body (see
+/// [`lpm_security::native_build::implied_install_script`]).
+///
 /// Returns an empty vec on any of:
 /// - missing `package.json` (store miss — the gate already fails
 ///   closed elsewhere),
 /// - malformed JSON,
-/// - missing or non-object `scripts` field,
+/// - a non-object `scripts` field,
 /// - no present install phases with non-empty bodies.
 ///
 /// Output order matches [`lpm_security::EXECUTED_INSTALL_PHASES`]
@@ -1316,17 +1320,26 @@ pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
         return vec![];
     };
-    let Some(scripts) = parsed.get("scripts").and_then(|v| v.as_object()) else {
+    let Some(manifest) = parsed.as_object() else {
         return vec![];
     };
+    let scripts = match manifest.get("scripts") {
+        Some(scripts) => match scripts.as_object() {
+            Some(scripts) => Some(scripts),
+            None => return vec![],
+        },
+        None => None,
+    };
+    let implied_install = lpm_security::native_build::implied_install_script(pkg_dir, manifest);
 
     lpm_security::EXECUTED_INSTALL_PHASES
         .iter()
         .filter_map(|phase| {
             scripts
-                .get(*phase)
+                .and_then(|scripts| scripts.get(*phase))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .or(implied_install.filter(|_| *phase == "install"))
                 .map(|s| ((*phase).to_string(), s.to_string()))
         })
         .collect()
@@ -2922,6 +2935,25 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn read_install_phase_bodies_gives_a_binding_gyp_package_its_implied_build() {
+        let package = tempdir().unwrap();
+        std::fs::write(
+            package.path().join("package.json"),
+            r#"{"name":"native","version":"1.0.0","scripts":{"postinstall":"node post.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.path().join("binding.gyp"), "{}").unwrap();
+
+        assert_eq!(
+            read_install_phase_bodies(package.path()),
+            [
+                ("install".to_string(), "node-gyp rebuild".to_string()),
+                ("postinstall".to_string(), "node post.js".to_string()),
+            ]
+        );
     }
 
     #[test]

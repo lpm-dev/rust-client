@@ -18,15 +18,13 @@ pub(super) fn package_baseline_dir_indexed(
     find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
 
+/// The install-time scripts of the package whose manifest is at
+/// `pkg_json_path`, as they run: those it names, and the native build it
+/// gets without naming one (see
+/// [`lpm_security::native_build::implied_install_script`]).
 pub(super) fn read_lifecycle_scripts(
     pkg_json_path: &Path,
 ) -> Result<Option<HashMap<String, String>>, lpm_common::LpmError> {
-    #[derive(serde::Deserialize)]
-    struct LifecycleManifest {
-        #[serde(default)]
-        scripts: HashMap<String, serde_json::Value>,
-    }
-
     let (content, _) = lpm_common::read_regular_file_capped_with_metadata(
         pkg_json_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
@@ -38,13 +36,23 @@ pub(super) fn read_lifecycle_scripts(
             pkg_json_path.display(),
         )));
     }
-    let manifest: LifecycleManifest = serde_json::from_slice(content).map_err(|error| {
-        lpm_common::LpmError::Store(format!(
-            "installed manifest {} is malformed: {error}",
-            pkg_json_path.display()
-        ))
-    })?;
-    let scripts = manifest.scripts;
+    let manifest: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(content)
+        .map_err(|error| {
+            lpm_common::LpmError::Store(format!(
+                "installed manifest {} is malformed: {error}",
+                pkg_json_path.display()
+            ))
+        })?;
+    let no_scripts = serde_json::Map::new();
+    let scripts = match manifest.get("scripts") {
+        Some(scripts) => scripts.as_object().ok_or_else(|| {
+            lpm_common::LpmError::Store(format!(
+                "installed manifest {} is malformed: scripts must be an object",
+                pkg_json_path.display()
+            ))
+        })?,
+        None => &no_scripts,
+    };
 
     let mut lifecycle = HashMap::new();
     for phase in EXECUTED_INSTALL_PHASES {
@@ -59,6 +67,14 @@ pub(super) fn read_lifecycle_scripts(
                 lifecycle.insert((*phase).to_string(), cmd.to_string());
             }
         }
+    }
+
+    if !lifecycle.contains_key("install")
+        && let Some(package_dir) = pkg_json_path.parent()
+        && let Some(implied) =
+            lpm_security::native_build::implied_install_script(package_dir, &manifest)
+    {
+        lifecycle.insert("install".to_string(), implied.to_string());
     }
 
     if lifecycle.is_empty() {
