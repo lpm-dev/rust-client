@@ -251,6 +251,55 @@ fn approve_scripts_yes_json_reports_rebuild_next_step_when_approved() {
     );
 }
 
+fn approval_warning_codes(project: &TempProject) -> Vec<String> {
+    seed_blocked_build_state_with_real_hash(project, "some-blocked-pkg", "1.0.0");
+    write_signed_unlock(project, &["trust-bulk-approve"]);
+    let out = lpm(project)
+        .args(["--json", "approve-scripts", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --yes");
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(parsed["approved_count"].as_u64(), Some(1));
+    parsed["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn an_approval_reports_an_upgrade_from_the_array_form_only_where_names_were_listed() {
+    const UPGRADED: &str = "legacy_upgraded_to_rich";
+
+    let without_any = TempProject::empty("");
+    write_project_no_trusted_deps(&without_any);
+    let codes = approval_warning_codes(&without_any);
+    assert!(!codes.iter().any(|code| code == UPGRADED), "{codes:?}");
+
+    let with_an_empty_array = TempProject::empty(
+        r#"{"name":"fixture","version":"0.0.1","lpm":{"trustedDependencies":[]}}"#,
+    );
+    let codes = approval_warning_codes(&with_an_empty_array);
+    assert!(!codes.iter().any(|code| code == UPGRADED), "{codes:?}");
+
+    let with_names = TempProject::empty(
+        r#"{"name":"fixture","version":"0.0.1","lpm":{"trustedDependencies":["esbuild"]}}"#,
+    );
+    let codes = approval_warning_codes(&with_names);
+    assert!(codes.iter().any(|code| code == UPGRADED), "{codes:?}");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&with_names.read_file("package.json")).unwrap();
+    assert!(manifest["lpm"]["trustedDependencies"]["esbuild@*"].is_object());
+}
+
 /// `approve-scripts <pkg> --dry-run --json` (named-approve path) must
 /// NOT mutate `package.json`. Pre-fix, the `write_back` call after
 /// auto-confirm fires unconditionally.

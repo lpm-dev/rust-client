@@ -285,7 +285,10 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             eprintln!();
         }
     }
-    let initial_was_legacy = matches!(trusted, TrustedDependencies::Legacy(_));
+    // A manifest that lists none reads as an empty array, which an approval
+    // has nothing to upgrade from.
+    let initial_was_legacy =
+        matches!(&trusted, TrustedDependencies::Legacy(names) if !names.is_empty());
 
     // Re-evaluate the persisted blocked set against the current trust.
     // The borrow returns &BlockedPackage; we materialize the underlying
