@@ -1340,7 +1340,11 @@ impl PreparedAccess<'_> {
             match update_ace(&path, self.invocation.0, None) {
                 Ok(()) => released.push(path),
                 Err(error) => {
-                    tracing::warn!(path = %path.display(), "cannot remove temporary sandbox metadata access: {error}");
+                    tracing::warn!(
+                        target: "lpm_sandbox::helper_appcontainer",
+                        "couldn't take back this run's access to {}: {error}",
+                        path.display(),
+                    );
                 }
             }
         }
