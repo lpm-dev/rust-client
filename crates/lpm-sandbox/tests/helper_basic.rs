@@ -159,6 +159,26 @@ fn helper_rejects_argv_without_separator() {
     );
 }
 
+/// The helper's exit code says how its run went even when the process
+/// that would read why is gone, as after its caller has ended.
+#[test]
+fn helper_keeps_its_exit_code_when_nothing_reads_its_stderr() {
+    use std::process::Stdio;
+
+    let (reader, stderr) = std::io::pipe().expect("make a pipe");
+    drop(reader);
+
+    let status = std::process::Command::new(assert_cmd::cargo::cargo_bin("lpm-sandbox-helper"))
+        .args(minimal_argv())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .status()
+        .expect("start the helper");
+
+    assert_eq!(status.code(), Some(EXIT_ARGV_PARSE));
+}
+
 #[test]
 fn helper_rejects_missing_appcontainer_name() {
     // Build a valid argv but omit `--appcontainer-name` to pin the

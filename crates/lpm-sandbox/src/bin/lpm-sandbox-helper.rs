@@ -75,13 +75,19 @@ mod windows_main {
         if let [flag] = argv.as_slice()
             && flag == lpm_sandbox::helper_protocol::RELEASE_FLAG
         {
-            println!("{}", lpm_sandbox::helper_protocol::HELPER_RELEASE);
+            use std::io::Write as _;
+
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                lpm_sandbox::helper_protocol::HELPER_RELEASE
+            );
             std::process::exit(0);
         }
         let args = match parse_argv(argv) {
             Ok(args) => args,
             Err(e) => {
-                eprintln!("lpm-sandbox-helper: argv parse failed: {e}");
+                say_why(format_args!("argv parse failed: {e}"));
                 // ProtocolVersionMismatch is its own exit code so
                 // the parent can distinguish "helper present but
                 // stale" from "helper present and accepting argv
@@ -96,10 +102,20 @@ mod windows_main {
         match dispatch(args) {
             Ok(exit_code) => std::process::exit(exit_code),
             Err(msg) => {
-                eprintln!("lpm-sandbox-helper: {msg}");
+                say_why(format_args!("{msg}"));
                 std::process::exit(EXIT_HELPER_FAILED);
             }
         }
+    }
+
+    /// Writes why the helper is about to fail. `eprintln!` panics when
+    /// the other end of stderr is closed, as it is once the helper's
+    /// caller has ended, and the panic's exit code would replace the one
+    /// that names the failure.
+    fn say_why(reason: std::fmt::Arguments<'_>) {
+        use std::io::Write as _;
+
+        let _ = writeln!(std::io::stderr(), "lpm-sandbox-helper: {reason}");
     }
 
     /// AppContainer setup / spawn / wait. Returns the lifecycle
