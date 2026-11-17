@@ -667,16 +667,31 @@ fn look_at_windows_output(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
+fn copy_sanitized_output<R, W>(reader: R, writer: W, process_finished: &AtomicBool)
 where
     R: Read,
     W: Write,
 {
+    copy_sanitized_output_by_reading(reader, writer, process_finished)
+}
+
+/// Copies a stream until it ends, for a target that can't ask whether a
+/// stream has output. Stopping once the process has ended would drop what
+/// it wrote last, so this waits for as long as anything the process
+/// started keeps the stream open. Of what arrives after the process ended
+/// it copies as much as the other targets do.
+#[cfg(any(test, not(any(unix, windows))))]
+fn copy_sanitized_output_by_reading<R, W>(
+    mut reader: R,
+    mut writer: W,
+    process_finished: &AtomicBool,
+) where
+    R: Read,
+    W: Write,
+{
     let mut buf = [0_u8; 8192];
+    let mut post_finish_bytes = 0_usize;
     loop {
-        if process_finished.load(Ordering::Acquire) {
-            break;
-        }
         let read = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => read,
@@ -689,6 +704,12 @@ where
         }
         if writer.flush().is_err() {
             break;
+        }
+        if process_finished.load(Ordering::Acquire) {
+            post_finish_bytes = post_finish_bytes.saturating_add(read);
+            if post_finish_bytes >= 1024 * 1024 {
+                break;
+            }
         }
     }
 }
@@ -958,5 +979,31 @@ mod cancellation_tests {
         );
         assert_eq!(result.unwrap_err(), "Lifecycle script interrupted");
         assert!(!root.path().join("started.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod output_by_reading_tests {
+    use super::copy_sanitized_output_by_reading;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn output_left_when_the_process_ended_is_still_copied() {
+        let finished = AtomicBool::new(true);
+        let mut copied = Vec::new();
+
+        copy_sanitized_output_by_reading(&b"the last line\n"[..], &mut copied, &finished);
+
+        assert_eq!(copied, b"the last line\n");
+    }
+
+    #[test]
+    fn output_that_keeps_coming_after_the_process_ended_is_cut_off() {
+        let finished = AtomicBool::new(true);
+        let mut copied = Vec::new();
+
+        copy_sanitized_output_by_reading(std::io::repeat(b'x'), &mut copied, &finished);
+
+        assert_eq!(copied.len(), 1024 * 1024);
     }
 }
