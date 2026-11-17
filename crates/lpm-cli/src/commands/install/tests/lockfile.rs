@@ -2597,3 +2597,67 @@ fn a_signed_package_keeps_the_integrity_its_signature_covers() {
     assert_eq!(record_proven_pins(&mut lockfile, &proven), 0);
     assert_eq!(locked_integrities(&lockfile), [PROVEN_SHA1]);
 }
+
+#[test]
+fn only_a_served_url_other_than_the_locked_one_is_written_back() {
+    let locked = |name: &str, tarball: Option<&str>| lpm_lockfile::LockedPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        source: Some(DEFAULT_REGISTRY_SOURCE.into()),
+        tarball: tarball.map(str::to_owned),
+        ..Default::default()
+    };
+    let rows = [
+        locked("same", Some("https://registry.example.test/same.tgz")),
+        locked("moved", Some("https://registry.example.test/old.tgz")),
+        locked("unnamed", None),
+        locked(
+            "not-fetched",
+            Some("https://registry.example.test/kept.tgz"),
+        ),
+    ];
+    let key = |name: &str| format!("{name}\0{}\0{DEFAULT_REGISTRY_SOURCE}", "1.0.0");
+    let served = HashMap::from([
+        (
+            key("same"),
+            "https://registry.example.test/same.tgz".to_string(),
+        ),
+        (
+            key("moved"),
+            "https://registry.example.test/new.tgz".to_string(),
+        ),
+        (
+            key("unnamed"),
+            "https://registry.example.test/unnamed.tgz".to_string(),
+        ),
+    ]);
+
+    let mut refreshed: Vec<_> = urls_other_than_locked(rows.iter(), &served)
+        .into_keys()
+        .collect();
+    refreshed.sort();
+
+    assert_eq!(refreshed, [key("moved"), key("unnamed")]);
+}
+
+#[test]
+fn a_package_that_records_no_tarball_url_is_never_reported_as_refreshed() {
+    let source =
+        "git+https://git.example.test/owner/repo.git#0123456789abcdef0123456789abcdef01234567";
+    let row = lpm_lockfile::LockedPackage {
+        name: "from-git".into(),
+        version: "1.0.0".into(),
+        source: Some(source.into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        row.source_kind(),
+        Some(Ok(lpm_lockfile::Source::Git { .. }))
+    ));
+    let served = HashMap::from([(
+        format!("from-git\0{}\0{source}", "1.0.0"),
+        "https://git.example.test/owner/repo/archive/0123456.tar.gz".to_string(),
+    )]);
+
+    assert!(urls_other_than_locked(std::iter::once(&row), &served).is_empty());
+}

@@ -1,4 +1,5 @@
-//! Workflow coverage for the integrity a lockfile keeps after it is replayed.
+//! Workflow coverage for what an install writes back to the lockfile it
+//! replays: a package's integrity and the URL that serves it.
 
 mod support;
 
@@ -182,4 +183,104 @@ async fn a_pin_the_fetched_bytes_do_not_match_fails_the_install_and_stays() {
 
     assert_eq!(project.read_file("lpm.lock"), pinned);
     assert!(!project.file_exists("node_modules/pinned/package.json"));
+}
+
+const REFRESHED_URL_NOTICE: &str = "stale tarball URL";
+
+/// Installs the single project, then leaves it as a fresh checkout: the
+/// lockfile, nothing installed, nothing in the store.
+async fn fresh_checkout(registry: &MockRegistry) -> TempProject {
+    let project = single_project();
+    registry
+        .with_package("pinned", "1.0.0", &make_tarball("pinned", "1.0.0"))
+        .await;
+    lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+    forget_install(&project);
+    std::fs::remove_dir_all(project.store_dir()).unwrap();
+    project
+}
+
+fn output_of(install: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    )
+}
+
+#[tokio::test]
+async fn a_download_from_the_locked_url_is_not_reported_as_a_refreshed_url() {
+    let registry = MockRegistry::start().await;
+    let project = fresh_checkout(&registry).await;
+    let locked = project.read_file("lpm.lock");
+
+    let install = lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    let output = output_of(install.get_output());
+    assert!(!output.contains(REFRESHED_URL_NOTICE), "{output}");
+    assert_eq!(project.read_file("lpm.lock"), locked);
+    assert!(project.file_exists("node_modules/pinned/package.json"));
+}
+
+#[tokio::test]
+async fn a_download_from_a_registry_an_npmrc_names_is_not_reported_as_a_refreshed_url() {
+    let registry = MockRegistry::start().await;
+    let scoped = MockRegistry::start().await;
+    scoped
+        .with_package(
+            "@acme/pinned",
+            "1.0.0",
+            &make_tarball("@acme/pinned", "1.0.0"),
+        )
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"@acme/pinned":"1.0.0"}}"#,
+    );
+    project.write_file(".npmrc", &format!("@acme:registry={}/\n", scoped.url()));
+    lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+    forget_install(&project);
+    std::fs::remove_dir_all(project.store_dir()).unwrap();
+    let locked = project.read_file("lpm.lock");
+    assert!(locked.contains(&scoped.url()), "{locked}");
+
+    let install = lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    let output = output_of(install.get_output());
+    assert!(!output.contains(REFRESHED_URL_NOTICE), "{output}");
+    assert_eq!(project.read_file("lpm.lock"), locked);
+    assert!(project.file_exists("node_modules/@acme/pinned/package.json"));
+}
+
+#[tokio::test]
+async fn a_download_from_another_url_than_the_locked_one_is_recorded_and_reported() {
+    let registry = MockRegistry::start().await;
+    let project = fresh_checkout(&registry).await;
+    let locked = project.read_file("lpm.lock");
+    let served = registry.tarball_url("pinned", "1.0.0");
+    assert!(locked.contains(&served), "{locked}");
+    project.write_file(
+        "lpm.lock",
+        &locked.replace(&served, &format!("{served}.moved")),
+    );
+
+    let install = lpm_with_registry(&project, &registry.url())
+        .args(INSTALL)
+        .assert()
+        .success();
+
+    let output = output_of(install.get_output());
+    assert!(output.contains(REFRESHED_URL_NOTICE), "{output}");
+    assert_eq!(project.read_file("lpm.lock"), locked);
 }
