@@ -46,6 +46,21 @@ fn terminate_child_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// The real `npm`, with `user_config` as its user configuration and
+/// `home` as its home. Its global configuration is a file in `home` that
+/// doesn't exist: the one below the Node prefix belongs to the machine.
+pub fn npm_configured_by(user_config: &Path, home: &Path) -> Command {
+    let mut command = Command::new("npm");
+    command
+        .env_remove("npm_config_userconfig")
+        .env_remove("npm_config_globalconfig")
+        .env("HOME", home)
+        .env("NPM_CONFIG_USERCONFIG", user_config)
+        .env("NPM_CONFIG_GLOBALCONFIG", home.join("global.npmrc"))
+        .env("NO_COLOR", "1");
+    command
+}
+
 pub struct VerdaccioRegistry {
     child: Child,
     config_dir: TempDir,
@@ -290,16 +305,13 @@ impl VerdaccioRegistry {
         );
 
         let npm_home = TempDir::new().expect("failed to create verdaccio npm home");
-        let mut command = Command::new("npm");
+        let mut command = npm_configured_by(&pkg_dir.path().join(".npmrc"), npm_home.path());
         command.arg("publish").arg("--registry").arg(self.url());
         if name.starts_with('@') {
             command.args(["--access", "public"]);
         }
         let output = command
             .current_dir(pkg_dir.path())
-            .env("HOME", npm_home.path())
-            .env("NPM_CONFIG_USERCONFIG", pkg_dir.path().join(".npmrc"))
-            .env("NO_COLOR", "1")
             .output()
             .expect("failed to run npm publish against verdaccio");
 
