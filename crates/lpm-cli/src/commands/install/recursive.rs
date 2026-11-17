@@ -1202,6 +1202,7 @@ fn select_workspace_install_targets(
             path: member.path.clone(),
             kind: "member",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
+                &member.path,
                 &member.package,
             ),
             dependency_count: package_install_dependency_count(&member.package),
@@ -1263,6 +1264,7 @@ fn select_workspace_install_targets(
             path: workspace.root.clone(),
             kind: "root",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
+                &workspace.root,
                 &workspace.root_package,
             ),
             dependency_count: package_install_dependency_count(&workspace.root_package),
@@ -2224,7 +2226,9 @@ mod tests {
             importer: ".".to_string(),
             path: path.to_path_buf(),
             kind: "root",
-            lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
+            lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
+                path, package,
+            ),
             dependency_count: package_install_dependency_count(package),
             has_registry_resolution_roots: package_install_dependency_count(package) > 0,
             resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
@@ -2243,7 +2247,10 @@ mod tests {
             importer: if kind == "root" { "." } else { path }.to_string(),
             path: PathBuf::from(path),
             kind,
-            lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
+            lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
+                Path::new(path),
+                package,
+            ),
             dependency_count: package_install_dependency_count(package),
             has_registry_resolution_roots: package_install_dependency_count(package) > 0,
             resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),

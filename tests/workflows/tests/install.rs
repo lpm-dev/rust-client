@@ -1294,6 +1294,113 @@ fs.appendFileSync('root-lifecycle.log', `${phase}:${event}:${pkg}:${marker}\n`);
     );
 }
 
+const RECORDING_NODE_GYP: &str = r#"const fs = require('fs');
+const event = process.env.npm_lifecycle_event || 'missing-event';
+fs.appendFileSync('node-gyp.log', `${process.argv.slice(2).join(' ')}:${event}\n`);
+"#;
+
+/// A project with a `binding.gyp` at its root, and a `node-gyp` that
+/// records how it was run, named the way a caller names their own.
+fn native_addon_project(manifest: &str) -> (TempProject, std::path::PathBuf) {
+    let project = TempProject::empty(manifest);
+    project.write_file("binding.gyp", "{ 'targets': [] }\n");
+    project.write_file("recording-node-gyp.js", RECORDING_NODE_GYP);
+    let node_gyp = project.path().join("recording-node-gyp.js");
+    (project, node_gyp)
+}
+
+fn install_native_addon_project(
+    project: &TempProject,
+    node_gyp: &std::path::Path,
+) -> std::process::Output {
+    lpm(project)
+        .env("npm_config_node_gyp", node_gyp)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .output()
+        .expect("failed to run lpm install")
+}
+
+#[test]
+fn bare_install_builds_the_binding_gyp_beside_the_manifest_each_time() {
+    let (project, node_gyp) =
+        native_addon_project(r#"{ "name": "native-addon", "version": "1.0.0" }"#);
+
+    for run in 1..=2 {
+        let output = install_native_addon_project(&project, &node_gyp);
+        assert!(
+            output.status.success(),
+            "install {run}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            project.read_file("node-gyp.log"),
+            "rebuild:install\n".repeat(run),
+            "install {run}"
+        );
+    }
+}
+
+/// With no `node-gyp` among the project's packages and none named by the
+/// caller, the build runs the one of the npm installed beside `node`.
+#[cfg(unix)]
+#[test]
+fn bare_install_builds_a_binding_gyp_with_the_node_gyp_of_the_npm_beside_node() {
+    let (project, _) = native_addon_project(r#"{ "name": "native-addon", "version": "1.0.0" }"#);
+    let host = tempfile::tempdir().unwrap();
+    let prefix = host.path().join("node's home");
+    let node = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("node"))
+        .find(|candidate| candidate.is_file())
+        .expect("node on PATH");
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::os::unix::fs::symlink(&node, prefix.join("bin").join("node")).unwrap();
+    let node_gyp = prefix.join("lib/node_modules/npm/node_modules/node-gyp");
+    std::fs::create_dir_all(node_gyp.join("bin")).unwrap();
+    std::fs::write(node_gyp.join("bin").join("node-gyp.js"), RECORDING_NODE_GYP).unwrap();
+    std::fs::write(
+        node_gyp.join("package.json"),
+        r#"{ "name": "node-gyp", "version": "11.2.0" }"#,
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .env("PATH", prefix.join("bin"))
+        .env_remove("npm_config_node_gyp")
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("node-gyp.log"), "rebuild:install\n");
+}
+
+#[test]
+fn bare_install_leaves_a_binding_gyp_its_manifest_speaks_for_unbuilt() {
+    for manifest in [
+        r#"{ "name": "native-addon", "version": "1.0.0", "gypfile": false }"#,
+        r#"{ "name": "native-addon", "version": "1.0.0", "scripts": { "install": "node -e 0" } }"#,
+        r#"{ "name": "native-addon", "version": "1.0.0", "scripts": { "preinstall": "node -e 0" } }"#,
+    ] {
+        let (project, node_gyp) = native_addon_project(manifest);
+
+        let output = install_native_addon_project(&project, &node_gyp);
+
+        assert!(
+            output.status.success(),
+            "{manifest}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!project.path().join("node-gyp.log").exists(), "{manifest}");
+    }
+}
+
 #[tokio::test]
 async fn install_add_does_not_run_root_prepare_lifecycle() {
     let mock = MockRegistry::start().await;
