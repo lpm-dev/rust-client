@@ -168,7 +168,8 @@ fn rebuild_dry_run_reports_success_and_package_count() {
           },
           "trusted": false
         }
-      ]
+      ],
+      "approvals_required": []
     }
     "#);
 }
