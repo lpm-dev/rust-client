@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { markdownTableCell } from "./markdown-table.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "../..");
@@ -640,7 +641,7 @@ function renderMarkdown(report) {
         info.version || "-",
         info.path || "-",
       ]
-        .map(escapeCell)
+        .map((cell) => markdownTableCell(cell))
         .join(" | ")
         .replace(/^/, "| ")
         .replace(/$/, " |"),
@@ -687,7 +688,7 @@ function renderResultRow(result) {
     metric("maxMs"),
     result.reason || "",
   ]
-    .map(escapeCell)
+    .map((cell) => markdownTableCell(cell))
     .join(" | ")
     .replace(/^/, "| ")
     .replace(/$/, " |");
@@ -837,10 +838,6 @@ function round(value) {
   return Math.round(value * 100) / 100;
 }
 
-function escapeCell(value) {
-  return String(value).replace(/\|/g, "\\|").replace(/\n/g, " ");
-}
-
 function sanitizeName(value) {
   return String(value).replace(/[^A-Za-z0-9_.-]/g, "-");
 }
@@ -921,6 +918,19 @@ function printCaseList() {
 }
 
 function runSelfTests() {
+  assert.equal(
+    renderResultRow({
+      group: "g",
+      scenario: "s",
+      runner: "r",
+      command: { display: "a|b" },
+      status: "fail",
+      iterations: 0,
+      reason: "x\ny",
+    }),
+    "| g | s | r | a\\|b | fail | 0 | - | - | - | - | - | x y |",
+  );
+
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-run-bin-bench-self-test-"));
   try {
     createFixtureProject(tmp);

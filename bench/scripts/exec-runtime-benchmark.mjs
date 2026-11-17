@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { markdownTableCell } from "./markdown-table.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(SCRIPT_DIR, "../..");
@@ -1002,7 +1003,7 @@ function renderResultRow(result) {
       result.helperInvocations || "-",
       result.format,
       result.projectMode,
-      `${result.status}: ${escapeCell(result.reason || "")}`,
+      `${result.status}: ${markdownTableCell(result.reason || "")}`,
       result.iterations,
       "-",
       "-",
@@ -1158,10 +1159,6 @@ function tail(value, maxChars) {
 
 function round(value) {
   return Math.round(value * 100) / 100;
-}
-
-function escapeCell(value) {
-  return String(value).replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
 function removeTree(target) {

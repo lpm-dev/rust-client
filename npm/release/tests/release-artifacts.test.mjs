@@ -642,8 +642,19 @@ test("Windows command shims use structured cmd arguments without escaped quotes"
 
   assert.deepEqual(windowsCommandInvocation(command, ["--version"]), {
     command: "cmd.exe",
-    args: ["/D", "/S", "/C", "call", command, "--version"],
+    args: ["/D", "/V:OFF", "/S", "/C", "call", command, "--version"],
   });
+});
+
+test("Windows command shims refuse arguments that cmd.exe would reinterpret", () => {
+  const command = path.join("C:\\", "release smoke", "lpm.cmd");
+  for (const unsafe of ["a&b", "a|b", "a<b", "a>b", "a^b", "%PATH%", 'a"b', "a\nb", "a\rb", "a=b", "a,b", "a;b"]) {
+    assert.throws(
+      () => windowsCommandInvocation(path.join("C:\\", unsafe, "lpm.cmd"), ["--version"]),
+      /cmd\.exe/,
+    );
+    assert.throws(() => windowsCommandInvocation(command, [unsafe]), /cmd\.exe/);
+  }
 });
 
 test(

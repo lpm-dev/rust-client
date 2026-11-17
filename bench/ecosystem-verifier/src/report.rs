@@ -12,14 +12,14 @@ pub fn write_markdown(path: &Path, report: &ComparisonReport) -> Result<()> {
     writeln!(output).expect("write string");
     writeln!(
         output,
-        "- Reference: `{}`",
-        markdown(&report.reference_manager)
+        "- Reference: {}",
+        code_span(&report.reference_manager)
     )
     .expect("write string");
     writeln!(
         output,
-        "- Candidate: `{}`",
-        markdown(&report.candidate_manager)
+        "- Candidate: {}",
+        code_span(&report.candidate_manager)
     )
     .expect("write string");
     writeln!(
@@ -103,7 +103,7 @@ pub fn write_markdown(path: &Path, report: &ComparisonReport) -> Result<()> {
         writeln!(
             output,
             "| {} | {} | {} | {} | {:.2}× | {} |",
-            markdown(manager),
+            table_text(manager),
             telemetry.unique_identities,
             telemetry.unique_instances,
             telemetry.additional_peer_instances,
@@ -118,7 +118,7 @@ pub fn write_markdown(path: &Path, report: &ComparisonReport) -> Result<()> {
         writeln!(output, "## Candidate evidence gaps").expect("write string");
         writeln!(output).expect("write string");
         for capability in &report.capability_gaps {
-            writeln!(output, "- `{}`", markdown(capability)).expect("write string");
+            writeln!(output, "- {}", code_span(capability)).expect("write string");
         }
         writeln!(output).expect("write string");
     }
@@ -127,7 +127,7 @@ pub fn write_markdown(path: &Path, report: &ComparisonReport) -> Result<()> {
         writeln!(output, "## Unsupported reference policy").expect("write string");
         writeln!(output).expect("write string");
         for gap in &report.compatibility_gaps {
-            writeln!(output, "- `{}`", markdown(gap)).expect("write string");
+            writeln!(output, "- {}", code_span(gap)).expect("write string");
         }
         writeln!(output).expect("write string");
     }
@@ -146,12 +146,12 @@ pub fn write_markdown(path: &Path, report: &ComparisonReport) -> Result<()> {
         for discrepancy in report.discrepancies.iter().take(MARKDOWN_DISCREPANCY_LIMIT) {
             writeln!(
                 output,
-                "| {:?} | `{}` | `{}` | `{}` | {} |",
+                "| {:?} | {} | {} | {} | {} |",
                 discrepancy.severity,
-                markdown(&discrepancy.category),
-                markdown(discrepancy.importer.as_deref().unwrap_or("—")),
-                markdown(discrepancy.subject.as_deref().unwrap_or("—")),
-                markdown(&discrepancy.message)
+                table_code_span(&discrepancy.category),
+                table_code_span(discrepancy.importer.as_deref().unwrap_or("—")),
+                table_code_span(discrepancy.subject.as_deref().unwrap_or("—")),
+                table_text(&discrepancy.message)
             )
             .expect("write string");
         }
@@ -181,8 +181,33 @@ pub fn write_markdown(path: &Path, report: &ComparisonReport) -> Result<()> {
     })
 }
 
-fn markdown(value: &str) -> String {
+/// `value` as inline code. A backslash can't escape a backtick inside a
+/// code span, so the fence is one backtick longer than the value's longest
+/// run of them, with a space inside each fence where the value starts or
+/// ends with a backtick, or starts and ends with a space. Line breaks become
+/// spaces.
+fn code_span(value: &str) -> String {
+    let value = value.replace(['\r', '\n'], " ");
+    let longest_run = value.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run + 1);
+    let pad = value.starts_with('`')
+        || value.ends_with('`')
+        || (value.starts_with(' ') && value.ends_with(' ') && !value.trim().is_empty());
+    let pad = if pad { " " } else { "" };
+    format!("{fence}{pad}{value}{pad}{fence}")
+}
+
+/// [`code_span`] in a table cell. GFM splits a row into cells before it
+/// parses code spans, so a pipe needs its backslash there too.
+fn table_code_span(value: &str) -> String {
+    code_span(value).replace('|', "\\|")
+}
+
+/// `value` as text in a table cell: backslashes escaped first, so each one
+/// renders as itself, then pipes and backticks. Line breaks become spaces.
+fn table_text(value: &str) -> String {
     value
+        .replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace('`', "\\`")
         .replace(['\r', '\n'], " ")
@@ -219,7 +244,7 @@ mod tests {
                 category: "edge|mismatch".into(),
                 importer: Some("packages/app".into()),
                 subject: Some("a`b".into()),
-                message: "first\nsecond".into(),
+                message: "first\nsecond C:\\tmp\\".into(),
                 expected: None,
                 actual: None,
             }],
@@ -230,10 +255,20 @@ mod tests {
         write_markdown(&output, &report).expect("write report");
         let rendered = std::fs::read_to_string(output).expect("read report");
 
-        assert!(rendered.contains("`edge\\|mismatch`"));
-        assert!(rendered.contains("`a\\`b`"));
-        assert!(rendered.contains("first second"));
-        assert!(rendered.contains("override debug => npm:obug@^1"));
+        assert!(rendered.contains("- Reference: `pnpm`"));
+        assert!(rendered.contains(
+            "| Error | `edge\\|mismatch` | `packages/app` | ``a`b`` | first second C:\\\\tmp\\\\ |"
+        ));
+        assert!(rendered.contains("- `override debug => npm:obug@^1`"));
+    }
+
+    #[test]
+    fn code_spans_fence_past_the_longest_backtick_run_and_pad_edge_backticks() {
+        assert_eq!(code_span("plain"), "`plain`");
+        assert_eq!(code_span("a``b"), "```a``b```");
+        assert_eq!(code_span("`a"), "`` `a ``");
+        assert_eq!(code_span(" a "), "`  a  `");
+        assert_eq!(code_span("two\nlines"), "`two lines`");
     }
 
     fn empty_peer_amplification() -> PeerAmplification {
