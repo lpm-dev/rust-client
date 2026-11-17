@@ -1170,8 +1170,12 @@ fn helper_missing_message(searched: &[PathBuf]) -> String {
 /// Removes the sandbox access `package`'s lifecycle scripts were given in
 /// `project_dir`, once the package leaves the project: on Windows, what
 /// its AppContainer identity there was granted, and its profile. `false`
-/// when it had none, as on other systems.
-pub fn release_package_identity(project_dir: &Path, package: &str) -> Result<bool, SandboxError> {
+/// when it had none, as on other systems. After a failure,
+/// [`release_identities_left_behind`] tries again.
+pub fn release_package_identity(
+    project_dir: &Path,
+    package: &str,
+) -> Result<bool, IdentityLeftBehind> {
     #[cfg(target_os = "windows")]
     {
         windows_appcontainer::release_package_identity(project_dir, package)
@@ -1183,18 +1187,50 @@ pub fn release_package_identity(project_dir: &Path, package: &str) -> Result<boo
     }
 }
 
-/// [`release_package_identity`] for every identity whose project no
-/// longer exists: how many it released, and why it couldn't release the
-/// others. One that keeps failing, as one whose grant only an
-/// administrator can remove does, doesn't hold back the rest.
-pub fn release_identities_of_removed_projects() -> (usize, Vec<SandboxError>) {
+/// A package left its project, and the sandbox access its scripts had
+/// there couldn't be removed. Says what to do about it.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}. {}", match .unrecorded {
+    None => "Run `lpm cache clean` to try again".to_owned(),
+    Some(why) => format!(
+        "`lpm cache clean` removes that access once the project is gone; that it tries \
+         before then couldn't be recorded: {why}"
+    ),
+})]
+pub struct IdentityLeftBehind {
+    /// Why the access is still there.
+    pub error: SandboxError,
+    /// Why [`release_identities_left_behind`] won't try again while the
+    /// project exists; `None` when it will.
+    pub unrecorded: Option<String>,
+}
+
+/// What [`release_identities_left_behind`] released, and what it
+/// couldn't.
+#[derive(Debug, Default)]
+pub struct ReleasedIdentities {
+    /// Identities of projects that no longer exist.
+    pub of_removed_projects: usize,
+    /// Identities that couldn't be released when their package left a
+    /// project that is still there.
+    pub of_removed_packages: usize,
+    /// Why each of the others couldn't be released.
+    pub failed: Vec<SandboxError>,
+}
+
+/// [`release_package_identity`] for every identity that was left behind:
+/// one whose project no longer exists, and one that couldn't be released
+/// when its package left the project. One that keeps failing, as one
+/// whose grant only an administrator can remove does, doesn't hold back
+/// the rest.
+pub fn release_identities_left_behind() -> ReleasedIdentities {
     #[cfg(target_os = "windows")]
     {
-        windows_appcontainer::release_identities_of_removed_projects()
+        windows_appcontainer::release_identities_left_behind()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        (0, Vec::new())
+        ReleasedIdentities::default()
     }
 }
 
@@ -1421,6 +1457,30 @@ mod tests {
             dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_identity_left_behind_says_when_its_release_is_tried_again() {
+        let left_behind = |unrecorded: Option<&str>| IdentityLeftBehind {
+            error: SandboxError::IdentityCleanupFailed {
+                project: PathBuf::from("/project"),
+                package: "esbuild".to_owned(),
+                reason: "the identity is held".to_owned(),
+            },
+            unrecorded: unrecorded.map(str::to_owned),
+        };
+
+        assert_eq!(
+            left_behind(None).to_string(),
+            "couldn't remove the sandbox access esbuild's scripts had in /project: the identity \
+             is held. Run `lpm cache clean` to try again"
+        );
+        assert_eq!(
+            left_behind(Some("the record can't be read")).to_string(),
+            "couldn't remove the sandbox access esbuild's scripts had in /project: the identity \
+             is held. `lpm cache clean` removes that access once the project is gone; that it \
+             tries before then couldn't be recorded: the record can't be read"
+        );
     }
 
     /// A program this process, or a child another thread forked, still

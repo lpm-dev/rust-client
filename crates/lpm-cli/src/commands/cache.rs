@@ -206,24 +206,21 @@ fn run_clean(
             // Windows keeps the sandbox access a package's scripts had in a
             // project with an AppContainer identity of the project's.
             let released_identities = if category.is_none() {
-                let (released, failed) = lpm_sandbox::release_identities_of_removed_projects();
-                for error in failed {
+                let mut released = lpm_sandbox::release_identities_left_behind();
+                for error in released.failed.drain(..) {
                     install_ui::warn_untrusted(&error.to_string());
                 }
                 released
             } else {
-                0
+                lpm_sandbox::ReleasedIdentities::default()
             };
 
             if json_output {
                 emit_clean_json(&cleaned, &skipped);
             } else {
                 emit_clean_human(&cleaned, &skipped);
-                if released_identities > 0 {
-                    install_ui::done_untrusted(&format!(
-                        "Removed the sandbox access of {released_identities} package{} in projects that no longer exist",
-                        if released_identities == 1 { "" } else { "s" }
-                    ));
+                for line in released_identities_lines(&released_identities) {
+                    install_ui::done_untrusted(&line);
                 }
             }
 
@@ -238,6 +235,24 @@ fn run_clean(
             Ok(())
         },
     )
+}
+
+fn released_identities_lines(released: &lpm_sandbox::ReleasedIdentities) -> Vec<String> {
+    let packages = |count: usize| format!("{count} package{}", if count == 1 { "" } else { "s" });
+    let mut lines = Vec::new();
+    if released.of_removed_projects > 0 {
+        lines.push(format!(
+            "Removed the sandbox access of {} in projects that no longer exist",
+            packages(released.of_removed_projects)
+        ));
+    }
+    if released.of_removed_packages > 0 {
+        lines.push(format!(
+            "Removed the sandbox access of {} that `lpm uninstall` had left behind",
+            packages(released.of_removed_packages)
+        ));
+    }
+    lines
 }
 
 struct OpenCacheRoots {
@@ -643,6 +658,28 @@ mod tests {
         for name in files {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
+    }
+
+    #[test]
+    fn released_sandbox_access_is_reported_by_why_it_was_left() {
+        let released = |of_removed_projects, of_removed_packages| lpm_sandbox::ReleasedIdentities {
+            of_removed_projects,
+            of_removed_packages,
+            failed: Vec::new(),
+        };
+
+        assert!(released_identities_lines(&released(0, 0)).is_empty());
+        assert_eq!(
+            released_identities_lines(&released(2, 0)),
+            ["Removed the sandbox access of 2 packages in projects that no longer exist"]
+        );
+        assert_eq!(
+            released_identities_lines(&released(3, 1)),
+            [
+                "Removed the sandbox access of 3 packages in projects that no longer exist",
+                "Removed the sandbox access of 1 package that `lpm uninstall` had left behind",
+            ]
+        );
     }
 
     #[test]

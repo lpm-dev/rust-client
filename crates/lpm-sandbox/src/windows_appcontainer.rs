@@ -100,26 +100,54 @@ struct IdentityRecord {
     version: u32,
     project: PathBuf,
     package: String,
+    /// The package left the project and the identity couldn't be released
+    /// then, so the next sweep tries again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    left_behind: bool,
 }
 
 const IDENTITY_RECORD_VERSION: u32 = 1;
 
+impl IdentityRecord {
+    fn read(path: &Path) -> Option<Self> {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|record| record.version == IDENTITY_RECORD_VERSION)
+    }
+
+    fn write(&self, path: &Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).expect("an identity record serializes");
+        lpm_common::write_file_atomic(path, bytes)
+    }
+}
+
 /// Records which project and package `name` belongs to, unless that is
-/// recorded already.
+/// recorded already. A record that says the package left is of an
+/// earlier stay: the package is back, and keeps the identity.
 fn record_identity(records: &Path, name: &str, project: &Path, package: &str) {
     let path = identity_record_path(records, name);
-    if path.exists() {
+    let recorded = path.exists();
+    if recorded && !IdentityRecord::read(&path).is_some_and(|record| record.left_behind) {
         return;
     }
     let record = IdentityRecord {
         version: IDENTITY_RECORD_VERSION,
         project: project.to_path_buf(),
         package: package.to_owned(),
+        left_behind: false,
     };
-    let bytes = serde_json::to_vec_pretty(&record).expect("an identity record serializes");
-    if let Err(error) =
-        std::fs::create_dir_all(records).and_then(|()| lpm_common::write_file_atomic(&path, bytes))
-    {
+    let Err(error) = std::fs::create_dir_all(records).and_then(|()| record.write(&path)) else {
+        return;
+    };
+    if recorded {
+        tracing::warn!(
+            "couldn't record that {package} is back in {}, so the next `lpm cache clean` \
+             removes the sandbox access its scripts have there, and the run after that sets \
+             it up again: {error}",
+            project.display()
+        );
+    } else {
         tracing::warn!(
             "couldn't record the sandbox identity of {package} in {}, so removing the package \
              won't remove the access its scripts had: {error}",
@@ -131,78 +159,166 @@ fn record_identity(records: &Path, name: &str, project: &Path, package: &str) {
 pub(crate) fn release_package_identity(
     project_dir: &Path,
     package: &str,
-) -> Result<bool, SandboxError> {
+) -> Result<bool, crate::IdentityLeftBehind> {
     let Some(records) = identity_records() else {
         return Ok(false);
     };
-    let name = appcontainer_name_for(project_dir, package);
-    if !identity_record_path(&records, &name).exists() {
-        return Ok(false);
-    }
-    release_identity(&records, &name, project_dir, package)?;
-    Ok(true)
+    release_package_identity_in(&records, locate_sandbox_helper, project_dir, package)
 }
 
-pub(crate) fn release_identities_of_removed_projects() -> (usize, Vec<SandboxError>) {
+/// Releases the identity `package` has in `project_dir`, if `records`
+/// holds one. One that can't be released is recorded as left behind, so
+/// that [`release_identities_left_behind`] tries again.
+fn release_package_identity_in(
+    records: &Path,
+    helper: impl FnOnce() -> Result<PathBuf, SandboxError>,
+    project_dir: &Path,
+    package: &str,
+) -> Result<bool, crate::IdentityLeftBehind> {
+    let name = appcontainer_name_for(project_dir, package);
+    let path = identity_record_path(records, &name);
+    if !path.exists() {
+        return Ok(false);
+    }
+    helper()
+        .and_then(|helper| {
+            release_identity(
+                records,
+                &helper,
+                &name,
+                project_dir,
+                package,
+                Released::Forgotten,
+            )
+        })
+        .map(|()| true)
+        .map_err(|error| crate::IdentityLeftBehind {
+            error,
+            unrecorded: record_as_left_behind(&path, project_dir, package).err(),
+        })
+}
+
+/// Says in the identity record `path` that `package` left `project`, or
+/// why that couldn't be said. A record that can't be parsed is replaced:
+/// what it should say is known here. One another release wrote isn't.
+fn record_as_left_behind(path: &Path, project: &Path, package: &str) -> Result<(), String> {
+    let parsed = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<IdentityRecord>(&bytes).ok());
+    let record = match parsed {
+        Some(record) if record.version != IDENTITY_RECORD_VERSION => {
+            return Err(format!("another release of lpm wrote {}", path.display()));
+        }
+        Some(record) if record.left_behind => return Ok(()),
+        Some(record) => IdentityRecord {
+            left_behind: true,
+            ..record
+        },
+        None => IdentityRecord {
+            version: IDENTITY_RECORD_VERSION,
+            project: project.to_path_buf(),
+            package: package.to_owned(),
+            left_behind: true,
+        },
+    };
+    record
+        .write(path)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+pub(crate) fn release_identities_left_behind() -> crate::ReleasedIdentities {
     let Some(records) = identity_records() else {
-        return (0, Vec::new());
+        return crate::ReleasedIdentities::default();
     };
-    let entries = match std::fs::read_dir(&records) {
+    release_identities_left_behind_in(&records, locate_sandbox_helper)
+}
+
+fn release_identities_left_behind_in(
+    records: &Path,
+    helper: impl FnOnce() -> Result<PathBuf, SandboxError>,
+) -> crate::ReleasedIdentities {
+    let mut released = crate::ReleasedIdentities::default();
+    let entries = match std::fs::read_dir(records) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (0, Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return released,
         Err(error) => {
-            return (
-                0,
-                vec![SandboxError::IdentityCleanupFailed {
-                    project: records,
-                    package: String::new(),
-                    reason: error.to_string(),
-                }],
-            );
+            released.failed.push(SandboxError::IdentityCleanupFailed {
+                project: records.to_path_buf(),
+                package: String::new(),
+                reason: error.to_string(),
+            });
+            return released;
         }
     };
-    let mut released = 0;
-    let mut failed = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name
-            .to_str()
-            .and_then(|file_name| file_name.strip_suffix(".identity.json"))
-        else {
-            continue;
-        };
-        let Some(record) = std::fs::read(entry.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<IdentityRecord>(&bytes).ok())
-            .filter(|record| record.version == IDENTITY_RECORD_VERSION)
-        else {
-            continue;
-        };
-        if record.project.exists() {
-            continue;
+    let left_behind: Vec<(String, IdentityRecord)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry
+                .file_name()
+                .to_str()?
+                .strip_suffix(".identity.json")?
+                .to_owned();
+            let record = IdentityRecord::read(&entry.path())?;
+            (record.left_behind || !record.project.exists()).then_some((name, record))
+        })
+        .collect();
+    if left_behind.is_empty() {
+        return released;
+    }
+    let helper = match helper() {
+        Ok(helper) => helper,
+        Err(error) => {
+            released.failed.push(error);
+            return released;
         }
-        match release_identity(&records, name, &record.project, &record.package) {
-            Ok(()) => released += 1,
-            Err(error) => failed.push(error),
+    };
+    for (name, record) in left_behind {
+        let (then, count) = if record.project.exists() {
+            (Released::Kept, &mut released.of_removed_packages)
+        } else {
+            (Released::Forgotten, &mut released.of_removed_projects)
+        };
+        match release_identity(
+            records,
+            &helper,
+            &name,
+            &record.project,
+            &record.package,
+            then,
+        ) {
+            Ok(()) => *count += 1,
+            Err(error) => released.failed.push(error),
         }
     }
-    (released, failed)
+    released
+}
+
+/// What becomes of an identity's record once the identity is released.
+enum Released {
+    Forgotten,
+    /// The record stays and stops saying that the package left. In a
+    /// project that is still there the package may be back, and a run of
+    /// it records its identity before its helper holds it; removing the
+    /// record here could remove that run's.
+    Kept,
 }
 
 /// Has the helper revoke what `name` was granted and delete its profile,
-/// then removes its identity record.
+/// then does to its identity record what `then` says.
 fn release_identity(
     records: &Path,
+    helper: &Path,
     name: &str,
     project: &Path,
     package: &str,
+    then: Released,
 ) -> Result<(), SandboxError> {
     let failed = |reason: String| SandboxError::IdentityCleanupFailed {
         project: project.to_path_buf(),
         package: package.to_owned(),
         reason,
     };
-    let output = Command::new(locate_sandbox_helper()?)
+    let output = Command::new(helper)
         .arg("--protocol-version")
         .arg(PROTOCOL_VERSION.to_string())
         .arg("--appcontainer-name")
@@ -223,7 +339,18 @@ fn release_identity(
     if let Some(reason) = heard_from(output.status, &output.stderr, &removing) {
         return Err(failed(reason));
     }
-    match std::fs::remove_file(identity_record_path(records, name)) {
+    let path = identity_record_path(records, name);
+    let recorded = match then {
+        Released::Forgotten => std::fs::remove_file(&path),
+        Released::Kept => IdentityRecord {
+            version: IDENTITY_RECORD_VERSION,
+            project: project.to_path_buf(),
+            package: package.to_owned(),
+            left_behind: false,
+        }
+        .write(&path),
+    };
+    match recorded {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(failed(error.to_string())),
@@ -1720,6 +1847,196 @@ mod tests {
 
         assert!(matches!(nothing, AfterRun::Nothing), "{nothing:?}");
         assert!(matches!(told, AfterRun::Unknown(_)), "{told:?}");
+    }
+
+    /// A folder for identity records and a project beside it, with two
+    /// scripts that stand in for the helper: one that fails as a cleanup
+    /// that found the identity held does, and one that succeeds and
+    /// writes down what it was started with.
+    struct Releases {
+        folder: tempfile::TempDir,
+    }
+
+    impl Releases {
+        fn new() -> Self {
+            let folder = tempfile::tempdir().unwrap();
+            std::fs::create_dir(folder.path().join("project")).unwrap();
+            std::fs::write(
+                folder.path().join("fails.cmd"),
+                "@echo lpm-sandbox-helper: the identity is held 1>&2\r\n@exit /b 66\r\n",
+            )
+            .unwrap();
+            std::fs::write(
+                folder.path().join("works.cmd"),
+                "@echo %*>> \"%~dp0released.txt\"\r\n@exit /b 0\r\n",
+            )
+            .unwrap();
+            Self { folder }
+        }
+
+        fn records(&self) -> PathBuf {
+            self.folder.path().join("records")
+        }
+
+        fn project(&self) -> PathBuf {
+            self.folder.path().join("project")
+        }
+
+        /// Records the identity of `package` in the project, as a run of
+        /// its scripts does, and says where.
+        fn run_of(&self, package: &str) -> PathBuf {
+            let name = appcontainer_name_for(&self.project(), package);
+            record_identity(&self.records(), &name, &self.project(), package);
+            identity_record_path(&self.records(), &name)
+        }
+
+        fn uninstall_of(
+            &self,
+            package: &str,
+            helper: &str,
+        ) -> Result<bool, crate::IdentityLeftBehind> {
+            let helper = self.folder.path().join(helper);
+            release_package_identity_in(&self.records(), || Ok(helper), &self.project(), package)
+        }
+
+        /// Sweeps, and says how many identities it released of packages
+        /// that left the project, of projects that are gone, and what
+        /// failed.
+        fn sweep(&self) -> (usize, usize, Vec<SandboxError>) {
+            let helper = self.folder.path().join("works.cmd");
+            let released = release_identities_left_behind_in(&self.records(), || Ok(helper));
+            (
+                released.of_removed_packages,
+                released.of_removed_projects,
+                released.failed,
+            )
+        }
+
+        /// How often the helper that works was started for `package`.
+        fn releases_of(&self, package: &str) -> usize {
+            let name = appcontainer_name_for(&self.project(), package);
+            std::fs::read_to_string(self.folder.path().join("released.txt"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|started_with| started_with.contains(&name))
+                .count()
+        }
+    }
+
+    #[test]
+    fn a_release_that_failed_when_its_package_left_is_tried_again_by_the_sweep() {
+        let releases = Releases::new();
+        let left = releases.run_of("left");
+        releases.run_of("stays");
+
+        let failed = releases.uninstall_of("left", "fails.cmd");
+        let (released, of_gone_projects, failures) = releases.sweep();
+        let (released_again, _, _) = releases.sweep();
+
+        let failed = failed.expect_err("the helper failed");
+        assert!(
+            matches!(
+                &failed.error,
+                SandboxError::IdentityCleanupFailed { reason, .. }
+                    if reason.contains("the identity is held")
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(failed.unrecorded, None);
+        assert_eq!(released, 1, "{failures:?}");
+        assert_eq!(of_gone_projects, 0, "the project is still there");
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(released_again, 0, "one that was released isn't left behind");
+        assert_eq!(releases.releases_of("left"), 1);
+        assert_eq!(
+            releases.releases_of("stays"),
+            0,
+            "a package still in its project keeps its identity"
+        );
+        assert!(
+            left.exists(),
+            "the record of a project that is still there stays for a run that has the package back"
+        );
+    }
+
+    #[test]
+    fn a_package_that_is_back_keeps_the_identity_its_failed_release_left_behind() {
+        let releases = Releases::new();
+        releases.run_of("back");
+        let failed = releases.uninstall_of("back", "fails.cmd");
+
+        let record = releases.run_of("back");
+        let (released, _, failures) = releases.sweep();
+
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(released, 0, "{failures:?}");
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(releases.releases_of("back"), 0);
+        assert!(record.exists());
+    }
+
+    #[test]
+    fn a_failed_release_is_recorded_over_a_record_that_can_t_be_parsed() {
+        let releases = Releases::new();
+        let record = releases.run_of("unparsable");
+        std::fs::write(&record, "not a record").unwrap();
+
+        let failed = releases.uninstall_of("unparsable", "fails.cmd");
+        let (released, _, failures) = releases.sweep();
+
+        assert_eq!(failed.expect_err("the helper failed").unrecorded, None);
+        assert_eq!(released, 1, "{failures:?}");
+        assert_eq!(releases.releases_of("unparsable"), 1);
+    }
+
+    #[test]
+    fn a_failed_release_that_can_t_be_recorded_says_so() {
+        let releases = Releases::new();
+        let record = releases.run_of("unrecorded");
+        let of_another_release = serde_json::json!({
+            "version": IDENTITY_RECORD_VERSION + 1,
+            "project": releases.project(),
+            "package": "unrecorded",
+        });
+        std::fs::write(&record, serde_json::to_vec(&of_another_release).unwrap()).unwrap();
+
+        let failed = releases.uninstall_of("unrecorded", "fails.cmd");
+        let (released, _, failures) = releases.sweep();
+
+        let unrecorded = failed.expect_err("the helper failed").unrecorded;
+        assert!(
+            unrecorded
+                .as_deref()
+                .is_some_and(|why| why.contains("another release of lpm wrote")),
+            "{unrecorded:?}"
+        );
+        assert_eq!(released, 0, "{failures:?}");
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            serde_json::to_vec(&of_another_release).unwrap(),
+            "another release's record is left as it is"
+        );
+    }
+
+    #[test]
+    fn a_release_that_works_leaves_nothing_and_the_sweep_takes_a_gone_project_s_identities() {
+        let releases = Releases::new();
+        let released_at_once = releases.run_of("uninstalled");
+        let of_a_gone_project = releases.run_of("orphan");
+
+        let uninstalled = releases.uninstall_of("uninstalled", "works.cmd");
+        let never_ran = releases.uninstall_of("never-ran", "works.cmd");
+        let (_, before, _) = releases.sweep();
+        std::fs::remove_dir(releases.project()).unwrap();
+        let (of_left_packages, after, failures) = releases.sweep();
+
+        assert!(matches!(uninstalled, Ok(true)), "{uninstalled:?}");
+        assert!(matches!(never_ran, Ok(false)), "{never_ran:?}");
+        assert!(!released_at_once.exists());
+        assert_eq!(before, 0, "the project is still there");
+        assert_eq!(after, 1, "{failures:?}");
+        assert_eq!(of_left_packages, 0, "no uninstall left it behind");
+        assert!(!of_a_gone_project.exists());
     }
 
     #[test]
