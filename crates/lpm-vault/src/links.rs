@@ -130,10 +130,12 @@ trait LinkStore {
 const DAMAGED_PREFIX: &str = "This env project's folder links on this machine can't be read";
 
 fn decode(bytes: &[u8]) -> Result<LinkRecord, String> {
+    /// Read as any number, as LPM Vault reads it, so the two agree on
+    /// which records are from a later version.
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Version {
-        schema_version: u64,
+        schema_version: f64,
     }
     let damaged = |error: serde_json::Error| {
         format!(
@@ -142,7 +144,7 @@ fn decode(bytes: &[u8]) -> Result<LinkRecord, String> {
         )
     };
     let version: Version = serde_json::from_slice(bytes).map_err(damaged)?;
-    if version.schema_version > u64::from(LINKS_SCHEMA_VERSION) {
+    if version.schema_version > f64::from(LINKS_SCHEMA_VERSION) {
         return Err(
             "This env project's folder links on this machine were written by a newer LPM CLI or \
              LPM Vault, which this LPM CLI can't read. Update the LPM CLI: lpm self-update"
@@ -410,7 +412,7 @@ pub(crate) fn require_for_write(
             (FolderLink::Linked, Some(_)) => {}
             (FolderLink::Linked, None) => {
                 let first = first_record(store, vault_id);
-                insert(store, &folder, vault_id, first)?;
+                insert(store, &folder, vault_id, Listing::First(first))?;
             }
         }
         Ok(folder.clone())
@@ -437,12 +439,16 @@ fn replace_damaged_in(
     folder: &Path,
     vault_id: &str,
 ) -> Result<(), String> {
-    let folders = match resolve(store, vault_id) {
-        Ok(resolved) => resolved.folders.unwrap_or_default(),
-        Err(error) if is_damaged(&error) => BTreeSet::new(),
+    let listing = match resolve(store, vault_id) {
+        Ok(Resolved {
+            folders: Some(folders),
+            ..
+        }) => Listing::Existing(folders),
+        Ok(_) => Listing::First(first_record(store, vault_id)),
+        Err(error) if is_damaged(&error) => Listing::First(first_record(store, vault_id)),
         Err(error) => return Err(error),
     };
-    insert(store, folder, vault_id, folders).map(drop)
+    insert(store, folder, vault_id, listing).map(drop)
 }
 
 /// Links `project_dir` to the vault `vault_id`; whether it wasn't listed
@@ -454,11 +460,11 @@ pub(crate) fn add(
 ) -> Result<(bool, PathBuf), String> {
     let folder = link_folder_path(project_dir);
     let added = with_store(directory, |store| {
-        let folders = match resolve(store, vault_id)?.folders {
-            Some(folders) => folders,
-            None => first_record(store, vault_id),
+        let listing = match resolve(store, vault_id)?.folders {
+            Some(folders) => Listing::Existing(folders),
+            None => Listing::First(first_record(store, vault_id)),
         };
-        insert(store, &folder, vault_id, folders)
+        insert(store, &folder, vault_id, listing)
     })?;
     Ok((added, folder))
 }
@@ -476,26 +482,38 @@ fn first_record(store: &mut dyn LinkStore, vault_id: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Writes `folders` with `folder`, already resolved, added; whether it was
-/// added.
+/// A vault's link list before a folder is added to it.
+enum Listing {
+    /// The list the vault has.
+    Existing(BTreeSet<String>),
+    /// What a vault without a list starts one from. It's written even when
+    /// it names the folder already, so the folder's link holds from then on.
+    First(BTreeSet<String>),
+}
+
+/// Writes the list with `folder`, already resolved, added; whether the
+/// folder is newly listed.
 fn insert(
     store: &mut dyn LinkStore,
     folder: &Path,
     vault_id: &str,
-    mut folders: BTreeSet<String>,
+    listing: Listing,
 ) -> Result<bool, String> {
     let key = folder_key(folder).ok_or_else(|| unlinkable(folder, vault_id))?;
-    let added = folders.insert(key.to_owned());
-    if added {
+    let (mut folders, first) = match listing {
+        Listing::Existing(folders) => (folders, false),
+        Listing::First(folders) => (folders, true),
+    };
+    let listed = folders.insert(key.to_owned()) || first;
+    if listed {
         store.write(vault_id, &record_of(folders))?;
     }
     store.note_linked(vault_id, folder);
-    Ok(added)
+    Ok(listed)
 }
 
 /// Unlinks `folder` from the vault `vault_id`; whether it was linked. A
-/// vault from before links is resolved first, and one that kept nothing
-/// from any folder gets an empty list, so the folder stays unlinked.
+/// vault from before links is resolved first.
 pub(crate) fn remove(
     directory: &VaultStorageDirectory,
     folder: &Path,
@@ -631,7 +649,13 @@ mod tests {
         let (_root, paths) = make_folders(&["own", "copy"]);
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
 
         assert_eq!(
             check_in(&mut store, &paths[0], "vault").unwrap().0,
@@ -731,7 +755,13 @@ mod tests {
             "vault".into(),
             ("proj-a".into(), paths[0].display().to_string()),
         );
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
 
         for _ in 0..3 {
             check_in(&mut store, &paths[0], "vault").unwrap();
@@ -745,7 +775,13 @@ mod tests {
         let (_root, paths) = make_folders(&["own", "copy"]);
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
 
         store.noted.clear();
         check_in(&mut store, &paths[1], "vault").unwrap();
@@ -763,7 +799,7 @@ mod tests {
             &mut store,
             &link_folder_path(&root.path().join("own/../own")),
             "vault",
-            BTreeSet::new(),
+            Listing::First(BTreeSet::new()),
         )
         .unwrap();
 
@@ -820,7 +856,7 @@ mod tests {
         );
 
         let first = first_record(&mut store, "vault");
-        insert(&mut store, &paths[1], "vault", first).unwrap();
+        insert(&mut store, &paths[1], "vault", Listing::First(first)).unwrap();
 
         assert_eq!(
             store.records["vault"].folders,
@@ -835,7 +871,13 @@ mod tests {
         let alias = root.path().join("alias");
         std::os::unix::fs::symlink(root.path().join("parent"), &alias).unwrap();
         let mut store = MemoryLinkStore::default();
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
         std::fs::remove_dir(&paths[0]).unwrap();
 
         assert!(remove_in(&mut store, &alias.join("own"), "vault").unwrap());
@@ -860,7 +902,13 @@ mod tests {
         let (_root, paths) = make_folders(&["own"]);
         let mut store = MemoryLinkStore::default();
 
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
 
         assert_eq!(store.noted, [("vault".to_owned(), paths[0].clone())]);
     }
@@ -870,7 +918,13 @@ mod tests {
         let (_root, paths) = make_folders(&["own"]);
         let mut store = MemoryLinkStore::default();
         store.values.insert("vault".into());
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
         store.reads = 0;
 
         let (link, folders) = check_in(&mut store, &paths[0], "vault").unwrap();
@@ -909,7 +963,9 @@ mod tests {
     #[test]
     fn a_link_list_from_a_later_version_is_refused_with_how_to_update() {
         let refusal = decode(br#"{"schemaVersion":2,"folders":[],"devices":{}}"#).unwrap_err();
+        let fractional = decode(br#"{"schemaVersion":2.0,"folders":{}}"#).unwrap_err();
 
+        assert!(fractional.contains("lpm self-update"), "{fractional}");
         assert!(refusal.contains("lpm self-update"), "{refusal}");
         assert!(crate::is_env_project_refusal(&refusal), "{refusal}");
         assert!(!is_damaged(&refusal), "{refusal}");
@@ -966,10 +1022,39 @@ mod tests {
         };
 
         assert!(unlinked.project_name.is_none());
-        insert(&mut store, &paths[0], "vault", BTreeSet::new()).unwrap();
+        insert(
+            &mut store,
+            &paths[0],
+            "vault",
+            Listing::First(BTreeSet::new()),
+        )
+        .unwrap();
         assert_eq!(
             check_in(&mut store, &paths[0], "vault").unwrap().0,
             FolderLink::Linked
         );
+    }
+
+    #[test]
+    fn linking_the_folder_a_vault_records_writes_its_first_list() {
+        let (_root, paths) = make_folders(&["recorded", "other"]);
+        let mut store = MemoryLinkStore::default();
+        store.projects.insert(
+            "vault".into(),
+            ("proj-a".into(), paths[0].display().to_string()),
+        );
+
+        let first = first_record(&mut store, "vault");
+        let listed = insert(&mut store, &paths[0], "vault", Listing::First(first)).unwrap();
+
+        assert!(listed);
+        assert_eq!(
+            store.records["vault"].folders,
+            BTreeSet::from([paths[0].display().to_string()])
+        );
+        assert!(matches!(
+            check_in(&mut store, &paths[1], "vault").unwrap().0,
+            FolderLink::Unlinked(_)
+        ));
     }
 }

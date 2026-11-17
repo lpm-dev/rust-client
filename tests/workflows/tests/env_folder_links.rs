@@ -289,13 +289,16 @@ fn a_deleted_folder_can_be_unlinked_by_its_path() {
     );
     std::fs::remove_dir_all(&checkout).unwrap();
     // Another spelling of the deleted folder's path, through a link to its
-    // parent.
-    let alias = project.path().join("alias");
+    // parent. Windows grants symbolic links only with a privilege, so it
+    // unlinks the path as linked.
     #[cfg(unix)]
-    std::os::unix::fs::symlink(project.path(), &alias).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(project.path(), &alias).unwrap();
-    let spelled = alias.join("second-checkout");
+    let spelled = {
+        let alias = project.path().join("alias");
+        std::os::unix::fs::symlink(project.path(), &alias).unwrap();
+        alias.join("second-checkout")
+    };
+    #[cfg(not(unix))]
+    let spelled = checkout.clone();
 
     let unlink = lpm_in(
         &project,
