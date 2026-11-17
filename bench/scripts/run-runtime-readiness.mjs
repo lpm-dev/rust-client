@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { markdownTableCell } from './markdown-table.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const SCHEMA_VERSION = 2;
@@ -3018,7 +3019,7 @@ function renderMarkdown(summary, comparison) {
     for (const [metric, result] of Object.entries(group.metrics)) {
       const metricVerdict = group.performance_gates ? result.verdict : 'advisory: baseline correctness failed';
       if (!result.baseline || !result.candidate) {
-        lines.push(`| ${group.scenario} | ${group.successful_pairs}/${group.observed_pairs}/${group.expected_pairs} | ${metric} | n/a | n/a | n/a | ${metricVerdict}: ${result.reason} |`);
+        lines.push(`| ${group.scenario} | ${group.successful_pairs}/${group.observed_pairs}/${group.expected_pairs} | ${metric} | n/a | n/a | n/a | ${markdownTableCell(`${metricVerdict}: ${result.reason}`)} |`);
         continue;
       }
       lines.push(`| ${group.scenario} | ${group.successful_pairs}/${group.observed_pairs}/${group.expected_pairs} | ${metric} | ${formatMetric(metric, result.baseline.median)}/${formatMetric(metric, result.baseline.p95)} | ${formatMetric(metric, result.candidate.median)}/${formatMetric(metric, result.candidate.p95)} | ${result.median_delta_pct}%/${result.p95_delta_pct}% | ${metricVerdict} |`);
@@ -3218,7 +3219,7 @@ function jsonFiniteReplacer(_key, value) {
 }
 
 function defaultOutputDir() {
-  const stamp = new Date().toISOString().replace(/[-:.]/g, '').replace('Z', 'Z');
+  const stamp = new Date().toISOString().replace(/[-:.]/g, '');
   return path.join(os.tmpdir(), `lpm-runtime-readiness-${stamp}-${process.pid}`);
 }
 
@@ -3408,6 +3409,23 @@ function printHelp() {
 }
 
 async function runSelfTests() {
+  const advisoryRow = renderMarkdown([], {
+    verdict: 'fail',
+    baseline: 'a',
+    candidate: 'b',
+    groups: [{
+      scenario: 's',
+      successful_pairs: 0,
+      observed_pairs: 1,
+      expected_pairs: 1,
+      performance_gates: true,
+      metrics: { wall_ms: { verdict: 'fail', reason: 'no pairs | a\nb' } },
+      correctness: { baseline_failures: 0, candidate_failures: 0 },
+      failures: [],
+    }],
+  });
+  assert.ok(advisoryRow.includes('| s | 0/1/1 | wall_ms | n/a | n/a | n/a | fail: no pairs \\| a b |'), advisoryRow);
+
   assert.equal(defaultTimeoutMs('pr'), 15_000);
   assert.equal(defaultTimeoutMs('full'), 60_000);
   assert.equal(benchmarkShutdownTimeoutMs(), 10_000);

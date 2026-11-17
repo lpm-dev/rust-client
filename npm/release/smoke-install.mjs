@@ -225,11 +225,9 @@ function verifyGeneratedCommands({ installPrefix, expectedVersion }) {
       assertRegularFile(command, "npm-generated Windows command shim");
     }
 
-    const cmdVersionInvocation = windowsCommandInvocation(cmdLpm, ["--version"]);
-    const cmdVersion = runChecked(cmdVersionInvocation.command, cmdVersionInvocation.args);
+    const cmdVersion = runWindowsCommand(cmdLpm, ["--version"]);
     assertCliVersion(cmdVersion.stdout, expectedVersion);
-    const cmdHelpInvocation = windowsCommandInvocation(cmdLpx, ["--help"]);
-    runChecked(cmdHelpInvocation.command, cmdHelpInvocation.args);
+    runWindowsCommand(cmdLpx, ["--help"]);
 
     const powerShellVersion = runChecked(
       "pwsh.exe",
@@ -254,11 +252,34 @@ function verifyGeneratedCommands({ installPrefix, expectedVersion }) {
   runChecked(lpx, ["--help"]);
 }
 
+// cmd.exe parses its command line itself. It expands `%` variables even inside
+// quotes, `call` doubles carets, npm's shims set `dp0` from their own path
+// without quotes, and Node quotes only arguments that contain whitespace or
+// quotes, so unquoted `,;=` split a word. `/V:OFF` keeps `!` literal even where
+// the registry enables delayed expansion.
+const CMD_RESERVED = /["%&<>^|,;=\r\n]/;
+
 export function windowsCommandInvocation(command, args) {
+  for (const value of [command, ...args]) {
+    if (CMD_RESERVED.test(value)) {
+      throw new Error(`cmd.exe would reinterpret a character in ${JSON.stringify(value)}`);
+    }
+  }
   return {
     command: "cmd.exe",
-    args: ["/D", "/S", "/C", "call", command, ...args],
+    args: ["/D", "/V:OFF", "/S", "/C", "call", command, ...args],
   };
+}
+
+function runWindowsCommand(command, args) {
+  const invocation = windowsCommandInvocation(command, args);
+  return checkedResult(
+    command,
+    spawnSync(invocation.command, invocation.args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
 }
 
 function verifiedTarballPath(root, record) {
@@ -322,11 +343,17 @@ function sha256File(file) {
 }
 
 function runChecked(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    ...options,
-  });
+  return checkedResult(
+    command,
+    spawnSync(command, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      ...options,
+    }),
+  );
+}
+
+function checkedResult(command, result) {
   if (result.error) {
     throw new Error(`failed to run ${command}: ${result.error.message}`, { cause: result.error });
   }

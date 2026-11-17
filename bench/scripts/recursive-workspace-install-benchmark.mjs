@@ -7,6 +7,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { markdownTableCell } from './markdown-table.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const args = parseArgs(process.argv.slice(2));
@@ -371,7 +372,7 @@ function renderMarkdown(summary) {
   for (const manager of summary.manager_order) {
     const result = summary.results[manager];
     lines.push(
-      `| ${manager} | ${escapeCell(result.version)} | ${result.wall_ms_median} ms | ${result.wall_ms_p95} ms | ${result.wall_ms_min} ms | ${result.wall_ms_max} ms | ${result.relative_to_fastest}× | ${result.lockfile_count} | ${result.lockfile_sidecar_count} |`,
+      `| ${manager} | ${markdownTableCell(result.version)} | ${result.wall_ms_median} ms | ${result.wall_ms_p95} ms | ${result.wall_ms_min} ms | ${result.wall_ms_max} ms | ${result.relative_to_fastest}× | ${result.lockfile_count} | ${result.lockfile_sidecar_count} |`,
     );
   }
   lines.push(
@@ -578,10 +579,6 @@ function removeTree(target) {
 
 function tail(value, maxChars) {
   return value.length > maxChars ? value.slice(value.length - maxChars) : value;
-}
-
-function escapeCell(value) {
-  return String(value).replaceAll('|', '\\|').replaceAll('\n', ' ');
 }
 
 function runSelfTests() {

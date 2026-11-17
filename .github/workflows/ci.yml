@@ -226,6 +226,9 @@ jobs:
       - name: Dev-command bench helper tests
         run: node --test bench/scripts/test-dev-command-suite.mjs
 
+      - name: Markdown table helper tests
+        run: node --test bench/scripts/test-markdown-table.mjs
+
       - name: Runtime readiness bench helper tests
         run: node bench/scripts/run-runtime-readiness.mjs --self-test
 

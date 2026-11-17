@@ -5,6 +5,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { markdownTableCell } from './markdown-table.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
@@ -185,7 +186,7 @@ const plan = {
   lpm_routes: lpmRoutes,
   lpm_firewall_modes: lpmFirewallModes,
   lpm_binaries: lpmBinaries.map((binary) => ({ name: binary.name, path: binary.path })),
-  lpm_cells: lpmCells.map((cell) => ({ name: cell.name, env: cell.env })),
+  lpm_cells: planLpmCells(lpmCells),
   lpm_comparison: lpmComparison
     ? {
         ...lpmComparison,
@@ -351,8 +352,9 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
       if (installedOk) {
         cleanProjectForWarm(projectDir);
         if (spec.manager === 'bun') {
-          removeTree(env.BUN_INSTALL_CACHE_DIR);
-          assert.equal(fs.existsSync(env.BUN_INSTALL_CACHE_DIR), false);
+          const bunCacheDir = bunInstallCacheDir(homeDir);
+          removeTree(bunCacheDir);
+          assert.equal(fs.existsSync(bunCacheDir), false);
           assert.equal(fs.existsSync(path.join(projectDir, 'bun.lock')) || fs.existsSync(path.join(projectDir, 'bun.lockb')), true);
         } else {
           cleanLpmDependencyState(lpmHome);
@@ -1100,6 +1102,10 @@ function buildRunSpecs(managers, binaries, cells, routes, firewallModes) {
   return specs;
 }
 
+function bunInstallCacheDir(homeDir) {
+  return path.join(homeDir, '.bun', 'install', 'cache');
+}
+
 function buildEnv({ homeDir, lpmHome, spec }) {
   const keep = [
     'PATH',
@@ -1145,7 +1151,7 @@ function buildEnv({ homeDir, lpmHome, spec }) {
   env.npm_config_cache = env.NPM_CONFIG_CACHE;
   env.PNPM_HOME = path.join(homeDir, '.pnpm-home');
   env.BUN_INSTALL = path.join(homeDir, '.bun');
-  env.BUN_INSTALL_CACHE_DIR = path.join(homeDir, '.bun', 'install', 'cache');
+  env.BUN_INSTALL_CACHE_DIR = bunInstallCacheDir(homeDir);
   env.CI = '1';
 
   if (spec.manager === 'lpm') {
@@ -2330,7 +2336,7 @@ function renderWarningSummaryMarkdown(summary) {
     lines.push('', '| Count | ID | Label | Example |', '| ---: | --- | --- | --- |');
     for (const warning of summary.expected) {
       lines.push(
-        `| ${warning.count} | ${warning.id} | ${warning.label} | ${markdownCell(warning.samples[0] ?? '')} |`,
+        `| ${warning.count} | ${warning.id} | ${warning.label} | ${markdownTableCell(warning.samples[0] ?? '', '<br>')} |`,
       );
     }
   }
@@ -2344,14 +2350,10 @@ function renderWarningSummaryMarkdown(summary) {
       const firstRun = warning.runs[0]
         ? `${warning.runs[0].fixture}/${warning.runs[0].spec}/${warning.runs[0].mode}/sample-${warning.runs[0].sample}`
         : '';
-      lines.push(`| ${warning.count} | ${markdownCell(warning.line)} | ${firstRun} |`);
+      lines.push(`| ${warning.count} | ${markdownTableCell(warning.line, '<br>')} | ${firstRun} |`);
     }
   }
   return lines.join('\n');
-}
-
-function markdownCell(value) {
-  return String(value).replace(/\|/g, '\\|').replace(/\n/g, '<br>');
 }
 
 function isWarningLikeLine(line) {
@@ -2364,6 +2366,16 @@ function isWarningLikeLine(line) {
 }
 
 function runSelfTests() {
+  assert.deepEqual(planLpmCells([{ name: 'auth', env: { LPM_TOKEN: 'secret', LPM_X: '1' } }]), [
+    { name: 'auth', env: { LPM_TOKEN: '[redacted]', LPM_X: '1' } },
+  ]);
+  const warningMarkdown = renderWarningSummaryMarkdown({
+    expected: [{ count: 1, id: 'w', label: 'W', samples: ['C:\\tmp\\\nnext|x'] }],
+    unexpected: [{ count: 2, line: 'a\r\nb', runs: [] }],
+  });
+  assert.ok(warningMarkdown.includes('| 1 | w | W | C:\\\\tmp\\\\<br>next\\|x |'), warningMarkdown);
+  assert.ok(warningMarkdown.includes('| 2 | a<br>b |  |'), warningMarkdown);
+
   for (const count of [2, 3, 4]) {
     const specs = Array.from({length: count}, (_, index) => index);
     const orders = Array.from({length: count * 2}, (_, sample) => balancedReferenceOrder(specs, sample + 1));
@@ -3104,6 +3116,10 @@ function tail(value) {
     return trimmed;
   }
   return trimmed.slice(trimmed.length - 2000);
+}
+
+function planLpmCells(cells) {
+  return cells.map((cell) => ({ name: cell.name, env: redactedEnv(cell.env) }));
 }
 
 function redactedEnv(env) {
