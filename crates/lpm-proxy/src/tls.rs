@@ -292,12 +292,14 @@ async fn serve_tls_http_connection(
     };
     let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
     let io = hyper_util::rt::TokioIo::new(tls_stream);
+    let forwarded_for = super::http::forwarded_for(peer);
     let service =
         hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
             let state = state.clone();
+            let forwarded_for = forwarded_for.clone();
             async move {
                 let request = request.map(axum::body::Body::new);
-                let response = proxy_http_request_inner(state, request, peer)
+                let response = proxy_http_request_inner(state, request, forwarded_for)
                     .await
                     .unwrap_or_else(|response| response);
                 Ok::<_, Infallible>(response)
