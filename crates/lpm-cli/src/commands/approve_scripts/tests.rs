@@ -27,7 +27,19 @@ fn security_test_dir() -> &'static PathBuf {
     })
 }
 
-fn security_test_env_vars() -> [(&'static str, OsString); 3] {
+/// An npm configuration that names no registry and holds no credential, so
+/// an approval's requests go where the test's client sends them and not
+/// where this machine's `.npmrc` would.
+fn empty_npmrc() -> &'static PathBuf {
+    static NPMRC: OnceLock<PathBuf> = OnceLock::new();
+    NPMRC.get_or_init(|| {
+        let path = security_test_dir().join("empty.npmrc");
+        fs::write(&path, "").expect("write empty npmrc");
+        path
+    })
+}
+
+fn approval_test_env_vars() -> [(&'static str, OsString); 6] {
     [
         (
             TEST_SECURITY_DIR_ENV,
@@ -35,17 +47,39 @@ fn security_test_env_vars() -> [(&'static str, OsString); 3] {
         ),
         (TEST_SECURITY_SECRET_ENV, TEST_SECURITY_SECRET.into()),
         (TEST_SECURITY_AUTH_RESULT_ENV, "approve".into()),
+        (
+            "NPM_CONFIG_USERCONFIG",
+            empty_npmrc().as_os_str().to_owned(),
+        ),
+        (
+            "NPM_CONFIG_GLOBALCONFIG",
+            empty_npmrc().as_os_str().to_owned(),
+        ),
+        ("LPM_NPM_ROUTE", "direct".into()),
     ]
 }
 
 fn ensure_security_test_backend() -> crate::test_env::ScopedEnv {
-    crate::test_env::ScopedEnv::set(security_test_env_vars())
+    crate::test_env::ScopedEnv::set(approval_test_env_vars())
 }
 
 fn scoped_lpm_home_with_security(path: &Path) -> crate::test_env::ScopedEnv {
-    let mut vars = security_test_env_vars().to_vec();
+    let mut vars = approval_test_env_vars().to_vec();
     vars.push(("LPM_HOME", path.as_os_str().to_owned()));
     crate::test_env::ScopedEnv::set(vars)
+}
+
+/// A client whose registries refuse the connection, for an approval that
+/// must not depend on what a registry answers.
+fn unreachable_registry() -> lpm_registry::RegistryClient {
+    lpm_registry::RegistryClient::new()
+        .with_base_url("http://127.0.0.1:9")
+        .with_npm_registry_url("http://127.0.0.1:9")
+        .with_cache_dir(None)
+}
+
+fn direct_routes() -> lpm_registry::RouteTable {
+    lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct)
 }
 
 async fn run(
@@ -56,7 +90,7 @@ async fn run(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let registry = lpm_registry::RegistryClient::new();
+    let registry = unreachable_registry();
     super::project::run(
         &registry,
         project_dir,
@@ -72,7 +106,7 @@ async fn run(
 /// The security test backend without its automatic approval, so a guarded
 /// mutation asks for one.
 fn security_test_backend_without_auto_approval() -> crate::test_env::ScopedEnv {
-    crate::test_env::ScopedEnv::update(security_test_env_vars().map(|(key, value)| {
+    crate::test_env::ScopedEnv::update(approval_test_env_vars().map(|(key, value)| {
         let value = (key != TEST_SECURITY_AUTH_RESULT_ENV).then_some(value);
         (key, value)
     }))
@@ -2542,9 +2576,11 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
         false,
         true,
         ApprovalProvenanceContext::new(
-            &lpm_registry::RegistryClient::new(),
+            &unreachable_registry(),
+            &root,
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2617,9 +2653,11 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
         false,
         true,
         ApprovalProvenanceContext::new(
-            &lpm_registry::RegistryClient::new(),
+            &unreachable_registry(),
+            &root,
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2650,9 +2688,11 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
         false,
         true,
         ApprovalProvenanceContext::new(
-            &lpm_registry::RegistryClient::new(),
+            &unreachable_registry(),
+            &root,
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2674,9 +2714,11 @@ async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
         &[],
         false,
         ApprovalProvenanceContext::new(
-            &lpm_registry::RegistryClient::new(),
+            &unreachable_registry(),
+            &root,
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2697,9 +2739,7 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
     ];
     let row_refs: Vec<_> = rows.iter().collect();
     let policy = deny_verify_policy();
-    let registry = lpm_registry::RegistryClient::new()
-        .with_npm_registry_url("http://127.0.0.1:9")
-        .with_cache_dir(None);
+    let registry = unreachable_registry();
     crate::provenance_fetch::reset_provenance_batch_call_count();
     global::reset_global_trust_write_count();
 
@@ -2707,7 +2747,7 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
         &root,
         &row_refs,
         false,
-        ApprovalProvenanceContext::new(&registry, &policy, EnforceMode::Deny),
+        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
     )
     .await
     .unwrap();
@@ -2722,17 +2762,19 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
 async fn provenance_batch_keeps_distinct_same_coordinate_artifacts_separate() {
     let tmp = tempdir().unwrap();
     let _env = scoped_lpm_home_with_security(tmp.path());
-    let registry = lpm_registry::RegistryClient::new()
-        .with_npm_registry_url("http://127.0.0.1:9")
-        .with_cache_dir(None);
+    let registry = unreachable_registry();
     let mut first = make_blocked("native-addon", "1.0.0");
     first.integrity = Some("sha512-artifact-a".into());
     let mut second = make_blocked("native-addon", "1.0.0");
     second.integrity = Some("sha512-artifact-b".into());
 
-    let provenance =
-        fetch_provenance_for_effective_set(&registry, &[first, second], &deny_verify_policy())
-            .await;
+    let provenance = fetch_provenance_for_effective_set(
+        &registry,
+        &direct_routes(),
+        &[first, second],
+        &deny_verify_policy(),
+    )
+    .await;
 
     assert_eq!(
         provenance.len(),
@@ -2745,19 +2787,394 @@ async fn provenance_batch_keeps_distinct_same_coordinate_artifacts_separate() {
 async fn provenance_batch_treats_registry_transport_failure_as_degraded() {
     let tmp = tempdir().unwrap();
     let _env = scoped_lpm_home_with_security(tmp.path());
-    let registry = lpm_registry::RegistryClient::new()
-        .with_npm_registry_url("http://127.0.0.1:9")
-        .with_cache_dir(None);
+    let registry = unreachable_registry();
     let blocked = make_blocked("native-addon", "1.0.0");
 
-    let provenance =
-        fetch_provenance_for_effective_set(&registry, &[blocked], &deny_verify_policy()).await;
+    let provenance = fetch_provenance_for_effective_set(
+        &registry,
+        &direct_routes(),
+        &[blocked],
+        &deny_verify_policy(),
+    )
+    .await;
     let status = provenance
         .values()
         .next()
         .expect("the attempted artifact must have a provenance status");
 
     assert_eq!(status, &ProvenanceStatus::TransportDegraded);
+}
+
+/// A registry that answers for `name@1.0.0` with the integrity
+/// [`make_blocked`] gives it and no attestation.
+async fn registry_publishing(name: &str) -> wiremock::MockServer {
+    let registry = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/{name}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": name,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/{name}/-/{name}-1.0.0.tgz", registry.uri()),
+                            "integrity": format!("sha512-{name}-integrity"),
+                        },
+                    },
+                },
+            })),
+        )
+        .mount(&registry)
+        .await;
+    registry
+}
+
+/// lpm.dev as it answers for a package it doesn't host.
+async fn registry_refusing_npm_metadata() -> wiremock::MockServer {
+    let registry = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(410)
+                .set_body_json(serde_json::json!({ "code": "npm_metadata_proxy_disabled" })),
+        )
+        .mount(&registry)
+        .await;
+    registry
+}
+
+async fn requests_to(registry: &wiremock::MockServer) -> usize {
+    registry.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+async fn provenance_capture_asks_the_public_registry_about_a_public_package() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let lpm = registry_refusing_npm_metadata().await;
+    let npm = registry_publishing("native-addon").await;
+    let registry = lpm_registry::RegistryClient::new()
+        .with_base_url(lpm.uri())
+        .with_npm_registry_url(npm.uri())
+        .with_cache_dir(None);
+
+    let provenance = fetch_provenance_for_effective_set(
+        &registry,
+        &direct_routes(),
+        &[make_blocked("native-addon", "1.0.0")],
+        &deny_verify_policy(),
+    )
+    .await;
+
+    assert_eq!(
+        provenance.values().collect::<Vec<_>>(),
+        [&ProvenanceStatus::Absent],
+        "the registry that publishes the package says it has no attestation",
+    );
+    assert_eq!(requests_to(&lpm).await, 0);
+}
+
+#[tokio::test]
+async fn a_registry_that_lists_only_a_sha1_does_not_refuse_an_artifact_known_by_its_sha512() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let archive = b"native-addon archive";
+    let sha512 = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha512,
+        archive,
+    )
+    .to_string();
+    let sha1 = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha1,
+        archive,
+    );
+    let mut blocked = make_blocked("native-addon", "1.0.0");
+    blocked.integrity = Some(sha512);
+    let npm = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/native-addon"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "native-addon",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "native-addon",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/native-addon/-/native-addon-1.0.0.tgz", npm.uri()),
+                            "shasum": hex::encode(&sha1.hash),
+                        },
+                    },
+                },
+            })),
+        )
+        .mount(&npm)
+        .await;
+    let registry = unreachable_registry().with_npm_registry_url(npm.uri());
+
+    let provenance = fetch_provenance_for_effective_set(
+        &registry,
+        &direct_routes(),
+        &[blocked],
+        &deny_verify_policy(),
+    )
+    .await;
+
+    assert_eq!(
+        provenance.values().collect::<Vec<_>>(),
+        [&ProvenanceStatus::Absent],
+        "a sha1 and a sha512 can't contradict each other",
+    );
+}
+
+#[tokio::test]
+async fn an_attestation_a_configured_registry_does_not_serve_is_no_reason_to_refuse() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let integrity = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha512,
+        b"native-addon archive",
+    )
+    .to_string();
+    let mut blocked = make_blocked("native-addon", "1.0.0");
+    blocked.integrity = Some(integrity.clone());
+    let mirror = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/native-addon"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "native-addon",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "native-addon",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/native-addon/-/native-addon-1.0.0.tgz", mirror.uri()),
+                            "integrity": integrity,
+                            "attestations": {
+                                "url": "https://registry.npmjs.org/-/npm/v1/attestations/native-addon@1.0.0",
+                            },
+                        },
+                    },
+                },
+            })),
+        )
+        .mount(&mirror)
+        .await;
+    let registry = unreachable_registry();
+    let npmrc =
+        lpm_registry::NpmrcConfig::parse(&format!("registry={}/\n", mirror.uri()), "test", &|_| {
+            None
+        });
+    let routes = lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+
+    let provenance =
+        fetch_provenance_for_effective_set(&registry, &routes, &[blocked], &deny_verify_policy())
+            .await;
+
+    assert_eq!(
+        provenance.values().collect::<Vec<_>>(),
+        [&ProvenanceStatus::TransportDegraded],
+    );
+}
+
+#[test]
+fn only_a_package_the_lockfile_records_from_a_registry_has_one_to_ask() {
+    let locked = |name: &str, source: &str| lpm_lockfile::LockedPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        source: Some(source.into()),
+        integrity: Some(format!("sha512-{name}-integrity")),
+        ..Default::default()
+    };
+    let rows = [
+        locked("from-registry", "registry+https://registry.npmjs.org"),
+        locked(
+            "from-tarball",
+            "tarball+https://example.test/from-tarball.tgz",
+        ),
+        locked("not-blocked", "registry+https://registry.npmjs.org"),
+    ];
+    let key = |name: &str| {
+        (
+            name.to_string(),
+            "1.0.0".to_string(),
+            Some(format!("sha512-{name}-integrity")),
+        )
+    };
+    let other_bytes = (
+        "from-registry".to_string(),
+        "1.0.0".to_string(),
+        Some("sha512-other".to_string()),
+    );
+
+    let recorded = recorded_registries(
+        [key("from-registry"), key("from-tarball"), other_bytes].into(),
+        rows.iter(),
+    );
+
+    assert_eq!(
+        recorded,
+        HashMap::from([(
+            key("from-registry"),
+            "https://registry.npmjs.org".to_string()
+        )])
+    );
+}
+
+#[test]
+fn a_package_the_lockfile_pins_by_another_hash_is_still_the_one_it_records() {
+    let archive = b"native-addon archive";
+    let hash =
+        |algorithm| lpm_common::integrity::Integrity::from_bytes(algorithm, archive).to_string();
+    let row = lpm_lockfile::LockedPackage {
+        name: "native-addon".into(),
+        version: "1.0.0".into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
+        integrity: Some(hash(lpm_common::integrity::HashAlgorithm::Sha1)),
+        ..Default::default()
+    };
+    let installed = (
+        "native-addon".to_string(),
+        "1.0.0".to_string(),
+        Some(hash(lpm_common::integrity::HashAlgorithm::Sha512)),
+    );
+
+    let recorded = recorded_registries([installed.clone()].into(), std::iter::once(&row));
+
+    assert_eq!(
+        recorded,
+        HashMap::from([(installed, "https://registry.npmjs.org".to_string())])
+    );
+}
+
+#[tokio::test]
+async fn provenance_capture_asks_only_the_registry_an_npmrc_names_for_a_scope() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let lpm = registry_refusing_npm_metadata().await;
+    let npm = registry_publishing("@acme/native-addon").await;
+    let private = registry_publishing("@acme/native-addon").await;
+    let registry = lpm_registry::RegistryClient::new()
+        .with_base_url(lpm.uri())
+        .with_npm_registry_url(npm.uri())
+        .with_cache_dir(None);
+    let npmrc = lpm_registry::NpmrcConfig::parse(
+        &format!("@acme:registry={}/\n", private.uri()),
+        "test",
+        &|_| None,
+    );
+    let routes = lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+
+    let provenance = fetch_provenance_for_effective_set(
+        &registry,
+        &routes,
+        &[make_blocked("@acme/native-addon", "1.0.0")],
+        &deny_verify_policy(),
+    )
+    .await;
+
+    assert_eq!(
+        provenance.values().collect::<Vec<_>>(),
+        [&ProvenanceStatus::Absent],
+    );
+    assert_eq!(requests_to(&private).await, 1);
+    assert_eq!(requests_to(&npm).await, 0);
+    assert_eq!(requests_to(&lpm).await, 0);
+}
+
+/// A global install of `eslint` whose lockfile records `esbuild` from
+/// `source`, and which blocks its script.
+fn seed_global_install_locking(root: &lpm_common::LpmRoot, source: &str) -> AggregateBlockedRow {
+    let mut blocked = row("esbuild", "0.25.1", &["eslint"]);
+    blocked.integrity = Some(
+        lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha512,
+            b"esbuild archive",
+        )
+        .to_string(),
+    );
+    seed_global_manifest_with_blocked(root, "eslint", "9.0.0", vec![blocked.clone()]);
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    let instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &blocked.name,
+        &blocked.version,
+        source,
+        "root",
+    ));
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: blocked.name.clone(),
+        version: blocked.version.clone(),
+        source: Some(source.into()),
+        integrity: blocked.integrity.clone(),
+        instance_id,
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        blocked.name.clone(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id,
+            package: blocked.name.clone(),
+            version: blocked.version.clone(),
+            source: Some(source.into()),
+        },
+    );
+    lockfile
+        .write_all(&root.global_root().join("installs/eslint@9.0.0/lpm.lock"))
+        .unwrap();
+    blocked
+}
+
+#[tokio::test]
+async fn a_global_approval_asks_the_registry_its_install_got_the_package_from() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let npm = registry_publishing("esbuild").await;
+    let registry = unreachable_registry().with_npm_registry_url(npm.uri());
+    let blocked = seed_global_install_locking(&root, &format!("registry+{}", npm.uri()));
+    let policy = deny_verify_policy();
+
+    // The registry in this test publishes other bytes under the name, so
+    // what the approval then decides is not what is being tested.
+    let _ = global::commit_global_approval_batch(
+        &root,
+        &[&blocked],
+        false,
+        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+    )
+    .await;
+
+    assert_eq!(requests_to(&npm).await, 1);
+}
+
+#[tokio::test]
+async fn a_global_approval_asks_no_registry_about_a_package_installed_from_elsewhere() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let npm = registry_publishing("esbuild").await;
+    let registry = unreachable_registry().with_npm_registry_url(npm.uri());
+    let blocked =
+        seed_global_install_locking(&root, "tarball+https://example.test/esbuild-0.25.1.tgz");
+    let policy = deny_verify_policy();
+
+    global::commit_global_approval_batch(
+        &root,
+        &[&blocked],
+        false,
+        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(requests_to(&npm).await, 0);
+    let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+    assert!(trust.trusted.contains_key("esbuild@0.25.1"));
 }
 
 /// Named-package approval writes exactly ONE entry to the trust
@@ -2782,9 +3199,11 @@ async fn run_global_named_approves_only_the_matched_row() {
         false,
         true,
         ApprovalProvenanceContext::new(
-            &lpm_registry::RegistryClient::new(),
+            &unreachable_registry(),
+            &root,
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2812,9 +3231,11 @@ async fn run_global_named_errors_for_unknown_package() {
         false,
         true,
         ApprovalProvenanceContext::new(
-            &lpm_registry::RegistryClient::new(),
+            &unreachable_registry(),
+            &root,
             &policy,
             EnforceMode::Deny,
+            true,
         ),
     )
     .await
@@ -2831,7 +3252,7 @@ async fn run_global_rejects_list_plus_yes() {
     let tmp = std::env::temp_dir();
     let _env = scoped_lpm_home(&tmp);
     let err = run_global(
-        &lpm_registry::RegistryClient::new(),
+        &unreachable_registry(),
         None,
         true,
         true,
@@ -2856,7 +3277,7 @@ async fn run_global_grouped_interactive_path_is_reachable() {
     );
     let _env = scoped_lpm_home(tmp.path());
     let err = run_global(
-        &lpm_registry::RegistryClient::new(),
+        &unreachable_registry(),
         None,
         false,
         false,
@@ -3078,9 +3499,11 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             false,
             true,
             ApprovalProvenanceContext::new(
-                &lpm_registry::RegistryClient::new(),
+                &unreachable_registry(),
+                &root,
                 &policy,
                 EnforceMode::Deny,
+                true,
             ),
         )
         .await
@@ -3095,9 +3518,11 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             false,
             true,
             ApprovalProvenanceContext::new(
-                &lpm_registry::RegistryClient::new(),
+                &unreachable_registry(),
+                &root,
                 &policy,
                 EnforceMode::Deny,
+                true,
             ),
         )
         .await

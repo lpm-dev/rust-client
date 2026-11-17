@@ -35,21 +35,69 @@ fn write_global_trust(
 #[derive(Clone, Copy)]
 pub(super) struct ApprovalProvenanceContext<'a> {
     registry: &'a lpm_registry::RegistryClient,
+    root: &'a lpm_common::LpmRoot,
     verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
     runtime_enforce: crate::provenance_fetch::EnforceMode,
+    json_output: bool,
 }
 
 impl<'a> ApprovalProvenanceContext<'a> {
     pub(super) fn new(
         registry: &'a lpm_registry::RegistryClient,
+        root: &'a lpm_common::LpmRoot,
         verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
         runtime_enforce: crate::provenance_fetch::EnforceMode,
+        json_output: bool,
     ) -> Self {
         Self {
             registry,
+            root,
             verify_policy,
             runtime_enforce,
+            json_output,
         }
+    }
+
+    /// Reads the provenance of those of `artifacts` a registry can speak
+    /// for: the ones a global install's lockfile records from the
+    /// registry a global install resolves them from now. The global
+    /// root's `.npmrc` and the lockfiles are read here and not before, so
+    /// a run that fetches nothing, such as a dry run, doesn't depend on
+    /// them.
+    async fn fetch(
+        &self,
+        artifacts: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    ) -> Result<HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>, LpmError>
+    {
+        let registries = install_registries(
+            self.registry,
+            &self.root.global_root(),
+            artifacts.iter().map(|artifact| artifact.0.as_str()),
+            self.json_output,
+        )?;
+        let lockfiles: Vec<lpm_lockfile::Lockfile> =
+            crate::global_blocked_set::install_roots(self.root)?
+                .iter()
+                .filter_map(|install| {
+                    read_lockfile(install, || {
+                        lpm_lockfile::Lockfile::read_for_project(install)
+                            .map(|project| project.lockfile)
+                    })
+                })
+                .collect();
+        let recorded = recorded_registries(
+            artifacts.iter().cloned().collect(),
+            lockfiles.iter().flat_map(|lockfile| &lockfile.packages),
+        );
+        let vouched =
+            installed_from_their_registry(&registries, &recorded, artifacts.iter().cloned());
+        Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
+            &registries.client,
+            &registries.route_table,
+            &vouched,
+            self.verify_policy,
+        )
+        .await)
     }
 }
 
@@ -192,7 +240,13 @@ async fn run_global_under_store_lock(
 
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
-    let provenance = ApprovalProvenanceContext::new(registry, &verify_policy, runtime_enforce);
+    let provenance = ApprovalProvenanceContext::new(
+        registry,
+        &root,
+        &verify_policy,
+        runtime_enforce,
+        json_output,
+    );
     if !dry_run {
         crate::security_approval::ensure_runtime_sigstore_posture_for_global(
             json_output,
@@ -503,12 +557,7 @@ pub(super) async fn run_global_bulk_yes(
     let provenance = if dry_run {
         HashMap::new()
     } else {
-        crate::provenance_fetch::fetch_provenance_for_artifacts(
-            provenance_context.registry,
-            &pairs,
-            provenance_context.verify_policy,
-        )
-        .await
+        provenance_context.fetch(&pairs).await?
     };
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
@@ -719,12 +768,7 @@ pub(super) async fn run_global_named(
     let provenance = if dry_run {
         HashMap::new()
     } else {
-        crate::provenance_fetch::fetch_provenance_for_artifacts(
-            provenance_context.registry,
-            &pairs,
-            provenance_context.verify_policy,
-        )
-        .await
+        provenance_context.fetch(&pairs).await?
     };
     let snap = snapshot_for_artifact_binding(
         &provenance,
@@ -1053,12 +1097,7 @@ async fn fetch_global_approval_snapshots(
         .iter()
         .map(|row| (row.name.clone(), row.version.clone(), row.integrity.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_artifacts(
-        provenance_context.registry,
-        &pairs,
-        provenance_context.verify_policy,
-    )
-    .await;
+    let provenance = provenance_context.fetch(&pairs).await?;
     rows.iter()
         .map(|row| {
             snapshot_for_artifact_binding(
