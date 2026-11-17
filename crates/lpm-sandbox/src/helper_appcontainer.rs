@@ -372,6 +372,26 @@ pub enum AppContainerError {
         /// Ids of the processes that still run as the identity.
         processes: processes::ProcessIds,
     },
+    /// The identity stayed held by a process that didn't take back what
+    /// a stopped run of it set, so that stays set and recorded.
+    #[error(
+        "another process holds this package's sandbox identity and hasn't taken back what \
+         the stopped run set"
+    )]
+    IdentityHeld,
+    /// A cleanup found the identity held for longer than it waits.
+    #[error(
+        "another process holds this package's sandbox identity, as a run of its scripts in \
+         this project does until the script ends, so nothing of it was cleaned up"
+    )]
+    IdentityBusy,
+    /// The process that started the run ended before the run held its
+    /// identity, so it set nothing and started no script.
+    #[error(
+        "the process that started this run ended before the run held the package's sandbox \
+         identity"
+    )]
+    CallerEnded,
     /// `GetExitCodeProcess` failed extracting the lifecycle child's
     /// exit code after it terminated.
     #[error("GetExitCodeProcess failed with Win32 error {last_error}")]
@@ -668,7 +688,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     //    identity until its script's last process is gone, so no other
     //    run of it changes its entries meanwhile. One without a grant
     //    record sets and removes them just the same.
-    let _identity = identity::lock(&args.appcontainer_name)?;
+    let _identity = identity::lock(&args.appcontainer_name, &caller)?;
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
@@ -1192,6 +1212,10 @@ fn derive_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainerError> {
     })
 }
 
+/// How long a take-back or a cleanup waits for whoever holds the identity
+/// to let go of it or, for a take-back, to take the stopped run back.
+const HELD_IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Revokes every tree the grant record names from the identity, removes
 /// the record and, when asked, deletes the profile: the cleanup an
 /// identity gets once its package leaves the project.
@@ -1202,7 +1226,12 @@ pub fn run_revoke_only(args: &HelperArgs) -> Result<i32, AppContainerError> {
             source: std::io::Error::other("--revoke-only needs --grant-record"),
         });
     };
-    let _identity = identity::lock(&args.appcontainer_name)?;
+    // The process that asked for the cleanup reads what this one says only
+    // once it has ended, so a wait without limit would be a silent one.
+    let wait_ms = u32::try_from(HELD_IDENTITY_WAIT.as_millis()).unwrap_or(u32::MAX - 1);
+    let Some(_identity) = identity::lock_within(&args.appcontainer_name, wait_ms)? else {
+        return Err(AppContainerError::IdentityBusy);
+    };
     let sid = derive_appcontainer_sid(&args.appcontainer_name)?;
     identity::revoke_all(record, sid.0)?;
     if args.delete_appcontainer_profile {
@@ -1226,6 +1255,15 @@ pub fn run_revoke_only(args: &HelperArgs) -> Result<i32, AppContainerError> {
 /// long as it lasted, as the identity's next run does before its own. The
 /// process that ended the run asks for it, so a time limit leaves no more
 /// behind than a script that exits.
+///
+/// While another process holds the identity, nothing is taken back here.
+/// A run or a cleanup of the identity that holds it takes back what an
+/// earlier run left before anything else, and the record then no longer
+/// names that run, which `--job` tells from the holder's own. A run still
+/// waiting for the identity when it was stopped had set and recorded
+/// nothing. Any other holder, which a process of any account can be,
+/// leaves the record as it is, and the take-back fails rather than report
+/// what didn't happen.
 pub fn run_take_back_run(args: &HelperArgs) -> Result<i32, AppContainerError> {
     let Some(record) = args.grant_record.as_deref() else {
         return Err(AppContainerError::GrantRecord {
@@ -1233,15 +1271,23 @@ pub fn run_take_back_run(args: &HelperArgs) -> Result<i32, AppContainerError> {
             source: std::io::Error::other("--take-back-run needs --grant-record"),
         });
     };
-    // Whoever holds the identity is a run or a cleanup of it, and each of
-    // those takes back what an earlier run left before anything else. A
-    // run still waiting for it when it was stopped had set nothing.
-    let Some(_identity) = identity::lock_if_free(&args.appcontainer_name)? else {
-        return Ok(0);
-    };
     let sid = derive_appcontainer_sid(&args.appcontainer_name)?;
-    identity::take_back_stopped_run(record, sid.0)?;
-    Ok(0)
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(_identity) = identity::lock_within(&args.appcontainer_name, 100)? {
+            identity::take_back_stopped_run(record, sid.0)?;
+            return Ok(0);
+        }
+        let still_named = match identity::names_a_stopped_run(record, args.job.as_deref()) {
+            Ok(false) => return Ok(0),
+            Ok(true) => AppContainerError::IdentityHeld,
+            // The holder may be replacing the record at this moment.
+            Err(unreadable) => unreadable,
+        };
+        if started.elapsed() >= HELD_IDENTITY_WAIT {
+            return Err(still_named);
+        }
+    }
 }
 
 /// Whether the grant record `record` still names the run whose script is
@@ -1249,7 +1295,7 @@ pub fn run_take_back_run(args: &HelperArgs) -> Result<i32, AppContainerError> {
 /// A record that can't be read is an error: no run or cleanup of the
 /// identity gets past it either.
 pub(crate) fn record_names_the_run_in(record: &Path, job: &str) -> Result<bool, AppContainerError> {
-    identity::names_the_run_in(record, job)
+    identity::names_a_stopped_run(record, Some(job))
 }
 
 fn acquire_profile_creation_lock() -> Result<ProfileCreationLock, AppContainerError> {

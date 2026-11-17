@@ -197,16 +197,52 @@ fn is_covered(path: &Path, trees: &[String]) -> bool {
     })
 }
 
+const HELD_NOTICE_AFTER_MS: u32 = 5_000;
+
 /// Holds the identity `name` for the rest of a run, against other runs
 /// of the same project and package, in any process or session.
-pub(super) fn lock(name: &str) -> Result<ProfileCreationLock, AppContainerError> {
-    setup::lock_named(&lock_name(name))
+///
+/// The lock is open to every account, as two accounts that share a
+/// project share its identities. A process that holds it and never lets
+/// go therefore keeps a run waiting, so a run that waits says what for,
+/// and gives up once the process that started it has ended.
+pub(super) fn lock(name: &str, caller: &Caller) -> Result<ProfileCreationLock, AppContainerError> {
+    use std::io::Write as _;
+
+    let lock_name = lock_name(name);
+    let caller = match caller {
+        Caller::Running(caller) => Some(caller.as_raw()),
+        Caller::Ended => return Err(AppContainerError::CallerEnded),
+        Caller::Unknown => None,
+    };
+    let mut wait_ms = HELD_NOTICE_AFTER_MS;
+    loop {
+        match setup::lock_named_while_running(&lock_name, wait_ms, caller)? {
+            setup::LockWait::Held(held) => return Ok(held),
+            setup::LockWait::WatchedEnded => return Err(AppContainerError::CallerEnded),
+            setup::LockWait::TimedOut => {}
+        }
+        if wait_ms != INFINITE {
+            // A reader gone from the other end of stderr mustn't stop the
+            // run.
+            let _ = writeln!(
+                std::io::stderr(),
+                "lpm-sandbox-helper: waiting for the process that holds this package's \
+                 sandbox identity ({lock_name}). Another run of the package's scripts in \
+                 this project would hold it until its script ends."
+            );
+            wait_ms = INFINITE;
+        }
+    }
 }
 
-/// Holds the identity `name` as [`lock`] does, unless a run or a cleanup
-/// of it holds it now.
-pub(super) fn lock_if_free(name: &str) -> Result<Option<ProfileCreationLock>, AppContainerError> {
-    setup::lock_named_within(&lock_name(name), 0)
+/// Holds the identity `name` as [`lock`] does, unless another process
+/// keeps it for longer than `wait_ms`.
+pub(super) fn lock_within(
+    name: &str,
+    wait_ms: u32,
+) -> Result<Option<ProfileCreationLock>, AppContainerError> {
+    setup::lock_named_within(&lock_name(name), wait_ms)
 }
 
 fn lock_name(name: &str) -> String {
@@ -284,11 +320,11 @@ pub(super) fn forget_run_access(
 /// take back stays in the record for the run after this one.
 pub(super) fn take_back_run_access(record: &Path, sid: PSID) -> Result<(), AppContainerError> {
     let mut recorded = read_record_strictly(record)?;
-    end_what_stopped_runs_left_running(&recorded.run, sid)?;
+    let held = end_what_stopped_runs_left_running(&recorded.run, sid)?;
     if recorded.run.is_empty() {
         return Ok(());
     }
-    let (left, _) = take_back(&recorded.run, sid);
+    let (left, _) = take_back(&recorded.run, sid, held);
     recorded.run = left;
     write_record(record, &recorded)
 }
@@ -302,19 +338,26 @@ pub(super) fn take_back_stopped_run(record: &Path, sid: PSID) -> Result<(), AppC
     if recorded.run.is_empty() {
         return Ok(());
     }
-    end_what_stopped_runs_left_running(&recorded.run, sid)?;
-    let (left, failed) = take_back(&recorded.run, sid);
+    let held = end_what_stopped_runs_left_running(&recorded.run, sid)?;
+    let (left, failed) = take_back(&recorded.run, sid, held);
     recorded.run = left;
     write_record(record, &recorded)?;
     failed.map_or(Ok(()), Err)
 }
 
-/// Whether `record` still names the run whose script is in the Job
-/// `job`: the run's helper then ended before it took back what the run
-/// set. A record that can't be read is the error it is for a run.
-pub(super) fn names_the_run_in(record: &Path, job: &str) -> Result<bool, AppContainerError> {
+/// Whether `record` still names a run that ended before it took back
+/// what it set: the run whose script was in the Job `job` or, with no Job
+/// to go by, any run. A record that can't be read is the error it is for
+/// a run.
+pub(super) fn names_a_stopped_run(
+    record: &Path,
+    job: Option<&str>,
+) -> Result<bool, AppContainerError> {
     let recorded = read_record_strictly(record)?;
-    Ok(recorded.run.jobs.iter().any(|name| name == job))
+    Ok(match job {
+        Some(job) => recorded.run.jobs.iter().any(|name| name == job),
+        None => !recorded.run.is_empty(),
+    })
 }
 
 /// Returns once no process of the runs `access` names is left, so that a
@@ -326,17 +369,24 @@ pub(super) fn names_the_run_in(record: &Path, job: &str) -> Result<bool, AppCont
 /// ended its processes. After that, and for runs whose helper made its
 /// own Job, the running processes are looked through for one still on
 /// its way out.
+///
+/// Says which of the Jobs could still be opened: something holds each of
+/// those.
 fn end_what_stopped_runs_left_running(
     access: &RunAccess,
     sid: PSID,
-) -> Result<(), AppContainerError> {
+) -> Result<Vec<String>, AppContainerError> {
     // One wait for all of it: whoever asked gives the answer a time of
     // its own, which many Jobs mustn't outlast.
     let deadline = std::time::Instant::now() + processes::LAST_PROCESS_WAIT;
     let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut held = Vec::new();
     for name in &access.jobs {
         match ScriptJob::open(name) {
-            Ok(job) => job.end_every_process(left())?,
+            Ok(job) => {
+                job.end_every_process(left())?;
+                held.push(name.clone());
+            }
             Err(AppContainerError::OpenJob {
                 last_error: ERROR_FILE_NOT_FOUND,
                 ..
@@ -344,14 +394,19 @@ fn end_what_stopped_runs_left_running(
             Err(error) => return Err(error),
         }
     }
-    processes::wait_until_none_runs_as(sid, left())
+    processes::wait_until_none_runs_as(sid, left())?;
+    Ok(held)
 }
 
 /// Removes the identity's traversal of each directory `access` names and
 /// its read denial on each secret. An entry that is gone, or became a
 /// link, holds neither. Says what it couldn't take back, and the first
-/// reason.
-fn take_back(access: &RunAccess, sid: PSID) -> (RunAccess, Option<AppContainerError>) {
+/// reason. `held_jobs` are those of `access` that something still holds.
+fn take_back(
+    access: &RunAccess,
+    sid: PSID,
+    held_jobs: Vec<String>,
+) -> (RunAccess, Option<AppContainerError>) {
     let mut left = RunAccess::default();
     let mut first = None;
     let mut keep = |held: &mut Vec<PathBuf>, path: &Path, error: AppContainerError| {
@@ -380,6 +435,14 @@ fn take_back(access: &RunAccess, sid: PSID) -> (RunAccess, Option<AppContainerEr
             Err(error) => keep(&mut left.denied, path, error),
         }
     }
+    // What is left set is still its run's, so that run's Job stays named
+    // with it: a take-back that waits on another holder of the identity
+    // tells by the name that the run isn't taken back yet. The process
+    // that started such a take-back holds the Job, so nothing waits on
+    // the name of one that is gone.
+    if !left.is_empty() {
+        left.jobs = held_jobs;
+    }
     (left, first)
 }
 
@@ -399,9 +462,10 @@ pub(super) fn revoke_all(record: &Path, sid: PSID) -> Result<(), AppContainerErr
     // While a tree still grants the identity, nothing its runs set is
     // taken back.
     if failed.is_none() {
-        failed = end_what_stopped_runs_left_running(&recorded.run, sid)
-            .err()
-            .or_else(|| take_back(&recorded.run, sid).1);
+        failed = match end_what_stopped_runs_left_running(&recorded.run, sid) {
+            Ok(held) => take_back(&recorded.run, sid, held).1,
+            Err(error) => Some(error),
+        };
     }
     if let Some(error) = failed {
         return Err(error);
@@ -1345,6 +1409,44 @@ mod tests {
         let recorded = read_record(&record).run;
         assert_eq!(recorded.denied, left.denied);
         assert_eq!(recorded.jobs, [taken]);
+    }
+
+    #[test]
+    fn what_a_take_back_leaves_set_keeps_the_name_of_a_job_something_still_holds() {
+        let name = unique_name("LpmIdentityLeftSet");
+        let sid = create_or_reuse_appcontainer_sid(&name).unwrap();
+        let _profile = Profile(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        let passed = root.path().join("passed");
+        std::fs::create_dir(&passed).unwrap();
+        let secret = root.path().join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let record = root.path().join("grants.json");
+        stopped_run(&record, &passed, &secret, sid.0);
+        let held_name = format!(r"Local\{name}-held");
+        let _held = ScriptJob::create(Some(&held_name)).unwrap();
+        record_run_access(
+            &record,
+            &RunAccess {
+                jobs: vec![held_name.clone(), format!(r"Local\{name}-gone")],
+                ..RunAccess::default()
+            },
+        )
+        .unwrap();
+        lock_directory_for_test(&passed);
+
+        without_privileges(|| take_back_run_access(&record, sid.0)).unwrap();
+
+        assert!(!denies(&secret, sid.0));
+        let left = read_record(&record).run;
+        assert_eq!(left.traversed, std::slice::from_ref(&passed));
+        assert!(left.denied.is_empty());
+        assert_eq!(
+            left.jobs,
+            [held_name],
+            "the run isn't taken back while its way through a directory is left"
+        );
+        std::fs::remove_dir(&passed).unwrap();
     }
 
     #[test]
