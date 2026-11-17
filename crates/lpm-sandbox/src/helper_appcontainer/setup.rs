@@ -642,6 +642,26 @@ pub(super) fn lock_named_within(
     name: &str,
     wait_ms: u32,
 ) -> Result<Option<ProfileCreationLock>, AppContainerError> {
+    match lock_named_while_running(name, wait_ms, None)? {
+        LockWait::Held(lock) => Ok(Some(lock)),
+        LockWait::TimedOut | LockWait::WatchedEnded => Ok(None),
+    }
+}
+
+pub(super) enum LockWait {
+    Held(ProfileCreationLock),
+    TimedOut,
+    /// The process that was watched ended before the lock was free.
+    WatchedEnded,
+}
+
+/// Takes the lock `name` as [`lock_named_within`] does, and stops waiting
+/// for it once the process `watched` has ended as well.
+pub(super) fn lock_named_while_running(
+    name: &str,
+    wait_ms: u32,
+    watched: Option<HANDLE>,
+) -> Result<LockWait, AppContainerError> {
     let wide = str_to_wide_with_nul(name);
     let sddl = str_to_wide_with_nul("D:(A;;0x00100001;;;AU)(A;;GA;;;SY)");
     let mut descriptor = ptr::null_mut();
@@ -674,14 +694,32 @@ pub(super) fn lock_named_within(
         return Err(last_error("open the sandbox permission lock"));
     }
     let handle = HandleGuard(raw);
-    let wait = unsafe { WaitForSingleObject(raw, wait_ms) };
-    if wait == windows_sys::Win32::Foundation::WAIT_TIMEOUT {
-        return Ok(None);
+    let wait = match watched {
+        Some(process) => {
+            let handles = [raw, process];
+            // SAFETY: both handles are open and the array outlives the call.
+            unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, wait_ms) }
+        }
+        // SAFETY: the mutex handle is open for the wait.
+        None => unsafe { WaitForSingleObject(raw, wait_ms) },
+    };
+    match wait {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => {
+            let lock = ProfileCreationLock(handle);
+            // SAFETY: the watched handle is open, and a zero timeout only
+            // reads its state.
+            let ended_too = watched
+                .is_some_and(|process| unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0);
+            Ok(if ended_too {
+                LockWait::WatchedEnded
+            } else {
+                LockWait::Held(lock)
+            })
+        }
+        windows_sys::Win32::Foundation::WAIT_TIMEOUT => Ok(LockWait::TimedOut),
+        ended if watched.is_some() && ended == WAIT_OBJECT_0 + 1 => Ok(LockWait::WatchedEnded),
+        _ => Err(last_error("acquire the sandbox permission lock")),
     }
-    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-        return Err(last_error("acquire the sandbox permission lock"));
-    }
-    Ok(Some(ProfileCreationLock(handle)))
 }
 
 pub(super) fn update_ace(

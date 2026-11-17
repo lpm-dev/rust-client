@@ -252,8 +252,8 @@ struct StartedRun {
 static RUNS: LazyLock<Mutex<HashMap<u32, TrackedRun>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// How long each step of the cleanup after an ended run may take before
-/// the process that ended the run stops waiting for it.
+/// How long ending the script an ended run left may take before the
+/// process that ended the run stops waiting for it.
 const CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A name for a run's Job that no other run on the machine has. A later
@@ -296,6 +296,11 @@ fn track_run(child: &mut Child, started: StartedRun) -> Result<(), SandboxError>
         }
     }
 }
+
+/// How long the take-back after an ended run may take. It waits for the
+/// identity, and as long again for the identity's last process, and is
+/// given the time to say how that went.
+const TAKE_BACK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 const TAKEN_BACK_LATER: &str = "the next run of the package or `lpm cache clean` takes it back";
 
@@ -387,7 +392,8 @@ pub(crate) fn end_run(pid: u32) {
 /// helper take back what the run set. The Job is held here, so the script
 /// outlived the helper, and the Job says when its last process is gone.
 /// The read denials come off only after that: the take-back finds the Job
-/// in the run's record and asks it again.
+/// in the run's record and asks it again. It is told the Job too, so that
+/// it knows the run's part of a record another run has since added to.
 fn clean_up_after(run: &StartedRun) {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -413,6 +419,8 @@ fn clean_up_after(run: &StartedRun) {
         .arg(&run.name)
         .arg("--grant-record")
         .arg(&run.record)
+        .arg("--job")
+        .arg(&run.job_name)
         .arg("--take-back-run")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -425,7 +433,7 @@ fn clean_up_after(run: &StartedRun) {
             return;
         }
     };
-    let wait_ms = u32::try_from(CLEANUP_WAIT.as_millis()).unwrap_or(u32::MAX - 1);
+    let wait_ms = u32::try_from(TAKE_BACK_WAIT.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: `cleanup` owns its process handle for the call.
     let ended =
         unsafe { WaitForSingleObject(cleanup.as_raw_handle().cast(), wait_ms) } == WAIT_OBJECT_0;
