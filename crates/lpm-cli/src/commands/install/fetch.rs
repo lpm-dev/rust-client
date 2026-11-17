@@ -1749,9 +1749,16 @@ pub(super) async fn run_online_fetch_phase(
                     p.integrity.as_deref(),
                     None,
                 );
+                // Strict availability holds every approved artifact to its
+                // provenance, including one approved while its attestation
+                // couldn't be fetched, whose approval recorded none.
                 if provenance_reference.is_none()
                     && !verification_scope.verifies_all()
                     && !trust_no_downgrade
+                    && !(availability_mode.is_strict()
+                        && trusted
+                            .binding_for_artifact(&p.name, &p.version, p.integrity.as_deref(), None)
+                            .is_some())
                 {
                     continue;
                 }

@@ -201,34 +201,44 @@ pub(super) fn print_package_card(blocked: &BlockedPackage, provenance: CardProve
 }
 
 pub(super) fn print_provenance_line(provenance: CardProvenance<'_>) {
-    let status = match provenance {
-        CardProvenance::Omitted => return,
-        CardProvenance::NotRead => install_ui::dim("not read in a dry run").to_string(),
-        CardProvenance::Read(None) => {
-            install_ui::dim("not checked: no registry the project uses vouches for it").to_string()
-        }
-        CardProvenance::Read(Some(status)) => match status {
-            ProvenanceStatus::Verified(snapshot) => match &snapshot.publisher {
-                Some(publisher) => format!("{} · {publisher}", "verified".green()),
-                None => "verified".green(),
-            },
-            ProvenanceStatus::Unverified(_) => {
-                "not verified: verification is skipped for this package".yellow()
-            }
-            ProvenanceStatus::Disabled(_) => "not verified: verification is off".yellow(),
-            ProvenanceStatus::Absent => "none: the registry serves no attestation".yellow(),
-            ProvenanceStatus::TransportDegraded => {
-                "unavailable: the attestation couldn't be fetched".yellow()
-            }
-            ProvenanceStatus::VerificationRejected { reason } => {
-                format!("{} {reason}", "failed verification:".red())
-            }
-        },
+    let Some(status) = provenance_status(provenance) else {
+        return;
     };
     println!(
         "{}",
         install_ui::terminal_line!("    {:<14}{}", install_ui::dim("Provenance:"), status)
     );
+}
+
+/// The card's provenance status, coloured by what it means; the publisher
+/// and the verifier's reason are sanitized.
+fn provenance_status(provenance: CardProvenance<'_>) -> Option<install_ui::TerminalLine> {
+    use install_ui::TerminalLine;
+    let blank = TerminalLine::new("");
+    Some(match provenance {
+        CardProvenance::Omitted => return None,
+        CardProvenance::NotRead => blank.dim("not read in a dry run"),
+        CardProvenance::Read(None) => {
+            blank.dim("not checked: no registry it was installed from speaks for it")
+        }
+        CardProvenance::Read(Some(status)) => match status {
+            ProvenanceStatus::Verified(snapshot) => match &snapshot.publisher {
+                Some(publisher) => blank.green("verified").text(" · ").field(publisher),
+                None => blank.green("verified"),
+            },
+            ProvenanceStatus::Unverified(_) => {
+                blank.yellow("not verified: verification is skipped for this package")
+            }
+            ProvenanceStatus::Disabled(_) => blank.yellow("not verified: verification is off"),
+            ProvenanceStatus::Absent => blank.yellow("none: the registry serves no attestation"),
+            ProvenanceStatus::TransportDegraded => {
+                blank.yellow("unavailable: the attestation couldn't be fetched")
+            }
+            ProvenanceStatus::VerificationRejected { reason } => {
+                blank.red("failed verification:").text(" ").field(reason)
+            }
+        },
+    })
 }
 
 /// `Reaches:` lines for an approval card. Nothing for a scan that found
@@ -542,4 +552,27 @@ pub(super) fn print_summary(
 #[allow(dead_code)]
 pub(super) fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
     build_state::build_state_path(project_dir)
+}
+
+#[cfg(test)]
+mod provenance_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_rejected_attestation_shows_its_reason_without_its_escape_sequences() {
+        let status = ProvenanceStatus::VerificationRejected {
+            reason: "bad signature\u{1b}[2J".into(),
+        };
+
+        let line = provenance_status(CardProvenance::Read(Some(&status))).unwrap();
+
+        assert!(line.contains("failed verification:"), "{line:?}");
+        assert!(line.contains("bad signature"), "{line:?}");
+        assert!(!line.contains("\u{1b}[2J"), "{line:?}");
+    }
+
+    #[test]
+    fn a_card_without_provenance_shows_no_line() {
+        assert!(provenance_status(CardProvenance::Omitted).is_none());
+    }
 }

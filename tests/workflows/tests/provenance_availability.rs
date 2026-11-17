@@ -259,3 +259,154 @@ async fn rebuild_refuses_an_approved_package_without_lockfile_provenance_under_s
     assert!(rebuilt.status.success(), "{output}");
     assert!(output.contains("strict-provenance-pkg@1.0.0"), "{output}");
 }
+
+/// A project whose approval of `PACKAGE` was recorded while its
+/// attestation couldn't be fetched, so the approval holds no provenance,
+/// with strict availability configured afterwards.
+async fn approved_while_unavailable_then_strict(mock: &MockRegistry) -> TempProject {
+    let project = installed_and_blocked(mock, Attestation::Unavailable, "best-effort").await;
+    let approval = approve(&project, mock);
+    assert!(approval.status.success(), "{}", output_of(&approval));
+    assert!(has_binding(&project));
+    write_availability(&project, "strict");
+    project
+}
+
+const MISSING_EVIDENCE: &str =
+    "strict provenance availability requires lockfile evidence for strict-provenance-pkg@1.0.0";
+
+#[tokio::test]
+async fn rebuild_refuses_a_package_approved_without_provenance_under_strict_availability() {
+    let mock = MockRegistry::start().await;
+    let project = approved_while_unavailable_then_strict(&mock).await;
+
+    let refused = rebuild(&project, &mock);
+
+    let output = output_of(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains(MISSING_EVIDENCE), "{output}");
+}
+
+#[tokio::test]
+async fn install_refuses_a_package_approved_without_provenance_under_strict_availability() {
+    let mock = MockRegistry::start().await;
+    let project = approved_while_unavailable_then_strict(&mock).await;
+    for installed in ["node_modules", ".lpm"] {
+        std::fs::remove_dir_all(project.path().join(installed)).unwrap();
+    }
+
+    let refused = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+
+    let output = output_of(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains(MISSING_EVIDENCE), "{output}");
+}
+
+#[tokio::test]
+async fn offline_install_refuses_an_approved_package_without_lockfile_provenance_under_strict_availability()
+ {
+    let mock = MockRegistry::start().await;
+    let project = installed_and_blocked(&mock, Attestation::Absent, "best-effort").await;
+    let approval = approve(&project, &mock);
+    assert!(approval.status.success(), "{}", output_of(&approval));
+    write_availability(&project, "strict");
+    for installed in ["node_modules", ".lpm"] {
+        std::fs::remove_dir_all(project.path().join(installed)).unwrap();
+    }
+
+    let refused = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .unwrap();
+
+    let output = output_of(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains(MISSING_EVIDENCE), "{output}");
+    assert!(
+        !output.contains("✓ strict-provenance-pkg@1.0.0  postinstall"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn rebuild_refuses_a_package_the_script_policy_runs_without_lockfile_provenance_under_strict_availability_for_all_packages()
+ {
+    let mock = MockRegistry::start().await;
+    let project = installed_and_blocked(&mock, Attestation::Absent, "best-effort").await;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    manifest["lpm"] = serde_json::json!({ "scriptPolicy": "allow" });
+    project.write_file("package.json", &manifest.to_string());
+    std::fs::write(
+        project.home().join(".lpm").join("config.toml"),
+        "[sigstore]\navailability = \"strict\"\nscope = \"all\"\n",
+    )
+    .unwrap();
+    write_signed_unlock(&project, &["trust-bulk-approve", "scripts-allow"]);
+
+    let refused = rebuild(&project, &mock);
+
+    let output = output_of(&refused);
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains(MISSING_EVIDENCE), "{output}");
+}
+
+#[tokio::test]
+async fn approve_scripts_refuses_to_run_on_a_config_it_cannot_read_rather_than_drop_strict_availability()
+ {
+    let mock = MockRegistry::start().await;
+    let project = installed_and_blocked(&mock, Attestation::Absent, "strict").await;
+    let config = project.home().join(".lpm").join("config.toml");
+    let readable = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{readable}[unterminated\n")).unwrap();
+    let manifest = project.read_file("package.json");
+
+    let approval = approve(&project, &mock);
+
+    assert!(!approval.status.success(), "{}", output_of(&approval));
+    assert_eq!(project.read_file("package.json"), manifest);
+}
+
+async fn an_approval_that_can_t_be_checked_is_refused(
+    change: impl FnOnce(&TempProject),
+    reason: &str,
+) {
+    let mock = MockRegistry::start().await;
+    let project = installed_and_blocked(&mock, Attestation::Absent, "strict").await;
+    change(&project);
+    let manifest = project.read_file("package.json");
+
+    let approval = approve(&project, &mock);
+
+    let output = output_of(&approval);
+    assert!(!approval.status.success(), "{output}");
+    assert!(output.contains(reason), "{output}");
+    assert_eq!(project.read_file("package.json"), manifest);
+}
+
+#[tokio::test]
+async fn approve_scripts_refuses_under_strict_availability_when_the_lockfile_can_t_be_read() {
+    an_approval_that_can_t_be_checked_is_refused(
+        |project| std::fs::remove_file(project.path().join(lpm_lockfile::LOCKFILE_NAME)).unwrap(),
+        "can't check strict-provenance-pkg@1.0.0",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn approve_scripts_refuses_under_strict_availability_a_package_now_routed_to_another_registry()
+ {
+    an_approval_that_can_t_be_checked_is_refused(
+        |project| project.write_file(".npmrc", "registry=https://registry.example.test/\n"),
+        "can't check strict-provenance-pkg@1.0.0",
+    )
+    .await;
+}

@@ -402,10 +402,11 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 registry,
                 project_dir,
                 std::slice::from_ref(target),
+                availability,
                 json_output,
             )?
             .fetch(std::iter::once(artifact_key(target)), &verify_policy)
-            .await
+            .await?
         };
         let reviewed_by_prompt = !json_output && is_tty();
         if reviewed_by_prompt {
@@ -587,13 +588,14 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 registry,
                 project_dir,
                 &effective_state.blocked_packages,
+                availability,
                 json_output,
             )?
             .fetch(
                 effective_state.blocked_packages.iter().map(artifact_key),
                 &verify_policy,
             )
-            .await
+            .await?
         };
 
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
@@ -691,13 +693,14 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             registry,
             project_dir,
             &effective_state.blocked_packages,
+            availability,
             json_output,
         )?
         .fetch(
             effective_state.blocked_packages.iter().map(artifact_key),
             &verify_policy,
         )
-        .await
+        .await?
     };
 
     // Walk one at a time. Quit aborts WITHOUT writing in-progress entries
@@ -716,9 +719,14 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             blocked,
             card_provenance(&provenance_by_pkg, blocked, dry_run),
         );
-        if let Some(status) = provenance_by_pkg.get(&artifact_key(blocked))
-            && let Err(refusal) = availability.require(status, &blocked.name, &blocked.version)
-        {
+        if let Some(refusal) = approval_refusal(
+            &provenance_by_pkg,
+            &blocked.name,
+            &blocked.version,
+            blocked.integrity.as_deref(),
+            runtime_enforce,
+            availability,
+        ) {
             output::warn(&format!("Skipped: {refusal}"));
             skipped.push(blocked);
             println!();

@@ -69,7 +69,7 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::metadata::{
         ProjectProvenance, SCHEMA_VERSION, approval_metadata_from_blocked,
-        approval_metadata_preserving_existing_provenance, artifact_key,
+        approval_metadata_preserving_existing_provenance, approval_refusal, artifact_key,
         authorize_project_trust_write, commit_project_trust_write, install_registries,
         installed_from_their_registry, read_lockfile, recorded_registries,
         runtime_availability_mode, runtime_verify_policy_with_source,

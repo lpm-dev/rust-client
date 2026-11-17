@@ -198,6 +198,8 @@ pub(super) struct ProjectProvenance {
     /// The registry the lockfile records for each candidate that came
     /// from one.
     recorded: HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    lockfile_read: bool,
+    availability: crate::provenance_fetch::AvailabilityMode,
 }
 
 impl ProjectProvenance {
@@ -208,6 +210,7 @@ impl ProjectProvenance {
         registry: &lpm_registry::RegistryClient,
         project_dir: &Path,
         candidates: &[BlockedPackage],
+        availability: crate::provenance_fetch::AvailabilityMode,
         json_output: bool,
     ) -> Result<Self, LpmError> {
         let registries = install_registries(
@@ -226,25 +229,83 @@ impl ProjectProvenance {
         Ok(Self {
             registries,
             recorded,
+            lockfile_read: lockfile.is_some(),
+            availability,
         })
     }
 
     /// Reads the provenance of those of `packages` a registry can speak
     /// for. The rest get no status, and so no provenance to compare a
-    /// later install with.
+    /// later install with; under strict availability, one that should have
+    /// a registry's word but can't get it here is refused.
     pub(super) async fn fetch(
         &self,
         packages: impl Iterator<Item = crate::provenance_fetch::ProvenanceArtifactKey>,
         policy: &crate::provenance_fetch::VerifyPolicy,
-    ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
-        let vouched = installed_from_their_registry(&self.registries, &self.recorded, packages);
-        crate::provenance_fetch::fetch_provenance_for_artifacts(
+    ) -> Result<HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>, LpmError>
+    {
+        let requested: Vec<_> = packages.collect();
+        let vouched = installed_from_their_registry(
+            &self.registries,
+            &self.recorded,
+            requested.iter().cloned(),
+        );
+        require_checkable(
+            self.availability,
+            self.lockfile_read,
+            &self.recorded,
+            &vouched,
+            &requested,
+        )?;
+        Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
             &self.registries.client,
             &self.registries.route_table,
             &vouched,
             policy,
         )
-        .await
+        .await)
+    }
+}
+
+/// Under strict availability, refuses `requested` packages whose provenance
+/// can't be read here though a registry may speak for them: the lockfiles
+/// that say where they came from can't all be read, or a package's route
+/// now sends it to another registry than the one it was installed from.
+/// Packages from a tarball, a git repository or a directory have none to
+/// read.
+pub(super) fn require_checkable(
+    availability: crate::provenance_fetch::AvailabilityMode,
+    lockfiles_read: bool,
+    recorded: &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    vouched: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    requested: &[crate::provenance_fetch::ProvenanceArtifactKey],
+) -> Result<(), LpmError> {
+    if !availability.is_strict() {
+        return Ok(());
+    }
+    let unchecked = |(name, version, _): &crate::provenance_fetch::ProvenanceArtifactKey,
+                     reason: &str| {
+        LpmError::ProvenanceUnavailable(format!(
+            "strict provenance availability can't check {name}@{version}: {reason}. Run \
+             `lpm install`, then approve it again"
+        ))
+    };
+    if !lockfiles_read && let Some(first) = requested.first() {
+        return Err(unchecked(
+            first,
+            "the lockfile that records where it came from can't be read",
+        ));
+    }
+    let vouched: std::collections::HashSet<_> = vouched.iter().collect();
+    match requested
+        .iter()
+        .find(|package| recorded.contains_key(*package) && !vouched.contains(package))
+    {
+        Some(package) => Err(unchecked(
+            package,
+            "it now routes to another registry than the one it was installed from",
+        )),
+        None => Ok(()),
     }
 }
 
@@ -350,11 +411,12 @@ fn same_registry(recorded: &str, routed: &str) -> bool {
 }
 
 /// The operator's `[sigstore] availability`, which an approval meets as an
-/// install does.
+/// install does: a config that can't be read stops it, as it stops an
+/// install, rather than leaving availability at best-effort.
 pub(super) fn runtime_availability_mode()
 -> Result<crate::provenance_fetch::AvailabilityMode, LpmError> {
     crate::provenance_fetch::AvailabilityMode::from_config(
-        crate::commands::config::GlobalConfig::load()
+        crate::commands::config::GlobalConfig::load_checked()?
             .get_sigstore_availability()
             .as_deref(),
     )
@@ -416,6 +478,41 @@ pub(super) fn snapshot_for_binding_with_mode(
         mode,
         crate::provenance_fetch::AvailabilityMode::BestEffort,
     )
+}
+
+/// Why committing an approval of this artifact would refuse it, as
+/// [`snapshot_for_artifact_binding`] would, without the warnings that
+/// committing prints, so a walk skips it before asking.
+pub(super) fn approval_refusal(
+    provenance_by_artifact: &HashMap<
+        crate::provenance_fetch::ProvenanceArtifactKey,
+        ProvenanceStatus,
+    >,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    mode: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
+) -> Option<LpmError> {
+    let status = provenance_by_artifact.get(&(
+        name.to_owned(),
+        version.to_owned(),
+        integrity.map(ToOwned::to_owned),
+    ))?;
+    if let Err(refusal) = availability.require(status, name, version) {
+        return Some(refusal);
+    }
+    match status {
+        ProvenanceStatus::VerificationRejected { .. }
+            if matches!(mode, crate::provenance_fetch::EnforceMode::Deny) =>
+        {
+            status
+                .clone()
+                .into_snapshot_for_binding(name, version)
+                .err()
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn snapshot_for_artifact_binding(

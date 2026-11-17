@@ -427,16 +427,18 @@ pub(super) fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> 
 }
 
 /// Under strict provenance availability, refuses to run the scripts of a
-/// package an install would refuse: a trusted registry package, in the
+/// package an install would refuse: a registry package about to run, in the
 /// verification scope, whose lockfile holds no provenance evidence bound
-/// to its bytes.
+/// to its bytes. Every approved artifact is in the approved scope, with or
+/// without the provenance its approval recorded; every package is in scope
+/// `all`, however it comes to run.
 pub(super) fn require_lockfile_provenance(
     packages: &[&super::scripts::ScriptablePackage],
     lockfile: &lpm_lockfile::Lockfile,
     trusted: &lpm_workspace::TrustedDependencies,
     scope: crate::provenance_fetch::VerificationScope,
 ) -> Result<(), lpm_common::LpmError> {
-    for package in packages.iter().filter(|package| package.is_trusted) {
+    for package in packages {
         let Some(row) = lockfile
             .packages
             .iter()
@@ -459,7 +461,7 @@ pub(super) fn require_lockfile_provenance(
         }
         let in_scope = scope.verifies_all()
             || trusted
-                .provenance_reference_for_candidate(
+                .binding_for_artifact(
                     &package.name,
                     &package.version,
                     package.integrity.as_deref(),

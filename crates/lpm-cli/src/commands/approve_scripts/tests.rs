@@ -213,6 +213,89 @@ fn snapshot_for_binding_verified_projects_under_both_modes() {
     assert!(deny.is_some());
 }
 
+fn artifact_status(
+    status: ProvenanceStatus,
+) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
+    HashMap::from([(("pkg".to_owned(), "1.0.0".to_owned(), None), status)])
+}
+
+#[test]
+fn an_approval_is_refused_before_it_is_asked_for_when_its_commit_would_be() {
+    use crate::provenance_fetch::AvailabilityMode::{BestEffort, Strict};
+    let rejected = || ProvenanceStatus::VerificationRejected {
+        reason: "DSSE signature mismatch".into(),
+    };
+    let refused = |status, mode, availability| {
+        approval_refusal(
+            &artifact_status(status),
+            "pkg",
+            "1.0.0",
+            None,
+            mode,
+            availability,
+        )
+    };
+
+    assert!(matches!(
+        refused(ProvenanceStatus::Absent, EnforceMode::Deny, Strict),
+        Some(LpmError::ProvenanceUnavailable(_))
+    ));
+    assert!(matches!(
+        refused(
+            ProvenanceStatus::TransportDegraded,
+            EnforceMode::Deny,
+            Strict
+        ),
+        Some(LpmError::ProvenanceUnavailable(_))
+    ));
+    assert!(matches!(
+        refused(rejected(), EnforceMode::Deny, BestEffort),
+        Some(LpmError::ProvenanceVerification(_))
+    ));
+    assert!(refused(ProvenanceStatus::Absent, EnforceMode::Deny, BestEffort).is_none());
+    assert!(refused(rejected(), EnforceMode::Warn, BestEffort).is_none());
+    assert!(refused(verified_status(), EnforceMode::Deny, Strict).is_none());
+    assert!(
+        approval_refusal(
+            &HashMap::new(),
+            "pkg",
+            "1.0.0",
+            None,
+            EnforceMode::Deny,
+            Strict
+        )
+        .is_none(),
+        "a package no registry speaks for has no provenance to refuse"
+    );
+}
+
+#[test]
+fn every_refusal_before_the_prompt_matches_the_commit() {
+    use crate::provenance_fetch::AvailabilityMode::{BestEffort, Strict};
+    for status in [
+        ProvenanceStatus::Absent,
+        ProvenanceStatus::TransportDegraded,
+        ProvenanceStatus::VerificationRejected {
+            reason: "Rekor SET verification failed".into(),
+        },
+        verified_status(),
+    ] {
+        for mode in [EnforceMode::Deny, EnforceMode::Warn] {
+            for availability in [BestEffort, Strict] {
+                let map = artifact_status(status.clone());
+                let early = approval_refusal(&map, "pkg", "1.0.0", None, mode, availability);
+                let commit =
+                    snapshot_for_artifact_binding(&map, "pkg", "1.0.0", None, mode, availability);
+                assert_eq!(
+                    early.is_some(),
+                    commit.is_err(),
+                    "{status:?} {mode:?} {availability:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Under `Deny` (default production posture), a
 /// `VerificationRejected` status returns
 /// `Err(LpmError::ProvenanceVerification(_))` so the caller's
@@ -2731,7 +2814,7 @@ async fn fetch_and_commit_global_approvals(
 }
 
 #[tokio::test]
-async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
+async fn a_global_commit_of_no_approvals_fetches_no_provenance_and_writes_nothing() {
     let tmp = tempdir().unwrap();
     let root = lpm_common::LpmRoot::from_dir(tmp.path());
     let policy = deny_verify_policy();
@@ -2756,6 +2839,48 @@ async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
     .unwrap();
 
     assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+    assert_eq!(global::global_trust_write_count(), 0);
+}
+
+#[tokio::test]
+async fn a_global_commit_under_strict_availability_refuses_a_package_without_an_attestation() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let policy = deny_verify_policy();
+    let registry = unreachable_registry();
+    let unattested = row("esbuild", "0.25.1", &["eslint"]);
+    let provenance = HashMap::from([(
+        (
+            unattested.name.clone(),
+            unattested.version.clone(),
+            unattested.integrity.clone(),
+        ),
+        ProvenanceStatus::Absent,
+    )]);
+    global::reset_global_trust_write_count();
+
+    let refusal = global::commit_global_approval_batch(
+        &root,
+        &[&unattested],
+        false,
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::Strict,
+            true,
+        ),
+        &provenance,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(refusal, LpmError::ProvenanceUnavailable(_)),
+        "{refusal:?}"
+    );
     assert_eq!(global::global_trust_write_count(), 0);
 }
 

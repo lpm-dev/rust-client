@@ -78,22 +78,29 @@ impl<'a> ApprovalProvenanceContext<'a> {
             artifacts.iter().map(|artifact| artifact.0.as_str()),
             self.json_output,
         )?;
-        let lockfiles: Vec<lpm_lockfile::Lockfile> =
-            crate::global_blocked_set::install_roots(self.root)?
-                .iter()
-                .filter_map(|install| {
-                    read_lockfile(install, || {
-                        lpm_lockfile::Lockfile::read_for_project(install)
-                            .map(|project| project.lockfile)
-                    })
+        let install_roots = crate::global_blocked_set::install_roots(self.root)?;
+        let lockfiles: Vec<lpm_lockfile::Lockfile> = install_roots
+            .iter()
+            .filter_map(|install| {
+                read_lockfile(install, || {
+                    lpm_lockfile::Lockfile::read_for_project(install)
+                        .map(|project| project.lockfile)
                 })
-                .collect();
+            })
+            .collect();
         let recorded = recorded_registries(
             artifacts.iter().cloned().collect(),
             lockfiles.iter().flat_map(|lockfile| &lockfile.packages),
         );
         let vouched =
             installed_from_their_registry(&registries, &recorded, artifacts.iter().cloned());
+        super::metadata::require_checkable(
+            self.availability,
+            lockfiles.len() == install_roots.len(),
+            &recorded,
+            &vouched,
+            artifacts,
+        )?;
         Ok(crate::provenance_fetch::fetch_provenance_for_artifacts(
             &registries.client,
             &registries.route_table,
@@ -1146,12 +1153,15 @@ pub(super) async fn run_global_interactive(
         }
     };
     let refusal = |row: &crate::global_blocked_set::AggregateBlockedRow| {
-        provenance.get(&row_artifact(row)).and_then(|status| {
-            provenance_context
-                .availability
-                .require(status, &row.name, &row.version)
-                .err()
-        })
+        let (name, version, integrity) = row_artifact(row);
+        approval_refusal(
+            &provenance,
+            &name,
+            &version,
+            integrity.as_deref(),
+            provenance_context.runtime_enforce,
+            provenance_context.availability,
+        )
     };
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
