@@ -486,7 +486,7 @@ pub(super) fn print_summary(
             if !approved.is_empty() {
                 output::info("Run `lpm rebuild` to execute the approved scripts.");
             }
-            if initial_was_legacy {
+            if initial_was_legacy && !approved.is_empty() {
                 output::info(
                     "trustedDependencies upgraded from legacy array to rich form (binding metadata).",
                 );
