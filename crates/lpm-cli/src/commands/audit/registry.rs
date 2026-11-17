@@ -150,14 +150,11 @@ pub(super) fn collect_registry_issues(
         }
     }
 
-    // Lifecycle scripts
-    if let Some(scripts) = &ver_meta.lifecycle_scripts
-        && !scripts.is_empty()
-    {
-        let names: Vec<&str> = scripts.keys().map(|s| s.as_str()).collect();
+    let scripts = ver_meta.install_script_phases();
+    if !scripts.is_empty() {
         issues.push(AuditIssue {
             severity: "moderate".to_string(),
-            message: format!("lifecycle scripts: {}", names.join(", ")),
+            message: format!("lifecycle scripts: {}", scripts.join(", ")),
             category: "scripts".to_string(),
             source: "registry".to_string(),
             ..AuditIssue::default()

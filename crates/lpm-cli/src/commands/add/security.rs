@@ -55,14 +55,12 @@ fn print_security_warnings_with_registry_findings(
         }
     }
 
-    if let Some(scripts) = &ver_meta.lifecycle_scripts {
-        let script_names: Vec<&str> = scripts.keys().map(|s| s.as_str()).collect();
-        if !script_names.is_empty() {
-            warnings.push(format!(
-                "has lifecycle scripts: {}",
-                script_names.join(", ")
-            ));
-        }
+    let script_names = ver_meta.install_script_phases();
+    if !script_names.is_empty() {
+        warnings.push(format!(
+            "has lifecycle scripts: {}",
+            script_names.join(", ")
+        ));
     }
 
     if warnings.is_empty() {

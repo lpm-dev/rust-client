@@ -374,31 +374,37 @@ const NODE_GYP_COMMANDS: &[&str] = &[
     "node-pre-gyp",
 ];
 
-static GYP_COMMAND_EXPANSION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<!@?\(([^)]*)\)").expect("valid gyp command expansion regex"));
-
 static GYP_SCRIPT_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"['"]([^'"\s]+\.(?:js|cjs|mjs|ts|sh))['"]"#).expect("valid gyp script path regex")
 });
 
+/// The gyp files node-gyp reads from the directory it builds in: the
+/// build file, and two it adds to every build when they are there.
+const GYP_FILES: &[&str] = &["binding.gyp", "config.gypi", "common.gypi"];
+
 fn scan_binding_gyp(root: &Path, dir: &Path, entries: &mut BTreeSet<PathBuf>, reach: &mut Scan) {
-    let gyp = dir.join("binding.gyp");
-    let Ok((content, _)) = lpm_common::read_text_regular_file_capped_with_metadata(
-        &root.join(&gyp),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) else {
-        return;
-    };
-    let source = path_to_slash_string(&gyp);
-    scan_bytes(content.as_bytes(), &source, reach);
-    for capture in GYP_COMMAND_EXPANSION.captures_iter(content.as_bytes()) {
-        let command = String::from_utf8_lossy(&capture[1]);
-        record_if_red(reach, &source, &command);
-    }
-    for capture in GYP_SCRIPT_PATH.captures_iter(content.as_bytes()) {
-        let path = String::from_utf8_lossy(&capture[1]);
-        if let Some(path) = resolve_within_package(&dir.join(path.as_ref())) {
-            insert_if_file(root, entries, path, reach);
+    for name in GYP_FILES {
+        let gyp = dir.join(name);
+        let Ok((content, _)) = lpm_common::read_text_regular_file_capped_with_metadata(
+            &root.join(&gyp),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) else {
+            // A file that isn't there runs nothing. One that can't be read may.
+            reach.incomplete |= root.join(&gyp).symlink_metadata().is_ok();
+            continue;
+        };
+        let source = path_to_slash_string(&gyp);
+        scan_bytes(content.as_bytes(), &source, reach);
+        let found = crate::gyp::commands(&content);
+        reach.incomplete |= found.unresolved;
+        for command in &found.shell {
+            record_if_red(reach, &source, command);
+        }
+        for capture in GYP_SCRIPT_PATH.captures_iter(content.as_bytes()) {
+            let path = String::from_utf8_lossy(&capture[1]);
+            if let Some(path) = resolve_within_package(&dir.join(path.as_ref())) {
+                insert_if_file(root, entries, path, reach);
+            }
         }
     }
 }
@@ -1232,6 +1238,169 @@ mod tests {
                 command: "bun install".into(),
             }]
         );
+    }
+
+    fn scan_of_binding_gyp(binding_gyp: &str) -> ScriptReach {
+        scan(
+            serde_json::json!({"name":"x","scripts":{"install":"node-gyp rebuild"}}),
+            &[("binding.gyp", binding_gyp)],
+        )
+    }
+
+    #[test]
+    fn every_form_of_gyp_command_expansion_is_read_to_its_closing_bracket() {
+        for expansion in [
+            "<!(bun install)",
+            "<!@(bun install)",
+            ">!(bun install)",
+            "^!@(bun install)",
+        ] {
+            let reach = scan_of_binding_gyp(&format!("{{'variables':{{'v':'{expansion}'}}}}\n"));
+            assert!(
+                reach.findings.contains(&ReachFinding::RunsRedCommand {
+                    source: "binding.gyp".into(),
+                    command: "bun install".into(),
+                }),
+                "{expansion}: {:?}",
+                reach.findings
+            );
+        }
+
+        let nested =
+            scan_of_binding_gyp("{'variables':{'v':'<!(bun install --cwd $(dirname x))'}}\n");
+        assert!(
+            nested.findings.contains(&ReachFinding::RunsRedCommand {
+                source: "binding.gyp".into(),
+                command: "bun install --cwd $(dirname x)".into(),
+            }),
+            "{:?}",
+            nested.findings
+        );
+    }
+
+    #[test]
+    fn a_gyp_command_is_reported_as_gyp_runs_it() {
+        let reach = scan_of_binding_gyp(
+            r#"{"targets":[{"include_dirs":["<!(node -e \"require('nan')\")"]}]}"#,
+        );
+        assert!(
+            reach.findings.contains(&ReachFinding::RunsRedCommand {
+                source: "binding.gyp".into(),
+                command: r#"node -e "require('nan')""#.into(),
+            }),
+            "{:?}",
+            reach.findings
+        );
+    }
+
+    #[test]
+    fn what_a_binding_gyp_runs_beyond_its_commands_leaves_the_scan_incomplete() {
+        assert!(!scan_of_binding_gyp("{'targets':[{'target_name':'x'}]}\n").incomplete);
+        for binding_gyp in [
+            "{'variables':{'v':'<!pymod_do_main(build_tools)'}}\n",
+            "{'includes':['common.gypi'],'targets':[]}\n",
+            "{'variables':{'v':'<!(bun install'}}\n",
+        ] {
+            assert!(scan_of_binding_gyp(binding_gyp).incomplete, "{binding_gyp}");
+        }
+    }
+
+    #[test]
+    fn a_gyp_file_that_may_run_something_unread_needs_review() {
+        for binding_gyp in [
+            // A named expansion, and a command given as a list.
+            "{'variables':{'v':'<!x(bun install)'}}",
+            "{'variables':{'v':\"<!(['bun','install'])\"}}",
+            // A command built from a variable.
+            "{'variables':{'c':'bun install','v':'<!(<(c))'}}",
+            // Commands a build step runs.
+            "{'targets':[{'target_name':'x','actions':[{'action':['bun','install']}]}]}",
+            "{'targets':[{'target_name':'x','rules':[{'action':['bun','install']}]}]}",
+            "{'targets':[{'target_name':'x','postbuilds':[{'action':['bun','install']}]}]}",
+            "{'targets':[{'target_name':'x','msvs_settings':{'VCPostBuildEventTool':{'CommandLine':'bun install'}}}]}",
+            "{'targets':[{'target_name':'x','xcode_settings':{'CC':'./cc'}}]}",
+            "{'make_global_settings':[['CC','./cc']],'targets':[]}",
+            // Another build file.
+            "{'targets':[{'target_name':'x','dependencies':['deps/other.gyp:other']}]}",
+            // A condition is Python that gyp evaluates.
+            "{'targets':[{'target_name':'x','conditions':[['().__class__.__name__==\"tuple\"',{}]]}]}",
+            // Python that isn't a plain literal.
+            "{'variables':{'v':'<!' + '(bun install)'}}",
+            "{'variables':{'v':r'<!(bun install)'}}",
+        ] {
+            assert!(
+                scan_of_binding_gyp(binding_gyp).requires_individual_review(),
+                "{binding_gyp}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gyp_command_is_read_as_python_spells_it() {
+        for binding_gyp in [
+            "{'variables':{'v':'<!(\\x62un install)'}}",
+            "{'variables':{'v':'\\x3c!(bun install)'}}",
+            "{'variables':{'v':'<!' '(bun install)'}}",
+            "{'variables':{'v':'<!(bun'\n  # split over two lines\n  ' install)'}}",
+        ] {
+            let reach = scan_of_binding_gyp(binding_gyp);
+            assert!(
+                reach.findings.contains(&ReachFinding::RunsRedCommand {
+                    source: "binding.gyp".into(),
+                    command: "bun install".into(),
+                }),
+                "{binding_gyp}: {:?}",
+                reach.findings
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_gyp_file_needs_no_review() {
+        let reach = scan_of_binding_gyp(
+            r#"{
+  # The addon and what it is built from.
+  'targets': [{
+    'target_name': 'addon',
+    'sources': ['src/addon.c'],
+    'cflags': ['-std=c99'],
+    'cflags!': ['-fno-exceptions'],
+    'defines': ['NAPI_VERSION=<(napi_build_version)'],
+    'variables': {'openssl_fips': '', 'anything': {'nested': 1}},
+    'xcode_settings': {'MACOSX_DEPLOYMENT_TARGET': '10.13', 'OTHER_CFLAGS': ['-arch x86_64']},
+    'msvs_settings': {'VCCLCompilerTool': {'ExceptionHandling': 1}},
+    'configurations': {'Release': {'defines': ['NDEBUG']}},
+    'conditions': [
+      ['OS=="win"', {'defines': ['WIN32']}, {'libraries': ['-lm']}],
+      ['OS=="mac" and target_arch!="arm64"', {'cflags+': ['-mmacosx-version-min=10.13']}],
+      ['<(module_abi) >= 93 or not (OS in "linux freebsd")', {}],
+    ],
+  }],
+}
+"#,
+        );
+        assert!(!reach.requires_individual_review(), "{reach:?}");
+    }
+
+    #[test]
+    fn the_gyp_files_node_gyp_adds_from_the_package_are_read_too() {
+        for name in ["config.gypi", "common.gypi"] {
+            let reach = scan(
+                serde_json::json!({"name":"x","scripts":{"install":"node-gyp rebuild"}}),
+                &[
+                    ("binding.gyp", "{'targets':[{'target_name':'x'}]}"),
+                    (name, "{'variables':{'v':'<!(bun install)'}}"),
+                ],
+            );
+            assert!(
+                reach.findings.contains(&ReachFinding::RunsRedCommand {
+                    source: name.into(),
+                    command: "bun install".into(),
+                }),
+                "{name}: {:?}",
+                reach.findings
+            );
+        }
     }
 
     #[test]

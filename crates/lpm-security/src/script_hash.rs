@@ -140,12 +140,14 @@ pub fn try_compute_script_hash_with_phase_bodies(
     let object = parsed
         .as_object()
         .ok_or_else(|| invalid("must contain a JSON object"))?;
-    let Some(scripts) = object.get("scripts") else {
-        return Ok(None);
+    let no_scripts = serde_json::Map::new();
+    let scripts = match object.get("scripts") {
+        Some(scripts) => scripts
+            .as_object()
+            .ok_or_else(|| invalid("has a non-object scripts field"))?,
+        None => &no_scripts,
     };
-    let scripts = scripts
-        .as_object()
-        .ok_or_else(|| invalid("has a non-object scripts field"))?;
+    let implied_install = crate::native_build::implied_install_script(store_pkg_dir, object);
 
     let mut hasher = Sha256::new();
     let mut phase_bodies = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
@@ -165,6 +167,10 @@ pub fn try_compute_script_hash_with_phase_bodies(
                 .as_str()
                 .ok_or_else(|| invalid(&format!("has a non-string {phase} script")))?,
             None => "",
+        };
+        let body = match implied_install {
+            Some(implied) if *phase == "install" && body.is_empty() => implied,
+            _ => body,
         };
         if !body.is_empty() {
             phase_bodies.push(((*phase).to_string(), body.to_string()));
@@ -508,6 +514,52 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_package_with_a_binding_gyp_and_no_scripts_has_the_implied_build_to_approve() {
+        let implied = tempdir().unwrap();
+        fs::write(implied.path().join("package.json"), r#"{"name":"native"}"#).unwrap();
+        fs::write(implied.path().join("binding.gyp"), "{}").unwrap();
+        let named = tempdir().unwrap();
+        write_pkg_json(
+            named.path(),
+            &serde_json::json!({"install": "node-gyp rebuild"}),
+        );
+
+        let data = compute_script_hash_with_phase_bodies(implied.path()).unwrap();
+
+        assert_eq!(
+            data.phase_bodies,
+            [("install".to_string(), "node-gyp rebuild".to_string())]
+        );
+        assert_eq!(
+            Some(data.hash),
+            compute_script_hash(named.path()),
+            "the same build is the same thing to approve, named or implied"
+        );
+    }
+
+    #[test]
+    fn the_implied_build_runs_between_the_scripts_a_package_names() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "node post.js"}),
+        );
+        let without_binding = compute_script_hash(dir.path()).unwrap();
+        fs::write(dir.path().join("binding.gyp"), "{}").unwrap();
+
+        let data = compute_script_hash_with_phase_bodies(dir.path()).unwrap();
+
+        assert_eq!(
+            data.phase_bodies,
+            [
+                ("install".to_string(), "node-gyp rebuild".to_string()),
+                ("postinstall".to_string(), "node post.js".to_string()),
+            ]
+        );
+        assert_ne!(data.hash, without_binding);
     }
 
     #[test]

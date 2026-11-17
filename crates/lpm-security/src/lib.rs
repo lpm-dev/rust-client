@@ -15,6 +15,8 @@
 //! Supply chain security: SLSA, Sigstore, typosquatting, OSV audit, release age.
 
 pub mod behavioral;
+mod gyp;
+pub mod native_build;
 pub mod provenance;
 pub mod quality;
 pub mod query;
@@ -69,6 +71,13 @@ const BLOCKED_SCRIPTS: &[&str] = &[
 /// every entry here MUST also appear in [`BLOCKED_SCRIPTS`]. You can't run
 /// a script that isn't blocked by default.
 pub const EXECUTED_INSTALL_PHASES: &[&str] = &["preinstall", "install", "postinstall"];
+
+/// The revision of the rules that say which install-time scripts a package
+/// has. An install records it. A project installed under another revision
+/// is installed again once, so its packages are looked at under these
+/// rules: one that had nothing to approve before may have a build now, and
+/// an approval may no longer cover what would run.
+pub const INSTALL_SCRIPT_RULES: &str = "2";
 
 /// Warning returned when a package release is too new.
 #[derive(Debug, Clone)]
