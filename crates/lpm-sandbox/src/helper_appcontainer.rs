@@ -41,6 +41,11 @@
 //! guard ensures on every exit path. The lifecycle child cannot
 //! outlive the helper.
 //!
+//! Nor does it outlive the process that started the helper. Windows
+//! ends no child with its parent, so the helper waits on that process
+//! beside the child, ends the child's whole Job when it goes first, and
+//! then takes back what the run set, as after any other exit.
+//!
 //! Secret-file DACLs are restored byte-for-byte after the child exits.
 //! Production also deletes the invocation-specific AppContainer profile,
 //! so its SID cannot accumulate readable paths across lifecycle runs.
@@ -54,10 +59,11 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetHandleInformation,
-    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
-    SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_SUCCESS,
+    FILETIME, GetHandleInformation, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, HLOCAL,
+    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
@@ -83,15 +89,17 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateMutexW,
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ReleaseMutex, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ReleaseMutex, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
@@ -295,12 +303,20 @@ pub enum AppContainerError {
         /// `GetLastError` reading.
         last_error: u32,
     },
-    /// `WaitForSingleObject` returned an unexpected value while
-    /// waiting for the lifecycle child.
-    #[error("WaitForSingleObject(child) returned unexpected value 0x{wait_result:08X}")]
+    /// The wait for the lifecycle child, alone or beside the helper's
+    /// caller, returned an unexpected value.
+    #[error("waiting for the lifecycle child returned unexpected value 0x{wait_result:08X}")]
     Wait {
-        /// Raw value returned by `WaitForSingleObject`.
+        /// Raw value returned by `WaitForSingleObject` or
+        /// `WaitForMultipleObjects`.
         wait_result: u32,
+    },
+    /// `TerminateJobObject` failed ending a lifecycle child whose caller
+    /// had ended.
+    #[error("TerminateJobObject failed with Win32 error {last_error}")]
+    EndJob {
+        /// Win32 error code from `GetLastError()`.
+        last_error: u32,
     },
     /// `GetExitCodeProcess` failed extracting the lifecycle child's
     /// exit code after it terminated.
@@ -573,6 +589,9 @@ impl Drop for AttrListGuard {
 /// failures all surface as [`AppContainerError`] with a named
 /// variant so stderr is self-diagnosable.
 pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError> {
+    // Looked up before anything else: the id that names the caller can
+    // name another process soon after the caller ends.
+    let caller = Caller::of_this_process();
     // 1. Derive (or create) the AppContainer SID. Production supplies
     //    the project and package's stable name and holds it until the
     //    child exits, so no other run of it changes its grants meanwhile.
@@ -829,22 +848,39 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         return Err(AppContainerError::AssignJob { last_error: last });
     }
 
-    // SAFETY: child_thread holds a valid suspended-thread handle.
-    let prev = unsafe { ResumeThread(child_thread.as_raw()) };
-    if prev == u32::MAX {
-        // ResumeThread returning -1 indicates failure. The job
-        // still owns the suspended child, so dropping `job` will
-        // KILL_ON_JOB_CLOSE-fire and reap it.
-        let last = unsafe { GetLastError() };
-        return Err(AppContainerError::AssignJob { last_error: last });
-    }
-
-    // SAFETY: child_proc handle is open for the wait.
-    let wait_result = unsafe { WaitForSingleObject(child_proc.as_raw(), u32::MAX) };
-    // 0 = WAIT_OBJECT_0; any other value (WAIT_FAILED, WAIT_TIMEOUT
-    // with INFINITE timeout — shouldn't happen) is an error.
-    if wait_result != 0 {
-        return Err(AppContainerError::Wait { wait_result });
+    // A caller that ended while the trees were being granted gets no
+    // script started for it: the child stays suspended until its Job ends.
+    let outlived_its_caller = if caller.has_ended() {
+        true
+    } else {
+        // SAFETY: child_thread holds a valid suspended-thread handle.
+        let prev = unsafe { ResumeThread(child_thread.as_raw()) };
+        if prev == u32::MAX {
+            // ResumeThread returning -1 indicates failure. The job
+            // still owns the suspended child, so dropping `job` will
+            // KILL_ON_JOB_CLOSE-fire and reap it.
+            let last = unsafe { GetLastError() };
+            return Err(AppContainerError::AssignJob { last_error: last });
+        }
+        caller.ends_before(child_proc.as_raw())?
+    };
+    if outlived_its_caller {
+        // Nobody may be left to read this, and no reader mustn't stop the
+        // cleanup that follows.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"lpm-sandbox-helper: the process that started this run has ended, so its script is stopped\n",
+        );
+        // SAFETY: the job handle is alive on this stack frame.
+        if unsafe { TerminateJobObject(job.as_raw(), 1) } == 0 {
+            let last = unsafe { GetLastError() };
+            return Err(AppContainerError::EndJob { last_error: last });
+        }
+        // SAFETY: child_proc handle is open for the wait.
+        let wait_result = unsafe { WaitForSingleObject(child_proc.as_raw(), INFINITE) };
+        if wait_result != WAIT_OBJECT_0 {
+            return Err(AppContainerError::Wait { wait_result });
+        }
     }
 
     // SAFETY: child_proc handle is still open; we just observed its
@@ -885,6 +921,116 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // the u32→i32 reinterpretation so the helper's caller can
     // observe the same numeric value the lifecycle child saw.
     Ok(exit_code as i32)
+}
+
+// ── The helper's caller ──────────────────────────────────────────────
+
+/// The process that started the helper, as the helper found it.
+enum Caller {
+    /// Running, and signalled once it ends.
+    Running(HandleGuard),
+    /// Ended before the helper looked.
+    Ended,
+    /// Not to be told, so the script runs as if its caller stays.
+    Unknown,
+}
+
+impl Caller {
+    fn of_this_process() -> Self {
+        let Some(id) = parent_process_id() else {
+            return Self::Unknown;
+        };
+        // SAFETY: OpenProcess takes no pointers.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                id,
+            )
+        };
+        if handle.is_null() {
+            // An id no process has is refused as an invalid parameter.
+            return if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+                Self::Ended
+            } else {
+                Self::Unknown
+            };
+        }
+        let handle = HandleGuard(handle);
+        // SAFETY: GetCurrentProcess returns a pseudo handle that needs no closing.
+        let helper = unsafe { GetCurrentProcess() };
+        match (creation_time(handle.as_raw()), creation_time(helper)) {
+            // A caller is older than what it starts. One that reads as
+            // younger is another process that got the id, or the caller
+            // itself after the clock was set back, and the two can't be
+            // told apart, so neither is waited on.
+            (Some(found), Some(helper)) if found <= helper => Self::Running(handle),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn has_ended(&self) -> bool {
+        match self {
+            // SAFETY: the handle is open, and a zero timeout only reads its state.
+            Self::Running(caller) => unsafe {
+                WaitForSingleObject(caller.as_raw(), 0) == WAIT_OBJECT_0
+            },
+            Self::Ended => true,
+            Self::Unknown => false,
+        }
+    }
+
+    /// Waits for `child` to exit or for the caller to end, and says
+    /// whether the caller went first. A child that has exited counts as
+    /// first, so its exit code is reported whatever became of the caller.
+    fn ends_before(&self, child: HANDLE) -> Result<bool, AppContainerError> {
+        let wait_result = match self {
+            Self::Running(caller) => {
+                let handles = [child, caller.as_raw()];
+                // SAFETY: both handles are open and the array outlives the call.
+                unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) }
+            }
+            // SAFETY: the child handle is open for the wait.
+            Self::Ended | Self::Unknown => unsafe { WaitForSingleObject(child, INFINITE) },
+        };
+        match wait_result {
+            WAIT_OBJECT_0 => Ok(false),
+            result if result == WAIT_OBJECT_0 + 1 => Ok(true),
+            wait_result => Err(AppContainerError::Wait { wait_result }),
+        }
+    }
+}
+
+fn parent_process_id() -> Option<u32> {
+    // SAFETY: the all-zero value is a valid initial state for this plain struct.
+    let mut information: PROCESS_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the buffer is a writable struct of the size given, and the
+    // returned length isn't asked for.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            GetCurrentProcess(),
+            ProcessBasicInformation,
+            (&raw mut information).cast(),
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    u32::try_from(information.InheritedFromUniqueProcessId).ok()
+}
+
+/// When the process was created, in the 100 ns intervals Windows counts.
+fn creation_time(process: HANDLE) -> Option<u64> {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the four outputs are writable and live for the call.
+    let ok = unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    (ok != 0).then(|| u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
 }
 
 // ── SID create-or-reuse ──────────────────────────────────────────────
@@ -1975,6 +2121,32 @@ mod tests {
         PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
+
+    #[test]
+    fn the_process_that_started_this_one_is_found_running_and_older() {
+        use std::os::windows::io::AsRawHandle;
+
+        let caller = Caller::of_this_process();
+        let Caller::Running(handle) = &caller else {
+            panic!("the test runner started this process and waits for it");
+        };
+        // SAFETY: GetCurrentProcess returns a pseudo handle that needs no closing.
+        let this = creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        assert!(creation_time(handle.as_raw()).unwrap() < this);
+        assert!(!caller.has_ended());
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 3"])
+            .spawn()
+            .unwrap();
+        assert!(
+            !caller.ends_before(child.as_raw_handle() as HANDLE).unwrap(),
+            "a child that exits while the caller runs went first"
+        );
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+        assert!(Caller::Ended.has_ended());
+        assert!(!Caller::Unknown.has_ended());
+    }
 
     #[test]
     fn a_run_stops_at_a_secret_it_cannot_deny_and_at_no_other() {
