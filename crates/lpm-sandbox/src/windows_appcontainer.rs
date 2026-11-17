@@ -353,6 +353,16 @@ impl AfterRun {
     }
 }
 
+/// Whether the helper `pid` is that of a run whose Job no process has
+/// joined yet: the helper is still setting the sandbox up or waiting for
+/// its identity.
+pub(crate) fn script_is_yet_to_start(pid: u32) -> bool {
+    RUNS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&pid)
+        .is_some_and(|run| matches!(run.started.job.processes_ever(), Ok(0)))
+}
+
 /// Ends the helper `pid`, then the script in the run's Job, then has a
 /// helper take back what the run set until it ended: the read denials on
 /// the project's secrets and its way through the folders above. An ended
@@ -1670,6 +1680,83 @@ mod tests {
 
         assert!(matches!(nothing, AfterRun::Nothing), "{nothing:?}");
         assert!(matches!(told, AfterRun::Unknown(_)), "{told:?}");
+    }
+
+    /// A process that waits for input nobody sends, ended with the test.
+    struct StandIn(Child);
+
+    impl StandIn {
+        fn start() -> Self {
+            Self(
+                Command::new(r"C:\Windows\System32\cmd.exe")
+                    .args(["/d", "/c", "pause"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("start a process to stand in"),
+            )
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A run kept in `RUNS` until the test is done with it.
+    struct KeptRun(u32);
+
+    impl Drop for KeptRun {
+        fn drop(&mut self) {
+            RUNS.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_run_is_yet_to_start_its_script_until_a_process_joins_its_job() {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let folder = tempfile::tempdir().unwrap();
+        let job_name = run_job_name();
+        let mut helper = StandIn::start();
+        let pid = helper.0.id();
+        track_run(
+            &mut helper.0,
+            StartedRun {
+                helper_path: folder.path().join("helper.cmd"),
+                name: "LpmFinishRunTest".to_owned(),
+                record: folder.path().join("grants.json"),
+                job: ScriptJob::create(Some(&job_name)).expect("make the run's Job"),
+                job_name: job_name.clone(),
+            },
+        )
+        .expect("keep the run");
+        let kept = KeptRun(pid);
+
+        let before_a_script = script_is_yet_to_start(pid);
+        let script = StandIn::start();
+        let job = ScriptJob::open(&job_name).expect("open the run's Job as its helper does");
+        // SAFETY: both handles are open.
+        let joined =
+            unsafe { AssignProcessToJobObject(job.as_raw(), script.0.as_raw_handle().cast()) };
+        // The Job goes on counting a script that has ended.
+        drop(script);
+        let after_a_script = script_is_yet_to_start(pid);
+        drop(kept);
+        let once_released = script_is_yet_to_start(pid);
+
+        assert_ne!(joined, 0, "the stand-in joins the Job");
+        assert!(before_a_script, "no process has joined the run's Job yet");
+        assert!(!after_a_script, "the Job has held a process");
+        assert!(
+            !once_released,
+            "a run that isn't kept has no script to wait for"
+        );
     }
 
     #[test]

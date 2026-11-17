@@ -1541,7 +1541,7 @@ async fn run_under_store_lock(
                 Err(e) => {
                     let mut hints = Vec::new();
                     #[cfg(windows)]
-                    if e.starts_with(process_tree::TIMEOUT_ERROR)
+                    if process_tree::is_of_a_script_out_of_time(&e)
                         && let Some(node) = stuck_node
                     {
                         hints.push(node.timeout_hint());
