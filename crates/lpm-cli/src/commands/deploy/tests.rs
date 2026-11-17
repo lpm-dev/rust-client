@@ -40,8 +40,18 @@ async fn run(
     let lpm_home = security_root.path().join("lpm-home");
     let security_dir = security_root.path().join("security");
     let policy_path = security_root.path().join("security-policy.toml");
+    // An install reads the npm configuration before it knows it has nothing
+    // to fetch, and this machine's could name a file that isn't there.
+    let npmrc = security_root.path().join("empty.npmrc");
+    std::fs::write(&npmrc, "").unwrap();
     let _security_env = crate::test_env::ScopedEnv::update([
         ("LPM_HOME", Some(lpm_home.as_os_str().to_owned())),
+        ("NPM_CONFIG_USERCONFIG", Some(npmrc.as_os_str().to_owned())),
+        (
+            "NPM_CONFIG_GLOBALCONFIG",
+            Some(npmrc.as_os_str().to_owned()),
+        ),
+        ("LPM_NPM_ROUTE", Some(OsString::from("direct"))),
         (
             "LPM_SECURITY_DIR",
             Some(security_dir.as_os_str().to_owned()),
@@ -59,7 +69,10 @@ async fn run(
             Some(OsString::from("deny")),
         ),
     ]);
-    let client = RegistryClient::new();
+    // No deploy here needs a registry, so none can reach a real one.
+    let client = RegistryClient::new()
+        .with_base_url("http://127.0.0.1:9")
+        .with_npm_registry_url("http://127.0.0.1:9");
     let result = super::run(
         &client,
         cwd,
@@ -1108,7 +1121,7 @@ async fn run_full_pipeline_with_empty_deps_member_succeeds_json_mode() {
 #[tokio::test]
 async fn run_full_pipeline_workspace_protocol_dep_is_localized_in_output() {
     let tmp = tempfile::tempdir().unwrap();
-    let workspace_root = build_workspace_with_workspace_protocol_dep(tmp.path());
+    let workspace_root = build_workspace_with_only_workspace_deps(tmp.path());
 
     let output_parent = tempfile::tempdir().unwrap();
     let output = output_parent.path().join("prod-api");
@@ -1123,29 +1136,26 @@ async fn run_full_pipeline_workspace_protocol_dep_is_localized_in_output() {
     )
     .await;
 
-    let _ = result;
+    assert!(result.is_ok(), "deploy should succeed: {result:?}");
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
+            .unwrap();
+    let local = after["dependencies"]["@scope/auth"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("file:")
+        .expect("deployment retains a local dependency");
+    assert!(output.join(local).join("package.json").is_file());
 
-    if output.join("package.json").exists() {
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
-                .unwrap();
-        let local = after["dependencies"]["@scope/auth"]
-            .as_str()
-            .unwrap()
-            .strip_prefix("file:")
-            .expect("deployment retains a local dependency");
-        assert!(output.join(local).join("package.json").is_file());
-
-        // CRITICAL: source workspace manifest is unchanged (still has workspace:*)
-        let source: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(workspace_root.join("packages/api/package.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            source["dependencies"]["@scope/auth"], "workspace:*",
-            "source workspace manifest must NOT be modified by deploy"
-        );
-    }
+    // CRITICAL: source workspace manifest is unchanged (still has workspace:*)
+    let source: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(workspace_root.join("packages/api/package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        source["dependencies"]["@scope/auth"], "workspace:*",
+        "source workspace manifest must NOT be modified by deploy"
+    );
 }
 
 #[tokio::test]
@@ -1370,7 +1380,7 @@ async fn run_e2e_combines_deny_list_and_local_workspace_dep_rewrite() {
     // 4. workspace:* deps are rewritten to local file dependencies
     // 5. The source workspace's manifests are byte-identical
     let tmp = tempfile::tempdir().unwrap();
-    let workspace_root = build_workspace_with_workspace_protocol_dep(tmp.path());
+    let workspace_root = build_workspace_with_only_workspace_deps(tmp.path());
 
     // Add some files that should be deployed and some that should NOT
     let api_dir = workspace_root.join("packages").join("api");
@@ -1414,7 +1424,7 @@ async fn run_e2e_combines_deny_list_and_local_workspace_dep_rewrite() {
         true,
     )
     .await;
-    let _ = result;
+    assert!(result.is_ok(), "deploy should succeed: {result:?}");
 
     // ── Positive: deployed source files exist ──────────────────────────
     assert!(output.join("package.json").exists(), "package.json copied");
@@ -1526,6 +1536,21 @@ fn build_workspace_with_workspace_protocol_dep(tmp: &Path) -> PathBuf {
     )
     .unwrap();
 
+    root
+}
+
+/// The same workspace without its registry dependency, for a deploy that
+/// has to finish with no registry to ask.
+fn build_workspace_with_only_workspace_deps(tmp: &Path) -> PathBuf {
+    let root = build_workspace_with_workspace_protocol_dep(tmp);
+    let manifest = root.join("packages").join("api").join("package.json");
+    let mut api: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    api["dependencies"]
+        .as_object_mut()
+        .unwrap()
+        .remove("express");
+    std::fs::write(&manifest, serde_json::to_string_pretty(&api).unwrap()).unwrap();
     root
 }
 
