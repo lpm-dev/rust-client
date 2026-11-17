@@ -232,7 +232,7 @@ fn helper_runs_trivial_command_under_appcontainer_and_propagates_exit_zero() {
 }
 
 #[test]
-fn helper_supports_concurrent_first_use_and_deletes_temporary_appcontainer_profile() {
+fn helpers_started_together_for_one_new_profile_all_run_and_leave_it_to_be_deleted() {
     const HELPER_COUNT: usize = 16;
 
     let unique_suffix = std::time::SystemTime::now()

@@ -1283,43 +1283,65 @@ fn a_run_whose_job_can_t_be_opened_starts_no_script() {
     assert!(!created.exists());
 }
 
-/// A script that runs as an identity outside any run that holds it: its
-/// helper has no grant record, so it doesn't hold the identity. It stands
-/// in for processes that outlasted their run: the script the helper
-/// started, and one that script started in turn. Both end once told to,
-/// so the helper takes back what it set as after any other run.
+/// A script that runs as an identity while no run holds the identity, and
+/// which the record of the run under test doesn't name. It belongs to a
+/// run of the identity that keeps a record of its own, as one started from
+/// another LPM home does, in a Job the test holds, and that run's helper
+/// was stopped. It stands in for processes that outlasted their run: the
+/// script the helper started, and one that script started in turn.
 struct OutlastingScript {
-    helper: std::process::Child,
+    /// Held until both scripts are gone, then closed.
+    job: Option<HeldJob>,
+    /// The identity with the stand-in run's own record.
+    identity: Vec<String>,
     folder: tempfile::TempDir,
 }
 
 impl OutlastingScript {
-    /// Starts the script as the identity `identity` names, and returns
-    /// once the script it starts in turn runs.
+    /// Starts the script as the identity `identity` names, stops its
+    /// helper once the script it starts in turn runs, and returns with
+    /// both scripts still running.
     fn start(identity: &[String]) -> Self {
         let folder = tempfile::tempdir().expect("folder for the outlasting script");
-        let started = folder.path().join("second-script-started");
+        let scripts_own = folder.path().join("script");
+        fs::create_dir(&scripts_own).expect("folder the outlasting script writes to");
+        let started = scripts_own.join("second-script-started");
         let quoted = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
         let name = identity
             .iter()
             .skip_while(|argument| *argument != "--appcontainer-name")
             .nth(1)
             .expect("the identity names its profile");
+        let identity = vec![
+            "--protocol-version".to_string(),
+            lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+            "--appcontainer-name".into(),
+            name.clone(),
+            "--grant-record".into(),
+            folder
+                .path()
+                .join("grants.json")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let job = HeldJob::create(format!(
+            r"Global\LpmFilesystemOutlasting-{}-{}",
+            std::process::id(),
+            NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let script = format!(
             "$env:LPM_TEST_STARTED = '{}'\n$env:LPM_TEST_TOLD_TO_END = '{}'\n& '{POWERSHELL}' -NoProfile -NonInteractive -Command 'New-Item -ItemType File -Path $env:LPM_TEST_STARTED | Out-Null; while (-not (Test-Path -LiteralPath $env:LPM_TEST_TOLD_TO_END)) {{ Start-Sleep -Milliseconds 100 }}'",
             quoted(&started),
-            quoted(&folder.path().join("told-to-end")),
+            quoted(&scripts_own.join("told-to-end")),
         );
-        let helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
-            .arg("--protocol-version")
-            .arg(lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string())
-            .arg("--appcontainer-name")
-            .arg(name)
+        let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .args(&identity)
+            .args(["--job", job.name.as_str()])
             .args(["--stdio-stdin", "null"])
             .args(["--stdio-stdout", "null"])
             .args(["--stdio-stderr", "null"])
             .arg("--writable-dir")
-            .arg(folder.path())
+            .arg(&scripts_own)
             .args([
                 "--",
                 POWERSHELL,
@@ -1330,35 +1352,57 @@ impl OutlastingScript {
             .arg(script)
             .spawn()
             .expect("spawn helper");
-        let mut script = Self { helper, folder };
+        // From here on dropping this ends the scripts and cleans up.
+        let outlasting = Self {
+            job: Some(job),
+            identity,
+            folder,
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while !started.exists() {
-            assert!(
-                script.helper.try_wait().expect("poll helper").is_none(),
-                "the outlasting script ended before it started"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the outlasting script never started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        script
-    }
-
-    /// Tells both scripts to end and waits for the helper, which then
-    /// takes back what it set. A helper that doesn't end is stopped.
-    fn end(&mut self) {
-        let _ = fs::write(self.folder.path().join("told-to-end"), "");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            if matches!(self.helper.try_wait(), Ok(Some(_)) | Err(_)) {
-                return;
+        let running = loop {
+            if started.exists() {
+                break true;
+            }
+            if helper.try_wait().expect("poll helper").is_some()
+                || std::time::Instant::now() >= deadline
+            {
+                break false;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let _ = helper.kill();
+        let _ = helper.wait();
+        assert!(running, "the outlasting script never started");
+        let left = outlasting.job.as_ref().map(HeldJob::active_processes);
+        assert!(
+            left >= Some(2),
+            "both scripts outlive their helper while the Job is held: {left:?}"
+        );
+        outlasting
+    }
+
+    /// Tells both scripts to end, waits until the Job counts none, and
+    /// has the stand-in run's own record cleaned up. Scripts that don't
+    /// end are ended with the Job.
+    fn end(&mut self) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let _ = fs::write(self.folder.path().join("script").join("told-to-end"), "");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while job.active_processes() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let _ = self.helper.kill();
-        let _ = self.helper.wait();
+        // The profile is left for the identity's own cleanup. This may run
+        // while a failed test unwinds, so a cleanup that failed is only
+        // shown.
+        let revoked = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+            .args(&self.identity)
+            .arg("--revoke-only")
+            .output();
+        if !matches!(&revoked, Ok(output) if output.status.success()) {
+            eprintln!("the outlasting script's own run wasn't cleaned up: {revoked:?}");
+        }
     }
 }
 
@@ -1490,6 +1534,152 @@ fn no_run_or_cleanup_of_an_identity_starts_while_a_process_still_runs_as_it() {
     assert!(created.exists());
     let cleanup = identity.clean_up();
     assert!(cleanup.status.success(), "{cleanup:?}");
+}
+
+/// A helper that is stopped, if it still runs, when the test is done with
+/// it: a cleanup of its identity gets nowhere while it holds the identity.
+struct StoppedWithTheTest(std::process::Child);
+
+impl Drop for StoppedWithTheTest {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn ends_within(helper: &mut std::process::Child, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if helper.try_wait().expect("poll helper").is_some() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A run without a grant record still denies its identity the project's
+/// secrets and takes the denials back when it ends. A second such run
+/// that didn't wait for the first would take them back under a script
+/// that still runs.
+#[test]
+fn a_run_without_a_grant_record_waits_for_the_run_of_its_identity_before_it() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let scripts_own = tempfile::tempdir().expect("folder the first script writes to");
+    let secret = project.path().join(".env");
+    fs::write(&secret, "protected-content").expect("seed protected file");
+    let started = scripts_own.path().join("started");
+    let told_to_end = scripts_own.path().join("told-to-end");
+    let secret_was_read = scripts_own.path().join(SECRET_WAS_READ);
+    let name = format!("LpmFilesystemNoRecord-{}", std::process::id());
+    // Neither run keeps a record, so one that has to be stopped leaves what
+    // it set. This record names everything the two may set, for the
+    // cleanup to take back.
+    let record = records.path().join("grants.json");
+    let above = |folder: &std::path::Path| -> Vec<std::path::PathBuf> {
+        folder
+            .ancestors()
+            .skip(1)
+            .map(std::path::Path::to_path_buf)
+            .collect()
+    };
+    let traversed = [above(project.path()), above(scripts_own.path())].concat();
+    fs::write(
+        &record,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "trees": [project.path(), scripts_own.path()],
+            "run": {
+                "traversed": traversed,
+                "denied": [&secret],
+            },
+        }))
+        .unwrap(),
+    )
+    .expect("write the cleanup's record");
+    let _profile = RunIdentity(vec![
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        name.clone(),
+        "--grant-record".into(),
+        record.to_string_lossy().into_owned(),
+    ]);
+    let run_without_a_record = |script: String, writable: Option<&std::path::Path>| {
+        let mut helper = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
+        helper
+            .arg("--protocol-version")
+            .arg(lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string())
+            .arg("--appcontainer-name")
+            .arg(&name)
+            .args(["--stdio-stdin", "null"])
+            .args(["--stdio-stdout", "null"])
+            .args(["--stdio-stderr", "null"])
+            .arg("--readable-dir")
+            .arg(project.path())
+            .arg("--secret-read-deny")
+            .arg(&secret);
+        if let Some(writable) = writable {
+            helper.arg("--writable-dir").arg(writable);
+        }
+        helper
+            .args([
+                "--",
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+            ])
+            .arg(script)
+            .spawn()
+            .map(StoppedWithTheTest)
+            .expect("spawn helper")
+    };
+    let quoted = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
+    let mut first = run_without_a_record(
+        format!(
+            "New-Item -ItemType File -Path '{}' | Out-Null; while (-not (Test-Path -LiteralPath '{}')) {{ try {{ [System.IO.File]::ReadAllText('{}') | Out-Null; [System.IO.File]::WriteAllText('{}', 'read') }} catch {{ }} }}",
+            quoted(&started),
+            quoted(&told_to_end),
+            quoted(&secret),
+            quoted(&secret_was_read),
+        ),
+        Some(scripts_own.path()),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !started.exists() {
+        assert!(
+            first.0.try_wait().expect("poll helper").is_none()
+                && std::time::Instant::now() < deadline,
+            "the first run's script never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let mut second = run_without_a_record("exit 0".to_owned(), None);
+    let second_ended_early = ends_within(&mut second.0, std::time::Duration::from_secs(5));
+    fs::write(&told_to_end, "").expect("tell the first script to end");
+    let first_ended = ends_within(&mut first.0, std::time::Duration::from_secs(60));
+    let second_ended = ends_within(&mut second.0, std::time::Duration::from_secs(120));
+
+    assert!(
+        !second_ended_early,
+        "the second run didn't wait for the first"
+    );
+    assert!(first_ended && second_ended);
+    let second_run = second.0.wait().expect("the second run's exit status");
+    assert!(second_run.success(), "{second_run:?}");
+    assert!(
+        !secret_was_read.exists(),
+        "the first run's script read the secret once the second run took the denial back"
+    );
+    assert!(
+        denied_app_containers(&secret).is_empty(),
+        "each run takes its denial back once its own script is gone"
+    );
 }
 
 #[test]
