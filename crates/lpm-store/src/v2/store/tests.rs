@@ -452,12 +452,76 @@ fn portable_materialization_metadata_matches_the_tree_walker() {
     std::fs::write(source.join("a/z.js"), b"nested").unwrap();
     std::fs::write(source.join("a-foo.js"), b"sibling").unwrap();
     std::fs::write(source.join("package.json"), b"{}").unwrap();
+    std::fs::write(source.join("empty.js"), b"").unwrap();
+    std::fs::write(source.join("a/large.bin"), vec![7u8; 256 * 1024 + 3]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(source.join("a/tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            source.join("a/tool"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
 
     let fused = materialize_into_portable_with_integrity(&source, &destination).unwrap();
 
     assert_eq!(
         fused,
         compute_tree_metadata_integrity(&destination).unwrap()
+    );
+    for relative in [
+        "a/z.js",
+        "a-foo.js",
+        "package.json",
+        "empty.js",
+        "a/large.bin",
+    ] {
+        assert_eq!(
+            std::fs::read(destination.join(relative)).unwrap(),
+            std::fs::read(source.join(relative)).unwrap(),
+            "{relative}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(destination.join("a/tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_materialization_reflinks_only_files_above_the_threshold() {
+    use crate::v2::fs_util::linux_copy::{MIN_REFLINK_BYTES, REFLINK_CANDIDATES};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let small = usize::try_from(MIN_REFLINK_BYTES).unwrap() - 1;
+    std::fs::write(source.join("small.js"), vec![1u8; small]).unwrap();
+    std::fs::write(source.join("tiny.js"), b"tiny").unwrap();
+    let candidates_before = REFLINK_CANDIDATES.with(std::cell::Cell::get);
+
+    materialize_into_portable_with_integrity(&source, &dir.path().join("small-only")).unwrap();
+    let after_small = REFLINK_CANDIDATES.with(std::cell::Cell::get);
+    std::fs::write(source.join("large.bin"), vec![2u8; small + 1]).unwrap();
+    materialize_into_portable_with_integrity(&source, &dir.path().join("with-large")).unwrap();
+    let after_large = REFLINK_CANDIDATES.with(std::cell::Cell::get);
+
+    assert_eq!(after_small - candidates_before, 0);
+    assert_eq!(after_large - after_small, 1);
+    assert_eq!(
+        std::fs::read(dir.path().join("with-large/large.bin")).unwrap(),
+        vec![2u8; small + 1]
     );
 }
 
