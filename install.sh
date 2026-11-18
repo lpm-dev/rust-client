@@ -276,8 +276,15 @@ else
     VERSION=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"version"' | sed -E 's/.*"version": *"([^"]+)".*/v\1/')
   else
     VERSION=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+    # The commit the release was published from; cosign binds the
+    # signature to it below.
+    RELEASE_COMMIT=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"target_commitish"' | sed -E 's/.*"target_commitish": *"([0-9a-f]{40})".*/\1/')
   fi
 fi
+case "${RELEASE_COMMIT:-}" in
+  *[!0-9a-f]*|"") RELEASE_COMMIT="" ;;
+esac
+[ "${#RELEASE_COMMIT}" -eq 40 ] || RELEASE_COMMIT=""
 
 if [ -z "$VERSION" ]; then
   echo "Failed to detect latest $INSTALL_CHANNEL version. Check https://github.com/$REPO/releases"
@@ -509,6 +516,37 @@ elif [ -n "$SHA_TOOL" ]; then
   fi
 fi
 
+# The one identity each release was signed with: release.yml in this
+# repository, run by hand on main for a stable release (by the schedule or
+# by hand for a nightly), at the commit the release records when the
+# installer knows it. Stable releases up to v0.76.5 were signed from their
+# own tag by a tag push. The staged version check below binds the rest.
+verify_manifest_signer() {
+  if [ "$RESOLVED_CHANNEL" = "stable" ] && version_lt "$VERSION" "v0.77.0"; then
+    signing_ref="refs/tags/$VERSION"
+    signing_trigger="push"
+  elif [ "$RESOLVED_CHANNEL" = "stable" ]; then
+    signing_ref="refs/heads/main"
+    signing_trigger="workflow_dispatch"
+  else
+    signing_ref="refs/heads/main"
+    signing_trigger=""
+  fi
+  set -- \
+    --bundle "$BUNDLE_TMP" \
+    --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@$signing_ref" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    --certificate-github-workflow-repository "$REPO" \
+    --certificate-github-workflow-ref "$signing_ref"
+  if [ -n "$signing_trigger" ]; then
+    set -- "$@" --certificate-github-workflow-trigger "$signing_trigger"
+  fi
+  if [ -n "$RELEASE_COMMIT" ]; then
+    set -- "$@" --certificate-github-workflow-sha "$RELEASE_COMMIT"
+  fi
+  cosign verify-blob "$@" "$MANIFEST_TMP" >/dev/null 2>&1
+}
+
 RELEASE_ASSET="$PLATFORM"
 if [ "$MACOS_BUNDLE" = "1" ]; then
   RELEASE_ASSET="$PLATFORM.zip"
@@ -566,15 +604,10 @@ elif [ -n "$SHA_TOOL" ]; then
   # fail-closed on rejection. `cosign` absent → SHA-only floor.
   if command -v cosign >/dev/null 2>&1 && [ -s "$BUNDLE_TMP" ]; then
     echo "cosign detected; verifying manifest signature..."
-    cosign verify-blob \
-      --bundle "$BUNDLE_TMP" \
-      --certificate-identity-regexp "^https://github\\.com/lpm-dev/rust-client/\\.github/workflows/release\\.yml@.+" \
-      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-      "$MANIFEST_TMP" >/dev/null 2>&1 \
-      || {
-        echo "ERROR: cosign refused the signature on SHA256SUMS.txt — manifest is not authentically from $REPO release.yml"
-        exit 1
-      }
+    verify_manifest_signer || {
+      echo "ERROR: cosign refused the signature on SHA256SUMS.txt — manifest is not authentically from $REPO release.yml"
+      exit 1
+    }
     echo "Verified Sigstore signature on manifest (identity-pinned to release.yml)"
   elif [ "$MACOS_BUNDLE" != "1" ] || [ "$LEGACY_MACOS" = "1" ]; then
     # On macOS the Developer ID signature and notarization checks below

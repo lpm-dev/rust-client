@@ -991,8 +991,9 @@ rm -rf "$fdir"
 pass "security floor refuses releases older than v0.87.0 before downloading"
 
 # ── Case 13: LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses unverifiable installs
+release_commit="1e98fb8efbcc00f620678fc8091b512ed503768f"
 fdir="$(mktemp -d)"
-printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "$release_commit" > "$fdir/api.json"
 write_signed_release "$fdir" 'require-sigstore-binary-bytes' "$FIXTURE_VERSION"
 trap 'stop_server' EXIT
 start_server "$fdir"
@@ -1028,6 +1029,57 @@ unset LPM_TEST_TOOL_STATE LPM_INSTALL_REQUIRE_SIGSTORE
 [ -s "$cosign_state/cosign-args" ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 did not run cosign"
 echo "$RUN_OUT" | grep -q "Verified Sigstore signature on manifest" \
   || fail "strict install did not report the Sigstore verification: $RUN_OUT"
+# cosign must hold the exact stable identity, bound to the release's commit.
+cosign_args="$(tr '\n' ' ' < "$cosign_state/cosign-args")"
+for expected in \
+  "--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main " \
+  "--certificate-oidc-issuer https://token.actions.githubusercontent.com " \
+  "--certificate-github-workflow-repository lpm-dev/rust-client " \
+  "--certificate-github-workflow-ref refs/heads/main " \
+  "--certificate-github-workflow-trigger workflow_dispatch " \
+  "--certificate-github-workflow-sha $release_commit "
+do
+  case "$cosign_args" in
+    *"$expected"*) ;;
+    *) fail "stable cosign check is missing '$expected': $cosign_args" ;;
+  esac
+done
+case "$cosign_args" in
+  *regexp*) fail "cosign must match the exact identity, not a pattern: $cosign_args" ;;
+esac
+
+# Releases up to v0.76.5 were signed from their own tag by a tag push.
+write_signed_release "$fdir" 'tag-signed-binary-bytes' v0.76.5
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.76.5 \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a tag-signed release must verify with its tag identity: $RUN_OUT"
+cosign_args="$(tr '\n' ' ' < "$cosign_state/cosign-args")"
+for expected in \
+  "--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v0.76.5 " \
+  "--certificate-github-workflow-ref refs/tags/v0.76.5 " \
+  "--certificate-github-workflow-trigger push "
+do
+  case "$cosign_args" in
+    *"$expected"*) ;;
+    *) fail "tag-signed cosign check is missing '$expected': $cosign_args" ;;
+  esac
+done
+
+# A nightly comes from main, started by the schedule or by hand.
+write_signed_release "$fdir" 'nightly-signer-binary-bytes' "$NIGHTLY_VERSION"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_VERSION="$NIGHTLY_VERSION" run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a nightly must verify with the main identity: $RUN_OUT"
+cosign_args="$(tr '\n' ' ' < "$cosign_state/cosign-args")"
+case "$cosign_args" in
+  *"--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main "*) ;;
+  *) fail "nightly cosign check must hold the main identity: $cosign_args" ;;
+esac
+case "$cosign_args" in
+  *--certificate-github-workflow-trigger*) fail "a nightly may come from either trigger: $cosign_args" ;;
+esac
+write_signed_release "$fdir" 'require-sigstore-binary-bytes' "$FIXTURE_VERSION"
 
 rm -f "$fdir/SHA256SUMS.txt.sigstore" "$cosign_state/cosign-args"
 LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_REQUIRE_SIGSTORE=1 run_install_sh

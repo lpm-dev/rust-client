@@ -154,6 +154,7 @@ mod tests {
                 workflow_ref: Some("refs/heads/main".into()),
                 ..Default::default()
             },
+            build: Default::default(),
             statement: serde_json::json!({"subject": [{"name": "relay-trust.json",
                 "digest": {"sha256": hex::encode(Sha256::digest(bytes))}}]}),
             integrated_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW as u64),
