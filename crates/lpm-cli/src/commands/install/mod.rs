@@ -69,6 +69,7 @@ mod workspace_resolution;
 use accounting::*;
 use catalog::*;
 use concurrency::*;
+pub(crate) use fetch::metadata_tarball_url_for_package;
 use fetch::*;
 use fetch_overlap::*;
 use firewall::{
@@ -692,6 +693,9 @@ async fn run_with_options_under_store_lock(
         min_release_age_exclude,
         timing,
     })?;
+    if frozen_lockfile_active {
+        workspace_lockfile::mark_active_install_frozen();
+    }
     let caller_policy_package = if policy_project_dir != project_dir
         && policy_project_dir.join("package.json").is_file()
     {
@@ -739,6 +743,7 @@ async fn run_with_options_under_store_lock(
         policy_extension_configs: &policy_extension_configs,
         force,
         offline,
+        frozen_lockfile: frozen_lockfile_active,
         no_skills,
         restore_managed_skills,
         omit_policy,
@@ -2017,6 +2022,9 @@ async fn run_with_options_under_store_lock(
         fast_path_lockfile,
         fresh_urls: &fresh_urls,
         proven_pins: &proven_pins,
+        unrecordable_tarball_hints: gate_stats
+            .query_string
+            .load(std::sync::atomic::Ordering::Relaxed),
         obsolete_binary_lockfile,
         json_output,
     })?;

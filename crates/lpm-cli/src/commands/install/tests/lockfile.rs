@@ -2661,6 +2661,36 @@ fn only_a_served_url_other_than_the_locked_one_is_written_back() {
 }
 
 #[test]
+fn a_served_url_with_a_query_drops_the_locked_url_and_locks_none() {
+    let locked = |name: &str, tarball: Option<&str>| lpm_lockfile::LockedPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        source: Some(DEFAULT_REGISTRY_SOURCE.into()),
+        tarball: tarball.map(str::to_owned),
+        ..Default::default()
+    };
+    let rows = [
+        locked("was-plain", Some("https://registry.example.test/a/-/a.tgz")),
+        locked("never-locked", None),
+    ];
+    let key = |name: &str| format!("{name}\0{}\0{DEFAULT_REGISTRY_SOURCE}", "1.0.0");
+    let served = HashMap::from([
+        (
+            key("was-plain"),
+            "https://cdn.example.test/a.tgz?sig=value".to_string(),
+        ),
+        (
+            key("never-locked"),
+            "https://cdn.example.test/b.tgz?sig=value".to_string(),
+        ),
+    ]);
+
+    let changes = urls_other_than_locked(rows.iter(), &served);
+
+    assert_eq!(changes, HashMap::from([(key("was-plain"), None)]));
+}
+
+#[test]
 fn a_package_that_records_no_tarball_url_is_never_reported_as_refreshed() {
     let source =
         "git+https://git.example.test/owner/repo.git#0123456789abcdef0123456789abcdef01234567";

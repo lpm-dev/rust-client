@@ -1049,3 +1049,73 @@ async fn fetch_firewall_monitor_continues_after_oidc_exchange_failure_but_enforc
         }
     }
 }
+
+const SIGNED_QUERY: &str = "sig=dummy-signature&expires=600";
+
+#[tokio::test]
+async fn fetch_looks_up_a_package_whose_lockfile_keeps_no_tarball_url() {
+    let mock = MockRegistry::start().await;
+    mock.with_package_at_a_url_with_query(
+        "ms",
+        "2.1.3",
+        &make_tarball("ms", "2.1.3"),
+        SIGNED_QUERY,
+    )
+    .await;
+    let lockfile = seed_lockfile(&mock).await;
+    assert!(!lockfile.contains("tarball ="), "{lockfile}");
+    let project = project_with_lockfile(&lockfile);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        package_object_dir(&project, "ms", "2.1.3")
+            .join("package.json")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn fetch_does_not_download_from_a_locked_url_with_a_query() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let served = mock.tarball_url("ms", "2.1.3");
+    assert!(lockfile.contains(&served), "{lockfile}");
+    let project =
+        project_with_lockfile(&lockfile.replace(&served, &format!("{served}?{SIGNED_QUERY}")));
+    let before = tarball_request_count(&mock, "ms", "2.1.3").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tarball_path = MockRegistry::tarball_path("ms", "2.1.3");
+    let queries: Vec<_> = mock
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == tarball_path)
+        .skip(before)
+        .map(|request| request.url.query().map(str::to_owned))
+        .collect();
+    assert_eq!(queries, [None]);
+}

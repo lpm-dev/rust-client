@@ -4307,7 +4307,7 @@ pub(super) fn canonical_cached_registry_tarball_url(
     }
 }
 
-pub(super) async fn metadata_tarball_url_for_package(
+pub(crate) async fn metadata_tarball_url_for_package(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     name: &str,

@@ -24,6 +24,10 @@ pub(super) struct WorkspaceLockfileCoordinator {
     projection_revision: AtomicU64,
     staged: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     non_persisting_importers: Mutex<BTreeSet<String>>,
+    /// An install in this transaction runs with a frozen lockfile, so a
+    /// commit that stages nothing doesn't rewrite it to drop URLs it no
+    /// longer keeps.
+    frozen: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     projection_materializations: AtomicUsize,
 }
@@ -129,6 +133,7 @@ impl WorkspaceLockfileCoordinator {
             projection_revision: AtomicU64::new(0),
             staged: Mutex::new(BTreeMap::new()),
             non_persisting_importers: Mutex::new(BTreeSet::new()),
+            frozen: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             projection_materializations: AtomicUsize::new(0),
         })
@@ -297,6 +302,11 @@ impl WorkspaceLockfileCoordinator {
             .insert(importer.to_string());
     }
 
+    fn mark_frozen(&self) {
+        self.frozen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(super) fn commit(&self, required_importers: &[String]) -> Result<bool, LpmError> {
         let staged = self
             .staged
@@ -309,6 +319,8 @@ impl WorkspaceLockfileCoordinator {
         if staged.is_empty()
             && !self.migration_pending
             && let Some(existing) = &self.existing
+            && (self.frozen.load(std::sync::atomic::Ordering::Relaxed)
+                || !holds_unrecordable_tarball_hint(existing.as_lockfile()))
             && existing
                 .as_lockfile()
                 .importers
@@ -421,6 +433,8 @@ impl WorkspaceLockfileCoordinator {
             union
         };
 
+        let mut union = union;
+        drop_unrecordable_tarball_hints(&mut union).map_err(lockfile_error)?;
         let path = self.root.join(lpm_lockfile::LOCKFILE_NAME);
         if !self.migration_pending
             && self
@@ -434,6 +448,48 @@ impl WorkspaceLockfileCoordinator {
         union.write_all(&path).map_err(lockfile_error)?;
         Ok(true)
     }
+}
+
+fn is_unrecordable_tarball_hint(row: &lpm_lockfile::LockedPackage) -> bool {
+    row.tarball
+        .as_deref()
+        .is_some_and(|url| !lpm_lockfile::is_recordable_tarball_hint(url))
+}
+
+fn holds_unrecordable_tarball_hint(lockfile: &lpm_lockfile::Lockfile) -> bool {
+    lockfile
+        .packages
+        .iter()
+        .chain(lockfile.workspace_packages.values())
+        .any(is_unrecordable_tarball_hint)
+}
+
+/// Drops, from every importer's rows, the tarball URLs a lockfile no longer
+/// keeps. An install rewrites only the importers it covers; this keeps the
+/// others from carrying such a URL on until they are installed.
+fn drop_unrecordable_tarball_hints(
+    union: &mut lpm_lockfile::Lockfile,
+) -> Result<(), lpm_lockfile::LockfileError> {
+    if !holds_unrecordable_tarball_hint(union) {
+        return Ok(());
+    }
+    let importers: Vec<String> = union.importers.keys().cloned().collect();
+    for importer in importers {
+        let mut projection = union.project_importer(&importer)?;
+        let mut changed = false;
+        for row in projection
+            .packages
+            .iter_mut()
+            .filter(|row| is_unrecordable_tarball_hint(row))
+        {
+            row.tarball = None;
+            changed = true;
+        }
+        if changed {
+            union.replace_importer(&importer, projection)?;
+        }
+    }
+    Ok(())
 }
 
 fn lockfile_error(error: lpm_lockfile::LockfileError) -> LpmError {
@@ -1052,6 +1108,18 @@ pub(super) fn mark_active_importer_non_persisting() {
     });
 }
 
+/// Keeps the workspace lockfile this install shares as it is, as a frozen
+/// install must, even where a commit would otherwise drop URLs it no longer
+/// keeps.
+pub(super) fn mark_active_install_frozen() {
+    if ACTIVE_TARGET
+        .try_with(|target| target.coordinator.mark_frozen())
+        .is_err()
+    {
+        let _ = ACTIVE_TRANSACTION.try_with(|transaction| transaction.coordinator.mark_frozen());
+    }
+}
+
 pub(crate) fn write(
     project_dir: &Path,
     lockfile: lpm_lockfile::Lockfile,
@@ -1483,6 +1551,34 @@ mod tests {
                 .unwrap()
                 .contains("resolved-with = \"migrate\"")
         );
+    }
+
+    #[test]
+    fn a_commit_that_stages_nothing_still_drops_a_locked_url_with_a_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut standalone = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut standalone,
+            "dependency",
+            "^1.0.0",
+            lpm_lockfile::LockedPackage {
+                tarball: Some(
+                    "https://registry.example/dependency/-/dependency-1.0.0.tgz?sig=abc".to_owned(),
+                ),
+                ..exact_package("dependency", "1.0.0", "root/dependency")
+            },
+        );
+        let mut union = lpm_lockfile::Lockfile::new();
+        union.absorb_importer(".", standalone).unwrap();
+        let path = directory.path().join(lpm_lockfile::LOCKFILE_NAME);
+        union.write_to_file(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("sig=abc"));
+        let coordinator = WorkspaceLockfileCoordinator::new(directory.path(), &[]).unwrap();
+
+        assert!(coordinator.commit(&[".".to_owned()]).unwrap());
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("sig=abc"), "{written}");
     }
 
     #[test]

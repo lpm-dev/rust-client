@@ -986,3 +986,26 @@ fn sbom_output_writes_file_without_stdout_payload() {
         serde_json::from_str(&project.read_file("bom.json")).expect("bom.json must be valid JSON");
     assert_eq!(written["bomFormat"], "CycloneDX");
 }
+
+#[test]
+fn sbom_omits_a_locked_tarball_url_with_a_query() {
+    let project = seed_project();
+    let lockfile = project.read_file("lpm.lock");
+    let signed = "left-pad-1.3.0.tgz?sig=dummy-signature";
+    project.write_file("lpm.lock", &lockfile.replace("left-pad-1.3.0.tgz", signed));
+
+    for format in ["cyclonedx", "spdx"] {
+        let output = lpm(&project)
+            .args(["sbom", "--format", format])
+            .output()
+            .expect("run SBOM");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{format}: {stdout}");
+        assert!(!stdout.contains("dummy-signature"), "{format}: {stdout}");
+        assert!(
+            stdout.contains("ansi-regex-5.0.1.tgz"),
+            "{format}: {stdout}"
+        );
+    }
+}

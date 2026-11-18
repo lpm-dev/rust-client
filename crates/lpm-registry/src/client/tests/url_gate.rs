@@ -353,6 +353,23 @@ fn gate_allows_localhost_registry() {
 }
 
 #[test]
+fn gate_rejects_a_stored_url_with_a_query_or_fragment() {
+    let client = RegistryClient::new().with_base_url("https://lpm.dev");
+    for url in [
+        "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?sig=value&expires=600",
+        "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?",
+        "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz#value",
+        "https://registry.npmjs.org/blobs/pkg-1.0.0?sig=value",
+    ] {
+        assert_eq!(
+            evaluate_cached_url(url, &client),
+            GateDecision::RejectedQuery,
+            "{url}"
+        );
+    }
+}
+
+#[test]
 fn gate_rejects_malformed_url() {
     let client = RegistryClient::new();
     assert_eq!(

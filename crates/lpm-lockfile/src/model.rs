@@ -781,8 +781,19 @@ pub struct LockedPackage {
     /// this hint is rejected by [`Lockfile::from_toml`] — see
     /// [`LockedPackage::tarball_field_hint_is_consistent`] and
     /// [`LockfileError::InvalidTarballHint`].
+    ///
+    /// Writers record only a URL [`is_recordable_tarball_hint`] accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tarball: Option<String>,
+}
+
+/// Whether a lockfile may record `url` as a package's tarball hint. A URL
+/// with a query or a fragment isn't: a registry that signs its download
+/// URLs puts the signature there, which would reach version control and
+/// stop working once it expires.
+#[inline]
+pub fn is_recordable_tarball_hint(url: &str) -> bool {
+    !url.contains(['?', '#'])
 }
 
 impl LockedPackage {

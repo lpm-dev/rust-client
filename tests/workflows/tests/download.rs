@@ -108,6 +108,41 @@ async fn download_json_accepts_version_flag_and_canonicalizes_output_dir() {
 }
 
 #[tokio::test]
+async fn download_json_masks_the_query_values_of_a_tarball_url() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let served = mock
+        .with_package_at_a_url_with_query(
+            "signed-pkg",
+            "1.0.0",
+            &make_tarball("signed-pkg", "1.0.0"),
+            "sig=dummy-signature&expires=600",
+        )
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["download", "signed-pkg@1.0.0", "--json", "--output", "out"])
+        .output()
+        .expect("failed to run lpm download --json");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("dummy-signature"), "{stdout}");
+    let json = parse_json_output(&output.stdout);
+    let (without_query, _) = served.split_once('?').unwrap();
+    assert_eq!(
+        json["tarball_url"],
+        format!("{without_query}?sig=<redacted>&expires=<redacted>")
+    );
+    assert!(project.file_exists("out/package.json"));
+}
+
+#[tokio::test]
 async fn download_version_flag_resolves_dist_tags_instead_of_exact_versions_only() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     let mock = MockRegistry::start().await;

@@ -1051,6 +1051,10 @@ pub(super) struct GateStats {
     /// the writer never emits a scheme-unsafe URL, so a non-zero
     /// counter is a corrupt-lockfile signal.
     pub(super) scheme_mismatch: std::sync::atomic::AtomicU64,
+    /// Stored URLs with a query or a fragment, which a lockfile no longer
+    /// keeps. Non-zero only for a lockfile an older LPM wrote; the install
+    /// rewrites it without them.
+    pub(super) query_string: std::sync::atomic::AtomicU64,
     /// Stored URL 404'd and the same-run retry (refresh metadata
     /// → fetch fresh URL) succeeded. Expected near-zero in steady
     /// state once the writeback trigger lands; persistent non-zero
@@ -1071,6 +1075,7 @@ impl GateStats {
             "origin_mismatch_count":  self.origin_mismatch.load(Ordering::Relaxed),
             "shape_mismatch_count":   self.shape_mismatch.load(Ordering::Relaxed),
             "scheme_mismatch_count":  self.scheme_mismatch.load(Ordering::Relaxed),
+            "query_string_count":     self.query_string.load(Ordering::Relaxed),
             "stale_recovery_count":   self.stale_recovery.load(Ordering::Relaxed),
             "stale_hard_fail_count":  self.stale_hard_fail.load(Ordering::Relaxed),
         })
