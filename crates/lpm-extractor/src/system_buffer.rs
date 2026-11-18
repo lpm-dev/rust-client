@@ -103,21 +103,16 @@ impl SystemBuffer {
         if is_mapped(self.capacity) && is_mapped(capacity) {
             let new_capacity = mapped_capacity(capacity);
             // SAFETY: `ptr` maps exactly `self.capacity` bytes. The kernel
-            // moves the pages instead of copying them, keeping their contents.
-            let ptr = unsafe {
-                libc::mremap(
-                    self.ptr.as_ptr().cast(),
-                    self.capacity,
-                    new_capacity,
-                    libc::MREMAP_MAYMOVE,
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                std::alloc::handle_alloc_error(layout(new_capacity));
+            // moves the pages instead of copying them, keeping their contents;
+            // on failure the old mapping is untouched.
+            let ptr = unsafe { remap(self.ptr.as_ptr().cast(), self.capacity, new_capacity) };
+            // A seccomp profile can refuse mremap; copying into a new
+            // mapping still works there.
+            if ptr != libc::MAP_FAILED {
+                self.ptr = allocated(ptr.cast(), layout(new_capacity));
+                self.capacity = new_capacity;
+                return;
             }
-            self.ptr = allocated(ptr.cast(), layout(new_capacity));
-            self.capacity = new_capacity;
-            return;
         }
         let (ptr, new_capacity) = allocate(capacity, false);
         // SAFETY: both allocations are live and distinct; `len <= capacity`.
@@ -127,6 +122,25 @@ impl SystemBuffer {
         self.ptr = ptr;
         self.capacity = new_capacity;
     }
+}
+
+/// `mremap(MREMAP_MAYMOVE)`, which tests can make fail.
+///
+/// # Safety
+/// `old` must be a live mapping of exactly `old_len` bytes.
+#[cfg(target_os = "linux")]
+unsafe fn remap(old: *mut libc::c_void, old_len: usize, new_len: usize) -> *mut libc::c_void {
+    #[cfg(test)]
+    if FAIL_NEXT_REMAP.with(|fail| fail.replace(false)) {
+        return libc::MAP_FAILED;
+    }
+    // SAFETY: the caller passes a live mapping of exactly `old_len` bytes.
+    unsafe { libc::mremap(old, old_len, new_len, libc::MREMAP_MAYMOVE) }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_NEXT_REMAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(unix)]
@@ -328,6 +342,26 @@ mod tests {
 
         let below = MAP_THRESHOLD - 3;
         assert_eq!(SystemBuffer::zeroed(below).capacity(), below);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_remap_grows_by_copying_instead() {
+        let mut buffer = SystemBuffer::new();
+        let first: Vec<u8> = (0..MAP_THRESHOLD as u32 + 7)
+            .map(|value| value as u8)
+            .collect();
+        buffer.extend_from_slice(&first);
+        FAIL_NEXT_REMAP.with(|fail| fail.set(true));
+
+        buffer.reserve_exact(3 * 1024 * 1024);
+
+        assert!(
+            !FAIL_NEXT_REMAP.with(std::cell::Cell::get),
+            "the remap was attempted"
+        );
+        assert_eq!(&buffer[..], &first[..]);
+        assert!(buffer.capacity() >= first.len() + 3 * 1024 * 1024);
     }
 
     #[test]
