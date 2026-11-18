@@ -144,7 +144,13 @@ fn setup_ci_json_reports_the_user_npmrc_location() {
     assert_eq!(envelope["location"], serde_json::json!("user"));
     assert_eq!(
         envelope["path"],
-        serde_json::json!(project.home().join(".npmrc").display().to_string())
+        serde_json::json!(
+            std::fs::canonicalize(project.home())
+                .unwrap()
+                .join(".npmrc")
+                .display()
+                .to_string()
+        )
     );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("ci-runtime-token"),
@@ -302,6 +308,62 @@ fn setup_ci_refuses_a_user_config_that_the_repository_tracks() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(project.read_file("ci.npmrc"), "fund=false\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_ci_checks_and_writes_the_same_user_config_through_a_link_and_dot_dot() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+    let dotfiles = tempfile::tempdir().expect("create a dotfiles repository");
+    std::fs::create_dir(dotfiles.path().join("sub")).unwrap();
+    std::fs::write(dotfiles.path().join(".npmrc"), "fund=false\n").unwrap();
+    let dotfiles_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dotfiles.path())
+            .output()
+            .expect("run git in the dotfiles repository");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    dotfiles_git(&["init", "-q"]);
+    dotfiles_git(&["add", "--", ".npmrc"]);
+    let safe = tempfile::tempdir().expect("create the directory the path names");
+    std::os::unix::fs::symlink(dotfiles.path().join("sub"), safe.path().join("link"))
+        .expect("link into the dotfiles repository");
+
+    let output = lpm(&project)
+        .env(
+            "NPM_CONFIG_USERCONFIG",
+            safe.path().join("link").join("..").join(".npmrc"),
+        )
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci with a user config path through a link and ..");
+
+    assert!(
+        !output.status.success(),
+        "the path resolves to a file the dotfiles repository tracks"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dotfiles.path().join(".npmrc")).unwrap(),
+        "fund=false\n",
+        "the token must not reach the tracked dotfiles .npmrc"
+    );
+    assert!(!safe.path().join(".npmrc").exists());
 }
 
 #[test]

@@ -189,6 +189,7 @@ pub async fn run(
     let registry = SetupRegistry::parse(registry_url)?;
 
     let target = setup_npmrc_destination(project_dir, &registry, &NpmUserConfig::from_env())?;
+    let _destination_lock = target.lock_shared_destination()?;
 
     let pkg_json_path = project_dir.join("package.json");
     let npmrc_path = target.path.clone();
@@ -528,6 +529,26 @@ impl SetupNpmrc {
         matches!(self.destination, NpmrcDestination::User { .. })
     }
 
+    /// Serializes setup runs that write npm's user configuration, which runs
+    /// from different projects share: each reads the file, stages a pending
+    /// block, and finalizes it, and an unserialized second run would stage
+    /// over the first one's block without retiring its token. Held until
+    /// the returned handle drops. A project `.npmrc` takes no lock.
+    pub(super) fn lock_shared_destination(
+        &self,
+    ) -> Result<Option<lpm_common::paths::SingleFileExclusiveLockHandle>, LpmError> {
+        if !self.is_user_config() {
+            return Ok(None);
+        }
+        let root = lpm_common::paths::LpmRoot::from_env()?;
+        let key = hex::encode(Sha256::digest(self.path.as_os_str().as_encoded_bytes()));
+        let lock = root
+            .root()
+            .join("locks")
+            .join(format!("setup-npmrc-{}.lock", &key[..16]));
+        lpm_common::paths::acquire_single_file_exclusive_lock(lock).map(Some)
+    }
+
     /// The ignore file that keeps the destination out of Git: a rule only
     /// this machine sees for npm's user configuration, which isn't project
     /// state.
@@ -693,12 +714,7 @@ pub(super) fn setup_npmrc_destination(
                     "Git tracks the project's .npmrc, so the token belongs in npm's user configuration, but there is no home directory to hold it. Set HOME, or name the file with NPM_CONFIG_USERCONFIG, then run the command again".into(),
                 )
             })?;
-            let path = std::path::absolute(path).map_err(|error| {
-                LpmError::ProjectFile(format!(
-                    "npm's user configuration {} has no usable path: {error}",
-                    path.display()
-                ))
-            })?;
+            let path = resolve_user_config(path)?;
             if same_file_location(&path, &project_npmrc) {
                 return Err(LpmError::ProjectFile(format!(
                     "refused to write a Git-tracked .npmrc because it will contain a bearer token: npm's user configuration is that file. Point NPM_CONFIG_USERCONFIG at a file outside the repository, or untrack .npmrc with `{}`, then run the command again",
@@ -776,21 +792,41 @@ fn tracked_npmrc_route(
     }
 }
 
+/// npm's user configuration at `path`, with its directory resolved once:
+/// every check that follows and the write itself use this one path. A
+/// lexical `..` after a link would otherwise let the Git check look at one
+/// file while the write lands in another.
+fn resolve_user_config(path: &Path) -> Result<PathBuf, LpmError> {
+    let shown = || lpm_common::sanitize_terminal_inline(&path.display().to_string()).to_string();
+    let absolute = std::path::absolute(path).map_err(|error| {
+        LpmError::ProjectFile(format!(
+            "npm's user configuration {} has no usable path: {error}",
+            shown()
+        ))
+    })?;
+    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+        return Err(LpmError::ProjectFile(format!(
+            "npm's user configuration {} names no file. Point NPM_CONFIG_USERCONFIG at a file",
+            shown()
+        )));
+    };
+    let parent = std::fs::canonicalize(parent).map_err(|_| {
+        LpmError::ProjectFile(format!(
+            "the directory of npm's user configuration {} doesn't exist. Create it, or point NPM_CONFIG_USERCONFIG at a file in a directory that exists",
+            shown()
+        ))
+    })?;
+    Ok(parent.join(name))
+}
+
 /// Refuses a user configuration that can't take the generated block: a
-/// link, which the write would replace with a file, one in a directory that
-/// doesn't exist, and one whose own settings for the registry the block
-/// would override for every project.
+/// link, which the write would replace with a file, and one whose own
+/// settings for the registry the block would override for every project.
 fn check_user_config(path: &Path, registry: &SetupRegistry) -> Result<(), LpmError> {
     let shown = lpm_common::sanitize_terminal_inline(&path.display().to_string()).to_string();
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(LpmError::ProjectFile(format!(
             "npm's user configuration {} is a symbolic link, and LPM CLI doesn't write a token through one. Point NPM_CONFIG_USERCONFIG at a regular file, or add the token line to the file the link leads to yourself",
-            shown
-        )));
-    }
-    if !path.parent().is_some_and(Path::is_dir) {
-        return Err(LpmError::ProjectFile(format!(
-            "the directory of npm's user configuration {} doesn't exist. Create it, or point NPM_CONFIG_USERCONFIG at a file in a directory that exists",
             shown
         )));
     }
@@ -1535,7 +1571,10 @@ mod tests {
                 trailing_slash: true
             })
         );
-        assert_eq!(tracked.path, home.path().join(".npmrc"));
+        assert_eq!(
+            tracked.path,
+            std::fs::canonicalize(home.path()).unwrap().join(".npmrc")
+        );
         assert_eq!(tracked.location(), "user");
     }
 
@@ -1626,6 +1665,40 @@ mod tests {
                 "{line}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_a_tracked_credential() {
+        let project = tracked_npmrc(&format!(
+            "\u{feff}//lpm.dev/api/registry/:_authToken=stale\n{ROUTED}"
+        ));
+
+        let message = refusal(project.path());
+
+        assert!(
+            message.contains("it sets `//lpm.dev/api/registry/:_authToken`"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_a_user_config_through_a_link_and_dot_dot_before_checking_it() {
+        let project = tracked_npmrc(ROUTED);
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir(real.path().join("sub")).unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(real.path().join("sub"), safe.path().join("link")).unwrap();
+        let through_link = safe.path().join("link").join("..").join(".npmrc");
+
+        let target =
+            destination_with(project.path(), &user_config_at(Some(&through_link), None)).unwrap();
+
+        assert_eq!(
+            target.path,
+            std::fs::canonicalize(real.path()).unwrap().join(".npmrc"),
+            "checks and the write must use the file the link leads to"
+        );
     }
 
     #[test]

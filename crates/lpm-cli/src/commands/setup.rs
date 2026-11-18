@@ -160,6 +160,7 @@ pub async fn run(
         &registry,
         &super::npmrc::NpmUserConfig::from_env(),
     )?;
+    let _destination_lock = target.lock_shared_destination()?;
 
     let npmrc_path = target.path.clone();
     let (_, ignore_warnings) = lpm_common::project_secret::prepare_secret_destination(

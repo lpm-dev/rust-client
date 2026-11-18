@@ -3,7 +3,7 @@ mod support;
 use sha2::{Digest, Sha256};
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -186,7 +186,13 @@ async fn setup_local_sends_the_token_to_the_user_npmrc_when_git_tracks_the_proje
     assert_eq!(envelope["gitignore_updated"], serde_json::json!(false));
     assert_eq!(
         envelope["npmrc_path"],
-        serde_json::json!(user_npmrc.display().to_string())
+        serde_json::json!(
+            std::fs::canonicalize(project.home())
+                .unwrap()
+                .join(".npmrc")
+                .display()
+                .to_string()
+        )
     );
 
     assert_eq!(
@@ -422,6 +428,63 @@ async fn setup_local_shares_one_user_block_between_tracked_projects_and_retires_
     assert_eq!(
         std::fs::read_to_string(other.join(".npmrc")).unwrap(),
         scope_line
+    );
+}
+
+#[tokio::test]
+async fn setup_local_serializes_tracked_projects_that_share_the_user_npmrc() {
+    let mock = MockRegistry::start().await;
+    let scope_line = format!("@lpm.dev:registry={}/api/registry/\n", mock.url());
+    let project = project_with_tracked_npmrc(&scope_line);
+    let other = nested_project_with_tracked_npmrc(&project, &scope_line);
+    mock.with_npmrc_token_replace_delayed(
+        "2030-01-02T03:04:05Z",
+        2,
+        std::time::Duration::from_millis(750),
+    )
+    .await;
+
+    let spawn = |directory: &std::path::Path| {
+        lpm_spawnable_with_registry(&project, &mock.url())
+            .current_dir(directory)
+            .args(["setup", "local"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start setup local")
+    };
+    let first = spawn(project.path());
+    let second = spawn(&other);
+    let outputs = tokio::task::spawn_blocking(move || {
+        [first, second].map(|child| child.wait_with_output().expect("wait for setup local"))
+    })
+    .await
+    .unwrap();
+
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "a run that waits for the other must still succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(first_body.get("previousTokenHash").is_none());
+    assert_eq!(
+        second_body["previousTokenHash"],
+        serde_json::json!(hex::encode(Sha256::digest(
+            first_body["token"].as_str().unwrap().as_bytes()
+        ))),
+        "the later run must see and retire the earlier run's token"
+    );
+    let user = std::fs::read_to_string(project.home().join(".npmrc")).unwrap();
+    assert_eq!(
+        generated_token(&user, &auth_scope(&mock.url())),
+        vec![second_body["token"].as_str().unwrap().to_owned()],
+        "{user}"
     );
 }
 
