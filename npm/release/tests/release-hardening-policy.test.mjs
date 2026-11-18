@@ -599,7 +599,9 @@ test("every stable release signature check holds the one exact signing identity"
   }
 });
 
-test("the stable signer script passes cosign the exact identity and refuses a malformed commit", () => {
+test("the stable signer script passes cosign the exact identity and refuses a malformed commit", {
+  skip: process.platform === "win32" && "runs the signer script with bash",
+}, () => {
   const script = path.join(repoRoot, "scripts/ci/verify-stable-release-signer.sh");
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-cosign-stub-"));
   const argsFile = path.join(bin, "args");

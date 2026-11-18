@@ -1342,10 +1342,12 @@ LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSED_TRIGGER=push \
   LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.60.0 run_install_sh
 unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSED_TRIGGER LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
 [ "$RUN_RC" -eq 0 ] || fail "a release before v0.77.0 signed from main must verify: $RUN_OUT"
-grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v0.60.0 .*--certificate-github-workflow-trigger push ' \
-  "$cosign_state/cosign-calls" || fail "a release before v0.77.0 is first checked against its tag"
-grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main .*--certificate-github-workflow-trigger workflow_dispatch ' \
-  "$cosign_state/cosign-calls" || fail "a release before v0.77.0 is then checked as signed from main by hand"
+[ "$(grep -c '' "$cosign_state/cosign-calls")" -eq 2 ] \
+  || fail "a release before v0.77.0 has exactly two signing identities: $(cat "$cosign_state/cosign-calls")"
+sed -n 1p "$cosign_state/cosign-calls" | grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v0.60.0 .*--certificate-github-workflow-trigger push ' \
+  || fail "a release before v0.77.0 is first checked against its tag"
+sed -n 2p "$cosign_state/cosign-calls" | grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main .*--certificate-github-workflow-trigger workflow_dispatch ' \
+  || fail "a release before v0.77.0 is then checked as signed from main by hand"
 
 # A nightly is scheduled or started by hand, and nothing else.
 write_signed_release "$fdir" 'nightly-trigger-binary-bytes' "$NIGHTLY_VERSION"
@@ -1354,14 +1356,19 @@ LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSED_TRIGGER=schedule LPM
   run_install_sh
 unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSED_TRIGGER LPM_INSTALL_VERSION
 [ "$RUN_RC" -eq 0 ] || fail "a nightly started by hand must verify: $RUN_OUT"
-grep -q -- '--certificate-github-workflow-trigger schedule ' "$cosign_state/cosign-calls" \
+[ "$(grep -c '' "$cosign_state/cosign-calls")" -eq 2 ] \
+  || fail "a nightly has exactly two signing identities: $(cat "$cosign_state/cosign-calls")"
+sed -n 1p "$cosign_state/cosign-calls" | grep -q -- '--certificate-github-workflow-trigger schedule ' \
   || fail "a nightly must first be checked as a scheduled run"
-grep -q -- '--certificate-github-workflow-trigger workflow_dispatch ' "$cosign_state/cosign-calls" \
+sed -n 2p "$cosign_state/cosign-calls" | grep -q -- '--certificate-github-workflow-trigger workflow_dispatch ' \
   || fail "a nightly must then be checked as a run started by hand"
+rm -f "$cosign_state/cosign-calls"
 LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSES=1 LPM_INSTALL_VERSION="$NIGHTLY_VERSION" \
   run_install_sh
 unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSES LPM_INSTALL_VERSION
-[ "$RUN_RC" -ne 0 ] || fail "a nightly from any other trigger must be refused: $RUN_OUT"
+[ "$RUN_RC" -ne 0 ] || fail "a nightly no identity verifies must be refused: $RUN_OUT"
+[ "$(grep -c '' "$cosign_state/cosign-calls")" -eq 2 ] \
+  || fail "a nightly is tried as scheduled and as started by hand, and nothing else: $(cat "$cosign_state/cosign-calls")"
 
 stop_server
 trap - EXIT
