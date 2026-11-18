@@ -227,20 +227,6 @@ pub async fn run(
         false,
         json_output,
     )?;
-    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
-        client,
-        project_dir,
-        crate::commands::registry_reads::RegistryReads::LPM_AND_NPM,
-    )?;
-    if !json_output && dry_run {
-        read_context.announce();
-    }
-    let planning_client = read_context
-        .client
-        .clone_with_config()
-        .without_metadata_memory_cache();
-    let install_client = read_context.client.clone_with_metadata_memory_cache();
-
     // Read lockfile ONCE
     let lockfile = read_optional_project_lockfile(project_dir)?;
     let roots = LockfileRootIndex::new(lockfile.as_ref());
@@ -351,6 +337,20 @@ pub async fn run(
         }
     }
 
+    let reads = crate::commands::registry_reads::RegistryReads {
+        lpm: jobs.iter().any(|job| job.route != MetadataRoute::PublicNpm),
+        npm: jobs.iter().any(|job| job.route == MetadataRoute::PublicNpm),
+    };
+    let read_context =
+        crate::commands::registry_reads::prepare_registry_read_context(client, project_dir, reads)?;
+    if !json_output && dry_run {
+        read_context.announce();
+    }
+    let planning_client = read_context
+        .client
+        .clone_with_config()
+        .without_metadata_memory_cache();
+    let install_client = read_context.client.clone_with_metadata_memory_cache();
     let planning_client_ref = &planning_client;
     let release_age_policy_ref = &release_age_policy;
     let fetches = futures::stream::iter(jobs.into_iter().map(move |job| async move {

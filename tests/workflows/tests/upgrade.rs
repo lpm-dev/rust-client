@@ -2961,3 +2961,53 @@ async fn upgrade_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
     let lockfile = project.read_file("lpm.lock");
     assert!(lockfile.contains("version = \"2.5.0\""), "{lockfile}");
 }
+
+#[tokio::test]
+async fn upgrade_names_the_npmrc_tls_settings_once_in_human_output() {
+    let project = TempProject::empty(
+        r#"{"name":"tls-summary-upgrade","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front
+        .mount_package(
+            &mock,
+            "ms",
+            &[
+                ("2.1.3", make_tarball("ms", "2.1.3")),
+                ("2.5.0", make_tarball("ms", "2.5.0")),
+            ],
+        )
+        .await;
+    front.write_user_npmrc_trusting_everywhere(project.home());
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    project.write_file(
+        "package.json",
+        r#"{"name":"tls-summary-upgrade","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    for (args, case) in [
+        (&["upgrade", "-y", "--dry-run"][..], "dry run"),
+        (&["upgrade", "-y"][..], "upgrade that installs"),
+        (&["upgrade", "-y"][..], "nothing left to upgrade"),
+    ] {
+        let out = lpm_with_registry(&project, &front.url)
+            .args(args)
+            .output()
+            .expect("spawn lpm upgrade");
+        assert!(
+            out.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            support::tls_front::tls_summary_count(&out.stderr),
+            1,
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

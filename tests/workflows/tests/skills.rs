@@ -3619,3 +3619,43 @@ fn uninstall_preserves_locally_edited_package_skills() {
 
 #[path = "skills/command_contract.rs"]
 mod command_contract;
+
+#[test]
+fn local_skills_add_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "//lpm.dev/:cafile={}\n",
+            project.home().join("missing-ca.pem").display()
+        ),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to add local standalone skill");
+
+    assert!(
+        output.status.success(),
+        "a local skill source reads no registry, so registry TLS files must not matter: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

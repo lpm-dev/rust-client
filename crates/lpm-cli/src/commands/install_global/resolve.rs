@@ -26,16 +26,23 @@ pub(super) async fn pre_resolve(
     routing_root: &Path,
 ) -> Result<ResolvedSpec, LpmError> {
     let (name, intent) = parse_user_save_intent(spec)?;
-    let crate::commands::registry_reads::RoutedReadContext {
-        client: registry,
-        route_table,
-    } = crate::commands::registry_reads::prepare_registry_read_context(
-        registry,
-        routing_root,
-        crate::commands::registry_reads::RegistryReads::LPM_AND_NPM,
-    )?;
-    let registry = &registry;
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(routing_root)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
     let route = route_table.route_for_package(&name);
+    let reads = if lpm_common::package_name::is_lpm_package(&name) {
+        crate::commands::registry_reads::RegistryReads::LPM
+    } else {
+        crate::commands::registry_reads::RegistryReads {
+            lpm: matches!(route, lpm_registry::UpstreamRoute::LpmWorker),
+            npm: matches!(route, lpm_registry::UpstreamRoute::NpmDirect),
+        }
+    };
+    let context = crate::commands::registry_reads::configure_registry_read_context(
+        registry,
+        route_table,
+        reads,
+    )?;
+    let registry = &context.client;
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
     // first-party registry path (PackageName parser); everything else
     // (`eslint`, `@types/node`, `@scope/foo`) is fetched via the npm

@@ -135,6 +135,15 @@ impl TlsFront {
         format!("{origin}/:cafile={}\n", self.ca_path.display())
     }
 
+    /// Write `~/.npmrc` for `home` trusting the test CA for every registry.
+    pub fn write_user_npmrc_trusting_everywhere(&self, home: &Path) {
+        std::fs::write(
+            home.join(".npmrc"),
+            format!("cafile={}\n", self.ca_path.display()),
+        )
+        .expect("write ~/.npmrc");
+    }
+
     /// Write `~/.npmrc` for `home`: `extra` lines, then the per-origin
     /// `cafile=` line that trusts this front.
     pub fn write_user_npmrc(&self, home: &Path, extra: &str) {
@@ -219,6 +228,13 @@ impl TlsFront {
         }
         mock.with_batch_metadata(vec![metadata]).await;
     }
+}
+
+/// How many times human output names the effective `.npmrc` TLS settings.
+pub fn tls_summary_count(stderr: &[u8]) -> usize {
+    String::from_utf8_lossy(stderr)
+        .matches("TLS overrides active")
+        .count()
 }
 
 impl Drop for TlsFront {

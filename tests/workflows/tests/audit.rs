@@ -4581,12 +4581,20 @@ async fn audit_fix_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
     )]])
     .await;
 
+    let human = lpm_through_front(&project, &mock, &front, &["audit", "fix", "--dry-run"]);
+    assert_eq!(
+        support::tls_front::tls_summary_count(&human.stderr),
+        1,
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
     let out = lpm_through_front(
         &project,
         &mock,
         &front,
         &["--json", "audit", "fix", "--dry-run"],
     );
+    assert_eq!(support::tls_front::tls_summary_count(&out.stderr), 0);
     assert!(
         out.status.success(),
         "audit fix must reach a registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
@@ -4595,6 +4603,19 @@ async fn audit_fix_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
     );
     let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(envelope["packages"][0]["to"], "1.0.1", "{envelope:#}");
+
+    let applied = lpm_through_front(&project, &mock, &front, &["audit", "fix"]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(
+        support::tls_front::tls_summary_count(&applied.stderr),
+        1,
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
 }
 
 #[tokio::test]
@@ -4706,6 +4727,35 @@ async fn audit_reading_only_the_lpm_registry_ignores_tls_settings_of_other_regis
     assert!(
         output.status.success(),
         "an audit that reads only the LPM registry must not load another registry's TLS files\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn audit_signatures_with_nothing_to_verify_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(r#"{"name":"empty-signatures","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "//lpm.dev/:cafile={}\n//registry.npmjs.org/:cafile={}\n",
+            project.home().join("missing-lpm-ca.pem").display(),
+            project.home().join("missing-npm-ca.pem").display()
+        ),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "signatures"])
+        .output()
+        .expect("run lpm audit signatures");
+    assert!(
+        output.status.success(),
+        "verifying no packages reads no registry\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

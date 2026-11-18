@@ -1833,3 +1833,30 @@ async fn outdated_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
     assert_eq!(envelope["outdated_count"], 1, "{envelope:#}");
     assert_eq!(envelope["packages"][0]["latest"], "2.1.4", "{envelope:#}");
 }
+
+#[tokio::test]
+async fn outdated_names_the_npmrc_tls_settings_once_in_human_output_and_never_in_json() {
+    let project = TempProject::empty(
+        r#"{"name":"tls-summary-outdated","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = install_ms_through_a_registry_only_cafile_trusts(&project, &mock).await;
+    front.write_user_npmrc_trusting_everywhere(project.home());
+
+    for (json, expected) in [(false, 1), (true, 0)] {
+        let mut command = lpm_with_registry(&project, &front.url);
+        if json {
+            command.arg("--json");
+        }
+        let out = command
+            .arg("outdated")
+            .output()
+            .expect("spawn lpm outdated");
+        assert_eq!(
+            support::tls_front::tls_summary_count(&out.stderr),
+            expected,
+            "json = {json}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

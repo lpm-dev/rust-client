@@ -153,6 +153,16 @@ pub fn prepare_registry_read_context(
 ) -> Result<RoutedReadContext, LpmError> {
     let route_table = RouteTable::from_env_and_filesystem(config_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    configure_registry_read_context(client, route_table, reads)
+}
+
+/// [`prepare_registry_read_context`] with a route table the caller already
+/// read.
+pub fn configure_registry_read_context(
+    client: &RegistryClient,
+    route_table: RouteTable,
+    reads: RegistryReads,
+) -> Result<RoutedReadContext, LpmError> {
     let eager_origins: Vec<_> = [
         reads.lpm.then(|| client.base_url()),
         reads.npm.then(|| client.npm_registry_url()),

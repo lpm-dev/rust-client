@@ -1709,4 +1709,21 @@ async fn query_trusts_the_npmrc_cafile_of_the_lpm_registry_it_reads() {
     );
     let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(matches[0]["name"], "@lpm.dev/acme.widget", "{matches}");
+    assert_eq!(support::tls_front::tls_summary_count(&output.stderr), 0);
+
+    let human = lpm(&project)
+        .args(["--registry", &front.url, "query", ":deprecated"])
+        .output()
+        .expect("run lpm query :deprecated");
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert_eq!(
+        support::tls_front::tls_summary_count(&human.stderr),
+        1,
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
 }

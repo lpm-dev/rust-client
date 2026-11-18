@@ -283,8 +283,14 @@ pub async fn run(
     };
 
     let external_state = if requirements.vulnerabilities || requirements.deprecations {
-        load_external_package_state(client, project_root, &inv.discovery.packages, requirements)
-            .await?
+        load_external_package_state(
+            client,
+            project_root,
+            &inv.discovery.packages,
+            requirements,
+            json_output,
+        )
+        .await?
     } else {
         ExternalPackageState::default()
     };
@@ -855,6 +861,7 @@ async fn load_external_package_state(
     project_dir: &Path,
     packages: &[crate::commands::audit::discovery::DiscoveredPackage],
     requirements: QueryDataRequirements,
+    json_output: bool,
 ) -> Result<ExternalPackageState, LpmError> {
     if !requirements.vulnerabilities && !requirements.deprecations {
         return Ok(ExternalPackageState::default());
@@ -878,8 +885,13 @@ async fn load_external_package_state(
         }
     }
 
-    let registry_future =
-        load_registry_package_state(client, project_dir, &registry_pairs, requirements);
+    let registry_future = load_registry_package_state(
+        client,
+        project_dir,
+        &registry_pairs,
+        requirements,
+        json_output,
+    );
     let osv_future = async {
         if osv_pairs.is_empty() {
             Ok(HashMap::new())
@@ -908,6 +920,7 @@ async fn load_registry_package_state(
     project_dir: &Path,
     packages: &[(String, String)],
     requirements: QueryDataRequirements,
+    json_output: bool,
 ) -> Result<ExternalPackageState, LpmError> {
     if packages.is_empty() {
         return Ok(ExternalPackageState::default());
@@ -934,7 +947,7 @@ async fn load_registry_package_state(
         client,
         project_dir,
         &names,
-        true,
+        json_output,
     )?;
     let mut metadata = if lpm_names.is_empty() {
         HashMap::new()
