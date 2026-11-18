@@ -239,6 +239,7 @@ async fn run_list_outdated(
     let read_context = crate::commands::registry_reads::prepare_registry_read_context(
         client,
         &root.global_root(),
+        crate::commands::registry_reads::RegistryReads::LPM_AND_NPM,
     )?;
     if !json_output {
         read_context.announce();

@@ -203,8 +203,15 @@ pub async fn run(
     let read_context = if jobs.is_empty() {
         None
     } else {
-        let context =
-            crate::commands::registry_reads::prepare_registry_read_context(client, project_dir)?;
+        let reads = crate::commands::registry_reads::RegistryReads {
+            lpm: jobs.iter().any(|job| job.route != MetadataRoute::PublicNpm),
+            npm: jobs.iter().any(|job| job.route == MetadataRoute::PublicNpm),
+        };
+        let context = crate::commands::registry_reads::prepare_registry_read_context(
+            client,
+            project_dir,
+            reads,
+        )?;
         if !json_output {
             context.announce();
         }

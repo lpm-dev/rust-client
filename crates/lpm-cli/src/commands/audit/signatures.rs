@@ -15,8 +15,11 @@ pub async fn run_signatures(
 ) -> Result<(), LpmError> {
     let discovery = discovery::discover_packages_retaining_lpm_lockfile(project_dir)?;
     let inputs = registry_signature_inputs_from_discovery(discovery)?;
-    let read_context =
-        crate::commands::registry_reads::prepare_registry_read_context(client, project_dir)?;
+    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
+        client,
+        project_dir,
+        crate::commands::registry_reads::RegistryReads::LPM_AND_NPM,
+    )?;
     if !json_output {
         read_context.announce();
     }

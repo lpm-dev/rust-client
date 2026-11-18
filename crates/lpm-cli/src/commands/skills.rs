@@ -254,6 +254,7 @@ pub async fn run(
             let context = crate::commands::registry_reads::prepare_registry_read_context(
                 client,
                 project_dir,
+                crate::commands::registry_reads::RegistryReads::LPM,
             )?;
             if !json_output {
                 context.announce();

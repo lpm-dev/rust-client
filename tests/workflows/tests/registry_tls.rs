@@ -1,6 +1,7 @@
 //! Workflow tests for `.npmrc` TLS settings on commands that read the LPM
 //! registry API without a project install: each one must reach a registry
-//! whose certificate only `~/.npmrc`'s `cafile=` makes trustworthy.
+//! whose certificate only `~/.npmrc`'s `cafile=` makes trustworthy, without
+//! loading the TLS files of a registry it doesn't contact.
 
 mod support;
 
@@ -50,7 +51,11 @@ async fn registry_api_reads_trust_the_npmrc_cafile_of_the_registry() {
     )
     .await;
     let front = TlsFront::start(&mock, project.home());
-    front.write_user_npmrc(project.home(), "");
+    let unreadable = project.home().join("missing-npm-ca.pem");
+    front.write_user_npmrc(
+        project.home(),
+        &format!("//registry.npmjs.org/:cafile={}\n", unreadable.display()),
+    );
 
     let failures: Vec<String> = [
         &["--json", "health"][..],

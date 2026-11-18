@@ -116,12 +116,32 @@ pub fn prepare_locked_read_context(
     configure_read_context_for_origins(client, route_table, origins, false)
 }
 
+/// Which of `client`'s registries a command reads. Their TLS clients build
+/// up front, so a broken setting for one of them fails before any request;
+/// a registry the command doesn't read never loads its TLS files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryReads {
+    pub lpm: bool,
+    pub npm: bool,
+}
+
+impl RegistryReads {
+    pub const LPM: Self = Self {
+        lpm: true,
+        npm: false,
+    };
+    pub const LPM_AND_NPM: Self = Self {
+        lpm: true,
+        npm: true,
+    };
+}
+
 /// The route table that the `.npmrc` files in effect at `config_dir` define,
 /// and `client` with their TLS settings (`cafile=`, `ca=`, `strict-ssl`,
 /// per-origin certificates), for a command that reads a registry itself
-/// rather than through `lpm install`. `client`'s LPM and npm registries
-/// build their TLS clients now; any other origin with settings of its own
-/// builds them on first use.
+/// rather than through `lpm install`. The registries in `reads` build their
+/// TLS clients now; any other origin with settings of its own builds them
+/// on first use.
 ///
 /// Security warnings print now. The advisory `.npmrc` warnings and the TLS
 /// summary wait for [`RoutedReadContext::announce`], which a command skips
@@ -129,25 +149,30 @@ pub fn prepare_locked_read_context(
 pub fn prepare_registry_read_context(
     client: &RegistryClient,
     config_dir: &Path,
+    reads: RegistryReads,
 ) -> Result<RoutedReadContext, LpmError> {
     let route_table = RouteTable::from_env_and_filesystem(config_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
-    let eager_origins: Vec<_> = [client.base_url(), client.npm_registry_url()]
-        .into_iter()
-        .filter_map(lpm_registry::npmrc::OriginKey::from_request_url)
-        .collect();
+    let eager_origins: Vec<_> = [
+        reads.lpm.then(|| client.base_url()),
+        reads.npm.then(|| client.npm_registry_url()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(lpm_registry::npmrc::OriginKey::from_request_url)
+    .collect();
     configure_read_context_for_origins(client, route_table, &eager_origins, false)
 }
 
 /// [`prepare_registry_read_context`] for the current directory, announced
-/// unless the output is JSON: the client for a command that reads the
+/// unless the output is JSON: the client for a command that reads the LPM
 /// registry without a project of its own.
 pub fn registry_client_for_current_directory(
     client: &RegistryClient,
     json_output: bool,
 ) -> Result<RegistryClient, LpmError> {
     let current_dir = std::env::current_dir().map_err(LpmError::Io)?;
-    let context = prepare_registry_read_context(client, &current_dir)?;
+    let context = prepare_registry_read_context(client, &current_dir, RegistryReads::LPM)?;
     if !json_output {
         context.announce();
     }

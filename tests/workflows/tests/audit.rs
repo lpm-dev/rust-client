@@ -4662,3 +4662,51 @@ async fn audit_without_registry_reads_does_not_load_npmrc_tls_files() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+#[tokio::test]
+async fn audit_reading_only_the_lpm_registry_ignores_tls_settings_of_other_registries() {
+    let project = TempProject::empty(
+        r#"{"name":"lpm-only-audit","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"lpm-only-audit","lockfileVersion":3,"packages":{"":{"dependencies":{"@lpm.dev/acme.widget":"1.0.0"}},"node_modules/@lpm.dev/acme.widget":{"version":"1.0.0","resolved":"https://lpm.dev/api/registry/@lpm.dev/acme.widget/-/acme.widget-1.0.0.tgz"}}}"#,
+    );
+    seed_node_modules_package(
+        &project,
+        "@lpm.dev/acme.widget",
+        &[("index.js", "module.exports = 1;\n")],
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/acme.widget",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": { "1.0.0": { "name": "@lpm.dev/acme.widget", "version": "1.0.0" } }
+    })])
+    .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let unreadable = project.home().join("missing-npm-ca.pem");
+    front.write_user_npmrc(
+        project.home(),
+        &format!("//registry.npmjs.org/:cafile={}\n", unreadable.display()),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &front.url,
+            "--json",
+            "audit",
+            "--fail-on=vuln",
+        ])
+        .output()
+        .expect("run lpm audit");
+    assert!(
+        output.status.success(),
+        "an audit that reads only the LPM registry must not load another registry's TLS files\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
