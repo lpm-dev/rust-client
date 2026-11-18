@@ -384,13 +384,20 @@ fn mismatched_installed_manifest(
 /// Which of `lockfile`'s packages install leaves off the current platform,
 /// aligned with `lockfile.packages`: each optional package whose `os`,
 /// `cpu` or `libc` excludes this platform, and each optional package
-/// reachable only through one. `root_json` is the importer's
+/// reachable only through one. `root_json` gives the importer's
 /// `package.json`, whose optional dependencies can keep a package
-/// reachable.
-pub(crate) fn platform_skipped_package_flags(lockfile: &Lockfile, root_json: &Value) -> Vec<bool> {
+/// reachable; it is read only when some package is excluded.
+pub(crate) fn platform_skipped_package_flags(
+    lockfile: &Lockfile,
+    root_json: impl FnOnce() -> Value,
+) -> Vec<bool> {
+    let blocked = platform_blocked_packages(lockfile);
+    if !blocked.contains(&true) {
+        return blocked;
+    }
     let indexes = graph::PackageIndexes::new(&lockfile.packages);
-    let roots = graph::selected_roots(root_json, lockfile, &indexes);
-    platform_skipped_packages(lockfile, &indexes, &roots)
+    let roots = graph::selected_roots(&root_json(), lockfile, &indexes);
+    platform_skipped_from_blocked(lockfile, &indexes, &roots, blocked)
 }
 
 fn platform_skipped_packages(
@@ -398,14 +405,28 @@ fn platform_skipped_packages(
     indexes: &graph::PackageIndexes<'_>,
     roots: &[(String, usize, graph::PackageScope)],
 ) -> Vec<bool> {
-    let packages = &lockfile.packages;
-    let blocked: Vec<_> = packages
-        .iter()
-        .map(|package| package.optional && !locked_package_matches_current_platform(package))
-        .collect();
+    let blocked = platform_blocked_packages(lockfile);
     if !blocked.contains(&true) {
         return blocked;
     }
+    platform_skipped_from_blocked(lockfile, indexes, roots, blocked)
+}
+
+fn platform_blocked_packages(lockfile: &Lockfile) -> Vec<bool> {
+    lockfile
+        .packages
+        .iter()
+        .map(|package| package.optional && !locked_package_matches_current_platform(package))
+        .collect()
+}
+
+fn platform_skipped_from_blocked(
+    lockfile: &Lockfile,
+    indexes: &graph::PackageIndexes<'_>,
+    roots: &[(String, usize, graph::PackageScope)],
+    blocked: Vec<bool>,
+) -> Vec<bool> {
+    let packages = &lockfile.packages;
     let adjacency = graph::package_adjacency(packages, indexes);
     let mut candidates = vec![false; packages.len()];
     let mut queue: VecDeque<_> = blocked
@@ -553,7 +574,7 @@ mod tests {
             packages,
             ..Lockfile::new()
         };
-        platform_skipped_package_flags(&lockfile, &Value::Null)
+        platform_skipped_package_flags(&lockfile, || Value::Null)
     }
 
     fn locked_package(name: &str, optional: bool) -> LockedPackage {

@@ -342,7 +342,7 @@ pub(in crate::commands::audit) fn print_summary(
 
     let not_installed = match behavioral.coverage.not_installed_packages {
         0 => None,
-        count => Some(format!("{count} optional not installed")),
+        count => Some(format!("{count} not installed")),
     };
 
     if osv_degraded || !behavioral.coverage.complete {

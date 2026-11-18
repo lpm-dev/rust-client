@@ -4437,7 +4437,7 @@ async fn audit_counts_optional_packages_install_skipped_on_this_platform_as_not_
     assert!(human.status.success(), "{text}");
     assert!(!text.contains("Audit incomplete"), "{text}");
     assert!(!text.contains("source audit incomplete"), "{text}");
-    assert!(text.contains("2 optional not installed"), "{text}");
+    assert!(text.contains("2 not installed"), "{text}");
 }
 
 #[tokio::test]

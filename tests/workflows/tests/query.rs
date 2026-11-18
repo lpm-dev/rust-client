@@ -1660,4 +1660,11 @@ async fn query_leaves_out_optional_packages_install_skipped_on_this_platform() {
             "a package install left off this platform is not in the installed tree"
         );
     }
+    let root_children = query(&[&format!(":root > #{HOST}")]);
+    assert_eq!(root_children.as_array().map(Vec::len), Some(1), "{root_children}");
+    assert_eq!(
+        query(&[&format!("#{HOST} > #{SKIPPED_OPTIONAL}")]),
+        serde_json::json!([]),
+        "the dependency graph has no edge to a package left off this platform"
+    );
 }

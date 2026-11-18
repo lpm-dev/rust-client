@@ -20,7 +20,7 @@ pub(super) struct BehavioralCoverage {
     scanned_packages: usize,
     partial_packages: usize,
     unavailable_packages: usize,
-    /// Optional packages the install left out, which have no source to scan.
+    /// Packages the install left out, which have no source to scan.
     pub(super) not_installed_packages: usize,
     packages: Vec<PackageCoverageGap>,
 }

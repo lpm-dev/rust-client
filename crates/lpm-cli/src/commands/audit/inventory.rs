@@ -485,7 +485,9 @@ fn load_behavioral_analyses_with_index(
                 {
                     Ok(source) => source,
                     Err(error)
-                        if package.platform_skipped && error.kind() == io::ErrorKind::NotFound =>
+                        if package.platform_skipped
+                            && project_root.is_some()
+                            && error.kind() == io::ErrorKind::NotFound =>
                     {
                         return Some(PackageScan::NotInstalled(*package_index));
                     }
@@ -884,6 +886,33 @@ mod tests {
         assert!(loaded.analyses[0].is_some());
         assert!(loaded.analyses[1..].iter().all(Option::is_none));
         assert_eq!(loaded.not_installed, [false, true, false, true]);
+    }
+
+    #[test]
+    fn a_platform_skipped_package_is_not_called_not_installed_when_the_project_root_cannot_open() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            root.path().join("home/.lpm").into_os_string(),
+        )]);
+        let discovery = DiscoveryResult {
+            manager: super::super::discovery::ManagerKind::Lpm,
+            lockfile_path: None,
+            project_root: root.path().join("missing-project"),
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages: vec![DiscoveredPackage {
+                platform_skipped: true,
+                ..discovered_package(None, None)
+            }],
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        };
+
+        let loaded = load_behavioral_analyses_with_index(&discovery, None, None);
+
+        assert_eq!(loaded.not_installed, [false]);
     }
 
     #[test]
