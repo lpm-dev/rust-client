@@ -2851,6 +2851,9 @@ mod tests {
         );
     }
 
+    // Windows refuses to rename a directory a handle holds open, so a held
+    // directory can't be replaced while its files are read there.
+    #[cfg(unix)]
     #[test]
     fn fingerprints_are_dropped_when_a_directory_is_replaced_while_files_are_read() {
         for warm in [true, false] {
