@@ -553,37 +553,44 @@ pub fn file_fits_buffered_extraction(file: &std::fs::File) -> bool {
 }
 
 /// The decoded size (mod 2^32) a gzip file's trailer declares, read without
-/// moving the file's cursor.
+/// moving the file's cursor. `None` when the file doesn't start with gzip's
+/// magic, so its extraction reports that instead of taking another route.
 fn gzip_declared_size(file: &std::fs::File, len: u64) -> Option<u32> {
     const GZIP_MIN_LEN: u64 = 18;
     if len < GZIP_MIN_LEN {
         return None;
     }
+    let mut magic = [0u8; 2];
     let mut trailer = [0u8; 4];
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt as _;
-        file.read_exact_at(&mut trailer, len - 4).ok()?;
-    }
-    #[cfg(windows)]
-    {
-        use std::io::Seek as _;
-        use std::os::windows::fs::FileExt as _;
-        // `seek_read` moves the cursor on Windows; put it back.
-        let mut cursor = file;
-        let position = cursor.stream_position().ok()?;
-        let read = file.seek_read(&mut trailer, len - 4);
-        cursor.seek(std::io::SeekFrom::Start(position)).ok()?;
-        if read.ok()? != trailer.len() {
-            return None;
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = file;
+    read_exact_at(file, &mut magic, 0)?;
+    if magic != [0x1f, 0x8b] {
         return None;
     }
+    read_exact_at(file, &mut trailer, len - 4)?;
     Some(u32::from_le_bytes(trailer))
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> Option<()> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_exact_at(buffer, offset).ok()
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> Option<()> {
+    use std::io::Seek as _;
+    use std::os::windows::fs::FileExt as _;
+    // `seek_read` moves the cursor on Windows; put it back.
+    let mut cursor = file;
+    let position = cursor.stream_position().ok()?;
+    let read = file.seek_read(buffer, offset);
+    cursor.seek(std::io::SeekFrom::Start(position)).ok()?;
+    (read.ok()? == buffer.len()).then_some(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(_file: &std::fs::File, _buffer: &mut [u8], _offset: u64) -> Option<()> {
+    None
 }
 
 #[derive(Clone, Copy)]

@@ -6222,6 +6222,21 @@ fn small_files_that_decode_past_the_buffer_stream() {
     }
 }
 
+#[test]
+fn small_files_without_gzip_magic_keep_the_hybrid_diagnostic() {
+    use std::io::Write as _;
+    let file = tempfile::tempfile().unwrap();
+    let mut bytes = b"plain tar, not gzip".to_vec();
+    bytes.extend_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+    (&file).write_all(&bytes).unwrap();
+    let reader = std::io::BufReader::new(file);
+
+    assert!(
+        !file_exceeds_hybrid_buffer(&reader),
+        "a trailer is only a declared size behind gzip's magic"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn nonregular_file_handles_retain_the_hybrid_reader() {

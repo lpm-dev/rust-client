@@ -291,22 +291,17 @@ mod tests {
         assert!(buffer.capacity() >= expected.len() + 5 * 1024 * 1024);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn mapped_zeroed_buffers_round_capacity_to_whole_pages_only() {
-        let len = MAP_THRESHOLD_FOR_TEST + 3;
+    fn large_zeroed_buffers_are_mapped_in_whole_pages() {
+        let len = MAP_THRESHOLD + 3;
         let mut buffer = SystemBuffer::zeroed(len);
         assert_eq!(buffer.len(), len);
         assert!(buffer.iter().all(|&byte| byte == 0));
-        assert!(buffer.capacity() >= len);
-        assert!(buffer.capacity() - len < 64 * 1024);
+        assert_eq!(buffer.capacity(), len.div_ceil(page_size()) * page_size());
         buffer[len - 1] = 1;
         assert_eq!(buffer[len - 1], 1);
     }
-
-    #[cfg(unix)]
-    const MAP_THRESHOLD_FOR_TEST: usize = MAP_THRESHOLD;
-    #[cfg(not(unix))]
-    const MAP_THRESHOLD_FOR_TEST: usize = 256 * 1024;
 
     #[test]
     fn empty_buffers_do_not_allocate() {
