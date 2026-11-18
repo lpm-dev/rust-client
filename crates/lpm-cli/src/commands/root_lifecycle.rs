@@ -14,6 +14,17 @@ const AFTER_INSTALL_PHASES: &[&str] = &[
     "postprepare",
 ];
 
+/// Whether `lpm install` runs the script `name` of the project or of a
+/// workspace member.
+pub(crate) fn is_install_lifecycle_script(name: &str) -> bool {
+    name == DEV_PREINSTALL || AFTER_INSTALL_PHASES.contains(&name)
+}
+
+#[cfg(test)]
+pub(crate) fn install_lifecycle_scripts() -> impl Iterator<Item = &'static str> {
+    std::iter::once(DEV_PREINSTALL).chain(AFTER_INSTALL_PHASES.iter().copied())
+}
+
 #[derive(Debug, Clone)]
 pub struct RootProjectLifecycle {
     package_name: Option<String>,

@@ -375,22 +375,13 @@ pub(crate) fn compute_install_hash_v10(
     hex::encode(hasher.finalize())
 }
 
-/// The `scripts` an install step reads: the lifecycle phases `lpm install`
-/// runs for the project and its workspace members, and the dependency
-/// phases its script policy blocks or runs for local packages.
-const INSTALL_READ_SCRIPTS: &[&str] = &[
-    "pnpm:devPreinstall",
-    "preinstall",
-    "install",
-    "postinstall",
-    "preprepare",
-    "prepare",
-    "postprepare",
-    "preuninstall",
-    "uninstall",
-    "postuninstall",
-    "prepublishOnly",
-];
+/// Whether an install step reads the script `name`: a lifecycle phase
+/// `lpm install` runs for the project and its workspace members, or a
+/// dependency phase its script policy blocks or runs for local packages.
+fn install_reads_script(name: &str) -> bool {
+    crate::commands::root_lifecycle::is_install_lifecycle_script(name)
+        || lpm_security::SecurityPolicy::is_blocked_script(name)
+}
 
 /// `manifest` as install freshness reads it: its JSON value without the
 /// `scripts` no install step reads, so editing a `dev` or `build` script,
@@ -402,7 +393,7 @@ fn manifest_for_install_hash(manifest: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         return std::borrow::Cow::Borrowed(manifest);
     };
     if let Some(serde_json::Value::Object(scripts)) = document.get_mut("scripts") {
-        scripts.retain(|name, _| INSTALL_READ_SCRIPTS.contains(&name.as_str()));
+        scripts.retain(|name, _| install_reads_script(name));
         if scripts.is_empty() {
             document.shift_remove("scripts");
         }
@@ -1938,6 +1929,29 @@ mod tests {
             r#"{"dependencies":{"a":"1.0.0"},"name":"app"}"#,
         ] {
             assert_ne!(hash(different), base, "{different}");
+        }
+    }
+
+    #[test]
+    fn install_hash_reads_every_script_an_install_step_runs_or_blocks() {
+        let hash = |manifest: String| compute_install_hash(&manifest, "lock");
+        let base = hash(r#"{"name":"app"}"#.to_string());
+        let phases = crate::commands::root_lifecycle::install_lifecycle_scripts()
+            .chain(lpm_security::EXECUTED_INSTALL_PHASES.iter().copied())
+            .chain([
+                "preuninstall",
+                "uninstall",
+                "postuninstall",
+                "prepublishOnly",
+            ]);
+        for phase in phases {
+            assert_ne!(
+                hash(format!(
+                    r#"{{"name":"app","scripts":{{"{phase}":"node x"}}}}"#
+                )),
+                base,
+                "{phase}"
+            );
         }
     }
 

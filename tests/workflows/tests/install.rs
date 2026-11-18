@@ -19002,10 +19002,10 @@ async fn install_stays_up_to_date_after_edits_to_scripts_install_never_runs() {
         "package.json",
         r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"},"scripts":{"postinstall":"node -e \"require('fs').writeFileSync('postinstall.log','ran')\""}}"#,
     );
-    reinstall();
-    assert_eq!(
-        project.read_file("postinstall.log"),
-        "ran",
-        "a new root lifecycle script must still run"
+    let result = reinstall();
+    assert_ne!(
+        result["up_to_date"], true,
+        "adding a lifecycle script must make the install run again: {result:#}"
     );
+    assert_eq!(project.read_file("postinstall.log"), "ran");
 }
