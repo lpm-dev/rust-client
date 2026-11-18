@@ -665,3 +665,33 @@ test("the Homebrew formula takes its checksums from the published release, verif
   assert.ok(positions.every((position) => position !== -1), JSON.stringify(positions));
   assert.deepEqual([...positions].sort((a, b) => a - b), positions, "checks run before the checksums are exported and dispatched");
 });
+
+test("every release job that holds a signing secret or an OIDC token runs in a protected environment", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const environments = {};
+  for (const [name, job] of jobsOf(workflow)) {
+    const holdsCredentials = /\$\{\{ secrets\.(?!GITHUB_TOKEN)/.test(job) || /^\s+id-token: write$/m.test(job);
+    if (!holdsCredentials || /^\s+uses: \.\/\.github\/workflows\//m.test(job)) continue;
+    environments[name] = job.match(/^    environment: (\S+)$/m)?.[1];
+  }
+  assert.deepEqual(environments, {
+    build: "release",
+    "notarize-macos": "release",
+    "sign-windows": "windows-signing",
+    release: "release",
+    "stage-promotion-release": "release",
+    "publish-promotion-platform": "release",
+    "publish-npm-platform": "release",
+    "publish-npm-wrapper": "release",
+    "update-homebrew": "release",
+  });
+
+  // A called workflow's job reads environment secrets only when it names
+  // the environment, and the caller's copies are optional so the call
+  // still works once the repository-level secrets are gone.
+  const preflight = read(".github/workflows/release-preflight.yml");
+  const signing = jobsOf(preflight).find(([name]) => name === "macos-signing")?.[1];
+  assert.ok(signing, "missing macos-signing preflight job");
+  assert.match(signing, /^    environment: release$/m);
+  assert.doesNotMatch(preflight, /required: true/);
+});
