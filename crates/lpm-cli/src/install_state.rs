@@ -290,7 +290,7 @@ pub fn compute_install_hash_v8(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(INSTALL_HASH_SCHEMA_TAG);
-    hasher.update(&manifest_for_install_hash(pkg_content.as_bytes()));
+    hasher.update(manifest_for_install_hash(pkg_content.as_bytes()));
     hasher.update(b"\x00"); // domain separator prevents "ab"+"cd" == "abc"+"d"
     hasher.update(lock_content.as_bytes());
     hasher.update(b"\x00");

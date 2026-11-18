@@ -1044,8 +1044,10 @@ async fn bare_install_repairs_unexpected_sidecars_after_manifest_mtime_changes()
     bare_install(&project).assert().success();
     let original_hash = project.read_file(".lpm/install-hash");
     assert!(!original_hash.lines().any(|line| line.starts_with("b:")));
-    let manifest = project.read_file("package.json");
-    project.write_file("package.json", &format!("{manifest}\n"));
+    project.write_file(
+        "package.json",
+        r#"{"name":"consumer","description":"changed","dependencies":{"engine-free":"1.0.0"}}"#,
+    );
     bare_install(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .assert()
