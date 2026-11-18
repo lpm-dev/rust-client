@@ -992,6 +992,40 @@ pub(crate) struct WhyArgs {
     /// Package to trace from the project root.
     #[arg(value_name = "PACKAGE")]
     pub(crate) package: String,
+
+    /// Trace only the packages within this many levels. The project root
+    /// counts as level 1, direct deps as level 2.
+    #[arg(long)]
+    pub(crate) depth: Option<std::num::NonZeroUsize>,
+
+    #[command(flatten)]
+    pub(crate) paths: WhyPathLimitArgs,
+}
+
+/// How many of a package's paths a why command shows.
+#[derive(Args)]
+pub(crate) struct WhyPathLimitArgs {
+    /// Show at most this many paths (default 1000). The count of all paths
+    /// is still reported.
+    #[arg(long, value_name = "N", conflicts_with = "all_paths")]
+    pub(crate) limit: Option<std::num::NonZeroUsize>,
+
+    /// Show every path, however many there are.
+    #[arg(long)]
+    pub(crate) all_paths: bool,
+}
+
+impl WhyPathLimitArgs {
+    /// The most paths to show, or `None` for every path.
+    pub(crate) fn limit(&self) -> Option<usize> {
+        if self.all_paths {
+            return None;
+        }
+        Some(self.limit.map_or(
+            crate::graph_render::DEFAULT_WHY_PATH_LIMIT,
+            std::num::NonZeroUsize::get,
+        ))
+    }
 }
 
 #[derive(Args)]
@@ -1004,9 +1038,18 @@ pub(crate) struct GraphArgs {
     #[arg(long, default_value = "tree", value_parser = ["tree", "dot", "mermaid", "json", "stats", "html"])]
     pub(crate) format: String,
 
-    /// Explain why a package is in your tree (show all paths from root).
+    /// Explain why a package is in your tree (show its paths from root).
     #[arg(long, name = "WHY")]
     pub(crate) why: Option<String>,
+
+    /// With `--why`: show at most this many paths (default 1000). The
+    /// count of all paths is still reported.
+    #[arg(long, value_name = "N", requires = "WHY", conflicts_with = "all_paths")]
+    pub(crate) limit: Option<std::num::NonZeroUsize>,
+
+    /// With `--why`: show every path, however many there are.
+    #[arg(long, requires = "WHY")]
+    pub(crate) all_paths: bool,
 
     /// Truncate the graph to the given depth. The project root counts
     /// as level 1, direct deps as level 2. Applied at the graph level,

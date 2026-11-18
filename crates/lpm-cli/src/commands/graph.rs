@@ -13,6 +13,7 @@ pub async fn run(
     project_dir: &Path,
     package: Option<&str>,
     why: Option<&str>,
+    why_path_limit: Option<usize>,
     format: &str,
     max_depth: Option<usize>,
     filter: Option<&str>,
@@ -172,6 +173,7 @@ pub async fn run(
                 &mut output,
                 &graph,
                 target,
+                why_path_limit,
                 overrides_state.as_ref(),
                 patch_state.as_ref(),
             )
@@ -181,6 +183,7 @@ pub async fn run(
                 &mut output,
                 &graph,
                 target,
+                why_path_limit,
                 overrides_state.as_ref(),
                 patch_state.as_ref(),
             )
@@ -199,7 +202,12 @@ pub async fn run(
         "tree" | "" => {
             let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout())
                 && lpm_common::color::enabled();
-            print!("{}", graph_render::render_tree(&graph, use_color));
+            let stdout = std::io::stdout();
+            let mut output = BufWriter::new(stdout.lock());
+            graph_render::write_tree(&mut output, &graph, use_color)
+                .and_then(|()| output.flush())
+                .map_err(|e| LpmError::Script(format!("failed to write graph tree: {e}")))?;
+            drop(output);
             if !json_output {
                 match max_depth {
                     Some(depth) => {
@@ -1142,6 +1150,7 @@ mod tests {
 
         let result = rt.block_on(run(
             dir.path(),
+            None,
             None,
             None,
             "tree",

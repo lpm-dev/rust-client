@@ -290,316 +290,686 @@ impl DepGraph {
         }
     }
 
-    fn path_summary(&self, target_name: &str) -> PathSummary {
-        if let Some(path_counts) = self.acyclic_path_counts() {
-            let mut versions = HashSet::new();
-            let mut path_count = 0usize;
-            for (key, node) in &self.nodes {
-                if node.is_project_root || node.name != target_name {
+    /// The plan for listing the paths from the graph's roots to every
+    /// package named `target_name`.
+    pub(crate) fn why_plan(&self, target_name: &str) -> WhyPlan<'_> {
+        WhyPlan::new(self, target_name)
+    }
+}
+
+/// How many paths a why command shows unless told otherwise.
+pub const DEFAULT_WHY_PATH_LIMIT: usize = 1_000;
+
+/// How many dependency edges the search for paths may follow through a part
+/// of the graph that has a cycle. Where there is no cycle the search follows
+/// only edges that lead to the target, so its work is bounded by the paths
+/// it shows; with a cycle, a search can reach a package whose only way on
+/// to the target passes through the path it is on.
+const CYCLIC_PATH_SEARCH_BUDGET: u64 = 1 << 24;
+
+/// What a walk over the paths to a package found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WhySummary {
+    /// Every path, when `count_exact`, otherwise a lower bound.
+    count: u64,
+    /// False when a part of the graph with a cycle kept some paths from
+    /// being tried, or the count passed `u64::MAX`.
+    count_exact: bool,
+    /// How many paths the walk showed.
+    shown: u64,
+    /// The search through a part of the graph with a cycle used its budget.
+    search_stopped: bool,
+    /// The shown paths used up a limit.
+    limit_reached: bool,
+    /// How many versions of the package some path reaches.
+    version_count: usize,
+}
+
+impl WhySummary {
+    /// Adds `paths` to the count; `exact` is whether that is all of them.
+    fn add(&mut self, paths: u64, exact: bool) {
+        self.count_exact &= exact;
+        self.count = self.count.checked_add(paths).unwrap_or_else(|| {
+            self.count_exact = false;
+            u64::MAX
+        });
+    }
+
+    /// How many paths the count includes that weren't shown.
+    fn hidden(&self) -> u64 {
+        self.count.saturating_sub(self.shown)
+    }
+
+    /// Whether some path to the package isn't shown, or may not be.
+    fn truncated(&self) -> bool {
+        self.hidden() > 0 || !self.count_exact
+    }
+}
+
+/// The paths from a graph's roots to the packages a why command names, by
+/// root, then by target key, then by each node's dependencies in order.
+///
+/// A walk hands each shown path to its caller as it finds it, so writing
+/// them needs memory for the graph's depth, not for the paths. Counting
+/// needs no walk where the part of the graph leading to a target has no
+/// cycle; [`WhyPlan::summary`] walks only the parts that have one.
+pub(crate) struct WhyPlan<'graph> {
+    index: GraphIndex<'graph>,
+    roots: Vec<usize>,
+    targets: Vec<usize>,
+    version_count: usize,
+    cyclic_search_budget: u64,
+}
+
+/// Whether a walk enumerates the paths it shows from parts of the graph
+/// without a cycle, which it can count without trying them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    Count,
+    Show,
+}
+
+impl<'graph> WhyPlan<'graph> {
+    fn new(graph: &'graph DepGraph, target_name: &str) -> Self {
+        let index = GraphIndex::new(graph);
+        let mut roots: Vec<usize> = graph
+            .roots
+            .iter()
+            .filter_map(|root| index.position(root))
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        let targets: Vec<usize> = (0..index.keys.len())
+            .filter(|&node| {
+                let node = &graph.nodes[index.keys[node]];
+                !node.is_project_root && node.name == target_name
+            })
+            .collect();
+
+        let mut reachable = vec![false; index.keys.len()];
+        let mut queue: VecDeque<usize> = roots.iter().copied().collect();
+        for &root in &roots {
+            reachable[root] = true;
+        }
+        while let Some(node) = queue.pop_front() {
+            for &child in &index.children[node] {
+                if !reachable[child] {
+                    reachable[child] = true;
+                    queue.push_back(child);
+                }
+            }
+        }
+        let version_count = targets
+            .iter()
+            .filter(|&&target| reachable[target])
+            .map(|&target| graph.nodes[index.keys[target]].version.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+
+        Self {
+            index,
+            roots,
+            targets,
+            version_count,
+            cyclic_search_budget: CYCLIC_PATH_SEARCH_BUDGET,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cyclic_search_budget(mut self, budget: u64) -> Self {
+        self.cyclic_search_budget = budget;
+        self
+    }
+
+    /// How many dependency edges a showing walk follows.
+    #[cfg(test)]
+    fn expanded_edges_to_show(&self, limit: Option<usize>) -> u64 {
+        let mut scratch = WalkScratch::new(self.index.keys.len());
+        let _ = self.walk(limit, WalkMode::Show, &mut scratch, |_| {
+            Ok::<(), std::convert::Infallible>(())
+        });
+        scratch.expanded_edges
+    }
+
+    /// What a walk showing at most `limit` paths (all when `None`) finds,
+    /// without enumerating the parts of the graph it can count.
+    pub(crate) fn summary(&self, limit: Option<usize>) -> WhySummary {
+        let mut scratch = WalkScratch::new(self.index.keys.len());
+        match self.walk(limit, WalkMode::Count, &mut scratch, |_| {
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(summary) => summary,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Hands `show` each path a walk showing at most `limit` paths (all when
+    /// `None`) shows, in order, and stops at its first error.
+    pub(crate) fn show<E>(
+        &self,
+        limit: Option<usize>,
+        show: impl FnMut(&[&'graph str]) -> Result<(), E>,
+    ) -> Result<WhySummary, E> {
+        let mut scratch = WalkScratch::new(self.index.keys.len());
+        self.walk(limit, WalkMode::Show, &mut scratch, show)
+    }
+
+    fn walk<E>(
+        &self,
+        limit: Option<usize>,
+        mode: WalkMode,
+        scratch: &mut WalkScratch,
+        mut show: impl FnMut(&[&'graph str]) -> Result<(), E>,
+    ) -> Result<WhySummary, E> {
+        let mut summary = WhySummary {
+            count_exact: true,
+            version_count: self.version_count,
+            ..WhySummary::default()
+        };
+        let mut remaining = limit.unwrap_or(usize::MAX);
+        let mut budget = self.cyclic_search_budget;
+        let mut keys: Vec<&'graph str> = Vec::new();
+
+        for &root in &self.roots {
+            for &target in &self.targets {
+                if root == target {
+                    summary.add(1, true);
+                    if remaining > 0 {
+                        remaining -= 1;
+                        summary.shown += 1;
+                        if mode == WalkMode::Show {
+                            show(&[self.index.keys[root]])?;
+                        }
+                    }
                     continue;
                 }
-                let reachable_paths = path_counts.get(key.as_str()).copied().unwrap_or(0);
-                if reachable_paths > 0 {
-                    path_count = path_count.saturating_add(reachable_paths);
-                    versions.insert(node.version.as_str());
+                let Some(pair) = scratch.plan_pair(&self.index, root, target) else {
+                    continue;
+                };
+                match pair {
+                    PairCount::Exact { paths, saturated } => {
+                        summary.add(paths, !saturated);
+                        let shown = usize::try_from(paths).unwrap_or(usize::MAX).min(remaining);
+                        if shown == 0 {
+                            continue;
+                        }
+                        remaining -= shown;
+                        summary.shown += shown as u64;
+                        if mode == WalkMode::Show {
+                            let mut left = shown;
+                            scratch.search(&self.index, root, target, None, |path| {
+                                keys.clear();
+                                keys.extend(path.iter().map(|&node| self.index.keys[node]));
+                                show(&keys)?;
+                                left -= 1;
+                                Ok(if left == 0 {
+                                    std::ops::ControlFlow::Break(())
+                                } else {
+                                    std::ops::ControlFlow::Continue(())
+                                })
+                            })?;
+                        }
+                    }
+                    PairCount::ThroughCycle => {
+                        if remaining == 0 {
+                            summary.add(1, false);
+                            continue;
+                        }
+                        let mut found = 0_u64;
+                        let outcome = if budget == 0 {
+                            SearchOutcome::OutOfBudget
+                        } else {
+                            scratch.search(
+                                &self.index,
+                                root,
+                                target,
+                                Some(&mut budget),
+                                |path| {
+                                    found += 1;
+                                    if remaining == 0 {
+                                        return Ok(std::ops::ControlFlow::Break(()));
+                                    }
+                                    remaining -= 1;
+                                    summary.shown += 1;
+                                    keys.clear();
+                                    keys.extend(path.iter().map(|&node| self.index.keys[node]));
+                                    show(&keys)?;
+                                    Ok(std::ops::ControlFlow::Continue(()))
+                                },
+                            )?
+                        };
+                        if outcome == SearchOutcome::OutOfBudget {
+                            summary.search_stopped = true;
+                            if found == 0 && remaining > 0 {
+                                remaining -= 1;
+                                summary.shown += 1;
+                                found = 1;
+                                let path = scratch.shortest_path(root, target);
+                                keys.clear();
+                                keys.extend(path.iter().map(|&node| self.index.keys[node]));
+                                show(&keys)?;
+                            }
+                        }
+                        summary.add(found.max(1), outcome == SearchOutcome::Finished);
+                    }
                 }
             }
-            return PathSummary {
-                path_count,
-                version_count: versions.len(),
-            };
         }
+        summary.limit_reached = limit.is_some() && remaining == 0;
+        Ok(summary)
+    }
+}
 
-        let mut versions = HashSet::new();
-        let path_count = self.visit_paths(target_name, |path| {
-            if let Some(node) = path.last().and_then(|key| self.nodes.get(*key)) {
-                versions.insert(node.version.as_str());
+/// A graph's nodes by position, in key order, with their edges.
+struct GraphIndex<'graph> {
+    keys: Vec<&'graph str>,
+    children: Vec<Vec<usize>>,
+    parents: Vec<Vec<usize>>,
+}
+
+impl<'graph> GraphIndex<'graph> {
+    fn new(graph: &'graph DepGraph) -> Self {
+        let mut keys: Vec<&str> = graph.nodes.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let positions: HashMap<&str, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(position, key)| (*key, position))
+            .collect();
+        let mut children = Vec::with_capacity(keys.len());
+        let mut parents = vec![Vec::new(); keys.len()];
+        for (parent, key) in keys.iter().enumerate() {
+            let node_children: Vec<usize> = graph.nodes[*key]
+                .dependencies
+                .iter()
+                .filter_map(|dependency| positions.get(dependency.as_str()).copied())
+                .collect();
+            for &child in &node_children {
+                parents[child].push(parent);
             }
-            true
-        });
-
-        PathSummary {
-            path_count,
-            version_count: versions.len(),
+            children.push(node_children);
+        }
+        Self {
+            keys,
+            children,
+            parents,
         }
     }
 
-    fn acyclic_path_counts(&self) -> Option<HashMap<&str, usize>> {
-        let mut visiting = HashSet::with_capacity(self.nodes.len());
-        let mut visited = HashSet::with_capacity(self.nodes.len());
-        let mut postorder = Vec::with_capacity(self.nodes.len());
+    fn position(&self, key: &str) -> Option<usize> {
+        self.keys.binary_search(&key).ok()
+    }
+}
 
-        for root in &self.roots {
-            if !self.collect_acyclic_postorder(root, &mut visiting, &mut visited, &mut postorder) {
-                return None;
+/// How the paths from one root to one target count.
+enum PairCount {
+    /// The nodes on those paths form no cycle, so this is every path.
+    Exact { paths: u64, saturated: bool },
+    /// The nodes on those paths form a cycle: the paths must be tried.
+    ThroughCycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchOutcome {
+    Finished,
+    /// The caller asked to stop.
+    Stopped,
+    /// The search used its budget.
+    OutOfBudget,
+}
+
+/// Buffers a walk reuses for every root and target. Marks carry the epoch
+/// of the pair that set them, so a pair clears nothing it didn't touch.
+struct WalkScratch {
+    epoch: u32,
+    /// Nodes that can reach the current target.
+    reaches_target: Vec<u32>,
+    /// Nodes on some path from the current root to the current target.
+    relevant: Vec<u32>,
+    relevant_nodes: Vec<usize>,
+    /// Each relevant node's parent on a shortest path from the root.
+    previous: Vec<usize>,
+    parents_left: Vec<usize>,
+    counts: Vec<u64>,
+    queue: VecDeque<usize>,
+    on_path: Vec<bool>,
+    /// Each node on the path, with the next of its dependencies to follow.
+    stack: Vec<(usize, usize)>,
+    path: Vec<usize>,
+    #[cfg(test)]
+    expanded_edges: u64,
+}
+
+impl WalkScratch {
+    fn new(len: usize) -> Self {
+        Self {
+            epoch: 0,
+            reaches_target: vec![0; len],
+            relevant: vec![0; len],
+            relevant_nodes: Vec::new(),
+            previous: vec![usize::MAX; len],
+            parents_left: vec![0; len],
+            counts: vec![0; len],
+            queue: VecDeque::new(),
+            on_path: vec![false; len],
+            stack: Vec::new(),
+            path: Vec::new(),
+            #[cfg(test)]
+            expanded_edges: 0,
+        }
+    }
+
+    /// Marks the nodes on some path from `root` to `target` that doesn't
+    /// pass through `target` before its end, and counts those paths when
+    /// the marked nodes form no cycle. `None` when `root` reaches no
+    /// `target`.
+    fn plan_pair(
+        &mut self,
+        index: &GraphIndex<'_>,
+        root: usize,
+        target: usize,
+    ) -> Option<PairCount> {
+        self.epoch = self.epoch.checked_add(1).unwrap_or_else(|| {
+            self.reaches_target.fill(0);
+            self.relevant.fill(0);
+            1
+        });
+        let epoch = self.epoch;
+
+        self.reaches_target[target] = epoch;
+        self.queue.push_back(target);
+        while let Some(node) = self.queue.pop_front() {
+            for &parent in &index.parents[node] {
+                if self.reaches_target[parent] != epoch {
+                    self.reaches_target[parent] = epoch;
+                    self.queue.push_back(parent);
+                }
             }
         }
-
-        let mut path_counts: HashMap<&str, usize> = HashMap::with_capacity(postorder.len());
-        for root in &self.roots {
-            path_counts
-                .entry(root.as_str())
-                .and_modify(|count| *count = count.saturating_add(1))
-                .or_insert(1usize);
+        if self.reaches_target[root] != epoch {
+            return None;
         }
-        for key in postorder.into_iter().rev() {
-            let current_count = path_counts.get(key).copied().unwrap_or(0);
-            if current_count == 0 {
+
+        self.relevant_nodes.clear();
+        self.relevant[root] = epoch;
+        self.previous[root] = usize::MAX;
+        self.relevant_nodes.push(root);
+        self.queue.push_back(root);
+        while let Some(node) = self.queue.pop_front() {
+            if node == target {
                 continue;
             }
-            if let Some(node) = self.nodes.get(key) {
-                for dependency in &node.dependencies {
-                    path_counts
-                        .entry(dependency.as_str())
-                        .and_modify(|count| *count = count.saturating_add(current_count))
-                        .or_insert(current_count);
-                }
-            }
-        }
-        Some(path_counts)
-    }
-
-    fn collect_acyclic_postorder<'graph>(
-        &'graph self,
-        key: &'graph str,
-        visiting: &mut HashSet<&'graph str>,
-        visited: &mut HashSet<&'graph str>,
-        postorder: &mut Vec<&'graph str>,
-    ) -> bool {
-        if visited.contains(key) {
-            return true;
-        }
-        if !visiting.insert(key) {
-            return false;
-        }
-        if let Some(node) = self.nodes.get(key) {
-            for dependency in &node.dependencies {
-                if !self.collect_acyclic_postorder(dependency, visiting, visited, postorder) {
-                    return false;
-                }
-            }
-        }
-        visiting.remove(key);
-        visited.insert(key);
-        postorder.push(key);
-        true
-    }
-
-    fn visit_paths<'graph, F>(&'graph self, target_name: &str, visitor: F) -> usize
-    where
-        F: FnMut(&[&'graph str]) -> bool,
-    {
-        let mut roots: Vec<&str> = self.roots.iter().map(String::as_str).collect();
-        roots.sort_unstable();
-
-        let mut target_keys: Vec<&str> = self
-            .nodes
-            .iter()
-            .filter(|(_, node)| !node.is_project_root && node.name == target_name)
-            .map(|(key, _)| key.as_str())
-            .collect();
-        target_keys.sort_unstable();
-
-        let mut traversal = PathTraversal::new(self.stats.max_depth.max(1), visitor);
-
-        for root_key in roots {
-            for target_key in &target_keys {
-                traversal.reset(root_key);
-                if !self.dfs_paths(root_key, target_key, &mut traversal) {
-                    return traversal.path_count;
+            for &child in &index.children[node] {
+                if self.reaches_target[child] == epoch && self.relevant[child] != epoch {
+                    self.relevant[child] = epoch;
+                    self.previous[child] = node;
+                    self.relevant_nodes.push(child);
+                    self.queue.push_back(child);
                 }
             }
         }
 
-        traversal.path_count
-    }
-
-    fn dfs_paths<'graph, F>(
-        &'graph self,
-        current: &'graph str,
-        target: &str,
-        traversal: &mut PathTraversal<'graph, F>,
-    ) -> bool
-    where
-        F: FnMut(&[&'graph str]) -> bool,
-    {
-        if current == target {
-            traversal.path_count = traversal.path_count.saturating_add(1);
-            return (traversal.visitor)(&traversal.path);
+        for &node in &self.relevant_nodes {
+            self.parents_left[node] = 0;
+            self.counts[node] = 0;
         }
-
-        if !traversal.visited.insert(current) {
-            return true;
-        }
-
-        if let Some(node) = self.nodes.get(current) {
-            for dep_key in &node.dependencies {
-                traversal.path.push(dep_key);
-                if !self.dfs_paths(dep_key, target, traversal) {
-                    return false;
+        for &node in &self.relevant_nodes {
+            if node == target {
+                continue;
+            }
+            for &child in &index.children[node] {
+                if self.relevant[child] == epoch {
+                    self.parents_left[child] += 1;
                 }
-                traversal.path.pop();
             }
         }
-
-        traversal.visited.remove(current);
-        true
-    }
-}
-
-struct PathTraversal<'graph, F> {
-    path: Vec<&'graph str>,
-    visited: HashSet<&'graph str>,
-    path_count: usize,
-    visitor: F,
-}
-
-impl<'graph, F> PathTraversal<'graph, F> {
-    fn new(initial_capacity: usize, visitor: F) -> Self {
-        Self {
-            path: Vec::with_capacity(initial_capacity),
-            visited: HashSet::with_capacity(initial_capacity),
-            path_count: 0,
-            visitor,
+        self.counts[root] = 1;
+        let mut ready: Vec<usize> = Vec::new();
+        if self.parents_left[root] == 0 {
+            ready.push(root);
         }
+        let mut counted = 0;
+        let mut saturated = false;
+        while let Some(node) = ready.pop() {
+            counted += 1;
+            if node == target {
+                continue;
+            }
+            let count = self.counts[node];
+            for &child in &index.children[node] {
+                if self.relevant[child] != epoch {
+                    continue;
+                }
+                self.counts[child] = self.counts[child].checked_add(count).unwrap_or_else(|| {
+                    saturated = true;
+                    u64::MAX
+                });
+                self.parents_left[child] -= 1;
+                if self.parents_left[child] == 0 {
+                    ready.push(child);
+                }
+            }
+        }
+        Some(if counted == self.relevant_nodes.len() {
+            PairCount::Exact {
+                paths: self.counts[target],
+                saturated,
+            }
+        } else {
+            PairCount::ThroughCycle
+        })
     }
 
-    fn reset(&mut self, root_key: &'graph str) {
+    /// Visits each simple path from `root` to `target` through the nodes
+    /// [`Self::plan_pair`] marked. With a `budget`, each edge followed
+    /// spends one, and the search ends once it is spent.
+    fn search<E>(
+        &mut self,
+        index: &GraphIndex<'_>,
+        root: usize,
+        target: usize,
+        mut budget: Option<&mut u64>,
+        mut visit: impl FnMut(&[usize]) -> Result<std::ops::ControlFlow<()>, E>,
+    ) -> Result<SearchOutcome, E> {
         self.path.clear();
-        self.path.push(root_key);
-        self.visited.clear();
+        self.path.push(root);
+        self.stack.clear();
+        self.stack.push((root, 0));
+        self.on_path[root] = true;
+        let outcome = loop {
+            let Some((node, next)) = self.stack.last_mut() else {
+                break Ok(SearchOutcome::Finished);
+            };
+            let Some(&child) = index.children[*node].get(*next) else {
+                self.on_path[*node] = false;
+                self.stack.pop();
+                self.path.pop();
+                continue;
+            };
+            *next += 1;
+            #[cfg(test)]
+            {
+                self.expanded_edges += 1;
+            }
+            if let Some(budget) = budget.as_deref_mut() {
+                if *budget == 0 {
+                    break Ok(SearchOutcome::OutOfBudget);
+                }
+                *budget -= 1;
+            }
+            if self.relevant[child] != self.epoch || self.on_path[child] {
+                continue;
+            }
+            self.path.push(child);
+            if child == target {
+                let flow = visit(&self.path);
+                self.path.pop();
+                match flow {
+                    Ok(std::ops::ControlFlow::Continue(())) => continue,
+                    Ok(std::ops::ControlFlow::Break(())) => break Ok(SearchOutcome::Stopped),
+                    Err(error) => break Err(error),
+                }
+            }
+            self.on_path[child] = true;
+            self.stack.push((child, 0));
+        };
+        for &(node, _) in &self.stack {
+            self.on_path[node] = false;
+        }
+        outcome
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PathSummary {
-    path_count: usize,
-    version_count: usize,
+    /// A shortest path from `root` to `target` through the marked nodes,
+    /// which is always one a search could find.
+    fn shortest_path(&self, root: usize, target: usize) -> Vec<usize> {
+        let mut path = vec![target];
+        let mut node = target;
+        while node != root {
+            node = self.previous[node];
+            path.push(node);
+        }
+        path.reverse();
+        path
+    }
 }
 
 // ── Tree Renderer ──────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn render_tree(graph: &DepGraph, use_color: bool) -> String {
-    let mut output = String::new();
-    let mut expanded = HashSet::with_capacity(graph.nodes.len());
-    let mut visiting = HashSet::with_capacity(graph.stats.max_depth.max(1));
-
-    let mut sorted_roots = graph.roots.clone();
-    sorted_roots.sort();
-
-    for (i, root_key) in sorted_roots.iter().enumerate() {
-        let is_last = i == sorted_roots.len() - 1;
-        render_tree_node(
-            graph,
-            root_key,
-            "",
-            is_last,
-            1,
-            use_color,
-            &mut expanded,
-            &mut visiting,
-            &mut output,
-        );
-    }
-
-    // Stats line
-    output.push('\n');
-    let dup_info = if graph.stats.duplicates.is_empty() {
-        String::new()
-    } else {
-        let mut names = String::new();
-        for (index, (name, _)) in graph.stats.duplicates.iter().enumerate() {
-            if index > 0 {
-                names.push_str(", ");
-            }
-            names.push_str(&sanitize_terminal_inline(name));
-        }
-        format!(", {} duplicates ({})", graph.stats.duplicates.len(), names)
-    };
-    output.push_str(&format!(
-        "{} packages, max depth {}{}\n",
-        graph.stats.total_packages, graph.stats.max_depth, dup_info,
-    ));
-
-    output
+    let mut output = Vec::new();
+    write_tree(&mut output, graph, use_color).expect("write graph tree");
+    String::from_utf8(output).expect("graph tree must be UTF-8")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_tree_node(
-    graph: &DepGraph,
-    key: &str,
-    prefix: &str,
-    is_last: bool,
-    depth: usize,
+/// Writes the graph as a tree, expanding each node's dependencies the first
+/// time it appears and marking it `(shared)` after that, or `(circular)`
+/// when it is one of its own ancestors.
+///
+/// The walk keeps its place on the heap and shares one prefix buffer among
+/// all levels, so memory grows with the graph's depth rather than with its
+/// square, and a deep graph can't exhaust the stack.
+pub fn write_tree<W: Write>(writer: W, graph: &DepGraph, use_color: bool) -> io::Result<()> {
+    let mut walk = TreeWalk {
+        writer,
+        graph,
+        use_color,
+        expanded: HashSet::with_capacity(graph.nodes.len()),
+        visiting: HashSet::with_capacity(graph.stats.max_depth.max(1)),
+        prefix: String::new(),
+        stack: Vec::with_capacity(graph.stats.max_depth.max(1)),
+    };
+
+    let mut sorted_roots: Vec<&str> = graph.roots.iter().map(String::as_str).collect();
+    sorted_roots.sort_unstable();
+    for (index, root_key) in sorted_roots.iter().enumerate() {
+        walk.write_node(root_key, index + 1 == sorted_roots.len())?;
+        while let Some(top) = walk.stack.last_mut() {
+            if let Some(dependency) = top.dependencies.get(top.next) {
+                top.next += 1;
+                let is_last = top.next == top.dependencies.len();
+                walk.write_node(dependency, is_last)?;
+            } else {
+                walk.prefix.truncate(top.prefix_len);
+                let key = top.key;
+                walk.stack.pop();
+                walk.visiting.remove(key);
+            }
+        }
+    }
+
+    let writer = &mut walk.writer;
+    writer.write_all(b"\n")?;
+    write!(
+        writer,
+        "{} packages, max depth {}",
+        graph.stats.total_packages, graph.stats.max_depth
+    )?;
+    if !graph.stats.duplicates.is_empty() {
+        write!(writer, ", {} duplicates (", graph.stats.duplicates.len())?;
+        for (index, (name, _)) in graph.stats.duplicates.iter().enumerate() {
+            if index > 0 {
+                writer.write_all(b", ")?;
+            }
+            writer.write_all(sanitize_terminal_inline(name).as_bytes())?;
+        }
+        writer.write_all(b")")?;
+    }
+    writer.write_all(b"\n")
+}
+
+struct TreeWalk<'graph, W> {
+    writer: W,
+    graph: &'graph DepGraph,
     use_color: bool,
-    expanded: &mut HashSet<String>,
-    visiting: &mut HashSet<String>,
-    output: &mut String,
-) {
-    let connector = if depth == 1 {
-        ""
-    } else if is_last {
-        "└── "
-    } else {
-        "├── "
-    };
+    expanded: HashSet<&'graph str>,
+    /// The nodes whose children are being written: the current node's
+    /// ancestors.
+    visiting: HashSet<&'graph str>,
+    prefix: String,
+    stack: Vec<ExpandingNode<'graph>>,
+}
 
-    let node = match graph.nodes.get(key) {
-        Some(n) => n,
-        None => return,
-    };
+struct ExpandingNode<'graph> {
+    key: &'graph str,
+    dependencies: &'graph [String],
+    next: usize,
+    /// The prefix's length before this node's children extended it.
+    prefix_len: usize,
+}
 
-    let colored_label = render_tree_label(node, use_color);
-
-    let circular = visiting.contains(key);
-    let shared = !circular && expanded.contains(key);
-    let marker = if circular {
-        color_tree_meta(" (circular)", use_color)
-    } else if shared {
-        color_tree_meta(" (shared)", use_color)
-    } else {
-        String::new()
-    };
-
-    output.push_str(&format!(
-        "{}{}{}{}\n",
-        color_tree_meta(prefix, use_color),
-        color_tree_meta(connector, use_color),
-        colored_label,
-        marker
-    ));
-
-    if circular || shared {
-        return;
+impl<'graph, W: Write> TreeWalk<'graph, W> {
+    /// Writes `key`'s line, and starts expanding it unless it was expanded
+    /// before or is one of its own ancestors.
+    fn write_node(&mut self, key: &str, is_last: bool) -> io::Result<()> {
+        let Some((key, node)) = self.graph.nodes.get_key_value(key) else {
+            return Ok(());
+        };
+        let top_level = self.stack.is_empty();
+        let connector = if top_level {
+            ""
+        } else if is_last {
+            "└── "
+        } else {
+            "├── "
+        };
+        let circular = self.visiting.contains(key.as_str());
+        let shared = !circular && self.expanded.contains(key.as_str());
+        write_tree_meta(&mut self.writer, &self.prefix, self.use_color)?;
+        write_tree_meta(&mut self.writer, connector, self.use_color)?;
+        self.writer
+            .write_all(render_tree_label(node, self.use_color).as_bytes())?;
+        if circular {
+            write_tree_meta(&mut self.writer, " (circular)", self.use_color)?;
+        } else if shared {
+            write_tree_meta(&mut self.writer, " (shared)", self.use_color)?;
+        }
+        self.writer.write_all(b"\n")?;
+        if circular || shared {
+            return Ok(());
+        }
+        self.visiting.insert(key);
+        self.expanded.insert(key);
+        let prefix_len = self.prefix.len();
+        if !top_level {
+            self.prefix.push_str(if is_last { "    " } else { "│   " });
+        }
+        self.stack.push(ExpandingNode {
+            key,
+            dependencies: &node.dependencies,
+            next: 0,
+            prefix_len,
+        });
+        Ok(())
     }
-    visiting.insert(key.to_string());
-    expanded.insert(key.to_string());
+}
 
-    let child_prefix = if depth == 1 {
-        "".to_string()
-    } else if is_last {
-        format!("{prefix}    ")
+fn write_tree_meta<W: Write>(writer: &mut W, text: &str, use_color: bool) -> io::Result<()> {
+    if use_color && !text.is_empty() {
+        write!(writer, "\x1b[2m{text}\x1b[22m")
     } else {
-        format!("{prefix}│   ")
-    };
-
-    let deps = &node.dependencies;
-    for (i, dep_key) in deps.iter().enumerate() {
-        let is_last_child = i == deps.len() - 1;
-        render_tree_node(
-            graph,
-            dep_key,
-            &child_prefix,
-            is_last_child,
-            depth + 1,
-            use_color,
-            expanded,
-            visiting,
-            output,
-        );
+        writer.write_all(text.as_bytes())
     }
-
-    visiting.remove(key);
 }
 
 fn render_tree_label(node: &DepNode, use_color: bool) -> String {
@@ -1094,10 +1464,38 @@ pub fn render_stats(graph: &DepGraph) -> String {
 
 // ── Why Renderer ───────────────────────────────────────────────────
 
+/// What [`write_why`] says after the paths: how many more there are, and
+/// why the count is a lower bound when it is one.
+fn write_why_trailer<W: Write>(writer: &mut W, summary: &WhySummary) -> io::Result<()> {
+    let at_least = if summary.count_exact { "" } else { "at least " };
+    let hidden = summary.hidden();
+    if hidden > 0 || (!summary.count_exact && !summary.search_stopped) {
+        if hidden > 0 {
+            write!(writer, "\n… and {at_least}{hidden} more path(s).")?;
+        } else {
+            write!(writer, "\n… and possibly more path(s).")?;
+        }
+        if summary.limit_reached {
+            write!(writer, " Use --limit <N> or --all-paths to show more.")?;
+        }
+        writeln!(writer)?;
+    }
+    if summary.search_stopped {
+        writeln!(
+            writer,
+            "\nThe search stopped after following {CYCLIC_PATH_SEARCH_BUDGET} dependency edges through a cycle, so more paths may exist."
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes why `target_name` is in the graph: its paths from the roots, at
+/// most `path_limit` of them (all when `None`), and how many there are.
 pub fn write_why<W: Write>(
     mut writer: W,
     graph: &DepGraph,
     target_name: &str,
+    path_limit: Option<usize>,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
     patch_state: Option<&crate::patch_state::PatchState>,
 ) -> io::Result<()> {
@@ -1106,9 +1504,10 @@ pub fn write_why<W: Write>(
         .nodes
         .values()
         .any(|n| n.name == target_name && n.is_direct);
-    let summary = graph.path_summary(target_name);
+    let plan = graph.why_plan(target_name);
+    let summary = plan.summary(path_limit);
 
-    if summary.path_count == 0 {
+    if summary.count == 0 {
         writeln!(writer, "{target_display} is not in your dependency tree.")?;
         return Ok(());
     }
@@ -1117,46 +1516,35 @@ pub fn write_why<W: Write>(
         writeln!(writer, "{target_display} is a direct dependency.\n")?;
     }
 
+    let at_least = if summary.count_exact { "" } else { "at least " };
     writeln!(
         writer,
-        "{target_display} is required by {} path(s):\n",
-        summary.path_count
+        "{target_display} is required by {at_least}{} path(s):\n",
+        summary.count
     )?;
 
-    let mut write_error = None;
-    let rendered_path_count = graph.visit_paths(target_name, |path| {
-        let result = (|| -> io::Result<()> {
-            writer.write_all(b"  ")?;
-            for (index, key) in path.iter().enumerate() {
-                if index > 0 {
-                    writer.write_all(" → ".as_bytes())?;
-                }
-                if let Some(node) = graph.nodes.get(*key) {
-                    write!(
-                        writer,
-                        "{}@{}",
-                        sanitize_terminal_inline(&node.name),
-                        sanitize_terminal_inline(&node.version)
-                    )?;
-                } else {
-                    writer.write_all(sanitize_terminal_inline(key).as_bytes())?;
-                }
+    let shown = plan.show(path_limit, |path| {
+        writer.write_all(b"  ")?;
+        for (index, key) in path.iter().enumerate() {
+            if index > 0 {
+                writer.write_all(" → ".as_bytes())?;
             }
-            writeln!(writer)
-        })();
-
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                write_error = Some(error);
-                false
+            if let Some(node) = graph.nodes.get(*key) {
+                write!(
+                    writer,
+                    "{}@{}",
+                    sanitize_terminal_inline(&node.name),
+                    sanitize_terminal_inline(&node.version)
+                )?;
+            } else {
+                writer.write_all(sanitize_terminal_inline(key).as_bytes())?;
             }
         }
-    });
-    if let Some(error) = write_error {
-        return Err(error);
-    }
-    debug_assert_eq!(rendered_path_count, summary.path_count);
+        writeln!(writer)
+    })?;
+    debug_assert_eq!(shown, summary);
+
+    write_why_trailer(&mut writer, &summary)?;
 
     if summary.version_count > 1 {
         writeln!(
@@ -1234,6 +1622,7 @@ pub(crate) fn render_why(
         &mut output,
         graph,
         target_name,
+        Some(DEFAULT_WHY_PATH_LIMIT),
         overrides_state,
         patch_state,
     )
@@ -1268,18 +1657,38 @@ fn truncate_integrity(integrity: &str) -> String {
 
 // ── Why JSON ───────────────────────────────────────────────────────
 
+/// Writes [`write_why`]'s report as JSON. `paths` and `path_keys` hold the
+/// same shown paths, by display name and by graph key. With a limit, one
+/// walk collects them; without one, each array walks them again rather
+/// than holding every path in memory.
 pub fn write_why_json<W: Write>(
     mut writer: W,
     graph: &DepGraph,
     target_name: &str,
+    path_limit: Option<usize>,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
     patch_state: Option<&crate::patch_state::PatchState>,
 ) -> Result<(), serde_json::Error> {
-    let summary = graph.path_summary(target_name);
+    let plan = graph.why_plan(target_name);
+    let (summary, collected) = if path_limit.is_some() {
+        let mut collected = CollectedPaths::default();
+        let summary = match plan.show(path_limit, |path| {
+            collected.push(path);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(summary) => summary,
+            Err(never) => match never {},
+        };
+        (summary, Some(collected))
+    } else {
+        (plan.summary(None), None)
+    };
     let output = WhyJson {
         graph,
         target_name,
+        plan: &plan,
         summary,
+        collected: collected.as_ref(),
         overrides_state,
         patch_state,
     };
@@ -1287,44 +1696,65 @@ pub fn write_why_json<W: Write>(
     writer.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
+/// Shown paths, one after another.
+#[derive(Default)]
+struct CollectedPaths<'graph> {
+    nodes: Vec<&'graph str>,
+    /// Where each path ends in `nodes`.
+    ends: Vec<usize>,
+}
+
+impl<'graph> CollectedPaths<'graph> {
+    fn push(&mut self, path: &[&'graph str]) {
+        self.nodes.extend_from_slice(path);
+        self.ends.push(self.nodes.len());
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[&'graph str]> + '_ {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let path = &self.nodes[start..end];
+            start = end;
+            path
+        })
+    }
+}
+
 struct WhyJson<'graph, 'value> {
     graph: &'graph DepGraph,
     target_name: &'value str,
-    summary: PathSummary,
+    plan: &'value WhyPlan<'graph>,
+    summary: WhySummary,
+    collected: Option<&'value CollectedPaths<'graph>>,
     overrides_state: Option<&'value crate::overrides_state::OverridesState>,
     patch_state: Option<&'value crate::patch_state::PatchState>,
 }
 
-// The explicit serializer keeps the JSON field names stable while `paths`
-// writes one visited path at a time instead of materializing the full array.
+// The explicit serializer keeps the JSON field names and their order stable.
 impl Serialize for WhyJson<'_, '_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut output = serializer.serialize_struct("WhyJson", 8)?;
+        let mut output = serializer.serialize_struct("WhyJson", 10)?;
         output.serialize_field("success", &true)?;
         output.serialize_field("target", self.target_name)?;
-        output.serialize_field("found", &(self.summary.path_count > 0))?;
-        output.serialize_field("path_count", &self.summary.path_count)?;
-        output.serialize_field(
-            "paths",
-            &WhyJsonPaths {
-                graph: self.graph,
-                target_name: self.target_name,
-                path_count: self.summary.path_count,
-                exact_keys: false,
-            },
-        )?;
-        output.serialize_field(
-            "path_keys",
-            &WhyJsonPaths {
-                graph: self.graph,
-                target_name: self.target_name,
-                path_count: self.summary.path_count,
-                exact_keys: true,
-            },
-        )?;
+        output.serialize_field("found", &(self.summary.count > 0))?;
+        output.serialize_field("path_count", &self.summary.count)?;
+        output.serialize_field("path_count_exact", &self.summary.count_exact)?;
+        for (field, keys) in [("paths", false), ("path_keys", true)] {
+            output.serialize_field(
+                field,
+                &WhyJsonPaths {
+                    graph: self.graph,
+                    plan: self.plan,
+                    summary: &self.summary,
+                    collected: self.collected,
+                    keys,
+                },
+            )?;
+        }
+        output.serialize_field("paths_truncated", &self.summary.truncated())?;
         output.serialize_field(
             "applied_overrides",
             &WhyJsonOverrideHits {
@@ -1407,9 +1837,28 @@ impl Serialize for WhyJsonPatchHits<'_> {
 
 struct WhyJsonPaths<'graph, 'value> {
     graph: &'graph DepGraph,
-    target_name: &'value str,
-    path_count: usize,
-    exact_keys: bool,
+    plan: &'value WhyPlan<'graph>,
+    summary: &'value WhySummary,
+    collected: Option<&'value CollectedPaths<'graph>>,
+    /// Write each path's graph keys rather than its display names.
+    keys: bool,
+}
+
+impl<'graph> WhyJsonPaths<'graph, '_> {
+    fn element<S: SerializeSeq>(
+        &self,
+        paths: &mut S,
+        path: &[&'graph str],
+    ) -> Result<(), S::Error> {
+        if self.keys {
+            paths.serialize_element(path)
+        } else {
+            paths.serialize_element(&WhyJsonPath {
+                graph: self.graph,
+                path,
+            })
+        }
+    }
 }
 
 impl Serialize for WhyJsonPaths<'_, '_> {
@@ -1417,30 +1866,19 @@ impl Serialize for WhyJsonPaths<'_, '_> {
     where
         S: serde::Serializer,
     {
-        let mut paths = serializer.serialize_seq(Some(self.path_count))?;
-        let mut serialization_error = None;
-        let serialized_path_count = self.graph.visit_paths(self.target_name, |path| {
-            let result = if self.exact_keys {
-                paths.serialize_element(path)
-            } else {
-                paths.serialize_element(&WhyJsonPath {
-                    graph: self.graph,
-                    path,
-                })
-            };
-            match result {
-                Ok(()) => true,
-                Err(error) => {
-                    serialization_error = Some(error);
-                    false
+        let len = usize::try_from(self.summary.shown).ok();
+        let mut paths = serializer.serialize_seq(len)?;
+        match self.collected {
+            Some(collected) => {
+                for path in collected.iter() {
+                    self.element(&mut paths, path)?;
                 }
             }
-        });
-
-        if let Some(error) = serialization_error {
-            return Err(error);
+            None => {
+                self.plan
+                    .show(None, |path| self.element(&mut paths, path))?;
+            }
         }
-        debug_assert_eq!(serialized_path_count, self.path_count);
         paths.end()
     }
 }
@@ -1479,6 +1917,7 @@ fn render_why_json(
         &mut output,
         graph,
         target_name,
+        Some(DEFAULT_WHY_PATH_LIMIT),
         overrides_state,
         patch_state,
     )?;
@@ -2619,149 +3058,146 @@ mod tests {
         );
     }
 
-    // ── Exponential path blowup in dfs_paths ─────────────
+    // ── Why paths ────────────────────────────────────────
 
-    #[test]
-    fn visit_paths_returns_every_path_with_storage_bounded_by_depth() {
-        let mut packages = Vec::new();
-        let mut root_deps = Vec::new();
-
-        let depth = 7;
-        for i in 0..depth {
-            let shared_key = format!("shared-{i}@1.0.0");
-            let a_key = format!("branch-{i}-a@1.0.0");
-            let b_key = format!("branch-{i}-b@1.0.0");
-
-            let next_deps = if i + 1 < depth {
+    /// A chain of `depth` levels in which every level has two packages that
+    /// both depend on the next level's shared package, ending at `target`:
+    /// 2^`depth` paths from the root to `target`.
+    fn dense_chain(depth: usize) -> Vec<LockedPackage> {
+        let mut packages = Vec::with_capacity(depth * 3 + 1);
+        for level in 0..depth {
+            let shared = format!("shared-{level}@1.0.0");
+            packages.push(package(&format!("branch-{level}-a"), &[shared.as_str()]));
+            packages.push(package(&format!("branch-{level}-b"), &[shared.as_str()]));
+            let next = if level + 1 < depth {
                 vec![
-                    format!("branch-{}-a@1.0.0", i + 1),
-                    format!("branch-{}-b@1.0.0", i + 1),
+                    format!("branch-{}-a@1.0.0", level + 1),
+                    format!("branch-{}-b@1.0.0", level + 1),
                 ]
             } else {
-                vec!["target@1.0.0".into()]
+                vec!["target@1.0.0".to_string()]
             };
-
-            packages.push(LockedPackage {
-                instance_id: None,
-                dependency_targets: std::collections::BTreeMap::new(),
-                peer_targets: std::collections::BTreeMap::new(),
-                name: format!("branch-{i}-a"),
-                version: "1.0.0".into(),
-                source: None,
-                integrity: None,
-                unpacked_size: None,
-                manifest_fingerprint: None,
-                registry_signatures: Vec::new(),
-                registry_published_at: None,
-                os: Vec::new(),
-                cpu: Vec::new(),
-                libc: Vec::new(),
-                node_engine: None,
-                optional: false,
-                dependencies: vec![shared_key.clone()],
-                alias_dependencies: vec![],
-                peers: vec![],
-                peer_edges: Vec::new(),
-                tarball: None,
-            });
-            packages.push(LockedPackage {
-                instance_id: None,
-                dependency_targets: std::collections::BTreeMap::new(),
-                peer_targets: std::collections::BTreeMap::new(),
-                name: format!("branch-{i}-b"),
-                version: "1.0.0".into(),
-                source: None,
-                integrity: None,
-                unpacked_size: None,
-                manifest_fingerprint: None,
-                registry_signatures: Vec::new(),
-                registry_published_at: None,
-                os: Vec::new(),
-                cpu: Vec::new(),
-                libc: Vec::new(),
-                node_engine: None,
-                optional: false,
-                dependencies: vec![shared_key.clone()],
-                alias_dependencies: vec![],
-                peers: vec![],
-                peer_edges: Vec::new(),
-                tarball: None,
-            });
-            packages.push(LockedPackage {
-                instance_id: None,
-                dependency_targets: std::collections::BTreeMap::new(),
-                peer_targets: std::collections::BTreeMap::new(),
-                name: format!("shared-{i}"),
-                version: "1.0.0".into(),
-                source: None,
-                integrity: None,
-                unpacked_size: None,
-                manifest_fingerprint: None,
-                registry_signatures: Vec::new(),
-                registry_published_at: None,
-                os: Vec::new(),
-                cpu: Vec::new(),
-                libc: Vec::new(),
-                node_engine: None,
-                optional: false,
-                dependencies: next_deps,
-                alias_dependencies: vec![],
-                peers: vec![],
-                peer_edges: Vec::new(),
-                tarball: None,
-            });
-
-            if i == 0 {
-                root_deps.push(a_key);
-                root_deps.push(b_key);
-            }
+            let next: Vec<&str> = next.iter().map(String::as_str).collect();
+            packages.push(package(&format!("shared-{level}"), &next));
         }
-        packages.push(LockedPackage {
-            instance_id: None,
-            dependency_targets: std::collections::BTreeMap::new(),
-            peer_targets: std::collections::BTreeMap::new(),
-            name: "target".into(),
-            version: "1.0.0".into(),
-            source: None,
-            integrity: None,
-            unpacked_size: None,
-            manifest_fingerprint: None,
-            registry_signatures: Vec::new(),
-            registry_published_at: None,
-            os: Vec::new(),
-            cpu: Vec::new(),
-            libc: Vec::new(),
-            node_engine: None,
-            optional: false,
-            dependencies: vec![],
-            alias_dependencies: vec![],
-            peers: vec![],
-            peer_edges: Vec::new(),
-            tarball: None,
-        });
+        packages.push(package("target", &[]));
+        packages
+    }
 
-        let direct: HashSet<String> = root_deps
-            .iter()
-            .map(|s| s.split('@').next().unwrap().to_string())
-            .collect();
-        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+    fn dense_chain_graph(depth: usize, extra_direct: &[&str]) -> DepGraph {
+        let mut packages = dense_chain(depth);
+        for name in extra_direct {
+            packages.push(package(name, &[]));
+        }
+        let mut direct = HashSet::from(["branch-0-a".to_string(), "branch-0-b".to_string()]);
+        direct.extend(extra_direct.iter().map(|name| (*name).to_string()));
+        DepGraph::from_lockfile(&packages, &direct, "app@1.0.0")
+    }
 
-        let mut callback_count = 0;
-        let mut max_path_len = 0;
-        let path_count = graph.visit_paths("target", |path| {
-            callback_count += 1;
-            max_path_len = max_path_len.max(path.len());
-            true
-        });
+    /// The paths a showing walk shows, with its summary, after checking
+    /// that a count-only walk summarizes the same.
+    fn walk(plan: &WhyPlan<'_>, limit: Option<usize>) -> (WhySummary, Vec<Vec<String>>) {
+        let mut paths = Vec::new();
+        let summary = plan
+            .show(limit, |path| {
+                paths.push(path.iter().map(|key| (*key).to_string()).collect());
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(plan.summary(limit), summary, "a count-only walk must agree");
+        (summary, paths)
+    }
 
-        assert_eq!(
-            (path_count, callback_count, max_path_len),
-            (1 << depth, 1 << depth, depth * 2 + 2)
+    fn walk_graph(
+        graph: &DepGraph,
+        target: &str,
+        limit: Option<usize>,
+    ) -> (WhySummary, Vec<Vec<String>>) {
+        walk(&graph.why_plan(target), limit)
+    }
+
+    fn strings<const N: usize>(path: [&str; N]) -> Vec<String> {
+        path.map(str::to_string).to_vec()
+    }
+
+    #[test]
+    fn why_shows_every_path_within_the_limit() {
+        let graph = dense_chain_graph(7, &[]);
+
+        let (summary, paths) = walk_graph(&graph, "target", Some(DEFAULT_WHY_PATH_LIMIT));
+
+        assert_eq!((summary.count, summary.count_exact), (1 << 7, true));
+        assert_eq!(paths.len(), 1 << 7);
+        assert!(paths.iter().all(|path| path.len() == 7 * 2 + 2));
+        assert!(!summary.truncated());
+    }
+
+    #[test]
+    fn why_follows_only_edges_that_lead_to_the_target() {
+        let graph = dense_chain_graph(64, &["lone"]);
+        let edges: usize = graph
+            .nodes
+            .values()
+            .map(|node| node.dependencies.len())
+            .sum();
+        let plan = graph.why_plan("lone");
+
+        let (summary, paths) = walk(&plan, None);
+
+        assert_eq!(paths, [strings(["app@1.0.0", "lone@1.0.0"])]);
+        assert_eq!((summary.count, summary.count_exact), (1, true));
+        let expanded = plan.expanded_edges_to_show(None);
+        assert!(
+            expanded <= edges as u64,
+            "followed {expanded} of {edges} edges"
         );
     }
 
     #[test]
-    fn visit_paths_terminates_cycles_without_losing_acyclic_paths() {
+    fn why_counts_a_dense_graph_exactly_but_shows_only_the_limit() {
+        let graph = dense_chain_graph(40, &[]);
+        let plan = graph.why_plan("target");
+
+        let (summary, paths) = walk(&plan, Some(3));
+
+        assert_eq!((summary.count, summary.count_exact), (1 << 40, true));
+        assert_eq!((summary.shown, paths.len()), (3, 3));
+        assert_eq!(summary.hidden(), (1 << 40) - 3);
+        assert!(summary.limit_reached && summary.truncated());
+        assert!(plan.expanded_edges_to_show(Some(3)) < 1_000);
+    }
+
+    #[test]
+    fn why_says_a_count_past_u64_max_is_not_exact() {
+        let graph = dense_chain_graph(64, &[]);
+
+        let (summary, _) = walk_graph(&graph, "target", Some(1));
+
+        assert_eq!((summary.count, summary.count_exact), (u64::MAX, false));
+        assert!(summary.truncated());
+    }
+
+    #[test]
+    fn why_says_counts_that_pass_u64_max_together_are_not_exact() {
+        let mut packages = dense_chain(63);
+        let shared = packages
+            .iter_mut()
+            .find(|package| package.name == "shared-62")
+            .unwrap();
+        shared.dependencies = vec!["target@1.0.0".into(), "target@2.0.0".into()];
+        let mut second = package("target", &[]);
+        second.version = "2.0.0".into();
+        packages.push(second);
+        let direct = HashSet::from(["branch-0-a".to_string(), "branch-0-b".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        let (summary, _) = walk_graph(&graph, "target", Some(1));
+
+        assert_eq!((summary.count, summary.count_exact), (u64::MAX, false));
+    }
+
+    #[test]
+    fn why_ends_cycles_without_losing_paths() {
         let packages = vec![
             package("a", &["target@1.0.0", "b@1.0.0"]),
             package("b", &["target@1.0.0", "a@1.0.0"]),
@@ -2770,17 +3206,130 @@ mod tests {
         let direct = HashSet::from(["a".to_string()]);
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
 
-        let path_count = graph.visit_paths("target", |_| true);
+        let (summary, _) = walk_graph(&graph, "target", None);
 
-        assert_eq!(path_count, 2);
+        assert_eq!((summary.count, summary.count_exact), (2, true));
         let json = render_why_json(&graph, "target", None, None).unwrap();
         let report: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(report["path_count"], 2);
+        assert_eq!(report["path_count_exact"], true);
+        assert_eq!(report["paths_truncated"], false);
         assert_eq!(report["path_keys"], report["paths"]);
     }
 
     #[test]
-    fn path_summary_counts_reachable_same_name_targets_independently() {
+    fn why_counts_exactly_when_the_only_cycle_runs_through_the_target() {
+        let packages = vec![
+            package("entry", &["target@1.0.0"]),
+            package("helper", &["target@1.0.0"]),
+            package("other", &["target@1.0.0"]),
+            package("target", &["helper@1.0.0"]),
+        ];
+        let direct = HashSet::from(["entry".to_string(), "other".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        let (summary, paths) = walk_graph(&graph, "target", Some(1));
+
+        assert_eq!((summary.count, summary.count_exact), (2, true));
+        assert_eq!(
+            paths,
+            [strings(["app@1.0.0", "entry@1.0.0", "target@1.0.0"])]
+        );
+    }
+
+    #[test]
+    fn why_through_a_cycle_reports_a_lower_bound_past_the_limit() {
+        let mut packages = dense_chain(4);
+        packages
+            .iter_mut()
+            .find(|package| package.name == "shared-3")
+            .unwrap()
+            .dependencies
+            .push("branch-0-a@1.0.0".to_string());
+        let direct = HashSet::from(["branch-0-a".to_string(), "branch-0-b".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        let (limited, limited_paths) = walk_graph(&graph, "target", Some(5));
+        let (every, every_paths) = walk_graph(&graph, "target", None);
+
+        assert_eq!((limited.count, limited.count_exact), (6, false));
+        assert_eq!((limited.shown, limited_paths.len()), (5, 5));
+        assert_eq!(limited.hidden(), 1);
+        assert_eq!((every.count, every.count_exact), (16, true));
+        assert_eq!(every_paths.len(), 16);
+    }
+
+    /// `a` and `b` form a cycle on the way to `target@1.0.0`; `other` leads
+    /// to `target@2.0.0` without one.
+    fn cyclic_and_acyclic_versions() -> DepGraph {
+        let mut second = package("target", &[]);
+        second.version = "2.0.0".into();
+        let packages = vec![
+            package("a", &["b@1.0.0", "target@1.0.0"]),
+            package("b", &["a@1.0.0"]),
+            package("other", &["target@2.0.0"]),
+            package("target", &[]),
+            second,
+        ];
+        let direct = HashSet::from(["a".to_string(), "other".to_string()]);
+        DepGraph::from_lockfile(&packages, &direct, "app@1.0.0")
+    }
+
+    #[test]
+    fn why_through_a_cycle_stops_at_its_budget_and_still_shows_a_path_in_order() {
+        let graph = cyclic_and_acyclic_versions();
+        let plan = graph.why_plan("target").with_cyclic_search_budget(1);
+
+        let (every, paths) = walk(&plan, Some(10));
+        let (limited, limited_paths) = walk(&plan, Some(1));
+
+        assert!(every.search_stopped && !every.count_exact);
+        assert_eq!(every.count, 2);
+        assert_eq!(
+            paths,
+            [
+                strings(["app@1.0.0", "a@1.0.0", "target@1.0.0"]),
+                strings(["app@1.0.0", "other@1.0.0", "target@2.0.0"]),
+            ]
+        );
+        assert_eq!(
+            limited_paths,
+            [strings(["app@1.0.0", "a@1.0.0", "target@1.0.0"])]
+        );
+        assert_eq!((limited.count, limited.hidden()), (2, 1));
+    }
+
+    #[test]
+    fn why_says_the_search_stopped_when_a_spent_budget_skips_a_cycle() {
+        let graph = cyclic_and_acyclic_versions();
+        let plan = graph.why_plan("target").with_cyclic_search_budget(0);
+
+        let (summary, paths) = walk(&plan, Some(10));
+
+        assert!(summary.search_stopped);
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn why_counts_versions_not_the_contexts_one_version_is_installed_in() {
+        let packages = vec![
+            package("left", &[]),
+            package("right", &[]),
+            package("plugin", &[]),
+            package("plugin", &[]),
+        ];
+        let direct = HashSet::from([0, 1]);
+        let adjacency = vec![vec![2], vec![3], Vec::new(), Vec::new()];
+        let graph = DepGraph::from_indexed_packages(&packages, &direct, &adjacency, "app@1.0.0");
+
+        let (summary, _) = walk_graph(&graph, "plugin", None);
+
+        assert_eq!((summary.count, summary.version_count), (2, 1));
+        assert!(!render_why(&graph, "plugin", None, None).contains("versions installed"));
+    }
+
+    #[test]
+    fn why_counts_reachable_same_name_targets_independently() {
         let mut target_v1 = package("target", &["target@2.0.0"]);
         target_v1.version = "1.0.0".into();
         let mut target_v2 = package("target", &[]);
@@ -2799,17 +3348,13 @@ mod tests {
             "app@1.0.0",
         );
 
-        assert_eq!(
-            graph.path_summary("target"),
-            PathSummary {
-                path_count: 2,
-                version_count: 2,
-            }
-        );
+        let (summary, _) = walk_graph(&graph, "target", None);
+
+        assert_eq!((summary.count, summary.version_count), (2, 2));
     }
 
     #[test]
-    fn visit_paths_orders_target_versions_and_edges_lexically() {
+    fn why_orders_target_versions_and_edges_lexically() {
         let mut target_v2 = package("target", &[]);
         target_v2.version = "2.0.0".into();
         let packages = vec![
@@ -2820,21 +3365,192 @@ mod tests {
         ];
         let direct = HashSet::from(["zeta".to_string(), "alpha".to_string()]);
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let mut paths = Vec::new();
 
-        graph.visit_paths("target", |path| {
-            paths.push(path.to_vec());
-            true
-        });
+        let (_, paths) = walk_graph(&graph, "target", None);
 
         assert_eq!(
             paths,
-            vec![
-                vec!["app@1.0.0", "alpha@1.0.0", "target@1.0.0"],
-                vec!["app@1.0.0", "zeta@1.0.0", "target@1.0.0"],
-                vec!["app@1.0.0", "alpha@1.0.0", "target@2.0.0"],
-                vec!["app@1.0.0", "zeta@1.0.0", "target@2.0.0"],
+            [
+                strings(["app@1.0.0", "alpha@1.0.0", "target@1.0.0"]),
+                strings(["app@1.0.0", "zeta@1.0.0", "target@1.0.0"]),
+                strings(["app@1.0.0", "alpha@1.0.0", "target@2.0.0"]),
+                strings(["app@1.0.0", "zeta@1.0.0", "target@2.0.0"]),
             ]
+        );
+    }
+
+    #[test]
+    fn why_shows_a_target_that_is_itself_a_root() {
+        let packages = vec![package("solo", &[])];
+        let mut graph =
+            DepGraph::from_lockfile(&packages, &HashSet::from(["solo".to_string()]), "app@1.0.0");
+        graph.roots = vec!["solo@1.0.0".to_string()];
+
+        let (summary, paths) = walk_graph(&graph, "solo", None);
+
+        assert_eq!((summary.count, summary.count_exact), (1, true));
+        assert_eq!(paths, [strings(["solo@1.0.0"])]);
+    }
+
+    #[test]
+    fn why_trailer_names_the_hidden_paths_and_why_the_count_is_a_lower_bound() {
+        let trailer = |summary: WhySummary| {
+            let mut output = Vec::new();
+            write_why_trailer(&mut output, &summary).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        let base = WhySummary {
+            count: 10,
+            count_exact: true,
+            shown: 10,
+            ..WhySummary::default()
+        };
+
+        assert_eq!(trailer(base), "");
+        assert_eq!(
+            trailer(WhySummary {
+                shown: 4,
+                limit_reached: true,
+                ..base
+            }),
+            "\n… and 6 more path(s). Use --limit <N> or --all-paths to show more.\n"
+        );
+        assert_eq!(
+            trailer(WhySummary {
+                count_exact: false,
+                shown: 4,
+                limit_reached: true,
+                search_stopped: true,
+                ..base
+            }),
+            format!(
+                "\n… and at least 6 more path(s). Use --limit <N> or --all-paths to show more.\n\
+                 \nThe search stopped after following {CYCLIC_PATH_SEARCH_BUDGET} dependency edges through a cycle, so more paths may exist.\n"
+            )
+        );
+        assert_eq!(
+            trailer(WhySummary {
+                count_exact: false,
+                ..base
+            }),
+            "\n… and possibly more path(s).\n"
+        );
+    }
+
+    const DEEP_GRAPH_CHILD: &str = "LPM_TEST_GRAPH_DEEP_CHAIN_CHILD";
+
+    #[test]
+    fn graph_traversals_handle_a_deep_chain_without_stack_growth() {
+        if std::env::var_os(DEEP_GRAPH_CHILD).is_some() {
+            const DEPTH: usize = 100_000;
+            let mut packages = Vec::with_capacity(DEPTH);
+            for level in 0..DEPTH {
+                let next = format!("link-{}@1.0.0", level + 1);
+                let dependencies: &[&str] = if level + 1 < DEPTH { &[&next] } else { &[] };
+                packages.push(package(&format!("link-{level}"), dependencies));
+            }
+            let direct = HashSet::from(["link-0".to_string()]);
+            let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+            let last = format!("link-{}", DEPTH - 1);
+            let walk = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let summary = graph.why_plan(&last).summary(Some(1));
+                    assert_eq!((summary.count, summary.shown), (1, 1));
+                    write_tree(io::sink(), &graph, false).unwrap();
+                    write_why(io::sink(), &graph, &last, Some(1), None, None).unwrap();
+                })
+                .unwrap();
+            walk.join().unwrap();
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "graph_render::tests::graph_traversals_handle_a_deep_chain_without_stack_growth",
+                "--nocapture",
+            ])
+            .env(DEEP_GRAPH_CHILD, "1")
+            .status()
+            .expect("run the deep graph child process");
+        assert!(status.success(), "a deep graph traversal aborted: {status}");
+    }
+
+    /// Accepts `capacity` bytes, then fails every write.
+    struct FullWriter {
+        capacity: usize,
+        written: usize,
+        attempts_after_full: usize,
+    }
+
+    impl Write for FullWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written >= self.capacity {
+                self.attempts_after_full += 1;
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "full"));
+            }
+            let accepted = buf.len().min(self.capacity - self.written);
+            self.written += accepted;
+            Ok(accepted)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tree_writer_stops_at_the_first_write_error() {
+        let graph = dense_chain_graph(200, &[]);
+        let mut writer = FullWriter {
+            capacity: 512,
+            written: 0,
+            attempts_after_full: 0,
+        };
+
+        let error = write_tree(&mut writer, &graph, false).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(writer.attempts_after_full, 1);
+    }
+
+    #[test]
+    fn tree_writer_writes_what_the_tree_renderer_did() {
+        let packages = vec![
+            package("a", &["b@1.0.0", "c@1.0.0"]),
+            package("b", &["c@1.0.0", "a@1.0.0"]),
+            package("c", &[]),
+            package("d", &["c@1.0.0"]),
+        ];
+        let direct = HashSet::from(["a".to_string(), "d".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        assert_eq!(
+            render_tree(&graph, false),
+            "app@1.0.0\n\
+             ├── a@1.0.0\n\
+             │   ├── b@1.0.0\n\
+             │   │   ├── a@1.0.0 (circular)\n\
+             │   │   └── c@1.0.0\n\
+             │   └── c@1.0.0 (shared)\n\
+             └── d@1.0.0\n\
+             \x20   └── c@1.0.0 (shared)\n\
+             \n\
+             4 packages, max depth 3\n"
+        );
+        assert_eq!(
+            render_tree(&graph, true),
+            "app\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\n\
+             \x1b[2m├── \x1b[22ma\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\n\
+             \x1b[2m│   \x1b[22m\x1b[2m├── \x1b[22mb\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\n\
+             \x1b[2m│   │   \x1b[22m\x1b[2m├── \x1b[22ma\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\x1b[2m (circular)\x1b[22m\n\
+             \x1b[2m│   │   \x1b[22m\x1b[2m└── \x1b[22mc\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\n\
+             \x1b[2m│   \x1b[22m\x1b[2m└── \x1b[22mc\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\x1b[2m (shared)\x1b[22m\n\
+             \x1b[2m└── \x1b[22md\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\n\
+             \x1b[2m    \x1b[22m\x1b[2m└── \x1b[22mc\x1b[2m@\x1b[22m\x1b[33m1.0.0\x1b[39m\x1b[2m (shared)\x1b[22m\n\
+             \n\
+             4 packages, max depth 3\n"
         );
     }
 
