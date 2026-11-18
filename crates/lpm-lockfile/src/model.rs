@@ -1067,7 +1067,19 @@ impl Lockfile {
     pub fn absorb_importer(
         &mut self,
         importer: &str,
+        standalone: Lockfile,
+    ) -> Result<(), LockfileError> {
+        self.absorb_importer_with_peer_schemas(importer, standalone, PeerSchemas::UNKNOWN)
+    }
+
+    /// [`Self::absorb_importer`] for a union whose rows are already known
+    /// not to use a peer schema, so the compatibility check skips scanning
+    /// every row for it.
+    fn absorb_importer_with_peer_schemas(
+        &mut self,
+        importer: &str,
         mut standalone: Lockfile,
+        known_absent: PeerSchemas,
     ) -> Result<(), LockfileError> {
         validate_importer_path(importer)?;
         let union_version = self
@@ -1078,25 +1090,16 @@ impl Lockfile {
                 LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
                 LOCKFILE_VERSION,
             );
-        let mut existing_packages = self.packages.iter().chain(self.workspace_packages.values());
-        let existing_has_legacy_peers = existing_packages
-            .clone()
-            .any(|package| !package.peers.is_empty());
-        let existing_has_structured_peers =
-            existing_packages.any(|package| !package.peer_edges.is_empty());
-        let incoming_has_legacy_peers = standalone
-            .packages
-            .iter()
-            .any(|package| !package.peers.is_empty());
-        let incoming_has_structured_peers = standalone
-            .packages
-            .iter()
-            .any(|package| !package.peer_edges.is_empty());
+        let incoming = PeerSchemas::of(&standalone.packages);
         let mixes_incompatible_peer_schemas =
             if union_version >= LOCKFILE_VERSION_WITH_STRUCTURED_PEERS {
-                existing_has_legacy_peers || incoming_has_legacy_peers
+                incoming.legacy
+                    || !known_absent.legacy
+                        && PeerSchemas::union_has(self, |package| !package.peers.is_empty())
             } else {
-                existing_has_structured_peers || incoming_has_structured_peers
+                incoming.structured
+                    || !known_absent.structured
+                        && PeerSchemas::union_has(self, |package| !package.peer_edges.is_empty())
             };
         if mixes_incompatible_peer_schemas {
             return Err(LockfileError::Serialize(format!(
@@ -1301,21 +1304,28 @@ impl Lockfile {
         let mut references =
             WorkspacePackageReferences::count(&self.importers, self.workspace_packages.len());
         references.prune_unreferenced(&mut self.workspace_packages);
+        // Rows leaving the union can't add a peer schema, so absence stays
+        // known until an importer brings one in.
+        let mut absent = PeerSchemas::absent_from_union(self);
         for (importer, standalone) in replacements {
             validate_importer_path(&importer)?;
             if let Some(previous) = self.importers.remove(&importer) {
                 references.release(&previous.locked_packages, &mut self.workspace_packages);
             }
+            let incoming = PeerSchemas::of(&standalone.packages);
             let lockfile_version = self.metadata.lockfile_version;
-            self.absorb_importer(&importer, standalone)?;
+            self.absorb_importer_with_peer_schemas(&importer, standalone, absent)?;
             if self.metadata.lockfile_version == lockfile_version {
                 references.retain(&self.importers[&importer].locked_packages);
+                absent.legacy &= !incoming.legacy;
+                absent.structured &= !incoming.structured;
             } else {
                 // A schema change readdresses every union row.
                 references = WorkspacePackageReferences::count(
                     &self.importers,
                     self.workspace_packages.len(),
                 );
+                absent = PeerSchemas::absent_from_union(self);
             }
         }
         Ok(())
@@ -2397,6 +2407,47 @@ impl ValidatedLockfile {
     }
 }
 
+/// Which peer schemas a set of package rows uses, or, where a union's rows
+/// are tracked, which ones they are known not to use.
+#[derive(Clone, Copy)]
+struct PeerSchemas {
+    legacy: bool,
+    structured: bool,
+}
+
+impl PeerSchemas {
+    const UNKNOWN: Self = Self {
+        legacy: false,
+        structured: false,
+    };
+
+    fn of(packages: &[LockedPackage]) -> Self {
+        Self {
+            legacy: packages.iter().any(|package| !package.peers.is_empty()),
+            structured: packages
+                .iter()
+                .any(|package| !package.peer_edges.is_empty()),
+        }
+    }
+
+    fn absent_from_union(union: &Lockfile) -> Self {
+        Self {
+            legacy: !Self::union_has(union, |package| !package.peers.is_empty()),
+            structured: !Self::union_has(union, |package| !package.peer_edges.is_empty()),
+        }
+    }
+
+    fn union_has(union: &Lockfile, uses: impl Fn(&LockedPackage) -> bool) -> bool {
+        #[cfg(test)]
+        UNION_PEER_SCHEMA_SCANS.with(|scans| scans.set(scans.get() + 1));
+        union
+            .packages
+            .iter()
+            .chain(union.workspace_packages.values())
+            .any(uses)
+    }
+}
+
 /// How many importer snapshots reference each workspace package row.
 struct WorkspacePackageReferences(HashMap<String, usize>);
 
@@ -2444,6 +2495,8 @@ impl WorkspacePackageReferences {
 #[cfg(test)]
 thread_local! {
     pub(crate) static WORKSPACE_REFERENCE_COUNTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static UNION_PEER_SCHEMA_SCANS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 

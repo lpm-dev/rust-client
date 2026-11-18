@@ -5192,6 +5192,7 @@ fn workspace_importer_batch_counts_references_once() {
         })
         .collect();
     let counts_before = crate::model::WORKSPACE_REFERENCE_COUNTS.with(std::cell::Cell::get);
+    let scans_before = crate::model::UNION_PEER_SCHEMA_SCANS.with(std::cell::Cell::get);
 
     let updated = validated
         .update_workspace_importers(&retained, replacements)
@@ -5201,6 +5202,11 @@ fn workspace_importer_batch_counts_references_once() {
         crate::model::WORKSPACE_REFERENCE_COUNTS.with(std::cell::Cell::get) - counts_before,
         1,
         "a batch must not rescan every importer after each replacement",
+    );
+    assert_eq!(
+        crate::model::UNION_PEER_SCHEMA_SCANS.with(std::cell::Cell::get) - scans_before,
+        2,
+        "a batch checks the union's peer schemas once, not once per replacement",
     );
     assert_eq!(updated.workspace_packages.len(), 1);
 }
