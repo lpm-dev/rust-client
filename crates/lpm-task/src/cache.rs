@@ -88,9 +88,38 @@ struct BackupSyncFailure {
     relative: PathBuf,
 }
 
+// One slot per project, so tests that inject failures in parallel don't
+// clear each other's.
 #[cfg(test)]
-static BACKUP_SYNC_FAILURE: std::sync::Mutex<Option<BackupSyncFailure>> =
-    std::sync::Mutex::new(None);
+static BACKUP_SYNC_FAILURES: std::sync::Mutex<Vec<BackupSyncFailure>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct InjectedBackupSyncFailure(PathBuf);
+
+#[cfg(test)]
+impl InjectedBackupSyncFailure {
+    fn new(project: PathBuf, relative: &str) -> Self {
+        BACKUP_SYNC_FAILURES
+            .lock()
+            .unwrap()
+            .push(BackupSyncFailure {
+                project: project.clone(),
+                relative: PathBuf::from(relative),
+            });
+        Self(project)
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedBackupSyncFailure {
+    fn drop(&mut self) {
+        BACKUP_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|failure| failure.project != self.0);
+    }
+}
 
 #[cfg(test)]
 static STAGING_CLEANUP_FAILURE: std::sync::Mutex<Option<std::ffi::OsString>> =
@@ -4097,13 +4126,13 @@ mod tests {
         let changed = target.path().join("dist/value-01.txt");
         let matching_identity = file_identity(&matching);
         fs::write(&changed, "locally edited").unwrap();
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = Some(BackupSyncFailure {
-            project: std::fs::canonicalize(target.path()).unwrap(),
-            relative: PathBuf::from("dist/value-01.txt"),
-        });
+        let injected = InjectedBackupSyncFailure::new(
+            std::fs::canonicalize(target.path()).unwrap(),
+            "dist/value-01.txt",
+        );
 
         let result = restore_archive(&archive_path, target.path(), &["dist/**".into()]);
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = None;
+        drop(injected);
 
         assert!(
             result.is_err(),
@@ -4157,14 +4186,11 @@ mod tests {
         fs::create_dir(staging.path().join("backups")).unwrap();
         fs::write(staging.path().join("outputs/value.txt"), "replacement").unwrap();
         let project_path = project.path().to_path_buf();
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = Some(BackupSyncFailure {
-            project: project_path.clone(),
-            relative: PathBuf::from("value.txt"),
-        });
+        let injected = InjectedBackupSyncFailure::new(project_path.clone(), "value.txt");
 
         let mut transaction = RestoreTransaction::new(project_path, staging.path(), 1).unwrap();
         let result = transaction.install(Path::new("value.txt"), true);
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = None;
+        drop(injected);
         drop(transaction);
 
         assert!(
@@ -4186,13 +4212,10 @@ mod tests {
         fs::write(project.path().join("stale.txt"), "original").unwrap();
         let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
         let canonical_project = std::fs::canonicalize(project.path()).unwrap();
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = Some(BackupSyncFailure {
-            project: canonical_project,
-            relative: PathBuf::from("stale.txt"),
-        });
+        let injected = InjectedBackupSyncFailure::new(canonical_project, "stale.txt");
 
         let result = staged.apply(&["stale.txt".into()]);
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = None;
+        drop(injected);
 
         assert!(
             result.is_err(),

@@ -2886,12 +2886,12 @@ fn sync_restore_file(file: &std::fs::File) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 fn fail_after_first_backup_sync(project_dir: &Path, relative: &Path) -> Result<(), LpmError> {
-    let failure = BACKUP_SYNC_FAILURE
+    let injected = BACKUP_SYNC_FAILURES
         .lock()
         .expect("backup sync failure lock")
-        .clone();
-    if failure.is_some_and(|failure| failure.project == project_dir && failure.relative == relative)
-    {
+        .iter()
+        .any(|failure| failure.project == project_dir && failure.relative == relative);
+    if injected {
         return Err(LpmError::Task(format!(
             "failed to sync task cache backup {}: injected failure",
             relative.display()
