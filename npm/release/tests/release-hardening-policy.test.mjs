@@ -642,9 +642,13 @@ test("the Homebrew formula takes its checksums from the published release, verif
   assert.doesNotMatch(job, /mode == 'full'/, "stable releases are never built in full mode");
   assert.match(job, /needs\.release-metadata\.outputs\.mode == 'promote' &&/);
   assert.match(job, /SOURCE_SHA: \$\{\{ needs\.prepare-promotion\.outputs\.source_sha \}\}/);
-  // A retry must work for as long as the release exists, so the job reads
-  // no artifact with a short retention.
-  assert.doesNotMatch(job, /download-verified-artifact|promotion-github-release|stage-promotion-release/);
+  // An immutable release is read on its own, so a retry works for as long as
+  // it exists. A release whose files can still change must be the same bytes
+  // as the manifest the promotion verified, kept for a day.
+  assert.match(job, /immutable=\$\(jq -r '\.immutable' "\$RUNNER_TEMP\/published-release\.json"\)/);
+  assert.match(job, /if \[ "\$immutable" != true \]; then\n[\s\S]*?scripts\/ci\/download-verified-artifact\.sh "\$GITHUB_REPOSITORY" "\$ARTIFACT_ID" "\$ARTIFACT_DIGEST" promotion-github-release\n\s+cmp promotion-github-release\/SHA256SUMS\.txt "\$published\/SHA256SUMS\.txt"\n\s+fi\n/);
+  assert.match(job, /ARTIFACT_ID: \$\{\{ needs\.stage-promotion-release\.outputs\.artifact_id \}\}/);
+  assert.match(job, /permissions:\n\s+actions: read\n\s+contents: read\n/);
   assert.match(job, /\[ "\$target_commit" != "\$SOURCE_SHA" \]/);
   assert.match(job, /--pattern SHA256SUMS\.txt --pattern SHA256SUMS\.txt\.sigstore --pattern lpm-linux-x64/);
   assert.match(job, /grep -E '\^\[0-9a-f\]\{64\}  lpm-linux-x64\$' SHA256SUMS\.txt \| sha256sum --check --strict/);
