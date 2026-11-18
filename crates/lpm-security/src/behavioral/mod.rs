@@ -881,6 +881,12 @@ impl DirectoryIdentity {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_FIRST_SOURCE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn package_directory_changed() -> std::io::Error {
     std::io::Error::other("a package directory changed while its files were read")
 }
@@ -1012,6 +1018,10 @@ impl<'a> PackageDirs<'a> {
             return Err(std::io::Error::other(
                 "source path is not a safe regular file",
             ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = AFTER_FIRST_SOURCE_OPEN.with(|hook| hook.borrow_mut().take()) {
+            hook();
         }
         Ok((file, metadata.len()))
     }
@@ -2738,6 +2748,36 @@ mod tests {
             "the open ran out of descriptors and held one directory at a time"
         );
         directories.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn fingerprints_are_dropped_when_a_directory_is_replaced_while_files_are_read() {
+        for warm in [true, false] {
+            let package = tempfile::tempdir().unwrap();
+            nested_fingerprint_fixture(package.path());
+            let directory =
+                cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                    .unwrap();
+            let root = package.path().to_path_buf();
+            AFTER_FIRST_SOURCE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::rename(root.join("lib"), root.join("lib-old")).unwrap();
+                    std::fs::create_dir(root.join("lib")).unwrap();
+                }));
+            });
+
+            if warm {
+                package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                    .expect_err("a fingerprint of a directory replaced mid-read was kept");
+            } else {
+                let (_, fingerprint) = analyze_package_from_open_dir_with_fingerprint(
+                    &directory,
+                    PackageDirectory::Published,
+                );
+                assert_eq!(fingerprint, None);
+            }
+            assert!(AFTER_FIRST_SOURCE_OPEN.with(|hook| hook.borrow().is_none()));
+        }
     }
 
     #[test]
