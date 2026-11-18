@@ -2531,6 +2531,8 @@ mod tests {
         }
     }
 
+    // The fingerprint hashes native paths, so Windows records `lib\index.js`.
+    #[cfg(unix)]
     #[test]
     fn warm_fingerprint_of_a_nested_package_is_stable() {
         let package = tempfile::tempdir().unwrap();
