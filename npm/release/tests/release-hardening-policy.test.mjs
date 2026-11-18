@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import os from "node:os";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -469,4 +471,62 @@ test("release metadata validates every dispatch input as a whole value before an
 
   const outside = workflow.replace(metadata, "");
   assert.doesNotMatch(outside, /inputs\.source_run_id/, "later jobs must read the validated run ID");
+});
+
+test("release metadata accepts only whole, valid dispatch inputs when its script runs", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const metadata = jobSource(workflow, "release-metadata", "verify");
+  const scripts = runScripts(metadata).filter(({ script }) => script.includes("STABLE_VERSION_PATTERN="));
+  assert.equal(scripts.length, 1, "missing the metadata script");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-metadata-"));
+  const script = path.join(directory, "metadata.sh");
+  fs.writeFileSync(script, scripts[0].script.replace(/^ {10}/gm, ""));
+  const sentinel = path.join(directory, "sentinel");
+  const run = (mode, version, sourceRunId) => {
+    const output = path.join(directory, "output");
+    fs.rmSync(output, { force: true });
+    const result = spawnSync("bash", ["-e", script], {
+      encoding: "utf8",
+      env: {
+        PATH: "/usr/bin:/bin",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_REF: "refs/heads/main",
+        GITHUB_OUTPUT: output,
+        GITHUB_REPOSITORY: "lpm-dev/rust-client",
+        INPUT_CHANNEL: "stable",
+        INPUT_MODE: mode,
+        INPUT_VERSION: version,
+        INPUT_SOURCE_RUN_ID: sourceRunId,
+      },
+    });
+    const written = fs.existsSync(output) ? fs.readFileSync(output, "utf8") : "";
+    return { status: result.status, written, stderr: result.stdout + result.stderr };
+  };
+  try {
+    const promote = run("promote", "0.88.0", "123");
+    assert.equal(promote.status, 0, promote.stderr);
+    assert.match(promote.written, /^source_run_id=123$/m);
+    assert.match(promote.written, /^tag=v0\.88\.0$/m);
+    const recovery = run("npm-publish-only", "0.88.0", "456");
+    assert.equal(recovery.status, 0, recovery.stderr);
+    assert.match(recovery.written, /^source_run_id=456$/m);
+
+    for (const [mode, version, sourceRunId] of [
+      ["promote", "0.88.0", `$(touch ${sentinel})123`],
+      ["promote", "0.88.0\ntag=v9.9.9", "123"],
+      ["promote", "0.88.0", ""],
+      ["promote", "0.88.0", "0123"],
+      ["promote", "0.88.0", "123\n456"],
+      ["candidate", "0.88.0", "123"],
+      ["unknown", "0.88.0", "123"],
+    ]) {
+      const refused = run(mode, version, sourceRunId);
+      const label = JSON.stringify({ mode, version, sourceRunId });
+      assert.notEqual(refused.status, 0, `${label} must be refused`);
+      assert.equal(refused.written, "", `${label} must write no outputs`);
+    }
+    assert.equal(fs.existsSync(sentinel), false, "an input must never run as code");
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
