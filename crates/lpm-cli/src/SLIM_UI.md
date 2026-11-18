@@ -89,6 +89,15 @@ reimplement:
   `NO_COLOR` / `--color` via `lpm_common::color`.
 - `format_duration(Duration)` — sub-second → `"Xms"`, else `"X.XXs"`.
 - `packages_word(count)` — pluralization for "package(s)".
+- `Table` — aligned columns for any list of rows. Each column is as wide
+  as its widest cell measured in screen columns, so styled and plain
+  cells line up and a long name widens its column instead of breaking the
+  row. `print_stdout` / `print_stderr` fit a row to the terminal by moving
+  its last cell to the next line. Use it instead of hard-coded widths such
+  as `{:<24}`, which break on the first name longer than the guess.
+- `detail_names(names)` — the names a warning is about, as one row: as
+  many as fit on the line, then "and N more". Never join a list of
+  unknown length into a warning.
 
 Install-specific helpers (`format_audit_advisory`,
 `short_registry_host`) live in `install_ui` for now but will move into
@@ -140,6 +149,15 @@ surfaces from it — never re-derive in two places.
 - **Don't introduce a new color or glyph** without bringing it up for
   design alignment. Drifting palettes are how every CLI's UX
   eventually rots.
+- **Don't pad text after coloring it.** `Painted` returns a `String`
+  with its escape sequences inside, and `{:<8}` counts them, so the
+  column comes out short and only colored terminals show it. Pad first
+  and color the padded text, or pad a `TerminalFragment`, which pads by
+  the columns it takes on screen. `styled_padding_guard` in the
+  integration tests fails on a width applied to `Painted` output.
+- **Let defaults recede.** In a list of settings, dim the rows that hold
+  built-in defaults and highlight the values something set, so the
+  rows a reader came for stand out.
 
 ## Reference implementation
 
