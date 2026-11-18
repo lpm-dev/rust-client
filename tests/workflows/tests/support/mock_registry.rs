@@ -439,6 +439,11 @@ struct ProjectTokenReplacementResponse {
     expires_at: String,
 }
 
+struct DelayedProjectTokenReplacementResponse {
+    replacement: ProjectTokenReplacementResponse,
+    delay: std::time::Duration,
+}
+
 struct ProjectTokenReplacementEchoError;
 
 struct ProjectTokenReplacementSequence {
@@ -589,6 +594,12 @@ impl Respond for ProjectTokenReplacementResponse {
             "replaced": body.get("previousTokenId").is_some()
                 || body.get("previousTokenHash").is_some(),
         }))
+    }
+}
+
+impl Respond for DelayedProjectTokenReplacementResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.replacement.respond(request).set_delay(self.delay)
     }
 }
 
@@ -1069,6 +1080,29 @@ impl MockRegistry {
             )))
             .respond_with(ProjectTokenReplacementResponse {
                 expires_at: expires_at.to_string(),
+            })
+            .expect(expected_calls)
+            .mount(self.server())
+            .await;
+        self
+    }
+
+    /// Like [`Self::with_npmrc_token_replace`], with each answer held back by
+    /// `delay`, so a test can overlap two setup runs.
+    pub async fn with_npmrc_token_replace_delayed(
+        &self,
+        expires_at: &str,
+        expected_calls: u64,
+        delay: std::time::Duration,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/replace-project"))
+            .and(body_string_contains("\"scope\":\"read\""))
+            .respond_with(DelayedProjectTokenReplacementResponse {
+                replacement: ProjectTokenReplacementResponse {
+                    expires_at: expires_at.to_string(),
+                },
+                delay,
             })
             .expect(expected_calls)
             .mount(self.server())

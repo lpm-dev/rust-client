@@ -63,7 +63,7 @@ fn setup_ci_without_bearer_fails_before_writing_dot_npmrc() {
 }
 
 #[test]
-fn setup_ci_refuses_to_write_a_tracked_npmrc() {
+fn setup_ci_writes_the_user_npmrc_when_git_tracks_the_project_npmrc() {
     let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
     project.write_private_file(".npmrc", "fund=false\n");
     git(&project, &["init", "-q"]);
@@ -81,13 +81,289 @@ fn setup_ci_refuses_to_write_a_tracked_npmrc() {
         .output()
         .expect("run setup ci npmrc with tracked npmrc");
 
-    assert!(!output.status.success(), "tracked npmrc must be refused");
-    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("tracked"),
-        "error must explain the git-index risk: {}",
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        output.status.success(),
+        "a tracked project npmrc must send the token to the user npmrc:\n{shown}"
+    );
+    assert_eq!(
+        project.read_file(".npmrc"),
+        "fund=false\n",
+        "the tracked project npmrc must stay as the team committed it"
+    );
+    let user = std::fs::read_to_string(project.home().join(".npmrc")).expect("read user npmrc");
+    assert!(
+        user.lines()
+            .any(|line| line == "//lpm.example.test/api/registry/:_authToken=ci-runtime-token")
+            && user
+                .lines()
+                .any(|line| line == "@lpm.dev:registry=https://lpm.example.test/api/registry/"),
+        "the user npmrc must hold the generated block, got:\n{user}"
+    );
+    assert!(
+        shown.contains("Git tracks the project's .npmrc, so the token went to npm's user configuration instead.")
+            && shown.contains("Add `@lpm.dev:registry=https://lpm.example.test/api/registry/`"),
+        "the output must explain where the token went and what the tracked file lacks:\n{shown}"
+    );
+}
+
+#[test]
+fn setup_ci_json_reports_the_user_npmrc_location() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(
+        ".npmrc",
+        "@lpm.dev:registry=https://lpm.example.test/api/registry/\n",
+    );
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+            "--json",
+        ])
+        .output()
+        .expect("run setup ci npmrc --json with tracked npmrc");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("setup ci --json must be valid JSON");
+    assert_eq!(envelope["location"], serde_json::json!("user"));
+    assert_eq!(
+        envelope["path"],
+        serde_json::json!(
+            std::fs::canonicalize(project.home())
+                .unwrap()
+                .join(".npmrc")
+                .display()
+                .to_string()
+        )
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("ci-runtime-token"),
+        "JSON output must never expose the bearer"
+    );
+}
+
+#[test]
+fn setup_ci_refuses_a_tracked_npmrc_that_sets_a_registry_credential() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    let committed = "@lpm.dev:registry=https://lpm.example.test/api/registry/\n//lpm.example.test/api/registry/:_authToken=${LPM_TOKEN}\n";
+    project.write_private_file(".npmrc", committed);
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci npmrc with a tracked registry credential");
+
+    assert!(
+        !output.status.success(),
+        "a committed credential would override the user npmrc"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("_authToken`. npm, Yarn 1 and Bun would use that setting"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file(".npmrc"), committed);
+    assert!(!project.home().join(".npmrc").exists());
+}
+
+#[tokio::test]
+async fn setup_ci_retires_a_setup_local_token_that_it_finds_in_the_user_npmrc() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    let previous_token = "lpm_user_config_read_only_token";
+    let mock = MockRegistry::start().await;
+    let scope_line = format!("@lpm.dev:registry={}/api/registry/\n", mock.url());
+    project.write_private_file(".npmrc", &scope_line);
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "fund=false\n\n\
+             # LPM Registry (generated by lpm setup local — do not commit)\n\
+             @lpm.dev:registry={}/api/registry/\n\
+             {}/api/registry/:_authToken={previous_token}\n\
+             # End LPM Registry\n",
+            mock.url(),
+            mock.url().replace("http:", "")
+        ),
+    )
+    .expect("seed the user npmrc");
+    mock.with_npmrc_token_self_revoke(previous_token, 200, 1)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci over a setup-local token in the user npmrc");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let user = std::fs::read_to_string(project.home().join(".npmrc")).unwrap();
+    assert!(user.starts_with("fund=false\n"), "{user}");
+    assert!(user.contains(":_authToken=ci-runtime-token"), "{user}");
+    assert!(!user.contains(previous_token), "{user}");
+    assert_eq!(project.read_file(".npmrc"), scope_line);
+}
+
+#[test]
+fn setup_ci_keeps_a_user_config_inside_the_repository_out_of_git() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+
+    let output = lpm(&project)
+        .env("NPM_CONFIG_USERCONFIG", project.path().join("ci.npmrc"))
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci with a user config in the repository");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project
+            .read_file("ci.npmrc")
+            .contains(":_authToken=ci-runtime-token")
+    );
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--ignored=no"])
+        .current_dir(project.path())
+        .output()
+        .expect("run git status");
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("ci.npmrc"),
+        "Git must ignore the user config that holds the token: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+#[test]
+fn setup_ci_refuses_a_user_config_that_the_repository_tracks() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    project.write_private_file("ci.npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc", "ci.npmrc"]);
+
+    let output = lpm(&project)
+        .env("NPM_CONFIG_USERCONFIG", project.path().join("ci.npmrc"))
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci with a tracked user config");
+
+    assert!(
+        !output.status.success(),
+        "a token must not go to a tracked user config"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("track"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("ci.npmrc"), "fund=false\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_ci_checks_and_writes_the_same_user_config_through_a_link_and_dot_dot() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+    let dotfiles = tempfile::tempdir().expect("create a dotfiles repository");
+    std::fs::create_dir(dotfiles.path().join("sub")).unwrap();
+    std::fs::write(dotfiles.path().join(".npmrc"), "fund=false\n").unwrap();
+    let dotfiles_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dotfiles.path())
+            .output()
+            .expect("run git in the dotfiles repository");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    dotfiles_git(&["init", "-q"]);
+    dotfiles_git(&["add", "--", ".npmrc"]);
+    let safe = tempfile::tempdir().expect("create the directory the path names");
+    std::os::unix::fs::symlink(dotfiles.path().join("sub"), safe.path().join("link"))
+        .expect("link into the dotfiles repository");
+
+    let output = lpm(&project)
+        .env(
+            "NPM_CONFIG_USERCONFIG",
+            safe.path().join("link").join("..").join(".npmrc"),
+        )
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci with a user config path through a link and ..");
+
+    assert!(
+        !output.status.success(),
+        "the path resolves to a file the dotfiles repository tracks"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dotfiles.path().join(".npmrc")).unwrap(),
+        "fund=false\n",
+        "the token must not reach the tracked dotfiles .npmrc"
+    );
+    assert!(!safe.path().join(".npmrc").exists());
 }
 
 #[test]
@@ -125,7 +401,7 @@ fn setup_ci_without_git_writes_outside_a_repository_and_refuses_inside_one() {
 }
 
 #[test]
-fn setup_ci_fails_closed_when_git_dir_poisoning_breaks_repository_inspection() {
+fn setup_ci_keeps_the_token_out_of_a_tracked_npmrc_when_git_dir_is_poisoned() {
     let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
     project.write_private_file(".npmrc", "fund=false\n");
     git(&project, &["init", "-q"]);
@@ -139,14 +415,19 @@ fn setup_ci_fails_closed_when_git_dir_poisoning_breaks_repository_inspection() {
         .expect("run setup ci with a poisoned GIT_DIR");
 
     assert!(
-        !output.status.success(),
-        "failed repository inspection must not be treated as a non-repository"
-    );
-    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("tracked"),
-        "failure must identify the tracked npmrc: {}",
+        output.status.success(),
+        "the repository's own index says Git tracks .npmrc: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file(".npmrc"),
+        "fund=false\n",
+        "a poisoned GIT_DIR must not pass the tracked .npmrc off as untracked and put the token in it"
+    );
+    assert!(
+        std::fs::read_to_string(project.home().join(".npmrc"))
+            .expect("read user npmrc")
+            .contains(":_authToken=ci-runtime-token")
     );
 }
 
@@ -168,14 +449,19 @@ fn setup_ci_ignores_a_poisoned_git_index_when_checking_tracked_npmrc() {
         .expect("run setup ci with a poisoned GIT_INDEX_FILE");
 
     assert!(
-        !output.status.success(),
-        "tracked npmrc must still be refused"
-    );
-    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("tracked"),
-        "the real repository index must remain authoritative: {}",
+        output.status.success(),
+        "the real index says Git tracks .npmrc, so the token goes to the user npmrc: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file(".npmrc"),
+        "fund=false\n",
+        "the real repository index must remain authoritative"
+    );
+    assert!(
+        std::fs::read_to_string(project.home().join(".npmrc"))
+            .expect("read user npmrc")
+            .contains(":_authToken=ci-runtime-token")
     );
 }
 

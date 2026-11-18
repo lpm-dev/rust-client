@@ -5,6 +5,7 @@ expression: envelope
 {
   "success": true,
   "npmrc_path": "[NPMRC_PATH]",
+  "npmrc_location": "project",
   "gitignore_path": "[GITIGNORE_PATH]",
   "proxy": false,
   "scope": "read",

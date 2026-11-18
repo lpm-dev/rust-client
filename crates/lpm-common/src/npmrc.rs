@@ -206,7 +206,7 @@ pub fn parse_npmrc_ini_settings<'a>(
     let mut in_section = false;
 
     let mut parse_line = |raw_line: &'a str, line_number: usize| {
-        let trimmed = raw_line.trim();
+        let trimmed = js_trim(raw_line);
         if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('#') {
             return;
         }
@@ -293,8 +293,15 @@ pub fn parse_npmrc_ini_settings<'a>(
     settings
 }
 
+/// JavaScript's `String.prototype.trim`, which npm's `ini` parser applies to
+/// every key and value. Unlike `str::trim`, it removes the byte order mark
+/// U+FEFF, which an editor can leave at the start of `.npmrc`.
+fn js_trim(value: &str) -> &str {
+    value.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
+}
+
 pub fn decode_npmrc_ini_fragment(value: &str) -> Cow<'_, str> {
-    let value = value.trim();
+    let value = js_trim(value);
     let quoted = value.len() >= 2
         && ((value.starts_with('"') && value.ends_with('"'))
             || (value.starts_with('\'') && value.ends_with('\'')));
@@ -339,7 +346,7 @@ pub fn decode_npmrc_ini_fragment(value: &str) -> Cow<'_, str> {
     if escaped {
         decoded.push('\\');
     }
-    let trimmed = decoded.trim();
+    let trimmed = js_trim(&decoded);
     let start = trimmed.as_ptr() as usize - decoded.as_ptr() as usize;
     let trimmed_len = trimmed.len();
     if start > 0 {
@@ -542,6 +549,22 @@ mod tests {
     };
     use std::borrow::Cow;
     use std::cell::Cell;
+
+    #[test]
+    fn npmrc_settings_ignore_a_byte_order_mark_as_npm_does() {
+        let mut warnings = Vec::new();
+        let settings = parse_npmrc_ini_settings(
+            "\u{feff}//lpm.dev/api/registry/:_authToken=stale\n\u{feff}# comment\nfund = \u{feff}false\n",
+            ".npmrc",
+            &mut warnings,
+        );
+
+        let keys: Vec<_> = settings.iter().map(|setting| &*setting.key).collect();
+        assert_eq!(keys, ["//lpm.dev/api/registry/:_authToken", "fund"]);
+        assert_eq!(settings[0].values[0].value, "stale");
+        assert_eq!(settings[1].values[0].value, "false");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 
     #[test]
     fn npmrc_interpolation_bounds_expanded_output_and_caches_environment_lookups() {
