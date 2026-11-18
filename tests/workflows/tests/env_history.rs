@@ -78,6 +78,39 @@ fn env_history_lists_each_change_newest_first_with_values_hidden() {
 }
 
 #[test]
+fn env_history_lines_up_its_columns_across_environment_names() {
+    let project = project();
+    for args in [
+        ["env", "set", "SHORT_ENV_KEY=one", "--env", "dev", "--json"],
+        [
+            "env",
+            "set",
+            "LONG_ENV_KEY=two",
+            "--env",
+            "a-much-longer-environment-name",
+            "--json",
+        ],
+    ] {
+        let (success, response) = json(&project, &args);
+        assert!(success, "{response}");
+    }
+
+    let human = lpm(&project).args(["env", "history"]).output().unwrap();
+    let human = String::from_utf8_lossy(&human.stdout);
+    let keys_column = |environment: &str| {
+        support::terminal::column_after(
+            support::terminal::line_with(&human, &format!("  {environment}  ")),
+            environment,
+        )
+    };
+    assert_eq!(
+        keys_column("dev"),
+        keys_column("a-much-longer-environment-name"),
+        "the keys must share a column, got:\n{human}"
+    );
+}
+
+#[test]
 fn env_history_show_finds_an_entry_by_its_short_id_and_reports_unknown_ones() {
     let project = project();
     set(&project, "TOKEN=first");

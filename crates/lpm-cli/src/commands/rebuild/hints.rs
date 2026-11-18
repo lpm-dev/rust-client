@@ -217,6 +217,7 @@ pub fn show_install_build_hint(
         unbuilt.len()
     ));
 
+    let mut table = install_ui::Table::new();
     for row in &unbuilt {
         let trust_label = if row.is_trusted {
             install_ui::green("trusted ✓")
@@ -225,18 +226,13 @@ pub fn show_install_build_hint(
         };
 
         let script_names: Vec<&str> = row.scripts.keys().map(|s| s.as_str()).collect();
-        let package = format!("{}@{}", row.name, row.version);
-        let scripts = script_names.join(", ");
-        println!(
-            "{}",
-            crate::install_ui::terminal_line!(
-                "  {:<30} {:<30} ({})",
-                install_ui::bold(&package),
-                install_ui::dim(&scripts),
-                trust_label,
-            )
-        );
+        table.row([
+            install_ui::bold(&format!("{}@{}", row.name, row.version)),
+            install_ui::dim(&script_names.join(", ")),
+            trust_label,
+        ]);
     }
+    table.print_stdout();
 
     let trusted_unbuilt = unbuilt.iter().filter(|r| r.is_trusted).count();
     println!();

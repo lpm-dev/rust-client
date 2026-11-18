@@ -45,12 +45,16 @@
 
 use lpm_common::color::Painted;
 use std::borrow::Cow;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{IsTerminal, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+mod table;
+
+pub use table::{Align, Table, stderr_columns, stdout_columns};
 
 const SPINNER_FRAMES: [&str; 4] = ["⠦", "⠴", "⠇", "⠸"];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
@@ -80,8 +84,52 @@ pub struct TerminalFragment(String);
 
 impl fmt::Display for TerminalFragment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.pad(&self.0)
+        pad_to_visible_width(formatter, &self.0)
     }
+}
+
+impl From<TerminalLine> for TerminalFragment {
+    fn from(line: TerminalLine) -> Self {
+        Self(line.into_owned())
+    }
+}
+
+impl TerminalFragment {
+    /// The columns this fragment takes on screen: escape sequences take
+    /// none, and wide characters take two.
+    #[inline]
+    pub fn visible_width(&self) -> usize {
+        console::measure_text_width(&self.0)
+    }
+}
+
+/// Pads styled text to the formatter's width by the columns it takes on
+/// screen. `Formatter::pad` counts every `char`, escape sequences included,
+/// so a colored cell would come out short by the length of its color codes.
+/// A precision is ignored: cutting styled text by `char`s could split an
+/// escape sequence.
+fn pad_to_visible_width(formatter: &mut fmt::Formatter<'_>, rendered: &str) -> fmt::Result {
+    let Some(width) = formatter.width() else {
+        return formatter.write_str(rendered);
+    };
+    let padding = width.saturating_sub(console::measure_text_width(rendered));
+    if padding == 0 {
+        return formatter.write_str(rendered);
+    }
+    let (before, after) = match formatter.align() {
+        Some(fmt::Alignment::Right) => (padding, 0),
+        Some(fmt::Alignment::Center) => (padding / 2, padding - padding / 2),
+        Some(fmt::Alignment::Left) | None => (0, padding),
+    };
+    let fill = formatter.fill();
+    for _ in 0..before {
+        formatter.write_char(fill)?;
+    }
+    formatter.write_str(rendered)?;
+    for _ in 0..after {
+        formatter.write_char(fill)?;
+    }
+    Ok(())
 }
 
 impl AsRef<str> for TerminalFragment {
@@ -172,6 +220,11 @@ impl TerminalLine {
     pub fn magenta(mut self, value: &str) -> Self {
         self.push_sanitized(value, Painted::magenta);
         self
+    }
+
+    /// A row already assembled from sanitized, LPM-styled fragments.
+    fn from_rendered(rendered: String) -> Self {
+        Self(Cow::Owned(rendered))
     }
 
     #[doc(hidden)]
@@ -300,7 +353,7 @@ pub(crate) use terminal_line;
 
 impl fmt::Display for TerminalLine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.pad(&self.0)
+        pad_to_visible_width(formatter, &self.0)
     }
 }
 
@@ -725,6 +778,81 @@ pub fn detail_line(msg: TerminalLine) {
     crate::live_region::print_line(&format!("{}{}", reset_prefix(), msg));
 }
 
+/// Columns assumed for a names preview when stderr isn't a terminal.
+const PIPED_NAMES_WIDTH: usize = 100;
+
+/// Prints the names a warning is about as one indented detail row: as many
+/// as fit on the line, then how many more there are, so a long list doesn't
+/// bury the rest of the output. `--json` carries every name.
+pub fn detail_names<I>(names: I)
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: AsRef<str>,
+{
+    let width = stderr_columns().unwrap_or(PIPED_NAMES_WIDTH);
+    detail_line(names_preview(names, width));
+}
+
+fn names_preview<I>(names: I, width: usize) -> TerminalLine
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: AsRef<str>,
+{
+    const INDENT: usize = 2;
+    let more_suffix = |more: usize| format!(", and {more} more (--json lists all)");
+
+    let names: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            let name = lpm_common::sanitize_terminal_inline(name.as_ref()).into_owned();
+            let width = console::measure_text_width(&name);
+            (name, width)
+        })
+        .collect();
+    let total = names.len();
+    let separators = 2 * total.saturating_sub(1);
+    let whole_list = INDENT + separators + names.iter().map(|(_, width)| width).sum::<usize>();
+
+    let mut count = total;
+    if whole_list > width {
+        count = 1;
+        let mut used = INDENT + names.first().map_or(0, |(_, width)| *width);
+        for (index, (_, name_width)) in names.iter().enumerate().skip(1) {
+            let more = total - index - 1;
+            let reserve = if more == 0 {
+                0
+            } else {
+                more_suffix(more).len()
+            };
+            if used + 2 + name_width + reserve > width {
+                break;
+            }
+            used += 2 + name_width;
+            count += 1;
+        }
+    }
+
+    let mut shown = String::with_capacity(
+        names[..count]
+            .iter()
+            .map(|(name, _)| name.len() + 2)
+            .sum::<usize>(),
+    );
+    for (index, (name, _)) in names[..count].iter().enumerate() {
+        if index > 0 {
+            shown.push_str(", ");
+        }
+        shown.push_str(name);
+    }
+    let line = TerminalLine::new("  ").field(&shown);
+    match total - count {
+        0 => line,
+        more => line.dim(&more_suffix(more)),
+    }
+}
+
 fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
     settle_any_active_spinner();
     let name = lpm_common::sanitize_terminal_inline(name);
@@ -1037,11 +1165,121 @@ pub fn format_audit_advisory(
 #[cfg(test)]
 mod tests {
     use super::{
-        LineKind, TerminalLine, assert_positional_terminal_format, format_line,
-        safe_package_source_identity, safe_url_origin, spinner_animation_enabled,
+        LineKind, TerminalFragment, TerminalLine, assert_positional_terminal_format, format_line,
+        names_preview, safe_package_source_identity, safe_url_origin, spinner_animation_enabled,
         static_spin_fallback_line, usage_bar_filled_cells,
     };
     use std::borrow::Cow;
+
+    #[test]
+    fn a_names_preview_shows_every_name_that_fits() {
+        let line = names_preview(["react", "react-dom", "zod"], 80);
+
+        assert_eq!(console::strip_ansi_codes(&line), "  react, react-dom, zod");
+    }
+
+    #[test]
+    fn a_names_preview_stops_at_the_width_and_counts_the_rest() {
+        let names: Vec<String> = (0..40)
+            .map(|index| format!("@scope/package-{index}"))
+            .collect();
+
+        let line = names_preview(&names, 80);
+        let visible = console::strip_ansi_codes(&line);
+
+        assert_eq!(
+            visible,
+            "  @scope/package-0, @scope/package-1, and 38 more (--json lists all)"
+        );
+        assert!(console::measure_text_width(&visible) <= 80);
+    }
+
+    #[test]
+    fn a_names_preview_shows_the_whole_list_when_it_fits_without_a_count() {
+        let line = names_preview(["abcdefghij", "klmnopqrst", "uvwxyz"], 40);
+
+        assert_eq!(
+            console::strip_ansi_codes(&line),
+            "  abcdefghij, klmnopqrst, uvwxyz"
+        );
+    }
+
+    #[test]
+    fn a_names_preview_shows_one_name_even_when_it_is_wider_than_the_line() {
+        let long = "x".repeat(120);
+
+        let line = names_preview([long.as_str(), "y"], 40);
+
+        assert_eq!(
+            console::strip_ansi_codes(&line),
+            format!("  {long}, and 1 more (--json lists all)")
+        );
+    }
+
+    #[test]
+    fn a_names_preview_neutralizes_terminal_controls_in_names() {
+        let line = names_preview(["evil\x1b[2Jname"], 80);
+
+        assert!(!line.contains("\x1b[2J"), "got {line:?}");
+    }
+
+    fn dimmed(text: &str) -> TerminalFragment {
+        TerminalFragment(format!("\x1b[2m{text}\x1b[22m"))
+    }
+
+    #[test]
+    fn a_styled_fragment_pads_to_its_visible_width() {
+        let padded = format!("{:<14}|", dimmed("Integrity:"));
+
+        assert_eq!(console::strip_ansi_codes(&padded), "Integrity:    |");
+    }
+
+    #[test]
+    fn a_styled_fragment_right_aligns_by_its_visible_width() {
+        let padded = format!("|{:>6}", dimmed("yes"));
+
+        assert_eq!(console::strip_ansi_codes(&padded), "|   yes");
+    }
+
+    #[test]
+    fn a_styled_fragment_centers_by_its_visible_width() {
+        let padded = format!("|{:^7}|", dimmed("ok"));
+
+        assert_eq!(console::strip_ansi_codes(&padded), "|  ok   |");
+    }
+
+    #[test]
+    fn a_hyperlinked_fragment_pads_by_the_url_it_shows() {
+        let link = TerminalFragment(
+            "\x1b]8;;https://lpm.dev/\x1b\\\x1b[34mhttps://lpm.dev/\x1b[39m\x1b]8;;\x1b\\"
+                .to_owned(),
+        );
+        let padded = format!("{link:<20}|");
+
+        assert_eq!(console::strip_ansi_codes(&padded), "https://lpm.dev/    |");
+    }
+
+    #[test]
+    fn a_wide_character_takes_two_columns_of_padding() {
+        let padded = format!("{:<6}|", TerminalFragment("日本".to_owned()));
+
+        assert_eq!(padded, "日本  |");
+    }
+
+    #[test]
+    fn a_fragment_wider_than_the_width_is_left_whole() {
+        let padded = format!("{:<3}|", dimmed("Script hash:"));
+
+        assert_eq!(console::strip_ansi_codes(&padded), "Script hash:|");
+    }
+
+    #[test]
+    fn a_styled_line_pads_to_its_visible_width() {
+        let line = TerminalLine::from_rendered("\x1b[36mpath\x1b[39m".to_owned());
+        let padded = format!("{line:<8}|");
+
+        assert_eq!(console::strip_ansi_codes(&padded), "path    |");
+    }
 
     #[test]
     fn usage_bar_rounds_visible_fraction_up_to_one_cell() {

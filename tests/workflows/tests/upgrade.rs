@@ -499,6 +499,71 @@ async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_sp
 }
 
 #[tokio::test]
+async fn upgrade_dry_run_lines_up_its_rows_across_names_and_versions() {
+    let short = "@lpm.dev/owner.short";
+    let long = "@lpm.dev/owner.a-much-longer-package-name";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"upgrade-columns","version":"1.0.0","dependencies":{{"{short}":"^1.0.0","{long}":"^10.0.0"}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for (name, version) in [(short, "1.0.0"), (long, "10.0.0")] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: Some("registry+https://lpm.dev".to_string()),
+            ..Default::default()
+        });
+    }
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[(short, short, "1.0.0"), (long, long, "10.0.0")],
+    );
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write lockfile");
+
+    let mock = MockRegistry::start().await;
+    for (pkg, versions, latest) in [
+        (short, ["1.0.0", "1.2.0"], "1.2.0"),
+        (long, ["10.0.0", "10.12.3"], "10.12.3"),
+    ] {
+        let versions = versions
+            .iter()
+            .map(|version| {
+                (
+                    *version,
+                    serde_json::json!({}),
+                    Some(make_tarball(pkg, version)),
+                )
+            })
+            .collect::<Vec<_>>();
+        mock.with_full_package_metadata(pkg, latest, &versions)
+            .await;
+    }
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color=always", "upgrade", "-y", "--dry-run"])
+        .output()
+        .expect("run lpm upgrade --dry-run");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let visible = support::terminal::visible_text(&String::from_utf8_lossy(&output.stderr));
+    let arrow_column = |name: &str| {
+        support::terminal::column_of(support::terminal::line_with(&visible, name), "→")
+    };
+    assert_eq!(
+        arrow_column(short),
+        arrow_column(long),
+        "the arrows must share a column, got:\n{visible}"
+    );
+}
+
+#[tokio::test]
 async fn upgrade_never_routes_non_registry_manifest_protocols_to_a_registry() {
     for (index, spec) in [
         "workspace:*",

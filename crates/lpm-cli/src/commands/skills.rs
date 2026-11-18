@@ -857,34 +857,29 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
     if !packages.is_empty() {
         print_package_inventory(&packages);
     }
-    if !managed.is_empty() {
-        println!("{}", install_ui::section("managed"));
-        for skill in &managed {
-            println!(
-                "{}",
-                crate::install_ui::terminal_line!(
-                    "  {:<24} {}",
-                    &skill.name,
-                    install_ui::dim(&skill.summary())
-                )
-            );
+    let managed_rows = managed
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill.summary()))
+        .collect::<Vec<_>>();
+    let external_rows = external
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill.summary()))
+        .collect::<Vec<_>>();
+    let mut table = install_ui::Table::new();
+    for (heading, rows) in [("managed", managed_rows), ("external", external_rows)] {
+        if rows.is_empty() {
+            continue;
         }
-        println!();
-    }
-    if !external.is_empty() {
-        println!("{}", install_ui::section("external"));
-        for skill in &external {
-            println!(
-                "{}",
-                crate::install_ui::terminal_line!(
-                    "  {:<24} {}",
-                    &skill.name,
-                    install_ui::dim(&skill.summary())
-                )
-            );
+        table.line(crate::install_ui::terminal_line!(
+            "{}",
+            install_ui::section(heading)
+        ));
+        for (name, summary) in rows {
+            table.row([install_ui::field(name), install_ui::dim(&summary)]);
         }
-        println!();
+        table.line(install_ui::TerminalLine::new(""));
     }
+    table.print_stdout();
     if total == 0 {
         install_ui::warn("No skills installed or discovered");
     } else if managed.is_empty() && external.is_empty() {

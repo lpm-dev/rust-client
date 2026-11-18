@@ -26,7 +26,10 @@ pub(super) fn package_name_without_version(pkg_id: &str) -> String {
         .map_or_else(|| pkg_id.to_string(), |(name, _)| name.to_string())
 }
 
-pub(super) fn preview_versioned_packages(packages: &[String], limit: usize) -> String {
+pub(super) fn preview_versioned_packages(
+    packages: &[String],
+    limit: usize,
+) -> install_ui::TerminalFragment {
     let mut preview: Vec<String> = packages
         .iter()
         .take(limit)
@@ -35,10 +38,13 @@ pub(super) fn preview_versioned_packages(packages: &[String], limit: usize) -> S
     if packages.len() > limit {
         preview.push(format!("+{}", packages.len() - limit));
     }
-    install_ui::dim(&preview.join(", ")).to_string()
+    install_ui::dim(&preview.join(", "))
 }
 
-pub(super) fn preview_package_names(packages: &[String], limit: usize) -> String {
+pub(super) fn preview_package_names(
+    packages: &[String],
+    limit: usize,
+) -> install_ui::TerminalFragment {
     let mut preview: Vec<String> = packages
         .iter()
         .take(limit)
@@ -47,7 +53,7 @@ pub(super) fn preview_package_names(packages: &[String], limit: usize) -> String
     if packages.len() > limit {
         preview.push(format!("+{}", packages.len() - limit));
     }
-    install_ui::dim(&preview.join(", ")).to_string()
+    install_ui::dim(&preview.join(", "))
 }
 
 pub(super) fn behavior_token_label(token: &str) -> &str {
@@ -57,22 +63,24 @@ pub(super) fn behavior_token_label(token: &str) -> &str {
     }
 }
 
-pub(super) fn format_behavior_message(message: &str) -> String {
+pub(super) fn format_behavior_message(message: &str) -> install_ui::TerminalFragment {
     let body = message.strip_prefix("uses ").unwrap_or(message);
-    let tokens: Vec<String> = body
+    let tokens: Vec<&str> = body
         .split(", ")
         .filter(|part| !part.is_empty())
-        .map(|part| lpm_common::sanitize_terminal_inline(behavior_token_label(part)).into_owned())
+        .map(behavior_token_label)
         .collect();
-    if tokens.len() == 2 && tokens[0] == "eval()" && tokens[1] == "dyn-require" {
-        return "eval() / dynamic require (misc)".to_string();
+    if tokens == ["eval()", "dyn-require"] {
+        return install_ui::field("eval() / dynamic require (misc)");
     }
-    if tokens.is_empty() {
-        lpm_common::sanitize_for_terminal(message)
-    } else {
-        let separator = format!(" {} ", install_ui::dim("·"));
-        tokens.join(&separator)
+    let Some((first, rest)) = tokens.split_first() else {
+        return install_ui::field(message);
+    };
+    let mut line = install_ui::TerminalLine::new("").field(first);
+    for token in rest {
+        line = line.text(" ").dim("·").text(" ").field(token);
     }
+    line.into()
 }
 
 pub(super) fn info_tag_label(tag: &str, count: usize) -> String {

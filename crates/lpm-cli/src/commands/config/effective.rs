@@ -6,6 +6,7 @@ use lpm_common::LpmError;
 
 use super::GlobalConfig;
 use crate::commands::install::policy_extensions::load_policy_extension_configs;
+use crate::install_ui;
 use crate::npm_firewall_config::TelemetryPolicyOrigin;
 use crate::precedence::{PolicyTier, PurePolicyKnob};
 use crate::security_approval::{EffectiveAuthorizedPosture, PostureSourceKind};
@@ -175,23 +176,96 @@ impl EffectiveConfig {
     }
 
     pub(super) fn print_human(&self) {
-        let mut current_group = None;
-        for entry in &self.entries {
-            if current_group != Some(entry.group) {
-                if current_group.is_some() {
-                    println!();
-                }
-                println!("{}", crate::install_ui::bold(entry.group));
-                println!("  {:<58} {:<24} SOURCE", "KEY", "VALUE");
-                current_group = Some(entry.group);
+        let width = install_ui::stdout_columns();
+        for (index, group) in self
+            .entries
+            .chunk_by(|left, right| left.group == right.group)
+            .enumerate()
+        {
+            if index > 0 {
+                println!();
             }
-            let key = lpm_common::sanitize_terminal_inline(&entry.key);
-            let display_value = display_json_value(&entry.value);
-            let value = lpm_common::sanitize_terminal_inline(&display_value);
-            let source = lpm_common::sanitize_terminal_inline(&entry.source);
-            println!("  {key:<58} {value:<24} {source}");
+            println!("{}", install_ui::section(group[0].group));
+            for line in group_table(group).render(width) {
+                println!("{line}");
+            }
         }
     }
+}
+
+/// Lays out one group: built-in defaults dimmed so the values something set
+/// stand out, and a run of keys under one long dotted parent nested under
+/// that parent instead of repeating it on every row. Saved keys LPM doesn't
+/// know stay whole: a quoted TOML key can hold a dot, so their dotted form
+/// doesn't say where a parent ends.
+fn group_table(group: &[EffectiveConfigEntry]) -> install_ui::Table {
+    const MIN_NESTED_RUN: usize = 3;
+
+    let nests = group
+        .first()
+        .is_some_and(|entry| entry.group != GROUP_ADDITIONAL);
+    let mut table = install_ui::Table::new();
+    let mut index = 0;
+    while index < group.len() {
+        let entry = &group[index];
+        if nests && let Some(parent) = nested_parent(&entry.key) {
+            let run = group[index..]
+                .iter()
+                .take_while(|entry| nested_parent(&entry.key) == Some(parent))
+                .count();
+            if run >= MIN_NESTED_RUN {
+                table.row([install_ui::dim(parent)]);
+                for entry in &group[index..index + run] {
+                    let child = &entry.key[parent.len() + 1..];
+                    push_entry_row(&mut table, entry, &format!("  {child}"));
+                }
+                index += run;
+                continue;
+            }
+        }
+        push_entry_row(&mut table, entry, &entry.key);
+        index += 1;
+    }
+    table
+}
+
+/// The parent of a key nested at least two levels deep, such as
+/// `firewall.npm.policies` for `firewall.npm.policies.lpm_ai_telemetry`.
+fn nested_parent(key: &str) -> Option<&str> {
+    key.rsplit_once('.')
+        .map(|(parent, _)| parent)
+        .filter(|parent| parent.contains('.'))
+}
+
+fn push_entry_row(table: &mut install_ui::Table, entry: &EffectiveConfigEntry, key: &str) {
+    let value = display_json_value(&entry.value);
+    let hint = (entry.key == crate::release_age_config::GLOBAL_KEY)
+        .then(|| entry.value.as_u64())
+        .flatten()
+        .filter(|secs| secs.is_multiple_of(3_600))
+        .map(crate::release_age_config::describe_minimum_release_age);
+    if entry.source == DEFAULT_SOURCE {
+        let value = match hint {
+            Some(hint) => install_ui::dim(&format!("{value} ({hint})")),
+            None => install_ui::dim(&value),
+        };
+        table.row([install_ui::dim(key), value, install_ui::dim("default")]);
+        return;
+    }
+    let value = match hint {
+        Some(hint) => crate::install_ui::terminal_line!(
+            "{} {}",
+            install_ui::section(&value),
+            install_ui::dim(&format!("({hint})"))
+        )
+        .into(),
+        None => install_ui::section(&value),
+    };
+    table.row([
+        install_ui::cyan(key),
+        value,
+        install_ui::field(&entry.source),
+    ]);
 }
 
 fn add_save_entries(
@@ -430,7 +504,8 @@ fn add_security_entries(
     posture: &EffectiveAuthorizedPosture,
 ) -> Result<(), LpmError> {
     let lpm = package.lpm.as_ref();
-    let global_release_age = read_optional_u64(global, "minimum-release-age-secs", global_path)?;
+    let global_release_age =
+        read_optional_u64(global, crate::release_age_config::GLOBAL_KEY, global_path)?;
     let (candidate_age, candidate_age_source) =
         if let Some(value) = lpm.and_then(|lpm| lpm.minimum_release_age) {
             (value, PACKAGE_JSON_SOURCE)
@@ -450,7 +525,7 @@ fn add_security_entries(
         |candidate, floor| candidate < floor,
     );
     entries.push(EffectiveConfigEntry::new(
-        "minimum-release-age-secs",
+        crate::release_age_config::GLOBAL_KEY,
         release_age,
         release_age_source,
         GROUP_SECURITY,

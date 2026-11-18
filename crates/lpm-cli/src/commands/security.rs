@@ -383,135 +383,7 @@ pub async fn run(
                 return Ok(());
             }
 
-            print_status_field("target", policy_value(status.target.as_str()));
-            let root_value = status
-                .project_root
-                .as_deref()
-                .map_or_else(|| install_ui::dim("(none)"), install_ui::cyan);
-            print_status_field("root", &root_value);
-            println!();
-            println!("{}", install_ui::section("effective floor"));
-            print_effective_floor_field(
-                "script policy",
-                &status.effective_floor.script_policy,
-                status.floor_sources.script_policy,
-            );
-            print_effective_floor_field(
-                "minimum release age",
-                &format_release_age(status.effective_floor.minimum_release_age_secs),
-                status.floor_sources.minimum_release_age_secs,
-            );
-            print_effective_floor_field(
-                "release age policy",
-                &status.effective_floor.release_age_policy,
-                status.floor_sources.release_age_policy,
-            );
-            print_effective_floor_field(
-                "sandbox mode",
-                &status.effective_floor.sandbox_mode,
-                status.floor_sources.sandbox_mode,
-            );
-            print_effective_floor_field(
-                "sandbox allow degraded",
-                bool_policy_value(status.effective_floor.sandbox_allow_degraded),
-                status.floor_sources.sandbox_allow_degraded,
-            );
-            print_effective_floor_field(
-                "sigstore verify",
-                &status.effective_floor.sigstore_verify,
-                status.floor_sources.sigstore_verify,
-            );
-            print_effective_floor_field(
-                "typosquat guard",
-                &status.effective_floor.typosquat_guard,
-                status.floor_sources.typosquat_guard,
-            );
-            print_effective_floor_field(
-                "npm firewall",
-                &status.effective_floor.firewall_mode,
-                status.floor_sources.firewall_mode,
-            );
-            print_effective_floor_field(
-                "install-time source analysis",
-                bool_policy_value(status.effective_floor.install_time_source_analysis),
-                status.floor_sources.install_time_source_analysis,
-            );
-
-            println!();
-            println!("{}", install_ui::section("policy sources"));
-            println!(
-                "  {} {} {}",
-                install_ui::dim(&format!("{:<24}", "approved posture")),
-                install_ui::cyan(&status.approved_posture_path),
-                source_suffix(status.approved_posture_source),
-            );
-            match status.managed_policy.as_ref() {
-                Some(policy) => {
-                    print_status_field("managed policy", install_ui::cyan(&policy.path));
-                    if let Some(name) = policy.name.as_deref() {
-                        print_status_field("policy name", install_ui::yellow(name));
-                    }
-                    if let Some(source) = policy.source.as_deref() {
-                        print_status_field("policy source", install_ui::dim(source));
-                    }
-                    if !policy.enforced_controls.is_empty() {
-                        print_status_field(
-                            "enforced controls",
-                            install_ui::dim(&policy.enforced_controls.join(", ")),
-                        );
-                    }
-                }
-                None => print_status_field("managed policy", install_ui::dim("inactive")),
-            }
-
-            println!();
-            println!("{}", install_ui::section("runtime overrides"));
-            if status.active_runtime_overrides.is_empty() {
-                println!("  {}", install_ui::dim("none"));
-            } else {
-                for override_row in &status.active_runtime_overrides {
-                    println!(
-                        "  {} {} ({})",
-                        install_ui::cyan(&format!("{:<24}", override_row.control)),
-                        policy_value(&override_row.value),
-                        install_ui::dim(&override_row.source),
-                    );
-                }
-            }
-
-            println!();
-            println!("{}", install_ui::section("active unlocks"));
-            if status.active_unlocks.is_empty() {
-                println!("  {}", install_ui::dim("none"));
-            } else {
-                for grant in &status.active_unlocks {
-                    let package_suffix = if grant.packages.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" | packages: {}", grant.packages.join(", "))
-                    };
-                    let limit_suffix = match grant.limits.min_release_age_secs {
-                        Some(secs) => format!(" | min-release-age >= {}", format_release_age(secs)),
-                        None => String::new(),
-                    };
-                    println!(
-                        "  {}  {} [{}] until {}{}{}",
-                        install_ui::cyan(&grant.id),
-                        install_ui::cyan(
-                            &grant
-                                .scopes
-                                .iter()
-                                .map(|scope| scope.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                        policy_value(grant.target.as_str()),
-                        install_ui::status_ok(&grant.expires_at.to_rfc3339()),
-                        install_ui::dim(&package_suffix),
-                        install_ui::dim(&limit_suffix),
-                    );
-                }
-            }
+            print_security_status(&status);
             println!();
             install_ui::done("Security floor loaded");
             Ok(())
@@ -644,30 +516,206 @@ fn print_protect_change(label: &str, change: security_approval::ManagedProtectio
 
 fn print_protect_status(status: &security_approval::ManagedProtectionStatus) {
     println!("{}", install_ui::section("managed protection"));
+    let mut fields = install_ui::Table::new();
     let active = if status.active {
         install_ui::status_ok("active")
     } else {
         install_ui::dim("inactive")
     };
-    print_status_field("status", &active);
-    print_status_field("policy", install_ui::cyan(&status.path));
+    fields.row([install_ui::dim("status"), active]);
+    fields.row([install_ui::dim("policy"), install_ui::cyan(&status.path)]);
     if let Some(mode) = status.firewall_mode.as_deref() {
-        print_status_field("firewall", policy_value(mode));
+        fields.row([install_ui::dim("firewall"), policy_value(mode)]);
     }
     if let Some(policy) = status.managed_policy.as_ref() {
-        if let Some(name) = policy.name.as_deref() {
-            print_status_field("name", install_ui::yellow(name));
-        }
-        if let Some(source) = policy.source.as_deref() {
-            print_status_field("source", install_ui::dim(source));
-        }
-        if !policy.enforced_controls.is_empty() {
-            print_status_field(
-                "controls",
-                install_ui::dim(&policy.enforced_controls.join(", ")),
+        push_managed_policy_details(&mut fields, policy, "name", "source", "controls");
+    }
+    fields.print_stdout();
+}
+
+fn push_managed_policy_details(
+    fields: &mut install_ui::Table,
+    policy: &security_approval::ManagedPolicyStatus,
+    name_label: &'static str,
+    source_label: &'static str,
+    controls_label: &'static str,
+) {
+    if let Some(name) = policy.name.as_deref() {
+        fields.row([install_ui::dim(name_label), install_ui::yellow(name)]);
+    }
+    if let Some(source) = policy.source.as_deref() {
+        fields.row([install_ui::dim(source_label), install_ui::dim(source)]);
+    }
+    if !policy.enforced_controls.is_empty() {
+        fields.row([
+            install_ui::dim(controls_label),
+            install_ui::dim(&policy.enforced_controls.join(", ")),
+        ]);
+    }
+}
+
+/// Prints `lpm security status`: every section's rows line up, and a floor
+/// value that comes from a built-in default is dimmed so the values an
+/// approved posture or a managed policy sets stand out.
+fn print_security_status(status: &security_approval::SecurityStatus) {
+    let mut target = install_ui::Table::new().indent(0);
+    target.row([
+        install_ui::dim("target"),
+        policy_value(status.target.as_str()),
+    ]);
+    target.row([
+        install_ui::dim("root"),
+        status
+            .project_root
+            .as_deref()
+            .map_or_else(|| install_ui::dim("(none)"), install_ui::cyan),
+    ]);
+    target.print_stdout();
+
+    println!();
+    println!("{}", install_ui::section("effective floor"));
+    let floor = &status.effective_floor;
+    let sources = &status.floor_sources;
+    let mut rows = install_ui::Table::new();
+    for (label, value, source) in [
+        (
+            "script policy",
+            floor.script_policy.clone(),
+            sources.script_policy,
+        ),
+        (
+            "minimum release age",
+            crate::release_age_config::describe_minimum_release_age(floor.minimum_release_age_secs),
+            sources.minimum_release_age_secs,
+        ),
+        (
+            "release age policy",
+            floor.release_age_policy.clone(),
+            sources.release_age_policy,
+        ),
+        (
+            "sandbox mode",
+            floor.sandbox_mode.clone(),
+            sources.sandbox_mode,
+        ),
+        (
+            "sandbox allow degraded",
+            bool_policy_value(floor.sandbox_allow_degraded).to_owned(),
+            sources.sandbox_allow_degraded,
+        ),
+        (
+            "sigstore verify",
+            floor.sigstore_verify.clone(),
+            sources.sigstore_verify,
+        ),
+        (
+            "typosquat guard",
+            floor.typosquat_guard.clone(),
+            sources.typosquat_guard,
+        ),
+        (
+            "npm firewall",
+            floor.firewall_mode.clone(),
+            sources.firewall_mode,
+        ),
+        (
+            "install-time source analysis",
+            bool_policy_value(floor.install_time_source_analysis).to_owned(),
+            sources.install_time_source_analysis,
+        ),
+    ] {
+        let value = if source == security_approval::PostureSourceKind::BuiltinDefault {
+            install_ui::dim(&value)
+        } else {
+            policy_value(&value)
+        };
+        rows.row([
+            install_ui::dim(label),
+            value,
+            install_ui::dim(source_name(source)),
+        ]);
+    }
+    rows.print_stdout();
+
+    println!();
+    println!("{}", install_ui::section("policy sources"));
+    let mut rows = install_ui::Table::new();
+    rows.row([
+        install_ui::dim("approved posture"),
+        install_ui::cyan(&status.approved_posture_path),
+        install_ui::dim(source_name(status.approved_posture_source)),
+    ]);
+    match status.managed_policy.as_ref() {
+        Some(policy) => {
+            rows.row([
+                install_ui::dim("managed policy"),
+                install_ui::cyan(&policy.path),
+            ]);
+            push_managed_policy_details(
+                &mut rows,
+                policy,
+                "policy name",
+                "policy source",
+                "enforced controls",
             );
         }
+        None => rows.row([
+            install_ui::dim("managed policy"),
+            install_ui::dim("inactive"),
+        ]),
     }
+    rows.print_stdout();
+
+    println!();
+    println!("{}", install_ui::section("runtime overrides"));
+    let mut rows = install_ui::Table::new();
+    if status.active_runtime_overrides.is_empty() {
+        rows.row([install_ui::dim("none")]);
+    }
+    for override_row in &status.active_runtime_overrides {
+        rows.row([
+            install_ui::cyan(&override_row.control),
+            policy_value(&override_row.value),
+            install_ui::dim(&override_row.source),
+        ]);
+    }
+    rows.print_stdout();
+
+    println!();
+    println!("{}", install_ui::section("active unlocks"));
+    let mut rows = install_ui::Table::new();
+    if status.active_unlocks.is_empty() {
+        rows.row([install_ui::dim("none")]);
+    }
+    for grant in &status.active_unlocks {
+        let scopes = grant
+            .scopes
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut limits = Vec::with_capacity(2);
+        if !grant.packages.is_empty() {
+            limits.push(format!("packages: {}", grant.packages.join(", ")));
+        }
+        if let Some(secs) = grant.limits.min_release_age_secs {
+            limits.push(format!(
+                "min-release-age >= {}",
+                crate::release_age_config::describe_minimum_release_age(secs)
+            ));
+        }
+        rows.row([
+            install_ui::cyan(&grant.id),
+            install_ui::cyan(&scopes),
+            policy_value(grant.target.as_str()),
+            install_ui::TerminalFragment::from(crate::install_ui::terminal_line!(
+                "until {}",
+                install_ui::status_ok(&grant.expires_at.to_rfc3339())
+            )),
+            install_ui::dim(&limits.join(" | ")),
+        ]);
+    }
+    rows.print_stdout();
 }
 
 fn source_name(source: security_approval::PostureSourceKind) -> &'static str {
@@ -678,56 +726,12 @@ fn source_name(source: security_approval::PostureSourceKind) -> &'static str {
     }
 }
 
-fn print_status_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
-    println!(
-        "{}",
-        crate::install_ui::terminal_line!("{} {}", install_ui::dim(&format!("{label:<8}")), value)
-    );
-}
-
 fn policy_value(value: &str) -> install_ui::TerminalFragment {
     install_ui::section(value)
 }
 
-fn source_suffix(source: security_approval::PostureSourceKind) -> install_ui::TerminalFragment {
-    install_ui::dim(&format!("({})", source_name(source)))
-}
-
-fn sourced_policy_value(
-    value: &str,
-    source: security_approval::PostureSourceKind,
-) -> install_ui::TerminalLine {
-    crate::install_ui::terminal_line!("{} {}", policy_value(value), source_suffix(source))
-}
-
-fn print_effective_floor_field(
-    label: &str,
-    value: &str,
-    source: security_approval::PostureSourceKind,
-) {
-    const LABEL_WIDTH: usize = 28;
-    println!(
-        "  {} {}",
-        install_ui::dim(&format!("{label:<width$}", width = LABEL_WIDTH)),
-        sourced_policy_value(value, source),
-    );
-}
-
 fn bool_policy_value(value: bool) -> &'static str {
     if value { "true" } else { "false" }
-}
-
-fn format_release_age(secs: u64) -> String {
-    if secs == 0 {
-        return "off".to_string();
-    }
-    if secs.is_multiple_of(86_400) {
-        return format!("{}d", secs / 86_400);
-    }
-    if secs.is_multiple_of(3_600) {
-        return format!("{}h", secs / 3_600);
-    }
-    format!("{secs}s")
 }
 
 #[cfg(test)]

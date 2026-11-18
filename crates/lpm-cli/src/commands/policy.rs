@@ -4,6 +4,7 @@ use crate::commands::install::policy_extensions::{
     PolicyExtensionMode, load_policy_extension_configs, resolve_policy_extension_program,
     run_policy_extension_test,
 };
+use crate::install_ui;
 use clap::Subcommand;
 use lpm_common::{LpmError, sanitize_for_terminal};
 use lpm_semver::Version;
@@ -238,7 +239,9 @@ fn run_list(json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    println!("Policy extensions");
+    println!("{}", install_ui::section("Policy extensions"));
+    let mut table = install_ui::Table::new();
+    table.header(&["name", "mode", "on error", "timeout", "command"]);
     for config in &configs {
         let displayed = config.to_config_json();
         let command = displayed["command"]
@@ -248,15 +251,15 @@ fn run_list(json_output: bool) -> Result<(), LpmError> {
             .filter_map(serde_json::Value::as_str)
             .collect::<Vec<_>>()
             .join(" ");
-        println!(
-            "  {:<24} {:<7} on-error={:<5} timeout={}ms  {}",
-            sanitize_for_terminal(config.name()),
-            config.mode().as_str(),
-            config.on_error().as_str(),
-            config.timeout_ms(),
-            sanitize_for_terminal(&command)
-        );
+        table.row([
+            install_ui::cyan(config.name()),
+            install_ui::yellow(config.mode().as_str()),
+            install_ui::field(config.on_error().as_str()),
+            install_ui::field(&format!("{}ms", config.timeout_ms())),
+            install_ui::dim(&command),
+        ]);
     }
+    table.print_stdout();
     Ok(())
 }
 
@@ -393,30 +396,25 @@ fn print_policy_inspection(inspection: &PolicyInspection) {
             inspection.enabled_count, inspection.enforce_count, inspection.report_count
         );
     }
+    let mut table = install_ui::Table::new();
     for diagnostic in &inspection.diagnostics {
-        let prefix = match diagnostic.severity {
-            PolicyDiagnosticSeverity::Pass => "ok",
-            PolicyDiagnosticSeverity::Warn => "warn",
-            PolicyDiagnosticSeverity::Fail => "fail",
-        };
         if diagnostic.code == POLICY_EXTENSIONS_CONFIGURED_CODE
             || diagnostic.code == POLICY_EXTENSIONS_NOT_CONFIGURED_CODE
         {
             continue;
         }
-        if let Some(extension) = &diagnostic.extension {
-            println!(
-                "  {prefix:<4} {:<24} {}",
-                sanitize_for_terminal(extension),
-                sanitize_for_terminal(&diagnostic.detail)
-            );
-        } else {
-            println!(
-                "  {prefix:<4} {}",
-                sanitize_for_terminal(&diagnostic.detail)
-            );
-        }
+        let severity = match diagnostic.severity {
+            PolicyDiagnosticSeverity::Pass => install_ui::status_ok("ok"),
+            PolicyDiagnosticSeverity::Warn => install_ui::yellow("warn"),
+            PolicyDiagnosticSeverity::Fail => install_ui::red("fail"),
+        };
+        table.row([
+            severity,
+            install_ui::cyan(diagnostic.extension.as_deref().unwrap_or("")),
+            install_ui::field(&diagnostic.detail),
+        ]);
     }
+    table.print_stdout();
 }
 
 fn policy_test_json(

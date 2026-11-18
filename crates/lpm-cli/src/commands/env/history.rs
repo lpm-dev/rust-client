@@ -723,8 +723,36 @@ fn print_timeline(timeline: &Timeline, project_dir: &std::path::Path, reveal: bo
             key_names(&gap.environments).join(", ")
         ));
     }
+    let columns: Vec<Option<(install_ui::TerminalFragment, install_ui::TerminalFragment)>> =
+        timeline
+            .rows
+            .iter()
+            .map(|row| match row {
+                TimelineRow::Entry(info) => Some((
+                    install_ui::field(&describe(info)),
+                    install_ui::field(
+                        &info
+                            .environments
+                            .iter()
+                            .map(|environment| environment.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                )),
+                TimelineRow::Unreadable { .. } => None,
+            })
+            .collect();
+    let (description_width, environments_width) = columns.iter().flatten().fold(
+        (0, 0),
+        |(description_width, environments_width), (description, environments)| {
+            (
+                description_width.max(description.visible_width()),
+                environments_width.max(environments.visible_width()),
+            )
+        },
+    );
     let mut current_day = None;
-    for row in &timeline.rows {
+    for (row, columns) in timeline.rows.iter().zip(&columns) {
         match row {
             TimelineRow::Entry(info) => {
                 let this_day = day(info.time);
@@ -733,19 +761,18 @@ fn print_timeline(timeline: &Timeline, project_dir: &std::path::Path, reveal: bo
                     println!("{this_day}");
                     current_day = Some(this_day);
                 }
-                let environments: Vec<&str> = info
-                    .environments
-                    .iter()
-                    .map(|environment| environment.name.as_str())
-                    .collect();
+                let Some((description, environments)) = columns else {
+                    continue;
+                };
                 let mut line = format!(
-                    "  {}  {}  {:<34}  {:<20}  {}",
+                    "  {}  {}  {:<description_width$}  {:<environments_width$}  {}",
                     clock(info.time),
                     hex::encode(&info.id[..4]),
-                    describe(info),
-                    environments.join(", "),
+                    description,
+                    environments,
                     keys_column(&key_names(&info.environments), info.key_count()),
                 );
+                line.truncate(line.trim_end().len());
                 if let (Some(since), Action::Outside) = (info.since, info.action) {
                     line.push_str(&format!("   ({} to {})", clock(since), clock(info.time)));
                 }
