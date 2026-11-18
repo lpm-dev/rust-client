@@ -3477,7 +3477,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-audit-corpus"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3499,7 +3499,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-auth"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -3529,7 +3529,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-cert"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "cap-fs-ext",
  "cap-primitives",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-cli"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-common"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "cap-fs-ext",
@@ -3720,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-dashboard"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "crossterm",
  "lpm-common",
@@ -3731,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-ecosystem-verifier"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "clap",
  "lpm-common",
@@ -3747,7 +3747,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "icu_properties",
  "regex-automata",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-backup"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -3778,7 +3778,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-codegen"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "icu_properties",
  "lpm-env",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-companion"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
@@ -3810,7 +3810,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-ffi"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "cap-std",
@@ -3831,7 +3831,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-source"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-wasm"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "lpm-env",
  "serde_json",
@@ -3855,7 +3855,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-extractor"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",
@@ -3874,7 +3874,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-global"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "crc32fast",
  "libc",
@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-http"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3906,7 +3906,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-inspect"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -3953,7 +3953,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-keyring"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "apple-native-keyring-store",
  "dbus-secret-service-keyring-store",
@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-linker"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "flate2",
  "hex",
@@ -3984,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-lockfile"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "criterion",
  "hex",
@@ -4002,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-migrate"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-network"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "crossterm",
  "if-addrs",
@@ -4040,7 +4040,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-plugin"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "filetime",
  "flate2",
@@ -4065,7 +4065,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-proxy"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "axum",
  "getrandom 0.4.3",
@@ -4090,7 +4090,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-registry"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "brotli",
@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-resolver"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "ahash",
  "criterion",
@@ -4163,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-runner"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "cap-std",
  "dirs",
@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-runtime"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "dirs",
  "flate2",
@@ -4226,7 +4226,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-sandbox"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "assert_cmd",
  "criterion",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-security"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "aho-corasick",
  "bytecount",
@@ -4290,7 +4290,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-semver"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "lpm-common",
  "node-semver",
@@ -4302,7 +4302,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-skill"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "regex",
  "serde",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-skill-wasm"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "lpm-skill",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-store"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -4350,7 +4350,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-task"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -4378,7 +4378,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-triage-advisor"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "async-trait",
  "getrandom 0.4.3",
@@ -4396,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-tunnel"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -4424,7 +4424,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-vault"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -4468,7 +4468,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-windows-bindgen"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "toml",
  "windows-bindgen",
@@ -4526,7 +4526,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-workspace"
-version = "0.86.0"
+version = "0.87.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
