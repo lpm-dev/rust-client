@@ -298,7 +298,7 @@ fn a_deleted_folder_can_be_unlinked_by_its_path() {
         alias.join("second-checkout")
     };
     #[cfg(not(unix))]
-    let spelled = checkout.clone();
+    let spelled = checkout;
 
     let unlink = lpm_in(
         &project,
