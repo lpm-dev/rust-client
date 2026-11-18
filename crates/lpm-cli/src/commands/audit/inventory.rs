@@ -334,8 +334,9 @@ pub(crate) struct BehavioralAnalyses {
     pub(crate) analyses: Vec<Option<Arc<PackageAnalysis>>>,
     pub(crate) source_paths: Vec<Option<PathBuf>>,
     /// Packages with no source because the install left them out: optional
-    /// packages a foreign manager didn't install, and `lpm.lock` packages
-    /// skipped on this platform whose source is absent.
+    /// or dev packages missing from the paths `package-lock.json` records,
+    /// and `lpm.lock` packages skipped on this platform whose source is
+    /// absent.
     pub(crate) not_installed: Vec<bool>,
 }
 

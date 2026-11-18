@@ -26,9 +26,9 @@ pub enum ScanMode {
     RegistryAndStore,
     /// Lockfile says it exists, but source is not present on disk.
     LocalMissing,
-    /// An optional package the package manager didn't install, so there is
-    /// no source to scan. Foreign lockfiles don't say which platforms a
-    /// package supports, and their managers may leave out any optional one.
+    /// An optional or dev package missing from the path `package-lock.json`
+    /// records for it after an install: npm leaves such packages out for
+    /// another platform or under `--omit`, so there is no source to scan.
     NotInstalled,
 }
 
