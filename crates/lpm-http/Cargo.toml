@@ -16,6 +16,7 @@ tokio = { workspace = true }
 webpki-root-certs = { workspace = true }
 
 [dev-dependencies]
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
 serde_json = { workspace = true }
 syn = { version = "3", features = ["full", "visit"] }
 wiremock = "0.6"
