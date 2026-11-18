@@ -11,4 +11,13 @@ fn main() {
     {
         println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
     }
+    // Rust's arm64 macOS deployment target (11.0) leaves ld64 writing classic
+    // rebase opcodes, which dyld applies to ~72k pointers at every launch.
+    // Chained fixups, which arm64 macOS 11 supports, cost a fraction of that
+    // and are applied lazily at page-in from macOS 13.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+    {
+        println!("cargo:rustc-link-arg-bins=-Wl,-fixup_chains");
+    }
 }
