@@ -139,7 +139,9 @@ fn setup_storage_status(token: &ResolvedSetupBearer) -> lpm_auth::AuthStorageSta
 /// Generate .npmrc for CI/CD environments.
 ///
 /// Creates a .npmrc file that configures the LPM registry with auth token
-/// so npm/pnpm/yarn can install @lpm.dev packages in CI.
+/// so npm, pnpm, Yarn 1 and Bun can install @lpm.dev packages in CI. When
+/// Git tracks the project's .npmrc, the block goes to npm's user
+/// configuration instead, as `npmrc::setup_npmrc_destination` explains.
 ///
 /// Default: scoped config (`@lpm.dev:registry=`) — only LPM packages go through lpm.dev.
 ///
@@ -155,13 +157,17 @@ pub async fn run(
     use_oidc: bool,
 ) -> Result<(), LpmError> {
     let registry = super::npmrc::SetupRegistry::parse(registry_url)?;
-    super::npmrc::reject_tracked_npmrc(project_dir)?;
+    let target = super::npmrc::setup_npmrc_destination(
+        project_dir,
+        &registry,
+        super::npmrc::npm_user_config().as_deref(),
+    )?;
 
-    let npmrc_path = project_dir.join(".npmrc");
+    let npmrc_path = target.path.clone();
     let (_, ignore_warnings) = lpm_common::project_secret::prepare_secret_destination(
         project_dir,
         &npmrc_path,
-        lpm_common::project_secret::IgnoreFile::RepositoryExclude,
+        target.ignore_file(lpm_common::project_secret::IgnoreFile::RepositoryExclude),
         lpm_common::project_secret::IgnoreFailure::Refuse,
     )
     .map_err(LpmError::from)?;
@@ -302,6 +308,7 @@ pub async fn run(
         let json = serde_json::json!({
             "success": true,
             "path": npmrc_path.display().to_string(),
+            "location": target.location(),
             "content": safe_content,
             "uses_env_var": token.uses_env_var,
             "oidc": use_oidc && pending_retirement.is_none(),
@@ -318,6 +325,9 @@ pub async fn run(
     } else {
         install_ui::done("Generated .npmrc");
         hint_line(&npmrc_path.display().to_string());
+        for note in target.user_destination_notes(&registry) {
+            install_ui::phase_untrusted(&note);
+        }
         for warning in &ignore_warnings {
             crate::output::warn(warning);
         }
