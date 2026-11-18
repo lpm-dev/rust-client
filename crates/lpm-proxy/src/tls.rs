@@ -248,10 +248,10 @@ async fn run_tls_listener(
             _ = super::http::wait_for_shutdown(&mut shutdown) => break,
             accepted = listener.accept() => accepted,
         };
-        let stream = match accepted {
-            Ok((stream, _)) => {
+        let (stream, peer) = match accepted {
+            Ok(accepted) => {
                 backoff.reset();
-                stream
+                accepted
             }
             Err(_) => {
                 drop(permit);
@@ -270,7 +270,7 @@ async fn run_tls_listener(
             tokio::select! {
                 biased;
                 _ = super::http::wait_for_shutdown(&mut connection_shutdown) => {}
-                _ = serve_tls_http_connection(acceptor, stream, state) => {}
+                _ = serve_tls_http_connection(acceptor, stream, peer, state) => {}
             }
         });
     }
@@ -282,6 +282,7 @@ async fn run_tls_listener(
 async fn serve_tls_http_connection(
     acceptor: tokio_rustls::TlsAcceptor,
     stream: tokio::net::TcpStream,
+    peer: SocketAddr,
     state: Arc<HttpProxyState>,
 ) {
     let Ok(Ok(tls_stream)) =
@@ -291,12 +292,14 @@ async fn serve_tls_http_connection(
     };
     let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
     let io = hyper_util::rt::TokioIo::new(tls_stream);
+    let forwarded_for = super::http::forwarded_for(peer);
     let service =
         hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
             let state = state.clone();
+            let forwarded_for = forwarded_for.clone();
             async move {
                 let request = request.map(axum::body::Body::new);
-                let response = proxy_http_request_inner(state, request)
+                let response = proxy_http_request_inner(state, request, forwarded_for)
                     .await
                     .unwrap_or_else(|response| response);
                 Ok::<_, Infallible>(response)

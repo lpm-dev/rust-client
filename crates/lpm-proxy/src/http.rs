@@ -312,10 +312,10 @@ async fn run_http_listener(
             _ = wait_for_shutdown(&mut shutdown) => break,
             accepted = listener.accept() => accepted,
         };
-        let stream = match accepted {
-            Ok((stream, _)) => {
+        let (stream, peer) = match accepted {
+            Ok(accepted) => {
                 backoff.reset();
-                stream
+                accepted
             }
             Err(_) => {
                 drop(permit);
@@ -333,7 +333,7 @@ async fn run_http_listener(
             tokio::select! {
                 biased;
                 _ = wait_for_shutdown(&mut connection_shutdown) => {}
-                _ = serve_http_connection(stream, state) => {}
+                _ = serve_http_connection(stream, peer, state) => {}
             }
         });
     }
@@ -342,17 +342,25 @@ async fn run_http_listener(
     while connections.join_next().await.is_some() {}
 }
 
-async fn serve_http_connection(stream: tokio::net::TcpStream, state: HttpFrontendState) {
+async fn serve_http_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    state: HttpFrontendState,
+) {
     let io = hyper_util::rt::TokioIo::new(stream);
+    let forwarded_for = forwarded_for(peer);
     let service =
         hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
             let state = state.clone();
+            let forwarded_for = forwarded_for.clone();
             async move {
                 let request = request.map(axum::body::Body::new);
                 let response = match state {
-                    HttpFrontendState::Proxy(state) => proxy_http_request_inner(state, request)
-                        .await
-                        .unwrap_or_else(|response| response),
+                    HttpFrontendState::Proxy(state) => {
+                        proxy_http_request_inner(state, request, forwarded_for)
+                            .await
+                            .unwrap_or_else(|response| response)
+                    }
                     HttpFrontendState::Redirect(state) => {
                         redirect_http_request_inner(state, request).await
                     }
@@ -428,6 +436,7 @@ async fn redirect_http_request_inner(
 pub(crate) async fn proxy_http_request_inner(
     state: Arc<HttpProxyState>,
     request: axum::extract::Request,
+    forwarded_for: axum::http::HeaderValue,
 ) -> Result<axum::response::Response, axum::response::Response> {
     use axum::body::Body;
     use axum::http::{StatusCode, header};
@@ -455,7 +464,7 @@ pub(crate) async fn proxy_http_request_inner(
     };
 
     if is_upgrade_request(request.headers()) {
-        return proxy_upgrade_request(request, upstream, host_header, state).await;
+        return proxy_upgrade_request(request, upstream, host_header, forwarded_for, state).await;
     }
 
     let (parts, body) = request.into_parts();
@@ -474,7 +483,7 @@ pub(crate) async fn proxy_http_request_inner(
 
     for (name, value) in &parts.headers {
         if name != header::COOKIE
-            && is_forwardable_http_header(name.as_str())
+            && is_forwardable_request_header(name.as_str())
             && !connection_header_nominates(&parts.headers, name)
         {
             builder = builder.header(name.clone(), value.clone());
@@ -485,6 +494,7 @@ pub(crate) async fn proxy_http_request_inner(
     }
     builder = builder
         .header(header::HOST, upstream.authority())
+        .header("x-forwarded-for", forwarded_for)
         .header("x-forwarded-host", host_header)
         .header("x-forwarded-proto", state.forwarded_proto);
 
@@ -544,6 +554,7 @@ async fn proxy_upgrade_request(
     mut request: axum::extract::Request,
     upstream: lpm_common::LocalTarget,
     host_header: String,
+    forwarded_for: axum::http::HeaderValue,
     state: Arc<HttpProxyState>,
 ) -> Result<axum::response::Response, axum::response::Response> {
     use axum::body::Body;
@@ -583,6 +594,7 @@ async fn proxy_upgrade_request(
         .header(header::HOST, upstream.authority())
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, requested_upgrade.clone())
+        .header("x-forwarded-for", forwarded_for)
         .header("x-forwarded-host", host_header)
         .header("x-forwarded-proto", state.forwarded_proto);
     let upstream_request = upstream_builder.body(Body::empty()).map_err(|_| {
@@ -760,6 +772,12 @@ fn is_forwardable_http_header(name: &str) -> bool {
     .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
+/// A client request header the dev server receives: not hop-by-hop, and not
+/// one through which a client could claim who it is or how it connected.
+fn is_forwardable_request_header(name: &str) -> bool {
+    is_forwardable_http_header(name) && !is_forwarding_identity_header(name)
+}
+
 fn is_forwardable_upgrade_request_header(name: &str) -> bool {
     ![
         "connection",
@@ -771,11 +789,82 @@ fn is_forwardable_upgrade_request_header(name: &str) -> bool {
         "transfer-encoding",
         "host",
         "content-length",
-        "x-forwarded-host",
-        "x-forwarded-proto",
     ]
     .iter()
     .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        && !is_forwarding_identity_header(name)
+}
+
+/// A header through which a proxy tells the server who the client is or how
+/// it connected. A client can send any of them, so none of its values reach
+/// the dev server: the proxy sends only what it saw itself.
+///
+/// Any separator counts as `-`: servers that expose headers as CGI-style
+/// variables, such as `HTTP_X_FORWARDED_FOR`, read `x_forwarded_for` and
+/// `x.forwarded.for` as the same header.
+pub(crate) fn is_forwarding_identity_header(name: &str) -> bool {
+    const PREFIX: &str = "x-forwarded-";
+    name.get(..PREFIX.len())
+        .is_some_and(|prefix| same_header_name(prefix, PREFIX))
+        || [
+            "forwarded",
+            "forwarded-for",
+            "x-forwarded",
+            "x-real-ip",
+            "x-client-ip",
+            "client-ip",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "cf-connecting-ipv6",
+            "cf-pseudo-ipv4",
+            "fastly-client-ip",
+            "fly-client-ip",
+            "do-connecting-ip",
+            "x-cluster-client-ip",
+            "x-appengine-user-ip",
+            "x-azure-clientip",
+            "x-azure-socketip",
+            "x-envoy-external-address",
+            "x-vercel-forwarded-for",
+            "x-nf-client-connection-ip",
+            "x-originating-ip",
+            "x-original-forwarded-for",
+            "x-remote-ip",
+            "x-remote-addr",
+            "x-original-host",
+            "x-host",
+            "front-end-https",
+            "x-url-scheme",
+            "x-scheme",
+            "x-https",
+            "x-arr-ssl",
+            "x-original-for",
+            "x-original-proto",
+            "proxy-client-ip",
+            "wl-proxy-client-ip",
+            "x-proxyuser-ip",
+        ]
+        .iter()
+        .any(|identity| same_header_name(name, identity))
+}
+
+/// Whether two header names match, ignoring ASCII case and treating any
+/// separator as `-`, as servers that turn header names into variable names
+/// do. `canonical` is lowercase and uses `-`.
+fn same_header_name(name: &str, canonical: &str) -> bool {
+    name.len() == canonical.len()
+        && name.bytes().zip(canonical.bytes()).all(|(byte, expected)| {
+            let byte = byte.to_ascii_lowercase();
+            byte == expected || (expected == b'-' && !byte.is_ascii_alphanumeric())
+        })
+}
+
+/// The `X-Forwarded-For` value naming `peer`: its bare address, with an IPv4
+/// peer on a dual-stack socket shown as IPv4. A connection's peer never
+/// changes, so this is built once per connection.
+pub(crate) fn forwarded_for(peer: SocketAddr) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::try_from(peer.ip().to_canonical().to_string())
+        .expect("an IP address is a valid header value")
 }
 
 fn is_forwardable_upgrade_response_header(name: &str) -> bool {
