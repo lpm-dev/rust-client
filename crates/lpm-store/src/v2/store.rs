@@ -98,6 +98,17 @@ fn file_exceeds_hybrid_buffer(reader: &std::io::BufReader<std::fs::File>) -> boo
     })
 }
 
+/// Whether a downloaded file is too large, compressed or as its gzip
+/// trailer declares it decoded, to buffer where the pipelined decoder can
+/// take it instead and write its files in parallel.
+fn file_takes_pipelined_decoder(reader: &std::io::BufReader<std::fs::File>) -> bool {
+    reader
+        .get_ref()
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+        && !lpm_extractor::file_fits_buffered_extraction(reader.get_ref())
+}
+
 enum TarballInput<'a> {
     Bytes(&'a [u8]),
     File(std::io::BufReader<std::fs::File>),
@@ -1470,13 +1481,13 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let stream_file = matches!(&tarball_input, TarballInput::File(reader) if file_exceeds_hybrid_buffer(reader));
         let extract_result = if !source_analysis_enabled && registry_cas_ingest.is_none() {
+            let pipeline_file = matches!(&tarball_input, TarballInput::File(reader) if file_takes_pipelined_decoder(reader));
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => {
                     lpm_extractor::extract_tarball_digests(bytes, tmp_dir)
                 }
-                TarballInput::File(reader) if stream_file => {
+                TarballInput::File(reader) if pipeline_file => {
                     lpm_extractor::extract_tarball_from_reader_pipelined_digests(
                         reader,
                         tmp_dir,
@@ -1503,6 +1514,7 @@ impl Store {
                 ),
             }
         } else {
+            let stream_file = matches!(&tarball_input, TarballInput::File(reader) if file_exceeds_hybrid_buffer(reader));
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
                     bytes,

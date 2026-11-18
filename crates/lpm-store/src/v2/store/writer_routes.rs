@@ -67,6 +67,89 @@ fn many_file_archive() -> Vec<u8> {
     archive.into_inner().unwrap().finish().unwrap()
 }
 
+fn compressible_many_file_archive() -> Vec<u8> {
+    use std::io::Read;
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    let mut archive = tar::Builder::new(gzip);
+    let size = 32 * 1024 * 1024;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(
+            &mut header,
+            "package/large",
+            std::io::repeat(0x5a).take(size),
+        )
+        .unwrap();
+    for index in 0..270 {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                format!("package/file-{index}"),
+                b"data".as_slice(),
+            )
+            .unwrap();
+    }
+    archive.into_inner().unwrap().finish().unwrap()
+}
+
+#[test]
+fn small_downloads_that_decode_past_the_buffer_keep_parallel_writers() {
+    const CHILD: &str = "LPM_TEST_STORE_DECODED_SIZE_WRITERS";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "v2::store::tests::writer_routes::small_downloads_that_decode_past_the_buffer_keep_parallel_writers", "--nocapture"])
+            .env(CHILD, "1").env("LPM_INTERNAL_EXTRACT_WRITERS", "2")
+            .output().unwrap();
+        assert!(
+            result.status.success()
+                && String::from_utf8_lossy(&result.stdout).contains("1 passed;"),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    let bytes = compressible_many_file_archive();
+    assert!(bytes.len() as u64 <= lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE);
+    let sri = crate::compute_sri_hash(&bytes);
+    let root = tempfile::tempdir().unwrap();
+    let archive = root.path().join("archive.tgz");
+    std::fs::write(&archive, &bytes).unwrap();
+    let store = Store::at_with_policies(
+        root.path().join("store"),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let activations = Arc::new(AtomicUsize::new(0));
+    let (object, _) =
+        tracing::subscriber::with_default(WriterProbe(Arc::clone(&activations)), || {
+            store.extract_object_from_file(&archive, &sri)
+        })
+        .unwrap();
+
+    assert_eq!(
+        activations.load(Ordering::Relaxed),
+        usize::from(has_writer_capacity())
+    );
+    assert_eq!(
+        std::fs::metadata(object.join("large")).unwrap().len(),
+        32 * 1024 * 1024
+    );
+    for index in 0..270 {
+        assert_eq!(
+            std::fs::read(object.join(format!("file-{index}"))).unwrap(),
+            b"data"
+        );
+    }
+}
+
 #[test]
 fn downloaded_file_routes_activate_writers_only_without_inspection() {
     const CHILD: &str = "LPM_TEST_STORE_FILE_WRITERS";

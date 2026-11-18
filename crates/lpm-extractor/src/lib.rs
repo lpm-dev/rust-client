@@ -532,6 +532,69 @@ pub const MAX_HYBRID_BUFFERED_COMPRESSED_SIZE: u64 = 8 * 1024 * 1024;
 /// Maximum decompressed output held by the buffered libdeflate path.
 const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
 
+/// Largest decoded size [`file_fits_buffered_extraction`] admits. Several
+/// archives extract at once, and each buffered one holds its whole decoded
+/// tar until its last entry is written, so larger downloads go to the
+/// pipelined decoder, which keeps at most 768 KiB queued.
+const MAX_ROUTED_BUFFERED_DECODE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Whether a file-backed archive is small enough, both compressed and as
+/// its gzip trailer declares it decoded, for the hybrid buffered path.
+/// Callers that can pipeline send the others to
+/// [`extract_tarball_from_reader_pipelined_digests`]. The trailer only routes:
+/// a buffered decode still stops at its own cap whatever it declares.
+pub fn file_fits_buffered_extraction(file: &std::fs::File) -> bool {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_HYBRID_BUFFERED_COMPRESSED_SIZE {
+        return false;
+    }
+    gzip_declared_size(file, metadata.len())
+        .is_none_or(|declared| declared as usize <= MAX_ROUTED_BUFFERED_DECODE_SIZE)
+}
+
+/// The decoded size (mod 2^32) a gzip file's trailer declares, read without
+/// moving the file's cursor. `None` when the file doesn't start with gzip's
+/// magic, so its extraction reports that instead of taking another route.
+fn gzip_declared_size(file: &std::fs::File, len: u64) -> Option<u32> {
+    const GZIP_MIN_LEN: u64 = 18;
+    if len < GZIP_MIN_LEN {
+        return None;
+    }
+    let mut magic = [0u8; 2];
+    let mut trailer = [0u8; 4];
+    read_exact_at(file, &mut magic, 0)?;
+    if magic != [0x1f, 0x8b] {
+        return None;
+    }
+    read_exact_at(file, &mut trailer, len - 4)?;
+    Some(u32::from_le_bytes(trailer))
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> Option<()> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_exact_at(buffer, offset).ok()
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> Option<()> {
+    use std::io::Seek as _;
+    use std::os::windows::fs::FileExt as _;
+    // `seek_read` moves the cursor on Windows; put it back.
+    let mut cursor = file;
+    let position = cursor.stream_position().ok()?;
+    let read = file.seek_read(buffer, offset);
+    cursor.seek(std::io::SeekFrom::Start(position)).ok()?;
+    (read.ok()? == buffer.len()).then_some(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(_file: &std::fs::File, _buffer: &mut [u8], _offset: u64) -> Option<()> {
+    None
+}
+
 #[derive(Clone, Copy)]
 struct ExtractionLimits {
     max_buffered_compressed_size: u64,

@@ -1,15 +1,18 @@
-//! Byte buffers owned through the system allocator.
+//! Byte buffers that return their memory to the OS when freed.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ptr::NonNull;
 
-/// Bytes allocated from the system allocator instead of the global one.
+/// Bytes allocated outside the global allocator.
 ///
 /// Extraction holds whole compressed and decompressed tarballs for a few
 /// milliseconds at a time on many threads. In mimalloc's per-thread arenas
 /// those multi-megabyte blocks keep hundreds of MiB committed after they are
-/// freed during a cold install. The system allocator maps blocks this large
-/// separately and returns them to the OS when they are freed.
+/// freed during a cold install, and the system allocators keep freed large
+/// blocks resident in caches of their own (macOS's large-block cache, glibc's
+/// heap once its mmap threshold has risen). On Unix, blocks of 256 KiB and up
+/// are therefore mapped straight from the OS and unmapped when freed; smaller
+/// ones come from the system allocator.
 pub(crate) struct SystemBuffer {
     ptr: NonNull<u8>,
     len: usize,
@@ -34,10 +37,9 @@ impl SystemBuffer {
     pub(crate) fn zeroed(len: usize) -> Self {
         let mut buffer = Self::new();
         if len > 0 {
-            let layout = layout(len);
-            // SAFETY: `layout` has a non-zero size.
-            buffer.ptr = allocated(unsafe { System.alloc_zeroed(layout) }, layout);
-            buffer.capacity = len;
+            let (ptr, capacity) = allocate(len, true);
+            buffer.ptr = ptr;
+            buffer.capacity = capacity;
             buffer.len = len;
         }
         buffer
@@ -83,18 +85,138 @@ impl SystemBuffer {
     }
 
     fn grow_to(&mut self, capacity: usize) {
-        let new_layout = layout(capacity);
-        let ptr = if self.capacity == 0 {
-            // SAFETY: `new_layout` has a non-zero size.
-            unsafe { System.alloc(new_layout) }
-        } else {
+        if self.capacity == 0 {
+            let (ptr, capacity) = allocate(capacity, false);
+            self.ptr = ptr;
+            self.capacity = capacity;
+            return;
+        }
+        if !is_mapped(self.capacity) && !is_mapped(capacity) {
             // SAFETY: `ptr` was allocated by `System` with `layout(self.capacity)`,
             // and the new size is non-zero.
-            unsafe { System.realloc(self.ptr.as_ptr(), layout(self.capacity), capacity) }
-        };
-        self.ptr = allocated(ptr, new_layout);
-        self.capacity = capacity;
+            let ptr = unsafe { System.realloc(self.ptr.as_ptr(), layout(self.capacity), capacity) };
+            self.ptr = allocated(ptr, layout(capacity));
+            self.capacity = capacity;
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if is_mapped(self.capacity) && is_mapped(capacity) {
+            let new_capacity = mapped_capacity(capacity);
+            // SAFETY: `ptr` maps exactly `self.capacity` bytes. The kernel
+            // moves the pages instead of copying them, keeping their contents;
+            // on failure the old mapping is untouched.
+            let ptr = unsafe { remap(self.ptr.as_ptr().cast(), self.capacity, new_capacity) };
+            // A seccomp profile can refuse mremap; copying into a new
+            // mapping still works there.
+            if ptr != libc::MAP_FAILED {
+                self.ptr = allocated(ptr.cast(), layout(new_capacity));
+                self.capacity = new_capacity;
+                return;
+            }
+        }
+        let (ptr, new_capacity) = allocate(capacity, false);
+        // SAFETY: both allocations are live and distinct; `len <= capacity`.
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), ptr.as_ptr(), self.len) };
+        // SAFETY: the old allocation came from `allocate` with `self.capacity`.
+        unsafe { release(self.ptr, self.capacity) };
+        self.ptr = ptr;
+        self.capacity = new_capacity;
     }
+}
+
+/// `mremap(MREMAP_MAYMOVE)`, which tests can make fail.
+///
+/// # Safety
+/// `old` must be a live mapping of exactly `old_len` bytes.
+#[cfg(target_os = "linux")]
+unsafe fn remap(old: *mut libc::c_void, old_len: usize, new_len: usize) -> *mut libc::c_void {
+    #[cfg(test)]
+    if FAIL_NEXT_REMAP.with(|fail| fail.replace(false)) {
+        return libc::MAP_FAILED;
+    }
+    // SAFETY: the caller passes a live mapping of exactly `old_len` bytes.
+    unsafe { libc::mremap(old, old_len, new_len, libc::MREMAP_MAYMOVE) }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FAIL_NEXT_REMAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(unix)]
+const MAP_THRESHOLD: usize = 256 * 1024;
+
+#[cfg(unix)]
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: sysconf has no preconditions.
+    *PAGE.get_or_init(|| {
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(16384)
+    })
+}
+
+#[cfg(unix)]
+fn mapped_capacity(size: usize) -> usize {
+    let page = page_size();
+    size.div_ceil(page)
+        .checked_mul(page)
+        .expect("buffer size overflows usize")
+}
+
+#[cfg(unix)]
+fn is_mapped(capacity: usize) -> bool {
+    capacity >= MAP_THRESHOLD
+}
+
+#[cfg(not(unix))]
+fn is_mapped(_capacity: usize) -> bool {
+    false
+}
+
+/// Allocate at least `size` bytes; returns the pointer and the capacity owned.
+fn allocate(size: usize, zeroed: bool) -> (NonNull<u8>, usize) {
+    #[cfg(unix)]
+    if is_mapped(size) {
+        let capacity = mapped_capacity(size);
+        // SAFETY: an anonymous private mapping with no address hint.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            std::alloc::handle_alloc_error(layout(capacity));
+        }
+        // Fresh anonymous pages are already zero.
+        return (allocated(ptr.cast(), layout(capacity)), capacity);
+    }
+    let layout = layout(size);
+    // SAFETY: `layout` has a non-zero size.
+    let ptr = unsafe {
+        if zeroed {
+            System.alloc_zeroed(layout)
+        } else {
+            System.alloc(layout)
+        }
+    };
+    (allocated(ptr, layout), size)
+}
+
+/// Free an allocation made by [`allocate`] with this `capacity`.
+unsafe fn release(ptr: NonNull<u8>, capacity: usize) {
+    #[cfg(unix)]
+    if is_mapped(capacity) {
+        // SAFETY: the caller passes a mapping of exactly `capacity` bytes.
+        unsafe { libc::munmap(ptr.as_ptr().cast(), capacity) };
+        return;
+    }
+    // SAFETY: the caller passes a `System` allocation with this layout.
+    unsafe { System.dealloc(ptr.as_ptr(), layout(capacity)) }
 }
 
 fn layout(size: usize) -> Layout {
@@ -114,8 +236,8 @@ impl Default for SystemBuffer {
 impl Drop for SystemBuffer {
     fn drop(&mut self) {
         if self.capacity > 0 {
-            // SAFETY: `ptr` was allocated by `System` with this layout.
-            unsafe { System.dealloc(self.ptr.as_ptr(), layout(self.capacity)) }
+            // SAFETY: `ptr` came from `allocate` with this capacity.
+            unsafe { release(self.ptr, self.capacity) }
         }
     }
 }
@@ -189,6 +311,57 @@ mod tests {
         buffer.reserve_exact(10);
         assert_eq!(buffer.capacity(), 13);
         assert_eq!(&buffer[..], b"abc");
+    }
+
+    #[test]
+    fn growing_past_the_mapping_threshold_keeps_every_byte() {
+        let mut buffer = SystemBuffer::new();
+        let mut expected = Vec::new();
+        for chunk in 0..1200_u32 {
+            let bytes = [(chunk % 251) as u8; 1000];
+            buffer.extend_from_slice(&bytes);
+            expected.extend_from_slice(&bytes);
+        }
+        assert_eq!(&buffer[..], &expected[..]);
+        assert!(buffer.capacity() >= expected.len());
+        buffer.reserve_exact(5 * 1024 * 1024);
+        assert_eq!(&buffer[..], &expected[..]);
+        assert!(buffer.capacity() >= expected.len() + 5 * 1024 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_buffers_from_the_threshold_up_are_mapped_in_whole_pages() {
+        let len = MAP_THRESHOLD + 3;
+        let mut buffer = SystemBuffer::zeroed(len);
+        assert_eq!(buffer.len(), len);
+        assert!(buffer.iter().all(|&byte| byte == 0));
+        assert_eq!(buffer.capacity(), len.div_ceil(page_size()) * page_size());
+        buffer[len - 1] = 1;
+        assert_eq!(buffer[len - 1], 1);
+
+        let below = MAP_THRESHOLD - 3;
+        assert_eq!(SystemBuffer::zeroed(below).capacity(), below);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_remap_grows_by_copying_instead() {
+        let mut buffer = SystemBuffer::new();
+        let first: Vec<u8> = (0..MAP_THRESHOLD as u32 + 7)
+            .map(|value| value as u8)
+            .collect();
+        buffer.extend_from_slice(&first);
+        FAIL_NEXT_REMAP.with(|fail| fail.set(true));
+
+        buffer.reserve_exact(3 * 1024 * 1024);
+
+        assert!(
+            !FAIL_NEXT_REMAP.with(std::cell::Cell::get),
+            "the remap was attempted"
+        );
+        assert_eq!(&buffer[..], &first[..]);
+        assert!(buffer.capacity() >= first.len() + 3 * 1024 * 1024);
     }
 
     #[test]
