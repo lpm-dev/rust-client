@@ -99,6 +99,26 @@ impl SystemBuffer {
             self.capacity = capacity;
             return;
         }
+        #[cfg(target_os = "linux")]
+        if is_mapped(self.capacity) && is_mapped(capacity) {
+            let new_capacity = mapped_capacity(capacity);
+            // SAFETY: `ptr` maps exactly `self.capacity` bytes. The kernel
+            // moves the pages instead of copying them, keeping their contents.
+            let ptr = unsafe {
+                libc::mremap(
+                    self.ptr.as_ptr().cast(),
+                    self.capacity,
+                    new_capacity,
+                    libc::MREMAP_MAYMOVE,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                std::alloc::handle_alloc_error(layout(new_capacity));
+            }
+            self.ptr = allocated(ptr.cast(), layout(new_capacity));
+            self.capacity = new_capacity;
+            return;
+        }
         let (ptr, new_capacity) = allocate(capacity, false);
         // SAFETY: both allocations are live and distinct; `len <= capacity`.
         unsafe { std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), ptr.as_ptr(), self.len) };
@@ -122,6 +142,14 @@ fn page_size() -> usize {
 }
 
 #[cfg(unix)]
+fn mapped_capacity(size: usize) -> usize {
+    let page = page_size();
+    size.div_ceil(page)
+        .checked_mul(page)
+        .expect("buffer size overflows usize")
+}
+
+#[cfg(unix)]
 fn is_mapped(capacity: usize) -> bool {
     capacity >= MAP_THRESHOLD
 }
@@ -135,11 +163,7 @@ fn is_mapped(_capacity: usize) -> bool {
 fn allocate(size: usize, zeroed: bool) -> (NonNull<u8>, usize) {
     #[cfg(unix)]
     if is_mapped(size) {
-        let page = page_size();
-        let capacity = size
-            .div_ceil(page)
-            .checked_mul(page)
-            .expect("buffer size overflows usize");
+        let capacity = mapped_capacity(size);
         // SAFETY: an anonymous private mapping with no address hint.
         let ptr = unsafe {
             libc::mmap(
@@ -293,7 +317,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn large_zeroed_buffers_are_mapped_in_whole_pages() {
+    fn only_buffers_from_the_threshold_up_are_mapped_in_whole_pages() {
         let len = MAP_THRESHOLD + 3;
         let mut buffer = SystemBuffer::zeroed(len);
         assert_eq!(buffer.len(), len);
@@ -301,6 +325,9 @@ mod tests {
         assert_eq!(buffer.capacity(), len.div_ceil(page_size()) * page_size());
         buffer[len - 1] = 1;
         assert_eq!(buffer[len - 1], 1);
+
+        let below = MAP_THRESHOLD - 3;
+        assert_eq!(SystemBuffer::zeroed(below).capacity(), below);
     }
 
     #[test]
