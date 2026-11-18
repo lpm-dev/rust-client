@@ -309,38 +309,34 @@ fn materialize_into_inner_impl(
         ))
     })?;
 
-    let mut names = Vec::new();
+    let mut entries = Vec::new();
     for entry in std::fs::read_dir(src).map_err(|e| {
         LpmError::Store(format!(
             "failed to read virtual-store source object dir {}: {e}",
             src.display()
         ))
     })? {
-        names.push(
-            entry
-                .map_err(|e| {
-                    LpmError::Store(format!("failed to enumerate virtual-store source dir: {e}"))
-                })?
-                .file_name(),
-        );
+        let entry = entry.map_err(|e| {
+            LpmError::Store(format!("failed to enumerate virtual-store source dir: {e}"))
+        })?;
+        // The listing reports entry types on the file systems stores live
+        // on; `file_type` stats only where it doesn't.
+        let file_type = entry.file_type().map_err(|e| {
+            LpmError::Store(format!(
+                "failed to stat virtual-store source entry {}: {e}",
+                entry.path().display()
+            ))
+        })?;
+        entries.push((entry.file_name(), file_type));
     }
-    names.sort_unstable();
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
-    for name in names {
+    for (name, file_type) in entries {
         let src_path = src.join(&name);
         if is_object_metadata_sidecar(root, &src_path) {
             continue;
         }
         let dst_path = dst.join(&name);
-
-        let file_type = std::fs::symlink_metadata(&src_path)
-            .map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to stat virtual-store source entry {}: {e}",
-                    src_path.display()
-                ))
-            })?
-            .file_type();
 
         if file_type.is_dir() {
             let record = tree_metadata
@@ -396,14 +392,22 @@ fn materialize_into_inner_impl(
                 )?;
             }
         } else {
-            materialize_regular_file(&src_path, &dst_path)?;
+            let written = materialize_regular_file(&src_path, &dst_path)?;
             if let Some(metadata) = tree_metadata.as_deref_mut() {
-                metadata.record(
-                    destination_root,
-                    &dst_path,
-                    TreeMetadataKind::File,
-                    Vec::new(),
-                )?;
+                match written {
+                    Some(written) => metadata.record_with_metadata(
+                        destination_root,
+                        &dst_path,
+                        TreeMetadataKind::File,
+                        &written,
+                    )?,
+                    None => metadata.record(
+                        destination_root,
+                        &dst_path,
+                        TreeMetadataKind::File,
+                        Vec::new(),
+                    )?,
+                }
             }
         }
     }
@@ -411,20 +415,24 @@ fn materialize_into_inner_impl(
     Ok(())
 }
 
-fn materialize_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+/// Copies one object file into a link entry. Linux returns the copy's
+/// metadata, read from its handle after the last change to it.
+fn materialize_regular_file(src: &Path, dst: &Path) -> Result<Option<std::fs::Metadata>, LpmError> {
     #[cfg(target_os = "linux")]
-    if try_linux_reflink(src, dst)? {
-        return Ok(());
+    {
+        linux_copy::copy_file(src, dst).map(Some)
     }
-
-    std::fs::copy(src, dst).map_err(|copy_err| {
-        LpmError::Store(format!(
-            "failed to copy virtual-store source file {} → {}: {copy_err}",
-            src.display(),
-            dst.display()
-        ))
-    })?;
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::copy(src, dst).map_err(|copy_err| {
+            LpmError::Store(format!(
+                "failed to copy virtual-store source file {} → {}: {copy_err}",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]
@@ -448,80 +456,186 @@ fn os_str_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
-fn try_linux_reflink(src: &Path, dst: &Path) -> Result<bool, LpmError> {
-    use std::collections::HashSet;
-    use std::fs::OpenOptions;
+pub(crate) mod linux_copy {
+    use lpm_common::LpmError;
+    use std::fs::{File, Metadata, OpenOptions};
+    use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::sync::{Mutex, OnceLock};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static UNSUPPORTED_FILESYSTEMS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-    let src_metadata = std::fs::metadata(src).map_err(|error| {
-        LpmError::Store(format!(
-            "failed to inspect reflink source {}: {error}",
-            src.display()
-        ))
-    })?;
-    let device = src_metadata.dev();
-    if UNSUPPORTED_FILESYSTEMS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&device)
-    {
-        return Ok(false);
+    /// Smaller files are copied rather than reflinked. Cloning a file
+    /// written moments earlier first forces its dirty pages to disk, which
+    /// on XFS and btrfs costs more than copying a small file. `copy_file_range`
+    /// can't stand in for the copy: on those file systems it clones too.
+    pub(crate) const MIN_REFLINK_BYTES: u64 = 64 * 1024;
+
+    const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+    /// The last device that refused a reflink, or `u64::MAX`.
+    static NO_REFLINK_DEVICE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static REFLINK_CANDIDATES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
     }
 
-    let source = std::fs::File::open(src).map_err(|error| {
-        LpmError::Store(format!(
-            "failed to open reflink source {}: {error}",
-            src.display()
-        ))
-    })?;
-    let destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dst)
-        .map_err(|error| {
+    pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<Metadata, LpmError> {
+        let failed = |action: &str, error: std::io::Error| {
             LpmError::Store(format!(
-                "failed to create reflink destination {}: {error}",
+                "failed to {action} virtual-store source file {} → {}: {error}",
+                src.display(),
                 dst.display()
             ))
-        })?;
-    const FICLONE: libc::Ioctl = 0x4004_9409;
-    // SAFETY: both descriptors are live regular files opened above, and
-    // FICLONE only reads the source fd and initializes the empty destination.
-    let result = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
-    if result == 0 {
-        std::fs::set_permissions(dst, src_metadata.permissions()).map_err(|error| {
-            let _ = std::fs::remove_file(dst);
-            LpmError::Store(format!(
-                "failed to apply reflink destination mode at {}: {error}",
-                dst.display()
-            ))
-        })?;
-        return Ok(true);
-    }
-
-    let error = std::io::Error::last_os_error();
-    drop(destination);
-    let _ = std::fs::remove_file(dst);
-    match error.raw_os_error() {
-        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => {
-            UNSUPPORTED_FILESYSTEMS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(device);
-            Ok(false)
+        };
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)
+            .map_err(|error| failed("open", error))?;
+        let source_metadata = source
+            .metadata()
+            .map_err(|error| failed("inspect", error))?;
+        if !source_metadata.is_file() {
+            return Err(failed(
+                "copy",
+                std::io::Error::other("the source is not a regular file"),
+            ));
         }
-        Some(libc::EXDEV) => Ok(false),
-        _ => Err(LpmError::Store(format!(
-            "failed to reflink {} → {}: {error}",
-            src.display(),
-            dst.display()
-        ))),
+        let mode = source_metadata.permissions().mode() & 0o7777;
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dst)
+            .map_err(|error| failed("create", error))?;
+        let copied = fill(&mut source, &mut destination, &source_metadata).and_then(|()| {
+            destination.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            destination.metadata()
+        });
+        copied.map_err(|error| {
+            drop(destination);
+            let _ = std::fs::remove_file(dst);
+            failed("copy", error)
+        })
+    }
+
+    fn fill(
+        source: &mut File,
+        destination: &mut File,
+        source_metadata: &Metadata,
+    ) -> std::io::Result<()> {
+        let len = source_metadata.len();
+        if len >= MIN_REFLINK_BYTES
+            && (reflink(source, destination, source_metadata.dev())?
+                || copy_file_range(source, destination, len)?)
+        {
+            return Ok(());
+        }
+        copy_through_buffer(source, destination, len)
+    }
+
+    fn reflink(source: &File, destination: &File, device: u64) -> std::io::Result<bool> {
+        #[cfg(test)]
+        REFLINK_CANDIDATES.with(|candidates| candidates.set(candidates.get() + 1));
+        if NO_REFLINK_DEVICE.load(Ordering::Relaxed) == device {
+            return Ok(false);
+        }
+        const FICLONE: libc::Ioctl = 0x4004_9409;
+        // SAFETY: both descriptors are live regular files, and FICLONE only
+        // reads the source and fills the empty destination.
+        if unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => {
+                NO_REFLINK_DEVICE.store(device, Ordering::Relaxed);
+                Ok(false)
+            }
+            Some(libc::EXDEV) => Ok(false),
+            _ => Err(error),
+        }
+    }
+
+    /// Copies in the kernel. `Ok(false)` when the file system refused
+    /// before any byte moved.
+    fn copy_file_range(source: &File, destination: &File, len: u64) -> std::io::Result<bool> {
+        let mut copied = 0u64;
+        while copied < len {
+            let requested = usize::try_from(len - copied)
+                .unwrap_or(usize::MAX)
+                .min(1 << 30);
+            // SAFETY: both descriptors are live; null offsets use and advance
+            // each file's own position.
+            let result = unsafe {
+                libc::copy_file_range(
+                    source.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    destination.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    requested,
+                    0,
+                )
+            };
+            match result {
+                0 => break,
+                written if written > 0 => copied += written as u64,
+                _ => {
+                    let error = std::io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::EINTR) => {}
+                        Some(
+                            libc::EXDEV
+                            | libc::ENOSYS
+                            | libc::EOPNOTSUPP
+                            | libc::EINVAL
+                            | libc::EPERM,
+                        ) if copied == 0 => return Ok(false),
+                        _ => return Err(error),
+                    }
+                }
+            }
+        }
+        if copied != len {
+            return Err(source_changed());
+        }
+        Ok(true)
+    }
+
+    fn copy_through_buffer(
+        source: &mut File,
+        destination: &mut File,
+        len: u64,
+    ) -> std::io::Result<()> {
+        thread_local! {
+            static BUFFER: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(vec![0; COPY_BUFFER_BYTES]);
+        }
+        BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            let mut copied = 0u64;
+            loop {
+                let read = match source.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
+                destination.write_all(&buffer[..read])?;
+                copied += read as u64;
+            }
+            if copied != len {
+                return Err(source_changed());
+            }
+            Ok(())
+        })
+    }
+
+    fn source_changed() -> std::io::Error {
+        std::io::Error::other("the source changed while it was copied")
     }
 }
 
