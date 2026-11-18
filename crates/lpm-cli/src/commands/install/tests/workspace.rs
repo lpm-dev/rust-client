@@ -926,3 +926,102 @@ fn confirm_multi_member_mutation_decline_on_tty_returns_abort_error() {
         other => panic!("expected Script error, got {other:?}"),
     }
 }
+
+fn member_link(name: &str, dir: &Path) -> WorkspaceMemberLink {
+    WorkspaceMemberLink {
+        name: name.to_string(),
+        link_name: name.to_string(),
+        version: "1.0.0".to_string(),
+        package_dir: dir.to_path_buf(),
+        source_dir: dir.to_path_buf(),
+        optional: false,
+    }
+}
+
+#[test]
+fn file_link_member_extraction_skips_canonicalization_without_local_path_deps() {
+    let members: Vec<WorkspaceMemberLink> = (0..8)
+        .map(|index| {
+            member_link(
+                &format!("member-{index}"),
+                Path::new(&format!("/workspace/packages/member-{index}")),
+            )
+        })
+        .collect();
+    let mut deps = HashMap::from([
+        ("react".to_string(), "^19.0.0".to_string()),
+        ("lodash".to_string(), "npm:lodash@4".to_string()),
+    ]);
+    let mut workspace_member_deps = vec![members[0].clone()];
+    let canonicalized = std::cell::Cell::new(0usize);
+
+    pre_extract_file_link_workspace_members_with(
+        &mut deps,
+        &mut workspace_member_deps,
+        &members,
+        Path::new("/workspace/packages/member-0"),
+        true,
+        |path| {
+            canonicalized.set(canonicalized.get() + 1);
+            Ok(path.to_path_buf())
+        },
+    );
+
+    assert_eq!(
+        canonicalized.get(),
+        0,
+        "an importer without file:/link: deps must not canonicalize every workspace member",
+    );
+    assert_eq!(deps.len(), 2);
+    assert_eq!(workspace_member_deps.len(), 1);
+}
+
+#[test]
+fn file_link_member_extraction_links_local_path_deps_that_resolve_to_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let foo_dir = root.join("packages/foo");
+    let bar_dir = root.join("packages/bar");
+    let outside_dir = root.join("vendor/outside");
+    for path in [&foo_dir, &bar_dir, &outside_dir] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(root.join("vendor/archive.tgz"), b"not a directory").unwrap();
+    let members = vec![member_link("foo", &foo_dir), member_link("bar", &bar_dir)];
+    let mut deps = HashMap::from([
+        ("alias-foo".to_string(), "file:./packages/foo".to_string()),
+        (
+            "bar".to_string(),
+            "link:./packages/../packages/bar".to_string(),
+        ),
+        ("outside".to_string(), "link:./vendor/outside".to_string()),
+        (
+            "archive".to_string(),
+            "file:./vendor/archive.tgz".to_string(),
+        ),
+        ("missing".to_string(), "file:./packages/missing".to_string()),
+        ("react".to_string(), "^19.0.0".to_string()),
+    ]);
+    let mut workspace_member_deps = vec![members[1].clone()];
+
+    pre_extract_file_link_workspace_members(
+        &mut deps,
+        &mut workspace_member_deps,
+        &members,
+        &root,
+        true,
+    );
+
+    let mut remaining: Vec<&str> = deps.keys().map(String::as_str).collect();
+    remaining.sort_unstable();
+    assert_eq!(remaining, vec!["archive", "missing", "outside", "react"]);
+    let links: Vec<(&str, &str)> = workspace_member_deps
+        .iter()
+        .map(|member| (member.link_name.as_str(), member.name.as_str()))
+        .collect();
+    assert_eq!(
+        links,
+        vec![("bar", "bar"), ("alias-foo", "foo")],
+        "an alias gets its own link and a duplicate of an existing (name, realpath) link is dropped",
+    );
+}

@@ -5002,3 +5002,237 @@ fn manifest_free_export_matching_workspace_globs_remains_standalone() {
         export.join(LOCKFILE_NAME)
     );
 }
+
+fn registry_importer(lockfile_version: u32, packages: &[(&str, &str)]) -> Lockfile {
+    let mut lockfile = legacy_lockfile();
+    lockfile.metadata.lockfile_version = lockfile_version;
+    for (name, version) in packages {
+        lockfile.add_package(LockedPackage {
+            instance_id: (lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES)
+                .then(|| instance_id(name)),
+            name: (*name).to_string(),
+            version: (*version).to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..LockedPackage::default()
+        });
+    }
+    lockfile
+}
+
+// Instance-addressed (v13) unions need exact root resolutions to validate;
+// the batch logic is version-independent, so the tests use v12 rows.
+const CURRENT_UNION_VERSION: u32 = LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+
+fn shared_row_union() -> Lockfile {
+    let mut union = legacy_lockfile();
+    for (importer, own) in [
+        ("packages/a", "a-only"),
+        ("packages/b", "b-only"),
+        ("packages/c", "c-only"),
+        ("packages/d", "d-only"),
+    ] {
+        union
+            .absorb_importer(
+                importer,
+                registry_importer(
+                    CURRENT_UNION_VERSION,
+                    &[("shared", "1.0.0"), (own, "1.0.0")],
+                ),
+            )
+            .expect("absorb importer");
+    }
+    union
+}
+
+fn replace_importers_one_prune_at_a_time(
+    mut union: Lockfile,
+    retained: &BTreeSet<String>,
+    replacements: BTreeMap<String, Lockfile>,
+) -> Lockfile {
+    let prune = |union: &mut Lockfile| {
+        let referenced: std::collections::HashSet<String> = union
+            .importers
+            .values()
+            .flat_map(|snapshot| snapshot.locked_packages.iter().cloned())
+            .collect();
+        union
+            .workspace_packages
+            .retain(|id, _| referenced.contains(id));
+    };
+    union
+        .importers
+        .retain(|importer, _| retained.contains(importer));
+    prune(&mut union);
+    for (importer, replacement) in replacements {
+        union.importers.remove(&importer);
+        prune(&mut union);
+        union
+            .absorb_importer(&importer, replacement)
+            .expect("absorb replacement");
+    }
+    union
+}
+
+#[test]
+fn workspace_importer_batch_prunes_shared_rows_only_after_their_last_reference() {
+    let union = shared_row_union();
+    let validated = crate::ValidatedLockfile::from_toml(&union.to_toml().unwrap()).unwrap();
+    let retained: BTreeSet<String> = ["packages/a", "packages/b", "packages/c"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let replacements = BTreeMap::from([
+        (
+            "packages/a".to_string(),
+            registry_importer(CURRENT_UNION_VERSION, &[("a-only", "2.0.0")]),
+        ),
+        (
+            "packages/b".to_string(),
+            registry_importer(
+                CURRENT_UNION_VERSION,
+                &[("shared", "2.0.0"), ("b-only", "1.0.0")],
+            ),
+        ),
+        (
+            "packages/e".to_string(),
+            registry_importer(CURRENT_UNION_VERSION, &[("shared", "1.0.0")]),
+        ),
+    ]);
+
+    let updated = validated
+        .update_workspace_importers(&retained, replacements.clone())
+        .expect("batch replacement");
+
+    assert_eq!(
+        updated,
+        replace_importers_one_prune_at_a_time(union, &retained, replacements),
+    );
+    let mut rows: Vec<String> = updated
+        .workspace_packages
+        .values()
+        .map(|package| format!("{}@{}", package.name, package.version))
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![
+            "a-only@2.0.0",
+            "b-only@1.0.0",
+            "c-only@1.0.0",
+            "shared@1.0.0",
+            "shared@2.0.0",
+        ],
+        "shared@1.0.0 survives through packages/c and packages/e; d-only leaves with packages/d",
+    );
+}
+
+#[test]
+fn workspace_importer_batch_readdresses_rows_after_a_schema_downgrade() {
+    let union = shared_row_union();
+    let validated = crate::ValidatedLockfile::from_toml(&union.to_toml().unwrap()).unwrap();
+    let retained: BTreeSet<String> = union.importers.keys().cloned().collect();
+    let replacements = BTreeMap::from([
+        (
+            "packages/a".to_string(),
+            registry_importer(
+                CURRENT_UNION_VERSION,
+                &[("shared", "1.0.0"), ("a-next", "1.0.0")],
+            ),
+        ),
+        (
+            "packages/b".to_string(),
+            registry_importer(
+                LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS,
+                &[("b-only", "1.0.0")],
+            ),
+        ),
+        (
+            "packages/c".to_string(),
+            registry_importer(CURRENT_UNION_VERSION, &[("c-next", "1.0.0")]),
+        ),
+    ]);
+
+    let updated = validated
+        .update_workspace_importers(&retained, replacements.clone())
+        .expect("batch replacement across a schema downgrade");
+
+    assert_eq!(
+        updated.metadata.lockfile_version,
+        LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS,
+    );
+    assert_eq!(
+        updated,
+        replace_importers_one_prune_at_a_time(union, &retained, replacements),
+    );
+    let encoded = updated.to_toml().expect("readdressed union serializes");
+    crate::ValidatedLockfile::from_toml(&encoded).expect("readdressed union validates");
+}
+
+#[test]
+fn workspace_importer_batch_counts_references_once() {
+    let mut union = legacy_lockfile();
+    let importers: Vec<String> = (0..32).map(|index| format!("packages/m{index}")).collect();
+    for importer in &importers {
+        union
+            .absorb_importer(
+                importer,
+                registry_importer(CURRENT_UNION_VERSION, &[("shared", "1.0.0")]),
+            )
+            .expect("absorb importer");
+    }
+    let validated = crate::ValidatedLockfile::from_toml(&union.to_toml().unwrap()).unwrap();
+    let retained: BTreeSet<String> = importers.iter().cloned().collect();
+    let replacements: BTreeMap<String, Lockfile> = importers
+        .iter()
+        .map(|importer| {
+            (
+                importer.clone(),
+                registry_importer(CURRENT_UNION_VERSION, &[("shared", "2.0.0")]),
+            )
+        })
+        .collect();
+    let counts_before = crate::model::WORKSPACE_REFERENCE_COUNTS.with(std::cell::Cell::get);
+    let scans_before = crate::model::UNION_PEER_SCHEMA_SCANS.with(std::cell::Cell::get);
+
+    let updated = validated
+        .update_workspace_importers(&retained, replacements)
+        .expect("batch replacement");
+
+    assert_eq!(
+        crate::model::WORKSPACE_REFERENCE_COUNTS.with(std::cell::Cell::get) - counts_before,
+        1,
+        "a batch must not rescan every importer after each replacement",
+    );
+    assert_eq!(
+        crate::model::UNION_PEER_SCHEMA_SCANS.with(std::cell::Cell::get) - scans_before,
+        2,
+        "a batch checks the union's peer schemas once, not once per replacement",
+    );
+    assert_eq!(updated.workspace_packages.len(), 1);
+}
+
+#[test]
+fn workspace_importer_batch_refuses_an_older_importer_after_one_brought_structured_peers() {
+    let union = shared_row_union();
+    let validated = crate::ValidatedLockfile::from_toml(&union.to_toml().unwrap()).unwrap();
+    let retained: BTreeSet<String> = union.importers.keys().cloned().collect();
+    let replacements = BTreeMap::from([
+        (
+            "packages/a".to_string(),
+            importer_lockfile("structured-plugin", "1.0.0"),
+        ),
+        (
+            "packages/b".to_string(),
+            registry_importer(
+                LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS,
+                &[("b-only", "1.0.0")],
+            ),
+        ),
+    ]);
+
+    let error = validated
+        .update_workspace_importers(&retained, replacements)
+        .expect_err("a pre-structured importer can't join rows another replacement brought");
+
+    assert!(error.to_string().contains("fresh resolution"), "{error}");
+}

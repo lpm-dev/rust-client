@@ -1067,7 +1067,19 @@ impl Lockfile {
     pub fn absorb_importer(
         &mut self,
         importer: &str,
+        standalone: Lockfile,
+    ) -> Result<(), LockfileError> {
+        self.absorb_importer_with_peer_schemas(importer, standalone, PeerSchemas::UNKNOWN)
+    }
+
+    /// [`Self::absorb_importer`] for a union whose rows are already known
+    /// not to use a peer schema, so the compatibility check skips scanning
+    /// every row for it.
+    fn absorb_importer_with_peer_schemas(
+        &mut self,
+        importer: &str,
         mut standalone: Lockfile,
+        known_absent: PeerSchemas,
     ) -> Result<(), LockfileError> {
         validate_importer_path(importer)?;
         let union_version = self
@@ -1078,25 +1090,16 @@ impl Lockfile {
                 LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
                 LOCKFILE_VERSION,
             );
-        let mut existing_packages = self.packages.iter().chain(self.workspace_packages.values());
-        let existing_has_legacy_peers = existing_packages
-            .clone()
-            .any(|package| !package.peers.is_empty());
-        let existing_has_structured_peers =
-            existing_packages.any(|package| !package.peer_edges.is_empty());
-        let incoming_has_legacy_peers = standalone
-            .packages
-            .iter()
-            .any(|package| !package.peers.is_empty());
-        let incoming_has_structured_peers = standalone
-            .packages
-            .iter()
-            .any(|package| !package.peer_edges.is_empty());
+        let incoming = PeerSchemas::of(&standalone.packages);
         let mixes_incompatible_peer_schemas =
             if union_version >= LOCKFILE_VERSION_WITH_STRUCTURED_PEERS {
-                existing_has_legacy_peers || incoming_has_legacy_peers
+                incoming.legacy
+                    || !known_absent.legacy
+                        && PeerSchemas::union_has(self, |package| !package.peers.is_empty())
             } else {
-                existing_has_structured_peers || incoming_has_structured_peers
+                incoming.structured
+                    || !known_absent.structured
+                        && PeerSchemas::union_has(self, |package| !package.peer_edges.is_empty())
             };
         if mixes_incompatible_peer_schemas {
             return Err(LockfileError::Serialize(format!(
@@ -1282,36 +1285,50 @@ impl Lockfile {
         }
 
         let mut updated = self.clone();
-        updated.replace_workspace_importer_in_place(importer, standalone)?;
+        updated.replace_workspace_importers_in_place([(importer.to_string(), standalone)])?;
         *self = updated;
         Ok(())
     }
 
-    fn replace_workspace_importer_in_place(
+    /// Replace importer projections one after another, pruning each row
+    /// once no importer references it. Rows no importer referenced before
+    /// the batch are pruned too.
+    ///
+    /// Reference counts are taken once for the batch: recomputing the
+    /// referenced set after every replacement would cost importers² on
+    /// a workspace-wide update.
+    fn replace_workspace_importers_in_place(
         &mut self,
-        importer: &str,
-        standalone: Lockfile,
+        replacements: impl IntoIterator<Item = (String, Lockfile)>,
     ) -> Result<(), LockfileError> {
-        validate_importer_path(importer)?;
-        self.importers.remove(importer);
-        self.prune_unreachable_workspace_packages();
-        self.absorb_importer(importer, standalone)
-    }
-
-    fn retain_workspace_importers(&mut self, retained_importers: &BTreeSet<String>) {
-        self.importers
-            .retain(|importer, _| retained_importers.contains(importer));
-        self.prune_unreachable_workspace_packages();
-    }
-
-    fn prune_unreachable_workspace_packages(&mut self) {
-        let referenced = self
-            .importers
-            .values()
-            .flat_map(|snapshot| snapshot.locked_packages.iter().map(String::as_str))
-            .collect::<HashSet<_>>();
-        self.workspace_packages
-            .retain(|id, _| referenced.contains(id.as_str()));
+        let mut references =
+            WorkspacePackageReferences::count(&self.importers, self.workspace_packages.len());
+        references.prune_unreferenced(&mut self.workspace_packages);
+        // Rows leaving the union can't add a peer schema, so absence stays
+        // known until an importer brings one in.
+        let mut absent = PeerSchemas::absent_from_union(self);
+        for (importer, standalone) in replacements {
+            validate_importer_path(&importer)?;
+            if let Some(previous) = self.importers.remove(&importer) {
+                references.release(&previous.locked_packages, &mut self.workspace_packages);
+            }
+            let incoming = PeerSchemas::of(&standalone.packages);
+            let lockfile_version = self.metadata.lockfile_version;
+            self.absorb_importer_with_peer_schemas(&importer, standalone, absent)?;
+            if self.metadata.lockfile_version == lockfile_version {
+                references.retain(&self.importers[&importer].locked_packages);
+                absent.legacy &= !incoming.legacy;
+                absent.structured &= !incoming.structured;
+            } else {
+                // A schema change readdresses every union row.
+                references = WorkspacePackageReferences::count(
+                    &self.importers,
+                    self.workspace_packages.len(),
+                );
+                absent = PeerSchemas::absent_from_union(self);
+            }
+        }
+        Ok(())
     }
 
     /// Materialize the standalone lockfile view consumed by one importer.
@@ -2382,12 +2399,105 @@ impl ValidatedLockfile {
         replacements: BTreeMap<String, Lockfile>,
     ) -> Result<Lockfile, LockfileError> {
         let mut updated = self.0.clone();
-        updated.retain_workspace_importers(retained_importers);
-        for (importer, replacement) in replacements {
-            updated.replace_workspace_importer_in_place(&importer, replacement)?;
-        }
+        updated
+            .importers
+            .retain(|importer, _| retained_importers.contains(importer));
+        updated.replace_workspace_importers_in_place(replacements)?;
         Ok(updated)
     }
+}
+
+/// Which peer schemas a set of package rows uses, or, where a union's rows
+/// are tracked, which ones they are known not to use.
+#[derive(Clone, Copy)]
+struct PeerSchemas {
+    legacy: bool,
+    structured: bool,
+}
+
+impl PeerSchemas {
+    const UNKNOWN: Self = Self {
+        legacy: false,
+        structured: false,
+    };
+
+    fn of(packages: &[LockedPackage]) -> Self {
+        Self {
+            legacy: packages.iter().any(|package| !package.peers.is_empty()),
+            structured: packages
+                .iter()
+                .any(|package| !package.peer_edges.is_empty()),
+        }
+    }
+
+    fn absent_from_union(union: &Lockfile) -> Self {
+        Self {
+            legacy: !Self::union_has(union, |package| !package.peers.is_empty()),
+            structured: !Self::union_has(union, |package| !package.peer_edges.is_empty()),
+        }
+    }
+
+    fn union_has(union: &Lockfile, uses: impl Fn(&LockedPackage) -> bool) -> bool {
+        #[cfg(test)]
+        UNION_PEER_SCHEMA_SCANS.with(|scans| scans.set(scans.get() + 1));
+        union
+            .packages
+            .iter()
+            .chain(union.workspace_packages.values())
+            .any(uses)
+    }
+}
+
+/// How many importer snapshots reference each workspace package row.
+struct WorkspacePackageReferences(HashMap<String, usize>);
+
+impl WorkspacePackageReferences {
+    fn count(importers: &BTreeMap<String, ImporterSnapshot>, rows: usize) -> Self {
+        #[cfg(test)]
+        WORKSPACE_REFERENCE_COUNTS.with(|counts| counts.set(counts.get() + 1));
+        let mut references = HashMap::with_capacity(rows);
+        for snapshot in importers.values() {
+            for id in &snapshot.locked_packages {
+                *references.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        Self(references)
+    }
+
+    fn prune_unreferenced(&self, workspace_packages: &mut BTreeMap<String, LockedPackage>) {
+        workspace_packages.retain(|id, _| self.0.contains_key(id));
+    }
+
+    fn retain(&mut self, ids: &[String]) {
+        for id in ids {
+            *self.0.entry(id.clone()).or_insert(0) += 1;
+        }
+    }
+
+    fn release(
+        &mut self,
+        ids: &[String],
+        workspace_packages: &mut BTreeMap<String, LockedPackage>,
+    ) {
+        for id in ids {
+            let Some(count) = self.0.get_mut(id) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(id);
+                workspace_packages.remove(id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WORKSPACE_REFERENCE_COUNTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static UNION_PEER_SCHEMA_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 impl Default for ValidatedLockfile {
