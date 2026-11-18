@@ -1282,36 +1282,43 @@ impl Lockfile {
         }
 
         let mut updated = self.clone();
-        updated.replace_workspace_importer_in_place(importer, standalone)?;
+        updated.replace_workspace_importers_in_place([(importer.to_string(), standalone)])?;
         *self = updated;
         Ok(())
     }
 
-    fn replace_workspace_importer_in_place(
+    /// Replace importer projections one after another, pruning each row
+    /// once no importer references it. Rows no importer referenced before
+    /// the batch are pruned too.
+    ///
+    /// Reference counts are taken once for the batch: recomputing the
+    /// referenced set after every replacement would cost importers² on
+    /// a workspace-wide update.
+    fn replace_workspace_importers_in_place(
         &mut self,
-        importer: &str,
-        standalone: Lockfile,
+        replacements: impl IntoIterator<Item = (String, Lockfile)>,
     ) -> Result<(), LockfileError> {
-        validate_importer_path(importer)?;
-        self.importers.remove(importer);
-        self.prune_unreachable_workspace_packages();
-        self.absorb_importer(importer, standalone)
-    }
-
-    fn retain_workspace_importers(&mut self, retained_importers: &BTreeSet<String>) {
-        self.importers
-            .retain(|importer, _| retained_importers.contains(importer));
-        self.prune_unreachable_workspace_packages();
-    }
-
-    fn prune_unreachable_workspace_packages(&mut self) {
-        let referenced = self
-            .importers
-            .values()
-            .flat_map(|snapshot| snapshot.locked_packages.iter().map(String::as_str))
-            .collect::<HashSet<_>>();
-        self.workspace_packages
-            .retain(|id, _| referenced.contains(id.as_str()));
+        let mut references =
+            WorkspacePackageReferences::count(&self.importers, self.workspace_packages.len());
+        references.prune_unreferenced(&mut self.workspace_packages);
+        for (importer, standalone) in replacements {
+            validate_importer_path(&importer)?;
+            if let Some(previous) = self.importers.remove(&importer) {
+                references.release(&previous.locked_packages, &mut self.workspace_packages);
+            }
+            let lockfile_version = self.metadata.lockfile_version;
+            self.absorb_importer(&importer, standalone)?;
+            if self.metadata.lockfile_version == lockfile_version {
+                references.retain(&self.importers[&importer].locked_packages);
+            } else {
+                // A schema change readdresses every union row.
+                references = WorkspacePackageReferences::count(
+                    &self.importers,
+                    self.workspace_packages.len(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Materialize the standalone lockfile view consumed by one importer.
@@ -2382,12 +2389,62 @@ impl ValidatedLockfile {
         replacements: BTreeMap<String, Lockfile>,
     ) -> Result<Lockfile, LockfileError> {
         let mut updated = self.0.clone();
-        updated.retain_workspace_importers(retained_importers);
-        for (importer, replacement) in replacements {
-            updated.replace_workspace_importer_in_place(&importer, replacement)?;
-        }
+        updated
+            .importers
+            .retain(|importer, _| retained_importers.contains(importer));
+        updated.replace_workspace_importers_in_place(replacements)?;
         Ok(updated)
     }
+}
+
+/// How many importer snapshots reference each workspace package row.
+struct WorkspacePackageReferences(HashMap<String, usize>);
+
+impl WorkspacePackageReferences {
+    fn count(importers: &BTreeMap<String, ImporterSnapshot>, rows: usize) -> Self {
+        #[cfg(test)]
+        WORKSPACE_REFERENCE_COUNTS.with(|counts| counts.set(counts.get() + 1));
+        let mut references = HashMap::with_capacity(rows);
+        for snapshot in importers.values() {
+            for id in &snapshot.locked_packages {
+                *references.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        Self(references)
+    }
+
+    fn prune_unreferenced(&self, workspace_packages: &mut BTreeMap<String, LockedPackage>) {
+        workspace_packages.retain(|id, _| self.0.contains_key(id));
+    }
+
+    fn retain(&mut self, ids: &[String]) {
+        for id in ids {
+            *self.0.entry(id.clone()).or_insert(0) += 1;
+        }
+    }
+
+    fn release(
+        &mut self,
+        ids: &[String],
+        workspace_packages: &mut BTreeMap<String, LockedPackage>,
+    ) {
+        for id in ids {
+            let Some(count) = self.0.get_mut(id) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(id);
+                workspace_packages.remove(id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WORKSPACE_REFERENCE_COUNTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 impl Default for ValidatedLockfile {

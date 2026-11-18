@@ -852,7 +852,40 @@ pub(super) fn pre_extract_file_link_workspace_members(
     project_dir: &Path,
     json_output: bool,
 ) {
+    pre_extract_file_link_workspace_members_with(
+        deps,
+        workspace_member_deps,
+        all_workspace_members,
+        project_dir,
+        json_output,
+        |path| path.canonicalize(),
+    );
+}
+
+pub(super) fn pre_extract_file_link_workspace_members_with(
+    deps: &mut HashMap<String, String>,
+    workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
+    all_workspace_members: &[WorkspaceMemberLink],
+    project_dir: &Path,
+    json_output: bool,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) {
     if all_workspace_members.is_empty() {
+        return;
+    }
+    // Every importer of a recursive workspace install runs this, so
+    // canonicalizing all members up front costs members² `realpath`s
+    // even though most importers declare no `file:` / `link:` deps.
+    let mut local_path_deps = deps
+        .iter()
+        .filter_map(|(local_name, raw)| {
+            let path = raw
+                .strip_prefix("file:")
+                .or_else(|| raw.strip_prefix("link:"))?;
+            Some((local_name, raw, path))
+        })
+        .peekable();
+    if local_path_deps.peek().is_none() {
         return;
     }
     // Canonicalize where possible; fall back to the lexical path on
@@ -867,26 +900,16 @@ pub(super) fn pre_extract_file_link_workspace_members(
     // to a hard error would break workspaces whose members live behind
     // permission-restricted intermediate dirs (rare but real on
     // monorepo CI).
-    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    // Pre-canonicalize each member's source_dir once for the realpath
-    // comparison loop. For a typical workspace (≤100 members) this is
-    // ≤100 syscalls regardless of the number of root deps.
+    let canonicalize_path = |p: &Path| canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let canonical_members: Vec<(PathBuf, &WorkspaceMemberLink)> = all_workspace_members
         .iter()
         .map(|m| (canonicalize_path(&m.package_dir), m))
         .collect();
 
     let mut to_remove: Vec<(String, WorkspaceMemberLink, String)> = Vec::new();
-    for (local_name, raw) in deps.iter() {
-        let path_str = if let Some(p) = raw.strip_prefix("file:") {
-            p
-        } else if let Some(p) = raw.strip_prefix("link:") {
-            p
-        } else {
-            continue;
-        };
+    for (local_name, raw, path_str) in local_path_deps {
         let abs = project_dir.join(path_str);
-        let Ok(realpath) = abs.canonicalize() else {
+        let Ok(realpath) = canonicalize(&abs) else {
             continue;
         };
         // Only `file:` deps that target a directory participate in
@@ -916,14 +939,16 @@ pub(super) fn pre_extract_file_link_workspace_members(
             raw.clone(),
         ));
     }
+    if to_remove.is_empty() {
+        return;
+    }
 
     // Apply the extraction: remove the dep + push the member link
     // (deduped against existing workspace_member_deps).
-    let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
+    let mut seen: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
         .iter()
         .map(|m| (m.link_name.clone(), canonicalize_path(&m.source_dir)))
         .collect();
-    let mut seen = existing;
     for (dep_name, member_link, raw_spec) in to_remove {
         deps.remove(&dep_name);
         let key = (
