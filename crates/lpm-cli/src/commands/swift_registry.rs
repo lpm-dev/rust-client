@@ -324,7 +324,14 @@ async fn run_in_directory(
         .or(xcode_project.as_deref())
         .and_then(Path::parent)
         .unwrap_or(cwd);
-    preflight_configuration(registry_url, package_dir)?;
+    match &xcode_project {
+        Some(project) => preflight_xcode_configuration(
+            registry_url,
+            package_dir,
+            &crate::xcode_project::native::containers(cwd, project)?,
+        )?,
+        None => preflight_configuration(registry_url, package_dir)?,
+    }
 
     if !json_output {
         install_ui::phase_line(swift_package_manager_phase());
@@ -382,8 +389,6 @@ async fn run_in_directory(
     if !trust.is_pinned() && !json_output {
         install_ui::warn_line(unpinned_signer_warning(host));
     }
-    let project_sets_aside_pin =
-        warn_when_project_sets_aside_pin(package_dir, host, &trust, json_output)?;
 
     let roots_outcome_label = match roots_outcome {
         RootsOutcome::Installed => "installed",
@@ -415,7 +420,6 @@ async fn run_in_directory(
             "trust_anchor": trust_anchor,
             "authentication_outcome": authentication_outcome,
             "signer_trust_policy": if trust.is_pinned() { "error" } else { "silentAllow" },
-            "project_signing_overrides_pin": project_sets_aside_pin,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
@@ -554,7 +558,6 @@ pub(crate) async fn ensure_configured_for_install(
     if trust_outcome == TrustOutcome::Configured && !trust.is_pinned() && !json_output {
         install_ui::warn_line(unpinned_signer_warning(host));
     }
-    warn_when_project_sets_aside_pin(package_dir, host, &trust, json_output)?;
 
     Ok(SwiftRegistrySetupOutcome {
         scope_repaired: !scope_matches,
@@ -619,17 +622,52 @@ pub(crate) fn ensure_xcode_registry_scope(registry_url: &str) -> Result<bool, Lp
     })
 }
 
+/// Checks the user's and the package's SwiftPM configuration before setup
+/// changes anything, and refuses a package whose own signing settings would
+/// keep the registry's pinned roots from applying to it.
 pub(crate) fn preflight_configuration(
     registry_url: &str,
     package_dir: &Path,
 ) -> Result<(), LpmError> {
+    preflight_project_configurations(registry_url, [project_configuration(package_dir)])
+}
+
+/// [`preflight_configuration`] for an Xcode project, whose containers'
+/// SwiftPM configuration Xcode reads as well.
+pub(crate) fn preflight_xcode_configuration(
+    registry_url: &str,
+    package_dir: &Path,
+    containers: &[crate::xcode_project::native::Container],
+) -> Result<(), LpmError> {
+    preflight_project_configurations(
+        registry_url,
+        std::iter::once(project_configuration(package_dir)).chain(
+            containers
+                .iter()
+                .map(crate::xcode_project::native::Container::registries_configuration),
+        ),
+    )
+}
+
+fn project_configuration(package_dir: &Path) -> std::path::PathBuf {
+    package_dir.join(".swiftpm/configuration/registries.json")
+}
+
+fn preflight_project_configurations(
+    registry_url: &str,
+    project_configurations: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Result<(), LpmError> {
     let endpoint = swift_registry_endpoint(registry_url)?;
     let host = swiftpm_registry_host(&endpoint);
     configuration::load(&configuration::global_path()?, host)?;
-    configuration::load(
-        &package_dir.join(".swiftpm/configuration/registries.json"),
-        host,
-    )?;
+    let trust = SignerTrust::for_host(host)?;
+    for path in project_configurations {
+        if signing::project_sets_aside(&configuration::load(&path, host)?, host, &trust) {
+            return Err(LpmError::Registry(project_sets_aside_pin_message(
+                &path, host,
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -681,22 +719,6 @@ fn configure_signing_trust(
     })
 }
 
-/// Warns when the project's own registries.json keeps the pinned roots from
-/// applying to it; whether it does.
-fn warn_when_project_sets_aside_pin(
-    package_dir: &Path,
-    host: &str,
-    trust: &SignerTrust,
-    json_output: bool,
-) -> Result<bool, LpmError> {
-    let path = package_dir.join(".swiftpm/configuration/registries.json");
-    let sets_aside = signing::project_sets_aside(&configuration::load(&path, host)?, host, trust);
-    if sets_aside && !json_output {
-        install_ui::warn_untrusted(&project_sets_aside_pin_warning(&path, host));
-    }
-    Ok(sets_aside)
-}
-
 fn ensure_json_object(
     value: &mut serde_json::Value,
 ) -> Result<&mut serde_json::Map<String, serde_json::Value>, LpmError> {
@@ -712,9 +734,9 @@ fn unpinned_signer_warning(host: &str) -> install_ui::TerminalLine {
     )
 }
 
-fn project_sets_aside_pin_warning(path: &Path, host: &str) -> String {
+fn project_sets_aside_pin_message(path: &Path, host: &str) -> String {
     format!(
-        "{} has its own signing settings, which Swift Package Manager uses in place of yours, so it doesn't check {host}'s releases against LPM's signing root in this project",
+        "{} has its own signing settings, which Swift Package Manager uses in place of yours, so it wouldn't check {host}'s releases against LPM's signing root here. Remove the `security` section from it, moving any settings you need to your user-wide SwiftPM configuration, then try again.",
         path.display()
     )
 }
@@ -1848,6 +1870,147 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
                 .join("security/lpm-trusted-roots")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn a_project_whose_own_signing_settings_set_the_pin_aside_is_refused_before_changes() {
+        let home = TempDir::new().unwrap();
+        let package = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let project_config = package
+            .path()
+            .join(".swiftpm/configuration/registries.json");
+        fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        fs::write(
+            &project_config,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "registries": {"lpmdev": {"url": "https://lpm.dev/api/swift-registry"}},
+                "security": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            ensure_configured_for_install(None, "https://lpm.dev", package.path(), true, true)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("its own signing settings"), "{error}");
+        assert!(error.contains("registries.json"), "{error}");
+        assert!(error.contains("Remove the `security` section"), "{error}");
+        assert!(
+            !test_swiftpm_root(home.path())
+                .join("configuration/registries.json")
+                .exists()
+        );
+        assert!(!pinned_roots_directory(home.path()).exists());
+    }
+
+    #[test]
+    fn null_optional_signing_fields_read_as_absent() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let unset = serde_json::json!({
+            "onUnsigned": null,
+            "onUntrustedCertificate": null,
+            "trustedRootCertificatesPath": null,
+            "includeDefaultTrustedRootCertificates": null
+        });
+        let mut config = pinned_signing_trust(home.path());
+        config["security"]["scopeOverrides"] = serde_json::json!({"lpmdev": {"signing": unset}});
+        config["security"]["packageOverrides"] =
+            serde_json::json!({"lpmdev.logger": {"signing": unset}});
+        assert!(signing::is_applied(&config, "lpm.dev", &lpm_dev_trust()));
+        let path = write_global_signing_trust(home.path(), &config);
+
+        assert_eq!(
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            TrustOutcome::AlreadyConfigured
+        );
+
+        let mut earlier = complete_signing_trust();
+        earlier["security"]["registryOverrides"] =
+            serde_json::json!({"lpm.dev": {"signing": unset}});
+        fs::write(&path, serde_json::to_vec(&earlier).unwrap()).unwrap();
+        assert_eq!(
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            TrustOutcome::Configured
+        );
+        let repaired: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(signing::is_applied(&repaired, "lpm.dev", &lpm_dev_trust()));
+    }
+
+    #[test]
+    fn an_unpinned_registry_leaves_lpmdev_scope_and_package_roots_alone() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let roots = serde_json::json!({
+            "signing": {
+                "trustedRootCertificatesPath": "/elsewhere",
+                "includeDefaultTrustedRootCertificates": true
+            }
+        });
+        let mut config = complete_signing_trust();
+        config["security"]["scopeOverrides"] = serde_json::json!({"lpmdev": roots});
+        config["security"]["packageOverrides"] = serde_json::json!({"lpmdev.logger": roots});
+        let path = write_global_signing_trust(home.path(), &config);
+
+        assert_eq!(
+            configure_signing_trust("127.0.0.1", &SignerTrust::Unpinned, true).unwrap(),
+            TrustOutcome::AlreadyConfigured
+        );
+        let retained: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(retained["security"]["scopeOverrides"]["lpmdev"], roots);
+        assert_eq!(
+            retained["security"]["packageOverrides"]["lpmdev.logger"],
+            roots
+        );
+    }
+
+    #[test]
+    fn the_roots_path_swiftpm_reads_is_plain() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let SignerTrust::Pinned { directory, .. } = lpm_dev_trust() else {
+            panic!("lpm.dev must be pinned");
+        };
+        let path = directory.to_str().unwrap();
+        assert!(!path.starts_with(r"\\?\"), "{path}");
+        assert!(directory.is_absolute(), "{path}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_roots_refuse_a_linked_lock_file() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let directory = pinned_roots_directory(home.path());
+        fs::create_dir_all(&directory).unwrap();
+        let elsewhere = home.path().join("elsewhere.lock");
+        fs::write(&elsewhere, "unrelated").unwrap();
+        std::os::unix::fs::symlink(
+            &elsewhere,
+            directory.parent().unwrap().join(".lpm-trusted-roots.lock"),
+        )
+        .unwrap();
+
+        assert!(signing::install_roots(&lpm_dev_trust(), false).is_err());
+        assert_eq!(fs::read_to_string(elsewhere).unwrap(), "unrelated");
+        assert!(!built_in_root_path(home.path()).exists());
+    }
+
+    #[test]
+    fn a_directory_at_a_root_s_name_is_refused_with_a_remedy() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        fs::create_dir_all(built_in_root_path(home.path())).unwrap();
+
+        let error = signing::install_roots(&lpm_dev_trust(), false).unwrap_err();
+
+        assert!(error.to_string().contains("remove it"), "{error}");
     }
 
     #[test]

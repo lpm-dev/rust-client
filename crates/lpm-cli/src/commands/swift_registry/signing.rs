@@ -108,8 +108,7 @@ pub(super) fn install_roots(trust: &SignerTrust, force: bool) -> Result<RootsOut
     std::fs::create_dir_all(security).map_err(|error| roots_error(security, error))?;
     real_directory(roots_parent)?;
     real_directory(directory)?;
-    let _lock =
-        lpm_common::paths::acquire_single_file_exclusive_lock(roots_parent.join(ROOTS_LOCK))?;
+    let _lock = super::configuration::exclusive_lock(&roots_parent.join(ROOTS_LOCK))?;
 
     let expected: Vec<(String, &[u8])> = roots
         .iter()
@@ -166,24 +165,27 @@ fn real_directory(path: &Path) -> Result<(), LpmError> {
     }
 }
 
-/// Removes every entry of `directory` that isn't one of the `expected`
-/// roots; whether it removed any.
+/// Removes every entry of `directory` but a regular file named for one of
+/// the `expected` roots; whether it removed any.
 fn remove_other_entries(directory: &Path, expected: &[(String, &[u8])]) -> Result<bool, LpmError> {
     let mut removed = false;
     let entries = std::fs::read_dir(directory).map_err(|error| roots_error(directory, error))?;
     for entry in entries {
         let entry = entry.map_err(|error| roots_error(directory, error))?;
-        let name = entry.file_name();
-        if expected
-            .iter()
-            .any(|(expected, _)| name.to_str() == Some(expected.as_str()))
-        {
-            continue;
-        }
         let path = entry.path();
         let metadata =
             std::fs::symlink_metadata(&path).map_err(|error| roots_error(&path, error))?;
-        if metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata) {
+        let linked = lpm_common::is_symlink_or_junction(&metadata);
+        let name = entry.file_name();
+        if metadata.is_file()
+            && !linked
+            && expected
+                .iter()
+                .any(|(expected, _)| name.to_str() == Some(expected.as_str()))
+        {
+            continue;
+        }
+        if metadata.is_dir() && !linked {
             return Err(roots_error(
                 &path,
                 "SwiftPM reads every entry here as a trusted root, so this directory can't stay; remove it",
@@ -415,7 +417,10 @@ fn overrides_set(
         .flatten()
         .filter(|(key, _)| matches(key))
         .filter_map(|(_, entry)| entry.get("signing"))
-        .any(|signing| keys.iter().any(|key| signing.get(*key).is_some()))
+        .any(|signing| {
+            keys.iter()
+                .any(|key| signing.get(*key).is_some_and(|value| !value.is_null()))
+        })
 }
 
 fn roots_path(directory: &Path) -> Result<&str, LpmError> {

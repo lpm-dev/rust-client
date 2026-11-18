@@ -206,9 +206,11 @@ pub(super) async fn run_swift_install_xcode_batch(
     options: SwiftInstallOptions<'_>,
 ) -> Result<serde_json::Value, LpmError> {
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
-    crate::commands::swift_registry::preflight_configuration(
+    let containers = crate::xcode_project::native::containers(project_dir, xcodeproj_path)?;
+    crate::commands::swift_registry::preflight_xcode_configuration(
         options.client.base_url(),
         &project_root.join(crate::swift_manifest::LPM_DEPS_REL_PATH),
+        &containers,
     )?;
     let prepared = prepare_swift_installs(requests, true)?;
     let wrapper = crate::swift_manifest::ensure_wrapper_package(project_root)?;
@@ -231,7 +233,6 @@ pub(super) async fn run_swift_install_xcode_batch(
     setup.include_scope_repair(
         crate::commands::swift_registry::ensure_xcode_registry_scope(options.client.base_url())?,
     );
-    let containers = crate::xcode_project::native::containers(project_dir, xcodeproj_path)?;
     let mut platforms = crate::xcode_project::deployment_targets(xcodeproj_path)?;
     for package in &prepared {
         for platform in package.platforms {

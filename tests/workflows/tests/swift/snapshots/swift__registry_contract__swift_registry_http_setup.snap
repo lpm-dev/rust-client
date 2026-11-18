@@ -13,6 +13,5 @@ expression: json
   "signing_trust_outcome": "configured",
   "trust_anchor": "insecure_http",
   "authentication_outcome": "skipped_http",
-  "signer_trust_policy": "silentAllow",
-  "project_signing_overrides_pin": false
+  "signer_trust_policy": "silentAllow"
 }

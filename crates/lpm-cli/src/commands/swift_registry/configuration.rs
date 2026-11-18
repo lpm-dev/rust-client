@@ -119,18 +119,19 @@ fn validate(path: &Path, value: &Value, host: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// SwiftPM reads a signing field that's `null` as one that's absent.
 fn validate_signing(path: &Path, signing: &Value, location: &str) -> Result<(), LpmError> {
+    let set = |key: &str| signing.get(key).filter(|value| !value.is_null());
     for key in [
         "onUnsigned",
         "onUntrustedCertificate",
         "trustedRootCertificatesPath",
     ] {
-        validate_string(path, signing, key, location)?;
+        if set(key).is_some_and(|value| !value.is_string()) {
+            return Err(invalid(path, format!("{location}.{key} must be a string")));
+        }
     }
-    if signing
-        .get("includeDefaultTrustedRootCertificates")
-        .is_some_and(|value| !value.is_boolean())
-    {
+    if set("includeDefaultTrustedRootCertificates").is_some_and(|value| !value.is_boolean()) {
         return Err(invalid(
             path,
             format!("{location}.includeDefaultTrustedRootCertificates must be a boolean"),
@@ -220,14 +221,11 @@ fn parse(path: &Path, original: Option<&str>, host: &str) -> Result<Value, LpmEr
     Ok(config)
 }
 
-pub(super) fn update(
-    path: &Path,
-    host: &str,
-    mutate: impl FnOnce(&mut Value) -> Result<(), LpmError>,
-) -> Result<bool, LpmError> {
-    load(path, host)?;
-    directories(path, true)?;
-    let lock_path = path.with_file_name(".lpm-registries.lock");
+/// Holds the lock file at `lock_path`, which must be a regular file and is
+/// never followed through a link.
+pub(super) fn exclusive_lock(
+    lock_path: &Path,
+) -> Result<lpm_common::paths::SingleFileExclusiveLockHandle, LpmError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -243,10 +241,20 @@ pub(super) fn update(
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let lock_file = options
-        .open(&lock_path)
-        .map_err(|error| invalid(&lock_path, error))?;
-    regular_file(&lock_path, &lock_file.metadata()?)?;
-    let _guard = lpm_common::paths::acquire_single_file_exclusive_lock_from_file(lock_file)?;
+        .open(lock_path)
+        .map_err(|error| invalid(lock_path, error))?;
+    regular_file(lock_path, &lock_file.metadata()?)?;
+    lpm_common::paths::acquire_single_file_exclusive_lock_from_file(lock_file)
+}
+
+pub(super) fn update(
+    path: &Path,
+    host: &str,
+    mutate: impl FnOnce(&mut Value) -> Result<(), LpmError>,
+) -> Result<bool, LpmError> {
+    load(path, host)?;
+    directories(path, true)?;
+    let _guard = exclusive_lock(&path.with_file_name(".lpm-registries.lock"))?;
     let original = read(path)?;
     let mut config = parse(path, original.as_deref(), host)?;
     let before = config.clone();

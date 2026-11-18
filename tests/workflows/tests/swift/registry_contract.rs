@@ -189,35 +189,67 @@ async fn swift_registry_replaces_lpm_dev_s_earlier_silent_allow_and_unused_certi
 }
 
 #[tokio::test]
-async fn swift_registry_warns_when_the_project_s_own_signing_settings_set_the_pin_aside() {
+async fn swift_registry_refuses_a_project_whose_own_signing_settings_set_the_pin_aside() {
     let project = swift_project();
+    let project_config = serde_json::json!({
+        "version": 1,
+        "registries": {"lpmdev": {"url": format!("{LPM_DEV}/api/swift-registry")}},
+        "security": {}
+    })
+    .to_string();
+    project.write_file(".swiftpm/configuration/registries.json", &project_config);
+
+    let mut command = lpm_with_registry(&project, LPM_DEV);
+    configure_fake_swift(&mut command, &project, &[], 0);
+    let output = command.args(["swift-registry", "--json"]).output().unwrap();
+
+    assert!(!output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error = json["error"].as_str().unwrap();
+    assert!(error.contains("has its own signing settings"), "{error}");
+    assert!(error.contains("Remove the `security` section"), "{error}");
+    assert_eq!(
+        project.read_file(".swiftpm/configuration/registries.json"),
+        project_config
+    );
+    assert!(
+        !swiftpm_home(&project)
+            .join("configuration/registries.json")
+            .exists()
+    );
+    assert!(!lpm_dev_roots_directory(&project).exists());
+}
+
+#[tokio::test]
+async fn swift_registry_refuses_an_xcode_project_whose_shared_signing_settings_set_the_pin_aside() {
+    let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "MyApp");
+    let shared =
+        "MyApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/configuration/registries.json";
     project.write_file(
-        ".swiftpm/configuration/registries.json",
+        shared,
         &serde_json::json!({
             "version": 1,
-            "registries": {"lpmdev": {"url": format!("{LPM_DEV}/api/swift-registry")}},
-            "security": {"default": {"signing": {"onUnsigned": "warn"}}}
+            "registries": {},
+            "security": {"default": {"signing": {"onUntrustedCertificate": "warn"}}}
         })
         .to_string(),
     );
 
     let mut command = lpm_with_registry(&project, LPM_DEV);
     configure_fake_swift(&mut command, &project, &[], 0);
-    let output = command.args(["swift-registry"]).output().unwrap();
-    assert!(output.status.success(), "{}", combined_output(&output));
-    assert!(
-        combined_output(&output).contains("has its own signing settings"),
-        "{}",
-        combined_output(&output)
-    );
-
-    let mut command = lpm_with_registry(&project, LPM_DEV);
-    configure_fake_swift(&mut command, &project, &[], 0);
     let output = command.args(["swift-registry", "--json"]).output().unwrap();
-    assert!(output.status.success(), "{}", combined_output(&output));
+
+    assert!(!output.status.success(), "{}", combined_output(&output));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["project_signing_overrides_pin"], true);
-    assert_lpm_dev_is_pinned(&project);
+    let error = json["error"].as_str().unwrap();
+    assert!(error.contains("xcshareddata"), "{error}");
+    assert!(error.contains("has its own signing settings"), "{error}");
+    assert!(
+        !swiftpm_home(&project)
+            .join("configuration/registries.json")
+            .exists()
+    );
 }
 
 #[tokio::test]

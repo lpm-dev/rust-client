@@ -9,11 +9,22 @@ pub(crate) struct Container {
 
 impl Container {
     pub(crate) fn lockfile(&self) -> PathBuf {
+        self.swiftpm_directory().join("Package.resolved")
+    }
+
+    /// The SwiftPM configuration Xcode reads for this container, which takes
+    /// the place of the package's own.
+    pub(crate) fn registries_configuration(&self) -> PathBuf {
+        self.swiftpm_directory()
+            .join("configuration")
+            .join("registries.json")
+    }
+
+    fn swiftpm_directory(&self) -> PathBuf {
         if self.workspace {
-            self.path.join("xcshareddata/swiftpm/Package.resolved")
+            self.path.join("xcshareddata/swiftpm")
         } else {
-            self.path
-                .join("project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+            self.path.join("project.xcworkspace/xcshareddata/swiftpm")
         }
     }
 
