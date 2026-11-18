@@ -483,7 +483,7 @@ test("release metadata accepts only whole, valid dispatch inputs when its script
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-metadata-"));
   const script = path.join(directory, "metadata.sh");
   fs.writeFileSync(script, scripts[0].script.replace(/^ {10}/gm, ""));
-  const run = (mode, version, sourceRunId) => {
+  const run = (mode, version, sourceRunId, channel = "stable") => {
     const output = path.join(directory, "output");
     fs.rmSync(output, { force: true });
     const result = spawnSync("bash", ["-e", script], {
@@ -494,7 +494,7 @@ test("release metadata accepts only whole, valid dispatch inputs when its script
         GITHUB_REF: "refs/heads/main",
         GITHUB_OUTPUT: output,
         GITHUB_REPOSITORY: "lpm-dev/rust-client",
-        INPUT_CHANNEL: "stable",
+        INPUT_CHANNEL: channel,
         INPUT_MODE: mode,
         INPUT_VERSION: version,
         INPUT_SOURCE_RUN_ID: sourceRunId,
@@ -511,8 +511,13 @@ test("release metadata accepts only whole, valid dispatch inputs when its script
     const recovery = run("npm-publish-only", "0.88.0", "456");
     assert.equal(recovery.status, 0, recovery.stderr);
     assert.match(recovery.written, /^source_run_id=456$/m);
+    const nightly = "0.88.0-nightly.20261119.270.abcdef0";
+    const nightlyRecovery = run("npm-publish-only", nightly, "789", "nightly");
+    assert.equal(nightlyRecovery.status, 0, nightlyRecovery.stderr);
+    assert.match(nightlyRecovery.written, /^npm_tag=nightly$/m);
+    assert.match(nightlyRecovery.written, new RegExp(`^version=${nightly.replaceAll(".", "\\.")}$`, "m"));
 
-    for (const [mode, version, sourceRunId] of [
+    for (const [mode, version, sourceRunId, channel = "stable"] of [
       ["promote", "0.88.0", "12a3"],
       ["promote", "0.88.0\ntag=v9.9.9", "123"],
       ["promote", "0.88.0", ""],
@@ -520,9 +525,13 @@ test("release metadata accepts only whole, valid dispatch inputs when its script
       ["promote", "0.88.0", "123\n456"],
       ["candidate", "0.88.0", "123"],
       ["unknown", "0.88.0", "123"],
+      ["npm-publish-only", `${"0.88.0-nightly.20261119.270.abcdef0"}\ntag=v9.9.9`, "789", "nightly"],
+      ["npm-publish-only", "0.88.0", "789", "nightly"],
+      ["promote", "0.88.0-nightly.20261119.270.abcdef0", "789", "nightly"],
+      ["promote", "0.88.0", "123", "beta"],
     ]) {
-      const refused = run(mode, version, sourceRunId);
-      const label = JSON.stringify({ mode, version, sourceRunId });
+      const refused = run(mode, version, sourceRunId, channel);
+      const label = JSON.stringify({ mode, version, sourceRunId, channel });
       assert.notEqual(refused.status, 0, `${label} must be refused`);
       assert.equal(refused.written, "", `${label} must write no outputs`);
     }
