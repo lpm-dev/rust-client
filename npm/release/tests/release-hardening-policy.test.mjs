@@ -632,22 +632,29 @@ test("the stable signer script passes cosign the exact identity and refuses a ma
   }
 });
 
-test("the Homebrew formula takes its checksums from the manifest the promotion verified", () => {
+test("the Homebrew formula takes its checksums from the published release, verified against the promoted commit", () => {
   const workflow = read(".github/workflows/release.yml");
   const job = jobsOf(workflow).find(([name]) => name === "update-homebrew")?.[1];
   assert.ok(job, "missing update-homebrew job");
 
   assert.doesNotMatch(job, /mode == 'full'/, "stable releases are never built in full mode");
   assert.match(job, /needs\.release-metadata\.outputs\.mode == 'promote' &&/);
-  assert.match(job, /ARTIFACT_ID: \$\{\{ needs\.stage-promotion-release\.outputs\.artifact_id \}\}/);
-  assert.match(job, /scripts\/ci\/download-verified-artifact\.sh\n\s+"\$GITHUB_REPOSITORY" "\$ARTIFACT_ID" "\$ARTIFACT_DIGEST" promotion-github-release/);
-  assert.match(job, /cmp promotion-github-release\/SHA256SUMS\.txt "\$RUNNER_TEMP\/published\/SHA256SUMS\.txt"/);
+  assert.match(job, /SOURCE_SHA: \$\{\{ needs\.prepare-promotion\.outputs\.source_sha \}\}/);
+  // A retry must work for as long as the release exists, so the job reads
+  // no artifact with a short retention.
+  assert.doesNotMatch(job, /download-verified-artifact|promotion-github-release|stage-promotion-release/);
   assert.match(job, /\[ "\$target_commit" != "\$SOURCE_SHA" \]/);
-  assert.match(job, /scripts\/ci\/verify-release-signing-policy\.sh \\\n\s+promotion-github-release\/lpm-linux-x64/);
-  assert.match(job, /' \\\n\s+promotion-github-release\/SHA256SUMS\.txt\)/);
-  assert.doesNotMatch(job, /releases\/download/, "the published manifest is read through the API, not re-trusted by URL");
+  assert.match(job, /--pattern SHA256SUMS\.txt --pattern SHA256SUMS\.txt\.sigstore --pattern lpm-linux-x64/);
+  assert.match(job, /grep -E '\^\[0-9a-f\]\{64\}  lpm-linux-x64\$' SHA256SUMS\.txt \| sha256sum --check --strict/);
+  assert.doesNotMatch(job, /releases\/download/, "the published release is read through the API, not by URL");
 
-  const order = ["download-verified-artifact.sh", "cmp promotion-github-release", "verify-stable-release-signer.sh", "verify-release-signing-policy.sh", "export_manifest_hash lpm-darwin-arm64.zip", "Create a token for the Homebrew tap"];
+  const order = [
+    "verify-stable-release-signer.sh",
+    "sha256sum --check --strict",
+    "verify-release-signing-policy.sh",
+    "export_manifest_hash lpm-darwin-arm64.zip",
+    "Create a token for the Homebrew tap",
+  ];
   const positions = order.map((needle) => job.indexOf(needle));
   assert.ok(positions.every((position) => position !== -1), JSON.stringify(positions));
   assert.deepEqual([...positions].sort((a, b) => a - b), positions, "checks run before the checksums are exported and dispatched");

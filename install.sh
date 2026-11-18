@@ -517,35 +517,36 @@ elif [ -n "$SHA_TOOL" ]; then
   fi
 fi
 
-# The one identity each release was signed with: release.yml in this
-# repository, on main, run by hand for a stable release and by the schedule
-# or by hand for a nightly. When the installer looks up the latest stable
-# release itself, the signature must also be for the commit that release
-# records. Stable releases up to v0.76.5 were signed from their own tag by
-# a tag push. The staged version check below binds an explicit version.
+# The identities releases are signed with: release.yml in this repository,
+# run from main by hand for a stable release, and by the schedule or by hand
+# for a nightly. Most stable releases before v0.77.0 were signed from their
+# own tag by a tag push, and v0.60.0, v0.61.0 and v0.68.0 from main by hand.
+# When the installer looks up the latest stable release itself, the
+# signature must also be for the commit that release records. An explicit
+# version isn't bound to a commit: a build the release workflow signed for
+# that version passes, and the staged check below confirms the version.
 verify_manifest_signer() {
   if [ "$RESOLVED_CHANNEL" = "stable" ] && version_lt "$VERSION" "v0.77.0"; then
-    signing_ref="refs/tags/$VERSION"
-    signing_triggers="push"
+    signers="refs/tags/$VERSION@push refs/heads/main@workflow_dispatch"
   elif [ "$RESOLVED_CHANNEL" = "stable" ]; then
-    signing_ref="refs/heads/main"
-    signing_triggers="workflow_dispatch"
+    signers="refs/heads/main@workflow_dispatch"
   else
-    signing_ref="refs/heads/main"
-    signing_triggers="schedule workflow_dispatch"
+    signers="refs/heads/main@schedule refs/heads/main@workflow_dispatch"
   fi
-  set -- \
-    --bundle "$BUNDLE_TMP" \
-    --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@$signing_ref" \
-    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    --certificate-github-workflow-repository "$REPO" \
-    --certificate-github-workflow-ref "$signing_ref"
-  if [ -n "$RELEASE_COMMIT" ]; then
-    set -- "$@" --certificate-github-workflow-sha "$RELEASE_COMMIT"
-  fi
-  for signing_trigger in $signing_triggers; do
-    if cosign verify-blob "$@" --certificate-github-workflow-trigger "$signing_trigger" \
-      "$MANIFEST_TMP" >/dev/null 2>&1; then
+  for signer in $signers; do
+    signing_ref=${signer%@*}
+    signing_trigger=${signer##*@}
+    set -- \
+      --bundle "$BUNDLE_TMP" \
+      --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@$signing_ref" \
+      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+      --certificate-github-workflow-repository "$REPO" \
+      --certificate-github-workflow-ref "$signing_ref" \
+      --certificate-github-workflow-trigger "$signing_trigger"
+    if [ -n "$RELEASE_COMMIT" ]; then
+      set -- "$@" --certificate-github-workflow-sha "$RELEASE_COMMIT"
+    fi
+    if cosign verify-blob "$@" "$MANIFEST_TMP" >/dev/null 2>&1; then
       return 0
     fi
   done

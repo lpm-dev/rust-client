@@ -1931,9 +1931,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 const RELEASE_WORKFLOW_BRANCH_REF: &str = "refs/heads/main";
 
 /// The last stable release signed from its own tag. Every later release
-/// is signed from `refs/heads/main`, so a tag-signed attestation for a
-/// newer version can only come from a tag pushed outside the release
-/// process.
+/// is signed only from `refs/heads/main`.
 const LAST_TAG_SIGNED_RELEASE: &str = "0.76.5";
 
 fn signed_from_its_tag(version: &str) -> bool {
@@ -4893,7 +4891,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             Some(FIXTURE_SOURCE_COMMIT),
         )
         .expect_err("a certificate without Fulcio build claims can't be bound to a release");
-        assert!(err.to_string().contains("certificate"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("the signing certificate has no Fulcio source repository extension"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4954,6 +4956,70 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 runner_environment: Some("github-hosted".to_string()),
             }
         );
+    }
+
+    /// Real published release assets: `(manifest, bundle)`. Refresh with
+    /// `gh release download <tag> -R lpm-dev/rust-client -p 'SHA256SUMS.txt*'`.
+    fn real_release_assets(manifest: &str, bundle: &str) -> (Vec<u8>, Vec<u8>) {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        (
+            std::fs::read(fixtures.join("release_manifests").join(manifest))
+                .expect("manifest fixture must exist"),
+            std::fs::read(fixtures.join("sigstore_bundles").join(bundle))
+                .expect("bundle fixture must exist"),
+        )
+    }
+
+    #[test]
+    fn real_tag_signed_release_v0_76_5_verifies_as_a_tag_push() {
+        let (manifest, bundle) = real_release_assets(
+            "lpm-v0.76.5-SHA256SUMS.txt",
+            "22-real-lpm-release-v0.76.5.json",
+        );
+        let release = github_release(
+            "2026-08-28T06:16:00Z",
+            Some("faa77c3cb0ccea39886f12e7005575bae4273505"),
+        );
+        let verified = verify_release_manifest("0.76.5", &manifest, &bundle, &release)
+            .expect("the last tag-signed release must satisfy the self-update policy");
+        assert_eq!(verified.workflow_ref.as_deref(), Some("refs/tags/v0.76.5"));
+        assert_eq!(
+            verified.source_commit,
+            "faa77c3cb0ccea39886f12e7005575bae4273505"
+        );
+        let certificate = verify_sigstore_bundle(
+            &bundle,
+            &IdentityExpectations::none(),
+            VerifyOptions::strict(),
+        )
+        .unwrap();
+        assert_eq!(certificate.build.build_trigger.as_deref(), Some("push"));
+    }
+
+    #[test]
+    fn real_scheduled_nightly_verifies() {
+        let version = "0.86.0-nightly.20261109.260.daa536a";
+        let (manifest, bundle) = real_release_assets(
+            "lpm-v0.86.0-nightly.20261109.260.daa536a-SHA256SUMS.txt",
+            "23-real-lpm-nightly-v0.86.0-nightly.20261109.260.daa536a.json",
+        );
+        let release = github_release(
+            "2026-11-09T13:26:19Z",
+            Some("daa536a898e160442cbab72191131164c3e7656a"),
+        );
+        let verified = verify_release_manifest(version, &manifest, &bundle, &release)
+            .expect("a scheduled nightly must satisfy the self-update policy");
+        assert_eq!(
+            verified.source_commit,
+            "daa536a898e160442cbab72191131164c3e7656a"
+        );
+        let certificate = verify_sigstore_bundle(
+            &bundle,
+            &IdentityExpectations::none(),
+            VerifyOptions::strict(),
+        )
+        .unwrap();
+        assert_eq!(certificate.build.build_trigger.as_deref(), Some("schedule"));
     }
 
     #[test]

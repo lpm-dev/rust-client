@@ -1334,6 +1334,19 @@ case "$(tr '\n' ' ' < "$cosign_state/cosign-args")" in
   *--certificate-github-workflow-sha*) fail "an inherited RELEASE_COMMIT reached cosign" ;;
 esac
 
+# Most releases before v0.77.0 were signed from their tag by a tag push;
+# v0.60.0, v0.61.0 and v0.68.0 were signed from main by hand.
+write_signed_release "$fdir" 'main-signed-legacy-binary-bytes' v0.60.0
+rm -f "$cosign_state/cosign-calls"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSED_TRIGGER=push \
+  LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.60.0 run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSED_TRIGGER LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a release before v0.77.0 signed from main must verify: $RUN_OUT"
+grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v0.60.0 .*--certificate-github-workflow-trigger push ' \
+  "$cosign_state/cosign-calls" || fail "a release before v0.77.0 is first checked against its tag"
+grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main .*--certificate-github-workflow-trigger workflow_dispatch ' \
+  "$cosign_state/cosign-calls" || fail "a release before v0.77.0 is then checked as signed from main by hand"
+
 # A nightly is scheduled or started by hand, and nothing else.
 write_signed_release "$fdir" 'nightly-trigger-binary-bytes' "$NIGHTLY_VERSION"
 rm -f "$cosign_state/cosign-calls"

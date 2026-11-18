@@ -2989,7 +2989,6 @@ jobs:
       - prepare-promotion
       - publish-promotion-platform
       - release-metadata
-      - stage-promotion-release
     if: >-
       always() &&
       needs.release-metadata.outputs.should_release == 'true' &&
@@ -3000,7 +2999,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      actions: read
       contents: read
     env:
       RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
@@ -3014,19 +3012,10 @@ jobs:
         with:
           cosign-release: "v3.0.6"
 
-      - name: Download promotion-time GitHub assets
-        env:
-          ARTIFACT_DIGEST: ${{ needs.stage-promotion-release.outputs.artifact_digest }}
-          ARTIFACT_ID: ${{ needs.stage-promotion-release.outputs.artifact_id }}
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          scripts/ci/download-verified-artifact.sh
-          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" promotion-github-release
-
-      # The formula's checksums come from the manifest the promotion verified.
-      # The published manifest must be the same bytes, signed by the stable
-      # release identity, and accepted by the self-update policy shipped in the
-      # release itself.
+      # The formula's checksums come from the published manifest. It must be
+      # signed by the stable release identity at the promoted commit, and
+      # accepted by the self-update policy shipped in the release. The job
+      # reads only the published release, so a retry works as long as it exists.
       - name: Verify the published release and export Homebrew checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3042,20 +3031,20 @@ jobs:
             exit 1
           fi
 
-          mkdir "$RUNNER_TEMP/published"
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/published" \
-            --pattern SHA256SUMS.txt --pattern SHA256SUMS.txt.sigstore
-          cmp promotion-github-release/SHA256SUMS.txt "$RUNNER_TEMP/published/SHA256SUMS.txt"
+          published="$RUNNER_TEMP/published"
+          mkdir "$published"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$published" \
+            --pattern SHA256SUMS.txt --pattern SHA256SUMS.txt.sigstore --pattern lpm-linux-x64
           scripts/ci/verify-stable-release-signer.sh \
-            "$RUNNER_TEMP/published/SHA256SUMS.txt" \
-            "$RUNNER_TEMP/published/SHA256SUMS.txt.sigstore" \
+            "$published/SHA256SUMS.txt" \
+            "$published/SHA256SUMS.txt.sigstore" \
             "$SOURCE_SHA"
-          (cd promotion-github-release && grep -E '^[0-9a-f]{64}  lpm-linux-x64$' SHA256SUMS.txt | sha256sum --check --strict)
+          (cd "$published" && grep -E '^[0-9a-f]{64}  lpm-linux-x64$' SHA256SUMS.txt | sha256sum --check --strict)
           scripts/ci/verify-release-signing-policy.sh \
-            promotion-github-release/lpm-linux-x64 \
+            "$published/lpm-linux-x64" \
             "$RELEASE_VERSION" \
-            "$RUNNER_TEMP/published/SHA256SUMS.txt" \
-            "$RUNNER_TEMP/published/SHA256SUMS.txt.sigstore" \
+            "$published/SHA256SUMS.txt" \
+            "$published/SHA256SUMS.txt.sigstore" \
             "$target_commit" \
             "$published_at"
 
@@ -3064,7 +3053,7 @@ jobs:
             local env_name="$2"
             local hash
             hash=$(awk -v p="$binary" '$2 == p { print $1; count++ } END { if (count != 1) exit 1 }' \
-              promotion-github-release/SHA256SUMS.txt) || {
+              "$published/SHA256SUMS.txt") || {
               echo "::error::SHA256SUMS.txt must contain exactly one entry for ${binary}"
               exit 1
             }
