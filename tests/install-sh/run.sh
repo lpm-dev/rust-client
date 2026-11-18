@@ -1151,6 +1151,9 @@ echo "$RUN_OUT" | grep -q "couldn't run the downloaded binary to check its versi
   || fail "an unrunnable binary must not be reported as another release: $RUN_OUT"
 echo "$RUN_OUT" | grep -q "cannot execute on this system" \
   || fail "the binary's own error must be shown: $RUN_OUT"
+if [ "$HOST_OS" = "Darwin" ]; then staged_parent=".lpm/libexec"; else staged_parent=".lpm/bin"; fi
+echo "$RUN_OUT" | grep -q "$staged_parent doesn't allow running programs" \
+  || fail "the message must name the directory the binary ran from: $RUN_OUT"
 rm -rf "$fdir"
 pass "a binary that can't run is reported as such"
 
@@ -1178,7 +1181,9 @@ fi
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 write_signed_release "$fdir" 'notice-binary-bytes' "$FIXTURE_VERSION"
-notice_executable=$(printf '#!/bin/sh\n# notice-binary-bytes\necho '"'"'lpm %s'"'"'\n[ -n "${LPM_NO_UPDATE_CHECK:-}" ] || printf '"'"'\\nUpdate available: 0.88.0\\n'"'"'\n' "${FIXTURE_VERSION#v}")
+# This fixture prints its notice first unless asked for no update check,
+# so it installs only when the installer sets LPM_NO_UPDATE_CHECK.
+notice_executable=$(printf '#!/bin/sh\n# notice-binary-bytes\n[ -n "${LPM_NO_UPDATE_CHECK:-}" ] || echo '"'"'Update available: 0.88.0'"'"'\necho '"'"'lpm %s'"'"'\n' "${FIXTURE_VERSION#v}")
 if [ "$HOST_OS" = "Darwin" ]; then
   fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
   printf '%s\n' "$notice_executable" > "$fixture_app/Contents/MacOS/lpm-rs"

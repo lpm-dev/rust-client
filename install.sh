@@ -597,7 +597,7 @@ require_reported_version() {
   if ! version_output=$(LPM_NO_UPDATE_CHECK=1 "$1" --version 2>"$version_errors") || [ -z "$version_output" ]; then
     echo "ERROR: couldn't run the downloaded binary to check its version:"
     sed -n '1,5s/^/  /p' "$version_errors"
-    echo "This can mean the binary doesn't suit this system, or that $INSTALL_DIR doesn't allow running programs."
+    echo "This can mean the binary doesn't suit this system, or that $2 doesn't allow running programs."
     return 1
   fi
   reported_version_line=$(printf '%s\n' "$version_output" | sed -n 1p)
@@ -796,7 +796,7 @@ install_macos_bundle() {
   "$MACOS_DITTO_TOOL" "$extracted_app" "$BUNDLE_STAGED_APP"
   validate_macos_bundle "$BUNDLE_STAGED_APP" "staged $EXPECTED_APP_NAME" \
     "$extracted_app" "$downloaded_cdhash"
-  require_reported_version "$BUNDLE_STAGED_APP/Contents/MacOS/lpm-rs" || return 1
+  require_reported_version "$BUNDLE_STAGED_APP/Contents/MacOS/lpm-rs" "$LIBEXEC_DIR" || return 1
   ln -s "$link_target" "$new_lpm"
   ln -s "$link_target" "$new_lpx"
 
@@ -888,7 +888,7 @@ else
   STAGED_BINARY=$(mktemp "$INSTALL_DIR/.$BINARY_NAME.new.XXXXXX")
   mv "$DOWNLOAD_TMP" "$STAGED_BINARY"
   chmod +x "$STAGED_BINARY"
-  require_reported_version "$STAGED_BINARY" || exit 1
+  require_reported_version "$STAGED_BINARY" "$INSTALL_DIR" || exit 1
   mv "$STAGED_BINARY" "$INSTALL_DIR/$BINARY_NAME"
   STAGED_BINARY=""
   ln -sf "$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
