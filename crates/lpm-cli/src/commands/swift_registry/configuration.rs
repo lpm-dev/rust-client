@@ -77,9 +77,7 @@ fn validate(path: &Path, value: &Value, host: &str) -> Result<(), LpmError> {
     ] {
         if let Some(section) = validate_object(path, value, keys)? {
             if keys.last() == Some(&"signing") {
-                for action in ["onUnsigned", "onUntrustedCertificate"] {
-                    validate_string(path, section, action, &keys.join("."))?;
-                }
+                validate_signing(path, section, &keys.join("."))?;
             }
             if keys == ["registries", "lpmdev"] {
                 validate_string(path, section, "url", "registries.lpmdev")?;
@@ -94,6 +92,49 @@ fn validate(path: &Path, value: &Value, host: &str) -> Result<(), LpmError> {
                 }
             }
         }
+    }
+    if let Some(packages) = validate_object(path, value, &["security", "packageOverrides"])? {
+        for (identity, entry) in packages.as_object().into_iter().flatten() {
+            let is_lpm_package = identity
+                .split_once('.')
+                .is_some_and(|(scope, _)| scope.eq_ignore_ascii_case("lpmdev"));
+            if !is_lpm_package {
+                continue;
+            }
+            let location = format!("security.packageOverrides.{identity}");
+            if !entry.is_object() {
+                return Err(invalid(path, format!("{location} must be an object")));
+            }
+            if let Some(signing) = entry.get("signing") {
+                if !signing.is_object() {
+                    return Err(invalid(
+                        path,
+                        format!("{location}.signing must be an object"),
+                    ));
+                }
+                validate_signing(path, signing, &format!("{location}.signing"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_signing(path: &Path, signing: &Value, location: &str) -> Result<(), LpmError> {
+    for key in [
+        "onUnsigned",
+        "onUntrustedCertificate",
+        "trustedRootCertificatesPath",
+    ] {
+        validate_string(path, signing, key, location)?;
+    }
+    if signing
+        .get("includeDefaultTrustedRootCertificates")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(invalid(
+            path,
+            format!("{location}.includeDefaultTrustedRootCertificates must be a boolean"),
+        ));
     }
     Ok(())
 }

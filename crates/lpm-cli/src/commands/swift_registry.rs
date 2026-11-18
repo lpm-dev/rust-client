@@ -1,10 +1,10 @@
 mod configuration;
+mod signing;
 
 use crate::{auth_storage_notice, install_ui};
-use futures::StreamExt;
 use lpm_common::LpmError;
+use signing::{RootsOutcome, SignerTrust};
 use std::path::Path;
-use x509_parser::prelude::{FromDer, X509Certificate};
 
 fn swift_registry_endpoint(registry_url: &str) -> Result<reqwest::Url, LpmError> {
     if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
@@ -248,22 +248,7 @@ async fn configure_swift_authentication(
     )))
 }
 
-/// Minimum size in bytes for a valid DER certificate.
-/// A DER-encoded X.509 certificate is at minimum ~100 bytes (header + key material).
-const MIN_CERT_SIZE: u64 = 100;
-const MAX_CERT_SIZE: usize = 64 * 1024;
-
-/// Result of `install_signing_certificate`. Distinguishes "I downloaded
-/// and wrote the cert this run" from "I found a valid one already on
-/// disk and skipped"; the call site uses this to decide whether
-/// success messaging is meaningful or noisy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CertOutcome {
-    Installed,
-    AlreadyInstalled,
-}
-
-/// Result of `configure_signing_trust`. Mirrors `CertOutcome` in shape.
+/// Result of `configure_signing_trust`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrustOutcome {
     Configured,
@@ -300,7 +285,8 @@ fn setup_action(repaired: bool) -> &'static str {
 /// Steps:
 /// 1. swift package-registry set --scope lpmdev <registry_url>/api/swift-registry
 /// 2. swift package-registry login --token-file <temporary_file> (HTTPS only)
-/// 3. Download signing certificate to ~/.swiftpm/security/trusted-root-certs/lpm.der
+/// 3. Install the registry's pinned signing roots, when it has any
+/// 4. Configure which signers SwiftPM accepts for the registry
 pub async fn run(
     session: &lpm_auth::SessionManager,
     registry_url: &str,
@@ -389,20 +375,31 @@ async fn run_in_directory(
         "skipped_http"
     };
 
-    // Step 3: Install signing certificate to SPM trust store. Fatal on
-    // failure — proceeding without a cert leaves SPM without the bytes
-    // it needs to verify the CMS signatures attached to LPM packages.
-    let cert_outcome = install_signing_certificate(&swift_registry_url, json_output, force).await?;
+    let host = swiftpm_registry_host(&endpoint);
+    let trust = SignerTrust::for_host(host)?;
+    let roots_outcome = install_signing_roots(&trust, json_output, force)?;
+    let trust_outcome = configure_signing_trust(host, &trust, json_output)?;
+    if !trust.is_pinned() && !json_output {
+        install_ui::warn_line(unpinned_signer_warning(host));
+    }
+    let project_sets_aside_pin =
+        warn_when_project_sets_aside_pin(package_dir, host, &trust, json_output)?;
 
-    let trust_outcome = configure_signing_trust(registry_url, json_output)?;
-
-    let cert_outcome_label = match cert_outcome {
-        CertOutcome::Installed => "installed",
-        CertOutcome::AlreadyInstalled => "already_installed",
+    let roots_outcome_label = match roots_outcome {
+        RootsOutcome::Installed => "installed",
+        RootsOutcome::AlreadyInstalled => "already_installed",
+        RootsOutcome::NotPinned => "not_pinned",
     };
     let trust_outcome_label = match trust_outcome {
         TrustOutcome::Configured => "configured",
         TrustOutcome::AlreadyConfigured => "already_configured",
+    };
+    let trust_anchor = if trust.is_pinned() {
+        "pinned_root"
+    } else if is_https {
+        "https"
+    } else {
+        "insecure_http"
     };
 
     if json_output {
@@ -411,13 +408,14 @@ async fn run_in_directory(
             "registry_url": swift_registry_url,
             "scope": "lpmdev",
             "https": is_https,
-            "signing_certificate_installed": true,
+            "signing_certificate_installed": trust.is_pinned(),
             "signing_trust_configured": true,
-            "signing_certificate_outcome": cert_outcome_label,
+            "signing_certificate_outcome": roots_outcome_label,
             "signing_trust_outcome": trust_outcome_label,
-            "trust_anchor": if is_https { "https" } else { "insecure_http" },
+            "trust_anchor": trust_anchor,
             "authentication_outcome": authentication_outcome,
-            "signer_trust_policy": "silentAllow",
+            "signer_trust_policy": if trust.is_pinned() { "error" } else { "silentAllow" },
+            "project_signing_overrides_pin": project_sets_aside_pin,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
@@ -427,12 +425,6 @@ async fn run_in_directory(
     Ok(())
 }
 
-/// Auto-configure SE-0292 registry scope for a Swift package directory if not already set up.
-///
-/// Checks `{package_dir}/.swiftpm/configuration/registries.json` for the `lpmdev` scope.
-/// If missing, runs `swift package-registry set --scope lpmdev`, installs signing cert,
-/// and configures signing trust policy — all silently.
-///
 /// Disposition of an existing `lpmdev` scope in `registries.json`.
 /// Carries enough information for the caller to either short-circuit
 /// (URL already matches), re-resolve and surface the mismatch (URL
@@ -555,13 +547,19 @@ pub(crate) async fn ensure_configured_for_install(
         .await?;
     }
 
-    let certificate = install_signing_certificate(&swift_registry_url, json_output, false).await?;
-    let trust = configure_signing_trust(registry_url, json_output)?;
+    let host = swiftpm_registry_host(&endpoint);
+    let trust = SignerTrust::for_host(host)?;
+    let roots = install_signing_roots(&trust, json_output, false)?;
+    let trust_outcome = configure_signing_trust(host, &trust, json_output)?;
+    if trust_outcome == TrustOutcome::Configured && !trust.is_pinned() && !json_output {
+        install_ui::warn_line(unpinned_signer_warning(host));
+    }
+    warn_when_project_sets_aside_pin(package_dir, host, &trust, json_output)?;
 
     Ok(SwiftRegistrySetupOutcome {
         scope_repaired: !scope_matches,
-        certificate_repaired: certificate == CertOutcome::Installed,
-        trust_repaired: trust == TrustOutcome::Configured,
+        certificate_repaired: roots == RootsOutcome::Installed,
+        trust_repaired: trust_outcome == TrustOutcome::Configured,
     })
 }
 
@@ -635,195 +633,38 @@ pub(crate) fn preflight_configuration(
     Ok(())
 }
 
-/// Check whether a certificate file exists and is valid (non-empty, non-corrupted).
-/// Returns `true` if the file should be considered already installed.
-#[cfg(test)]
-fn is_cert_valid(cert_path: &std::path::Path) -> bool {
-    read_valid_der_certificate(cert_path).is_some()
-}
-
-fn read_valid_der_certificate(cert_path: &Path) -> Option<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(cert_path).ok()?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_CERT_SIZE as u64
-    {
-        return None;
-    }
-    let bytes = lpm_common::read_file_capped(cert_path, MAX_CERT_SIZE as u64).ok()?;
-    validate_der_certificate(&bytes).ok()?;
-    Some(bytes)
-}
-
-fn validate_der_certificate(bytes: &[u8]) -> Result<(), LpmError> {
-    if bytes.len() < MIN_CERT_SIZE as usize {
-        return Err(LpmError::Registry(format!(
-            "certificate is too small ({} bytes)",
-            bytes.len()
-        )));
-    }
-    if bytes.len() > MAX_CERT_SIZE {
-        return Err(LpmError::Registry(format!(
-            "certificate exceeds the {MAX_CERT_SIZE}-byte limit"
-        )));
-    }
-    let (remaining, _) = X509Certificate::from_der(bytes).map_err(|error| {
-        LpmError::Registry(format!("certificate is not valid DER X.509: {error}"))
-    })?;
-    if !remaining.is_empty() {
-        return Err(LpmError::Registry(
-            "certificate contains trailing data after the DER X.509 object".into(),
-        ));
-    }
-    Ok(())
-}
-
-async fn fetch_signing_certificate(cert_url: &str) -> Result<Vec<u8>, LpmError> {
-    let client = lpm_http::client_builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|error| {
-            LpmError::Registry(format!(
-                "could not build signing certificate client: {error}"
-            ))
-        })?;
-    let response = client.get(cert_url).send().await.map_err(|error| {
-        if error.is_timeout() {
-            return LpmError::Registry(
-                "signing certificate request timed out (10-second connection limit; 30-second overall limit)".into(),
-            );
-        }
-        LpmError::Registry(format!(
-            "could not download signing certificate: {}",
-            lpm_http::display_error(&error)
-        ))
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let reason = lpm_http::read_body_capped(response, 64 * 1024)
-            .await
-            .ok()
-            .and_then(|body| {
-                lpm_common::registry_error_body_message(&String::from_utf8_lossy(&body))
-            });
-        return Err(LpmError::Registry(match reason {
-            Some(reason) => {
-                format!(
-                    "signing certificate not available (HTTP {status} from {cert_url}): {reason}"
-                )
-            }
-            None => format!("signing certificate not available (HTTP {status} from {cert_url})"),
-        }));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CERT_SIZE as u64)
-    {
-        return Err(LpmError::Registry(format!(
-            "signing certificate from {cert_url} exceeds the {MAX_CERT_SIZE}-byte limit"
-        )));
-    }
-    let mut bytes = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or(MIN_CERT_SIZE)
-            .min(MAX_CERT_SIZE as u64) as usize,
-    );
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            if error.is_timeout() {
-                return LpmError::Registry(
-                    "signing certificate request timed out (10-second connection limit; 30-second overall limit)".into(),
-                );
-            }
-            LpmError::Registry(format!(
-                "failed to read signing certificate from {cert_url}: {error}"
-            ))
-        })?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_CERT_SIZE {
-            return Err(LpmError::Registry(format!(
-                "signing certificate from {cert_url} exceeds the {MAX_CERT_SIZE}-byte limit"
-            )));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    validate_der_certificate(&bytes).map_err(|error| {
-        LpmError::Registry(format!(
-            "downloaded signing certificate from {cert_url} is invalid: {error}"
-        ))
-    })?;
-    Ok(bytes)
-}
-
-/// Fetch and validate the current certificate before comparing local bytes.
-/// Matching bytes avoid a rewrite unless `force` is set. Download or validation
-/// failures preserve the existing certificate and stop setup.
-async fn install_signing_certificate(
-    swift_registry_url: &str,
+fn install_signing_roots(
+    trust: &SignerTrust,
     json_output: bool,
     force: bool,
-) -> Result<CertOutcome, LpmError> {
-    let cert_url = format!("{swift_registry_url}/certificate");
-    let trust_dir = crate::swift_manifest::paths::security_dir()?.join("trusted-root-certs");
-
-    let cert_path = trust_dir.join("lpm.der");
-
-    let cert_bytes = fetch_signing_certificate(&cert_url).await?;
-    let installed_matches = !force
-        && read_valid_der_certificate(&cert_path).is_some_and(|installed| installed == cert_bytes);
-    if installed_matches {
-        if !json_output {
-            install_ui::done_line(signing_certificate_already_installed_message(&cert_path));
-        }
-        return Ok(CertOutcome::AlreadyInstalled);
+) -> Result<RootsOutcome, LpmError> {
+    let outcome = signing::install_roots(trust, force)?;
+    if let (SignerTrust::Pinned { directory, .. }, false) = (trust, json_output) {
+        install_ui::done_line(match outcome {
+            RootsOutcome::Installed => signing_root_installed_message(directory),
+            RootsOutcome::AlreadyInstalled | RootsOutcome::NotPinned => {
+                signing_root_already_installed_message(directory)
+            }
+        });
     }
-
-    if !json_output {
-        if force && cert_path.exists() {
-            install_ui::phase("Re-downloading package signing certificate");
-        } else {
-            install_ui::phase("Installing package signing certificate");
-        }
-    }
-
-    std::fs::create_dir_all(&trust_dir).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to create trust directory {}: {e}",
-            trust_dir.display()
-        ))
-    })?;
-
-    lpm_common::write_file_atomic(&cert_path, &cert_bytes).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to write certificate to {}: {e}",
-            cert_path.display()
-        ))
-    })?;
-
-    if !json_output {
-        install_ui::done_line(signing_certificate_installed_message(&cert_path));
-    }
-
-    Ok(CertOutcome::Installed)
+    Ok(outcome)
 }
 
-/// Configure the registry host's HTTPS-anchored signer policy while retaining
-/// strict defaults for other registries. SwiftPM only supports signing actions
-/// in registry overrides, not scope overrides.
+/// Sets which signers SwiftPM accepts for `host`, the registry's host as
+/// SwiftPM keys it, and keeps strict defaults for every other registry.
+/// SwiftPM takes signing actions only from registry overrides, not scope
+/// overrides.
 fn configure_signing_trust(
-    registry_url: &str,
+    host: &str,
+    trust: &SignerTrust,
     json_output: bool,
 ) -> Result<TrustOutcome, LpmError> {
-    let endpoint = swift_registry_endpoint(registry_url)?;
-    let host = swiftpm_registry_host(&endpoint);
     let config_path = configuration::global_path()?;
     let changed = configuration::update(&config_path, host, |config| {
-        if signing_trust_is_valid(config, host) {
+        if signing::is_applied(config, host, trust) {
             return Ok(());
         }
-        apply_signing_trust(config, host)
+        signing::apply(config, host, trust)
     })?;
     if !json_output {
         let message = if changed {
@@ -840,56 +681,20 @@ fn configure_signing_trust(
     })
 }
 
-fn apply_signing_trust(
-    config: &mut serde_json::Value,
-    registry_host: &str,
-) -> Result<(), LpmError> {
-    let root = ensure_json_object(config)?;
-    root.insert("version".to_string(), serde_json::json!(1));
-    ensure_json_object(
-        root.entry("registries")
-            .or_insert_with(|| serde_json::json!({})),
-    )?;
-
-    // Merge security config — preserve any existing keys
-    let security = ensure_json_object(config)?
-        .entry("security")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let default = ensure_json_object(security)?
-        .entry("default")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let signing = ensure_json_object(default)?
-        .entry("signing")
-        .or_insert_with(|| serde_json::json!({}));
-    let signing_obj = ensure_json_object(signing)?;
-    repair_default_signing_policy(signing_obj, "onUnsigned");
-    repair_default_signing_policy(signing_obj, "onUntrustedCertificate");
-
-    if let Some(scope_signing) = security
-        .get_mut("scopeOverrides")
-        .and_then(|value| value.get_mut("lpmdev"))
-        .and_then(|value| value.get_mut("signing"))
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        scope_signing.remove("onUntrustedCertificate");
+/// Warns when the project's own registries.json keeps the pinned roots from
+/// applying to it; whether it does.
+fn warn_when_project_sets_aside_pin(
+    package_dir: &Path,
+    host: &str,
+    trust: &SignerTrust,
+    json_output: bool,
+) -> Result<bool, LpmError> {
+    let path = package_dir.join(".swiftpm/configuration/registries.json");
+    let sets_aside = signing::project_sets_aside(&configuration::load(&path, host)?, host, trust);
+    if sets_aside && !json_output {
+        install_ui::warn_untrusted(&project_sets_aside_pin_warning(&path, host));
     }
-    let registry_overrides = ensure_json_object(security)?
-        .entry("registryOverrides")
-        .or_insert_with(|| serde_json::json!({}));
-    let registry = ensure_json_object(registry_overrides)?
-        .entry(registry_host)
-        .or_insert_with(|| serde_json::json!({}));
-    let registry_signing = ensure_json_object(registry)?
-        .entry("signing")
-        .or_insert_with(|| serde_json::json!({}));
-    ensure_json_object(registry_signing)?.insert(
-        "onUntrustedCertificate".to_string(),
-        serde_json::Value::String("silentAllow".to_string()),
-    );
-
-    Ok(())
+    Ok(sets_aside)
 }
 
 fn ensure_json_object(
@@ -900,51 +705,18 @@ fn ensure_json_object(
     })
 }
 
-fn default_signing_policy_is_secure(value: Option<&serde_json::Value>) -> bool {
-    value.and_then(serde_json::Value::as_str) == Some("error")
+fn unpinned_signer_warning(host: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
+        "LPM CLI pins no signing root for {}, so Swift Package Manager accepts its releases from any signer",
+        host
+    )
 }
 
-fn repair_default_signing_policy(
-    signing: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) {
-    if !default_signing_policy_is_secure(signing.get(key)) {
-        signing.insert(
-            key.to_string(),
-            serde_json::Value::String("error".to_string()),
-        );
-    }
-}
-
-fn signing_trust_is_valid(config: &serde_json::Value, registry_host: &str) -> bool {
-    if config.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-        || !config
-            .get("registries")
-            .is_some_and(serde_json::Value::is_object)
-        || config
-            .pointer("/security/scopeOverrides/lpmdev/signing/onUntrustedCertificate")
-            .is_some()
-    {
-        return false;
-    }
-    let signing = config
-        .get("security")
-        .and_then(|security| security.get("default"))
-        .and_then(|default| default.get("signing"));
-    let defaults_match =
-        default_signing_policy_is_secure(signing.and_then(|value| value.get("onUnsigned")))
-            && default_signing_policy_is_secure(
-                signing.and_then(|value| value.get("onUntrustedCertificate")),
-            );
-    let override_matches = config
-        .get("security")
-        .and_then(|s| s.get("registryOverrides"))
-        .and_then(|o| o.get(registry_host))
-        .and_then(|l| l.get("signing"))
-        .and_then(|s| s.get("onUntrustedCertificate"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "silentAllow");
-    defaults_match && override_matches
+fn project_sets_aside_pin_warning(path: &Path, host: &str) -> String {
+    format!(
+        "{} has its own signing settings, which Swift Package Manager uses in place of yours, so it doesn't check {host}'s releases against LPM's signing root in this project",
+        path.display()
+    )
 }
 
 fn swift_package_manager_phase() -> install_ui::TerminalLine {
@@ -962,33 +734,33 @@ fn scope_set_message(swift_registry_url: &str) -> install_ui::TerminalLine {
     )
 }
 
-fn signing_certificate_installed_message(cert_path: &Path) -> install_ui::TerminalLine {
+fn signing_root_installed_message(roots: &Path) -> install_ui::TerminalLine {
     let home = dirs::home_dir();
-    signing_certificate_installed_message_with_home(cert_path, home.as_deref())
+    signing_root_installed_message_with_home(roots, home.as_deref())
 }
 
-fn signing_certificate_installed_message_with_home(
-    cert_path: &Path,
+fn signing_root_installed_message_with_home(
+    roots: &Path,
     home: Option<&Path>,
 ) -> install_ui::TerminalLine {
     crate::install_ui::terminal_line!(
-        "Installed signing certificate {}",
-        display_home_relative_with(cert_path, home)
+        "Installed signing root {}",
+        display_home_relative_with(roots, home)
     )
 }
 
-fn signing_certificate_already_installed_message(cert_path: &Path) -> install_ui::TerminalLine {
+fn signing_root_already_installed_message(roots: &Path) -> install_ui::TerminalLine {
     let home = dirs::home_dir();
-    signing_certificate_already_installed_message_with_home(cert_path, home.as_deref())
+    signing_root_already_installed_message_with_home(roots, home.as_deref())
 }
 
-fn signing_certificate_already_installed_message_with_home(
-    cert_path: &Path,
+fn signing_root_already_installed_message_with_home(
+    roots: &Path,
     home: Option<&Path>,
 ) -> install_ui::TerminalLine {
     crate::install_ui::terminal_line!(
-        "Signing certificate already installed {}",
-        display_home_relative_with(cert_path, home)
+        "Signing root already installed {}",
+        display_home_relative_with(roots, home)
     )
 }
 
@@ -1048,6 +820,61 @@ mod tests {
             .cert
             .der()
             .to_vec()
+    }
+
+    fn lpm_dev_trust() -> SignerTrust {
+        SignerTrust::for_host("lpm.dev").unwrap()
+    }
+
+    fn pinned_roots_directory(home: &Path) -> PathBuf {
+        lpm_common::symlink::windows_plain_path(
+            &test_swiftpm_root(&fs::canonicalize(home).unwrap())
+                .join("security")
+                .join("lpm-trusted-roots")
+                .join("lpm.dev"),
+        )
+    }
+
+    fn built_in_root() -> Vec<u8> {
+        let SignerTrust::Pinned { roots, .. } = lpm_dev_trust() else {
+            panic!("lpm.dev must be pinned");
+        };
+        assert_eq!(roots.len(), 1);
+        roots.into_iter().next().unwrap()
+    }
+
+    fn built_in_root_path(home: &Path) -> PathBuf {
+        pinned_roots_directory(home)
+            .join("c96df3ac7c141082cae02d6cbfa41b3753d64972e3199c64ba41a05359966cde.der")
+    }
+
+    fn legacy_certificate_path(home: &Path) -> PathBuf {
+        test_swiftpm_root(home).join("security/trusted-root-certs/lpm.der")
+    }
+
+    fn pinned_signing_trust(home: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "registries": {},
+            "security": {
+                "default": {
+                    "signing": {
+                        "onUnsigned": "error",
+                        "onUntrustedCertificate": "error"
+                    }
+                },
+                "registryOverrides": {
+                    "lpm.dev": {
+                        "signing": {
+                            "onUnsigned": "error",
+                            "onUntrustedCertificate": "error",
+                            "trustedRootCertificatesPath": pinned_roots_directory(home),
+                            "includeDefaultTrustedRootCertificates": false
+                        }
+                    }
+                }
+            }
+        })
     }
 
     fn write_matching_package_scope(package_dir: &Path, registry_url: &str) {
@@ -1125,7 +952,7 @@ mod tests {
         let config = native.join("configuration/registries.json");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, "invalid native configuration").unwrap();
-        assert!(configure_signing_trust("https://lpm.dev", true).is_err());
+        assert!(configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).is_err());
         assert_eq!(
             fs::read_to_string(config).unwrap(),
             "invalid native configuration"
@@ -1156,6 +983,11 @@ mod tests {
             r#"{"security":{"scopeOverrides":{"lpmdev":{"signing":[]}}}}"#,
             r#"{"security":{"registryOverrides":{"lpm.dev":null}}}"#,
             r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"onUntrustedCertificate":false}}}}}"#,
+            r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"trustedRootCertificatesPath":42}}}}}"#,
+            r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"includeDefaultTrustedRootCertificates":"no"}}}}}"#,
+            r#"{"security":{"scopeOverrides":{"lpmdev":{"signing":{"includeDefaultTrustedRootCertificates":1}}}}}"#,
+            r#"{"security":{"packageOverrides":{"lpmdev.logger":[]}}}"#,
+            r#"{"security":{"packageOverrides":{"LPMDEV.logger":{"signing":{"trustedRootCertificatesPath":false}}}}}"#,
         ];
         // The error names the file canonically, which spells out a Windows
         // 8.3 short name such as `RUNNER~1` in the temp path.
@@ -1163,7 +995,7 @@ mod tests {
         let mut accepted = Vec::new();
         for original in cases {
             fs::write(&path, original).unwrap();
-            let result = configure_signing_trust("https://lpm.dev", true);
+            let result = configure_signing_trust("lpm.dev", &lpm_dev_trust(), true);
             if result.is_ok() || fs::read_to_string(&path).unwrap() != original {
                 accepted.push(original);
             } else {
@@ -1198,7 +1030,7 @@ mod tests {
         fs::create_dir(&swiftpm).unwrap();
         let alias = swiftpm.join("configuration");
         std::os::unix::fs::symlink(&native, &alias).unwrap();
-        configure_signing_trust("https://lpm.dev", true).unwrap();
+        configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
         assert!(
             fs::symlink_metadata(alias)
                 .unwrap()
@@ -1213,7 +1045,7 @@ mod tests {
         );
         assert_eq!(
             config["security"]["registryOverrides"]["lpm.dev"]["signing"]["onUntrustedCertificate"],
-            "silentAllow"
+            "error"
         );
     }
 
@@ -1226,7 +1058,7 @@ mod tests {
         let target = home.path().join("shared.json");
         fs::rename(&path, &target).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(configure_signing_trust("https://lpm.dev", true).is_err());
+        assert!(configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).is_err());
         assert!(
             fs::symlink_metadata(&path)
                 .unwrap()
@@ -1250,8 +1082,12 @@ mod tests {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    configure_signing_trust(&format!("https://registry{index}.example"), true)
-                        .unwrap();
+                    configure_signing_trust(
+                        &format!("registry{index}.example"),
+                        &SignerTrust::Unpinned,
+                        true,
+                    )
+                    .unwrap();
                 });
             }
         });
@@ -1266,44 +1102,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_setup_rejects_invalid_configuration_before_certificate_changes() {
+    async fn automatic_setup_rejects_invalid_configuration_before_installing_roots() {
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
-        let server = MockServer::start().await;
-        write_matching_package_scope(package.path(), &server.uri());
+        write_matching_package_scope(package.path(), "https://lpm.dev");
         let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
         fs::write(&path, "broken json").unwrap();
-        let certificate = signing_certificate_path(home.path());
-        fs::create_dir_all(certificate.parent().unwrap()).unwrap();
-        fs::write(&certificate, "existing certificate").unwrap();
-        Mock::given(method("GET"))
-            .and(wiremock::matchers::path("/api/swift-registry/certificate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(valid_der_certificate()))
-            .mount(&server)
-            .await;
+        let legacy = legacy_certificate_path(home.path());
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "existing certificate").unwrap();
+
         let result =
-            ensure_configured_for_install(None, &server.uri(), package.path(), true, true).await;
+            ensure_configured_for_install(None, "https://lpm.dev", package.path(), true, true)
+                .await;
+
         assert!(result.is_err(), "invalid configuration must stop setup");
         assert_eq!(fs::read_to_string(path).unwrap(), "broken json");
-        assert_eq!(
-            fs::read_to_string(certificate).unwrap(),
-            "existing certificate"
-        );
-        assert!(server.received_requests().await.unwrap().is_empty());
-    }
-
-    fn signing_certificate_path(home: &Path) -> PathBuf {
-        test_swiftpm_root(home).join("security/trusted-root-certs/lpm.der")
-    }
-
-    async fn mount_signing_certificate(server: &MockServer, certificate: Vec<u8>) {
-        Mock::given(method("GET"))
-            .and(path("/api/swift-registry/certificate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(certificate))
-            .expect(1)
-            .mount(server)
-            .await;
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "existing certificate");
+        assert!(!pinned_roots_directory(home.path()).exists());
     }
 
     #[cfg(unix)]
@@ -1398,7 +1215,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
             .unwrap()
             .success()
         );
-        configure_signing_trust("https://[::1]:8443", true).unwrap();
+        configure_signing_trust("::1", &SignerTrust::Unpinned, true).unwrap();
         let config = configuration::load(&configuration::global_path().unwrap(), "::1").unwrap();
         assert_eq!(config["authentication"]["::1:8443"]["type"], "token");
         assert_eq!(
@@ -1638,8 +1455,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn anonymous_https_setup_skips_rejected_credentials_but_requires_certificate_verification()
-     {
+    async fn anonymous_lpm_dev_setup_pins_the_built_in_root_without_logging_in() {
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let path = fake_swift_path(home.path());
@@ -1650,15 +1466,33 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
             ("XDG_CONFIG_HOME", None),
             ("LPM_TOKEN", None),
         ]);
-        let registry_url = "https://127.0.0.1:1";
-        write_matching_package_scope(package.path(), registry_url);
-        let session = lpm_auth::SessionManager::new(registry_url, Some("rejected-access".into()));
-        let error =
-            ensure_configured_for_install(Some(&session), registry_url, package.path(), true, true)
-                .await
-                .expect_err("unreachable certificate endpoint must prevent setup");
+        write_matching_package_scope(package.path(), "https://lpm.dev");
+        let session =
+            lpm_auth::SessionManager::new("https://lpm.dev", Some("rejected-access".into()));
+
+        let outcome = ensure_configured_for_install(
+            Some(&session),
+            "https://lpm.dev",
+            package.path(),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
         assert!(!home.path().join("swift-login-tokens").exists());
-        assert!(error.to_string().contains("certificate"), "{error}");
+        assert_eq!(
+            fs::read(built_in_root_path(home.path())).unwrap(),
+            built_in_root()
+        );
+        assert_eq!(
+            outcome.to_json(),
+            serde_json::json!({
+                "scope": "retained",
+                "signing_certificate": "repaired",
+                "signing_trust": "repaired"
+            })
+        );
     }
 
     #[cfg(unix)]
@@ -1801,74 +1635,10 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         ])
     }
 
-    // Cert idempotency should check file size, not just existence.
-    // An empty or very small file should NOT be considered a valid certificate.
-
-    #[test]
-    fn is_cert_valid_returns_false_for_nonexistent_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.der");
-        assert!(!is_cert_valid(&path));
-    }
-
-    #[test]
-    fn is_cert_valid_returns_false_for_empty_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("empty.der");
-        fs::write(&path, b"").unwrap();
-        assert!(!is_cert_valid(&path));
-    }
-
-    #[test]
-    fn is_cert_valid_returns_false_for_truncated_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("small.der");
-        // 50 bytes is well below the MIN_CERT_SIZE threshold
-        fs::write(&path, vec![0u8; 50]).unwrap();
-        assert!(!is_cert_valid(&path));
-    }
-
-    #[test]
-    fn is_cert_valid_rejects_plausibly_sized_malformed_der() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("malformed.der");
-        fs::write(&path, vec![0x30u8; MIN_CERT_SIZE as usize]).unwrap();
-        assert!(!is_cert_valid(&path));
-    }
-
-    #[test]
-    fn is_cert_valid_accepts_a_complete_x509_der_certificate() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("valid.der");
-        fs::write(&path, valid_der_certificate()).unwrap();
-        assert!(is_cert_valid(&path));
-    }
-
-    #[test]
-    fn is_cert_valid_rejects_an_oversized_certificate_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("oversized.der");
-        fs::write(&path, vec![0x30; MAX_CERT_SIZE + 1]).unwrap();
-        assert!(!is_cert_valid(&path));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_cert_valid_rejects_a_certificate_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("target.der");
-        let path = dir.path().join("linked.der");
-        fs::write(&target, valid_der_certificate()).unwrap();
-        symlink(target, &path).unwrap();
-        assert!(!is_cert_valid(&path));
-    }
-
     #[test]
     fn swift_registry_slim_messages_match_design_copy() {
         let home = std::path::PathBuf::from("/Users/example");
-        let cert_path = home.join(".swiftpm/security/trusted-root-certs/lpm.der");
+        let roots = home.join(".swiftpm/security/lpm-trusted-roots/lpm.dev");
         let config_path = home.join(".swiftpm/configuration/registries.json");
         let scope_message = scope_set_message("https://lpm.dev/api/swift-registry");
         let phase_message = swift_package_manager_phase();
@@ -1889,12 +1659,20 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
             );
         }
         assert_eq!(
-            display_home_relative_with(&cert_path, Some(&home)),
-            "~/.swiftpm/security/trusted-root-certs/lpm.der"
+            display_home_relative_with(&roots, Some(&home)),
+            "~/.swiftpm/security/lpm-trusted-roots/lpm.dev"
         );
         assert_eq!(
-            signing_certificate_installed_message_with_home(&cert_path, Some(&home)).to_string(),
-            "Installed signing certificate ~/.swiftpm/security/trusted-root-certs/lpm.der"
+            signing_root_installed_message_with_home(&roots, Some(&home)).to_string(),
+            "Installed signing root ~/.swiftpm/security/lpm-trusted-roots/lpm.dev"
+        );
+        assert_eq!(
+            signing_root_already_installed_message_with_home(&roots, Some(&home)).to_string(),
+            "Signing root already installed ~/.swiftpm/security/lpm-trusted-roots/lpm.dev"
+        );
+        assert_eq!(
+            strip_ansi(&unpinned_signer_warning("registry.example")),
+            "LPM CLI pins no signing root for registry.example, so Swift Package Manager accepts its releases from any signer"
         );
         assert_eq!(
             signing_trust_updated_message_with_home(&config_path, Some(&home)).to_string(),
@@ -1914,204 +1692,280 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
             "registries": {}
         });
         let path = write_global_signing_trust(home.path(), &config);
-        configure_signing_trust("https://lpm.dev", true).unwrap();
+        configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
         let updated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(updated["authentication"], config["authentication"]);
     }
 
-    /// First-run cert install must fail-closed when the registry returns
-    /// a non-2xx for the cert endpoint. Pre-fix this returned `false` and
-    /// the wider `lpm swift-registry` flow continued, printing
-    /// `"success": true` with `signing_certificate_installed: false` —
-    /// users with an off-line origin would think setup was done.
-    #[tokio::test]
-    async fn install_signing_certificate_errors_on_http_404() {
-        let temp_home = TempDir::new().unwrap();
-        let _home = home_override(temp_home.path());
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/swift-registry/certificate"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let result = install_signing_certificate(
-            &format!("{}/api/swift-registry", server.uri()),
-            true, // json_output — silence stdout for tests
-            false,
-        )
-        .await;
-
-        let err = result.expect_err("404 from cert endpoint must be fatal");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("HTTP 404") || msg.contains("not available"),
-            "error should name the HTTP failure mode, got: {msg:?}"
-        );
-    }
-
-    /// First-run cert install must fail-closed when the body is below
-    /// the minimum cert size (truncated, empty, or HTML error page).
-    /// Same justification as the 404 case.
-    #[tokio::test]
-    async fn install_signing_certificate_errors_on_truncated_body() {
-        let temp_home = TempDir::new().unwrap();
-        let _home = home_override(temp_home.path());
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/swift-registry/certificate"))
-            // 32 bytes — well below MIN_CERT_SIZE.
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 32]))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let result = install_signing_certificate(
-            &format!("{}/api/swift-registry", server.uri()),
-            true,
-            false,
-        )
-        .await;
-
-        let err = result.expect_err("truncated cert body must be fatal");
-        assert!(
-            err.to_string().contains("too small"),
-            "error should call out the size guard, got: {err}"
-        );
-    }
-
-    /// Happy path: a server returning a plausibly-sized DER blob lands at
-    /// `~/.swiftpm/security/trusted-root-certs/lpm.der` and reports
-    /// `CertOutcome::Installed`.
-    #[tokio::test]
-    async fn install_signing_certificate_writes_cert_to_swiftpm_trust_store() {
-        let temp_home = TempDir::new().unwrap();
-        let _home = home_override(temp_home.path());
-
-        let server = MockServer::start().await;
-        let cert_bytes = valid_der_certificate();
-        Mock::given(method("GET"))
-            .and(path("/api/swift-registry/certificate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(cert_bytes.clone()))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let outcome = install_signing_certificate(
-            &format!("{}/api/swift-registry", server.uri()),
-            true,
-            false,
-        )
-        .await
-        .expect("first install should succeed against a healthy origin");
-
-        assert_eq!(outcome, CertOutcome::Installed);
-        let cert_path =
-            test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
-        let written = fs::read(&cert_path).expect("cert should land at the SPM trust path");
-        assert_eq!(written, cert_bytes);
-    }
-
-    /// Idempotent re-run verifies the Registry's current certificate and
-    /// retains matching local bytes without rewriting them.
-    #[tokio::test]
-    async fn install_signing_certificate_skips_when_valid_cert_already_installed() {
-        let temp_home = TempDir::new().unwrap();
-        let _home = home_override(temp_home.path());
-
-        let cert_path =
-            test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        let cert_bytes = valid_der_certificate();
-        fs::write(&cert_path, &cert_bytes).unwrap();
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/swift-registry/certificate"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(cert_bytes))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let outcome = install_signing_certificate(
-            &format!("{}/api/swift-registry", server.uri()),
-            true,
-            false,
-        )
-        .await
-        .expect("idempotent re-run should not fail");
-
-        assert_eq!(outcome, CertOutcome::AlreadyInstalled);
-    }
-
-    /// `--force` must re-fetch the cert even when a valid one is on disk
-    /// (so a user can rotate the cert deliberately) AND must propagate
-    /// download failure as `Err` even though a stale cert exists.
-    /// Silently keeping the stale cert and reporting "success" would
-    /// defeat the explicit re-fetch the user asked for.
-    #[tokio::test]
-    async fn install_signing_certificate_force_propagates_download_failure() {
-        let temp_home = TempDir::new().unwrap();
-        let _home = home_override(temp_home.path());
-
-        // Seed a valid cert on disk that --force should override.
-        let cert_path =
-            test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(&cert_path, valid_der_certificate()).unwrap();
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/swift-registry/certificate"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let result = install_signing_certificate(
-            &format!("{}/api/swift-registry", server.uri()),
-            true,
-            true, // force
-        )
-        .await;
-
-        let err = result.expect_err(
-            "--force download failure must be fatal even when a stale cert exists on disk",
-        );
-        assert!(err.to_string().contains("503") || err.to_string().contains("not available"));
-    }
-
-    /// `configure_signing_trust` writes the registry silentAllow
-    /// override into a fresh `~/.swiftpm/configuration/registries.json`.
-    /// Pin the produced shape so the trust-anchor docs and the file
-    /// contents stay aligned.
     #[test]
-    fn configure_signing_trust_writes_registry_override_for_lpm_host() {
-        let temp_home = TempDir::new().unwrap();
-        let _home = home_override(temp_home.path());
+    fn the_built_in_root_is_lpm_dev_s_offline_swift_signing_root() {
+        use sha2::Digest as _;
+        use x509_parser::prelude::{FromDer as _, X509Certificate};
 
-        let outcome =
-            configure_signing_trust("https://lpm.dev", true).expect("trust config should succeed");
-        assert_eq!(outcome, TrustOutcome::Configured);
-
-        let config_path = test_swiftpm_root(temp_home.path()).join("configuration/registries.json");
-        let content = fs::read_to_string(&config_path).expect("registries.json should be written");
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let root = built_in_root();
         assert_eq!(
-            json["security"]["registryOverrides"]["lpm.dev"]["signing"]["onUntrustedCertificate"]
-                .as_str(),
-            Some("silentAllow"),
-            "registry host must pin onUntrustedCertificate=silentAllow"
+            hex::encode(sha2::Sha256::digest(&root)),
+            "c96df3ac7c141082cae02d6cbfa41b3753d64972e3199c64ba41a05359966cde"
+        );
+        let (rest, certificate) = X509Certificate::from_der(&root).unwrap();
+        assert!(rest.is_empty());
+        let constraints = certificate.basic_constraints().unwrap().unwrap();
+        assert!(constraints.critical && constraints.value.ca);
+        assert_eq!(constraints.value.path_len_constraint, Some(0));
+        let usage = certificate.key_usage().unwrap().unwrap();
+        assert!(usage.critical && usage.value.key_cert_sign());
+        assert_eq!(certificate.subject(), certificate.issuer());
+    }
+
+    #[test]
+    fn only_lpm_dev_is_pinned() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        for host in ["lpm.dev", "LPM.dev"] {
+            assert_eq!(
+                SignerTrust::for_host(host).unwrap(),
+                SignerTrust::Pinned {
+                    roots: vec![built_in_root()],
+                    directory: pinned_roots_directory(home.path()),
+                },
+                "{host}"
+            );
+        }
+        for host in [
+            "127.0.0.1",
+            "registry.example",
+            "www.lpm.dev",
+            "lpm.dev.example",
+        ] {
+            assert_eq!(
+                SignerTrust::for_host(host).unwrap(),
+                SignerTrust::Unpinned,
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_roots_leave_the_directory_holding_exactly_the_built_in_root() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let directory = pinned_roots_directory(home.path());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("other-root.der"), valid_der_certificate()).unwrap();
+        fs::write(directory.join(".DS_Store"), "finder state").unwrap();
+        let legacy = legacy_certificate_path(home.path());
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, valid_der_certificate()).unwrap();
+
+        assert_eq!(
+            signing::install_roots(&lpm_dev_trust(), false).unwrap(),
+            RootsOutcome::Installed
         );
 
-        // Idempotent re-run on the same registries.json reports
-        // AlreadyConfigured, no rewrite.
-        let outcome2 = configure_signing_trust("https://lpm.dev", true)
-            .expect("idempotent re-run should succeed");
-        assert_eq!(outcome2, TrustOutcome::AlreadyConfigured);
+        let entries: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries, [built_in_root_path(home.path())]);
+        assert_eq!(
+            fs::read(built_in_root_path(home.path())).unwrap(),
+            built_in_root()
+        );
+        assert!(
+            !legacy.exists(),
+            "the certificate earlier releases wrote stays"
+        );
+        assert_eq!(
+            signing::install_roots(&lpm_dev_trust(), false).unwrap(),
+            RootsOutcome::AlreadyInstalled
+        );
+        assert_eq!(
+            signing::install_roots(&lpm_dev_trust(), true).unwrap(),
+            RootsOutcome::Installed
+        );
+    }
+
+    #[test]
+    fn a_damaged_pinned_root_is_rewritten() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let root = built_in_root_path(home.path());
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(&root, &built_in_root()[..100]).unwrap();
+
+        assert_eq!(
+            signing::install_roots(&lpm_dev_trust(), false).unwrap(),
+            RootsOutcome::Installed
+        );
+        assert_eq!(fs::read(root).unwrap(), built_in_root());
+    }
+
+    #[test]
+    fn pinned_roots_refuse_a_directory_inside_the_roots_directory() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let nested = pinned_roots_directory(home.path()).join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let error = signing::install_roots(&lpm_dev_trust(), false).unwrap_err();
+
+        assert!(error.to_string().contains("remove it"), "{error}");
+        assert!(nested.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_roots_refuse_a_linked_roots_directory() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let directory = pinned_roots_directory(home.path());
+        let elsewhere = home.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &directory).unwrap();
+
+        let error = signing::install_roots(&lpm_dev_trust(), false).unwrap_err();
+
+        assert!(error.to_string().contains("not a link"), "{error}");
+        assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_unpinned_registry_installs_no_roots_and_keeps_the_earlier_certificate() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let legacy = legacy_certificate_path(home.path());
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, valid_der_certificate()).unwrap();
+
+        assert_eq!(
+            signing::install_roots(&SignerTrust::Unpinned, true).unwrap(),
+            RootsOutcome::NotPinned
+        );
+        assert!(legacy.exists());
+        assert!(
+            !test_swiftpm_root(home.path())
+                .join("security/lpm-trusted-roots")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn lpm_dev_signatures_must_chain_to_the_pinned_root() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+
+        let outcome = configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
+
+        assert_eq!(outcome, TrustOutcome::Configured);
+        let config_path = test_swiftpm_root(home.path()).join("configuration/registries.json");
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(json, pinned_signing_trust(home.path()));
+        assert_eq!(
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            TrustOutcome::AlreadyConfigured
+        );
+    }
+
+    #[test]
+    fn signing_trust_replaces_a_silent_allow_lpm_dev_override_with_the_pin() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let mut earlier = complete_signing_trust();
+        earlier["security"]["registryOverrides"] = serde_json::json!({
+            "lpm.dev": {"signing": {"onUntrustedCertificate": "silentAllow"}}
+        });
+        assert!(!signing::is_applied(&earlier, "lpm.dev", &lpm_dev_trust()));
+        let path = write_global_signing_trust(home.path(), &earlier);
+
+        assert_eq!(
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            TrustOutcome::Configured
+        );
+
+        let repaired: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(repaired, pinned_signing_trust(home.path()));
+    }
+
+    #[test]
+    fn signing_trust_drops_lpmdev_scope_and_package_roots_that_would_replace_the_pin() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let mut config = pinned_signing_trust(home.path());
+        let other_roots = serde_json::json!({
+            "signing": {
+                "trustedRootCertificatesPath": "/elsewhere",
+                "includeDefaultTrustedRootCertificates": true
+            }
+        });
+        config["security"]["scopeOverrides"] =
+            serde_json::json!({"LPMDEV": other_roots, "other": other_roots});
+        config["security"]["packageOverrides"] =
+            serde_json::json!({"lpmdev.logger": other_roots, "other.logger": other_roots});
+        assert!(!signing::is_applied(&config, "lpm.dev", &lpm_dev_trust()));
+        let path = write_global_signing_trust(home.path(), &config);
+
+        configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
+
+        let repaired: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(signing::is_applied(&repaired, "lpm.dev", &lpm_dev_trust()));
+        assert_eq!(
+            repaired["security"]["scopeOverrides"]["LPMDEV"]["signing"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            repaired["security"]["packageOverrides"]["lpmdev.logger"]["signing"],
+            serde_json::json!({})
+        );
+        assert_eq!(repaired["security"]["scopeOverrides"]["other"], other_roots);
+        assert_eq!(
+            repaired["security"]["packageOverrides"]["other.logger"],
+            other_roots
+        );
+    }
+
+    #[test]
+    fn a_project_with_its_own_signing_settings_sets_the_pin_aside() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let trust = lpm_dev_trust();
+        let scope_only = serde_json::json!({"version": 1, "registries": {}});
+        let own_settings = serde_json::json!({
+            "version": 1,
+            "registries": {},
+            "security": {"default": {"signing": {"onUnsigned": "warn"}}}
+        });
+
+        assert!(!signing::project_sets_aside(&scope_only, "lpm.dev", &trust));
+        assert!(signing::project_sets_aside(
+            &own_settings,
+            "lpm.dev",
+            &trust
+        ));
+        assert!(!signing::project_sets_aside(
+            &pinned_signing_trust(home.path()),
+            "lpm.dev",
+            &trust
+        ));
+        assert!(!signing::project_sets_aside(
+            &own_settings,
+            "127.0.0.1",
+            &SignerTrust::Unpinned
+        ));
+        let mut restated_with_own_defaults = pinned_signing_trust(home.path());
+        restated_with_own_defaults["security"]["default"]["signing"]["onUnsigned"] =
+            serde_json::json!("warn");
+        assert!(!signing::project_sets_aside(
+            &restated_with_own_defaults,
+            "lpm.dev",
+            &trust
+        ));
+        let mut scope_roots = pinned_signing_trust(home.path());
+        scope_roots["security"]["scopeOverrides"] = serde_json::json!({
+            "lpmdev": {"signing": {"trustedRootCertificatesPath": "/elsewhere"}}
+        });
+        assert!(signing::project_sets_aside(&scope_roots, "lpm.dev", &trust));
     }
 
     // ── M53: scope URL verification ──────────────────────────────
@@ -2197,68 +2051,54 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     }
 
     #[tokio::test]
-    async fn automatic_setup_repairs_a_missing_certificate_when_scope_and_trust_match() {
+    async fn automatic_setup_installs_missing_pinned_roots_when_scope_and_trust_match() {
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
-        let server = MockServer::start().await;
-        let certificate = valid_der_certificate();
-        mount_signing_certificate(&server, certificate.clone()).await;
-        write_matching_package_scope(package.path(), &server.uri());
-        write_global_signing_trust(home.path(), &complete_signing_trust());
+        write_matching_package_scope(package.path(), "https://lpm.dev");
+        write_global_signing_trust(home.path(), &pinned_signing_trust(home.path()));
 
-        ensure_configured(None, &server.uri(), package.path(), true)
-            .await
-            .unwrap();
+        let outcome =
+            ensure_configured_for_install(None, "https://lpm.dev", package.path(), true, true)
+                .await
+                .unwrap();
 
         assert_eq!(
-            fs::read(signing_certificate_path(home.path())).unwrap(),
-            certificate
+            fs::read(built_in_root_path(home.path())).unwrap(),
+            built_in_root()
+        );
+        assert_eq!(
+            outcome.to_json(),
+            serde_json::json!({
+                "scope": "retained",
+                "signing_certificate": "repaired",
+                "signing_trust": "retained"
+            })
         );
     }
 
     #[tokio::test]
-    async fn automatic_setup_replaces_a_malformed_local_certificate() {
+    async fn automatic_setup_against_an_unpinned_registry_requests_no_certificate() {
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
         let server = MockServer::start().await;
-        let certificate = valid_der_certificate();
-        mount_signing_certificate(&server, certificate.clone()).await;
         write_matching_package_scope(package.path(), &server.uri());
-        write_global_signing_trust(home.path(), &complete_signing_trust());
-        let cert_path = signing_certificate_path(home.path());
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(&cert_path, vec![0x30; MIN_CERT_SIZE as usize]).unwrap();
 
-        ensure_configured(None, &server.uri(), package.path(), true)
+        let outcome = ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
-        assert_eq!(fs::read(cert_path).unwrap(), certificate);
-    }
-
-    #[tokio::test]
-    async fn automatic_setup_replaces_a_stale_but_valid_local_certificate() {
-        let home = TempDir::new().unwrap();
-        let package = TempDir::new().unwrap();
-        let _home = home_override(home.path());
-        let server = MockServer::start().await;
-        let expected = valid_der_certificate();
-        let stale = valid_der_certificate();
-        assert_ne!(stale, expected);
-        mount_signing_certificate(&server, expected.clone()).await;
-        write_matching_package_scope(package.path(), &server.uri());
-        write_global_signing_trust(home.path(), &complete_signing_trust());
-        let cert_path = signing_certificate_path(home.path());
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(&cert_path, stale).unwrap();
-
-        ensure_configured(None, &server.uri(), package.path(), true)
-            .await
-            .unwrap();
-
-        assert_eq!(fs::read(cert_path).unwrap(), expected);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!test_swiftpm_root(home.path()).join("security").exists());
+        assert_eq!(
+            outcome.to_json(),
+            serde_json::json!({
+                "scope": "retained",
+                "signing_certificate": "retained",
+                "signing_trust": "repaired"
+            })
+        );
     }
 
     #[tokio::test]
@@ -2267,14 +2107,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
         let server = MockServer::start().await;
-        let certificate = valid_der_certificate();
-        mount_signing_certificate(&server, certificate.clone()).await;
         write_matching_package_scope(package.path(), &server.uri());
         let config_path =
             write_global_signing_trust(home.path(), &serde_json::json!({"version": 1}));
-        let cert_path = signing_certificate_path(home.path());
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(cert_path, certificate).unwrap();
 
         ensure_configured(None, &server.uri(), package.path(), true)
             .await
@@ -2282,7 +2117,11 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
-        assert!(signing_trust_is_valid(&repaired, "127.0.0.1"));
+        assert!(signing::is_applied(
+            &repaired,
+            "127.0.0.1",
+            &SignerTrust::Unpinned
+        ));
     }
 
     #[tokio::test]
@@ -2290,47 +2129,28 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
-        let server = MockServer::start().await;
-        let certificate = valid_der_certificate();
-        mount_signing_certificate(&server, certificate.clone()).await;
-        write_matching_package_scope(package.path(), &server.uri());
-        let mut trust = complete_signing_trust();
+        write_matching_package_scope(package.path(), "https://lpm.dev");
+        let mut trust = pinned_signing_trust(home.path());
         trust["security"]["default"]["signing"]["onUnsigned"] = serde_json::json!("silentAllow");
         let config_path = write_global_signing_trust(home.path(), &trust);
-        let cert_path = signing_certificate_path(home.path());
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(cert_path, certificate).unwrap();
 
-        ensure_configured(None, &server.uri(), package.path(), true)
+        ensure_configured_for_install(None, "https://lpm.dev", package.path(), true, true)
             .await
             .unwrap();
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
-        assert!(signing_trust_is_valid(&repaired, "127.0.0.1"));
-        assert_eq!(
-            repaired["security"]["default"]["signing"]["onUnsigned"],
-            "error"
-        );
+        assert_eq!(repaired, pinned_signing_trust(home.path()));
     }
 
     #[tokio::test]
-    async fn automatic_setup_retains_stricter_default_signing_policies() {
+    async fn automatic_setup_retains_complete_unpinned_trust() {
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
         let server = MockServer::start().await;
-        let certificate = valid_der_certificate();
-        mount_signing_certificate(&server, certificate.clone()).await;
         write_matching_package_scope(package.path(), &server.uri());
-        let mut trust = complete_signing_trust();
-        trust["security"]["default"]["signing"]["onUnsigned"] = serde_json::json!("error");
-        trust["security"]["default"]["signing"]["onUntrustedCertificate"] =
-            serde_json::json!("error");
-        let config_path = write_global_signing_trust(home.path(), &trust);
-        let cert_path = signing_certificate_path(home.path());
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(cert_path, certificate).unwrap();
+        let config_path = write_global_signing_trust(home.path(), &complete_signing_trust());
 
         let outcome = ensure_configured(None, &server.uri(), package.path(), true)
             .await
@@ -2338,14 +2158,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
         let retained: serde_json::Value =
             serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
-        assert_eq!(
-            retained["security"]["default"]["signing"]["onUnsigned"],
-            "error"
-        );
-        assert_eq!(
-            retained["security"]["default"]["signing"]["onUntrustedCertificate"],
-            "error"
-        );
+        assert_eq!(retained, complete_signing_trust());
         assert_eq!(
             outcome.to_json(),
             serde_json::json!({
@@ -2357,54 +2170,53 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     }
 
     #[tokio::test]
-    async fn automatic_setup_surfaces_certificate_repair_failure() {
+    async fn automatic_setup_surfaces_a_roots_directory_it_cant_create() {
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
-        let server = MockServer::start().await;
-        mount_signing_certificate(&server, valid_der_certificate()).await;
-        write_matching_package_scope(package.path(), &server.uri());
-        write_global_signing_trust(home.path(), &complete_signing_trust());
-        let blocked_directory = test_swiftpm_root(home.path()).join("security/trusted-root-certs");
-        fs::create_dir_all(blocked_directory.parent().unwrap()).unwrap();
-        fs::write(&blocked_directory, "not a directory").unwrap();
+        write_matching_package_scope(package.path(), "https://lpm.dev");
+        write_global_signing_trust(home.path(), &pinned_signing_trust(home.path()));
+        let blocked = test_swiftpm_root(home.path()).join("security/lpm-trusted-roots");
+        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        fs::write(&blocked, "not a directory").unwrap();
 
-        let error = ensure_configured(None, &server.uri(), package.path(), true)
-            .await
-            .unwrap_err();
+        let error =
+            ensure_configured_for_install(None, "https://lpm.dev", package.path(), true, true)
+                .await
+                .unwrap_err();
 
         assert!(
             error
                 .to_string()
-                .contains("failed to create trust directory"),
+                .contains("Can't set up the Swift signing roots"),
             "{error}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn automatic_setup_retains_matching_certificate_and_complete_trust_without_rewrites() {
+    async fn automatic_setup_retains_matching_roots_and_complete_trust_without_rewrites() {
         use std::os::unix::fs::MetadataExt;
 
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let _home = home_override(home.path());
-        let server = MockServer::start().await;
-        let certificate = valid_der_certificate();
-        mount_signing_certificate(&server, certificate.clone()).await;
-        write_matching_package_scope(package.path(), &server.uri());
-        let config_path = write_global_signing_trust(home.path(), &complete_signing_trust());
-        let cert_path = signing_certificate_path(home.path());
-        fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
-        fs::write(&cert_path, certificate).unwrap();
-        let cert_inode = fs::metadata(&cert_path).unwrap().ino();
+        write_matching_package_scope(package.path(), "https://lpm.dev");
+        let config_path =
+            write_global_signing_trust(home.path(), &pinned_signing_trust(home.path()));
+        signing::install_roots(&lpm_dev_trust(), false).unwrap();
+        let root_inode = fs::metadata(built_in_root_path(home.path())).unwrap().ino();
         let config_inode = fs::metadata(&config_path).unwrap().ino();
 
-        let outcome = ensure_configured(None, &server.uri(), package.path(), true)
-            .await
-            .unwrap();
+        let outcome =
+            ensure_configured_for_install(None, "https://lpm.dev", package.path(), true, true)
+                .await
+                .unwrap();
 
-        assert_eq!(fs::metadata(cert_path).unwrap().ino(), cert_inode);
+        assert_eq!(
+            fs::metadata(built_in_root_path(home.path())).unwrap().ino(),
+            root_inode
+        );
         assert_eq!(fs::metadata(config_path).unwrap().ino(), config_inode);
         assert_eq!(
             outcome.to_json(),

@@ -1388,8 +1388,8 @@ pub(crate) fn run_swift_resolve_with_force(
     if !status.success() {
         return Err(LpmError::Registry(
             "swift package resolve failed after automatic Registry setup. See the Swift output \
-             above for the actual cause. If Registry configuration or the signing certificate is \
-             stale or corrupt, repair it with `lpm swift-registry --force`."
+             above for the actual cause. If Registry configuration or the signing roots are \
+             stale or corrupt, repair them with `lpm swift-registry --force`."
                 .into(),
         ));
     }

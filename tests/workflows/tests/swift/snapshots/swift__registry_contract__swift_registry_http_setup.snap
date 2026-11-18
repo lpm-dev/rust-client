@@ -7,11 +7,12 @@ expression: json
   "registry_url": "[registry]/api/swift-registry",
   "scope": "lpmdev",
   "https": false,
-  "signing_certificate_installed": true,
+  "signing_certificate_installed": false,
   "signing_trust_configured": true,
-  "signing_certificate_outcome": "installed",
+  "signing_certificate_outcome": "not_pinned",
   "signing_trust_outcome": "configured",
   "trust_anchor": "insecure_http",
   "authentication_outcome": "skipped_http",
-  "signer_trust_policy": "silentAllow"
+  "signer_trust_policy": "silentAllow",
+  "project_signing_overrides_pin": false
 }

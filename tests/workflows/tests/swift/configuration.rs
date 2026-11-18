@@ -33,9 +33,9 @@ async fn explicit_scope_setup_preserves_extensions_and_unrelated_registry_entrie
 #[tokio::test]
 async fn malformed_later_workspace_configuration_prevents_setup_for_every_member() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = swift_workspace();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let manifest = project.read_file("packages/swift-member/Package.swift");
     project.write_file(
         "packages/z-swift/package.json",
@@ -83,11 +83,11 @@ async fn malformed_later_workspace_configuration_prevents_setup_for_every_member
 #[tokio::test]
 async fn invalid_configuration_stops_explicit_setup_and_install_before_swift_or_file_changes() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     for global in [true, false] {
         for install in [true, false] {
             let project = swift_project();
-            configure_existing_registry(&project, &mock.url(), &cert);
+            configure_existing_registry(&project, &mock.url());
             let local_config = project
                 .path()
                 .join(".swiftpm/configuration/registries.json");
@@ -98,13 +98,10 @@ async fn invalid_configuration_stops_explicit_setup_and_install_before_swift_or_
                 &local_config
             };
             std::fs::write(invalid, "invalid original configuration").unwrap();
-            let certificate = swiftpm_home(&project).join("security/trusted-root-certs/lpm.der");
-            std::fs::write(&certificate, "previous certificate").unwrap();
             let files = [
                 project.path().join("Package.swift"),
                 local_config.clone(),
                 global_config.clone(),
-                certificate,
             ];
             let originals = files
                 .iter()

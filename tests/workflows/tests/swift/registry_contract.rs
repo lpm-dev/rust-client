@@ -1,5 +1,4 @@
 use super::*;
-use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn swift_registry_normalizes_a_trailing_slash() {
@@ -98,95 +97,133 @@ async fn swift_registry_http_json_reports_unencrypted_transport() {
     });
 }
 
-#[tokio::test]
-async fn swift_registry_stalled_certificate_headers_fail_within_the_deadline() {
-    let mock = MockRegistry::start().await;
-    let cert = rcgen::generate_simple_self_signed(vec!["lpm.dev".into()])
+const LPM_DEV: &str = "https://lpm.dev";
+const LPM_DEV_ROOT: &str = "c96df3ac7c141082cae02d6cbfa41b3753d64972e3199c64ba41a05359966cde";
+
+fn lpm_dev_roots_directory(project: &TempProject) -> std::path::PathBuf {
+    swiftpm_home(project)
+        .join("security")
+        .join("lpm-trusted-roots")
+        .join("lpm.dev")
+}
+
+fn lpm_dev_signing(project: &TempProject) -> serde_json::Value {
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(swiftpm_home(project).join("configuration/registries.json")).unwrap(),
+    )
+    .unwrap();
+    config["security"]["registryOverrides"]["lpm.dev"]["signing"].clone()
+}
+
+fn assert_lpm_dev_is_pinned(project: &TempProject) {
+    let signing = lpm_dev_signing(project);
+    assert_eq!(signing["onUnsigned"], "error", "{signing}");
+    assert_eq!(signing["onUntrustedCertificate"], "error", "{signing}");
+    assert_eq!(
+        signing["includeDefaultTrustedRootCertificates"], false,
+        "{signing}"
+    );
+    let roots = lpm_dev_roots_directory(project);
+    assert_eq!(
+        std::fs::canonicalize(signing["trustedRootCertificatesPath"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&roots).unwrap()
+    );
+    let entries: Vec<_> = std::fs::read_dir(&roots)
         .unwrap()
-        .cert
-        .der()
-        .to_vec();
-    Mock::given(method("GET"))
-        .and(path("/api/swift-registry/certificate"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(cert.clone())
-                .set_delay(Duration::from_secs(40)),
-        )
-        .mount(mock.server())
-        .await;
-    let project = swift_project();
-    configure_existing_registry(&project, &mock.url(), &cert);
-    let cert_path = swiftpm_home(&project).join("security/trusted-root-certs/lpm.der");
-    let mut command = lpm_with_registry(&project, &mock.url());
-    configure_fake_swift(&mut command, &project, &[], 0);
-    let start = Instant::now();
-    let output = command
-        .timeout(Duration::from_secs(45))
-        .args(["swift-registry", "--json", "--force"])
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "stalled fetch unexpectedly succeeded"
+        .map(|entry| entry.unwrap())
+        .collect();
+    assert_eq!(entries.len(), 1, "the roots directory holds only the root");
+    assert_eq!(
+        entries[0].file_name(),
+        format!("{LPM_DEV_ROOT}.der").as_str()
     );
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["success"], false);
-    assert!(
-        json["error"].as_str().unwrap().contains("timed out"),
-        "{json}"
+    let root = std::fs::read(entries[0].path()).unwrap();
+    assert_eq!(
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&root)),
+        LPM_DEV_ROOT
     );
-    assert!(start.elapsed() < Duration::from_secs(37));
-    assert_eq!(std::fs::read(cert_path).unwrap(), cert);
 }
 
 #[tokio::test]
-async fn swift_registry_stalled_certificate_body_fails_within_the_deadline() {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0; 4096];
-        assert!(stream.read(&mut request).unwrap() > 0);
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nx")
-            .unwrap();
-        let mut end = [0; 1];
-        stream
-            .set_read_timeout(Some(Duration::from_secs(40)))
-            .unwrap();
-        let _ = stream.read(&mut end);
-    });
+async fn swift_registry_pins_lpm_dev_releases_to_its_built_in_signing_root() {
     let project = swift_project();
-    let cert = rcgen::generate_simple_self_signed(vec!["lpm.dev".into()])
-        .unwrap()
-        .cert
-        .der()
-        .to_vec();
-    configure_existing_registry(&project, &base_url, &cert);
-    let cert_path = swiftpm_home(&project).join("security/trusted-root-certs/lpm.der");
-    let mut command = lpm_with_registry(&project, &base_url);
+    let mut command = lpm_with_registry(&project, LPM_DEV);
     configure_fake_swift(&mut command, &project, &[], 0);
-    let start = Instant::now();
-    let output = command
-        .timeout(Duration::from_secs(45))
-        .args(["swift-registry", "--json", "--force"])
-        .output()
-        .unwrap();
-    server.join().unwrap();
-    assert!(!output.status.success());
-    assert!(
-        start.elapsed() < Duration::from_secs(37),
-        "fetch had no deadline"
+
+    let output = command.args(["swift-registry", "--json"]).output().unwrap();
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["trust_anchor"], "pinned_root");
+    assert_eq!(json["signer_trust_policy"], "error");
+    insta::assert_json_snapshot!("swift_registry_lpm_dev_setup", json);
+    assert_lpm_dev_is_pinned(&project);
+}
+
+#[tokio::test]
+async fn swift_registry_replaces_lpm_dev_s_earlier_silent_allow_and_unused_certificate() {
+    let project = swift_project();
+    configure_existing_registry(&project, LPM_DEV);
+    assert_eq!(
+        lpm_dev_signing(&project)["onUntrustedCertificate"],
+        "silentAllow"
     );
-    assert_eq!(std::fs::read(cert_path).unwrap(), cert);
+    let earlier_certificate = swiftpm_home(&project).join("security/trusted-root-certs/lpm.der");
+    std::fs::create_dir_all(earlier_certificate.parent().unwrap()).unwrap();
+    std::fs::write(
+        &earlier_certificate,
+        b"certificate an earlier release wrote",
+    )
+    .unwrap();
+    let mut command = lpm_with_registry(&project, LPM_DEV);
+    configure_fake_swift(&mut command, &project, &[], 0);
+
+    let output = command.args(["swift-registry", "--json"]).output().unwrap();
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["signing_certificate_outcome"], "installed");
+    assert_eq!(json["signing_trust_outcome"], "configured");
+    assert_lpm_dev_is_pinned(&project);
+    assert!(!earlier_certificate.exists());
+}
+
+#[tokio::test]
+async fn swift_registry_warns_when_the_project_s_own_signing_settings_set_the_pin_aside() {
+    let project = swift_project();
+    project.write_file(
+        ".swiftpm/configuration/registries.json",
+        &serde_json::json!({
+            "version": 1,
+            "registries": {"lpmdev": {"url": format!("{LPM_DEV}/api/swift-registry")}},
+            "security": {"default": {"signing": {"onUnsigned": "warn"}}}
+        })
+        .to_string(),
+    );
+
+    let mut command = lpm_with_registry(&project, LPM_DEV);
+    configure_fake_swift(&mut command, &project, &[], 0);
+    let output = command.args(["swift-registry"]).output().unwrap();
+    assert!(output.status.success(), "{}", combined_output(&output));
+    assert!(
+        combined_output(&output).contains("has its own signing settings"),
+        "{}",
+        combined_output(&output)
+    );
+
+    let mut command = lpm_with_registry(&project, LPM_DEV);
+    configure_fake_swift(&mut command, &project, &[], 0);
+    let output = command.args(["swift-registry", "--json"]).output().unwrap();
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["project_signing_overrides_pin"], true);
+    assert_lpm_dev_is_pinned(&project);
 }
 
 #[tokio::test]
 async fn xcode_registry_scopes_use_the_same_normalized_url() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     Mock::given(wiremock::matchers::path_regex(r"^//"))
         .respond_with(|request: &wiremock::Request| {
             let mut location = format!("/{}", request.url.path().trim_start_matches('/'));
@@ -200,7 +237,7 @@ async fn xcode_registry_scopes_use_the_same_normalized_url() {
         .await;
     let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
     write_xcode_project(&project, "", "MyApp");
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let mut command = lpm_with_registry(&project, &format!("{}/", mock.url()));
     configure_fake_swift(&mut command, &project, &["unused"], 0);
     command
@@ -224,12 +261,12 @@ async fn xcode_registry_scopes_use_the_same_normalized_url() {
 async fn swift_registry_repairs_xcode_user_scope_and_preserves_other_registries() {
     for existing in [false, true] {
         let mock = MockRegistry::start().await;
-        let cert = mount_swift_package(&mock).await;
+        mount_swift_package(&mock).await;
         let project = TempProject::empty(r#"{"name":"xcode-registry-setup","version":"1.0.0"}"#);
         write_xcode_project(&project, "", "MyApp");
         let global_path = swiftpm_home(&project).join("configuration/registries.json");
         if existing {
-            configure_existing_registry(&project, &mock.url(), &cert);
+            configure_existing_registry(&project, &mock.url());
             let mut global: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&global_path).unwrap()).unwrap();
             global["registries"]["acme"] =
