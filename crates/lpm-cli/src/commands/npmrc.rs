@@ -188,7 +188,7 @@ pub async fn run(
     }
     let registry = SetupRegistry::parse(registry_url)?;
 
-    let target = setup_npmrc_destination(project_dir, &registry, npm_user_config().as_deref())?;
+    let target = setup_npmrc_destination(project_dir, &registry, &NpmUserConfig::from_env())?;
 
     let pkg_json_path = project_dir.join("package.json");
     let npmrc_path = target.path.clone();
@@ -243,15 +243,23 @@ pub async fn run(
         .as_secs();
     let days_since_epoch = now / 86400;
     let today = format!("{days_since_epoch}");
-    let token_name = format!("npmrc-{project_name}-{today}");
+    // A token in npm's user configuration serves every project on the
+    // machine, so it isn't named after the one that created it.
+    let token_name = if target.is_user_config() {
+        format!("npmrc-user-config-{today}")
+    } else {
+        format!("npmrc-{project_name}-{today}")
+    };
 
     let registry_line = format!("@lpm.dev:registry={}/", registry.endpoint());
     if let Some(existing_registry) = local_setup_registry_url(existing_npmrc)
         && existing_registry != registry.endpoint()
     {
-        return Err(LpmError::Script(format!(
-            "the setup-local token belongs to {existing_registry}; rerun with its registry to finish replacement safely"
-        )));
+        return Err(target.foreign_registry_error(
+            "setup-local token",
+            &existing_registry,
+            "finish replacement safely",
+        ));
     }
     reject_legacy_ci_retirement_state(existing_npmrc)?;
     let pending = match pending_setup_token(existing_npmrc, registry.auth_scope())? {
@@ -298,8 +306,10 @@ pub async fn run(
         pending.token
     );
     let pending_content = replace_generated_block(existing_npmrc, &pending_config);
-    if let Err(error) = write_token_npmrc(&npmrc_path, &pending_content) {
-        return Err(rollback_files(LpmError::Io(error), rollback));
+    // Conditional, as npm's user configuration can change under another
+    // command, such as `npm login`, between the read above and this write.
+    if let Err(error) = write_npmrc_if_unchanged(&npmrc_path, existing_npmrc, &pending_content) {
+        return Err(rollback_files(error, rollback));
     }
     let rollback = rollback.with_npmrc(
         &npmrc_path,
@@ -423,7 +433,7 @@ pub async fn run(
             "success": true,
             "npmrc_path": npmrc_path.display().to_string(),
             "npmrc_location": target.location(),
-            "gitignore_path": gitignore_path.display().to_string(),
+            "gitignore_path": (!target.is_user_config()).then(|| gitignore_path.display().to_string()),
             "proxy": false,
             "scope": replaced.scope,
             "expires_at": expires_at,
@@ -445,7 +455,7 @@ pub async fn run(
                 npmrc_path.display()
             )),
         }
-        for note in target.user_destination_notes(&registry) {
+        for note in target.user_destination_notes(&registry, SetupCommand::Local) {
             install_ui::phase_untrusted(&note);
         }
         for warning in &warnings {
@@ -481,9 +491,28 @@ pub(super) enum NpmrcDestination {
     /// The project's own `.npmrc`, which Git doesn't track.
     Project,
     /// npm's user configuration, because Git tracks the project's `.npmrc`.
-    /// `scope_routed` says whether that tracked file already sends
-    /// `@lpm.dev` packages to the registry, as other machines need it to.
-    User { scope_routed: bool },
+    User {
+        /// How the tracked file routes `@lpm.dev`, which other machines rely on.
+        tracked_route: TrackedScopeRoute,
+        /// Whether the file is `~/.npmrc`, the only one Bun reads.
+        bun_reads_it: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TrackedScopeRoute {
+    /// The tracked `.npmrc` doesn't route `@lpm.dev`.
+    Missing,
+    /// It routes `@lpm.dev` to the registry. Bun needs the URL to end with
+    /// a slash, and the project line takes precedence over the generated one.
+    Routed { trailing_slash: bool },
+}
+
+/// Which command writes the block, for the notes and errors that differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SetupCommand {
+    Local,
+    Ci,
 }
 
 impl SetupNpmrc {
@@ -493,6 +522,10 @@ impl SetupNpmrc {
             NpmrcDestination::Project => "project",
             NpmrcDestination::User { .. } => "user",
         }
+    }
+
+    pub(super) fn is_user_config(&self) -> bool {
+        matches!(self.destination, NpmrcDestination::User { .. })
     }
 
     /// The ignore file that keeps the destination out of Git: a rule only
@@ -510,18 +543,65 @@ impl SetupNpmrc {
         }
     }
 
+    /// The error for a generated block in the destination that belongs to
+    /// `existing_registry`, which a run for another registry must not replace.
+    pub(super) fn foreign_registry_error(
+        &self,
+        block: &str,
+        existing_registry: &str,
+        finish: &str,
+    ) -> LpmError {
+        let existing_registry = lpm_common::sanitize_terminal_inline(existing_registry);
+        match self.destination {
+            NpmrcDestination::Project => LpmError::Script(format!(
+                "the {block} belongs to {existing_registry}; rerun with its registry to {finish}"
+            )),
+            NpmrcDestination::User { .. } => LpmError::Script(format!(
+                "npm's user configuration {} holds the {block} for {existing_registry}, and it has room for one generated block. Rerun with `--registry {existing_registry}`, or remove that block first",
+                lpm_common::sanitize_terminal_inline(&self.path.display().to_string())
+            )),
+        }
+    }
+
     /// Lines the human output adds after a write to npm's user configuration.
-    pub(super) fn user_destination_notes(&self, registry: &SetupRegistry) -> Vec<String> {
-        let NpmrcDestination::User { scope_routed } = self.destination else {
+    pub(super) fn user_destination_notes(
+        &self,
+        registry: &SetupRegistry,
+        command: SetupCommand,
+    ) -> Vec<String> {
+        let NpmrcDestination::User {
+            tracked_route,
+            bun_reads_it,
+        } = self.destination
+        else {
             return Vec::new();
         };
         let mut notes = vec![
-            "Git tracks the project's .npmrc, so the token went to npm's user configuration instead.".to_string(),
+            "Git tracks the project's .npmrc, so the token went to npm's user configuration instead. Every project on this machine uses it.".to_string(),
         ];
-        if !scope_routed {
-            notes.push(format!(
+        match tracked_route {
+            TrackedScopeRoute::Missing => notes.push(format!(
                 "Add `@lpm.dev:registry={}/` to the tracked .npmrc so other machines route @lpm.dev packages to this registry too.",
                 registry.endpoint()
+            )),
+            TrackedScopeRoute::Routed {
+                trailing_slash: false,
+            } => notes.push(
+                "End the @lpm.dev:registry URL in the tracked .npmrc with a slash. Bun drops the last part of a registry URL that has none.".to_string(),
+            ),
+            TrackedScopeRoute::Routed {
+                trailing_slash: true,
+            } => {}
+        }
+        if !bun_reads_it {
+            notes.push(
+                "NPM_CONFIG_USERCONFIG names this file. Bun reads only ~/.npmrc, so Bun won't use the token.".to_string(),
+            );
+        }
+        if command == SetupCommand::Ci {
+            notes.push(format!(
+                "The token stays in {} after the job. On a runner that other jobs share, remove the generated block when the job ends, or point NPM_CONFIG_USERCONFIG at a file in the job's temporary directory.",
+                self.path.display()
             ));
         }
         notes
@@ -529,25 +609,72 @@ impl SetupNpmrc {
 }
 
 /// npm's user configuration file: `NPM_CONFIG_USERCONFIG` when it names one,
-/// else `.npmrc` in the home directory, as npm, pnpm, Yarn 1 and Bun read it.
-pub(super) fn npm_user_config() -> Option<PathBuf> {
-    lpm_common::npm_user_config_path(lpm_common::npm_home_dir().as_deref())
+/// else `.npmrc` in the home directory. npm, pnpm and Yarn 1 honor the
+/// variable. Bun reads `~/.npmrc` alone, which `home_npmrc` names.
+pub(super) struct NpmUserConfig {
+    pub(super) path: Option<PathBuf>,
+    pub(super) home_npmrc: Option<PathBuf>,
+}
+
+impl NpmUserConfig {
+    pub(super) fn from_env() -> Self {
+        let home = lpm_common::npm_home_dir();
+        Self {
+            path: lpm_common::npm_user_config_path(home.as_deref()),
+            home_npmrc: home.map(|home| home.join(".npmrc")),
+        }
+    }
+}
+
+/// The settings that make a request to a registry carry a credential. npm
+/// takes the token first, so a project `_authToken` overrides a user one; the
+/// others in a committed file are a leaked secret all the same.
+const CREDENTIAL_KEYS: [&str; 5] = [
+    "_authToken",
+    "_auth",
+    "_password",
+    "username",
+    "tokenHelper",
+];
+
+/// The first credential setting for `auth_scope` in `settings`.
+fn credential_for_scope<'a>(
+    settings: &'a [lpm_common::NpmrcIniSetting<'_>],
+    auth_scope: &str,
+) -> Option<&'a str> {
+    settings.iter().find_map(|setting| {
+        let field = setting.key.strip_prefix(auth_scope)?.strip_prefix(':')?;
+        CREDENTIAL_KEYS.contains(&field).then_some(&*setting.key)
+    })
+}
+
+/// The `@lpm.dev` route in `settings`, as written.
+fn scope_route<'a>(settings: &'a [lpm_common::NpmrcIniSetting<'_>]) -> Option<&'a str> {
+    settings
+        .iter()
+        .find(|setting| &*setting.key == "@lpm.dev:registry")
+        .and_then(|setting| setting.values.last())
+        .map(|value| value.value.as_ref())
 }
 
 /// Chooses the `.npmrc` that will hold the bearer, before anything writes it.
 ///
 /// An `.npmrc` that Git doesn't track takes the generated block, as it
 /// always has. One that Git tracks keeps the settings the team shares and
-/// takes no token: the block goes to npm's user configuration, `user_config`.
-/// That works only while the tracked file sets no credential for the
-/// registry, because npm, Yarn 1 and Bun prefer a project setting to a user
-/// one, and only while it routes `@lpm.dev` to the same registry, if it routes
-/// the scope at all. A repository where Git can't tell whether the file is
-/// tracked is refused, as is a user configuration that is the tracked file.
+/// takes no token: the block goes to npm's user configuration instead. That
+/// works only while the tracked file sets no credential for the registry,
+/// because npm, Yarn 1 and Bun prefer a project setting to a user one, and
+/// only while it routes `@lpm.dev` to the same registry, if it routes the
+/// scope at all. The user configuration must be a regular file, or none yet,
+/// in a directory that exists, and must not set its own credential or route
+/// for the registry outside the generated block: the block would override
+/// them for every project. A repository where Git can't tell whether the
+/// file is tracked is refused, as is a user configuration that is the
+/// tracked file.
 pub(super) fn setup_npmrc_destination(
     project_dir: &Path,
     registry: &SetupRegistry,
-    user_config: Option<&Path>,
+    user_config: &NpmUserConfig,
 ) -> Result<SetupNpmrc, LpmError> {
     use lpm_common::project_git::{GitProbeError, repository_marker_above, tracked_entries};
     let project_npmrc = project_dir.join(".npmrc");
@@ -560,27 +687,35 @@ pub(super) fn setup_npmrc_destination(
         Err(GitProbeError::GitMissing(_)) if !repository_marker_above(project_dir) => Ok(project()),
         Ok(Some(tracked)) if tracked.is_empty() => Ok(project()),
         Ok(Some(tracked)) => {
-            let scope_routed = tracked_npmrc_routes_scope(&project_npmrc, registry)?;
-            let user_config = user_config.ok_or_else(|| {
+            let tracked_route = tracked_npmrc_route(&project_npmrc, registry)?;
+            let path = user_config.path.as_deref().ok_or_else(|| {
                 LpmError::ProjectFile(
                     "Git tracks the project's .npmrc, so the token belongs in npm's user configuration, but there is no home directory to hold it. Set HOME, or name the file with NPM_CONFIG_USERCONFIG, then run the command again".into(),
                 )
             })?;
-            let user_config = std::path::absolute(user_config).map_err(|error| {
+            let path = std::path::absolute(path).map_err(|error| {
                 LpmError::ProjectFile(format!(
                     "npm's user configuration {} has no usable path: {error}",
-                    user_config.display()
+                    path.display()
                 ))
             })?;
-            if same_file_location(&user_config, &project_npmrc) {
+            if same_file_location(&path, &project_npmrc) {
                 return Err(LpmError::ProjectFile(format!(
                     "refused to write a Git-tracked .npmrc because it will contain a bearer token: npm's user configuration is that file. Point NPM_CONFIG_USERCONFIG at a file outside the repository, or untrack .npmrc with `{}`, then run the command again",
                     tracked.untrack_command()
                 )));
             }
+            check_user_config(&path, registry)?;
+            let bun_reads_it = user_config
+                .home_npmrc
+                .as_deref()
+                .is_some_and(|home_npmrc| same_file_location(&path, home_npmrc));
             Ok(SetupNpmrc {
-                path: user_config,
-                destination: NpmrcDestination::User { scope_routed },
+                path,
+                destination: NpmrcDestination::User {
+                    tracked_route,
+                    bun_reads_it,
+                },
             })
         }
         Err(GitProbeError::GitMissing(reason)) => Err(LpmError::ProjectFile(format!(
@@ -592,21 +727,23 @@ pub(super) fn setup_npmrc_destination(
     }
 }
 
-/// Whether the tracked project `.npmrc` routes `@lpm.dev` to `registry`.
-/// It is refused when it sets a credential for the registry, which would
-/// override the token in npm's user configuration, or routes the scope
-/// somewhere else, where that token would never be sent.
-fn tracked_npmrc_routes_scope(
+/// How the tracked project `.npmrc` routes `@lpm.dev`. It is refused when it
+/// sets a credential for the registry, which would override the token in
+/// npm's user configuration, or routes the scope somewhere else, where that
+/// token would never be sent.
+fn tracked_npmrc_route(
     project_npmrc: &Path,
     registry: &SetupRegistry,
-) -> Result<bool, LpmError> {
+) -> Result<TrackedScopeRoute, LpmError> {
     let content = match lpm_common::read_text_file_capped_nofollow(
         project_npmrc,
         lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
     ) {
         Ok(content) => content,
         // Deleted from the work tree: npm reads no project settings.
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(false),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return Ok(TrackedScopeRoute::Missing);
+        }
         Err(error) => {
             return Err(LpmError::ProjectFile(format!(
                 "Git tracks the project's .npmrc, and LPM CLI could not read it to make sure that it sets no credential of its own: {error}"
@@ -615,31 +752,78 @@ fn tracked_npmrc_routes_scope(
     };
     let mut diagnostics = Vec::new();
     let settings = lpm_common::parse_npmrc_ini_settings(&content, ".npmrc", &mut diagnostics);
-    let credential_prefix = format!("{}:", registry.auth_scope());
-    if settings
-        .iter()
-        .any(|setting| setting.key.starts_with(&credential_prefix))
-    {
+    if let Some(key) = credential_for_scope(&settings, registry.auth_scope()) {
         return Err(LpmError::ProjectFile(format!(
-            "Git tracks the project's .npmrc, and it sets a credential for {scope}. npm, Yarn 1 and Bun would use that line instead of a token in npm's user configuration. Remove the `{scope}:` line from the tracked file, then run the command again. If the line held a token, revoke the token too, because the repository has it",
-            scope = registry.auth_scope()
+            "Git tracks the project's .npmrc, and it sets `{}`. npm, Yarn 1 and Bun would use that setting instead of a token in npm's user configuration. Remove it from the tracked file, then run the command again. If it held a secret, revoke that too, because the repository has it",
+            lpm_common::sanitize_terminal_inline(key)
         )));
     }
-    let routed = settings
-        .iter()
-        .find(|setting| &*setting.key == "@lpm.dev:registry")
-        .and_then(|setting| setting.values.last())
-        .map(|value| normalize_registry_url(&value.value));
-    match routed {
-        None => Ok(false),
-        Some(routed) if routed == registry.endpoint() => Ok(true),
-        Some(routed) => Err(LpmError::ProjectFile(format!(
-            "Git tracks the project's .npmrc, and it routes @lpm.dev packages to {}, so a token for {} would never be sent. Run the command with `--registry {}`, or change that line",
-            lpm_common::sanitize_terminal_inline(&routed),
-            registry.endpoint(),
-            lpm_common::sanitize_terminal_inline(&routed),
-        ))),
+    match scope_route(&settings) {
+        None => Ok(TrackedScopeRoute::Missing),
+        Some(routed) if normalize_registry_url(routed) == registry.endpoint() => {
+            Ok(TrackedScopeRoute::Routed {
+                trailing_slash: routed.ends_with('/'),
+            })
+        }
+        Some(routed) => {
+            let routed =
+                lpm_common::sanitize_terminal_inline(&normalize_registry_url(routed)).to_string();
+            Err(LpmError::ProjectFile(format!(
+                "Git tracks the project's .npmrc, and it routes @lpm.dev packages to {routed}, so a token for {} would never be sent. Run the command with `--registry {routed}`, or change that line",
+                registry.endpoint(),
+            )))
+        }
     }
+}
+
+/// Refuses a user configuration that can't take the generated block: a
+/// link, which the write would replace with a file, one in a directory that
+/// doesn't exist, and one whose own settings for the registry the block
+/// would override for every project.
+fn check_user_config(path: &Path, registry: &SetupRegistry) -> Result<(), LpmError> {
+    let shown = lpm_common::sanitize_terminal_inline(&path.display().to_string()).to_string();
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(LpmError::ProjectFile(format!(
+            "npm's user configuration {} is a symbolic link, and LPM CLI doesn't write a token through one. Point NPM_CONFIG_USERCONFIG at a regular file, or add the token line to the file the link leads to yourself",
+            shown
+        )));
+    }
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Err(LpmError::ProjectFile(format!(
+            "the directory of npm's user configuration {} doesn't exist. Create it, or point NPM_CONFIG_USERCONFIG at a file in a directory that exists",
+            shown
+        )));
+    }
+    let content = match lpm_common::read_text_file_capped_nofollow(
+        path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let outside = lines_outside_generated_blocks(&content).join("\n");
+    let mut diagnostics = Vec::new();
+    let settings = lpm_common::parse_npmrc_ini_settings(&outside, ".npmrc", &mut diagnostics);
+    if let Some(key) = credential_for_scope(&settings, registry.auth_scope()) {
+        return Err(LpmError::ProjectFile(format!(
+            "npm's user configuration {} already sets `{}`, and the generated token would take its place in every project. Remove that setting, then run the command again",
+            shown,
+            lpm_common::sanitize_terminal_inline(key)
+        )));
+    }
+    if let Some(routed) = scope_route(&settings)
+        && normalize_registry_url(routed) != registry.endpoint()
+    {
+        return Err(LpmError::ProjectFile(format!(
+            "npm's user configuration {} routes @lpm.dev packages to {}, and the generated block would send them to {} in every project. Remove that line, or run the command with `--registry {}`",
+            shown,
+            lpm_common::sanitize_terminal_inline(&normalize_registry_url(routed)),
+            registry.endpoint(),
+            lpm_common::sanitize_terminal_inline(&normalize_registry_url(routed)),
+        )));
+    }
+    Ok(())
 }
 
 /// Whether two paths name the same file, once the directories on the way
@@ -1140,6 +1324,18 @@ fn valid_generated_project_token(token: &str) -> bool {
 }
 
 fn replace_generated_block(existing: &str, generated: &str) -> String {
+    let kept = lines_outside_generated_blocks(existing);
+    let prefix = kept.join("\n").trim().to_string();
+    if prefix.is_empty() {
+        format!("{generated}\n")
+    } else {
+        format!("{prefix}\n\n{generated}\n")
+    }
+}
+
+/// The lines of `existing` that no generated block holds, including an
+/// unterminated block's marker, registry and bearer lines.
+pub(super) fn lines_outside_generated_blocks(existing: &str) -> Vec<&str> {
     let lines: Vec<_> = existing.lines().collect();
     let mut kept = Vec::with_capacity(lines.len());
     let mut index = 0;
@@ -1176,12 +1372,7 @@ fn replace_generated_block(existing: &str, generated: &str) -> String {
         kept.push(line);
         index += 1;
     }
-    let prefix = kept.join("\n").trim().to_string();
-    if prefix.is_empty() {
-        format!("{generated}\n")
-    } else {
-        format!("{prefix}\n\n{generated}\n")
-    }
+    kept
 }
 
 fn is_generated_header(line: &str) -> bool {
@@ -1246,13 +1437,38 @@ mod tests {
         assert!(private(&npmrc));
     }
 
-    fn destination_for(project: &Path, user_config: Option<&Path>) -> Result<SetupNpmrc, LpmError> {
-        let registry = SetupRegistry::parse("https://lpm.dev").unwrap();
-        setup_npmrc_destination(project, &registry, user_config)
+    const LPM_DEV: &str = "https://lpm.dev";
+
+    /// npm's user configuration at `path`, with `home` the home directory
+    /// whose `.npmrc` Bun reads.
+    fn user_config_at(path: Option<&Path>, home: Option<&Path>) -> NpmUserConfig {
+        NpmUserConfig {
+            path: path.map(Path::to_path_buf),
+            home_npmrc: home.map(|home| home.join(".npmrc")),
+        }
     }
 
-    fn refusal_with(project: &Path, user_config: Option<&Path>) -> String {
-        match destination_for(project, user_config) {
+    fn destination_with(
+        project: &Path,
+        user_config: &NpmUserConfig,
+    ) -> Result<SetupNpmrc, LpmError> {
+        setup_npmrc_destination(
+            project,
+            &SetupRegistry::parse(LPM_DEV).unwrap(),
+            user_config,
+        )
+    }
+
+    /// The destination with `~/.npmrc` in `home` as npm's user configuration.
+    fn destination_in_home(project: &Path, home: &Path) -> Result<SetupNpmrc, LpmError> {
+        destination_with(
+            project,
+            &user_config_at(Some(&home.join(".npmrc")), Some(home)),
+        )
+    }
+
+    fn refusal_with(project: &Path, user_config: &NpmUserConfig) -> String {
+        match destination_with(project, user_config) {
             Err(LpmError::ProjectFile(message)) => message,
             Err(other) => panic!("expected a project-file refusal, got {other:?}"),
             Ok(target) => panic!(
@@ -1266,7 +1482,10 @@ mod tests {
 
     fn refusal(project: &Path) -> String {
         let home = tempfile::tempdir().unwrap();
-        refusal_with(project, Some(&home.path().join(".npmrc")))
+        refusal_with(
+            project,
+            &user_config_at(Some(&home.path().join(".npmrc")), Some(home.path())),
+        )
     }
 
     /// A Git repository whose `.npmrc`, holding `contents`, Git tracks.
@@ -1278,11 +1497,20 @@ mod tests {
         project
     }
 
+    const ROUTED: &str = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
+
+    fn user_destination(tracked_route: TrackedScopeRoute) -> NpmrcDestination {
+        NpmrcDestination::User {
+            tracked_route,
+            bun_reads_it: true,
+        }
+    }
+
     #[test]
     fn writes_the_project_npmrc_outside_any_repository() {
         let project = tempfile::tempdir().unwrap();
 
-        let target = destination_for(project.path(), None).unwrap();
+        let target = destination_with(project.path(), &user_config_at(None, None)).unwrap();
 
         assert_eq!(target.destination, NpmrcDestination::Project);
         assert_eq!(target.path, project.path().join(".npmrc"));
@@ -1292,25 +1520,22 @@ mod tests {
     fn writes_an_untracked_npmrc_and_sends_a_tracked_ones_token_to_the_user_config() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let user_config = home.path().join(".npmrc");
         git(project.path(), &["init", "-q"]);
-        std::fs::write(
-            project.path().join(".npmrc"),
-            "@lpm.dev:registry=https://lpm.dev/api/registry/\n",
-        )
-        .unwrap();
+        std::fs::write(project.path().join(".npmrc"), ROUTED).unwrap();
 
-        let untracked = destination_for(project.path(), Some(&user_config)).unwrap();
+        let untracked = destination_in_home(project.path(), home.path()).unwrap();
         assert_eq!(untracked.destination, NpmrcDestination::Project);
         assert_eq!(untracked.location(), "project");
 
         git(project.path(), &["add", "--", ".npmrc"]);
-        let tracked = destination_for(project.path(), Some(&user_config)).unwrap();
+        let tracked = destination_in_home(project.path(), home.path()).unwrap();
         assert_eq!(
             tracked.destination,
-            NpmrcDestination::User { scope_routed: true }
+            user_destination(TrackedScopeRoute::Routed {
+                trailing_slash: true
+            })
         );
-        assert_eq!(tracked.path, user_config);
+        assert_eq!(tracked.path, home.path().join(".npmrc"));
         assert_eq!(tracked.location(), "user");
     }
 
@@ -1318,34 +1543,43 @@ mod tests {
     fn a_tracked_npmrc_that_does_not_route_the_scope_asks_for_the_line() {
         let project = tracked_npmrc("fund=false\n");
         let home = tempfile::tempdir().unwrap();
-        let registry = SetupRegistry::parse("https://lpm.dev").unwrap();
+        let registry = SetupRegistry::parse(LPM_DEV).unwrap();
 
-        let target = destination_for(project.path(), Some(&home.path().join(".npmrc"))).unwrap();
+        let target = destination_in_home(project.path(), home.path()).unwrap();
 
         assert_eq!(
             target.destination,
-            NpmrcDestination::User {
-                scope_routed: false
-            }
+            user_destination(TrackedScopeRoute::Missing)
         );
-        let notes = target.user_destination_notes(&registry).join("\n");
+        let notes = target
+            .user_destination_notes(&registry, SetupCommand::Local)
+            .join("\n");
         assert!(
             notes.contains("`@lpm.dev:registry=https://lpm.dev/api/registry/`"),
             "{notes}"
         );
+        assert!(!notes.contains("Bun"), "{notes}");
+        assert!(!notes.contains("after the job"), "{notes}");
     }
 
     #[test]
-    fn a_tracked_route_matches_the_registry_whatever_its_spacing_and_trailing_slash() {
+    fn a_tracked_route_without_its_trailing_slash_matches_but_asks_for_the_slash() {
         let project = tracked_npmrc("@lpm.dev:registry = https://lpm.dev/api/registry\n");
         let home = tempfile::tempdir().unwrap();
+        let registry = SetupRegistry::parse(LPM_DEV).unwrap();
 
-        let target = destination_for(project.path(), Some(&home.path().join(".npmrc"))).unwrap();
+        let target = destination_in_home(project.path(), home.path()).unwrap();
 
         assert_eq!(
             target.destination,
-            NpmrcDestination::User { scope_routed: true }
+            user_destination(TrackedScopeRoute::Routed {
+                trailing_slash: false
+            })
         );
+        let notes = target
+            .user_destination_notes(&registry, SetupCommand::Local)
+            .join("\n");
+        assert!(notes.contains("with a slash. Bun drops"), "{notes}");
     }
 
     #[test]
@@ -1364,47 +1598,54 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_tracked_npmrc_that_sets_its_own_credential_for_the_registry() {
-        for line in [
-            "//lpm.dev/api/registry/:_authToken=${LPM_TOKEN}",
-            "//lpm.dev/api/registry/:_authToken=lpm_committed",
-            "//lpm.dev/api/registry/:_auth=dXNlcjpwYXNz",
+    fn refuses_a_tracked_npmrc_that_sets_a_credential_and_names_the_setting() {
+        for (line, key) in [
+            (
+                "//lpm.dev/api/registry/:_authToken=${LPM_TOKEN}",
+                "//lpm.dev/api/registry/:_authToken",
+            ),
+            (
+                "//lpm.dev/api/registry/:_authToken=lpm_committed",
+                "//lpm.dev/api/registry/:_authToken",
+            ),
+            (
+                "//lpm.dev/api/registry/:_auth=dXNlcjpwYXNz",
+                "//lpm.dev/api/registry/:_auth",
+            ),
+            (
+                "//lpm.dev/api/registry/:_password=c2VjcmV0",
+                "//lpm.dev/api/registry/:_password",
+            ),
         ] {
-            let project = tracked_npmrc(&format!(
-                "@lpm.dev:registry=https://lpm.dev/api/registry/\n{line}\n"
-            ));
+            let project = tracked_npmrc(&format!("{ROUTED}{line}\n"));
 
             let message = refusal(project.path());
 
             assert!(
-                message.contains("sets a credential for //lpm.dev/api/registry/")
-                    && message.contains("Remove the"),
+                message.contains(&format!("it sets `{key}`")) && message.contains("Remove it"),
                 "{line}: {message}"
             );
         }
     }
 
     #[test]
-    fn a_tracked_credential_for_another_registry_stays_the_teams_business() {
-        let project = tracked_npmrc(
-            "@lpm.dev:registry=https://lpm.dev/api/registry/\n//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}\n",
-        );
+    fn settings_for_the_registry_that_are_not_credentials_stay_the_teams_business() {
+        let project = tracked_npmrc(&format!(
+            "{ROUTED}//lpm.dev/api/registry/:always-auth=true\n//npm.pkg.github.com/:_authToken=${{GITHUB_TOKEN}}\n"
+        ));
         let home = tempfile::tempdir().unwrap();
 
-        let target = destination_for(project.path(), Some(&home.path().join(".npmrc"))).unwrap();
+        let target = destination_in_home(project.path(), home.path()).unwrap();
 
-        assert_eq!(
-            target.destination,
-            NpmrcDestination::User { scope_routed: true }
-        );
+        assert!(target.is_user_config());
     }
 
     #[test]
     fn refuses_a_user_config_that_is_the_tracked_npmrc() {
-        let project = tracked_npmrc("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
+        let project = tracked_npmrc(ROUTED);
         let through_a_dot = project.path().join(".").join(".npmrc");
 
-        let message = refusal_with(project.path(), Some(&through_a_dot));
+        let message = refusal_with(project.path(), &user_config_at(Some(&through_a_dot), None));
 
         assert!(
             message.contains("npm's user configuration is that file"),
@@ -1414,11 +1655,140 @@ mod tests {
 
     #[test]
     fn refuses_a_tracked_npmrc_when_no_user_config_can_be_named() {
-        let project = tracked_npmrc("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
+        let project = tracked_npmrc(ROUTED);
 
-        let message = refusal_with(project.path(), None);
+        let message = refusal_with(project.path(), &user_config_at(None, None));
 
         assert!(message.contains("Set HOME"), "{message}");
+    }
+
+    #[test]
+    fn refuses_a_user_config_whose_directory_is_missing() {
+        let project = tracked_npmrc(ROUTED);
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("custom").join("npmrc");
+
+        let message = refusal_with(
+            project.path(),
+            &user_config_at(Some(&missing), Some(home.path())),
+        );
+
+        assert!(message.contains("doesn't exist"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_user_config_that_is_a_symbolic_link() {
+        let project = tracked_npmrc(ROUTED);
+        let home = tempfile::tempdir().unwrap();
+        let dotfiles = tempfile::tempdir().unwrap();
+        std::fs::write(dotfiles.path().join("npmrc"), "fund=false\n").unwrap();
+        std::os::unix::fs::symlink(dotfiles.path().join("npmrc"), home.path().join(".npmrc"))
+            .unwrap();
+
+        let message = refusal_with(
+            project.path(),
+            &user_config_at(Some(&home.path().join(".npmrc")), Some(home.path())),
+        );
+
+        assert!(message.contains("is a symbolic link"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(dotfiles.path().join("npmrc")).unwrap(),
+            "fund=false\n"
+        );
+    }
+
+    #[test]
+    fn refuses_a_user_config_whose_own_lines_the_block_would_override() {
+        for (own, expected) in [
+            (
+                "//lpm.dev/api/registry/:_authToken=lpm_publish\n",
+                "already sets `//lpm.dev/api/registry/:_authToken`",
+            ),
+            (
+                "@lpm.dev:registry=http://localhost:3000/api/registry/\n",
+                "routes @lpm.dev packages to http://localhost:3000/api/registry",
+            ),
+        ] {
+            let project = tracked_npmrc(ROUTED);
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join(".npmrc"), format!("fund=false\n{own}")).unwrap();
+
+            let message = refusal_with(
+                project.path(),
+                &user_config_at(Some(&home.path().join(".npmrc")), Some(home.path())),
+            );
+
+            assert!(message.contains(expected), "{own}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_user_config_may_hold_its_own_matching_route_and_a_generated_block() {
+        let project = tracked_npmrc(ROUTED);
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".npmrc"),
+            format!(
+                "{ROUTED}\n{GENERATED_HEADER}\n{TOKEN_ID_PREFIX}11111111-1111-4111-8111-111111111111\n{ROUTED}//lpm.dev/api/registry/:_authToken=lpm_{}\n{GENERATED_END}\n",
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+
+        let target = destination_in_home(project.path(), home.path()).unwrap();
+
+        assert!(target.is_user_config());
+    }
+
+    #[test]
+    fn notes_that_bun_ignores_a_user_config_named_by_the_environment() {
+        let project = tracked_npmrc(ROUTED);
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let registry = SetupRegistry::parse(LPM_DEV).unwrap();
+
+        let target = destination_with(
+            project.path(),
+            &user_config_at(Some(&elsewhere.path().join("ci.npmrc")), Some(home.path())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.destination,
+            NpmrcDestination::User {
+                tracked_route: TrackedScopeRoute::Routed {
+                    trailing_slash: true
+                },
+                bun_reads_it: false,
+            }
+        );
+        let notes = target
+            .user_destination_notes(&registry, SetupCommand::Ci)
+            .join("\n");
+        assert!(notes.contains("Bun won't use the token"), "{notes}");
+        assert!(notes.contains("stays in"), "{notes}");
+    }
+
+    #[test]
+    fn names_the_user_config_when_its_block_belongs_to_another_registry() {
+        let project = tracked_npmrc(ROUTED);
+        let home = tempfile::tempdir().unwrap();
+        let target = destination_in_home(project.path(), home.path()).unwrap();
+
+        let message = target
+            .foreign_registry_error(
+                "setup-local token",
+                "http://localhost:3000/api/registry",
+                "finish replacement safely",
+            )
+            .to_string();
+
+        assert!(
+            message.contains("npm's user configuration")
+                && message.contains("--registry http://localhost:3000/api/registry"),
+            "{message}"
+        );
     }
 
     #[test]
