@@ -122,7 +122,19 @@ pub(super) fn emit_yes_warning_banner(count: usize, json_output: bool) {
     }
 }
 
-pub(super) fn print_package_card(blocked: &BlockedPackage) {
+/// What an approval card says about a package's provenance.
+#[derive(Clone, Copy)]
+pub(super) enum CardProvenance<'a> {
+    /// The card has no provenance line: a listing reads none.
+    Omitted,
+    /// A dry run reads no provenance.
+    NotRead,
+    /// What the registry the package came from says, or `None` when no
+    /// registry speaks for it.
+    Read(Option<&'a ProvenanceStatus>),
+}
+
+pub(super) fn print_package_card(blocked: &BlockedPackage, provenance: CardProvenance<'_>) {
     println!();
     println!(
         "{}",
@@ -177,6 +189,7 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     print_reach_lines(blocked.reach.as_ref());
+    print_provenance_line(provenance);
     if blocked.binding_drift {
         println!(
             "    {} {}",
@@ -185,6 +198,47 @@ pub(super) fn print_package_card(blocked: &BlockedPackage) {
         );
     }
     println!();
+}
+
+pub(super) fn print_provenance_line(provenance: CardProvenance<'_>) {
+    let Some(status) = provenance_status(provenance) else {
+        return;
+    };
+    println!(
+        "{}",
+        install_ui::terminal_line!("    {:<14}{}", install_ui::dim("Provenance:"), status)
+    );
+}
+
+/// The card's provenance status, coloured by what it means; the publisher
+/// and the verifier's reason are sanitized.
+fn provenance_status(provenance: CardProvenance<'_>) -> Option<install_ui::TerminalLine> {
+    use install_ui::TerminalLine;
+    let blank = TerminalLine::new("");
+    Some(match provenance {
+        CardProvenance::Omitted => return None,
+        CardProvenance::NotRead => blank.dim("not read in a dry run"),
+        CardProvenance::Read(None) => {
+            blank.dim("not checked: no registry it was installed from speaks for it")
+        }
+        CardProvenance::Read(Some(status)) => match status {
+            ProvenanceStatus::Verified(snapshot) => match &snapshot.publisher {
+                Some(publisher) => blank.green("verified").text(" · ").field(publisher),
+                None => blank.green("verified"),
+            },
+            ProvenanceStatus::Unverified(_) => {
+                blank.yellow("not verified: verification is skipped for this package")
+            }
+            ProvenanceStatus::Disabled(_) => blank.yellow("not verified: verification is off"),
+            ProvenanceStatus::Absent => blank.yellow("none: the registry serves no attestation"),
+            ProvenanceStatus::TransportDegraded => {
+                blank.yellow("unavailable: the attestation couldn't be fetched")
+            }
+            ProvenanceStatus::VerificationRejected { reason } => {
+                blank.red("failed verification:").text(" ").field(reason)
+            }
+        },
+    })
 }
 
 /// `Reaches:` lines for an approval card. Nothing for a scan that found
@@ -341,7 +395,7 @@ pub(super) fn print_listing(
         state.blocked_packages.len()
     ));
     for blocked in &state.blocked_packages {
-        print_package_card(blocked);
+        print_package_card(blocked, CardProvenance::Omitted);
         // surface the version diff card
         // alongside each entry's regular card. No-op for entries
         // without a prior binding under the same name (first-time
@@ -498,4 +552,47 @@ pub(super) fn print_summary(
 #[allow(dead_code)]
 pub(super) fn _build_state_path_for_tests(project_dir: &Path) -> PathBuf {
     build_state::build_state_path(project_dir)
+}
+
+#[cfg(test)]
+mod provenance_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_rejected_attestation_shows_its_reason_without_its_escape_sequences() {
+        let status = ProvenanceStatus::VerificationRejected {
+            reason: "bad signature\u{1b}[2J".into(),
+        };
+
+        let line = provenance_status(CardProvenance::Read(Some(&status))).unwrap();
+
+        assert!(line.contains("failed verification:"), "{line:?}");
+        assert!(line.contains("bad signature"), "{line:?}");
+        assert!(!line.contains("\u{1b}[2J"), "{line:?}");
+    }
+
+    #[test]
+    fn a_status_keeps_the_colour_that_says_what_it_means() {
+        // The colour switch is process-wide; the gate's nextest runs each
+        // test in its own process.
+        let previous = lpm_common::color::enabled();
+        lpm_common::color::set_enabled(true);
+        let rejected = ProvenanceStatus::VerificationRejected {
+            reason: "bad signature".into(),
+        };
+
+        let absent = provenance_status(CardProvenance::Read(Some(&ProvenanceStatus::Absent)));
+        let failed = provenance_status(CardProvenance::Read(Some(&rejected)));
+
+        lpm_common::color::set_enabled(previous);
+        let absent = absent.unwrap();
+        let failed = failed.unwrap();
+        assert!(absent.contains("\x1b[33m"), "{absent:?}");
+        assert!(failed.contains("\x1b[31m"), "{failed:?}");
+    }
+
+    #[test]
+    fn a_card_without_provenance_shows_no_line() {
+        assert!(provenance_status(CardProvenance::Omitted).is_none());
+    }
 }

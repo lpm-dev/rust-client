@@ -817,6 +817,21 @@ pub enum LpmError {
     )]
     ProvenanceVerification(String),
 
+    /// `[sigstore] availability = "strict"` requires verified provenance
+    /// for a package, and none could be established: the registry served
+    /// no attestation, fetching it failed, or the lockfile records none.
+    #[error("provenance unavailable: {0}")]
+    #[diagnostic(
+        code(lpm::provenance_unavailable),
+        help(
+            "`[sigstore] availability = \"strict\"` in ~/.lpm/config.toml requires verified \
+             provenance for this package. If the registry is unreachable, try again later. A \
+             package published without an attestation can't be installed, approved or rebuilt \
+             under strict availability; to accept it, set `availability = \"best-effort\"`."
+        )
+    )]
+    ProvenanceUnavailable(String),
+
     /// `lpm self-update` standalone path refused to swap the binary
     /// because the release artifacts failed an integrity gate
     /// (`SHA256SUMS.txt` missing on a release that predates the
@@ -1061,6 +1076,7 @@ impl LpmError {
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
+            LpmError::ProvenanceUnavailable(_) => "provenance_unavailable",
             LpmError::SelfUpdate(_) => "self_update",
             LpmError::SecurityFloor(_) => "security_floor",
             LpmError::SecurityApprovalStore(_) => "security_approval_store",

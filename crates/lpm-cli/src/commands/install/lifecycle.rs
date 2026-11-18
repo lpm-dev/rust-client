@@ -561,6 +561,7 @@ pub(super) async fn run_online_auto_build_phase(
             advisor_session.map(|s| s.approvals()),
             false,
             Some(policy_project_dir),
+            crate::commands::rebuild::ProvenanceCheck::CheckedByInstall,
         )
         .await
         {

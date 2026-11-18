@@ -426,6 +426,69 @@ pub(super) fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> 
         .reduce(StaticTier::worse_of)
 }
 
+/// Under strict provenance availability, refuses to run the scripts of a
+/// package an install would refuse: a registry package about to run, in the
+/// verification scope, whose lockfile holds no provenance evidence bound
+/// to its bytes. Every approved artifact is in the approved scope, with or
+/// without the provenance its approval recorded; every package is in scope
+/// `all`, however it comes to run.
+pub(super) fn require_lockfile_provenance(
+    packages: &[&super::scripts::ScriptablePackage],
+    lockfile: &lpm_lockfile::Lockfile,
+    trusted: &lpm_workspace::TrustedDependencies,
+    scope: crate::provenance_fetch::VerificationScope,
+) -> Result<(), lpm_common::LpmError> {
+    for package in packages {
+        let Some(row) = lockfile
+            .packages
+            .iter()
+            .find(|row| match package.instance_id {
+                Some(instance_id) => row.instance_id == Some(instance_id),
+                None => {
+                    row.name == package.name
+                        && row.version == package.version
+                        && row.integrity == package.integrity
+                }
+            })
+        else {
+            continue;
+        };
+        if !matches!(
+            row.source_kind(),
+            None | Some(Ok(lpm_lockfile::Source::Registry { .. }))
+        ) {
+            continue;
+        }
+        let in_scope = scope.verifies_all()
+            || trusted
+                .binding_for_artifact(
+                    &package.name,
+                    &package.version,
+                    package.integrity.as_deref(),
+                    None,
+                )
+                .is_some();
+        if !in_scope {
+            continue;
+        }
+        let Some(evidence) = lockfile.provenance.get(&row.package_key().lockfile_id()) else {
+            return Err(
+                crate::provenance_fetch::AvailabilityMode::missing_lockfile_evidence(
+                    &package.name,
+                    &package.version,
+                ),
+            );
+        };
+        crate::provenance_bundle::validate_locked_provenance(
+            &package.name,
+            &package.version,
+            package.integrity.as_deref(),
+            evidence,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod approval_identity_tests {
     use super::*;

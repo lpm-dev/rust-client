@@ -1086,6 +1086,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::ProvenanceVerification(reason) => {
             diagnostic_lines("Provenance verification failed", Some(reason), error)
         }
+        lpm_common::LpmError::ProvenanceUnavailable(reason) => {
+            diagnostic_lines("Provenance unavailable", Some(reason), error)
+        }
         lpm_common::LpmError::SelfUpdate(reason) => {
             diagnostic_lines("Self-update refused", Some(reason), error)
         }

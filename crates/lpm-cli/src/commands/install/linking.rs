@@ -816,6 +816,9 @@ pub(super) async fn run_link_and_finish(
             None,
             false,
             None,
+            // Only the offline install links here, and it checks no
+            // provenance, so its builds check the lockfile's.
+            crate::commands::rebuild::ProvenanceCheck::Lockfile,
         )
         .await
         {

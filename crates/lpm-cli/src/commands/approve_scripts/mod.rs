@@ -43,8 +43,8 @@ pub use project::{compute_effective_blocked_set, run};
 mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::display::{
-        _build_state_path_for_tests, blocked_to_json, emit_yes_warning_banner, is_tty,
-        print_full_script, print_listing, print_package_card, print_summary,
+        _build_state_path_for_tests, CardProvenance, blocked_to_json, emit_yes_warning_banner,
+        is_tty, print_full_script, print_listing, print_package_card, print_summary,
         print_version_diff_card_for_blocked, truncate_for_display,
     };
     #[allow(unused_imports)]
@@ -68,11 +68,12 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::metadata::{
-        ProjectProvenance, SCHEMA_VERSION, approval_metadata_from_blocked,
-        approval_metadata_preserving_existing_provenance, artifact_key,
+        ApprovalScope, ProjectProvenance, SCHEMA_VERSION, approval_metadata_from_blocked,
+        approval_metadata_preserving_existing_provenance, approval_refusal, artifact_key,
         authorize_project_trust_write, commit_project_trust_write, install_registries,
-        installed_from_their_registry, read_lockfile, recorded_registries,
-        runtime_verify_policy_with_source, snapshot_for_artifact_binding,
+        installed_from_outside_a_registry, installed_from_their_registry, read_lockfile,
+        recorded_registries, runtime_availability_mode, runtime_verify_policy_with_source,
+        snapshot_for_artifact_binding, unchecked_packages,
     };
     #[cfg(test)]
     pub(super) use super::metadata::{

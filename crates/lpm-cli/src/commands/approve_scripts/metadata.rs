@@ -198,6 +198,11 @@ pub(super) struct ProjectProvenance {
     /// The registry the lockfile records for each candidate that came
     /// from one.
     recorded: HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    /// The candidates the lockfile records from a tarball, a git
+    /// repository or a directory.
+    outside_a_registry: std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
+    lockfile_read: bool,
+    availability: crate::provenance_fetch::AvailabilityMode,
 }
 
 impl ProjectProvenance {
@@ -208,6 +213,7 @@ impl ProjectProvenance {
         registry: &lpm_registry::RegistryClient,
         project_dir: &Path,
         candidates: &[BlockedPackage],
+        availability: crate::provenance_fetch::AvailabilityMode,
         json_output: bool,
     ) -> Result<Self, LpmError> {
         let registries = install_registries(
@@ -219,33 +225,198 @@ impl ProjectProvenance {
         let lockfile = read_lockfile(project_dir, || {
             crate::commands::install::workspace_lockfile::read_project(project_dir)
         });
-        let recorded = recorded_registries(
-            candidates.iter().map(artifact_key).collect(),
-            lockfile.iter().flat_map(|lockfile| &lockfile.packages),
-        );
+        let keys: std::collections::HashSet<_> = candidates.iter().map(artifact_key).collect();
+        let rows = || lockfile.iter().flat_map(|lockfile| &lockfile.packages);
+        let outside_a_registry = installed_from_outside_a_registry(&keys, rows());
+        let recorded = recorded_registries(keys, rows());
         Ok(Self {
             registries,
             recorded,
+            outside_a_registry,
+            lockfile_read: lockfile.is_some(),
+            availability,
         })
     }
 
     /// Reads the provenance of those of `packages` a registry can speak
     /// for. The rest get no status, and so no provenance to compare a
-    /// later install with.
+    /// later install with; under strict availability, one that should have
+    /// a registry's word but can't get it here refuses them all, as a named
+    /// or `--yes` approval must.
     pub(super) async fn fetch(
         &self,
         packages: impl Iterator<Item = crate::provenance_fetch::ProvenanceArtifactKey>,
         policy: &crate::provenance_fetch::VerifyPolicy,
+    ) -> Result<HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>, LpmError>
+    {
+        let requested: Vec<_> = packages.collect();
+        let (vouched, unchecked) = self.checkable(&requested)?;
+        if let Some((_, reason)) = unchecked.into_iter().next() {
+            return Err(LpmError::ProvenanceUnavailable(reason));
+        }
+        Ok(self.statuses(&vouched, policy).await)
+    }
+
+    /// [`Self::fetch`] for a review that asks about each package: one strict
+    /// availability can't check is returned with why, to be skipped.
+    pub(super) async fn review(
+        &self,
+        packages: impl Iterator<Item = crate::provenance_fetch::ProvenanceArtifactKey>,
+        policy: &crate::provenance_fetch::VerifyPolicy,
+    ) -> Result<ApprovalProvenance, LpmError> {
+        let requested: Vec<_> = packages.collect();
+        let (vouched, unchecked) = self.checkable(&requested)?;
+        Ok((self.statuses(&vouched, policy).await, unchecked))
+    }
+
+    /// The packages a registry can speak for, and those strict availability
+    /// can't check here.
+    #[allow(clippy::type_complexity)]
+    fn checkable(
+        &self,
+        requested: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    ) -> Result<
+        (
+            Vec<crate::provenance_fetch::ProvenanceArtifactKey>,
+            Vec<(crate::provenance_fetch::ProvenanceArtifactKey, String)>,
+        ),
+        LpmError,
+    > {
+        let vouched = installed_from_their_registry(
+            &self.registries,
+            &self.recorded,
+            requested.iter().cloned(),
+        );
+        let unchecked = unchecked_packages(
+            self.availability,
+            self.lockfile_read,
+            &self.recorded,
+            &self.outside_a_registry,
+            &vouched,
+            requested,
+            ApprovalScope::Project,
+        )?;
+        Ok((vouched, unchecked))
+    }
+
+    async fn statuses(
+        &self,
+        vouched: &[crate::provenance_fetch::ProvenanceArtifactKey],
+        policy: &crate::provenance_fetch::VerifyPolicy,
     ) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
-        let vouched = installed_from_their_registry(&self.registries, &self.recorded, packages);
         crate::provenance_fetch::fetch_provenance_for_artifacts(
             &self.registries.client,
             &self.registries.route_table,
-            &vouched,
+            vouched,
             policy,
         )
         .await
     }
+}
+
+/// The provenance a review read for each package, and, in order, the
+/// packages strict availability can't check here with why.
+pub(super) type ApprovalProvenance = (
+    HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>,
+    Vec<(crate::provenance_fetch::ProvenanceArtifactKey, String)>,
+);
+
+/// Where an approval is recorded, which decides how to get a lockfile that
+/// records where its packages came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ApprovalScope {
+    Project,
+    Global,
+}
+
+impl ApprovalScope {
+    fn reinstall(self) -> &'static str {
+        match self {
+            Self::Project => "Run `lpm install`",
+            Self::Global => "Reinstall the global package with `lpm install -g`",
+        }
+    }
+}
+
+/// Under strict availability, the `requested` packages whose provenance
+/// can't be read here though a registry may speak for them, in order, with
+/// why: a package's route now sends it to another registry than the one it
+/// was installed from, or the lockfile doesn't record one registry for it.
+/// Packages from a tarball, a git repository or a directory,
+/// `outside_a_registry`, have none to read. Fails when the lockfiles that
+/// say where they came from can't all be read, which leaves none checkable.
+pub(super) fn unchecked_packages(
+    availability: crate::provenance_fetch::AvailabilityMode,
+    lockfiles_read: bool,
+    recorded: &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, String>,
+    outside_a_registry: &std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
+    vouched: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    requested: &[crate::provenance_fetch::ProvenanceArtifactKey],
+    scope: ApprovalScope,
+) -> Result<Vec<(crate::provenance_fetch::ProvenanceArtifactKey, String)>, LpmError> {
+    if !availability.is_strict() || requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reinstall = scope.reinstall();
+    if !lockfiles_read {
+        return Err(LpmError::ProvenanceUnavailable(format!(
+            "strict provenance availability can't check this approval: a lockfile that records \
+             where its packages came from can't be read. {reinstall}, then approve again"
+        )));
+    }
+    let vouched: std::collections::HashSet<_> = vouched.iter().collect();
+    Ok(requested
+        .iter()
+        .filter(|package| !vouched.contains(package) && !outside_a_registry.contains(*package))
+        .map(|package| {
+            let reason = if recorded.contains_key(package) {
+                "it now routes to another registry than the one it was installed from"
+            } else {
+                "the lockfile doesn't record one registry it came from"
+            };
+            let (name, version, _) = package;
+            (
+                package.clone(),
+                format!(
+                    "strict provenance availability can't check {name}@{version}: {reason}. \
+                     {reinstall}, then approve it again"
+                ),
+            )
+        })
+        .collect())
+}
+
+/// Those of `candidates` every matching lockfile row says came from
+/// outside a registry: a tarball, a git repository or a directory. No
+/// registry speaks for them. One a registry row, or a row whose source is
+/// unknown, also names isn't among them.
+pub(super) fn installed_from_outside_a_registry<'a>(
+    candidates: &std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey>,
+    rows: impl Iterator<Item = &'a lpm_lockfile::LockedPackage>,
+) -> std::collections::HashSet<crate::provenance_fetch::ProvenanceArtifactKey> {
+    let mut outside = std::collections::HashSet::new();
+    let mut from_a_registry = std::collections::HashSet::new();
+    for row in rows {
+        let is_outside = matches!(
+            row.source_kind(),
+            Some(Ok(source)) if !matches!(source, lpm_lockfile::Source::Registry { .. })
+        );
+        let matching = candidates.iter().filter(|(name, version, integrity)| {
+            *name == row.name
+                && *version == row.version
+                && !matches!(
+                    (&row.integrity, integrity),
+                    (Some(pinned), Some(known)) if lpm_common::integrity::contradict(pinned, known)
+                )
+        });
+        if is_outside {
+            outside.extend(matching.cloned());
+        } else {
+            from_a_registry.extend(matching.cloned());
+        }
+    }
+    outside.retain(|candidate| !from_a_registry.contains(candidate));
+    outside
 }
 
 /// The lockfile of the install in `dir`, or `None` with a warning when it
@@ -319,6 +490,9 @@ pub(super) fn recorded_registries<'a>(
         };
         let registry = match row.source_kind() {
             Some(Ok(lpm_lockfile::Source::Registry { url })) => Some(url),
+            // A row from before lockfiles recorded sources is npm's, as
+            // install reads it.
+            None => Some(NPM_REGISTRY.to_owned()),
             _ => None,
         };
         for candidate in installed {
@@ -342,11 +516,25 @@ pub(super) fn recorded_registries<'a>(
     recorded
 }
 
+const NPM_REGISTRY: &str = "https://registry.npmjs.org";
+
 /// Whether two registry URLs name one registry. A package is asked about
 /// only at the registry it was installed from, so a route that changed
 /// since the install sends its name nowhere new.
 fn same_registry(recorded: &str, routed: &str) -> bool {
     recorded.trim_end_matches('/') == routed.trim_end_matches('/')
+}
+
+/// The operator's `[sigstore] availability`, which an approval meets as an
+/// install does: a config that can't be read stops it, as it stops an
+/// install, rather than leaving availability at best-effort.
+pub(super) fn runtime_availability_mode()
+-> Result<crate::provenance_fetch::AvailabilityMode, LpmError> {
+    crate::provenance_fetch::AvailabilityMode::from_config(
+        crate::commands::config::GlobalConfig::load_checked()?
+            .get_sigstore_availability()
+            .as_deref(),
+    )
 }
 
 pub(super) fn runtime_verify_policy_with_source() -> (
@@ -388,7 +576,8 @@ pub(super) fn runtime_verify_policy_with_source() -> (
 ///
 /// Non-rejection statuses (`Verified`, `Absent`, `TransportDegraded`)
 /// project identically under both modes — the mode only affects the
-/// rejection arm.
+/// rejection arm. Under strict `availability`, `Absent` and
+/// `TransportDegraded` refuse the approval as they refuse an install.
 /// Pure coordinate-keyed variant for unit tests of enforcement-mode behavior.
 #[cfg(test)]
 pub(super) fn snapshot_for_binding_with_mode(
@@ -402,7 +591,43 @@ pub(super) fn snapshot_for_binding_with_mode(
         name,
         version,
         mode,
+        crate::provenance_fetch::AvailabilityMode::BestEffort,
     )
+}
+
+/// Why committing an approval of this artifact would refuse it, as
+/// [`snapshot_for_artifact_binding`] would, without the warnings that
+/// committing prints, so a walk skips it before asking.
+pub(super) fn approval_refusal(
+    provenance_by_artifact: &HashMap<
+        crate::provenance_fetch::ProvenanceArtifactKey,
+        ProvenanceStatus,
+    >,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    mode: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
+) -> Option<LpmError> {
+    let status = provenance_by_artifact.get(&(
+        name.to_owned(),
+        version.to_owned(),
+        integrity.map(ToOwned::to_owned),
+    ))?;
+    if let Err(refusal) = availability.require(status, name, version) {
+        return Some(refusal);
+    }
+    match status {
+        ProvenanceStatus::VerificationRejected { .. }
+            if matches!(mode, crate::provenance_fetch::EnforceMode::Deny) =>
+        {
+            status
+                .clone()
+                .into_snapshot_for_binding(name, version)
+                .err()
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn snapshot_for_artifact_binding(
@@ -414,13 +639,20 @@ pub(super) fn snapshot_for_artifact_binding(
     version: &str,
     integrity: Option<&str>,
     mode: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
     let key = (
         name.to_string(),
         version.to_string(),
         integrity.map(ToOwned::to_owned),
     );
-    snapshot_status_for_binding(provenance_by_artifact.get(&key), name, version, mode)
+    snapshot_status_for_binding(
+        provenance_by_artifact.get(&key),
+        name,
+        version,
+        mode,
+        availability,
+    )
 }
 
 fn snapshot_status_for_binding(
@@ -428,10 +660,12 @@ fn snapshot_status_for_binding(
     name: &str,
     version: &str,
     mode: crate::provenance_fetch::EnforceMode,
+    availability: crate::provenance_fetch::AvailabilityMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
     let Some(status) = status.cloned() else {
         return Ok(None);
     };
+    availability.require(&status, name, version)?;
 
     // Warn / Off short-circuit on VerificationRejected: log loudly but
     // do NOT propagate as Err, so the approval proceeds and the

@@ -1651,8 +1651,9 @@ pub(super) async fn run_online_fetch_phase(
     //
     // **Override short-circuit:** `--ignore-provenance-drift-all`
     // skips the entire gate (no trusted-dependencies read, no
-    // per-package fetch). `--ignore-provenance-drift <pkg>` skips
-    // the per-package fetch for the named entries. Both paths emit a
+    // per-package fetch), and `--ignore-provenance-drift <pkg>` skips
+    // the per-package fetch for the named entries, unless strict
+    // availability still needs each package's evidence. Both paths emit a
     // concise advisory to stderr so the waived drift is auditable
     // (users explicitly asked for the opt-out; silent skip would
     // hide that they're accepting a non-zero-risk identity).
@@ -1692,7 +1693,12 @@ pub(super) async fn run_online_fetch_phase(
     let availability_mode = crate::provenance_fetch::AvailabilityMode::from_config(
         global_config.get_sigstore_availability().as_deref(),
     )?;
-    if !drift_ignore_policy.ignores_all() || verification_scope.verifies_all() || trust_no_downgrade
+    // Waiving drift waives the comparison with an approval's provenance,
+    // not strict availability, which still needs each package's evidence.
+    if !drift_ignore_policy.ignores_all()
+        || verification_scope.verifies_all()
+        || trust_no_downgrade
+        || availability_mode.is_strict()
     {
         let trusted = lpm_security::SecurityPolicy::from_package_json(
             &policy_project_dir.join("package.json"),
@@ -1749,9 +1755,16 @@ pub(super) async fn run_online_fetch_phase(
                     p.integrity.as_deref(),
                     None,
                 );
+                // Strict availability holds every approved artifact to its
+                // provenance, including one approved while its attestation
+                // couldn't be fetched, whose approval recorded none.
                 if provenance_reference.is_none()
                     && !verification_scope.verifies_all()
                     && !trust_no_downgrade
+                    && !(availability_mode.is_strict()
+                        && trusted
+                            .binding_for_artifact(&p.name, &p.version, p.integrity.as_deref(), None)
+                            .is_some())
                 {
                     continue;
                 }
@@ -1781,7 +1794,11 @@ pub(super) async fn run_online_fetch_phase(
                 } else {
                     false
                 };
-                if drift_waived && !verification_scope.verifies_all() && !trust_no_downgrade {
+                if drift_waived
+                    && !verification_scope.verifies_all()
+                    && !trust_no_downgrade
+                    && !availability_mode.is_strict()
+                {
                     continue;
                 }
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if used_lockfile {
@@ -1791,10 +1808,11 @@ pub(super) async fn run_online_fetch_phase(
                         // versions and sources that already coexisted in this lockfile. Only a
                         // fresh resolution may classify missing evidence as a downgrade.
                         if availability_mode.is_strict() {
-                            return Err(LpmError::ProvenanceVerification(format!(
-                                "strict provenance availability requires lockfile evidence for {}@{}",
-                                p.name, p.version
-                            )));
+                            return Err(
+                                crate::provenance_fetch::AvailabilityMode::missing_lockfile_evidence(
+                                    &p.name, &p.version,
+                                ),
+                            );
                         }
                         continue;
                     };
@@ -1937,12 +1955,11 @@ pub(super) async fn run_online_fetch_phase(
                                         "this version has no attestation",
                                     ));
                                 }
-                                if availability_mode.is_strict() {
-                                    return Err(LpmError::ProvenanceVerification(format!(
-                                        "strict provenance availability requires an attestation for {}@{}",
-                                        p.name, p.version
-                                    )));
-                                }
+                                availability_mode.require(
+                                    &lpm_common::ProvenanceStatus::Absent,
+                                    &p.name,
+                                    &p.version,
+                                )?;
                                 (
                                     Some(lpm_workspace::ProvenanceSnapshot {
                                         present: false,
@@ -1959,12 +1976,11 @@ pub(super) async fn run_online_fetch_phase(
                                         "this version's attestation could not be retrieved",
                                     ));
                                 }
-                                if availability_mode.is_strict() {
-                                    return Err(LpmError::ProvenanceVerification(format!(
-                                        "strict provenance availability could not verify {}@{} because the attestation was unavailable",
-                                        p.name, p.version
-                                    )));
-                                }
+                                availability_mode.require(
+                                    &lpm_common::ProvenanceStatus::TransportDegraded,
+                                    &p.name,
+                                    &p.version,
+                                )?;
                                 (None, lpm_common::ProvenanceStatus::TransportDegraded)
                             }
                             Err(lpm_common::LpmError::ProvenanceVerification(reason)) => {

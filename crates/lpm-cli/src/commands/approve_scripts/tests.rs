@@ -213,6 +213,89 @@ fn snapshot_for_binding_verified_projects_under_both_modes() {
     assert!(deny.is_some());
 }
 
+fn artifact_status(
+    status: ProvenanceStatus,
+) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
+    HashMap::from([(("pkg".to_owned(), "1.0.0".to_owned(), None), status)])
+}
+
+#[test]
+fn an_approval_is_refused_before_it_is_asked_for_when_its_commit_would_be() {
+    use crate::provenance_fetch::AvailabilityMode::{BestEffort, Strict};
+    let rejected = || ProvenanceStatus::VerificationRejected {
+        reason: "DSSE signature mismatch".into(),
+    };
+    let refused = |status, mode, availability| {
+        approval_refusal(
+            &artifact_status(status),
+            "pkg",
+            "1.0.0",
+            None,
+            mode,
+            availability,
+        )
+    };
+
+    assert!(matches!(
+        refused(ProvenanceStatus::Absent, EnforceMode::Deny, Strict),
+        Some(LpmError::ProvenanceUnavailable(_))
+    ));
+    assert!(matches!(
+        refused(
+            ProvenanceStatus::TransportDegraded,
+            EnforceMode::Deny,
+            Strict
+        ),
+        Some(LpmError::ProvenanceUnavailable(_))
+    ));
+    assert!(matches!(
+        refused(rejected(), EnforceMode::Deny, BestEffort),
+        Some(LpmError::ProvenanceVerification(_))
+    ));
+    assert!(refused(ProvenanceStatus::Absent, EnforceMode::Deny, BestEffort).is_none());
+    assert!(refused(rejected(), EnforceMode::Warn, BestEffort).is_none());
+    assert!(refused(verified_status(), EnforceMode::Deny, Strict).is_none());
+    assert!(
+        approval_refusal(
+            &HashMap::new(),
+            "pkg",
+            "1.0.0",
+            None,
+            EnforceMode::Deny,
+            Strict
+        )
+        .is_none(),
+        "a package no registry speaks for has no provenance to refuse"
+    );
+}
+
+#[test]
+fn every_refusal_before_the_prompt_matches_the_commit() {
+    use crate::provenance_fetch::AvailabilityMode::{BestEffort, Strict};
+    for status in [
+        ProvenanceStatus::Absent,
+        ProvenanceStatus::TransportDegraded,
+        ProvenanceStatus::VerificationRejected {
+            reason: "Rekor SET verification failed".into(),
+        },
+        verified_status(),
+    ] {
+        for mode in [EnforceMode::Deny, EnforceMode::Warn] {
+            for availability in [BestEffort, Strict] {
+                let map = artifact_status(status.clone());
+                let early = approval_refusal(&map, "pkg", "1.0.0", None, mode, availability);
+                let commit =
+                    snapshot_for_artifact_binding(&map, "pkg", "1.0.0", None, mode, availability);
+                assert_eq!(
+                    early.is_some(),
+                    commit.is_err(),
+                    "{status:?} {mode:?} {availability:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Under `Deny` (default production posture), a
 /// `VerificationRejected` status returns
 /// `Err(LpmError::ProvenanceVerification(_))` so the caller's
@@ -2591,6 +2674,7 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -2668,6 +2752,7 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -2703,6 +2788,7 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -2712,8 +2798,23 @@ async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
     assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
 }
 
+/// Reads the rows' provenance as the interactive walk does before its
+/// first prompt, then commits them.
+async fn fetch_and_commit_global_approvals(
+    root: &lpm_common::LpmRoot,
+    rows: &[&crate::global_blocked_set::AggregateBlockedRow],
+    provenance_context: ApprovalProvenanceContext<'_>,
+) -> Result<(), LpmError> {
+    let artifacts: Vec<_> = rows
+        .iter()
+        .map(|row| (row.name.clone(), row.version.clone(), row.integrity.clone()))
+        .collect();
+    let provenance = provenance_context.fetch(&artifacts).await?;
+    global::commit_global_approval_batch(root, rows, false, provenance_context, &provenance).await
+}
+
 #[tokio::test]
-async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
+async fn a_global_commit_of_no_approvals_fetches_no_provenance_and_writes_nothing() {
     let tmp = tempdir().unwrap();
     let root = lpm_common::LpmRoot::from_dir(tmp.path());
     let policy = deny_verify_policy();
@@ -2729,13 +2830,57 @@ async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
+        &HashMap::new(),
     )
     .await
     .unwrap();
 
     assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+    assert_eq!(global::global_trust_write_count(), 0);
+}
+
+#[tokio::test]
+async fn a_global_commit_under_strict_availability_refuses_a_package_without_an_attestation() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let policy = deny_verify_policy();
+    let registry = unreachable_registry();
+    let unattested = row("esbuild", "0.25.1", &["eslint"]);
+    let provenance = HashMap::from([(
+        (
+            unattested.name.clone(),
+            unattested.version.clone(),
+            unattested.integrity.clone(),
+        ),
+        ProvenanceStatus::Absent,
+    )]);
+    global::reset_global_trust_write_count();
+
+    let refusal = global::commit_global_approval_batch(
+        &root,
+        &[&unattested],
+        false,
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::Strict,
+            true,
+        ),
+        &provenance,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(refusal, LpmError::ProvenanceUnavailable(_)),
+        "{refusal:?}"
+    );
     assert_eq!(global::global_trust_write_count(), 0);
 }
 
@@ -2754,11 +2899,17 @@ async fn global_interactive_approvals_commit_in_one_trust_write() {
     crate::provenance_fetch::reset_provenance_batch_call_count();
     global::reset_global_trust_write_count();
 
-    global::commit_global_approval_batch(
+    fetch_and_commit_global_approvals(
         &root,
         &row_refs,
-        false,
-        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
+            true,
+        ),
     )
     .await
     .unwrap();
@@ -3038,6 +3189,170 @@ fn only_a_package_the_lockfile_records_from_a_registry_has_one_to_ask() {
 }
 
 #[test]
+fn a_package_from_outside_a_registry_is_told_apart_from_one_whose_registry_is_unknown() {
+    let locked = |name: &str, source: Option<&str>| lpm_lockfile::LockedPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        source: source.map(Into::into),
+        integrity: Some(format!("sha512-{name}-integrity")),
+        ..Default::default()
+    };
+    let rows = [
+        locked(
+            "from-tarball",
+            Some("tarball+https://example.test/from-tarball.tgz"),
+        ),
+        locked("no-source", None),
+        locked("from-registry", Some("registry+https://registry.npmjs.org")),
+        locked("mixed", Some("tarball+https://example.test/mixed.tgz")),
+        locked("mixed", Some("registry+https://registry.npmjs.org")),
+    ];
+    let key = |name: &str| {
+        (
+            name.to_string(),
+            "1.0.0".to_string(),
+            Some(format!("sha512-{name}-integrity")),
+        )
+    };
+
+    let outside = installed_from_outside_a_registry(
+        &[
+            key("from-tarball"),
+            key("no-source"),
+            key("from-registry"),
+            key("mixed"),
+        ]
+        .into(),
+        rows.iter(),
+    );
+
+    assert_eq!(
+        outside,
+        [key("from-tarball")].into(),
+        "a package a registry row also names isn't outside every registry"
+    );
+}
+
+#[test]
+fn strict_availability_refuses_an_approval_whose_registry_it_cannot_tell() {
+    use crate::provenance_fetch::AvailabilityMode::{BestEffort, Strict};
+    let key = |name: &str| (name.to_string(), "1.0.0".to_string(), None);
+    let recorded = HashMap::from([
+        (key("vouched"), "https://registry.npmjs.org".to_string()),
+        (key("rerouted"), "https://registry.npmjs.org".to_string()),
+    ]);
+    let outside = std::collections::HashSet::from([key("from-tarball")]);
+    let vouched = [key("vouched")];
+    let check = |availability, read, requested: &[_], scope| {
+        unchecked_packages(
+            availability,
+            read,
+            &recorded,
+            &outside,
+            &vouched,
+            requested,
+            scope,
+        )
+    };
+
+    assert_eq!(
+        check(
+            Strict,
+            true,
+            &[key("vouched"), key("from-tarball")],
+            ApprovalScope::Project
+        )
+        .unwrap(),
+        []
+    );
+    for (requested, reason) in [
+        (key("rerouted"), "another registry"),
+        (key("no-source"), "doesn't record one registry"),
+    ] {
+        let unchecked = check(
+            Strict,
+            true,
+            std::slice::from_ref(&requested),
+            ApprovalScope::Project,
+        )
+        .unwrap();
+        assert_eq!(unchecked.len(), 1);
+        assert!(unchecked[0].1.contains(reason), "{}", unchecked[0].1);
+        assert_eq!(
+            check(BestEffort, true, &[requested], ApprovalScope::Project).unwrap(),
+            []
+        );
+    }
+    let unreadable = check(Strict, false, &[key("vouched")], ApprovalScope::Project).unwrap_err();
+    assert!(
+        matches!(unreadable, LpmError::ProvenanceUnavailable(_)),
+        "{unreadable:?}"
+    );
+    assert!(
+        unreadable.to_string().contains("can't be read"),
+        "{unreadable}"
+    );
+    let global = check(Strict, false, &[key("vouched")], ApprovalScope::Global)
+        .unwrap_err()
+        .to_string();
+    assert!(global.contains("lpm install -g"), "{global}");
+}
+
+#[test]
+fn a_row_without_a_source_is_recorded_from_npm_as_install_reads_it() {
+    let row = lpm_lockfile::LockedPackage {
+        name: "legacy".into(),
+        version: "1.0.0".into(),
+        source: None,
+        integrity: Some("sha512-legacy".into()),
+        ..Default::default()
+    };
+    let installed = (
+        "legacy".to_string(),
+        "1.0.0".to_string(),
+        Some("sha512-legacy".to_string()),
+    );
+
+    let recorded = recorded_registries([installed.clone()].into(), std::iter::once(&row));
+
+    assert_eq!(
+        recorded,
+        HashMap::from([(installed, "https://registry.npmjs.org".to_string())])
+    );
+}
+
+#[test]
+fn a_review_skips_only_the_packages_strict_availability_cannot_check() {
+    let key = |name: &str| (name.to_string(), "1.0.0".to_string(), None);
+    let recorded = HashMap::from([
+        (key("vouched"), "https://registry.npmjs.org".to_string()),
+        (key("rerouted"), "https://registry.npmjs.org".to_string()),
+    ]);
+    let requested = [key("vouched"), key("rerouted"), key("from-tarball")];
+    let unchecked = |read| {
+        unchecked_packages(
+            crate::provenance_fetch::AvailabilityMode::Strict,
+            read,
+            &recorded,
+            &[key("from-tarball")].into(),
+            &[key("vouched")],
+            &requested,
+            ApprovalScope::Project,
+        )
+    };
+
+    let skipped = unchecked(true).unwrap();
+
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].0, key("rerouted"));
+    assert!(skipped[0].1.contains("rerouted@1.0.0"), "{}", skipped[0].1);
+    assert!(
+        unchecked(false).is_err(),
+        "a lockfile that can't be read leaves no package checkable"
+    );
+}
+
+#[test]
 fn a_package_the_lockfile_pins_by_another_hash_is_still_the_one_it_records() {
     let archive = b"native-addon archive";
     let hash =
@@ -3152,11 +3467,17 @@ async fn a_global_approval_asks_the_registry_its_install_got_the_package_from() 
 
     // The registry in this test publishes other bytes under the name, so
     // what the approval then decides is not what is being tested.
-    let _ = global::commit_global_approval_batch(
+    let _ = fetch_and_commit_global_approvals(
         &root,
         &[&blocked],
-        false,
-        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
+            true,
+        ),
     )
     .await;
 
@@ -3174,11 +3495,17 @@ async fn a_global_approval_asks_no_registry_about_a_package_installed_from_elsew
         seed_global_install_locking(&root, "tarball+https://example.test/esbuild-0.25.1.tgz");
     let policy = deny_verify_policy();
 
-    global::commit_global_approval_batch(
+    fetch_and_commit_global_approvals(
         &root,
         &[&blocked],
-        false,
-        ApprovalProvenanceContext::new(&registry, &root, &policy, EnforceMode::Deny, true),
+        ApprovalProvenanceContext::new(
+            &registry,
+            &root,
+            &policy,
+            EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
+            true,
+        ),
     )
     .await
     .unwrap();
@@ -3214,6 +3541,7 @@ async fn run_global_named_approves_only_the_matched_row() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -3246,6 +3574,7 @@ async fn run_global_named_errors_for_unknown_package() {
             &root,
             &policy,
             EnforceMode::Deny,
+            crate::provenance_fetch::AvailabilityMode::BestEffort,
             true,
         ),
     )
@@ -3514,6 +3843,7 @@ async fn global_named_approvals_do_not_clobber_each_other() {
                 &root,
                 &policy,
                 EnforceMode::Deny,
+                crate::provenance_fetch::AvailabilityMode::BestEffort,
                 true,
             ),
         )
@@ -3533,6 +3863,7 @@ async fn global_named_approvals_do_not_clobber_each_other() {
                 &root,
                 &policy,
                 EnforceMode::Deny,
+                crate::provenance_fetch::AvailabilityMode::BestEffort,
                 true,
             ),
         )
