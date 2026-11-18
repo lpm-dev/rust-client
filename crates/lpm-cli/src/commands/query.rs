@@ -213,11 +213,12 @@ pub async fn run(
         let lock_path = lpm_root_outer.store_lock();
         let lpm_root_inner = lpm_root_outer;
         lpm_common::with_shared_lock(lock_path, || {
-            let inv = PackageInventory::from_discovery_with_lpm_root(
+            let mut inv = PackageInventory::from_discovery_with_lpm_root(
                 pre_discovery,
                 store_version,
                 Some(&lpm_root_inner),
             );
+            inv.retain_installed();
             if requirements.needs_disk_state() {
                 populate_package_disk_state(
                     &inv,
@@ -232,8 +233,9 @@ pub async fn run(
             Ok(inv)
         })?
     } else {
-        let inv =
+        let mut inv =
             PackageInventory::from_discovery_with_lpm_root(pre_discovery, store_version, None);
+        inv.retain_installed();
         if requirements.needs_disk_state() {
             populate_package_disk_state(
                 &inv,

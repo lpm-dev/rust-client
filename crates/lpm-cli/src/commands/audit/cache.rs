@@ -511,6 +511,7 @@ mod tests {
             scan_mode: ScanMode::FullLocal,
             is_dev: false,
             is_optional: false,
+            platform_skipped: false,
             dependencies: Vec::new(),
         }
     }

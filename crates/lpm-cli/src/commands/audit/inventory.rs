@@ -323,7 +323,25 @@ pub struct PackageInventory {
     pub analyses: Vec<Option<Arc<PackageAnalysis>>>,
     /// Source directories aligned with [`DiscoveryResult::packages`].
     pub source_paths: Vec<Option<PathBuf>>,
+    /// Packages the install left out, aligned with [`DiscoveryResult::packages`].
+    pub(crate) not_installed: Vec<bool>,
     pub(crate) baseline_index: Option<ProjectV2BaselineIndex>,
+}
+
+/// Behavioral analyses for a [`DiscoveryResult`], each vector aligned with
+/// its packages.
+pub(crate) struct BehavioralAnalyses {
+    pub(crate) analyses: Vec<Option<Arc<PackageAnalysis>>>,
+    pub(crate) source_paths: Vec<Option<PathBuf>>,
+    /// Packages with no source because the install left them out: optional
+    /// packages a foreign manager didn't install, and `lpm.lock` packages
+    /// skipped on this platform whose source is absent.
+    pub(crate) not_installed: Vec<bool>,
+}
+
+enum PackageScan {
+    Analyzed(LoadedAnalysis),
+    NotInstalled(usize),
 }
 
 struct LoadedAnalysis {
@@ -365,21 +383,42 @@ impl PackageInventory {
                 discovery.workspace_root.as_ref(),
             )
         });
-        let (analyses, source_paths) =
-            load_behavioral_analyses_with_index(&discovery, lpm_root, baseline_index.as_ref());
+        let BehavioralAnalyses {
+            analyses,
+            source_paths,
+            not_installed,
+        } = load_behavioral_analyses_with_index(&discovery, lpm_root, baseline_index.as_ref());
         Self {
             discovery,
             analyses,
             source_paths,
+            not_installed,
             baseline_index,
         }
+    }
+
+    /// Drop the packages the install left out, so the inventory holds only
+    /// the installed tree.
+    pub(crate) fn retain_installed(&mut self) {
+        if !self.not_installed.contains(&true) {
+            return;
+        }
+        let not_installed = std::mem::take(&mut self.not_installed);
+        self.discovery.remove_packages(&not_installed);
+        let mut removed = not_installed.iter();
+        self.analyses
+            .retain(|_| !removed.next().is_some_and(|&flag| flag));
+        let mut removed = not_installed.iter();
+        self.source_paths
+            .retain(|_| !removed.next().is_some_and(|&flag| flag));
+        self.not_installed = vec![false; self.discovery.packages.len()];
     }
 }
 
 pub(crate) fn load_behavioral_analyses(
     discovery: &DiscoveryResult,
     store_version: lpm_store::StoreVersion,
-) -> (Vec<Option<Arc<PackageAnalysis>>>, Vec<Option<PathBuf>>) {
+) -> BehavioralAnalyses {
     let needs_store = discovery
         .packages
         .iter()
@@ -405,7 +444,7 @@ fn load_behavioral_analyses_with_index(
     discovery: &DiscoveryResult,
     lpm_root: Option<&lpm_common::LpmRoot>,
     baseline_index: Option<&ProjectV2BaselineIndex>,
-) -> (Vec<Option<Arc<PackageAnalysis>>>, Vec<Option<PathBuf>>) {
+) -> BehavioralAnalyses {
     let scannable: Vec<(usize, &DiscoveredPackage)> = discovery
         .packages
         .iter()
@@ -437,13 +476,21 @@ fn load_behavioral_analyses_with_index(
     );
     let project_cache_ref = project_cache.as_ref();
     let shared_by_fingerprint = dashmap::DashMap::new();
-    let loaded: Vec<LoadedAnalysis> = scannable
+    let loaded: Vec<PackageScan> = scannable
         .par_iter()
         .enumerate()
         .filter_map(|(scan_index, (package_index, package))| {
             let package_source =
-                open_package_source(project_root.as_ref(), package, lpm_root, baseline_index)
-                    .ok()?;
+                match open_package_source(project_root.as_ref(), package, lpm_root, baseline_index)
+                {
+                    Ok(source) => source,
+                    Err(error)
+                        if package.platform_skipped && error.kind() == io::ErrorKind::NotFound =>
+                    {
+                        return Some(PackageScan::NotInstalled(*package_index));
+                    }
+                    Err(_) => return None,
+                };
             let package_directory = &package_source.directory;
             let contents = match package_source.origin {
                 SourceOrigin::Store => PackageDirectory::Published,
@@ -468,13 +515,13 @@ fn load_behavioral_analyses_with_index(
                     .as_deref()
                     .and_then(|fingerprint| cache.get(key, package, fingerprint))
                 {
-                    return Some(LoadedAnalysis {
+                    return Some(PackageScan::Analyzed(LoadedAnalysis {
                         scan_index,
                         package_index: *package_index,
                         analysis: cached,
                         cache_fingerprint: None,
                         source_path: package_source.path,
-                    });
+                    }));
                 }
             }
 
@@ -490,19 +537,31 @@ fn load_behavioral_analyses_with_index(
                     Entry::Vacant(entry) => Arc::clone(&entry.insert(analysis)),
                 };
             }
-            Some(LoadedAnalysis {
+            Some(PackageScan::Analyzed(LoadedAnalysis {
                 scan_index,
                 package_index: *package_index,
                 analysis,
                 cache_fingerprint,
                 source_path: package_source.path,
-            })
+            }))
         })
         .collect();
 
     let mut analyses = vec![None; discovery.packages.len()];
     let mut source_paths = vec![None; discovery.packages.len()];
-    for loaded in loaded {
+    let mut not_installed: Vec<bool> = discovery
+        .packages
+        .iter()
+        .map(|package| package.scan_mode == ScanMode::NotInstalled)
+        .collect();
+    for scan in loaded {
+        let loaded = match scan {
+            PackageScan::Analyzed(loaded) => loaded,
+            PackageScan::NotInstalled(package_index) => {
+                not_installed[package_index] = true;
+                continue;
+            }
+        };
         let package = &discovery.packages[loaded.package_index];
         let key = std::mem::take(&mut analysis_keys[loaded.scan_index]);
         if let Some(fingerprint) = loaded.cache_fingerprint.as_ref() {
@@ -529,7 +588,11 @@ fn load_behavioral_analyses_with_index(
     {
         tracing::debug!("failed to write behavioral analysis cache: {error}");
     }
-    (analyses, source_paths)
+    BehavioralAnalyses {
+        analyses,
+        source_paths,
+        not_installed,
+    }
 }
 
 pub(crate) fn open_project_root(path: &Path) -> io::Result<cap_std::fs::Dir> {
@@ -674,6 +737,7 @@ mod tests {
             scan_mode: ScanMode::RegistryAndStore,
             is_dev: false,
             is_optional: false,
+            platform_skipped: false,
             dependencies: Vec::new(),
         }
     }
@@ -764,12 +828,62 @@ mod tests {
             workspace_root: None,
         };
 
-        let (analyses, _) = load_behavioral_analyses(&discovery, lpm_store::StoreVersion::V1);
+        let analyses = load_behavioral_analyses(&discovery, lpm_store::StoreVersion::V1).analyses;
         let first = analyses[0].as_ref().unwrap();
         let second = analyses[1].as_ref().unwrap();
 
         assert!(first.source.eval);
         assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn a_platform_skipped_package_is_not_installed_only_when_its_source_is_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            root.path().join("home/.lpm").into_os_string(),
+        )]);
+        let project_root = root.path().join("project");
+        let installed = project_root.join("node_modules/installed-skipped");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(
+            installed.join("package.json"),
+            r#"{"name":"installed-skipped","version":"1.0.0","license":"MIT"}"#,
+        )
+        .unwrap();
+        std::fs::write(installed.join("index.js"), "module.exports = 1\n").unwrap();
+        let package = |name: &str, platform_skipped: bool| DiscoveredPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            path: format!("node_modules/{name}"),
+            platform_skipped,
+            ..discovered_package(None, None)
+        };
+        let discovery = DiscoveryResult {
+            manager: super::super::discovery::ManagerKind::Lpm,
+            lockfile_path: None,
+            project_root,
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages: vec![
+                package("installed-skipped", true),
+                package("absent-skipped", true),
+                package("absent-required", false),
+                DiscoveredPackage {
+                    scan_mode: ScanMode::NotInstalled,
+                    ..package("absent-foreign-optional", false)
+                },
+            ],
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        };
+
+        let loaded = load_behavioral_analyses_with_index(&discovery, None, None);
+
+        assert!(loaded.analyses[0].is_some());
+        assert!(loaded.analyses[1..].iter().all(Option::is_none));
+        assert_eq!(loaded.not_installed, [false, true, false, true]);
     }
 
     #[test]
@@ -848,7 +962,7 @@ mod tests {
             workspace_root: None,
         };
 
-        let (analyses, _) = load_behavioral_analyses_with_index(&discovery, None, None);
+        let analyses = load_behavioral_analyses_with_index(&discovery, None, None).analyses;
         let [kit, runner, local] = [0, 1, 2].map(|index| analyses[index].as_ref().unwrap());
 
         assert!(kit.source.eval);

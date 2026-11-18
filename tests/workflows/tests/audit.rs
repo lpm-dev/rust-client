@@ -4387,3 +4387,105 @@ fn audit_secrets_without_node_modules_fails_with_helpful_error() {
         "stderr must guide the user, got:\n{stderr}",
     );
 }
+
+#[tokio::test]
+async fn audit_counts_optional_packages_install_skipped_on_this_platform_as_not_installed() {
+    use support::platform_skipped_optional::{
+        PROJECT_MANIFEST, answer_osv_with_no_advisories, mount_platform_skipped_optional_tree,
+    };
+
+    let project = TempProject::empty(PROJECT_MANIFEST);
+    let mock = MockRegistry::start().await;
+    mount_platform_skipped_optional_tree(&mock).await;
+    answer_osv_with_no_advisories(&mock).await;
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--json",
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+        ])
+        .output()
+        .expect("run lpm install --audit-after-install");
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+    assert_eq!(
+        envelope["audit_summary"]["packages_audited"], 3,
+        "the audit after install must complete: {envelope}"
+    );
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=all"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert_eq!(json["success"], true, "{json}");
+    let coverage = &json["behavioral_coverage"];
+    assert_eq!(coverage["complete"], true, "{coverage}");
+    assert_eq!(coverage["scanned_packages"], 1, "{coverage}");
+    assert_eq!(coverage["unavailable_packages"], 0, "{coverage}");
+    assert_eq!(coverage["not_installed_packages"], 2, "{coverage}");
+    assert_eq!(coverage["packages"], serde_json::json!([]), "{coverage}");
+
+    let human = run_audit(&project, &mock, &[]);
+    let text = strip_ansi(&String::from_utf8_lossy(&human.stderr));
+    assert!(human.status.success(), "{text}");
+    assert!(!text.contains("Audit incomplete"), "{text}");
+    assert!(!text.contains("source audit incomplete"), "{text}");
+    assert!(text.contains("2 optional not installed"), "{text}");
+}
+
+#[tokio::test]
+async fn audit_treats_an_absent_optional_npm_package_as_not_installed() {
+    let project = TempProject::empty(
+        r#"{"name":"coverage-host","version":"1.0.0","dependencies":{"present":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"coverage-host","lockfileVersion":3,"packages":{"":{"dependencies":{"present":"1.0.0"}},"node_modules/present":{"version":"1.0.0","resolved":"https://registry.npmjs.org/present/-/present-1.0.0.tgz","optionalDependencies":{"absent-native":"1.0.0"}},"node_modules/absent-native":{"version":"1.0.0","resolved":"https://registry.npmjs.org/absent-native/-/absent-native-1.0.0.tgz","optional":true,"os":["aix"]}}}"#,
+    );
+    seed_node_modules_package(
+        &project,
+        "present",
+        &[("index.js", "module.exports = 1;\n")],
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![], vec![]]).await;
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=all"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert_eq!(json["success"], true, "{json}");
+    assert_eq!(json["behavioral_coverage"]["complete"], true, "{json}");
+    assert_eq!(
+        json["behavioral_coverage"]["not_installed_packages"], 1,
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn audit_still_reports_an_absent_required_package_beside_an_absent_optional_one() {
+    let project = TempProject::empty(
+        r#"{"name":"coverage-host","version":"1.0.0","dependencies":{"missing":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"coverage-host","lockfileVersion":3,"packages":{"":{"dependencies":{"missing":"1.0.0"}},"node_modules/missing":{"version":"1.0.0","resolved":"https://registry.npmjs.org/missing/-/missing-1.0.0.tgz","optionalDependencies":{"absent-native":"1.0.0"}},"node_modules/absent-native":{"version":"1.0.0","resolved":"https://registry.npmjs.org/absent-native/-/absent-native-1.0.0.tgz","optional":true,"os":["aix"]}}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![], vec![]]).await;
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=all"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    let coverage = &json["behavioral_coverage"];
+    assert_eq!(coverage["complete"], false, "{coverage}");
+    assert_eq!(coverage["unavailable_packages"], 1, "{coverage}");
+    assert_eq!(coverage["not_installed_packages"], 1, "{coverage}");
+    assert_eq!(coverage["packages"][0]["name"], "missing", "{coverage}");
+}

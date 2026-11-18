@@ -195,6 +195,7 @@ sig = "MEQCIEvidence"
                 scan_mode: ScanMode::LocalMissing,
                 is_dev: false,
                 is_optional: false,
+                platform_skipped: false,
                 dependencies: Vec::new(),
             }],
             lpm_lockfile: None,

@@ -26,6 +26,10 @@ pub enum ScanMode {
     RegistryAndStore,
     /// Lockfile says it exists, but source is not present on disk.
     LocalMissing,
+    /// An optional package the package manager didn't install, so there is
+    /// no source to scan. Foreign lockfiles don't say which platforms a
+    /// package supports, and their managers may leave out any optional one.
+    NotInstalled,
 }
 
 /// A package discovered during the inventory phase.
@@ -55,6 +59,11 @@ pub struct DiscoveredPackage {
     pub is_dev: bool,
     /// Whether this is an optional dependency.
     pub is_optional: bool,
+    /// Whether `lpm install` leaves this `lpm.lock` package off the current
+    /// platform: an optional package whose `os`, `cpu` or `libc` excludes
+    /// it, or one reachable only through such a package. When its source
+    /// is absent, it isn't installed rather than missing.
+    pub platform_skipped: bool,
     /// Direct dependencies: (name, exact_version).
     /// Extracted from lockfile dependency edges. Used by the query engine
     /// for `>` combinator traversal (e.g., `lpm query :eval > :network`).
@@ -140,6 +149,24 @@ pub(crate) struct WorkspaceRootDiscovery {
 impl DiscoveryResult {
     pub(crate) fn retained_lpm_lockfile(&self) -> Option<&lpm_lockfile::Lockfile> {
         self.lpm_lockfile.as_deref()
+    }
+
+    /// Remove the packages `remove` marks, aligned with [`Self::packages`].
+    /// The retained `lpm.lock` rows line up with the packages discovered
+    /// from them, so the same rows leave it too.
+    pub(crate) fn remove_packages(&mut self, remove: &[bool]) {
+        debug_assert_eq!(remove.len(), self.packages.len());
+        if let Some(lockfile) = self.lpm_lockfile.as_mut()
+            && lockfile.packages.len() == remove.len()
+        {
+            let mut removed = remove.iter();
+            Arc::make_mut(lockfile)
+                .packages
+                .retain(|_| !removed.next().is_some_and(|&flag| flag));
+        }
+        let mut removed = remove.iter();
+        self.packages
+            .retain(|_| !removed.next().is_some_and(|&flag| flag));
     }
 
     pub(crate) fn include_workspace_root_graph(&mut self) {
@@ -342,10 +369,12 @@ fn lpm_discovered_packages(
         .iter()
         .filter_map(|package| package.instance_id.map(|id| (id, package)))
         .collect();
+    let platform_skipped = lpm_platform_skipped_packages(project_root, lockfile);
     lockfile
         .packages
         .iter()
-        .map(|p| {
+        .zip(platform_skipped)
+        .map(|(p, platform_skipped)| {
             // All packages in lpm.lock (both @lpm.dev and npm) are in the
             // LPM store at ~/.lpm/store/v1/<name>@<version>/. The store-backed
             // scan uses store.package_dir(name, version), not the path field.
@@ -382,11 +411,27 @@ fn lpm_discovered_packages(
                 local_source_dir,
                 scan_mode: ScanMode::RegistryAndStore,
                 is_dev: false,
-                is_optional: false,
+                is_optional: p.optional,
+                platform_skipped,
                 dependencies,
             }
         })
         .collect()
+}
+
+/// [`crate::commands::manifest_metadata::platform_skipped_package_flags`]
+/// for the importer at `project_root`. An unreadable `package.json` only
+/// drops the root optional dependencies that could keep a skipped package
+/// reachable, and audit counts a skipped package as not installed only
+/// when its source is absent too.
+fn lpm_platform_skipped_packages(
+    project_root: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> Vec<bool> {
+    let root_json =
+        crate::commands::manifest_metadata::read_json_file(&project_root.join("package.json"))
+            .unwrap_or(serde_json::Value::Null);
+    crate::commands::manifest_metadata::platform_skipped_package_flags(lockfile, &root_json)
 }
 
 /// The packages `package` installs directly, peers included, each as the
@@ -640,6 +685,7 @@ fn discover_from_yarn_lockfile(
                     scan_mode: ScanMode::OsvOnly,
                     is_dev: package.is_dev,
                     is_optional: package.is_optional,
+                    platform_skipped: false,
                     dependencies: package.dependencies,
                 }
             })
@@ -980,8 +1026,9 @@ fn read_package_from_node_modules(
             resolved_url: None,
             local_source_dir: None,
             scan_mode: ScanMode::FullLocal,
-            is_dev: false,            // Can't determine without lockfile
-            is_optional: false,       // Can't determine without lockfile
+            is_dev: false,      // Can't determine without lockfile
+            is_optional: false, // Can't determine without lockfile
+            platform_skipped: false,
             dependencies: Vec::new(), // Resolved in second pass
         },
         dep_names,
@@ -1053,13 +1100,14 @@ where
             published_as: _,
             fetched_from: _,
         } = package;
-        let (path, scan_mode) = match selected_path {
+        let (path, presence) = match selected_path {
             SelectedPackagePath::Validate(path) => {
-                let scan_mode = package_scan_mode(project_root, &canonical_project_root, &path)?;
-                (path, scan_mode)
+                let presence = package_presence(project_root, &canonical_project_root, &path)?;
+                (path, presence)
             }
-            SelectedPackagePath::Missing(path) => (path, ScanMode::LocalMissing),
+            SelectedPackagePath::Missing(path) => (path, PackagePresence::Absent),
         };
+        let scan_mode = presence.scan_mode(is_optional);
 
         packages.push(DiscoveredPackage {
             name,
@@ -1073,6 +1121,7 @@ where
             scan_mode,
             is_dev,
             is_optional,
+            platform_skipped: false,
             dependencies,
         });
     }
@@ -1114,11 +1163,30 @@ fn migrated_to_discovered_pnpm(
     })
 }
 
-fn package_scan_mode(
+#[derive(Clone, Copy)]
+enum PackagePresence {
+    Directory,
+    Absent,
+    /// Something other than a directory is at the package's path. Node can
+    /// still load a file there, so it isn't an uninstalled package.
+    NotDirectory,
+}
+
+impl PackagePresence {
+    fn scan_mode(self, is_optional: bool) -> ScanMode {
+        match self {
+            Self::Directory => ScanMode::FullLocal,
+            Self::Absent if is_optional => ScanMode::NotInstalled,
+            Self::Absent | Self::NotDirectory => ScanMode::LocalMissing,
+        }
+    }
+}
+
+fn package_presence(
     project_root: &Path,
     canonical_project_root: &Path,
     relative_path: &str,
-) -> Result<ScanMode, LpmError> {
+) -> Result<PackagePresence, LpmError> {
     let relative = Path::new(relative_path);
     if relative_path.contains('\\')
         || relative.is_absolute()
@@ -1140,12 +1208,12 @@ fn package_scan_mode(
                     "lockfile package path resolves outside the project: {relative_path}"
                 )));
             }
-            Ok(ScanMode::FullLocal)
+            Ok(PackagePresence::Directory)
         }
-        Ok(_) => Ok(ScanMode::LocalMissing),
+        Ok(_) => Ok(PackagePresence::NotDirectory),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             validate_nearest_existing_ancestor(&absolute, canonical_project_root, relative_path)?;
-            Ok(ScanMode::LocalMissing)
+            Ok(PackagePresence::Absent)
         }
         Err(error) => Err(LpmError::Io(error)),
     }
@@ -1324,6 +1392,73 @@ mod tests {
             instance_id: Some(instance(id)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn lpm_discovery_flags_the_packages_install_skips_on_this_platform() {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"app","dependencies":{"host":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let mut host = locked_at(1, "host", "1.0.0");
+        host.dependencies = vec!["wasm-only@1.0.0".into()];
+        host.dependency_targets = BTreeMap::from([("wasm-only".to_string(), instance(2))]);
+        let mut wasm_only = locked_at(2, "wasm-only", "1.0.0");
+        wasm_only.optional = true;
+        wasm_only.cpu = vec!["wasm32".into()];
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![host, wasm_only],
+            ..lpm_lockfile::Lockfile::new()
+        };
+
+        let packages = lpm_discovered_packages(project.path(), &lockfile);
+
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| (package.platform_skipped, package.is_optional))
+                .collect::<Vec<_>>(),
+            [(false, false), (true, true)]
+        );
+    }
+
+    #[test]
+    fn removing_packages_drops_their_rows_from_the_retained_lpm_lockfile() {
+        let project = tempfile::tempdir().unwrap();
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![
+                locked_at(1, "kept", "1.0.0"),
+                locked_at(2, "removed", "1.0.0"),
+                locked_at(3, "also-kept", "1.0.0"),
+            ],
+            ..lpm_lockfile::Lockfile::new()
+        };
+        let mut discovery = DiscoveryResult {
+            manager: ManagerKind::Lpm,
+            lockfile_path: None,
+            project_root: project.path().to_path_buf(),
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages: lpm_discovered_packages(project.path(), &lockfile),
+            lpm_lockfile: Some(Arc::new(lockfile)),
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        };
+
+        discovery.remove_packages(&[false, true, false]);
+
+        let package_names: Vec<&str> = discovery.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(package_names, ["kept", "also-kept"]);
+        let row_names: Vec<&str> = discovery
+            .retained_lpm_lockfile()
+            .unwrap()
+            .packages
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(row_names, ["kept", "also-kept"]);
     }
 
     #[test]

@@ -340,11 +340,21 @@ pub(in crate::commands::audit) fn print_summary(
         .filter(|issue| issue.is_capability())
         .count();
 
+    let not_installed = match behavioral.coverage.not_installed_packages {
+        0 => None,
+        count => Some(format!("{count} optional not installed")),
+    };
+
     if osv_degraded || !behavioral.coverage.complete {
-        install_ui::warn_untrusted(&format!(
+        let mut line = format!(
             "Audit incomplete · {total_scanned} {} scanned",
             install_ui::packages_word(total_scanned)
-        ));
+        );
+        if let Some(not_installed) = &not_installed {
+            line.push_str(" · ");
+            line.push_str(not_installed);
+        }
+        install_ui::warn_untrusted(&line);
     } else if vuln_count == 0
         && lpm_actionable_issues == 0
         && behavioral.packages_with_actionable_findings == 0
@@ -356,6 +366,7 @@ pub(in crate::commands::audit) fn print_summary(
         if behavioral.packages_scanned > 0 {
             parts.push(format!("{} analyzed", behavioral.packages_scanned));
         }
+        parts.extend(not_installed);
         if metadata_signals > 0 {
             parts.push(format!(
                 "{metadata_signals} metadata signal{}",
@@ -390,6 +401,7 @@ pub(in crate::commands::audit) fn print_summary(
             ));
         }
         parts.push(format!("{total_scanned} scanned"));
+        parts.extend(not_installed);
 
         install_ui::warn_untrusted(&parts.join(" · "));
     }

@@ -162,6 +162,7 @@ mod tests {
             scan_mode: ScanMode::RegistryAndStore,
             is_dev: false,
             is_optional: false,
+            platform_skipped: false,
             dependencies: dependencies
                 .iter()
                 .map(|(name, version)| (name.to_string(), version.to_string()))

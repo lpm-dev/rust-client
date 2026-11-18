@@ -1615,3 +1615,49 @@ async fn query_rejects_registry_metadata_that_omits_the_installed_version() {
         "query must identify the missing installed version instead of applying latest metadata, got:\n{stderr}"
     );
 }
+
+#[tokio::test]
+async fn query_leaves_out_optional_packages_install_skipped_on_this_platform() {
+    use support::platform_skipped_optional::{
+        HOST, PROJECT_MANIFEST, SKIPPED_DESCENDANT, SKIPPED_OPTIONAL,
+        answer_osv_with_no_advisories, install_platform_skipped_optional_tree,
+    };
+
+    let project = TempProject::empty(PROJECT_MANIFEST);
+    let mock = MockRegistry::start().await;
+    install_platform_skipped_optional_tree(&project, &mock).await;
+    answer_osv_with_no_advisories(&mock).await;
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+
+    let query = |args: &[&str]| {
+        let output = lpm(&project)
+            .env("LPM_OSV_URL", &osv_url)
+            .arg("--json")
+            .arg("query")
+            .args(args)
+            .output()
+            .expect("run lpm query");
+        assert!(
+            output.status.success(),
+            "lpm query {args:?} must succeed when install skipped an optional package for this platform\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .unwrap_or_else(|error| panic!("lpm query {args:?} must print JSON: {error}"))
+    };
+
+    for selector in [":scripts", ":built", ":eval"] {
+        assert_eq!(query(&[selector]), serde_json::json!([]), "{selector}");
+    }
+    assert_eq!(query(&["--count"])["total"], 1);
+    let host = query(&[&format!("#{HOST}")]);
+    assert_eq!(host.as_array().map(Vec::len), Some(1), "{host}");
+    for skipped in [SKIPPED_OPTIONAL, SKIPPED_DESCENDANT] {
+        assert_eq!(
+            query(&[&format!("#{skipped}")]),
+            serde_json::json!([]),
+            "a package install left off this platform is not in the installed tree"
+        );
+    }
+}
