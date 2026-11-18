@@ -1156,6 +1156,54 @@ if [ "$HOST_OS" = "Darwin" ]; then
   pass "the pre-bundle macOS asset says when the publisher wasn't verified"
 fi
 
+# ── Case 20: an update notice after the version line is not a mismatch ──
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'notice-binary-bytes' "$FIXTURE_VERSION"
+notice_executable=$(printf '#!/bin/sh\n# notice-binary-bytes\necho '"'"'lpm %s'"'"'\n[ -n "${LPM_NO_UPDATE_CHECK:-}" ] || printf '"'"'\\nUpdate available: 0.88.0\\n'"'"'\n' "${FIXTURE_VERSION#v}")
+if [ "$HOST_OS" = "Darwin" ]; then
+  fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
+  printf '%s\n' "$notice_executable" > "$fixture_app/Contents/MacOS/lpm-rs"
+  rm -f "$fdir/$RELEASE_ASSET"
+  ditto -c -k --keepParent "$fixture_app" "$fdir/$RELEASE_ASSET"
+else
+  printf '%s\n' "$notice_executable" > "$fdir/$RELEASE_ASSET"
+fi
+notice_sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$notice_sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "a binary that also prints an update notice must install: $RUN_OUT"
+rm -rf "$fdir"
+pass "an update notice after the version line is not a mismatch"
+
+# A binary from an earlier release ignores LPM_NO_UPDATE_CHECK.
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'stubborn-notice-binary-bytes' "$FIXTURE_VERSION"
+notice_executable=$(printf '#!/bin/sh\n# stubborn-notice-binary-bytes\necho '"'"'lpm %s'"'"'\nprintf '"'"'\\nUpdate available: 0.88.0\\n'"'"'\n' "${FIXTURE_VERSION#v}")
+if [ "$HOST_OS" = "Darwin" ]; then
+  fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
+  printf '%s\n' "$notice_executable" > "$fixture_app/Contents/MacOS/lpm-rs"
+  rm -f "$fdir/$RELEASE_ASSET"
+  ditto -c -k --keepParent "$fixture_app" "$fdir/$RELEASE_ASSET"
+else
+  printf '%s\n' "$notice_executable" > "$fdir/$RELEASE_ASSET"
+fi
+notice_sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$notice_sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "only the first line of --version names the version: $RUN_OUT"
+rm -rf "$fdir"
+pass "only the first line of --version names the version"
+
 echo
 for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do
   run_shell_setup_tests "$scenario"

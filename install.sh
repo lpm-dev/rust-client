@@ -574,20 +574,21 @@ elif [ -n "$SHA_TOOL" ]; then
   fi
 fi
 
-# A release's binary must report the version it was published as. This
-# catches an authentic signed manifest of another release served under
-# this version's path. The binary runs from the install directory, since
-# the temporary directory may be mounted noexec.
+# A release's binary must report the version the installer asked for. Its
+# first line of --version names the version; an update notice can follow,
+# so the check asks for none and reads only that line. The binary runs from
+# the install directory, since the temporary directory may be mounted noexec.
 require_reported_version() {
   [ "${LPM_INSTALL_INSECURE:-0}" = "1" ] && return 0
   expected_version_line="lpm ${VERSION#v}"
   version_errors="$STAGE_DIR/version-check.err"
-  if ! reported_version_line=$("$1" --version 2>"$version_errors") || [ -z "$reported_version_line" ]; then
+  if ! version_output=$(LPM_NO_UPDATE_CHECK=1 "$1" --version 2>"$version_errors") || [ -z "$version_output" ]; then
     echo "ERROR: couldn't run the downloaded binary to check its version:"
     sed -n '1,5s/^/  /p' "$version_errors"
     echo "This can mean the binary doesn't suit this system, or that $INSTALL_DIR doesn't allow running programs."
     return 1
   fi
+  reported_version_line=$(printf '%s\n' "$version_output" | sed -n 1p)
   if [ "$reported_version_line" != "$expected_version_line" ]; then
     echo "ERROR: the downloaded binary reports '$reported_version_line', but the release is $VERSION."
     echo "Refusing to install a binary from another release."

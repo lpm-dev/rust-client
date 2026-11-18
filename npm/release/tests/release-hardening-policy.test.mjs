@@ -538,6 +538,8 @@ test("release metadata accepts only whole, valid dispatch inputs when its script
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
 test("a published release must be immutable, checked after every publication path", () => {
   const workflow = read(".github/workflows/release.yml");
   const jobs = jobsOf(workflow);
