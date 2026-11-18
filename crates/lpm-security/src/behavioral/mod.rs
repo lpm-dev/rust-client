@@ -738,6 +738,7 @@ pub fn package_input_fingerprint_from_open_dir(
             content_digest,
         );
     }
+    directories.verify_unchanged()?;
     hash_native_artifacts(&mut hasher, &native_artifacts);
 
     match digest_package_manifest_from_open_dir(package_dir)? {
@@ -847,9 +848,38 @@ fn hash_fingerprint_record_digest(
 /// opening the next file of the same directory costs one `openat` rather than
 /// one per path component. Every handle was opened from the package root, or
 /// from another such handle, without following links.
+///
+/// A cached handle keeps reading a directory that was replaced after it was
+/// opened, where reopening the path for each file would see the new one, so
+/// [`Self::verify_unchanged`] checks every directory still has the identity
+/// it had when it was opened.
 struct PackageDirs<'a> {
     root: &'a cap_std::fs::Dir,
     recent: Vec<(std::path::PathBuf, cap_std::fs::Dir)>,
+    opened: std::collections::BTreeMap<std::path::PathBuf, DirectoryIdentity>,
+    reopened_changed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn of(directory: &cap_std::fs::Dir) -> std::io::Result<Self> {
+        use cap_fs_ext::MetadataExt as _;
+
+        let metadata = directory.dir_metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+fn package_directory_changed() -> std::io::Error {
+    std::io::Error::other("a package directory changed while its files were read")
 }
 
 impl<'a> PackageDirs<'a> {
@@ -859,7 +889,54 @@ impl<'a> PackageDirs<'a> {
         Self {
             root,
             recent: Vec::with_capacity(Self::MAX_RECENT),
+            opened: std::collections::BTreeMap::new(),
+            reopened_changed: false,
         }
+    }
+
+    /// Whether every directory opened below the root still has the identity
+    /// it had then, reopened top-down from the root without following links.
+    fn verify_unchanged(&self) -> std::io::Result<()> {
+        use cap_fs_ext::DirExt as _;
+
+        if self.reopened_changed {
+            return Err(package_directory_changed());
+        }
+        let mut ancestors: Vec<(&Path, cap_std::fs::Dir)> = Vec::new();
+        // Path order visits each directory after its ancestors.
+        for (path, identity) in &self.opened {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            while ancestors
+                .last()
+                .is_some_and(|(ancestor, _)| *ancestor != parent)
+            {
+                ancestors.pop();
+            }
+            let name = path.file_name().ok_or_else(package_directory_changed)?;
+            let current = match ancestors.last() {
+                Some((_, directory)) => directory.open_dir_nofollow(name)?,
+                None if parent.as_os_str().is_empty() => self.root.open_dir_nofollow(name)?,
+                None => return Err(package_directory_changed()),
+            };
+            if DirectoryIdentity::of(&current)? != *identity {
+                return Err(package_directory_changed());
+            }
+            ancestors.push((path, current));
+        }
+        Ok(())
+    }
+
+    fn record_opened(&mut self, path: &Path, directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+        let identity = DirectoryIdentity::of(directory)?;
+        match self.opened.entry(path.to_path_buf()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(identity);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                self.reopened_changed |= *entry.get() != identity;
+            }
+        }
+        Ok(())
     }
 
     fn open_file(&mut self, relative_path: &Path) -> std::io::Result<(cap_std::fs::File, u64)> {
@@ -921,6 +998,7 @@ impl<'a> PackageDirs<'a> {
             }
         }
         let skip = base.map_or(0, |(_, depth)| depth);
+        let mut prefix: std::path::PathBuf = relative.components().take(skip).collect();
         let mut current: Option<cap_std::fs::Dir> = None;
         for name in relative.components().skip(skip) {
             let next = match (&current, base) {
@@ -928,6 +1006,8 @@ impl<'a> PackageDirs<'a> {
                 (None, Some((index, _))) => self.recent[index].1.open_dir_nofollow(name)?,
                 (None, None) => self.root.open_dir_nofollow(name)?,
             };
+            prefix.push(name);
+            self.record_opened(&prefix, &next)?;
             current = Some(next);
         }
         let directory = current.expect("a non-empty path below its cached ancestor");
@@ -1090,6 +1170,9 @@ fn analyze_cap_files_with_fingerprint(
                 analyzer.merge(result);
             }
         }
+    }
+    if fingerprint.is_some() && directories.verify_unchanged().is_err() {
+        fingerprint = None;
     }
     (analyzer, fingerprint, over_budget)
 }
@@ -2494,6 +2577,31 @@ mod tests {
                 .unwrap();
         }
         assert!(directories.recent.len() <= PackageDirs::MAX_RECENT);
+    }
+
+    #[test]
+    fn package_dirs_detect_a_directory_replaced_after_it_was_opened() {
+        let package = tempfile::tempdir().unwrap();
+        nested_fingerprint_fixture(package.path());
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+        directories
+            .open_file(Path::new("lib/deep/deeper/c.js"))
+            .unwrap();
+        directories.open_file(Path::new("lib/index.js")).unwrap();
+        directories.verify_unchanged().unwrap();
+
+        std::fs::rename(
+            package.path().join("lib/deep"),
+            package.path().join("lib/old"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(package.path().join("lib/deep/deeper")).unwrap();
+        std::fs::write(package.path().join("lib/deep/deeper/c.js"), "changed").unwrap();
+
+        let error = directories.verify_unchanged().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other, "{error}");
     }
 
     #[cfg(unix)]
