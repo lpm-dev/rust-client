@@ -5210,3 +5210,29 @@ fn workspace_importer_batch_counts_references_once() {
     );
     assert_eq!(updated.workspace_packages.len(), 1);
 }
+
+#[test]
+fn workspace_importer_batch_refuses_an_older_importer_after_one_brought_structured_peers() {
+    let union = shared_row_union();
+    let validated = crate::ValidatedLockfile::from_toml(&union.to_toml().unwrap()).unwrap();
+    let retained: BTreeSet<String> = union.importers.keys().cloned().collect();
+    let replacements = BTreeMap::from([
+        (
+            "packages/a".to_string(),
+            importer_lockfile("structured-plugin", "1.0.0"),
+        ),
+        (
+            "packages/b".to_string(),
+            registry_importer(
+                LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS,
+                &[("b-only", "1.0.0")],
+            ),
+        ),
+    ]);
+
+    let error = validated
+        .update_workspace_importers(&retained, replacements)
+        .expect_err("a pre-structured importer can't join rows another replacement brought");
+
+    assert!(error.to_string().contains("fresh resolution"), "{error}");
+}
