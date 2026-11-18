@@ -63,7 +63,7 @@ pub(super) fn run_async_main() -> Result<()> {
             {
                 keep_state_ignored_at_exit_from(cwd);
             }
-            if let Some(workers) = install_runtime_worker_threads(
+            if let Some(workers) = runtime_worker_threads(
                 cli.command.as_ref(),
                 std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
                 std::thread::available_parallelism().map_or(1, |count| count.get()),
@@ -109,7 +109,44 @@ pub(super) fn keep_project_state_ignored(project_dir: &std::path::Path) {
     }
 }
 
-fn install_runtime_worker_threads(
+/// Commands that run one script or read local state, and do any parallel
+/// work on rayon, the blocking pool or their own threads. A runtime worker
+/// per CPU only adds thread start-up and scheduler contention to them.
+fn runs_on_two_workers(command: Option<&Commands>) -> bool {
+    match command {
+        Some(Commands::Run(args)) => {
+            args.scripts.len() <= 1
+                && !args.parallel
+                && args.workspace_concurrency.is_none()
+                && !args.all
+                && args.filter.is_empty()
+                && args.filter_prod.is_empty()
+                && !args.affected
+                && !args.watch
+        }
+        Some(
+            Commands::Exec(_)
+            | Commands::Why(_)
+            | Commands::Graph(_)
+            | Commands::Query(_)
+            | Commands::Licenses(_)
+            | Commands::Sbom(_)
+            | Commands::Doctor(_)
+            | Commands::Filter(_)
+            | Commands::Trust(_)
+            | Commands::Catalog(_)
+            | Commands::Cache(_)
+            | Commands::Store(_)
+            | Commands::Audit(_)
+            | Commands::Outdated(_)
+            | Commands::Info(_)
+            | Commands::Search(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn runtime_worker_threads(
     command: Option<&Commands>,
     explicit_worker_count: bool,
     available_parallelism: usize,
@@ -117,6 +154,9 @@ fn install_runtime_worker_threads(
 ) -> Option<usize> {
     if explicit_worker_count {
         return None;
+    }
+    if runs_on_two_workers(command) {
+        return Some(available_parallelism.clamp(1, 2));
     }
     let install = match command {
         Some(Commands::Install(args)) => {
@@ -161,7 +201,7 @@ fn install_runtime_worker_threads(
 #[cfg(test)]
 mod tests {
     use super::super::Cli;
-    use super::{install_runtime_worker_threads, writes_nothing};
+    use super::{runtime_worker_threads, writes_nothing};
     use clap::Parser;
 
     /// The elevated helpers keep what the exit hook would write, a
@@ -204,7 +244,7 @@ mod tests {
             let cli = Cli::try_parse_from(args).unwrap();
             for available in [1, 2, 18] {
                 assert_eq!(
-                    install_runtime_worker_threads(
+                    runtime_worker_threads(
                         cli.command.as_ref(),
                         false,
                         available,
@@ -222,7 +262,7 @@ mod tests {
         std::fs::write(project.path().join("package.json"), "\u{FEFF}{}").unwrap();
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
         assert_eq!(
-            install_runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
+            runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
             Some(2),
         );
     }
@@ -231,9 +271,38 @@ mod tests {
     fn install_runtime_leaves_explicit_worker_counts_to_tokio() {
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
         assert_eq!(
-            install_runtime_worker_threads(cli.command.as_ref(), true, 18, None),
+            runtime_worker_threads(cli.command.as_ref(), true, 18, None),
             None,
         );
+    }
+
+    #[test]
+    fn single_script_and_local_state_commands_run_on_two_workers() {
+        for args in [
+            vec!["lpm", "run", "test"],
+            vec!["lpm", "run", "test", "--", "--watch"],
+            vec!["lpm", "exec", "tsc"],
+            vec!["lpm", "why", "react"],
+            vec!["lpm", "graph"],
+            vec!["lpm", "audit"],
+            vec!["lpm", "outdated"],
+            vec!["lpm", "info", "react"],
+            vec!["lpm", "doctor"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            for available in [1, 2, 18] {
+                assert_eq!(
+                    runtime_worker_threads(cli.command.as_ref(), false, available, None),
+                    Some(available.min(2)),
+                    "{args:?}",
+                );
+            }
+            assert_eq!(
+                runtime_worker_threads(cli.command.as_ref(), true, 18, None),
+                None,
+                "{args:?} with TOKIO_WORKER_THREADS",
+            );
+        }
     }
 
     #[test]
@@ -251,17 +320,17 @@ mod tests {
             vec!["lpm", "install", "--workspace-root"],
             vec!["lpm", "add", "react"],
             vec!["lpm", "dev"],
-            vec!["lpm", "run", "test"],
+            vec!["lpm", "run", "build", "test"],
+            vec!["lpm", "run", "test", "--parallel"],
+            vec!["lpm", "run", "test", "--all"],
+            vec!["lpm", "run", "test", "--filter", "app"],
+            vec!["lpm", "run", "test", "--affected"],
+            vec!["lpm", "run", "test", "--watch"],
             vec!["lpm", "serve"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
             assert_eq!(
-                install_runtime_worker_threads(
-                    cli.command.as_ref(),
-                    false,
-                    18,
-                    Some(project.path())
-                ),
+                runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
                 None,
             );
         }
@@ -282,7 +351,7 @@ mod tests {
             let cli = Cli::try_parse_from(["lpm", command]).unwrap();
             for path in [project.path(), member.as_path()] {
                 assert_eq!(
-                    install_runtime_worker_threads(cli.command.as_ref(), false, 18, Some(path)),
+                    runtime_worker_threads(cli.command.as_ref(), false, 18, Some(path)),
                     None,
                 );
             }
@@ -294,22 +363,17 @@ mod tests {
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
         let project = tempfile::tempdir().unwrap();
         assert_eq!(
-            install_runtime_worker_threads(cli.command.as_ref(), false, 18, None),
+            runtime_worker_threads(cli.command.as_ref(), false, 18, None),
             None
         );
         assert_eq!(
-            install_runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
+            runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
             None
         );
         for manifest in ["invalid JSON", "[]", r#"{"workspaces":[]}"#] {
             std::fs::write(project.path().join("package.json"), manifest).unwrap();
             assert_eq!(
-                install_runtime_worker_threads(
-                    cli.command.as_ref(),
-                    false,
-                    18,
-                    Some(project.path())
-                ),
+                runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
                 None
             );
         }
@@ -324,7 +388,7 @@ mod tests {
         std::fs::write(member.join("package.json"), "{}").unwrap();
         std::fs::write(project.path().join("pnpm-workspace.yaml"), "packages: []\n").unwrap();
         assert_eq!(
-            install_runtime_worker_threads(cli.command.as_ref(), false, 18, Some(&member)),
+            runtime_worker_threads(cli.command.as_ref(), false, 18, Some(&member)),
             None
         );
     }
@@ -336,7 +400,7 @@ mod tests {
         std::fs::write(project.path().join("package.json"), "{}").unwrap();
         std::fs::write(project.path().join("Package.swift"), "").unwrap();
         assert_eq!(
-            install_runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
+            runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
             None
         );
     }
