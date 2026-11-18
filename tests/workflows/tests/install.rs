@@ -18960,3 +18960,52 @@ fn a_command_refuses_an_lpm_home_git_could_commit() {
         );
     }
 }
+
+#[tokio::test]
+async fn install_stays_up_to_date_after_edits_to_scripts_install_never_runs() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "ms", "version": "2.1.3"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"},"scripts":{"dev":"vite"}}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    let reinstall = || {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
+            .output()
+            .expect("run lpm install --json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assertions::parse_json_output(&output.stdout)
+    };
+
+    for manifest in [
+        "{\n  \"name\": \"scripts-edit\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"ms\": \"2.1.3\" },\n  \"scripts\": { \"dev\": \"vite --host\", \"build\": \"vite build\" }\n}\n",
+        r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    ] {
+        project.write_file("package.json", manifest);
+        let result = reinstall();
+        assert_eq!(
+            result["up_to_date"], true,
+            "an edit to scripts no install step runs must leave the install fresh: {manifest}\n{result:#}"
+        );
+    }
+
+    project.write_file(
+        "package.json",
+        r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"},"scripts":{"postinstall":"node -e \"require('fs').writeFileSync('postinstall.log','ran')\""}}"#,
+    );
+    reinstall();
+    assert_eq!(
+        project.read_file("postinstall.log"),
+        "ran",
+        "a new root lifecycle script must still run"
+    );
+}

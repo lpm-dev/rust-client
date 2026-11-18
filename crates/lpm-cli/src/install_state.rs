@@ -270,6 +270,10 @@ pub fn compute_install_hash_v7(
 /// switches. Including the platform tuple forces a re-run when a cached
 /// project moves between OS/CPU/libc environments.
 ///
+/// `pkg_content` and each manifest in `file_link_manifests` count as
+/// [`manifest_for_install_hash`] reads them, so editing a script no install
+/// step runs leaves the hash unchanged.
+///
 /// Order discipline: `schema_tag || pkg || \0 || lock || \0 || flb ||
 /// \0 || linker || \0 || integrity_policy || \0 || platform`. Each
 /// section is separated by an explicit `\0` domain separator so a future
@@ -286,7 +290,7 @@ pub fn compute_install_hash_v8(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(INSTALL_HASH_SCHEMA_TAG);
-    hasher.update(pkg_content.as_bytes());
+    hasher.update(&manifest_for_install_hash(pkg_content.as_bytes()));
     hasher.update(b"\x00"); // domain separator prevents "ab"+"cd" == "abc"+"d"
     hasher.update(lock_content.as_bytes());
     hasher.update(b"\x00");
@@ -371,6 +375,44 @@ pub(crate) fn compute_install_hash_v10(
     hex::encode(hasher.finalize())
 }
 
+/// The `scripts` an install step reads: the lifecycle phases `lpm install`
+/// runs for the project and its workspace members, and the dependency
+/// phases its script policy blocks or runs for local packages.
+const INSTALL_READ_SCRIPTS: &[&str] = &[
+    "pnpm:devPreinstall",
+    "preinstall",
+    "install",
+    "postinstall",
+    "preprepare",
+    "prepare",
+    "postprepare",
+    "preuninstall",
+    "uninstall",
+    "postuninstall",
+    "prepublishOnly",
+];
+
+/// `manifest` as install freshness reads it: its JSON value without the
+/// `scripts` no install step reads, so editing a `dev` or `build` script,
+/// or reformatting the file, leaves an install up to date. Anything that
+/// isn't a JSON object, such as `pnpm-workspace.yaml`, is read as written.
+fn manifest_for_install_hash(manifest: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let json = manifest.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(manifest);
+    let Ok(serde_json::Value::Object(mut document)) = serde_json::from_slice(json) else {
+        return std::borrow::Cow::Borrowed(manifest);
+    };
+    if let Some(serde_json::Value::Object(scripts)) = document.get_mut("scripts") {
+        scripts.retain(|name, _| INSTALL_READ_SCRIPTS.contains(&name.as_str()));
+        if scripts.is_empty() {
+            document.shift_remove("scripts");
+        }
+    }
+    match serde_json::to_vec(&document) {
+        Ok(canonical) => std::borrow::Cow::Owned(canonical),
+        Err(_) => std::borrow::Cow::Borrowed(manifest),
+    }
+}
+
 fn platform_tuple_key(platform: &PlatformTuple) -> String {
     let libc = platform.libc.as_deref().unwrap_or("none");
     let mut key = String::with_capacity(platform.os.len() + platform.cpu.len() + libc.len() + 2);
@@ -449,7 +491,7 @@ pub fn collect_file_link_manifest_bytes(
     for (path, content) in entries {
         out.extend_from_slice(path.to_string_lossy().as_bytes());
         out.push(0);
-        out.extend_from_slice(content);
+        out.extend_from_slice(&manifest_for_install_hash(content));
         out.push(0);
     }
     out
@@ -1878,6 +1920,39 @@ mod tests {
     }
 
     #[test]
+    fn install_hash_ignores_scripts_no_install_step_reads_and_formatting() {
+        let hash = |manifest: &str| compute_install_hash(manifest, "lock");
+        let base = hash(r#"{"name":"app","dependencies":{"a":"1.0.0"}}"#);
+
+        for same in [
+            r#"{"name":"app","dependencies":{"a":"1.0.0"},"scripts":{"dev":"vite"}}"#,
+            "\u{feff}{\n  \"name\": \"app\",\n  \"dependencies\": { \"a\": \"1.0.0\" },\n  \"scripts\": {}\n}\n",
+        ] {
+            assert_eq!(hash(same), base, "{same}");
+        }
+        for different in [
+            r#"{"name":"app","dependencies":{"a":"1.0.1"}}"#,
+            r#"{"name":"app","dependencies":{"a":"1.0.0"},"scripts":{"postinstall":"node x"}}"#,
+            r#"{"name":"app","dependencies":{"a":"1.0.0"},"scripts":{"pnpm:devPreinstall":"x"}}"#,
+            r#"{"name":"app","dependencies":{"a":"1.0.0"},"scripts":"not an object"}"#,
+            r#"{"dependencies":{"a":"1.0.0"},"name":"app"}"#,
+        ] {
+            assert_ne!(hash(different), base, "{different}");
+        }
+    }
+
+    #[test]
+    fn manifest_for_install_hash_reads_non_json_content_as_written() {
+        for content in [
+            &b"packages:\n  - packages/*\n"[..],
+            b"[1, 2]",
+            b"\0not json",
+        ] {
+            assert_eq!(manifest_for_install_hash(content).as_ref(), content);
+        }
+    }
+
+    #[test]
     fn schema_tag_is_baked_into_hash() {
         // Pin the hash of known inputs against the current schema tag so
         // that any accidental change to `INSTALL_HASH_SCHEMA_TAG` — or
@@ -2228,6 +2303,7 @@ mod tests {
     fn a_project_installed_under_earlier_install_script_rules_is_not_up_to_date() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         let pkg = r#"{"dependencies":{}}"#;
         fs::write(p.join("package.json"), pkg).unwrap();
         fs::write(p.join("lpm.lock"), "").unwrap();
