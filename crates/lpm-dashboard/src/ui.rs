@@ -91,13 +91,27 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         .split(area);
 
     // Service list
+    let port_label =
+        |port: Option<u16>| port.map_or_else(|| "  —".to_string(), |port| format!(":{port}"));
+    let name_width = app
+        .services
+        .iter()
+        .map(|svc| Span::raw(svc.name.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let port_width = app
+        .services
+        .iter()
+        .map(|svc| Span::raw(port_label(svc.port)).width())
+        .max()
+        .unwrap_or(0);
     let items: Vec<ListItem> = app
         .services
         .iter()
         .enumerate()
         .map(|(i, svc)| {
             let icon = svc.status.icon();
-            let port_str = svc.port.map_or_else(|| "  —".into(), |p| format!(":{p}"));
+            let port_str = port_label(svc.port);
 
             let style = if i == app.selected_service {
                 Style::default().bold().fg(Color::Cyan)
@@ -114,9 +128,9 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
             let mut spans = vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(status_color)),
-                Span::styled(format!("{:<10}", svc.name), style),
+                Span::styled(pad_to_column(&svc.name, name_width + 1), style),
                 Span::styled(
-                    format!("{port_str:<6}"),
+                    pad_to_column(&port_str, port_width + 1),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(svc.status.label(), Style::default().fg(status_color)),
@@ -336,7 +350,10 @@ fn render_webhooks(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
             Line::from(vec![
                 Span::styled(format!(" {time} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<6}", wh.method), Style::default()),
+                Span::styled(
+                    pad_to_column(&wh.method, WEBHOOK_METHOD_COLUMNS),
+                    Style::default(),
+                ),
                 Span::styled(
                     format!("{:<30} ", truncate_path(&wh.path, 30)),
                     Style::default(),
@@ -519,6 +536,21 @@ fn render_webhook_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, inde
 ///
 /// Uses `char_indices()` instead of byte-indexing to prevent panics
 /// on paths containing multi-byte UTF-8 characters (emoji, CJK, etc.).
+/// The longest standard HTTP method, `OPTIONS`, and a space after it.
+const WEBHOOK_METHOD_COLUMNS: usize = 8;
+
+/// `text` followed by spaces up to `columns` screen columns, counting wide
+/// characters as two, with at least one space so the next span never touches
+/// it.
+fn pad_to_column(text: &str, columns: usize) -> String {
+    let width = Span::raw(text).width();
+    let padding = columns.saturating_sub(width).max(1);
+    let mut padded = String::with_capacity(text.len() + padding);
+    padded.push_str(text);
+    padded.extend(std::iter::repeat_n(' ', padding));
+    padded
+}
+
 fn truncate_path(path: &str, max: usize) -> String {
     if path.chars().count() <= max {
         path.to_string()
@@ -573,6 +605,22 @@ mod tests {
             result.chars().count() <= 15,
             "should not exceed max: {result}"
         );
+    }
+
+    #[test]
+    fn pad_to_column_fills_to_the_column() {
+        assert_eq!(pad_to_column("web", 6), "web   ");
+    }
+
+    #[test]
+    fn pad_to_column_keeps_a_space_after_text_as_wide_as_the_column() {
+        assert_eq!(pad_to_column("OPTIONS", 7), "OPTIONS ");
+        assert_eq!(pad_to_column(":65535", 6), ":65535 ");
+    }
+
+    #[test]
+    fn pad_to_column_counts_wide_characters_as_two_columns() {
+        assert_eq!(pad_to_column("日本", 6), "日本  ");
     }
 
     #[test]

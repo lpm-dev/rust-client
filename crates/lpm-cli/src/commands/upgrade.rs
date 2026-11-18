@@ -9,7 +9,6 @@ use crate::prompt::prompt_err;
 use crate::upgrade_engine::PeerViolation;
 use crate::upgrade_engine::{self, PatchInvalidation, PeerImpact, SemverClass};
 use futures::StreamExt;
-use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::PackageMetadata;
 use lpm_registry::RegistryClient;
@@ -515,33 +514,23 @@ pub async fn run(
             deduped.len(),
             install_ui::packages_word(deduped.len())
         ));
+        let mut table = install_ui::Table::new().indent(0).gap(1).align_right(2);
         for u in &deduped {
-            let dev_tag = match u.dependency_kind {
-                DependencyKind::Development => " (dev)",
-                DependencyKind::Optional => " (optional)",
-                DependencyKind::Runtime => "",
-            };
-            let glyph = format_upgrade_glyph(u.semver_class);
-            let safe_name = lpm_common::sanitize_terminal_inline(&u.name);
-            let safe_from = lpm_common::sanitize_terminal_inline(&u.from);
-            let safe_to = lpm_common::sanitize_terminal_inline(&u.to);
-            let name = format!("{safe_name:<24}").bold();
-            let from = format!("{safe_from:>8}").dimmed();
-            let arrow = "→".dimmed();
-            let to = format!("{safe_to:<8}").yellow();
-            let class_label = format_class_label(u.semver_class);
-            let hint = format_candidate_hint(u);
-            let hint_suffix = if hint.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", hint.dimmed())
-            };
-            eprintln!(
-                "{glyph} {name} {from} {arrow} {to} {class_label}{}{}",
-                dev_tag.dimmed(),
-                hint_suffix,
-            );
+            table.row([
+                format_upgrade_glyph(u.semver_class),
+                install_ui::bold(&u.name),
+                install_ui::dim(&u.from),
+                install_ui::dim("→"),
+                install_ui::yellow(&u.to),
+                install_ui::TerminalFragment::from(crate::install_ui::terminal_line!(
+                    "{}{}",
+                    format_class_label(u.semver_class),
+                    install_ui::dim(dependency_kind_tag(u.dependency_kind)),
+                )),
+                install_ui::dim(&format_candidate_hint(u)),
+            ]);
         }
+        table.print_stderr();
 
         if dry_run {
             install_ui::done_untrusted(&format!(
@@ -1090,36 +1079,19 @@ fn attach_skipped_private(json: &mut serde_json::Value, skipped_private: &[Strin
 }
 
 fn warn_skipped_private(skipped_private: &[String]) {
-    if skipped_private.is_empty() {
-        return;
-    }
-
-    let names = skipped_private
-        .iter()
-        .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
-        .collect::<Vec<_>>();
-    install_ui::warn_untrusted(&format!(
-        "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
-        skipped_private.len(),
-        names.join(", "),
-    ));
-    install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run.");
+    crate::npm_public_source::warn_skipped_private(skipped_private);
 }
 
 fn warn_skipped_non_registry(skipped_non_registry: &[String]) {
     if skipped_non_registry.is_empty() {
         return;
     }
-
-    let names = skipped_non_registry
-        .iter()
-        .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
-        .collect::<Vec<_>>();
     install_ui::warn_untrusted(&format!(
-        "skipped {} non-registry package(s): {}",
+        "skipped {} non-registry {}",
         skipped_non_registry.len(),
-        names.join(", "),
+        install_ui::packages_word(skipped_non_registry.len()),
     ));
+    install_ui::detail_names(skipped_non_registry);
 }
 
 // ── Interactive multiselect ─────────────────────────────────────────
@@ -1158,8 +1130,9 @@ fn select_candidates_interactively(
         .map(|(i, _)| i)
         .collect();
 
+    let widths = CandidateRowWidths::of(candidates);
     for (i, c) in candidates.iter().enumerate() {
-        let label = format_candidate_row_for_tui(c);
+        let label = format_candidate_row_for_tui(c, widths);
         let hint = format_candidate_hint(c);
         ms = ms.item(i, label, hint);
     }
@@ -1206,23 +1179,46 @@ fn deduplicate_by_highest_target(mut selected: Vec<EnrichedCandidate>) -> Vec<En
 
 // ── Formatting helpers ──────────────────────────────────────────────
 
-fn format_candidate_row_for_tui(c: &EnrichedCandidate) -> String {
-    let dev_tag = match c.dependency_kind {
+/// Column widths that line the picker's rows up: every name padded to the
+/// longest name, every current version to the longest current version.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CandidateRowWidths {
+    name: usize,
+    from: usize,
+}
+
+impl CandidateRowWidths {
+    fn of(candidates: &[EnrichedCandidate]) -> Self {
+        candidates.iter().fold(Self::default(), |widths, c| Self {
+            name: widths.name.max(install_ui::field(&c.name).visible_width()),
+            from: widths.from.max(install_ui::field(&c.from).visible_width()),
+        })
+    }
+}
+
+fn dependency_kind_tag(kind: DependencyKind) -> &'static str {
+    match kind {
         DependencyKind::Development => " (dev)",
         DependencyKind::Optional => " (optional)",
         DependencyKind::Runtime => "",
-    };
-    let class_label = format_class_label(c.semver_class);
+    }
+}
+
+fn format_candidate_row_for_tui(c: &EnrichedCandidate, widths: CandidateRowWidths) -> String {
     let kind_tag = match c.target_kind {
         TargetKind::AbsoluteLatest => " (latest)",
         TargetKind::WithinMajor => "",
     };
-    let name = lpm_common::sanitize_terminal_inline(&c.name);
-    let from = lpm_common::sanitize_terminal_inline(&c.from);
-    let to = lpm_common::sanitize_terminal_inline(&c.to);
     format!(
-        "{:<40} {} → {} {}{}{}",
-        name, from, to, class_label, kind_tag, dev_tag,
+        "{:<name_width$}  {:>from_width$} → {} {}{}{}",
+        install_ui::field(&c.name),
+        install_ui::field(&c.from),
+        install_ui::field(&c.to),
+        format_class_label(c.semver_class),
+        kind_tag,
+        dependency_kind_tag(c.dependency_kind),
+        name_width = widths.name,
+        from_width = widths.from,
     )
 }
 
@@ -1267,22 +1263,22 @@ fn format_candidate_hint(c: &EnrichedCandidate) -> String {
     parts.join("  •  ")
 }
 
-fn format_class_label(class: SemverClass) -> String {
+fn format_class_label(class: SemverClass) -> install_ui::TerminalFragment {
     match class {
-        SemverClass::Patch => "patch".green(),
-        SemverClass::Minor => "minor".yellow(),
-        SemverClass::Major => "MAJOR".red(),
-        SemverClass::Prerelease => "pre".dimmed(),
-        SemverClass::Unknown => "?".dimmed(),
+        SemverClass::Patch => install_ui::green("patch"),
+        SemverClass::Minor => install_ui::yellow("minor"),
+        SemverClass::Major => install_ui::red("MAJOR"),
+        SemverClass::Prerelease => install_ui::dim("pre"),
+        SemverClass::Unknown => install_ui::dim("?"),
     }
 }
 
-fn format_upgrade_glyph(class: SemverClass) -> String {
+fn format_upgrade_glyph(class: SemverClass) -> install_ui::TerminalFragment {
     match class {
-        SemverClass::Patch => "↑".green(),
-        SemverClass::Minor => "↑".yellow(),
-        SemverClass::Major => "↑".red(),
-        SemverClass::Prerelease | SemverClass::Unknown => "↑".dimmed(),
+        SemverClass::Patch => install_ui::green("↑"),
+        SemverClass::Minor => install_ui::yellow("↑"),
+        SemverClass::Major => install_ui::red("↑"),
+        SemverClass::Prerelease | SemverClass::Unknown => install_ui::dim("↑"),
     }
 }
 
@@ -1899,9 +1895,31 @@ mod tests {
     #[test]
     fn format_row_includes_class_label() {
         let c = make_candidate(SemverClass::Patch, false, true, false);
-        let row = format_candidate_row_for_tui(&c);
+        let row =
+            format_candidate_row_for_tui(&c, CandidateRowWidths::of(std::slice::from_ref(&c)));
         assert!(row.contains("1.2.0"));
         assert!(row.contains("1.2.4"));
+    }
+
+    #[test]
+    fn picker_rows_line_up_their_arrows_across_names_and_versions() {
+        let short = make_candidate(SemverClass::Patch, false, true, false);
+        let mut long = make_candidate(SemverClass::Major, false, true, false);
+        long.name = "@typescript-eslint/eslint-plugin-with-a-long-name".into();
+        long.from = "10.0.0-beta.12".into();
+        let candidates = [short, long];
+        let widths = CandidateRowWidths::of(&candidates);
+
+        let arrow_columns: Vec<usize> = candidates
+            .iter()
+            .map(|candidate| {
+                let row = format_candidate_row_for_tui(candidate, widths);
+                let visible = console::strip_ansi_codes(&row).into_owned();
+                console::measure_text_width(&visible[..visible.find('→').expect("an arrow")])
+            })
+            .collect();
+
+        assert_eq!(arrow_columns[0], arrow_columns[1], "{arrow_columns:?}");
     }
 
     #[test]

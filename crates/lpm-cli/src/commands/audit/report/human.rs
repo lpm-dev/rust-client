@@ -237,15 +237,16 @@ pub(in crate::commands::audit) fn print_behavioral_results(
         // Sort by count descending
         let mut sorted: Vec<(&String, &Vec<String>)> = moderate_tags.iter().collect();
         sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        let mut table = install_ui::Table::new().align_right(1);
         for (message, packages) in sorted {
-            let count = packages.len();
-            eprintln!(
-                "  {} {count:<3} {}  {}",
-                "!".yellow(),
+            table.row([
+                install_ui::yellow("!"),
+                install_ui::field(&packages.len().to_string()),
                 format_behavior_message(message),
                 preview_package_names(packages, 2),
-            );
+            ]);
         }
+        table.print_stderr();
         eprintln!();
     }
 
@@ -259,15 +260,16 @@ pub(in crate::commands::audit) fn print_behavioral_results(
         );
         let mut sorted: Vec<_> = capabilities.iter().collect();
         sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        let mut table = install_ui::Table::new().align_right(1);
         for (name, packages) in sorted {
-            eprintln!(
-                "  {} {:<3} {}  {}",
-                "ℹ".blue(),
-                packages.len(),
-                lpm_common::sanitize_terminal_inline(name),
-                preview_package_names(packages, 2)
-            );
+            table.row([
+                install_ui::url("ℹ"),
+                install_ui::field(&packages.len().to_string()),
+                install_ui::field(name),
+                preview_package_names(packages, 2),
+            ]);
         }
+        table.print_stderr();
         eprintln!();
     }
 

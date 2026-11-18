@@ -1792,27 +1792,17 @@ pub fn view(
                         )
                     );
                 }
-                println!(
-                    "{}",
-                    super::install_ui::terminal_line!(
-                        "  {} {} {}",
-                        super::install_ui::dim(&format!("{:<13}", "agent")),
-                        super::install_ui::dim(&format!("{:<25}", "status")),
-                        super::install_ui::dim("path")
-                    )
-                );
+                let mut table = super::install_ui::Table::new();
+                table.header(&["agent", "status", "path"]);
                 for (agent, target) in &record.targets {
                     let diagnosis = diagnose_target(&store, target, &canonical);
-                    println!(
-                        "{}",
-                        super::install_ui::terminal_line!(
-                            "  {} {} {}",
-                            &format!("{:<13}", agent_slug(*agent)),
-                            styled_target_status(diagnosis.status, 25),
-                            super::install_ui::cyan(&diagnosis.path.display().to_string())
-                        )
-                    );
+                    table.row([
+                        super::install_ui::field(agent_slug(*agent)),
+                        styled_target_status(diagnosis.status),
+                        super::install_ui::cyan(&diagnosis.path.display().to_string()),
+                    ]);
                 }
+                table.print_stdout();
             }
             return Ok(());
         }
@@ -2027,40 +2017,30 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
             "No managed standalone skills or broken external links to diagnose",
         );
     } else {
-        println!(
-            "{}",
-            super::install_ui::terminal_line!(
-                "{} {} {} {}",
-                super::install_ui::section(&format!("{:<24}", "managed skill")),
-                super::install_ui::dim(&format!("{:<13}", "agent")),
-                super::install_ui::dim(&format!("{:<25}", "status")),
-                super::install_ui::dim("path")
-            )
-        );
+        let mut table = super::install_ui::Table::new().indent(0);
+        table.row([
+            super::install_ui::section("managed skill"),
+            super::install_ui::dim("agent"),
+            super::install_ui::dim("status"),
+            super::install_ui::dim("path"),
+        ]);
         for (name, agent, diagnosis) in &rows {
-            println!(
-                "{}",
-                super::install_ui::terminal_line!(
-                    "{} {} {} {}",
-                    &format!("{name:<24}"),
-                    &format!("{:<13}", agent_slug(*agent)),
-                    styled_target_status(diagnosis.status, 25),
-                    super::install_ui::cyan(&diagnosis.path.display().to_string())
-                )
-            );
+            table.row([
+                super::install_ui::field(name),
+                super::install_ui::field(agent_slug(*agent)),
+                styled_target_status(diagnosis.status),
+                super::install_ui::cyan(&diagnosis.path.display().to_string()),
+            ]);
         }
         for skill in &external_broken {
-            println!(
-                "{}",
-                super::install_ui::terminal_line!(
-                    "{} {} {} {}",
-                    &format!("{:<24}", skill.name),
-                    &format!("{:<13}", agent_slug(skill.agent)),
-                    super::install_ui::red(&format!("{:<25}", "external broken link")),
-                    super::install_ui::cyan(&skill.path)
-                )
-            );
+            table.row([
+                super::install_ui::field(&skill.name),
+                super::install_ui::field(agent_slug(skill.agent)),
+                super::install_ui::red("external broken link"),
+                super::install_ui::cyan(&skill.path),
+            ]);
         }
+        table.print_stdout();
     }
     Ok(())
 }
@@ -3673,16 +3653,16 @@ fn agent_slug(agent: AgentTarget) -> &'static str {
     }
 }
 
-fn styled_target_status(status: TargetStatus, width: usize) -> super::install_ui::TerminalFragment {
-    let label = format!("{:<width$}", status.as_str());
+fn styled_target_status(status: TargetStatus) -> super::install_ui::TerminalFragment {
+    let label = status.as_str();
     match status {
-        TargetStatus::Healthy => super::install_ui::status_ok(&label),
-        TargetStatus::Disabled => super::install_ui::dim(&label),
+        TargetStatus::Healthy => super::install_ui::status_ok(label),
+        TargetStatus::Disabled => super::install_ui::dim(label),
         TargetStatus::CanonicalMissing
         | TargetStatus::TargetMissing
         | TargetStatus::OwnershipMismatch
         | TargetStatus::LinkPlaceholder
-        | TargetStatus::DisabledTargetPresent => super::install_ui::red(&label),
+        | TargetStatus::DisabledTargetPresent => super::install_ui::red(label),
     }
 }
 

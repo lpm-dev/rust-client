@@ -7,7 +7,7 @@ use crate::commands::manifest_metadata::{
 };
 use crate::install_ui;
 use clap::ValueEnum;
-use lpm_common::{LpmError, sanitize_terminal_inline};
+use lpm_common::LpmError;
 use lpm_lockfile::{LockedPackage, Lockfile};
 use lpm_security::behavioral::manifest::license_expression_is_copyleft;
 use serde_json::{Value, json};
@@ -274,21 +274,17 @@ fn emit_json(inventory: &LicenseInventory, summary: &PolicySummary) -> Result<()
 }
 
 fn emit_human(inventory: &LicenseInventory, summary: &PolicySummary) {
-    println!(
-        "{:<42} {:<12} {:<10} License",
-        "Package", "Version", "Scope"
-    );
-    println!("{:-<42} {:-<12} {:-<10} {:-<1}", "", "", "", "");
+    let mut table = install_ui::Table::new().indent(0);
+    table.header(&["Package", "Version", "Scope", "License"]);
     for package in &inventory.packages {
-        let license_expression = sanitize_terminal_inline(&package.license_expression);
-        println!(
-            "{:<42} {:<12} {:<10} {}",
-            truncate_cell(&package.name, 42),
-            truncate_cell(&package.version, 12),
-            package.scope,
-            license_expression
-        );
+        table.row([
+            install_ui::field(&package.name),
+            install_ui::field(&package.version),
+            install_ui::dim(package.scope),
+            license_cell(package),
+        ]);
     }
+    table.print_stdout();
 
     if summary.failed {
         install_ui::warn_untrusted(&format!(
@@ -371,17 +367,16 @@ fn normalize_license(license: &str) -> String {
     license.trim().to_ascii_lowercase()
 }
 
-fn truncate_cell(value: &str, width: usize) -> String {
-    let value = sanitize_terminal_inline(value);
-    if value.chars().count() <= width {
-        return value.into_owned();
+/// A license in red when it's missing or denied, and in yellow when it's
+/// copyleft, so the rows a policy cares about stand out.
+fn license_cell(package: &PackageLicense) -> install_ui::TerminalFragment {
+    if package.missing || !package.denied_licenses.is_empty() {
+        install_ui::red(&package.license_expression)
+    } else if package.copyleft {
+        install_ui::yellow(&package.license_expression)
+    } else {
+        install_ui::field(&package.license_expression)
     }
-    let mut out = value
-        .chars()
-        .take(width.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
-    out
 }
 
 #[cfg(test)]

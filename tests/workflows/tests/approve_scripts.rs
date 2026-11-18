@@ -103,6 +103,41 @@ fn approve_scripts_blocked_package_fields_cannot_inject_terminal_rows() {
     }
 }
 
+#[test]
+fn approve_scripts_list_keeps_labels_apart_from_values_when_colored() {
+    let project = TempProject::empty("");
+    write_project_no_trusted_deps(&project);
+    seed_blocked_build_state_with_real_hash(&project, "card-pkg", "1.0.0");
+
+    let output = lpm(&project)
+        .args(["--color=always", "approve-scripts", "--list"])
+        .output()
+        .expect("spawn lpm approve-scripts --list");
+    assert!(output.status.success(), "{output:?}");
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        raw.contains('\x1b'),
+        "--color=always must color the card:\n{raw:?}"
+    );
+    let visible = support::terminal::visible_text(&raw);
+    let value_column = |label: &str| {
+        let row = support::terminal::line_with(&visible, label);
+        let after = support::terminal::column_of(row, label) + label.chars().count();
+        assert!(
+            row[after..].starts_with(' '),
+            "{label:?} must be followed by a space, got {row:?}"
+        );
+        after + row[after..].len() - row[after..].trim_start().len()
+    };
+
+    assert_eq!(
+        value_column("Integrity:"),
+        value_column("Script hash:"),
+        "card values must share a column, got:\n{visible}"
+    );
+}
+
 // ─── Global-mode fixture helpers ────────────────────────────────────────
 
 /// Write a minimal `<home>/.lpm/global/manifest.toml` with one

@@ -842,6 +842,133 @@ async fn outdated_human_output_uses_slim_completion() {
 }
 
 #[tokio::test]
+async fn outdated_table_lines_up_its_columns_when_colored() {
+    let short = "@lpm.dev/owner.short";
+    let long = "@lpm.dev/owner.a-much-longer-package-name";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"outdated-columns","version":"1.0.0","dependencies":{{"{short}":"^1.0.0"}},"devDependencies":{{"{long}":"^10.0.0"}}}}"#
+    ));
+    project.write_file(
+        "lpm.lock",
+        &format!(
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+             [[packages]]\nname = \"{long}\"\nversion = \"10.0.0\"\nsource = \"registry+https://lpm.dev\"\n\n\
+             [[packages]]\nname = \"{short}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n",
+        ),
+    );
+
+    let mock = MockRegistry::start().await;
+    for (pkg, versions, latest) in [
+        (short, ["1.0.0", "1.5.0", "2.0.0"], "2.0.0"),
+        (long, ["10.0.0", "10.12.3", "11.0.0"], "11.0.0"),
+    ] {
+        let versions = versions
+            .iter()
+            .map(|version| {
+                (
+                    *version,
+                    serde_json::json!({}),
+                    Some(make_tarball(pkg, version)),
+                )
+            })
+            .collect::<Vec<_>>();
+        mock.with_full_package_metadata(pkg, latest, &versions)
+            .await;
+    }
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color=always", "outdated"])
+        .output()
+        .expect("spawn lpm outdated");
+    assert!(output.status.success(), "{output:?}");
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        raw.contains('\x1b'),
+        "--color=always must color the table:\n{raw:?}"
+    );
+    let visible = support::terminal::visible_text(&raw);
+    let header = support::terminal::line_with(&visible, "Latest");
+    let short_row = support::terminal::line_with(&visible, short);
+    let long_row = support::terminal::line_with(&visible, long);
+    for (column, short_cell, long_cell) in [
+        ("Package", short, long),
+        ("Current", "1.0.0", "10.0.0"),
+        ("Wanted", "1.5.0", "10.12.3"),
+        ("Latest", "2.0.0", "11.0.0"),
+    ] {
+        let expected = support::terminal::column_of(header, column);
+        assert_eq!(
+            (
+                support::terminal::column_of(short_row, short_cell),
+                support::terminal::column_of(long_row, long_cell),
+            ),
+            (expected, expected),
+            "{column} must line up under its header, got:\n{visible}"
+        );
+    }
+}
+
+/// A long list of packages skipped to keep their names private must not
+/// fill the screen: the warning names as many as fit on one line and
+/// counts the rest.
+#[tokio::test]
+async fn outdated_shows_a_one_line_preview_of_many_skipped_private_names() {
+    let names: Vec<String> = (0..40)
+        .map(|index| format!("private-package-{index:02}"))
+        .collect();
+    let dependencies = names
+        .iter()
+        .map(|name| format!(r#""{name}":"^1.0.0""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"private-many","version":"1.0.0","dependencies":{{{dependencies}}}}}"#
+    ));
+    let mut lockfile =
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n".to_string();
+    for name in &names {
+        lockfile.push_str(&format!(
+            "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
+        ));
+    }
+    project.write_file("lpm.lock", &lockfile);
+    let mock = MockRegistry::start().await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["outdated"])
+        .output()
+        .expect("spawn lpm outdated");
+    assert!(output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("! skipped 40 packages without a recorded public npm or LPM-registry source"),
+        "the headline must count the skipped packages, got:\n{stderr}"
+    );
+    let names_line = support::terminal::line_with(&stderr, "private-package-00");
+    assert!(
+        names_line.starts_with("  private-package-00, private-package-01")
+            && names_line.ends_with("more (--json lists all)"),
+        "the names must fit one line and count the rest, got {names_line:?}"
+    );
+    assert!(
+        names_line.chars().count() <= 100,
+        "a piped preview must fit 100 columns, got {} in {names_line:?}",
+        names_line.chars().count()
+    );
+    assert!(
+        !stderr.contains("private-package-39"),
+        "names past the preview must be counted, not listed, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("up to date"),
+        "a run that checked nothing must not claim the entries are up to date, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn outdated_reports_zero_when_installed_matches_latest() {
     let pkg = "@lpm.dev/owner.up-to-date-pkg";
     let project = TempProject::empty(&format!(

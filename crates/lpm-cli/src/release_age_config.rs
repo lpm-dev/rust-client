@@ -57,9 +57,23 @@ pub(crate) const DEFAULT_MIN_RELEASE_AGE_SECS: u64 =
     lpm_security::SecurityPolicy::DEFAULT_MIN_RELEASE_AGE;
 
 /// TOML key in `~/.lpm/config.toml` holding the global override.
-const GLOBAL_KEY: &str = "minimum-release-age-secs";
+pub(crate) const GLOBAL_KEY: &str = "minimum-release-age-secs";
 const GLOBAL_EXCLUDE_KEY: &str = "minimum-release-age-exclude";
 pub(crate) const GLOBAL_POLICY_KEY: &str = "release-age-policy";
+
+/// A minimum release age as people read it: `off`, `3d`, `12h`, or `90s`.
+pub(crate) fn describe_minimum_release_age(secs: u64) -> String {
+    if secs == 0 {
+        return "off".to_string();
+    }
+    if secs.is_multiple_of(86_400) {
+        return format!("{}d", secs / 86_400);
+    }
+    if secs.is_multiple_of(3_600) {
+        return format!("{}h", secs / 3_600);
+    }
+    format!("{secs}s")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseAgeConfig {

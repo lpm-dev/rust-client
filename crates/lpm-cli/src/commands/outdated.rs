@@ -6,7 +6,6 @@ use crate::npm_public_source::{
     read_optional_project_lockfile,
 };
 use futures::StreamExt;
-use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{PackageMetadata, RegistryClient};
 use lpm_resolver::specifier::Specifier;
@@ -312,68 +311,26 @@ pub async fn run(
     } else {
         let outdated: Vec<_> = results.iter().filter(|result| result.outdated).collect();
         if outdated.is_empty() && lookup_failures.is_empty() {
-            let message = if include_npm {
-                "All checked package.json dependency entries are up to date"
-            } else {
-                "All checked LPM dependency entries are up to date"
-            };
-            install_ui::done_untrusted(message);
-        } else if !outdated.is_empty() {
-            let rendered = outdated
-                .iter()
-                .map(|result| {
-                    let wanted = result.wanted.as_str();
-                    (
-                        *result,
-                        lpm_common::sanitize_terminal_inline(&result.name),
-                        lpm_common::sanitize_terminal_inline(&result.current),
-                        lpm_common::sanitize_terminal_inline(wanted),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let section_width = outdated
-                .iter()
-                .map(|result| result.section.len())
-                .max()
-                .unwrap_or(0)
-                .max("Section".len());
-            let package_width = rendered
-                .iter()
-                .map(|(_, name, _, _)| name.len())
-                .max()
-                .unwrap_or(0)
-                .max("Package".len());
-            let current_width = rendered
-                .iter()
-                .map(|(_, _, current, _)| current.len())
-                .max()
-                .unwrap_or(0)
-                .max("Current".len());
-            let wanted_width = rendered
-                .iter()
-                .map(|(_, _, _, wanted)| wanted.len())
-                .max()
-                .unwrap_or(0)
-                .max("Wanted".len());
-
-            println!(
-                "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
-                "Section".dimmed(),
-                "Package".dimmed(),
-                "Current".dimmed(),
-                "Wanted".dimmed(),
-                "Latest".dimmed()
-            );
-            for (result, name, current, wanted) in rendered {
-                println!(
-                    "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
-                    result.section.dimmed(),
-                    name,
-                    current.dimmed(),
-                    install_ui::status_ok(&wanted),
-                    style_latest_version(&result.latest, &wanted),
-                );
+            if let Some(message) = up_to_date_message(
+                results.len(),
+                skipped_private.len() + skipped_non_registry.len(),
+                include_npm,
+            ) {
+                install_ui::done_untrusted(&message);
             }
+        } else if !outdated.is_empty() {
+            let mut table = install_ui::Table::new().indent(0);
+            table.header(&["Section", "Package", "Current", "Wanted", "Latest"]);
+            for result in &outdated {
+                table.row([
+                    install_ui::dim(result.section),
+                    install_ui::field(&result.name),
+                    install_ui::dim(&result.current),
+                    install_ui::status_ok(&result.wanted),
+                    style_latest_version(&result.latest, &result.wanted),
+                ]);
+            }
+            table.print_stdout();
             println!();
             install_ui::done_untrusted(&format!(
                 "Found {} outdated {}",
@@ -381,28 +338,14 @@ pub async fn run(
                 install_ui::packages_word(outdated.len()),
             ));
         }
-        if !skipped_private.is_empty() {
-            let skipped_private_list = skipped_private
-                .iter()
-                .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
-                .collect::<Vec<_>>();
-            install_ui::warn_untrusted(&format!(
-                "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
-                skipped_private.len(),
-                skipped_private_list.join(", "),
-            ));
-            install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run");
-        }
+        crate::npm_public_source::warn_skipped_private(&skipped_private);
         if !skipped_non_registry.is_empty() {
-            let skipped_non_registry_list = skipped_non_registry
-                .iter()
-                .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
-                .collect::<Vec<_>>();
             install_ui::warn_untrusted(&format!(
-                "skipped {} local, workspace, Git, tarball, or JSR package(s): {}",
+                "skipped {} local, workspace, Git, tarball, or JSR {}",
                 skipped_non_registry.len(),
-                skipped_non_registry_list.join(", "),
+                install_ui::packages_word(skipped_non_registry.len()),
             ));
+            install_ui::detail_names(&skipped_non_registry);
         }
         if !lookup_failures.is_empty() {
             install_ui::warn_untrusted(&format!(
@@ -603,13 +546,59 @@ fn plan_outdated_result(
     })
 }
 
-fn style_latest_version(latest: &str, wanted: &str) -> String {
+/// The success line when nothing checked is outdated. It counts the entries
+/// checked, and says nothing when every entry was skipped, so a run that
+/// checked nothing never reads as all clear.
+fn up_to_date_message(checked: usize, skipped: usize, include_npm: bool) -> Option<String> {
+    let kind = if include_npm { "package.json" } else { "LPM" };
+    match checked {
+        0 if skipped > 0 => None,
+        0 => Some(format!("No {kind} dependency entries to check")),
+        1 => Some(format!(
+            "The 1 checked {kind} dependency entry is up to date"
+        )),
+        checked => Some(format!(
+            "All {checked} checked {kind} dependency entries are up to date"
+        )),
+    }
+}
+
+fn style_latest_version(latest: &str, wanted: &str) -> install_ui::TerminalFragment {
     let latest_major = lpm_semver::Version::parse(latest).ok().map(|v| v.major());
     let wanted_major = lpm_semver::Version::parse(wanted).ok().map(|v| v.major());
-    let latest = lpm_common::sanitize_terminal_inline(latest);
     if matches!((wanted_major, latest_major), (Some(wanted), Some(latest)) if latest > wanted) {
-        latest.red()
+        install_ui::red(latest)
     } else {
-        latest.yellow()
+        install_ui::yellow(latest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::up_to_date_message;
+
+    #[test]
+    fn the_up_to_date_message_counts_the_entries_checked() {
+        assert_eq!(
+            up_to_date_message(2, 96, true).as_deref(),
+            Some("All 2 checked package.json dependency entries are up to date")
+        );
+        assert_eq!(
+            up_to_date_message(1, 0, false).as_deref(),
+            Some("The 1 checked LPM dependency entry is up to date")
+        );
+    }
+
+    #[test]
+    fn a_run_that_skipped_every_entry_claims_nothing_is_up_to_date() {
+        assert_eq!(up_to_date_message(0, 40, true), None);
+    }
+
+    #[test]
+    fn a_project_without_dependencies_says_there_was_nothing_to_check() {
+        assert_eq!(
+            up_to_date_message(0, 0, true).as_deref(),
+            Some("No package.json dependency entries to check")
+        );
     }
 }

@@ -121,6 +121,32 @@ impl<'a> LockfileRootIndex<'a> {
     }
 }
 
+/// Warns that packages without a recorded public source were left out of a
+/// registry check, names as many as fit on a line, and says how to record
+/// their sources.
+pub(crate) fn warn_skipped_private<I>(names: I)
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: AsRef<str>,
+{
+    let names = names.into_iter();
+    let count = names.len();
+    if count == 0 {
+        return;
+    }
+    crate::install_ui::warn_untrusted(&format!(
+        "skipped {count} {} without a recorded public npm or LPM-registry source",
+        crate::install_ui::packages_word(count),
+    ));
+    crate::install_ui::detail_line(
+        crate::install_ui::TerminalLine::new("  ")
+            .dim("their names were kept from registry.npmjs.org in case they're private"),
+    );
+    crate::install_ui::detail_names(names);
+    crate::install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run");
+}
+
 pub(crate) fn read_optional_project_lockfile(
     project_dir: &std::path::Path,
 ) -> Result<Option<lpm_lockfile::Lockfile>, lpm_common::LpmError> {

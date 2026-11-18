@@ -1460,11 +1460,151 @@ fn config_list_human_groups_effective_values_and_sources() {
     assert!(stdout.contains("Network"));
     assert!(stdout.contains("sigstore.verify"));
     assert!(stdout.contains("~/.lpm/config.toml"));
-    assert!(stdout.contains("built-in default"));
+    assert!(
+        support::terminal::line_with(&stdout, "save-prefix").ends_with("  default"),
+        "a built-in default must name its source as `default`, got:\n{stdout}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
         "config list must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+/// The column where a row's value starts, after its key and the spaces
+/// that pad the key column.
+fn value_column(line: &str) -> usize {
+    let key_end = line
+        .trim_start()
+        .find(' ')
+        .expect("a key followed by a value")
+        + (line.len() - line.trim_start().len());
+    key_end + line[key_end..].len() - line[key_end..].trim_start().len()
+}
+
+#[test]
+fn config_list_lines_up_each_group_when_colored() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "release-age-policy = \"strict\"\n[sigstore]\nverify = \"deny\"\n\
+         [firewall.npm.policies]\nlpm_ai_suspicious = \"block\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--color=always", "config", "list"])
+        .output()
+        .expect("failed to run lpm config list");
+    assert!(output.status.success(), "{output:?}");
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        raw.contains('\x1b'),
+        "--color=always must color the list:\n{raw:?}"
+    );
+    let visible = support::terminal::visible_text(&raw);
+    let columns: Vec<usize> = [
+        "minimum-release-age-secs",
+        "release-age-policy",
+        "minimum-release-age-exclude",
+        "sigstore.verify",
+        "firewall.mode",
+        "install-time-source-analysis",
+    ]
+    .iter()
+    .map(|key| value_column(support::terminal::line_with(&visible, key)))
+    .collect();
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "every value in a group must start in the same column, got {columns:?} in:\n{visible}"
+    );
+    assert_eq!(
+        value_column(support::terminal::line_with(&visible, "save-prefix")),
+        value_column(support::terminal::line_with(&visible, "save-exact")),
+        "a short group must line up on its own keys, got:\n{visible}"
+    );
+    assert!(
+        value_column(support::terminal::line_with(&visible, "save-prefix")) < 20,
+        "a short group must not take the width of the longest key in another group, got:\n{visible}"
+    );
+}
+
+#[test]
+fn config_list_nests_firewall_policies_under_one_parent_key() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "list"])
+        .output()
+        .expect("failed to run lpm config list");
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "  firewall.npm.policies"),
+        "the shared parent must head the policies, got:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("    lpm_ai_telemetry ")),
+        "each policy must be listed under its parent by its own name, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("firewall.npm.policies.lpm_ai_telemetry"),
+        "the parent key must not repeat on every policy row, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn config_list_dims_defaults_and_highlights_values_that_were_set() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(&project, "save-exact = true\n");
+
+    let output = lpm(&project)
+        .args(["--color=always", "config", "list"])
+        .output()
+        .expect("failed to run lpm config list");
+    assert!(output.status.success(), "{output:?}");
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let default_row = raw
+        .lines()
+        .find(|line| line.contains("save-prefix"))
+        .expect("save-prefix row");
+    let set_row = raw
+        .lines()
+        .find(|line| line.contains("save-exact"))
+        .expect("save-exact row");
+    assert!(
+        default_row.contains("\x1b[2msave-prefix"),
+        "a default's key must be dimmed, got {default_row:?}"
+    );
+    assert!(
+        set_row.contains("\x1b[36msave-exact"),
+        "a set key must be highlighted, got {set_row:?}"
+    );
+    assert!(
+        set_row.contains("\x1b[33mtrue"),
+        "a set value must be highlighted, got {set_row:?}"
+    );
+}
+
+#[test]
+fn config_list_reads_the_minimum_release_age_in_days() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(&project, "minimum-release-age-secs = 172800\n");
+
+    let output = lpm(&project)
+        .args(["config", "list"])
+        .output()
+        .expect("failed to run lpm config list");
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        support::terminal::line_with(&stdout, "minimum-release-age-secs").contains("172800 (2d)"),
+        "the raw seconds must read in days too, got:\n{stdout}"
     );
 }
 

@@ -156,7 +156,7 @@ fn security_status_human_uses_slim_completion() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("target   project")
+        stdout.contains("target  project")
             && stdout.contains("effective floor")
             && stdout.contains("npm firewall")
             && stdout.contains("active unlocks"),
@@ -196,8 +196,53 @@ fn security_status_human_reports_install_time_source_analysis_and_source() {
         .find(|line| line.contains("install-time source analysis"));
     assert!(
         source_analysis_row
-            .is_some_and(|line| { line.contains("false") && line.contains("(builtin-default)") }),
+            .is_some_and(|line| { line.contains("false") && line.ends_with("  builtin-default") }),
         "security status must show the install-time source analysis value and source, got:\n{stdout}",
+    );
+}
+
+#[test]
+fn security_status_lines_up_every_row_of_a_section_when_colored() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--color=always", "security", "status"])
+        .output()
+        .expect("failed to run lpm security status");
+    assert!(output.status.success(), "{output:?}");
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        raw.contains('\x1b'),
+        "--color=always must color the status:\n{raw:?}"
+    );
+    let visible = support::terminal::visible_text(&raw);
+    let line = |label: &str| support::terminal::line_with(&visible, label);
+    let value_column = |label: &str| {
+        let row = line(label);
+        let after = support::terminal::column_of(row, label) + label.len();
+        after + row[after..].len() - row[after..].trim_start().len()
+    };
+
+    assert_eq!(
+        value_column("approved posture"),
+        value_column("managed policy"),
+        "policy source values must share a column, got:\n{visible}"
+    );
+    assert_eq!(
+        support::terminal::column_of(line("approved posture"), "approved posture"),
+        support::terminal::column_of(line("managed policy"), "managed policy"),
+        "policy source labels must share an indent, got:\n{visible}"
+    );
+    assert_eq!(
+        value_column("script policy"),
+        value_column("install-time source analysis"),
+        "floor values must share a column, got:\n{visible}"
+    );
+    assert_eq!(
+        support::terminal::column_of(line("script policy"), "builtin-default"),
+        support::terminal::column_of(line("install-time source analysis"), "builtin-default"),
+        "floor sources must share a column, got:\n{visible}"
     );
 }
 

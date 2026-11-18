@@ -198,6 +198,74 @@ fn licenses_json_inventories_installed_package_licenses() {
 }
 
 #[test]
+fn licenses_show_long_names_and_versions_whole_in_aligned_columns() {
+    let long_name = "@an-unusually-long-scope/with-a-package-name-past-forty-two";
+    let long_version = "1.0.0-experimental.20261117";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"licenses-long","version":"1.0.0","license":"MIT","dependencies":{{"{long_name}":"{long_version}","left-pad":"^1.3.0"}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for (name, version) in [(long_name, long_version), ("left-pad", "1.3.0")] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
+            name: name.to_string(),
+            version: version.to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..Default::default()
+        });
+    }
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[
+            (long_name, long_name, long_version),
+            ("left-pad", "left-pad", "1.3.0"),
+        ],
+    );
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("failed to write lpm.lock");
+    project.write_file(
+        &format!("node_modules/{long_name}/package.json"),
+        &format!(r#"{{"name":"{long_name}","version":"{long_version}","license":"GPL-3.0-only"}}"#),
+    );
+    project.write_file(
+        "node_modules/left-pad/package.json",
+        r#"{"name":"left-pad","version":"1.3.0","license":"WTFPL"}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--color=always", "licenses"])
+        .output()
+        .expect("run lpm licenses");
+    assert!(output.status.success(), "{output:?}");
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let visible = support::terminal::visible_text(&raw);
+    let long_row = support::terminal::line_with(&visible, long_name);
+    assert!(
+        long_row.contains(long_version),
+        "a long name and version must be shown whole, got:\n{visible}"
+    );
+    let header = support::terminal::line_with(&visible, "License");
+    let short_row = support::terminal::line_with(&visible, "left-pad");
+    let license = support::terminal::column_of(header, "License");
+    assert_eq!(
+        (
+            support::terminal::column_of(long_row, "GPL-3.0-only"),
+            support::terminal::column_of(short_row, "WTFPL"),
+        ),
+        (license, license),
+        "licenses must line up under their header, got:\n{visible}"
+    );
+    assert!(
+        raw.contains("\x1b[33mGPL-3.0-only"),
+        "a copyleft license must stand out, got:\n{raw:?}"
+    );
+}
+
+#[test]
 fn licenses_human_output_sanitizes_manifest_fields_without_changing_json() {
     let project = seed_project();
     let hostile_license = "MIT\nforged-row\u{1b}[2J";

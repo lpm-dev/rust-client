@@ -387,22 +387,27 @@ fn format_human_security_summary(
                 "API use detected in source; execution and malicious intent are not established."
             ),
         )));
+        let mut table = install_ui::Table::new();
         for issue in &capabilities {
-            lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
-                "  {} {}  {}",
-                install_ui::cyan("ℹ"),
-                lpm_common::sanitize_terminal_inline(issue.tag_label),
+            table.row([
+                install_ui::TerminalFragment::from(install_ui::terminal_line!(
+                    "{} {}",
+                    install_ui::cyan("ℹ"),
+                    issue.tag_label,
+                )),
                 install_ui::dim(&format!(
                     "{} {}",
                     issue.packages.len(),
-                    if issue.packages.len() == 1 {
-                        "package"
-                    } else {
-                        "packages"
-                    }
+                    install_ui::packages_word(issue.packages.len())
                 )),
-            )));
+            ]);
         }
+        lines.extend(
+            table
+                .render(install_ui::stderr_columns())
+                .into_iter()
+                .map(SecuritySummaryLine::Detail),
+        );
         if verbose {
             append_query_hint(&mut lines, &capabilities, "capabilities");
         }
@@ -477,19 +482,20 @@ fn append_issue_tiers(
     issues: &[&TagIssue],
     severities: &[Severity],
 ) {
+    let mut table = install_ui::Table::new().indent(4).gap(1).align_right(0);
     for &severity in severities {
-        let tier_issues: Vec<&TagIssue> = issues
+        let mut tier_issues = issues
             .iter()
             .copied()
             .filter(|issue| issue.severity == severity)
-            .collect();
-        if tier_issues.is_empty() {
+            .peekable();
+        if tier_issues.peek().is_none() {
             continue;
         }
-        lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
+        table.line(install_ui::terminal_line!(
             "  {}",
             format_security_severity(severity)
-        )));
+        ));
         for issue in tier_issues {
             let count = issue.packages.len();
             let preview_str = preview_packages(&issue.packages, 3);
@@ -498,16 +504,24 @@ fn append_issue_tiers(
             } else {
                 install_ui::dim("")
             };
-            lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
-                "    {} {:<27} {} {}{}",
+            table.row([
                 install_ui::status_ok(&count.to_string()),
                 install_ui::cyan(issue.tag_label),
                 install_ui::dim("→"),
-                install_ui::dim(&preview_str),
-                suffix,
-            )));
+                install_ui::TerminalFragment::from(install_ui::terminal_line!(
+                    "{}{}",
+                    install_ui::dim(&preview_str),
+                    suffix,
+                )),
+            ]);
         }
     }
+    lines.extend(
+        table
+            .render(install_ui::stderr_columns())
+            .into_iter()
+            .map(SecuritySummaryLine::Detail),
+    );
 }
 
 fn append_query_hint(
