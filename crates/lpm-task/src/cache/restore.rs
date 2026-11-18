@@ -1547,8 +1547,18 @@ pub(super) fn same_bytes(
         }
         remaining -= length as u64;
     }
+    Ok(at_end(&mut existing)? && at_end(&mut staged)?)
+}
+
+fn at_end(reader: &mut impl std::io::Read) -> std::io::Result<bool> {
     let mut extra = [0u8; 1];
-    Ok(existing.read(&mut extra)? == 0 && staged.read(&mut extra)? == 0)
+    loop {
+        match reader.read(&mut extra) {
+            Ok(read) => return Ok(read == 0),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(unix)]

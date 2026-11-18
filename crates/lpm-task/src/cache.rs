@@ -4162,6 +4162,34 @@ mod tests {
     }
 
     #[test]
+    fn output_comparison_retries_an_interrupted_end_of_file_check() {
+        struct InterruptedAtEnd<'a>(&'a [u8], bool);
+        impl std::io::Read for InterruptedAtEnd<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() && !self.1 {
+                    self.1 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let length = self.0.len().min(buffer.len());
+                buffer[..length].copy_from_slice(&self.0[..length]);
+                self.0 = &self.0[length..];
+                Ok(length)
+            }
+        }
+        let cached = vec![3u8; 1000];
+
+        let same = restore::same_bytes(
+            InterruptedAtEnd(&cached, false),
+            InterruptedAtEnd(&cached, false),
+            cached.len() as u64,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert!(same);
+    }
+
+    #[test]
     fn restore_rollback_leaves_outputs_that_already_matched_in_place() {
         let (_archive_dir, archive_path) = archive_of_dist_outputs(2);
         let target = tempfile::tempdir().unwrap();
