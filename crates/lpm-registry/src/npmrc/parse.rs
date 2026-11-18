@@ -1537,18 +1537,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_ssl_false_sets_some_false_with_loud_warning() {
+    fn strict_ssl_false_sets_some_false_and_leaves_the_warning_to_each_command() {
         let cfg = NpmrcConfig::parse("strict-ssl=false\n", "test", &no_env);
         let tagged = cfg.tls.strict_ssl.expect("strict_ssl should be Some");
         assert!(!tagged.value);
         assert_eq!(tagged.source, "test");
         assert_eq!(tagged.line, 1);
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(
-            cfg.warnings[0].contains("DISABLED"),
-            "warning: {}",
-            cfg.warnings[0]
-        );
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
     }
 
     #[test]

@@ -351,6 +351,9 @@ pub(super) fn prepare_install_routing_context(
     }
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
         && !tagged.value
+        && crate::commands::registry_reads::first_npmrc_security_warning(
+            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
+        )
     {
         output::warn(&format!(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
@@ -361,7 +364,9 @@ pub(super) fn prepare_install_routing_context(
         ));
     }
     for warning in route_table.npmrc_security_warnings() {
-        output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        if crate::commands::registry_reads::first_npmrc_security_warning(warning) {
+            output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        }
     }
 
     let top_level_specs = top_level_registry_specs(deps);

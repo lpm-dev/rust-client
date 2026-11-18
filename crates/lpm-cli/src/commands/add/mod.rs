@@ -513,6 +513,9 @@ async fn run_locked(
     // strict-ssl=false is a security signal; emit unconditionally on stderr.
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
         && !tagged.value
+        && crate::commands::registry_reads::first_npmrc_security_warning(
+            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
+        )
     {
         output::warn(&format!(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
@@ -524,7 +527,9 @@ async fn run_locked(
     }
     // Project-local `.npmrc` refusals are surfaced even in JSON mode.
     for w in route_table.npmrc_security_warnings() {
-        output::warn(&lpm_common::sanitize_terminal_inline(w));
+        if crate::commands::registry_reads::first_npmrc_security_warning(w) {
+            output::warn(&lpm_common::sanitize_terminal_inline(w));
+        }
     }
     // Request-aware eager-build: `lpm add <spec>`'s
     // top-level request is exactly `{spec}`. The fetch site below

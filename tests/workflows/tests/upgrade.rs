@@ -3011,3 +3011,52 @@ async fn upgrade_names_the_npmrc_tls_settings_once_in_human_output() {
         );
     }
 }
+
+#[tokio::test]
+async fn upgrade_and_install_warn_about_strict_ssl_false_once() {
+    let project = TempProject::empty(
+        r#"{"name":"strict-ssl-once","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n\
+         source = \"registry+https://registry.npmjs.org\"\n",
+    );
+    std::fs::write(project.home().join(".npmrc"), "strict-ssl=false\n").unwrap();
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "ms",
+        "2.5.0",
+        &[
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.5.0",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.5.0")),
+            ),
+        ],
+    )
+    .await;
+
+    for args in [
+        &["install", "--no-security-summary", "--no-skills"][..],
+        &["upgrade", "-y"][..],
+    ] {
+        let out = lpm_with_registry(&project, &mock.url())
+            .args(args)
+            .output()
+            .expect("spawn lpm");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.matches("strict-ssl=false").count(),
+            1,
+            "{args:?} must warn about strict-ssl=false once: {stderr}"
+        );
+    }
+}

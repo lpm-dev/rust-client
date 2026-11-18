@@ -118,7 +118,8 @@ pub fn prepare_locked_read_context(
 
 /// Which of `client`'s registries a command reads. Their TLS clients build
 /// up front, so a broken setting for one of them fails before any request;
-/// a registry the command doesn't read never loads its TLS files.
+/// a registry the command doesn't read never loads its per-origin TLS files
+/// (a global `cafile=` loads with the `.npmrc` itself).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegistryReads {
     pub lpm: bool,
@@ -197,6 +198,25 @@ impl RoutedReadContext {
     }
 }
 
+/// Whether this process has yet to print the `.npmrc` security warning
+/// `key`. A command that reads a registry and then installs loads the same
+/// `.npmrc` settings again, and each load warns about them.
+pub(crate) fn first_npmrc_security_warning(key: &str) -> bool {
+    static SHOWN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SHOWN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_owned())
+}
+
+/// The [`first_npmrc_security_warning`] key of a `strict-ssl=false` line,
+/// which each command words for itself.
+pub(crate) fn strict_ssl_warning_key(source: &str, line: usize) -> String {
+    format!("strict-ssl\0{source}\0{line}")
+}
+
 fn print_npmrc_advisories(route_table: &RouteTable) {
     for warning in route_table.npmrc_warnings() {
         install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
@@ -221,6 +241,9 @@ fn configure_read_context_for_origins(
 
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
         && !tagged.value
+        && crate::commands::registry_reads::first_npmrc_security_warning(
+            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
+        )
     {
         install_ui::warn_untrusted(&format!(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
@@ -232,7 +255,9 @@ fn configure_read_context_for_origins(
     }
 
     for warning in route_table.npmrc_security_warnings() {
-        install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
+        if crate::commands::registry_reads::first_npmrc_security_warning(warning) {
+            install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
+        }
     }
 
     let configured_client = client
