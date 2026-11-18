@@ -77,9 +77,7 @@ fn validate(path: &Path, value: &Value, host: &str) -> Result<(), LpmError> {
     ] {
         if let Some(section) = validate_object(path, value, keys)? {
             if keys.last() == Some(&"signing") {
-                for action in ["onUnsigned", "onUntrustedCertificate"] {
-                    validate_string(path, section, action, &keys.join("."))?;
-                }
+                validate_signing(path, section, &keys.join("."))?;
             }
             if keys == ["registries", "lpmdev"] {
                 validate_string(path, section, "url", "registries.lpmdev")?;
@@ -94,6 +92,72 @@ fn validate(path: &Path, value: &Value, host: &str) -> Result<(), LpmError> {
                 }
             }
         }
+    }
+    // SwiftPM compares scopes without regard to case, so `LPMDEV` is the
+    // `lpmdev` scope too.
+    if let Some(scopes) = validate_object(path, value, &["security", "scopeOverrides"])? {
+        for (scope, entry) in scopes.as_object().into_iter().flatten() {
+            if !scope.eq_ignore_ascii_case("lpmdev") {
+                continue;
+            }
+            let location = format!("security.scopeOverrides.{scope}");
+            if !entry.is_object() {
+                return Err(invalid(path, format!("{location} must be an object")));
+            }
+            if let Some(signing) = entry.get("signing") {
+                if !signing.is_object() {
+                    return Err(invalid(
+                        path,
+                        format!("{location}.signing must be an object"),
+                    ));
+                }
+                validate_signing(path, signing, &format!("{location}.signing"))?;
+            }
+        }
+    }
+    if let Some(packages) = validate_object(path, value, &["security", "packageOverrides"])? {
+        for (identity, entry) in packages.as_object().into_iter().flatten() {
+            let is_lpm_package = identity
+                .split_once('.')
+                .is_some_and(|(scope, _)| scope.eq_ignore_ascii_case("lpmdev"));
+            if !is_lpm_package {
+                continue;
+            }
+            let location = format!("security.packageOverrides.{identity}");
+            if !entry.is_object() {
+                return Err(invalid(path, format!("{location} must be an object")));
+            }
+            if let Some(signing) = entry.get("signing") {
+                if !signing.is_object() {
+                    return Err(invalid(
+                        path,
+                        format!("{location}.signing must be an object"),
+                    ));
+                }
+                validate_signing(path, signing, &format!("{location}.signing"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SwiftPM reads a signing field that's `null` as one that's absent.
+fn validate_signing(path: &Path, signing: &Value, location: &str) -> Result<(), LpmError> {
+    let set = |key: &str| signing.get(key).filter(|value| !value.is_null());
+    for key in [
+        "onUnsigned",
+        "onUntrustedCertificate",
+        "trustedRootCertificatesPath",
+    ] {
+        if set(key).is_some_and(|value| !value.is_string()) {
+            return Err(invalid(path, format!("{location}.{key} must be a string")));
+        }
+    }
+    if set("includeDefaultTrustedRootCertificates").is_some_and(|value| !value.is_boolean()) {
+        return Err(invalid(
+            path,
+            format!("{location}.includeDefaultTrustedRootCertificates must be a boolean"),
+        ));
     }
     Ok(())
 }
@@ -179,14 +243,11 @@ fn parse(path: &Path, original: Option<&str>, host: &str) -> Result<Value, LpmEr
     Ok(config)
 }
 
-pub(super) fn update(
-    path: &Path,
-    host: &str,
-    mutate: impl FnOnce(&mut Value) -> Result<(), LpmError>,
-) -> Result<bool, LpmError> {
-    load(path, host)?;
-    directories(path, true)?;
-    let lock_path = path.with_file_name(".lpm-registries.lock");
+/// Holds the lock file at `lock_path`, which must be a regular file and is
+/// never followed through a link.
+pub(super) fn exclusive_lock(
+    lock_path: &Path,
+) -> Result<lpm_common::paths::SingleFileExclusiveLockHandle, LpmError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -202,10 +263,20 @@ pub(super) fn update(
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let lock_file = options
-        .open(&lock_path)
-        .map_err(|error| invalid(&lock_path, error))?;
-    regular_file(&lock_path, &lock_file.metadata()?)?;
-    let _guard = lpm_common::paths::acquire_single_file_exclusive_lock_from_file(lock_file)?;
+        .open(lock_path)
+        .map_err(|error| invalid(lock_path, error))?;
+    regular_file(lock_path, &lock_file.metadata()?)?;
+    lpm_common::paths::acquire_single_file_exclusive_lock_from_file(lock_file)
+}
+
+pub(super) fn update(
+    path: &Path,
+    host: &str,
+    mutate: impl FnOnce(&mut Value) -> Result<(), LpmError>,
+) -> Result<bool, LpmError> {
+    load(path, host)?;
+    directories(path, true)?;
+    let _guard = exclusive_lock(&path.with_file_name(".lpm-registries.lock"))?;
     let original = read(path)?;
     let mut config = parse(path, original.as_deref(), host)?;
     let before = config.clone();

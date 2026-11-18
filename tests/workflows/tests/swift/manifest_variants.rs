@@ -1,16 +1,6 @@
 use super::*;
 
-async fn mount_variants(mock: &MockRegistry) -> Vec<u8> {
-    let cert = rcgen::generate_simple_self_signed(vec!["lpm.dev".into()])
-        .unwrap()
-        .cert
-        .der()
-        .to_vec();
-    Mock::given(method("GET"))
-        .and(path("/api/swift-registry/certificate"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(cert.clone()))
-        .mount(mock.server())
-        .await;
+async fn mount_variants(mock: &MockRegistry) {
     let tarball = b"unused swift package tarball";
     let mut metadata = mock.package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball);
     metadata["versions"][SWIFT_VERSION]["_ecosystem"] = serde_json::json!("swift");
@@ -23,15 +13,14 @@ async fn mount_variants(mock: &MockRegistry) -> Vec<u8> {
     });
     mock.with_package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball, metadata)
         .await;
-    cert
 }
 
 #[tokio::test]
 async fn swift_install_selects_the_library_from_the_resolving_tools_version() {
     let mock = MockRegistry::start().await;
-    let cert = mount_variants(&mock).await;
+    mount_variants(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
     command
@@ -52,9 +41,9 @@ async fn swift_install_selects_the_library_from_the_resolving_tools_version() {
 #[tokio::test]
 async fn swift_install_accepts_the_native_apple_vendor_version_prefix() {
     let mock = MockRegistry::start().await;
-    let cert = mount_variants(&mock).await;
+    mount_variants(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
     command
@@ -74,9 +63,9 @@ async fn swift_install_accepts_the_native_apple_vendor_version_prefix() {
 #[tokio::test]
 async fn swift_install_rejects_an_incompatible_manifest_without_editing_the_project() {
     let mock = MockRegistry::start().await;
-    let cert = mount_variants(&mock).await;
+    mount_variants(&mock).await;
     let project = swift_project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let before = project.read_file("Package.swift");
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
@@ -91,10 +80,10 @@ async fn swift_install_rejects_an_incompatible_manifest_without_editing_the_proj
 #[tokio::test]
 async fn xcode_uses_the_selected_manifests_product_and_platform() {
     let mock = MockRegistry::start().await;
-    let cert = mount_variants(&mock).await;
+    mount_variants(&mock).await;
     let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
     write_xcode_project(&project, "", "MyApp");
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &["unused"], 0);
     command

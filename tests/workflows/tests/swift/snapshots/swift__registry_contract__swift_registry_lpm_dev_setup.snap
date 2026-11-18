@@ -1,0 +1,17 @@
+---
+source: tests/workflows/tests/swift/registry_contract.rs
+expression: json
+---
+{
+  "success": true,
+  "registry_url": "https://lpm.dev/api/swift-registry",
+  "scope": "lpmdev",
+  "https": true,
+  "signing_certificate_installed": true,
+  "signing_trust_configured": true,
+  "signing_certificate_outcome": "installed",
+  "signing_trust_outcome": "configured",
+  "trust_anchor": "pinned_root",
+  "authentication_outcome": "skipped_no_credential",
+  "signer_trust_policy": "error"
+}

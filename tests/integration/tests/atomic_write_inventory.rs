@@ -159,6 +159,10 @@ fn reviewed_raw_atomic_writer(key: &str) -> bool {
 
 const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
+        "crates/lpm-cli/src/commands/swift_registry/signing.rs::write_root",
+        "writes a pinned Swift signing root to an exclusively created NamedTempFile in the roots directory's parent and persists it into the roots directory under the roots lock; SwiftPM reads every file in that directory as a trusted root, so a temporary file there, partial or left by a crash, would fail its signature checks",
+    ),
+    (
         "crates/lpm-cli/src/security_approval/managed_policy.rs::set_aside_windows_policy_entry",
         "renames a Windows managed policy, or its directory, that fails the policy's own checks to a fresh `.untrusted-<time>` name beside it, keeping it for the administrator, before LPM makes or writes its own; the name's nanosecond time is one nobody can have taken beforehand",
     ),

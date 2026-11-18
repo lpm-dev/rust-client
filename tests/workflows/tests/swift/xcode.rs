@@ -16,9 +16,9 @@ fn install(project: &TempProject, mock: &MockRegistry) -> assert_cmd::Command {
 #[tokio::test]
 async fn xcode_reinstall_repairs_missing_target_and_framework_references() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     install(&project, &mock).assert().success();
     let path = "MyApp.xcodeproj/project.pbxproj";
     let original = project.read_file(path);
@@ -66,9 +66,9 @@ fn workspace(project: &TempProject) -> &'static str {
 #[tokio::test]
 async fn xcode_install_updates_the_containing_workspace_lockfile() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let lock = workspace(&project);
     let log = project.path().join("xcode.log");
     install(&project, &mock)
@@ -91,9 +91,9 @@ async fn xcode_install_updates_the_containing_workspace_lockfile() {
 #[tokio::test]
 async fn xcode_resolution_failure_restores_workspace_lockfile_and_project() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let lock = workspace(&project);
     let original = project.read_file(lock);
     let pbx = project.read_file("MyApp.xcodeproj/project.pbxproj");
@@ -110,9 +110,9 @@ async fn xcode_resolution_failure_restores_workspace_lockfile_and_project() {
 #[tokio::test]
 async fn xcode_install_uses_effective_xcconfig_deployment_minima() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let path = "MyApp.xcodeproj/project.pbxproj";
     let pbx = project.read_file(path).replace(
         "isa = PBXProject;",
@@ -135,9 +135,9 @@ async fn xcode_install_uses_effective_xcconfig_deployment_minima() {
 #[tokio::test]
 async fn xcode_reinstall_repairs_a_deleted_frameworks_phase() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     install(&project, &mock).assert().success();
     let path = "MyApp.xcodeproj/project.pbxproj";
     let original = project.read_file(path);
@@ -165,9 +165,9 @@ async fn xcode_reinstall_repairs_a_deleted_frameworks_phase() {
 #[tokio::test]
 async fn xcode_failed_resolution_removes_a_new_project_lockfile() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = project();
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let lock = "MyApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved";
     install(&project, &mock)
         .env("LPM_TEST_XCODE_LOCKFILE", project.path().join(lock))
@@ -180,14 +180,14 @@ async fn xcode_failed_resolution_removes_a_new_project_lockfile() {
 #[tokio::test]
 async fn xcode_install_resolves_a_workspace_containing_a_nested_project() {
     let mock = MockRegistry::start().await;
-    let cert = mount_swift_package(&mock).await;
+    mount_swift_package(&mock).await;
     let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
     write_xcode_project(&project, "App", "MyApp");
     project.write_file(
         "Custom.xcworkspace/contents.xcworkspacedata",
         r#"<Workspace version="1.0"><FileRef location="group:App/MyApp.xcodeproj"/></Workspace>"#,
     );
-    configure_existing_registry(&project, &mock.url(), &cert);
+    configure_existing_registry(&project, &mock.url());
     let lock = "Custom.xcworkspace/xcshareddata/swiftpm/Package.resolved";
     let log = project.path().join("xcode.log");
     install(&project, &mock)

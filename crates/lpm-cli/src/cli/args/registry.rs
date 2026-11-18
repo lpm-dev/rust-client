@@ -285,7 +285,7 @@ pub(crate) struct SetupArgs {
 
 #[derive(Args)]
 pub(crate) struct SwiftRegistryArgs {
-    /// Replace the local signing certificate even when its bytes already match.
+    /// Rewrite the registry's pinned signing roots even when they already match.
     #[arg(long)]
     pub(crate) force: bool,
 }
