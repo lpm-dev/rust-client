@@ -311,7 +311,9 @@ fn lpm_packages_for_enrichment(
 }
 
 fn emit_human_security_summary(package_count: usize, issues: &[TagIssue], verbose: bool) {
-    for line in format_human_security_summary(package_count, issues, verbose) {
+    let lines =
+        format_human_security_summary(package_count, issues, verbose, install_ui::stderr_columns());
+    for line in lines {
         match line {
             SecuritySummaryLine::Warn(message) => install_ui::warn_line(message),
             SecuritySummaryLine::Detail(message) => install_ui::detail_line(message),
@@ -319,10 +321,13 @@ fn emit_human_security_summary(package_count: usize, issues: &[TagIssue], verbos
     }
 }
 
+/// The summary's rows, with tables fitted to `max_width` columns when the
+/// caller prints to a terminal.
 fn format_human_security_summary(
     package_count: usize,
     issues: &[TagIssue],
     verbose: bool,
+    max_width: Option<usize>,
 ) -> Vec<SecuritySummaryLine> {
     let mut lines = Vec::new();
     let actionable: Vec<&TagIssue> = issues
@@ -355,10 +360,11 @@ fn format_human_security_summary(
                 &mut lines,
                 &actionable,
                 &[Severity::Critical, Severity::High, Severity::Medium],
+                max_width,
             );
         } else {
             append_severity_rollup(&mut lines, &actionable);
-            append_issue_tiers(&mut lines, &actionable, &[Severity::Critical]);
+            append_issue_tiers(&mut lines, &actionable, &[Severity::Critical], max_width);
         }
         lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
             "  {} Run {} for full details.",
@@ -404,7 +410,7 @@ fn format_human_security_summary(
         }
         lines.extend(
             table
-                .render(install_ui::stderr_columns())
+                .render(max_width)
                 .into_iter()
                 .map(SecuritySummaryLine::Detail),
         );
@@ -420,7 +426,7 @@ fn format_human_security_summary(
             install_ui::cyan("ℹ"),
             summary_heading("Behavioral metadata", package_count, signal_count, "signal")
         )));
-        append_issue_tiers(&mut lines, &metadata, &[Severity::Info]);
+        append_issue_tiers(&mut lines, &metadata, &[Severity::Info], max_width);
         append_query_hint(&mut lines, &metadata, "signals");
     }
 
@@ -481,6 +487,7 @@ fn append_issue_tiers(
     lines: &mut Vec<SecuritySummaryLine>,
     issues: &[&TagIssue],
     severities: &[Severity],
+    max_width: Option<usize>,
 ) {
     let mut table = install_ui::Table::new().indent(4).gap(1).align_right(0);
     for &severity in severities {
@@ -518,7 +525,7 @@ fn append_issue_tiers(
     }
     lines.extend(
         table
-            .render(install_ui::stderr_columns())
+            .render(max_width)
             .into_iter()
             .map(SecuritySummaryLine::Detail),
     );
@@ -1235,6 +1242,39 @@ mod tests {
     }
 
     #[test]
+    fn human_security_summary_lines_up_arrows_across_counts_and_labels() {
+        let critical = |tag_label, packages: usize| TagIssue {
+            tag_label,
+            severity: Severity::Critical,
+            install_visibility: InstallVisibility::Default,
+            selector: Some(":obfuscated"),
+            packages: (0..packages)
+                .map(|index| format!("pkg-{index}@1.0.0"))
+                .collect(),
+        };
+        let issues = vec![
+            critical("obfuscated code", 1),
+            critical("environment-variable access", 12),
+        ];
+
+        let arrow_columns: Vec<usize> = format_human_security_summary(13, &issues, false, None)
+            .iter()
+            .filter_map(|line| match line {
+                SecuritySummaryLine::Detail(message) => {
+                    let visible = console::strip_ansi_codes(message).into_owned();
+                    visible
+                        .find('→')
+                        .map(|byte| console::measure_text_width(&visible[..byte]))
+                }
+                SecuritySummaryLine::Warn(_) => None,
+            })
+            .collect();
+
+        assert_eq!(arrow_columns.len(), 2, "{arrow_columns:?}");
+        assert_eq!(arrow_columns[0], arrow_columns[1], "{arrow_columns:?}");
+    }
+
+    #[test]
     fn human_security_summary_rolls_up_severities_and_details_only_critical_by_default() {
         let issues = vec![
             TagIssue {
@@ -1270,7 +1310,7 @@ mod tests {
             },
         ];
 
-        let lines = format_human_security_summary(9, &issues, false);
+        let lines = format_human_security_summary(9, &issues, false, None);
         let joined = lines
             .iter()
             .map(|line| match line {
@@ -1335,7 +1375,7 @@ mod tests {
             },
         ];
 
-        let lines = format_human_security_summary(2, &issues, true);
+        let lines = format_human_security_summary(2, &issues, true, None);
         let joined = lines
             .iter()
             .map(|line| match line {
@@ -1380,7 +1420,7 @@ mod tests {
             },
         ];
 
-        assert!(format_human_security_summary(1, &issues, false).is_empty());
+        assert!(format_human_security_summary(1, &issues, false, None).is_empty());
     }
 
     #[test]
@@ -1402,7 +1442,7 @@ mod tests {
             },
         ];
 
-        let lines = format_human_security_summary(1, &issues, true);
+        let lines = format_human_security_summary(1, &issues, true, None);
         let joined = lines
             .iter()
             .map(|line| match line {

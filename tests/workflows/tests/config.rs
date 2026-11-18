@@ -1471,17 +1471,6 @@ fn config_list_human_groups_effective_values_and_sources() {
     );
 }
 
-/// The column where a row's value starts, after its key and the spaces
-/// that pad the key column.
-fn value_column(line: &str) -> usize {
-    let key_end = line
-        .trim_start()
-        .find(' ')
-        .expect("a key followed by a value")
-        + (line.len() - line.trim_start().len());
-    key_end + line[key_end..].len() - line[key_end..].trim_start().len()
-}
-
 #[test]
 fn config_list_lines_up_each_group_when_colored() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
@@ -1512,19 +1501,22 @@ fn config_list_lines_up_each_group_when_colored() {
         "install-time-source-analysis",
     ]
     .iter()
-    .map(|key| value_column(support::terminal::line_with(&visible, key)))
+    .map(|key| support::terminal::column_after(support::terminal::line_with(&visible, key), key))
     .collect();
     assert!(
         columns.windows(2).all(|pair| pair[0] == pair[1]),
         "every value in a group must start in the same column, got {columns:?} in:\n{visible}"
     );
+    let save_column = |key: &str| {
+        support::terminal::column_after(support::terminal::line_with(&visible, key), key)
+    };
     assert_eq!(
-        value_column(support::terminal::line_with(&visible, "save-prefix")),
-        value_column(support::terminal::line_with(&visible, "save-exact")),
+        save_column("save-prefix"),
+        save_column("save-exact"),
         "a short group must line up on its own keys, got:\n{visible}"
     );
     assert!(
-        value_column(support::terminal::line_with(&visible, "save-prefix")) < 20,
+        save_column("save-prefix") < 20,
         "a short group must not take the width of the longest key in another group, got:\n{visible}"
     );
 }
@@ -1591,21 +1583,31 @@ fn config_list_dims_defaults_and_highlights_values_that_were_set() {
 }
 
 #[test]
-fn config_list_reads_the_minimum_release_age_in_days() {
-    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
-    seed_config(&project, "minimum-release-age-secs = 172800\n");
+fn config_list_reads_a_minimum_release_age_of_whole_hours_or_days_in_those_units() {
+    for (config, expected) in [
+        ("minimum-release-age-secs = 172800\n", "172800 (2d)"),
+        ("minimum-release-age-secs = 7200\n", "7200 (2h)"),
+        ("minimum-release-age-secs = 90\n", "90 "),
+        ("", "0 (off)"),
+    ] {
+        let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+        if !config.is_empty() {
+            seed_config(&project, config);
+        }
 
-    let output = lpm(&project)
-        .args(["config", "list"])
-        .output()
-        .expect("failed to run lpm config list");
-    assert!(output.status.success(), "{output:?}");
+        let output = lpm(&project)
+            .args(["config", "list"])
+            .output()
+            .expect("failed to run lpm config list");
+        assert!(output.status.success(), "{output:?}");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        support::terminal::line_with(&stdout, "minimum-release-age-secs").contains("172800 (2d)"),
-        "the raw seconds must read in days too, got:\n{stdout}"
-    );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let row = support::terminal::line_with(&stdout, "minimum-release-age-secs");
+        assert!(
+            row.contains(expected) && (expected != "90 " || !row.contains('(')),
+            "{config:?} must read as {expected:?}, got {row:?}"
+        );
+    }
 }
 
 #[test]

@@ -5,12 +5,14 @@
 //! `install_ui::TerminalFragment`, which pads by the columns it takes on
 //! screen.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
-    Attribute, Expr, ExprLit, ExprMethodCall, ImplItemFn, ItemFn, ItemMod, Lit, Macro, Token,
+    Attribute, Expr, ExprLit, ExprMethodCall, ImplItemFn, ItemFn, ItemMod, Lit, Local, Macro, Pat,
+    Token,
 };
 
 const FORMAT_MACROS: &[&str] = &[
@@ -179,10 +181,61 @@ fn painted_call(expr: &Expr) -> Option<String> {
 struct StyledPaddingAudit {
     relative: String,
     current_function: Option<String>,
+    /// Locals of the current function bound to painted text, with the
+    /// painting method, so `{name:<8}` on one is caught too.
+    painted_locals: HashMap<String, String>,
     violations: Vec<String>,
 }
 
+/// The name a `let` binds, when it binds a single identifier.
+fn bound_name(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ident(ident) => Some(ident.ident.to_string()),
+        Pat::Type(typed) => bound_name(&typed.pat),
+        _ => None,
+    }
+}
+
+/// The local an argument names, as `name` or `&name`.
+fn named_local(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+        Expr::Reference(reference) => named_local(&reference.expr),
+        Expr::Paren(paren) => named_local(&paren.expr),
+        _ => None,
+    }
+}
+
 impl StyledPaddingAudit {
+    fn new(relative: &str) -> Self {
+        Self {
+            relative: relative.to_owned(),
+            current_function: None,
+            painted_locals: HashMap::new(),
+            violations: Vec::new(),
+        }
+    }
+
+    /// The painting method behind a format argument: called in the argument
+    /// itself, or on the way to a local it names.
+    fn painted_argument(&self, argument: &Expr) -> Option<String> {
+        painted_call(argument).or_else(|| {
+            named_local(argument).and_then(|name| self.painted_locals.get(&name).cloned())
+        })
+    }
+
+    fn enter_function(&mut self, name: String) -> (Option<String>, HashMap<String, String>) {
+        (
+            self.current_function.replace(name),
+            std::mem::take(&mut self.painted_locals),
+        )
+    }
+
+    fn leave_function(&mut self, saved: (Option<String>, HashMap<String, String>)) {
+        self.current_function = saved.0;
+        self.painted_locals = saved.1;
+    }
+
     fn audit_format_macro(&mut self, mac: &Macro) {
         let Ok(arguments) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
         else {
@@ -224,17 +277,28 @@ impl StyledPaddingAudit {
 
         let mut next = 0;
         for placeholder in placeholders(&format.value()) {
-            let argument = match &placeholder.argument {
+            if !placeholder.has_width {
+                if matches!(placeholder.argument, Argument::Next) {
+                    next += 1;
+                }
+                continue;
+            }
+            let method = match &placeholder.argument {
                 Argument::Next => {
                     next += 1;
-                    positional.get(next - 1).copied()
+                    positional
+                        .get(next - 1)
+                        .and_then(|argument| self.painted_argument(argument))
                 }
-                Argument::Index(index) => positional.get(*index).copied(),
-                Argument::Named(name) => named(name),
+                Argument::Index(index) => positional
+                    .get(*index)
+                    .and_then(|argument| self.painted_argument(argument)),
+                Argument::Named(name) => match named(name) {
+                    Some(argument) => self.painted_argument(argument),
+                    None => self.painted_locals.get(name).cloned(),
+                },
             };
-            if placeholder.has_width
-                && let Some(method) = argument.and_then(painted_call)
-            {
+            if let Some(method) = method {
                 self.violations.push(format!(
                     "{}: {}: {:?} pads the result of `.{method}()`",
                     self.relative,
@@ -258,17 +322,36 @@ impl<'ast> Visit<'ast> for StyledPaddingAudit {
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
         if !is_test_only(&item.attrs) {
-            let previous = self.current_function.replace(item.sig.ident.to_string());
+            let saved = self.enter_function(item.sig.ident.to_string());
             syn::visit::visit_item_fn(self, item);
-            self.current_function = previous;
+            self.leave_function(saved);
         }
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
         if !is_test_only(&item.attrs) {
-            let previous = self.current_function.replace(item.sig.ident.to_string());
+            let saved = self.enter_function(item.sig.ident.to_string());
             syn::visit::visit_impl_item_fn(self, item);
-            self.current_function = previous;
+            self.leave_function(saved);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        syn::visit::visit_local(self, local);
+        let Some(name) = bound_name(&local.pat) else {
+            return;
+        };
+        match local
+            .init
+            .as_ref()
+            .and_then(|init| painted_call(&init.expr))
+        {
+            Some(method) => {
+                self.painted_locals.insert(name, method);
+            }
+            None => {
+                self.painted_locals.remove(&name);
+            }
         }
     }
 
@@ -280,6 +363,14 @@ impl<'ast> Visit<'ast> for StyledPaddingAudit {
             .is_some_and(|segment| FORMAT_MACROS.contains(&segment.ident.to_string().as_str()));
         if is_format_macro {
             self.audit_format_macro(mac);
+        } else if let Ok(arguments) =
+            mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        {
+            // `vec!`, `assert!` and the like hold expressions `syn` leaves as
+            // tokens; read them so a format macro inside is audited too.
+            for argument in &arguments {
+                self.visit_expr(argument);
+            }
         }
         syn::visit::visit_macro(self, mac);
     }
@@ -314,11 +405,7 @@ fn format_widths_never_pad_text_that_is_already_colored() {
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
         let syntax =
             syn::parse_file(&source).unwrap_or_else(|error| panic!("parse {relative}: {error}"));
-        let mut audit = StyledPaddingAudit {
-            relative,
-            current_function: None,
-            violations: Vec::new(),
-        };
+        let mut audit = StyledPaddingAudit::new(&relative);
         audit.visit_file(&syntax);
         violations.extend(audit.violations);
     }
@@ -340,11 +427,7 @@ fn the_guard_flags_a_width_on_painted_text() {
             let fine = format!("{}", section.dimmed());
         }
     };
-    let mut audit = StyledPaddingAudit {
-        relative: "example.rs".to_owned(),
-        current_function: None,
-        violations: Vec::new(),
-    };
+    let mut audit = StyledPaddingAudit::new("example.rs");
     audit.visit_file(&syntax);
 
     assert_eq!(
@@ -354,6 +437,65 @@ fn the_guard_flags_a_width_on_painted_text() {
             "example.rs: render: \"{0:>8} {label:<4}\" pads the result of `.cyan()`",
         ]
     );
+}
+
+#[test]
+fn the_guard_follows_painted_text_through_a_local_binding() {
+    let syntax: syn::File = syn::parse_quote! {
+        fn render(raw: &str) {
+            let name = raw.cyan();
+            println!("{name:<8}");
+            println!("{:<8}|", name);
+            println!("{:<8}|", &name);
+            println!("{name}");
+            let name = format!("{raw:<8}");
+            println!("{name:<10}");
+        }
+    };
+    let mut audit = StyledPaddingAudit::new("example.rs");
+    audit.visit_file(&syntax);
+
+    assert_eq!(
+        audit.violations,
+        [
+            "example.rs: render: \"{name:<8}\" pads the result of `.cyan()`",
+            "example.rs: render: \"{:<8}|\" pads the result of `.cyan()`",
+            "example.rs: render: \"{:<8}|\" pads the result of `.cyan()`",
+        ]
+    );
+}
+
+#[test]
+fn the_guard_reads_format_macros_nested_in_other_macros() {
+    let syntax: syn::File = syn::parse_quote! {
+        fn render(raw: &str) -> Vec<String> {
+            vec![format!("{:<8}", raw.dimmed()), raw.to_string()]
+        }
+    };
+    let mut audit = StyledPaddingAudit::new("example.rs");
+    audit.visit_file(&syntax);
+
+    assert_eq!(
+        audit.violations,
+        ["example.rs: render: \"{:<8}\" pads the result of `.dimmed()`"]
+    );
+}
+
+#[test]
+fn a_binding_painted_in_one_function_is_not_followed_into_another() {
+    let syntax: syn::File = syn::parse_quote! {
+        fn first(raw: &str) {
+            let name = raw.cyan();
+            println!("{name}");
+        }
+        fn second(name: &str) {
+            println!("{name:<8}");
+        }
+    };
+    let mut audit = StyledPaddingAudit::new("example.rs");
+    audit.visit_file(&syntax);
+
+    assert!(audit.violations.is_empty(), "{:?}", audit.violations);
 }
 
 #[test]

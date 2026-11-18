@@ -716,7 +716,6 @@ fn print_security_status(status: &security_approval::SecurityStatus) {
         ]);
     }
     rows.print_stdout();
-    println!();
 }
 
 fn source_name(source: security_approval::PostureSourceKind) -> &'static str {

@@ -163,6 +163,11 @@ fn security_status_human_uses_slim_completion() {
         "security status must render the status sections to stdout, got:\n{stdout}",
     );
 
+    assert!(
+        stdout.ends_with("  none\n\n") && !stdout.ends_with("\n\n\n"),
+        "security status must end with one blank line before its completion line, got:\n{stdout:?}",
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("✓ Security floor loaded"),
@@ -218,11 +223,7 @@ fn security_status_lines_up_every_row_of_a_section_when_colored() {
     );
     let visible = support::terminal::visible_text(&raw);
     let line = |label: &str| support::terminal::line_with(&visible, label);
-    let value_column = |label: &str| {
-        let row = line(label);
-        let after = support::terminal::column_of(row, label) + label.len();
-        after + row[after..].len() - row[after..].trim_start().len()
-    };
+    let value_column = |label: &str| support::terminal::column_after(line(label), label);
 
     assert_eq!(
         value_column("approved posture"),

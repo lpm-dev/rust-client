@@ -465,12 +465,13 @@ pub async fn run(
                 &skipped_non_registry,
             )?;
         } else {
-            let message = if requested_packages.is_empty() {
-                "All checked package.json dependencies are up to date"
-            } else {
-                "All requested package.json dependencies are up to date"
-            };
-            install_ui::done_untrusted(message);
+            if let Some(message) = up_to_date_message(
+                upgradeable_deps.len(),
+                skipped_private.len() + skipped_non_registry.len(),
+                !requested_packages.is_empty(),
+            ) {
+                install_ui::done_untrusted(&message);
+            }
             warn_skipped_private(&skipped_private);
             warn_skipped_non_registry(&skipped_non_registry);
         }
@@ -1076,6 +1077,23 @@ fn attach_skipped_private(json: &mut serde_json::Value, skipped_private: &[Strin
             "Packages without a recorded public npm or LPM-registry source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
         ),
     );
+}
+
+/// The success line when no checked dependency has an upgrade. It counts the
+/// dependencies checked, and says nothing when every one was skipped, so a
+/// run that checked nothing never reads as all clear.
+fn up_to_date_message(checked: usize, skipped: usize, requested: bool) -> Option<String> {
+    if requested {
+        return Some("All requested package.json dependencies are up to date".to_string());
+    }
+    match checked {
+        0 if skipped > 0 => None,
+        0 => Some("No package.json dependencies to check".to_string()),
+        1 => Some("The 1 checked package.json dependency is up to date".to_string()),
+        checked => Some(format!(
+            "All {checked} checked package.json dependencies are up to date"
+        )),
+    }
 }
 
 fn warn_skipped_private(skipped_private: &[String]) {
@@ -1890,6 +1908,31 @@ mod tests {
             route: MetadataRoute::Lpm,
             selected_metadata,
         }
+    }
+
+    #[test]
+    fn the_up_to_date_message_counts_the_dependencies_checked() {
+        assert_eq!(
+            up_to_date_message(3, 40, false).as_deref(),
+            Some("All 3 checked package.json dependencies are up to date")
+        );
+        assert_eq!(
+            up_to_date_message(1, 0, false).as_deref(),
+            Some("The 1 checked package.json dependency is up to date")
+        );
+        assert_eq!(
+            up_to_date_message(2, 0, true).as_deref(),
+            Some("All requested package.json dependencies are up to date")
+        );
+    }
+
+    #[test]
+    fn an_upgrade_that_skipped_every_dependency_claims_nothing_is_up_to_date() {
+        assert_eq!(up_to_date_message(0, 12, false), None);
+        assert_eq!(
+            up_to_date_message(0, 0, false).as_deref(),
+            Some("No package.json dependencies to check")
+        );
     }
 
     #[test]

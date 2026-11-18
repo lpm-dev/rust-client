@@ -93,18 +93,23 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
     // Service list
     let port_label =
         |port: Option<u16>| port.map_or_else(|| "  —".to_string(), |port| format!(":{port}"));
-    let name_width = app
-        .services
-        .iter()
-        .map(|svc| Span::raw(svc.name.as_str()).width())
-        .max()
-        .unwrap_or(0);
     let port_width = app
         .services
         .iter()
         .map(|svc| Span::raw(port_label(svc.port)).width())
         .max()
         .unwrap_or(0);
+    let longest_name = app
+        .services
+        .iter()
+        .map(|svc| Span::raw(svc.name.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let name_columns = service_name_columns(
+        longest_name,
+        port_width,
+        usize::from(chunks[0].width.saturating_sub(2)),
+    );
     let items: Vec<ListItem> = app
         .services
         .iter()
@@ -128,7 +133,7 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
             let mut spans = vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(status_color)),
-                Span::styled(pad_to_column(&svc.name, name_width + 1), style),
+                Span::styled(fit_to_column(&svc.name, name_columns), style),
                 Span::styled(
                     pad_to_column(&port_str, port_width + 1),
                     Style::default().fg(Color::DarkGray),
@@ -532,10 +537,48 @@ fn render_webhook_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, inde
     frame.render_widget(detail, area);
 }
 
-/// Truncate a path string with ellipsis if too long.
-///
-/// Uses `char_indices()` instead of byte-indexing to prevent panics
-/// on paths containing multi-byte UTF-8 characters (emoji, CJK, etc.).
+/// Columns a service row keeps for its status after the name and port, as
+/// wide as `starting`; longer statuses run to the sidebar's edge.
+const SERVICE_STATUS_COLUMNS: usize = 8;
+
+/// Columns before a service name: the status icon between two spaces.
+const SERVICE_ICON_COLUMNS: usize = 3;
+
+/// The narrowest a service name column gets on a cramped sidebar.
+const MIN_SERVICE_NAME_COLUMNS: usize = 6;
+
+/// The columns a service name gets: the longest name and a space, but never
+/// so many that a row's port and status fall outside the sidebar.
+fn service_name_columns(longest_name: usize, port_width: usize, inner_width: usize) -> usize {
+    let budget =
+        inner_width.saturating_sub(SERVICE_ICON_COLUMNS + port_width + 1 + SERVICE_STATUS_COLUMNS);
+    (longest_name + 1).min(budget.max(MIN_SERVICE_NAME_COLUMNS))
+}
+
+/// `text` padded to `columns`, or cut with `…` when it doesn't fit with a
+/// space after it.
+fn fit_to_column(text: &str, columns: usize) -> String {
+    if Span::raw(text).width() < columns {
+        return pad_to_column(text, columns);
+    }
+    let room = columns.saturating_sub(2);
+    let mut cut = 0;
+    let mut used = 0;
+    for (index, character) in text.char_indices() {
+        let end = index + character.len_utf8();
+        let width = Span::raw(&text[index..end]).width();
+        if used + width > room {
+            break;
+        }
+        used += width;
+        cut = end;
+    }
+    let mut fitted = String::with_capacity(cut + 4);
+    fitted.push_str(&text[..cut]);
+    fitted.push('…');
+    pad_to_column(&fitted, columns)
+}
+
 /// The longest standard HTTP method, `OPTIONS`, and a space after it.
 const WEBHOOK_METHOD_COLUMNS: usize = 8;
 
@@ -551,6 +594,10 @@ fn pad_to_column(text: &str, columns: usize) -> String {
     padded
 }
 
+/// Truncate a path string with ellipsis if too long.
+///
+/// Uses `char_indices()` instead of byte-indexing to prevent panics
+/// on paths containing multi-byte UTF-8 characters (emoji, CJK, etc.).
 fn truncate_path(path: &str, max: usize) -> String {
     if path.chars().count() <= max {
         path.to_string()
@@ -605,6 +652,78 @@ mod tests {
             result.chars().count() <= 15,
             "should not exceed max: {result}"
         );
+    }
+
+    fn sidebar_rows(services: Vec<crate::app::ServiceState>) -> Vec<String> {
+        let app = DashboardApp::new(services);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("test terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| (0..30).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn ready_service(name: &str, port: u16) -> crate::app::ServiceState {
+        crate::app::ServiceState {
+            name: name.to_string(),
+            port: Some(port),
+            hosts: Vec::new(),
+            proxy_port: None,
+            status: ServiceStatus::Ready,
+            logs: crate::log_buffer::LogBuffer::new(10),
+        }
+    }
+
+    #[test]
+    fn a_long_service_name_leaves_every_row_its_port_and_status_in_the_sidebar() {
+        let rows = sidebar_rows(vec![
+            ready_service("web", 3000),
+            ready_service("an-unusually-long-service-name", 8080),
+        ]);
+
+        let row = |needle: &str| {
+            rows.iter()
+                .find(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("no sidebar row contains {needle:?}: {rows:#?}"))
+                .clone()
+        };
+        let short = row("web");
+        let long = row("an-unusua…");
+        assert!(
+            short.contains(":3000") && short.contains("ready"),
+            "the short row must keep its port and status: {short:?}"
+        );
+        assert!(
+            long.contains(":8080") && long.contains("ready"),
+            "the long row must keep its port and status: {long:?}"
+        );
+        assert_eq!(
+            short
+                .find(":3000")
+                .map(|byte| short[..byte].chars().count()),
+            long.find(":8080").map(|byte| long[..byte].chars().count()),
+            "ports must share a column: {short:?} / {long:?}"
+        );
+    }
+
+    #[test]
+    fn fit_to_column_cuts_a_long_name_with_an_ellipsis_and_a_space() {
+        assert_eq!(fit_to_column("an-unusually-long-name", 8), "an-unu… ");
+        assert_eq!(fit_to_column("web", 8), "web     ");
+    }
+
+    #[test]
+    fn fit_to_column_cuts_wide_characters_by_their_columns() {
+        assert_eq!(fit_to_column("日本語サービス", 8), "日本語… ");
+    }
+
+    #[test]
+    fn service_name_columns_shrink_to_leave_room_for_port_and_status() {
+        assert_eq!(service_name_columns(3, 5, 28), 4);
+        assert_eq!(service_name_columns(30, 5, 28), 11);
+        assert_eq!(service_name_columns(30, 5, 12), MIN_SERVICE_NAME_COLUMNS);
     }
 
     #[test]

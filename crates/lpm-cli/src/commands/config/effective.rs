@@ -237,6 +237,7 @@ fn push_entry_row(table: &mut install_ui::Table, entry: &EffectiveConfigEntry, k
     let hint = (entry.key == crate::release_age_config::GLOBAL_KEY)
         .then(|| entry.value.as_u64())
         .flatten()
+        .filter(|secs| secs.is_multiple_of(3_600))
         .map(crate::release_age_config::describe_minimum_release_age);
     if entry.source == DEFAULT_SOURCE {
         let value = match hint {

@@ -109,9 +109,9 @@ impl Table {
     ///
     /// With `max_width` (the terminal's width), a row too wide to fit moves
     /// its last cell to the next line: under the rightmost earlier column it
-    /// fits under, or else ending at the right edge, where it can't be taken
-    /// for the first cell of a row. The terminal never wraps the row back to
-    /// its first column unless the cell alone is wider than the terminal.
+    /// fits under, or else ending at the right edge, so it reads as the end
+    /// of the row above rather than a row of its own. Only a cell wider than
+    /// the terminal still wraps; it starts just inside the row.
     pub fn render(&self, max_width: Option<usize>) -> Vec<TerminalLine> {
         let widths = self.column_widths();
         let mut lines = Vec::with_capacity(self.rows.len());
@@ -214,13 +214,15 @@ impl Table {
 
         rendered.truncate(rendered.trim_end_matches(' ').len());
         lines.push(TerminalLine::from_rendered(rendered));
-        let hanging_start = self.indent + self.gap;
         let start = column_starts[1..]
             .iter()
             .rev()
             .copied()
             .find(|start| start + last_width <= max)
-            .unwrap_or_else(|| max.saturating_sub(last_width).max(hanging_start));
+            .unwrap_or(match max.checked_sub(last_width) {
+                Some(flush_right) => flush_right,
+                None => self.indent + self.gap,
+            });
         let mut continuation = String::with_capacity(start + last.text.len());
         push_spaces(&mut continuation, start);
         self.push_cell(&mut continuation, last_column, last, last_width);
@@ -428,6 +430,34 @@ mod tests {
             [
                 "  install-time-source-analysis  false",
                 "               approved security posture",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_cell_that_fits_the_terminal_never_overflows_it() {
+        let mut table = Table::new();
+        table.row([plain("key"), plain(&"x".repeat(38))]);
+
+        assert_eq!(
+            visible(&table.render(Some(40))),
+            ["  key".to_owned(), format!("  {}", "x".repeat(38))]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_right_aligned_cell_keeps_its_column_width() {
+        let mut table = Table::new().align_right(1);
+        table.row([plain("installed packages"), plain("7")]);
+        table.row([plain("cached"), plain("1234")]);
+
+        assert_eq!(
+            visible(&table.render(Some(25))),
+            [
+                "  installed packages".to_owned(),
+                format!("{}7", " ".repeat(24)),
+                "  cached".to_owned(),
+                format!("{}1234", " ".repeat(21)),
             ]
         );
     }

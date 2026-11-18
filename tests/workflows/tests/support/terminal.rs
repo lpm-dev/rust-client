@@ -31,7 +31,7 @@ pub fn visible_text(output: &str) -> String {
     visible
 }
 
-/// The screen column where `needle` starts in a line of visible text.
+/// The character column where `needle` starts in a line of visible text.
 pub fn column_of(line: &str, needle: &str) -> usize {
     let start = line
         .find(needle)
@@ -45,4 +45,15 @@ pub fn line_with<'a>(visible: &'a str, needle: &str) -> &'a str {
         .lines()
         .find(|line| line.contains(needle))
         .unwrap_or_else(|| panic!("no line contains {needle:?} in:\n{visible}"))
+}
+
+/// The character column where the text after `label` starts, past the
+/// spaces that pad `label`'s column.
+pub fn column_after(line: &str, label: &str) -> usize {
+    let start = line
+        .find(label)
+        .unwrap_or_else(|| panic!("{label:?} not in {line:?}"));
+    let after = start + label.len();
+    let padding = line[after..].len() - line[after..].trim_start_matches(' ').len();
+    line[..after + padding].chars().count()
 }

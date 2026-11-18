@@ -123,12 +123,12 @@ fn approve_scripts_list_keeps_labels_apart_from_values_when_colored() {
     let visible = support::terminal::visible_text(&raw);
     let value_column = |label: &str| {
         let row = support::terminal::line_with(&visible, label);
-        let after = support::terminal::column_of(row, label) + label.chars().count();
+        let column = support::terminal::column_after(row, label);
         assert!(
-            row[after..].starts_with(' '),
+            column > support::terminal::column_of(row, label) + label.chars().count(),
             "{label:?} must be followed by a space, got {row:?}"
         );
-        after + row[after..].len() - row[after..].trim_start().len()
+        column
     };
 
     assert_eq!(

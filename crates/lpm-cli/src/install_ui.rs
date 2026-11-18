@@ -803,32 +803,49 @@ where
     const INDENT: usize = 2;
     let more_suffix = |more: usize| format!(", and {more} more (--json lists all)");
 
-    let names = names.into_iter();
+    let names: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            let name = lpm_common::sanitize_terminal_inline(name.as_ref()).into_owned();
+            let width = console::measure_text_width(&name);
+            (name, width)
+        })
+        .collect();
     let total = names.len();
-    let mut shown = String::new();
-    let mut used = INDENT;
-    let mut count = 0;
-    for name in names {
-        let name = lpm_common::sanitize_terminal_inline(name.as_ref());
-        let separator = if count == 0 { 0 } else { 2 };
-        let after = total - count - 1;
-        let reserve = if after == 0 {
-            0
-        } else {
-            more_suffix(after).len()
-        };
-        let name_width = console::measure_text_width(&name);
-        if count > 0 && used + separator + name_width + reserve > width {
-            break;
+    let separators = 2 * total.saturating_sub(1);
+    let whole_list = INDENT + separators + names.iter().map(|(_, width)| width).sum::<usize>();
+
+    let mut count = total;
+    if whole_list > width {
+        count = 1;
+        let mut used = INDENT + names.first().map_or(0, |(_, width)| *width);
+        for (index, (_, name_width)) in names.iter().enumerate().skip(1) {
+            let more = total - index - 1;
+            let reserve = if more == 0 {
+                0
+            } else {
+                more_suffix(more).len()
+            };
+            if used + 2 + name_width + reserve > width {
+                break;
+            }
+            used += 2 + name_width;
+            count += 1;
         }
-        if count > 0 {
-            shown.push_str(", ");
-        }
-        shown.push_str(&name);
-        used += separator + name_width;
-        count += 1;
     }
 
+    let mut shown = String::with_capacity(
+        names[..count]
+            .iter()
+            .map(|(name, _)| name.len() + 2)
+            .sum::<usize>(),
+    );
+    for (index, (name, _)) in names[..count].iter().enumerate() {
+        if index > 0 {
+            shown.push_str(", ");
+        }
+        shown.push_str(name);
+    }
     let line = TerminalLine::new("  ").field(&shown);
     match total - count {
         0 => line,
@@ -1175,6 +1192,16 @@ mod tests {
             "  @scope/package-0, @scope/package-1, and 38 more (--json lists all)"
         );
         assert!(console::measure_text_width(&visible) <= 80);
+    }
+
+    #[test]
+    fn a_names_preview_shows_the_whole_list_when_it_fits_without_a_count() {
+        let line = names_preview(["abcdefghij", "klmnopqrst", "uvwxyz"], 40);
+
+        assert_eq!(
+            console::strip_ansi_codes(&line),
+            "  abcdefghij, klmnopqrst, uvwxyz"
+        );
     }
 
     #[test]

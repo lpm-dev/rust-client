@@ -656,6 +656,54 @@ fn policy_test_rejects_dist_tag_before_starting_extension() {
 }
 
 #[test]
+fn policy_list_lines_up_extensions_whose_names_differ_in_length() {
+    let project = TempProject::empty(r#"{"name":"policy-list-columns","version":"1.0.0"}"#);
+    let command = toml::Value::Array(
+        policy_extension_command(&[])
+            .into_iter()
+            .map(toml::Value::String)
+            .collect(),
+    );
+    let mut extensions = toml::map::Map::new();
+    for (name, mode) in [
+        ("feed", "report"),
+        ("a-much-longer-extension-name", "enforce"),
+    ] {
+        let mut extension = toml::map::Map::new();
+        extension.insert("command".to_string(), command.clone());
+        extension.insert("mode".to_string(), toml::Value::String(mode.to_string()));
+        extensions.insert(name.to_string(), toml::Value::Table(extension));
+    }
+    let mut policy = toml::map::Map::new();
+    policy.insert("extensions".to_string(), toml::Value::Table(extensions));
+    let mut root = toml::map::Map::new();
+    root.insert("policy".to_string(), toml::Value::Table(policy));
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).expect("create isolated lpm home");
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        toml::to_string_pretty(&toml::Value::Table(root)).expect("serialize policy config"),
+    )
+    .expect("write policy extension config");
+
+    let output = lpm(&project)
+        .args(["--color=always", "policy", "list"])
+        .output()
+        .expect("run lpm policy list");
+    assert!(output.status.success(), "{output:?}");
+
+    let visible = support::terminal::visible_text(&String::from_utf8_lossy(&output.stdout));
+    let mode_column = |name: &str| {
+        support::terminal::column_after(support::terminal::line_with(&visible, name), name)
+    };
+    assert_eq!(
+        mode_column("feed"),
+        mode_column("a-much-longer-extension-name"),
+        "modes must share a column, got:\n{visible}"
+    );
+}
+
+#[test]
 fn policy_list_redacts_credentials_without_changing_saved_arguments() {
     let project = TempProject::empty(r#"{"name":"policy-list-secrets","version":"1.0.0"}"#);
     let command = policy_extension_command(&[
