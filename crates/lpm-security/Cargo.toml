@@ -43,6 +43,9 @@ oxc_span = "=0.158.0"
 oxc_str = "=0.158.0"
 oxc_semantic = "=0.158.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = "0.8"
 serde_json = { workspace = true }

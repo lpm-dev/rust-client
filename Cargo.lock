@@ -4258,6 +4258,7 @@ dependencies = [
  "flate2",
  "hex",
  "ignore",
+ "libc",
  "lpm-common",
  "lpm-extractor",
  "lpm-lockfile",

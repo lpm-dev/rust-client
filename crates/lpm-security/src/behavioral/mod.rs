@@ -202,6 +202,9 @@ impl FileRole {
 struct SourceFile {
     role: FileRole,
     path: std::path::PathBuf,
+    /// The size the path walk saw. Walks over an open package directory
+    /// don't stat entries and leave it 0: their reads take the size from
+    /// the opened file instead.
     size: u64,
 }
 
@@ -631,6 +634,23 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
     contents: PackageDirectory<'_>,
 ) -> (PackageAnalysis, Option<String>) {
+    let (analysis, fingerprint, directory_changed) =
+        analyze_package_from_open_dir_reading(package_dir, contents, true);
+    if !directory_changed {
+        return (analysis, fingerprint);
+    }
+    // Files read through a held handle came from a directory that has since
+    // been replaced; read the package again by path, as it is now.
+    let (analysis, fingerprint, _) =
+        analyze_package_from_open_dir_reading(package_dir, contents, false);
+    (analysis, fingerprint)
+}
+
+fn analyze_package_from_open_dir_reading(
+    package_dir: &cap_std::fs::Dir,
+    contents: PackageDirectory<'_>,
+    hold_directories: bool,
+) -> (PackageAnalysis, Option<String>, bool) {
     let limits = ScanLimits::INSTALL;
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
@@ -648,8 +668,14 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     native_artifacts.sort_unstable();
     let (candidates, found) = sources.into_read_order();
     let candidate_count = candidates.len();
-    let (mut analyzer, mut fingerprint, over_budget) =
-        analyze_cap_files_with_fingerprint(package_dir, candidates, limits, discovery_complete);
+    let (mut analyzer, mut fingerprint, over_budget, directory_changed) =
+        analyze_cap_files_with_fingerprint(
+            package_dir,
+            candidates,
+            limits,
+            discovery_complete,
+            hold_directories,
+        );
     let skipped = found - candidate_count + over_budget;
     analyzer.skip(skipped);
     let limit_reached = discovery_limit_reached || skipped > 0;
@@ -686,7 +712,7 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
         hasher.update([u8::from(limit_reached)]);
         format!("sha256-{}", hex::encode(hasher.finalize()))
     });
-    (analysis, fingerprint)
+    (analysis, fingerprint, directory_changed)
 }
 
 /// Hash the exact package inputs that can affect behavioral analysis.
@@ -719,8 +745,9 @@ pub fn package_input_fingerprint_from_open_dir(
     let mut hasher = new_fingerprint_hasher();
     let mut budget = ScanBudget::new(limits);
     let mut over_budget = 0usize;
+    let mut directories = PackageDirs::new(package_dir);
     for source_file in &candidates {
-        let (file, size) = open_cap_source_file(package_dir, &source_file.path)?;
+        let (file, size) = directories.open_file(&source_file.path)?;
         if !budget.admit(source_file.role.is_test(), limits.read_bytes(size)) {
             over_budget += 1;
             continue;
@@ -734,6 +761,7 @@ pub fn package_input_fingerprint_from_open_dir(
             content_digest,
         );
     }
+    directories.verify_unchanged()?;
     hash_native_artifacts(&mut hasher, &native_artifacts);
 
     match digest_package_manifest_from_open_dir(package_dir)? {
@@ -770,15 +798,21 @@ fn collect_cap_fingerprint_files(
     for entry in directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        // The directory entry's type spares a stat per entry; a file system
+        // that does not report it falls back to one. Every later open refuses
+        // symlinks, so an entry replaced after the read cannot redirect it.
+        let mut file_type = entry.file_type()?;
+        if !(file_type.is_dir() || file_type.is_file() || file_type.is_symlink()) {
+            file_type = directory.symlink_metadata(&name)?.file_type();
+        }
+        if file_type.is_symlink() {
+            continue;
+        }
         let relative = relative_dir.join(&name);
-        let metadata = directory.symlink_metadata(&name)?;
-        if metadata.is_symlink() {
+        if !rules.reads(&relative, file_type.is_dir()) {
             continue;
         }
-        if !rules.reads(&relative, metadata.is_dir()) {
-            continue;
-        }
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             let child = directory.open_dir_nofollow(&name)?;
             collect_cap_fingerprint_files(
                 &child,
@@ -788,12 +822,12 @@ fn collect_cap_fingerprint_files(
                 native_artifacts,
                 limit_reached,
             )?;
-        } else if metadata.is_file() {
-            if PackageAnalyzer::should_scan(&relative, metadata.len()) {
+        } else if file_type.is_file() {
+            if PackageAnalyzer::should_scan(&relative, 0) {
                 let candidate = SourceFile {
                     role: FileRole::of(&relative),
                     path: relative,
-                    size: metadata.len(),
+                    size: 0,
                 };
                 *limit_reached |= files.insert(candidate);
             } else if PackageAnalyzer::is_native_artifact(&relative) {
@@ -833,46 +867,317 @@ fn hash_fingerprint_record_digest(
     hasher.update(content_digest);
 }
 
-fn open_cap_source_file(
-    root: &cap_std::fs::Dir,
-    relative_path: &Path,
-) -> std::io::Result<(cap_std::fs::File, u64)> {
-    use cap_fs_ext::{
-        DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _,
-    };
+/// The directories of one package that recent opens went through, so that
+/// opening the next file of the same directory costs one `openat` rather than
+/// one per path component. Every handle was opened from the package root, or
+/// from another such handle, without following links.
+///
+/// A held handle keeps reading a directory that was replaced after it was
+/// opened, where reopening the path for each file would see the new one, so
+/// [`Self::verify_unchanged`] checks every directory still has the identity
+/// it had when it was opened.
+struct PackageDirs<'a> {
+    root: &'a cap_std::fs::Dir,
+    /// The last directory opened and its ancestors below the root,
+    /// shallowest first. Files are read in path order, so the next file's
+    /// directory usually shares most of this chain.
+    chain: Vec<(std::path::PathBuf, cap_std::fs::Dir)>,
+    opened: std::collections::BTreeMap<std::path::PathBuf, DirectoryIdentity>,
+    reopened_changed: bool,
+    tracking_limit: usize,
+    holds_directories: bool,
+}
 
-    let mut parent = root.try_clone()?;
-    let mut components = relative_path.components().peekable();
-    let mut leaf = None;
-    while let Some(component) = components.next() {
-        let std::path::Component::Normal(name) = component else {
+/// Set once any analysis thread runs out of descriptors. From then on no
+/// [`PackageDirs`] holds directory handles, so the threads still holding
+/// theirs give them back at their next open rather than starving the rest.
+static DIRECTORY_HANDLES_EXHAUSTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn of(directory: &cap_std::fs::Dir) -> std::io::Result<Self> {
+        use cap_fs_ext::MetadataExt as _;
+
+        let metadata = directory.dir_metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_FIRST_SOURCE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn package_directory_changed() -> std::io::Error {
+    std::io::Error::other("a package directory changed while its files were read")
+}
+
+impl<'a> PackageDirs<'a> {
+    /// Each held handle is a descriptor on top of the files every analysis
+    /// thread has open, so a deep path keeps only its deepest directories.
+    const MAX_HELD: usize = 8;
+    /// Directories whose identities a package's read keeps for the final
+    /// check. Past this, files are reached holding no handle, so nothing they
+    /// read can come from a replaced directory and nothing more is tracked.
+    const MAX_TRACKED: usize = 4096;
+
+    fn new(root: &'a cap_std::fs::Dir) -> Self {
+        Self::with_tracking_limit(root, Self::MAX_TRACKED)
+    }
+
+    fn with_tracking_limit(root: &'a cap_std::fs::Dir, tracking_limit: usize) -> Self {
+        Self {
+            root,
+            chain: Vec::with_capacity(Self::MAX_HELD),
+            opened: std::collections::BTreeMap::new(),
+            reopened_changed: false,
+            tracking_limit,
+            holds_directories: true,
+        }
+    }
+
+    /// Reaches every file by its path, holding one directory at a time.
+    fn holding_none(root: &'a cap_std::fs::Dir) -> Self {
+        Self {
+            holds_directories: false,
+            ..Self::with_tracking_limit(root, 0)
+        }
+    }
+
+    /// Whether every directory opened below the root still has the identity
+    /// it had then, reopened top-down from the root without following links.
+    /// Gives back the handles the reads held first.
+    fn verify_unchanged(&mut self) -> std::io::Result<()> {
+        self.chain.clear();
+        if self.reopened_changed {
+            return Err(package_directory_changed());
+        }
+        match self.verify_holding_ancestors() {
+            Err(error) if runs_out_of_descriptors(&error) => self.verify_holding_one_directory(),
+            verified => verified,
+        }
+    }
+
+    fn verify_holding_ancestors(&self) -> std::io::Result<()> {
+        use cap_fs_ext::DirExt as _;
+
+        let mut ancestors: Vec<(&Path, cap_std::fs::Dir)> = Vec::new();
+        // Path order visits each directory after its ancestors.
+        for (path, identity) in &self.opened {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            while ancestors
+                .last()
+                .is_some_and(|(ancestor, _)| *ancestor != parent)
+            {
+                ancestors.pop();
+            }
+            let name = path.file_name().ok_or_else(package_directory_changed)?;
+            let current = match ancestors.last() {
+                Some((_, directory)) => directory.open_dir_nofollow(name)?,
+                None if parent.as_os_str().is_empty() => self.root.open_dir_nofollow(name)?,
+                None => return Err(package_directory_changed()),
+            };
+            if DirectoryIdentity::of(&current)? != *identity {
+                return Err(package_directory_changed());
+            }
+            ancestors.push((path, current));
+        }
+        Ok(())
+    }
+
+    fn verify_holding_one_directory(&self) -> std::io::Result<()> {
+        use cap_fs_ext::DirExt as _;
+
+        for (path, identity) in &self.opened {
+            let mut current: Option<cap_std::fs::Dir> = None;
+            for name in path.components() {
+                current = Some(match &current {
+                    Some(directory) => directory.open_dir_nofollow(name)?,
+                    None => self.root.open_dir_nofollow(name)?,
+                });
+            }
+            let current = current.ok_or_else(package_directory_changed)?;
+            if DirectoryIdentity::of(&current)? != *identity {
+                return Err(package_directory_changed());
+            }
+        }
+        Ok(())
+    }
+
+    fn record_opened(&mut self, path: &Path, directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+        let identity = DirectoryIdentity::of(directory)?;
+        match self.opened.entry(path.to_path_buf()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(identity);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                self.reopened_changed |= *entry.get() != identity;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_file(&mut self, relative_path: &Path) -> std::io::Result<(cap_std::fs::File, u64)> {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+
+        let mut components = relative_path.components();
+        let leaf = match components.next_back() {
+            Some(std::path::Component::Normal(name)) => name,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source path has no file name",
+                ));
+            }
+        };
+        let parent_path = components.as_path();
+        if parent_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "source path contains an unsafe component",
             ));
-        };
-        if components.peek().is_some() {
-            parent = parent.open_dir_nofollow(name)?;
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
+        let hold = self.holds_directories
+            && self.opened.len() < self.tracking_limit
+            && !DIRECTORY_HANDLES_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed);
+        let file = if hold {
+            self.open_through_chain(parent_path, leaf, &options)?
         } else {
-            leaf = Some(name.to_os_string());
+            self.chain.clear();
+            self.open_holding_one_directory(parent_path, leaf, &options, false)?
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.is_symlink() {
+            return Err(std::io::Error::other(
+                "source path is not a safe regular file",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = AFTER_FIRST_SOURCE_OPEN.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        Ok((file, metadata.len()))
+    }
+
+    fn open_through_chain(
+        &mut self,
+        parent_path: &Path,
+        leaf: &std::ffi::OsStr,
+        options: &cap_std::fs::OpenOptions,
+    ) -> std::io::Result<cap_std::fs::File> {
+        match self
+            .directory(parent_path)
+            .and_then(|parent| parent.open_with(leaf, options))
+        {
+            // Give the held handles back and open this file holding one
+            // directory at a time, as reopening the path for each file did.
+            Err(error) if runs_out_of_descriptors(&error) => {
+                DIRECTORY_HANDLES_EXHAUSTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.chain.clear();
+                self.open_holding_one_directory(parent_path, leaf, options, false)
+            }
+            opened => opened,
         }
     }
-    let leaf = leaf.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "source path has no file name",
-        )
-    })?;
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No).nonblock(true);
-    let file = parent.open_with(&leaf, &options)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.is_symlink() {
-        return Err(std::io::Error::other(
-            "source path is not a safe regular file",
-        ));
+
+    /// The handle of `relative`, a path of normal components, opened from
+    /// its deepest held ancestor.
+    fn directory(&mut self, relative: &Path) -> std::io::Result<&cap_std::fs::Dir> {
+        use cap_fs_ext::DirExt as _;
+
+        if relative.as_os_str().is_empty() {
+            return Ok(self.root);
+        }
+        while self
+            .chain
+            .last()
+            .is_some_and(|(held, _)| !relative.starts_with(held))
+        {
+            self.chain.pop();
+        }
+        let held_depth = self
+            .chain
+            .last()
+            .map_or(0, |(held, _)| held.components().count());
+        let mut prefix: std::path::PathBuf = relative.components().take(held_depth).collect();
+        for name in relative.components().skip(held_depth) {
+            let next = match self.chain.last() {
+                Some((_, directory)) => directory.open_dir_nofollow(name)?,
+                None => self.root.open_dir_nofollow(name)?,
+            };
+            prefix.push(name);
+            self.record_opened(&prefix, &next)?;
+            if self.chain.len() == Self::MAX_HELD {
+                self.chain.remove(0);
+            }
+            self.chain.push((prefix.clone(), next));
+        }
+        Ok(&self
+            .chain
+            .last()
+            .expect("a non-empty path below its deepest held ancestor")
+            .1)
     }
-    Ok((file, metadata.len()))
+
+    fn open_holding_one_directory(
+        &mut self,
+        parent_path: &Path,
+        leaf: &std::ffi::OsStr,
+        options: &cap_std::fs::OpenOptions,
+        track: bool,
+    ) -> std::io::Result<cap_std::fs::File> {
+        use cap_fs_ext::DirExt as _;
+
+        let mut prefix = std::path::PathBuf::new();
+        let mut current: Option<cap_std::fs::Dir> = None;
+        for name in parent_path.components() {
+            let next = match &current {
+                Some(directory) => directory.open_dir_nofollow(name)?,
+                None => self.root.open_dir_nofollow(name)?,
+            };
+            if track {
+                prefix.push(name);
+                self.record_opened(&prefix, &next)?;
+            }
+            current = Some(next);
+        }
+        current
+            .as_ref()
+            .map_or(self.root, |directory| directory)
+            .open_with(leaf, options)
+    }
+}
+
+#[cfg(unix)]
+fn runs_out_of_descriptors(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn runs_out_of_descriptors(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn open_cap_source_file(
+    root: &cap_std::fs::Dir,
+    relative_path: &Path,
+) -> std::io::Result<(cap_std::fs::File, u64)> {
+    PackageDirs::new(root).open_file(relative_path)
 }
 
 struct OpenCapSourceFile {
@@ -940,12 +1245,16 @@ fn analyze_open_cap_source_file(
 /// Reads the `files` a directory walk kept, in read order, within the
 /// package's budgets. Returns the analysis, the input fingerprint unless a
 /// read failed, and how many files the budgets left unread.
+/// Analyses `files` and fingerprints what it read. The last value says a
+/// directory a held handle read from was replaced meanwhile, which also
+/// drops the fingerprint.
 fn analyze_cap_files_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
     files: Vec<SourceFile>,
     limits: ScanLimits,
     fingerprint_valid: bool,
-) -> (PackageAnalyzer, Option<Sha256>, usize) {
+    hold_directories: bool,
+) -> (PackageAnalyzer, Option<Sha256>, usize, bool) {
     use rayon::prelude::*;
 
     let mut analyzer = PackageAnalyzer::with_limits(limits);
@@ -960,11 +1269,16 @@ fn analyze_cap_files_with_fingerprint(
         files.len().max(1)
     };
 
+    let mut directories = if hold_directories {
+        PackageDirs::new(package_dir)
+    } else {
+        PackageDirs::holding_none(package_dir)
+    };
     let mut files = files.into_iter().peekable();
     while files.peek().is_some() {
         let mut opened = Vec::with_capacity(batch_size);
         for source_file in files.by_ref().take(batch_size) {
-            let (file, size) = match open_cap_source_file(package_dir, &source_file.path) {
+            let (file, size) = match directories.open_file(&source_file.path) {
                 Ok(opened) => opened,
                 Err(_) => {
                     fingerprint = None;
@@ -1021,7 +1335,11 @@ fn analyze_cap_files_with_fingerprint(
             }
         }
     }
-    (analyzer, fingerprint, over_budget)
+    let directory_changed = directories.verify_unchanged().is_err();
+    if directory_changed {
+        fingerprint = None;
+    }
+    (analyzer, fingerprint, over_budget, directory_changed)
 }
 
 fn digest_cap_source_file(
@@ -2340,6 +2658,396 @@ mod tests {
                 .unwrap(),
             standalone_fingerprint
         );
+    }
+
+    fn nested_fingerprint_fixture(root: &Path) {
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "package.json".into(),
+                r#"{"name":"nested","version":"1.0.0","main":"lib/index.js"}"#.into(),
+            ),
+            (
+                "lib/index.js".into(),
+                "module.exports = require('./deep/b');\n".into(),
+            ),
+            (
+                "lib/deep/b.js".into(),
+                "exports.b = () => eval('1');\n".into(),
+            ),
+            (
+                "lib/deep/deeper/c.js".into(),
+                "require('child_process');\n".into(),
+            ),
+            ("lib/deep/types.d.ts".into(), "export {};\n".into()),
+            ("src/x.ts".into(), "export const x: number = 1;\n".into()),
+            ("test/t.js".into(), "fetch('https://example.com');\n".into()),
+            ("README.md".into(), "readme\n".into()),
+        ];
+        for index in 0..24 {
+            files.push((
+                format!("lib/many/dir-{index:02}/file.js"),
+                format!("module.exports = {index};\n"),
+            ));
+        }
+        for (path, content) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+
+    // The fingerprint hashes native paths, so Windows records `lib\index.js`.
+    #[cfg(unix)]
+    #[test]
+    fn warm_fingerprint_of_a_nested_package_is_stable() {
+        let package = tempfile::tempdir().unwrap();
+        nested_fingerprint_fixture(package.path());
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let fingerprint =
+            package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                .unwrap();
+
+        assert_eq!(
+            fingerprint,
+            "sha256-cce94d9b379e7ad7ceb652b864da5f3f98ee7027faa9a6cca6a35fa4ad3def12"
+        );
+    }
+
+    #[test]
+    fn package_dirs_open_nested_files_through_cached_directories() {
+        let package = tempfile::tempdir().unwrap();
+        nested_fingerprint_fixture(package.path());
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+
+        for path in [
+            "lib/deep/deeper/c.js",
+            "lib/deep/b.js",
+            "lib/index.js",
+            "lib/deep/deeper/c.js",
+            "package.json",
+        ] {
+            let (_, size) = directories.open_file(Path::new(path)).unwrap();
+            assert_eq!(
+                size,
+                std::fs::metadata(package.path().join(path)).unwrap().len(),
+                "{path}"
+            );
+        }
+        for index in 0..24 {
+            directories
+                .open_file(Path::new(&format!("lib/many/dir-{index:02}/file.js")))
+                .unwrap();
+        }
+        assert!(directories.chain.len() <= PackageDirs::MAX_HELD);
+    }
+
+    fn deep_package(root: &Path, depth: usize) -> std::path::PathBuf {
+        let mut relative = std::path::PathBuf::new();
+        for level in 0..depth {
+            relative.push(format!("d{level}"));
+        }
+        std::fs::create_dir_all(root.join(&relative)).unwrap();
+        relative.push("leaf.js");
+        std::fs::write(root.join(&relative), "module.exports = 1;\n").unwrap();
+        relative
+    }
+
+    #[test]
+    fn package_dirs_hold_at_most_eight_directories_of_a_deep_path() {
+        let package = tempfile::tempdir().unwrap();
+        let leaf = deep_package(package.path(), 24);
+        std::fs::write(package.path().join("top.js"), "1").unwrap();
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+
+        directories.open_file(&leaf).unwrap();
+        assert_eq!(directories.chain.len(), PackageDirs::MAX_HELD);
+        directories.open_file(Path::new("top.js")).unwrap();
+        directories.open_file(&leaf).unwrap();
+
+        assert!(directories.chain.len() <= PackageDirs::MAX_HELD);
+        directories.verify_unchanged().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_dirs_open_holding_one_directory_when_descriptors_run_out() {
+        const CHILD: &str = "LPM_TEST_PACKAGE_DIRS_DESCRIPTOR_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "behavioral::tests::package_dirs_open_holding_one_directory_when_descriptors_run_out",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let package = tempfile::tempdir().unwrap();
+        let leaf = deep_package(package.path(), 12);
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        // Leave four free descriptors: fewer than the chain would hold.
+        let mut free = 0;
+        let mut limit = 0;
+        while free < 4 {
+            // SAFETY: F_GETFD only reads the descriptor's flags.
+            if unsafe { libc::fcntl(limit, libc::F_GETFD) } == -1 {
+                free += 1;
+            }
+            limit += 1;
+        }
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the valid struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: limit as libc::rlim_t,
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: setrlimit reads the valid struct; this child process only
+        // runs this test.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+        let mut directories = PackageDirs::new(&root);
+
+        let (_file, size) = directories.open_file(&leaf).unwrap();
+
+        assert_eq!(size, "module.exports = 1;\n".len() as u64);
+        assert!(
+            directories.chain.is_empty(),
+            "the open ran out of descriptors and held one directory at a time"
+        );
+        // SAFETY: as above; restores the soft limit the test lowered.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+            0
+        );
+        directories.verify_unchanged().unwrap();
+        let mut other_thread = PackageDirs::new(&root);
+        other_thread.open_file(&leaf).unwrap();
+        assert!(
+            other_thread.chain.is_empty(),
+            "once any reader ran out, no reader holds directories"
+        );
+    }
+
+    // Windows refuses to rename a directory a handle holds open, so a held
+    // directory can't be replaced while its files are read there.
+    #[cfg(unix)]
+    #[test]
+    fn fingerprints_are_dropped_when_a_directory_is_replaced_while_files_are_read() {
+        for warm in [true, false] {
+            let package = tempfile::tempdir().unwrap();
+            nested_fingerprint_fixture(package.path());
+            let directory =
+                cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                    .unwrap();
+            let displaced = tempfile::tempdir_in(package.path().parent().unwrap()).unwrap();
+            let (root, old_lib) = (package.path().to_path_buf(), displaced.path().join("lib"));
+            AFTER_FIRST_SOURCE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::rename(root.join("lib"), old_lib).unwrap();
+                    std::fs::create_dir(root.join("lib")).unwrap();
+                }));
+            });
+
+            if warm {
+                package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                    .expect_err("a fingerprint of a directory replaced mid-read was kept");
+            } else {
+                let (analysis, fingerprint) = analyze_package_from_open_dir_with_fingerprint(
+                    &directory,
+                    PackageDirectory::Published,
+                );
+                assert!(
+                    !analysis.source.eval && !analysis.source.child_process,
+                    "the analysis must describe the replaced, now empty, lib/"
+                );
+                assert_eq!(
+                    fingerprint,
+                    Some(
+                        package_input_fingerprint_from_open_dir(
+                            &directory,
+                            PackageDirectory::Published
+                        )
+                        .unwrap()
+                    ),
+                    "the package is read again by path and fingerprinted as it is now"
+                );
+            }
+            assert!(AFTER_FIRST_SOURCE_OPEN.with(|hook| hook.borrow().is_none()));
+        }
+    }
+
+    #[test]
+    fn package_dirs_stop_tracking_and_holding_directories_past_their_limit() {
+        let package = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            let directory = package.path().join(format!("lib/m{index}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("index.js"), format!("{index}")).unwrap();
+        }
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::with_tracking_limit(&root, 3);
+
+        for index in 0..4 {
+            directories
+                .open_file(Path::new(&format!("lib/m{index}/index.js")))
+                .unwrap();
+        }
+        let tracked = directories.opened.len();
+        std::fs::rename(
+            package.path().join("lib/m5"),
+            package.path().join("lib/m5-old"),
+        )
+        .unwrap();
+        std::fs::create_dir(package.path().join("lib/m5")).unwrap();
+        std::fs::write(package.path().join("lib/m5/index.js"), "new").unwrap();
+        let (_, size) = directories.open_file(Path::new("lib/m5/index.js")).unwrap();
+
+        assert!((3..=4).contains(&tracked), "{tracked}");
+        assert_eq!(
+            directories.opened.len(),
+            tracked,
+            "past the limit nothing more is tracked"
+        );
+        assert!(
+            directories.chain.is_empty(),
+            "past the limit no handle is held"
+        );
+        assert_eq!(
+            size, 3,
+            "an untracked open reads the directory as it is now"
+        );
+        directories.verify_unchanged().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_dirs_verify_after_reads_with_one_descriptor_left() {
+        const CHILD: &str = "LPM_TEST_PACKAGE_DIRS_VERIFY_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "behavioral::tests::package_dirs_verify_after_reads_with_one_descriptor_left",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let package = tempfile::tempdir().unwrap();
+        let leaf = deep_package(package.path(), 12);
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+        drop(directories.open_file(&leaf).unwrap());
+        assert_eq!(directories.chain.len(), PackageDirs::MAX_HELD);
+        let mut limit = 0;
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        while unsafe { libc::fcntl(limit, libc::F_GETFD) } != -1 {
+            limit += 1;
+        }
+        // One free descriptor below the limit besides the held handles.
+        let limit = limit + 1;
+        let rlimit = libc::rlimit {
+            rlim_cur: limit as libc::rlim_t,
+            rlim_max: limit as libc::rlim_t,
+        };
+        // SAFETY: setrlimit reads the valid struct; this child process only
+        // runs this test.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) }, 0);
+
+        directories.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn package_dirs_detect_a_directory_replaced_after_it_was_opened() {
+        let package = tempfile::tempdir().unwrap();
+        nested_fingerprint_fixture(package.path());
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+        directories
+            .open_file(Path::new("lib/deep/deeper/c.js"))
+            .unwrap();
+        directories.open_file(Path::new("lib/index.js")).unwrap();
+        directories.verify_unchanged().unwrap();
+
+        std::fs::rename(
+            package.path().join("lib/deep"),
+            package.path().join("lib/old"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(package.path().join("lib/deep/deeper")).unwrap();
+        std::fs::write(package.path().join("lib/deep/deeper/c.js"), "changed").unwrap();
+
+        let error = directories.verify_unchanged().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other, "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_dirs_refuse_links_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let package = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.js"), "secret").unwrap();
+        std::fs::create_dir_all(package.path().join("lib/real")).unwrap();
+        std::fs::write(package.path().join("lib/real/a.js"), "a").unwrap();
+        symlink(outside.path(), package.path().join("lib/escape")).unwrap();
+        symlink(
+            outside.path().join("secret.js"),
+            package.path().join("lib/real/link.js"),
+        )
+        .unwrap();
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+        directories.open_file(Path::new("lib/real/a.js")).unwrap();
+
+        for path in [
+            "lib/escape/secret.js",
+            "lib/real/link.js",
+            "lib/real/../escape/secret.js",
+            "lib/real/..",
+        ] {
+            assert!(
+                directories.open_file(Path::new(path)).is_err(),
+                "{path} was opened"
+            );
+        }
     }
 
     #[test]
