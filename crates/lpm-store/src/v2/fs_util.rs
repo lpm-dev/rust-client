@@ -392,22 +392,16 @@ fn materialize_into_inner_impl(
                 )?;
             }
         } else {
-            let written = materialize_regular_file(&src_path, &dst_path)?;
+            materialize_regular_file(&src_path, &dst_path)?;
             if let Some(metadata) = tree_metadata.as_deref_mut() {
-                match written {
-                    Some(written) => metadata.record_with_metadata(
-                        destination_root,
-                        &dst_path,
-                        TreeMetadataKind::File,
-                        &written,
-                    )?,
-                    None => metadata.record(
-                        destination_root,
-                        &dst_path,
-                        TreeMetadataKind::File,
-                        Vec::new(),
-                    )?,
-                }
+                // Stat by path once the copy is closed: NFS and some FUSE
+                // mounts settle mtime at close, after any handle stat.
+                metadata.record(
+                    destination_root,
+                    &dst_path,
+                    TreeMetadataKind::File,
+                    Vec::new(),
+                )?;
             }
         }
     }
@@ -415,12 +409,10 @@ fn materialize_into_inner_impl(
     Ok(())
 }
 
-/// Copies one object file into a link entry. Linux returns the copy's
-/// metadata, read from its handle after the last change to it.
-fn materialize_regular_file(src: &Path, dst: &Path) -> Result<Option<std::fs::Metadata>, LpmError> {
+fn materialize_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
     #[cfg(target_os = "linux")]
     {
-        linux_copy::copy_file(src, dst).map(Some)
+        linux_copy::copy_file(src, dst)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -431,7 +423,7 @@ fn materialize_regular_file(src: &Path, dst: &Path) -> Result<Option<std::fs::Me
                 dst.display()
             ))
         })?;
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -482,7 +474,7 @@ pub(crate) mod linux_copy {
             const { std::cell::Cell::new(0) };
     }
 
-    pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<Metadata, LpmError> {
+    pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
         let failed = |action: &str, error: std::io::Error| {
             LpmError::Store(format!(
                 "failed to {action} virtual-store source file {} → {}: {error}",
@@ -511,10 +503,8 @@ pub(crate) mod linux_copy {
             .mode(0o600)
             .open(dst)
             .map_err(|error| failed("create", error))?;
-        let copied = fill(&mut source, &mut destination, &source_metadata).and_then(|()| {
-            destination.set_permissions(std::fs::Permissions::from_mode(mode))?;
-            destination.metadata()
-        });
+        let copied = fill(&mut source, &mut destination, &source_metadata)
+            .and_then(|()| destination.set_permissions(std::fs::Permissions::from_mode(mode)));
         copied.map_err(|error| {
             drop(destination);
             let _ = std::fs::remove_file(dst);
@@ -560,17 +550,11 @@ pub(crate) mod linux_copy {
         }
     }
 
-    /// Copies in the kernel. `Ok(false)` when the file system refused
-    /// before any byte moved.
     fn copy_file_range(source: &File, destination: &File, len: u64) -> std::io::Result<bool> {
-        let mut copied = 0u64;
-        while copied < len {
-            let requested = usize::try_from(len - copied)
-                .unwrap_or(usize::MAX)
-                .min(1 << 30);
+        copy_in_kernel(len, |requested| {
             // SAFETY: both descriptors are live; null offsets use and advance
             // each file's own position.
-            let result = unsafe {
+            let written = unsafe {
                 libc::copy_file_range(
                     source.as_raw_fd(),
                     std::ptr::null_mut(),
@@ -580,23 +564,45 @@ pub(crate) mod linux_copy {
                     0,
                 )
             };
-            match result {
-                0 => break,
-                written if written > 0 => copied += written as u64,
-                _ => {
-                    let error = std::io::Error::last_os_error();
-                    match error.raw_os_error() {
-                        Some(libc::EINTR) => {}
-                        Some(
-                            libc::EXDEV
-                            | libc::ENOSYS
-                            | libc::EOPNOTSUPP
-                            | libc::EINVAL
-                            | libc::EPERM,
-                        ) if copied == 0 => return Ok(false),
-                        _ => return Err(error),
-                    }
+            usize::try_from(written).map_err(|_| std::io::Error::last_os_error())
+        })
+    }
+
+    /// Runs `copy_chunk` until `len` bytes moved. `Ok(false)` when the file
+    /// system refused before any byte moved, which some (overlayfs, FUSE and
+    /// network mounts) signal by copying nothing, as `std::fs::copy` treats it.
+    pub(crate) fn copy_in_kernel(
+        len: u64,
+        mut copy_chunk: impl FnMut(usize) -> std::io::Result<usize>,
+    ) -> std::io::Result<bool> {
+        let mut copied = 0u64;
+        while copied < len {
+            let requested = usize::try_from(len - copied)
+                .unwrap_or(usize::MAX)
+                .min(1 << 30);
+            match copy_chunk(requested) {
+                Ok(0) if copied == 0 => return Ok(false),
+                Ok(0) => break,
+                Ok(written) => copied += written as u64,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if copied == 0
+                        && matches!(
+                            error.raw_os_error(),
+                            Some(
+                                libc::EXDEV
+                                    | libc::ENOSYS
+                                    | libc::EOPNOTSUPP
+                                    | libc::EINVAL
+                                    | libc::EPERM
+                                    | libc::EBADF
+                                    | libc::EOVERFLOW
+                            )
+                        ) =>
+                {
+                    return Ok(false);
                 }
+                Err(error) => return Err(error),
             }
         }
         if copied != len {
@@ -636,6 +642,41 @@ pub(crate) mod linux_copy {
 
     fn source_changed() -> std::io::Error {
         std::io::Error::other("the source changed while it was copied")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::copy_in_kernel;
+
+        fn os_error(code: i32) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+
+        #[test]
+        fn a_first_copy_of_nothing_falls_back_to_reading_and_writing() {
+            assert!(!copy_in_kernel(100, |_| Ok(0)).unwrap());
+        }
+
+        #[test]
+        fn a_refusal_before_any_byte_moved_falls_back() {
+            for code in [libc::EXDEV, libc::EBADF, libc::EOVERFLOW, libc::EOPNOTSUPP] {
+                assert!(!copy_in_kernel(100, |_| os_error(code)).unwrap(), "{code}");
+            }
+        }
+
+        #[test]
+        fn a_copy_that_stops_after_progress_is_an_error() {
+            let mut calls = [Ok(60), Ok(0)].into_iter();
+            assert!(copy_in_kernel(100, |_| calls.next().unwrap()).is_err());
+            let mut calls = [Ok(60), os_error(libc::EXDEV)].into_iter();
+            assert!(copy_in_kernel(100, |_| calls.next().unwrap()).is_err());
+        }
+
+        #[test]
+        fn an_interrupted_copy_is_retried() {
+            let mut calls = [os_error(libc::EINTR), Ok(40), Ok(60)].into_iter();
+            assert!(copy_in_kernel(100, |_| calls.next().unwrap()).unwrap());
+        }
     }
 }
 

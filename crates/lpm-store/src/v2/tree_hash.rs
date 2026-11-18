@@ -114,22 +114,13 @@ impl TreeMetadataBuilder {
                 path.display()
             ))
         })?;
-        self.fill(index, &metadata, payload)
-    }
-
-    fn fill(
-        &mut self,
-        index: usize,
-        metadata: &std::fs::Metadata,
-        payload: Vec<u8>,
-    ) -> Result<(), LpmError> {
         let record = self.records.get_mut(index).ok_or_else(|| {
             LpmError::Store("invalid materialized tree metadata record index".into())
         })?;
-        record.mode = object_entry_mode(metadata);
+        record.mode = object_entry_mode(&metadata);
         record.len = metadata.len();
-        record.modified_time_nanos = modified_time_nanos(metadata);
-        record.change_time_nanos = change_time_nanos(metadata);
+        record.modified_time_nanos = modified_time_nanos(&metadata);
+        record.change_time_nanos = change_time_nanos(&metadata);
         record.payload = payload;
         Ok(())
     }
@@ -143,19 +134,6 @@ impl TreeMetadataBuilder {
     ) -> Result<(), LpmError> {
         let index = self.reserve(root, path, kind)?;
         self.refresh(index, path, payload)
-    }
-
-    /// [`Self::record`] for an entry whose final metadata the caller read
-    /// from its open handle.
-    pub(crate) fn record_with_metadata(
-        &mut self,
-        root: &Path,
-        path: &Path,
-        kind: TreeMetadataKind,
-        metadata: &std::fs::Metadata,
-    ) -> Result<(), LpmError> {
-        let index = self.reserve(root, path, kind)?;
-        self.fill(index, metadata, Vec::new())
     }
 
     pub(crate) fn finish(self) -> String {
