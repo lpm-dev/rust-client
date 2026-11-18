@@ -87,9 +87,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Inputs are matched as whole values with [[ =~ ]]. grep matches line
-          # by line, so a value with an embedded newline would pass on its
-          # first line and then add lines of its own to $GITHUB_OUTPUT.
+          # Every input is matched as one whole value with [[ =~ ]].
           STABLE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           NIGHTLY_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'
 

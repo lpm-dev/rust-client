@@ -460,8 +460,7 @@ test("release metadata validates every dispatch input as a whole value before an
   assert.match(metadata, /candidate \| full\)/);
   assert.match(metadata, /echo "source_run_id=\$SOURCE_RUN_ID"/);
 
-  // `grep` matches line by line, so a value with an embedded newline would
-  // pass on its first line and then write extra lines to $GITHUB_OUTPUT.
+  // Each input is matched as one whole value, never line by line.
   assert.doesNotMatch(metadata, /printf '%s\\n' "\$(?:VERSION|NPM_NIGHTLY|SOURCE_RUN_ID)" \|\s*grep/);
   assert.match(metadata, /\[\[ "\$VERSION" =~ \$STABLE_VERSION_PATTERN \]\]/);
   assert.match(metadata, /\[\[ "\$VERSION" =~ \$NIGHTLY_VERSION_PATTERN \]\]/);
