@@ -4477,6 +4477,7 @@ async fn audit_still_reports_an_absent_required_package_beside_an_absent_optiona
         "package-lock.json",
         r#"{"name":"coverage-host","lockfileVersion":3,"packages":{"":{"dependencies":{"missing":"1.0.0"}},"node_modules/missing":{"version":"1.0.0","resolved":"https://registry.npmjs.org/missing/-/missing-1.0.0.tgz","optionalDependencies":{"absent-native":"1.0.0"}},"node_modules/absent-native":{"version":"1.0.0","resolved":"https://registry.npmjs.org/absent-native/-/absent-native-1.0.0.tgz","optional":true,"os":["aix"]}}}"#,
     );
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
     let mock = MockRegistry::start().await;
     mock.with_osv_querybatch(vec![vec![], vec![]]).await;
 

@@ -61,8 +61,10 @@ pub struct DiscoveredPackage {
     pub is_optional: bool,
     /// Whether `lpm install` leaves this `lpm.lock` package off the current
     /// platform: an optional package whose `os`, `cpu` or `libc` excludes
-    /// it, or one reachable only through such a package. When its source
-    /// is absent, it isn't installed rather than missing.
+    /// it, or one reachable only through such a package. Only a row with an
+    /// instance id qualifies, since discovery resolves its install path from
+    /// its parent; when its source is absent, it isn't installed rather than
+    /// missing.
     pub platform_skipped: bool,
     /// Direct dependencies: (name, exact_version).
     /// Extracted from lockfile dependency edges. Used by the query engine
@@ -410,7 +412,7 @@ fn lpm_discovered_packages(
                 scan_mode: ScanMode::RegistryAndStore,
                 is_dev: false,
                 is_optional: p.optional,
-                platform_skipped,
+                platform_skipped: platform_skipped && p.instance_id.is_some(),
                 dependencies,
             }
         })
@@ -418,10 +420,8 @@ fn lpm_discovered_packages(
 }
 
 /// [`crate::commands::manifest_metadata::platform_skipped_package_flags`]
-/// for the importer at `project_root`. An unreadable `package.json` only
-/// drops the root optional dependencies that could keep a skipped package
-/// reachable, and audit counts a skipped package as not installed only
-/// when its source is absent too.
+/// for the importer at `project_root`, reading its `package.json` only for
+/// a lockfile without exact root resolutions.
 fn lpm_platform_skipped_packages(
     project_root: &Path,
     lockfile: &lpm_lockfile::Lockfile,
@@ -1056,6 +1056,9 @@ fn migrated_npm_to_discovered(
     project_root: &Path,
     migrated: Vec<lpm_migrate::MigratedPackage>,
 ) -> Result<Vec<DiscoveredPackage>, LpmError> {
+    // Without `node_modules` nothing was installed, so an absent package
+    // wasn't left out by the install.
+    let installed = project_root.join("node_modules").is_dir();
     migrated_to_discovered_with(project_root, migrated, |package| {
         let path = package.lockfile_key.clone().ok_or_else(|| {
             LpmError::Script(format!(
@@ -1063,7 +1066,11 @@ fn migrated_npm_to_discovered(
                 package.name, package.version
             ))
         })?;
-        Ok(SelectedPackagePath::Recorded(path))
+        Ok(if installed {
+            SelectedPackagePath::Recorded(path)
+        } else {
+            SelectedPackagePath::Probe(path)
+        })
     })
 }
 
@@ -1417,8 +1424,11 @@ mod tests {
         let mut wasm_only = locked_at(2, "wasm-only", "1.0.0");
         wasm_only.optional = true;
         wasm_only.cpu = vec!["wasm32".into()];
+        let mut legacy_wasm_only = wasm_only.clone();
+        legacy_wasm_only.name = "legacy-wasm-only".into();
+        legacy_wasm_only.instance_id = None;
         let lockfile = lpm_lockfile::Lockfile {
-            packages: vec![host, wasm_only],
+            packages: vec![host, wasm_only, legacy_wasm_only],
             ..lpm_lockfile::Lockfile::new()
         };
 
@@ -1429,7 +1439,8 @@ mod tests {
                 .iter()
                 .map(|package| (package.platform_skipped, package.is_optional))
                 .collect::<Vec<_>>(),
-            [(false, false), (true, true)]
+            [(false, false), (true, true), (false, true)],
+            "a row without an instance id has no resolved install path to confirm its absence"
         );
     }
 
@@ -2376,6 +2387,31 @@ packages:
         assert_eq!(mode("opt"), ScanMode::NotInstalled);
         assert_eq!(mode("devtool"), ScanMode::NotInstalled);
         assert_eq!(mode("required"), ScanMode::LocalMissing);
+    }
+
+    #[test]
+    fn an_absent_optional_npm_package_is_a_coverage_gap_when_nothing_was_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/opt":{"version":"1.0.0","resolved":"https://registry.npmjs.org/opt/-/opt-1.0.0.tgz","optional":true},"node_modules/devtool":{"version":"1.0.0","resolved":"https://registry.npmjs.org/devtool/-/devtool-1.0.0.tgz","dev":true}}}"#,
+        )
+        .unwrap();
+
+        let result = discover_packages(dir.path()).unwrap();
+
+        assert!(
+            result
+                .packages
+                .iter()
+                .all(|package| package.scan_mode == ScanMode::LocalMissing),
+            "{:?}",
+            result
+                .packages
+                .iter()
+                .map(|p| p.scan_mode)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
