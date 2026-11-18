@@ -9,9 +9,9 @@ use sha2::{Digest as _, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// The offline roots LPM.dev signs its Swift releases under. A release
-/// verifies only when a certificate one of them issued signed it; a
-/// rotation ships the new root beside the old one.
+/// The offline roots LPM.dev signs its Swift releases' source archives
+/// under. An archive verifies only when a certificate one of them issued
+/// signed it; a rotation ships the new root beside the old one.
 const LPM_DEV_SIGNING_ROOTS: &[&str] = &[include_str!("lpm-dev-swift-signing-root-2026.pem")];
 
 const LPM_DEV_HOST: &str = "lpm.dev";
@@ -87,6 +87,9 @@ fn decode_built_in_root(pem: &str) -> Result<Vec<u8>, LpmError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RootsOutcome {
     Installed,
+    /// Only entries that aren't roots, or the certificate earlier releases
+    /// wrote, were removed.
+    Repaired,
     AlreadyInstalled,
     /// The registry has no pinned roots, so there was nothing to install.
     NotPinned,
@@ -114,17 +117,20 @@ pub(super) fn install_roots(trust: &SignerTrust, force: bool) -> Result<RootsOut
         .iter()
         .map(|root| (root_file_name(root), root.as_slice()))
         .collect();
-    let mut changed = remove_other_entries(directory, &expected)?;
+    let mut removed = remove_other_entries(directory, &expected)?;
+    let mut written = false;
     for (name, root) in &expected {
         let path = directory.join(name);
         if force || read_root(&path).as_deref() != Some(*root) {
             write_root(roots_parent, &path, root)?;
-            changed = true;
+            written = true;
         }
     }
-    changed |= remove_legacy_certificate(security)?;
-    Ok(if changed {
+    removed |= remove_legacy_certificate(security)?;
+    Ok(if written {
         RootsOutcome::Installed
+    } else if removed {
+        RootsOutcome::Repaired
     } else {
         RootsOutcome::AlreadyInstalled
     })
@@ -364,12 +370,51 @@ fn security_keeps(security: &Value, host: &str, trust: &SignerTrust) -> bool {
     match trust {
         SignerTrust::Pinned { directory, .. } => pin_holds(security, host, directory),
         SignerTrust::Unpinned => {
-            host_signing(security, host)
-                .and_then(|signing| signing.get("onUntrustedCertificate"))
-                .and_then(Value::as_str)
-                == Some("silentAllow")
+            host_action(security, host) == Some("silentAllow") || user_pins(security, host)
         }
     }
+}
+
+/// Whether the user pinned `host` to roots of their own, which LPM CLI keeps
+/// for a registry it pins nothing for.
+fn user_pins(security: &Value, host: &str) -> bool {
+    host_action(security, host) == Some("error")
+        && host_signing(security, host)
+            .and_then(|signing| signing.get("trustedRootCertificatesPath"))
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.is_empty())
+}
+
+fn host_action<'a>(security: &'a Value, host: &str) -> Option<&'a str> {
+    host_signing(security, host)
+        .and_then(|signing| signing.get("onUntrustedCertificate"))
+        .and_then(Value::as_str)
+}
+
+/// Whether `config` lets SwiftPM accept `host`'s releases from any signer.
+pub(super) fn accepts_any_signer(config: &Value, host: &str) -> bool {
+    config
+        .get("security")
+        .is_none_or(|security| host_action(security, host) != Some("error"))
+}
+
+/// Whether `config` holds the pinned roots for `host` beside an any-signer
+/// policy, which only an earlier LPM CLI release writes.
+pub(super) fn set_aside_by_earlier_release(
+    config: &Value,
+    host: &str,
+    trust: &SignerTrust,
+) -> bool {
+    let SignerTrust::Pinned { directory, .. } = trust else {
+        return false;
+    };
+    config.get("security").is_some_and(|security| {
+        host_action(security, host) == Some("silentAllow")
+            && host_signing(security, host)
+                .and_then(|signing| signing.get("trustedRootCertificatesPath"))
+                .and_then(Value::as_str)
+                .is_some_and(|path| roots_path(directory).is_ok_and(|ours| ours == path))
+    })
 }
 
 /// Whether the `security` settings accept `host`'s `lpmdev` releases only

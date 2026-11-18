@@ -124,8 +124,13 @@ fn assert_lpm_dev_is_pinned(project: &TempProject) {
         "{signing}"
     );
     let roots = lpm_dev_roots_directory(project);
+    let written = signing["trustedRootCertificatesPath"].as_str().unwrap();
+    assert!(
+        !written.starts_with(r"\\?\"),
+        "SwiftPM gets a plain path: {written}"
+    );
     assert_eq!(
-        std::fs::canonicalize(signing["trustedRootCertificatesPath"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(written).unwrap(),
         std::fs::canonicalize(&roots).unwrap()
     );
     let entries: Vec<_> = std::fs::read_dir(&roots)

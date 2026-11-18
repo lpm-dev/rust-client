@@ -93,6 +93,28 @@ fn validate(path: &Path, value: &Value, host: &str) -> Result<(), LpmError> {
             }
         }
     }
+    // SwiftPM compares scopes without regard to case, so `LPMDEV` is the
+    // `lpmdev` scope too.
+    if let Some(scopes) = validate_object(path, value, &["security", "scopeOverrides"])? {
+        for (scope, entry) in scopes.as_object().into_iter().flatten() {
+            if !scope.eq_ignore_ascii_case("lpmdev") {
+                continue;
+            }
+            let location = format!("security.scopeOverrides.{scope}");
+            if !entry.is_object() {
+                return Err(invalid(path, format!("{location} must be an object")));
+            }
+            if let Some(signing) = entry.get("signing") {
+                if !signing.is_object() {
+                    return Err(invalid(
+                        path,
+                        format!("{location}.signing must be an object"),
+                    ));
+                }
+                validate_signing(path, signing, &format!("{location}.signing"))?;
+            }
+        }
+    }
     if let Some(packages) = validate_object(path, value, &["security", "packageOverrides"])? {
         for (identity, entry) in packages.as_object().into_iter().flatten() {
             let is_lpm_package = identity

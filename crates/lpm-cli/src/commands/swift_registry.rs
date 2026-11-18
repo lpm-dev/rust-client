@@ -248,11 +248,22 @@ async fn configure_swift_authentication(
     )))
 }
 
-/// Result of `configure_signing_trust`.
+/// Whether `configure_signing_trust` changed the configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrustOutcome {
     Configured,
     AlreadyConfigured,
+}
+
+/// What `configure_signing_trust` did, and the policy it left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustConfiguration {
+    outcome: TrustOutcome,
+    /// SwiftPM accepts the registry's releases from any signer.
+    accepts_any_signer: bool,
+    /// An earlier LPM CLI release had set the pinned registry back to
+    /// accepting any signer.
+    restored_after_earlier_release: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,21 +396,22 @@ async fn run_in_directory(
     let host = swiftpm_registry_host(&endpoint);
     let trust = SignerTrust::for_host(host)?;
     let roots_outcome = install_signing_roots(&trust, json_output, force)?;
-    let trust_outcome = configure_signing_trust(host, &trust, json_output)?;
-    if !trust.is_pinned() && !json_output {
+    let configured = configure_signing_trust(host, &trust, json_output)?;
+    if configured.accepts_any_signer && !json_output {
         install_ui::warn_line(unpinned_signer_warning(host));
     }
 
     let roots_outcome_label = match roots_outcome {
         RootsOutcome::Installed => "installed",
+        RootsOutcome::Repaired => "repaired",
         RootsOutcome::AlreadyInstalled => "already_installed",
         RootsOutcome::NotPinned => "not_pinned",
     };
-    let trust_outcome_label = match trust_outcome {
+    let trust_outcome_label = match configured.outcome {
         TrustOutcome::Configured => "configured",
         TrustOutcome::AlreadyConfigured => "already_configured",
     };
-    let trust_anchor = if trust.is_pinned() {
+    let trust_anchor = if !configured.accepts_any_signer {
         "pinned_root"
     } else if is_https {
         "https"
@@ -419,7 +431,7 @@ async fn run_in_directory(
             "signing_trust_outcome": trust_outcome_label,
             "trust_anchor": trust_anchor,
             "authentication_outcome": authentication_outcome,
-            "signer_trust_policy": if trust.is_pinned() { "error" } else { "silentAllow" },
+            "signer_trust_policy": if configured.accepts_any_signer { "silentAllow" } else { "error" },
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
@@ -554,15 +566,18 @@ pub(crate) async fn ensure_configured_for_install(
     let host = swiftpm_registry_host(&endpoint);
     let trust = SignerTrust::for_host(host)?;
     let roots = install_signing_roots(&trust, json_output, false)?;
-    let trust_outcome = configure_signing_trust(host, &trust, json_output)?;
-    if trust_outcome == TrustOutcome::Configured && !trust.is_pinned() && !json_output {
+    let configured = configure_signing_trust(host, &trust, json_output)?;
+    if configured.outcome == TrustOutcome::Configured
+        && configured.accepts_any_signer
+        && !json_output
+    {
         install_ui::warn_line(unpinned_signer_warning(host));
     }
 
     Ok(SwiftRegistrySetupOutcome {
         scope_repaired: !scope_matches,
-        certificate_repaired: roots == RootsOutcome::Installed,
-        trust_repaired: trust_outcome == TrustOutcome::Configured,
+        certificate_repaired: matches!(roots, RootsOutcome::Installed | RootsOutcome::Repaired),
+        trust_repaired: configured.outcome == TrustOutcome::Configured,
     })
 }
 
@@ -680,6 +695,7 @@ fn install_signing_roots(
     if let (SignerTrust::Pinned { directory, .. }, false) = (trust, json_output) {
         install_ui::done_line(match outcome {
             RootsOutcome::Installed => signing_root_installed_message(directory),
+            RootsOutcome::Repaired => signing_roots_repaired_message(directory),
             RootsOutcome::AlreadyInstalled | RootsOutcome::NotPinned => {
                 signing_root_already_installed_message(directory)
             }
@@ -696,13 +712,18 @@ fn configure_signing_trust(
     host: &str,
     trust: &SignerTrust,
     json_output: bool,
-) -> Result<TrustOutcome, LpmError> {
+) -> Result<TrustConfiguration, LpmError> {
     let config_path = configuration::global_path()?;
+    let mut restored_after_earlier_release = false;
+    let mut accepts_any_signer = true;
     let changed = configuration::update(&config_path, host, |config| {
-        if signing::is_applied(config, host, trust) {
-            return Ok(());
+        if !signing::is_applied(config, host, trust) {
+            restored_after_earlier_release =
+                signing::set_aside_by_earlier_release(config, host, trust);
+            signing::apply(config, host, trust)?;
         }
-        signing::apply(config, host, trust)
+        accepts_any_signer = signing::accepts_any_signer(config, host);
+        Ok(())
     })?;
     if !json_output {
         let message = if changed {
@@ -711,11 +732,18 @@ fn configure_signing_trust(
             signing_trust_already_configured_message(&config_path)
         };
         install_ui::done_line(message);
+        if restored_after_earlier_release {
+            install_ui::warn_line(earlier_release_warning(host));
+        }
     }
-    Ok(if changed {
-        TrustOutcome::Configured
-    } else {
-        TrustOutcome::AlreadyConfigured
+    Ok(TrustConfiguration {
+        outcome: if changed {
+            TrustOutcome::Configured
+        } else {
+            TrustOutcome::AlreadyConfigured
+        },
+        accepts_any_signer,
+        restored_after_earlier_release,
     })
 }
 
@@ -725,6 +753,13 @@ fn ensure_json_object(
     value.as_object_mut().ok_or_else(|| {
         LpmError::Registry("Swift signing trust configuration must contain objects".into())
     })
+}
+
+fn earlier_release_warning(host: &str) -> install_ui::TerminalLine {
+    crate::install_ui::terminal_line!(
+        "An earlier LPM CLI release on this machine had set {} back to accepting any signer; this release restored its signing root. Update every LPM CLI you run here",
+        host
+    )
 }
 
 fn unpinned_signer_warning(host: &str) -> install_ui::TerminalLine {
@@ -768,6 +803,14 @@ fn signing_root_installed_message_with_home(
     crate::install_ui::terminal_line!(
         "Installed signing root {}",
         display_home_relative_with(roots, home)
+    )
+}
+
+fn signing_roots_repaired_message(roots: &Path) -> install_ui::TerminalLine {
+    let home = dirs::home_dir();
+    crate::install_ui::terminal_line!(
+        "Removed files that aren't signing roots from {}",
+        display_home_relative_with(roots, home.as_deref())
     )
 }
 
@@ -1008,6 +1051,8 @@ mod tests {
             r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"trustedRootCertificatesPath":42}}}}}"#,
             r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"includeDefaultTrustedRootCertificates":"no"}}}}}"#,
             r#"{"security":{"scopeOverrides":{"lpmdev":{"signing":{"includeDefaultTrustedRootCertificates":1}}}}}"#,
+            r#"{"security":{"scopeOverrides":{"LPMDEV":{"signing":[]}}}}"#,
+            r#"{"security":{"scopeOverrides":{"LpmDev":[]}}}"#,
             r#"{"security":{"packageOverrides":{"lpmdev.logger":[]}}}"#,
             r#"{"security":{"packageOverrides":{"LPMDEV.logger":{"signing":{"trustedRootCertificatesPath":false}}}}}"#,
         ];
@@ -1927,7 +1972,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = write_global_signing_trust(home.path(), &config);
 
         assert_eq!(
-            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true)
+                .unwrap()
+                .outcome,
             TrustOutcome::AlreadyConfigured
         );
 
@@ -1936,7 +1983,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
             serde_json::json!({"lpm.dev": {"signing": unset}});
         fs::write(&path, serde_json::to_vec(&earlier).unwrap()).unwrap();
         assert_eq!(
-            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true)
+                .unwrap()
+                .outcome,
             TrustOutcome::Configured
         );
         let repaired: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -1959,7 +2008,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = write_global_signing_trust(home.path(), &config);
 
         assert_eq!(
-            configure_signing_trust("127.0.0.1", &SignerTrust::Unpinned, true).unwrap(),
+            configure_signing_trust("127.0.0.1", &SignerTrust::Unpinned, true)
+                .unwrap()
+                .outcome,
             TrustOutcome::AlreadyConfigured
         );
         let retained: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -2014,11 +2065,85 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     }
 
     #[test]
+    fn an_unpinned_registry_keeps_the_user_s_own_signing_root() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let mut config = complete_signing_trust();
+        config["security"]["registryOverrides"] = serde_json::json!({
+            "registry.example": {"signing": {
+                "onUntrustedCertificate": "error",
+                "trustedRootCertificatesPath": "/Users/example/registry-roots"
+            }}
+        });
+        let path = write_global_signing_trust(home.path(), &config);
+
+        let configured =
+            configure_signing_trust("registry.example", &SignerTrust::Unpinned, true).unwrap();
+
+        assert_eq!(configured.outcome, TrustOutcome::AlreadyConfigured);
+        assert!(!configured.accepts_any_signer);
+        let kept: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(kept, config);
+        let fresh = configure_signing_trust("other.example", &SignerTrust::Unpinned, true).unwrap();
+        assert!(fresh.accepts_any_signer);
+    }
+
+    #[test]
+    fn an_earlier_release_s_any_signer_policy_beside_the_pinned_roots_is_reported() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let mut config = pinned_signing_trust(home.path());
+        config["security"]["registryOverrides"]["lpm.dev"]["signing"]["onUntrustedCertificate"] =
+            serde_json::json!("silentAllow");
+        write_global_signing_trust(home.path(), &config);
+
+        let configured = configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
+
+        assert_eq!(configured.outcome, TrustOutcome::Configured);
+        assert!(configured.restored_after_earlier_release);
+        assert!(!configured.accepts_any_signer);
+        let again = configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
+        assert!(!again.restored_after_earlier_release);
+    }
+
+    #[test]
+    fn a_roots_directory_only_cleaned_up_is_reported_as_repaired() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        signing::install_roots(&lpm_dev_trust(), false).unwrap();
+        fs::write(pinned_roots_directory(home.path()).join("desktop.ini"), "").unwrap();
+
+        assert_eq!(
+            signing::install_roots(&lpm_dev_trust(), false).unwrap(),
+            RootsOutcome::Repaired
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_roots_refuse_a_junction_in_place_of_the_roots_directory() {
+        let home = TempDir::new().unwrap();
+        let _home = home_override(home.path());
+        let directory = pinned_roots_directory(home.path());
+        let elsewhere = home.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        lpm_common::create_dir_symlink_or_junction(&elsewhere, &directory).unwrap();
+
+        let error = signing::install_roots(&lpm_dev_trust(), false).unwrap_err();
+
+        assert!(error.to_string().contains("not a link"), "{error}");
+        assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
     fn lpm_dev_signatures_must_chain_to_the_pinned_root() {
         let home = TempDir::new().unwrap();
         let _home = home_override(home.path());
 
-        let outcome = configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap();
+        let outcome = configure_signing_trust("lpm.dev", &lpm_dev_trust(), true)
+            .unwrap()
+            .outcome;
 
         assert_eq!(outcome, TrustOutcome::Configured);
         let config_path = test_swiftpm_root(home.path()).join("configuration/registries.json");
@@ -2026,7 +2151,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
             serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
         assert_eq!(json, pinned_signing_trust(home.path()));
         assert_eq!(
-            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true)
+                .unwrap()
+                .outcome,
             TrustOutcome::AlreadyConfigured
         );
     }
@@ -2043,7 +2170,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = write_global_signing_trust(home.path(), &earlier);
 
         assert_eq!(
-            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true).unwrap(),
+            configure_signing_trust("lpm.dev", &lpm_dev_trust(), true)
+                .unwrap()
+                .outcome,
             TrustOutcome::Configured
         );
 
