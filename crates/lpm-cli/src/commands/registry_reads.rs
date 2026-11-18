@@ -241,9 +241,7 @@ fn configure_read_context_for_origins(
 
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
         && !tagged.value
-        && crate::commands::registry_reads::first_npmrc_security_warning(
-            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
-        )
+        && first_npmrc_security_warning(&strict_ssl_warning_key(&tagged.source, tagged.line))
     {
         install_ui::warn_untrusted(&format!(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
@@ -255,7 +253,7 @@ fn configure_read_context_for_origins(
     }
 
     for warning in route_table.npmrc_security_warnings() {
-        if crate::commands::registry_reads::first_npmrc_security_warning(warning) {
+        if first_npmrc_security_warning(warning) {
             install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
         }
     }
@@ -353,6 +351,25 @@ fn validate_metadata_registry_base(base_url: &str) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_npmrc_security_warning_prints_once_per_process() {
+        let key = "registry-reads-test: project .npmrc refused ca";
+        assert!(first_npmrc_security_warning(key));
+        assert!(!first_npmrc_security_warning(key));
+        assert!(first_npmrc_security_warning(&strict_ssl_warning_key(
+            "/a/.npmrc",
+            1
+        )));
+        assert!(first_npmrc_security_warning(&strict_ssl_warning_key(
+            "/a/.npmrc",
+            2
+        )));
+        assert!(!first_npmrc_security_warning(&strict_ssl_warning_key(
+            "/a/.npmrc",
+            1
+        )));
+    }
 
     #[test]
     fn split_package_and_inline_version_handles_unscoped_npm_specs() {
