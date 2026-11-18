@@ -98,19 +98,24 @@ mod xcode_project;
 pub(crate) use cli::Commands;
 pub(crate) use cli::{BundleFormat, BundlePlatform, CheckEngine, Cli};
 
-// dhat heap profiling overrides mimalloc so allocation counts reflect the raw
-// Rust alloc surface (not mimalloc's internal pools). Build:
+// dhat heap profiling replaces the global allocator so allocation counts
+// reflect the raw Rust alloc surface (not an allocator's internal pools). Build:
 //   cargo build -p lpm-cli --features dhat-heap
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-// mimalloc replaces the system allocator on Unix non-profiling builds.
-// Typically 5-15% faster on alloc-heavy workloads (resolver BFS, lockfile
-// parse, linker path construction) vs the macOS/Linux system malloc.
-// Disable for comparison builds: cargo build --release --features no-mimalloc
-// Windows uses the system allocator (mimalloc is in cfg(unix) deps).
-#[cfg(all(unix, not(feature = "dhat-heap"), not(feature = "no-mimalloc")))]
+// mimalloc replaces the system allocator in non-profiling builds for Unix
+// targets other than macOS (comparison builds: `--features no-mimalloc`).
+// macOS and Windows keep their system allocators: on macOS, installs peaked
+// 40-60% lower in RSS under the system allocator, with no wall-clock loss,
+// as mimalloc kept freed memory committed in its per-thread arenas.
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(feature = "dhat-heap"),
+    not(feature = "no-mimalloc")
+))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -122,4 +127,23 @@ fn main() -> Result<()> {
 
     open_file_limit::raise();
     cli::run()
+}
+
+#[cfg(all(test, target_os = "macos", not(feature = "dhat-heap")))]
+mod global_allocator_tests {
+    unsafe extern "C" {
+        fn malloc_zone_from_ptr(ptr: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+
+    #[test]
+    fn macos_heap_allocations_come_from_a_malloc_zone_rather_than_mimalloc() {
+        let allocation = Box::new([0_u8; 256]);
+        // SAFETY: `malloc_zone_from_ptr` only looks the pointer up in the
+        // registered malloc zones and returns null when none owns it.
+        let zone = unsafe { malloc_zone_from_ptr(allocation.as_ptr().cast()) };
+        assert!(
+            !zone.is_null(),
+            "heap allocations must come from a malloc zone"
+        );
+    }
 }
