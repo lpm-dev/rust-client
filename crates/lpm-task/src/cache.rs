@@ -4096,6 +4096,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restoring_resets_an_output_mtime_that_differs_within_the_same_second() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-00.txt");
+        let restored_mtime = fs::metadata(&output).unwrap().modified().unwrap();
+        let within_second = restored_mtime + std::time::Duration::from_millis(500);
+        set_test_mtime(&output, within_second);
+        if fs::metadata(&output).unwrap().modified().unwrap() != within_second {
+            return; // The file system keeps whole seconds only.
+        }
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().modified().unwrap(),
+            restored_mtime,
+            "an output whose mtime differs from the archive's, even within a second, is restored"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn restoring_resets_the_mode_of_an_output_with_matching_bytes() {

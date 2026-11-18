@@ -1486,8 +1486,8 @@ enum DirectoryCreationDurability {
 }
 
 /// Whether `existing` already holds what publishing `staged` over it would
-/// leave: the same bytes, permissions and whole-second modification time
-/// (archives record seconds). Both handles are left at an unspecified offset.
+/// leave: the same bytes, permissions and modification time. Both handles
+/// are left at an unspecified offset.
 fn output_already_restored(
     existing: &cap_std::fs::File,
     staged: &cap_std::fs::File,
@@ -1498,11 +1498,9 @@ fn output_already_restored(
     const CHUNK: usize = 64 * 1024;
     let existing_metadata = existing.metadata()?;
     let staged_metadata = staged.metadata()?;
-    let existing_seconds = whole_seconds_since_epoch(existing_metadata.modified()?.into_std());
     if existing_metadata.len() != staged_metadata.len()
         || !restored_permissions_match(&existing_metadata, &staged_metadata)
-        || existing_seconds.is_none()
-        || existing_seconds != whole_seconds_since_epoch(staged_metadata.modified()?.into_std())
+        || existing_metadata.modified()? != staged_metadata.modified()?
     {
         return Ok(false);
     }
@@ -1532,12 +1530,6 @@ fn output_already_restored(
         remaining -= length as u64;
     }
     Ok(true)
-}
-
-fn whole_seconds_since_epoch(time: std::time::SystemTime) -> Option<u64> {
-    time.duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|elapsed| elapsed.as_secs())
 }
 
 #[cfg(unix)]
