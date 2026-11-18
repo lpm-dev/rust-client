@@ -19041,3 +19041,40 @@ async fn install_stays_up_to_date_for_a_manifest_that_starts_with_a_byte_order_m
         assert_eq!(result["up_to_date"], true, "dev = {dev}: {result:#}");
     }
 }
+
+#[tokio::test]
+async fn install_rechecks_a_local_dependency_of_a_manifest_that_starts_with_a_byte_order_mark() {
+    let project = TempProject::empty(
+        "\u{feff}{\"name\":\"bom-local\",\"version\":\"1.0.0\",\"dependencies\":{\"local-dep\":\"file:./local-dep\"}}",
+    );
+    project.write_file(
+        "local-dep/package.json",
+        r#"{"name":"local-dep","version":"1.0.0"}"#,
+    );
+    project.write_file("local-dep/index.js", "module.exports = 1;\n");
+    let mock = MockRegistry::start().await;
+    let install = || {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
+            .output()
+            .expect("run lpm install --json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assertions::parse_json_output(&output.stdout)
+    };
+    install();
+    assert_eq!(install()["up_to_date"], true);
+
+    project.write_file(
+        "local-dep/package.json",
+        r#"{"name":"local-dep","version":"1.0.0","scripts":{"postinstall":"node -e 0"}}"#,
+    );
+    let result = install();
+    assert_ne!(
+        result["up_to_date"], true,
+        "a local dependency's new lifecycle script must make the install run again: {result:#}"
+    );
+}

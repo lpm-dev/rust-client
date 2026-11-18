@@ -597,7 +597,9 @@ fn walk_file_link_deps(
     if depth >= max_depth {
         return;
     }
-    let Ok(pkg) = serde_json::from_str::<serde_json::Value>(pkg_content) else {
+    let Ok(pkg) =
+        serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(pkg_content))
+    else {
         return;
     };
     for field in [
@@ -1957,6 +1959,26 @@ mod tests {
                 "{phase}"
             );
         }
+    }
+
+    #[test]
+    fn local_dependency_manifests_count_whether_or_not_the_manifest_starts_with_a_byte_order_mark()
+    {
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join("local");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(
+            local.join("package.json"),
+            r#"{"name":"local","version":"1.0.0","dependencies":{"a":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let manifest = r#"{"name":"app","dependencies":{"local":"file:./local"}}"#;
+
+        let plain = collect_file_link_manifest_bytes(dir.path(), manifest);
+        let marked = collect_file_link_manifest_bytes(dir.path(), &format!("\u{feff}{manifest}"));
+
+        assert!(!plain.is_empty());
+        assert_eq!(marked, plain);
     }
 
     #[test]
