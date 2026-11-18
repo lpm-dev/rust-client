@@ -319,6 +319,11 @@ if version_lt "$VERSION" "$MIN_VERSION"; then
   if [ "${LPM_INSTALL_MIN_VERSION_OVERRIDE:-0}" = "1" ]; then
     echo "WARN: $VERSION is below the configured minimum $MIN_VERSION."
     echo "      LPM_INSTALL_MIN_VERSION_OVERRIDE=1 set — proceeding anyway."
+  elif [ -z "$REQUESTED_VERSION" ] && [ "$INSTALL_CHANNEL" = "nightly" ]; then
+    echo "ERROR: The latest nightly, $VERSION, was built before $MIN_VERSION,"
+    echo "       the oldest release this installer delivers."
+    echo "Install the stable release instead, or try again once the next nightly is published."
+    exit 1
   else
     echo "ERROR: detected version $VERSION is below the minimum supported $MIN_VERSION."
     echo ""
@@ -489,10 +494,17 @@ elif [ -n "$SHA_TOOL" ]; then
   # couldn't verify who published the release; LPM_INSTALL_REQUIRE_SIGSTORE=1
   # refuses that case instead. With cosign, every release at or above the
   # floor has a bundle to verify.
-  curl -fsSL --max-time 30 "$BUNDLE_URL" -o "$BUNDLE_TMP" 2>/dev/null || rm -f "$BUNDLE_TMP"
+  bundle_status=$(curl -sSL --max-time 30 -o "$BUNDLE_TMP" -w '%{http_code}' "$BUNDLE_URL" 2>/dev/null) \
+    || bundle_status="no response"
+  [ "$bundle_status" = "200" ] || rm -f "$BUNDLE_TMP"
   if [ ! -s "$BUNDLE_TMP" ] && { [ "$REQUIRE_SIGSTORE" = "1" ] || command -v cosign >/dev/null 2>&1; }; then
-    echo "ERROR: release $VERSION has no Sigstore bundle ($BUNDLE_URL),"
-    echo "       so cosign can't verify who published it. Refusing to install."
+    if [ "$bundle_status" = "404" ] || [ "$bundle_status" = "200" ]; then
+      echo "ERROR: release $VERSION has no Sigstore bundle ($BUNDLE_URL),"
+      echo "       so cosign can't verify who published it. Refusing to install."
+    else
+      echo "ERROR: couldn't download the Sigstore bundle of release $VERSION ($bundle_status)."
+      echo "       cosign can't verify who published it without it. Try again."
+    fi
     exit 1
   fi
 fi

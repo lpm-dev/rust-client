@@ -1079,11 +1079,15 @@ start_server "$fdir"
 LPM_INSTALL_CHANNEL=nightly run_install_sh
 unset LPM_INSTALL_CHANNEL
 [ "$RUN_RC" -ne 0 ] || fail "a nightly built before the floor release must be refused: $RUN_OUT"
-echo "$RUN_OUT" | grep -q "detected version v$floor_nightly is below the minimum supported v0.87.0" \
-  || fail "floor refusal of a nightly was unclear: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "The latest nightly, v$floor_nightly, was built before v0.87.0" \
+  || fail "the nightly channel must say the latest nightly predates the floor: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "attack signal" \
+  && fail "a nightly that predates the floor is not a tampering signal: $RUN_OUT"
 LPM_INSTALL_VERSION="v$floor_nightly" run_install_sh
 unset LPM_INSTALL_VERSION
 [ "$RUN_RC" -ne 0 ] || fail "an explicit nightly built before the floor release must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "detected version v$floor_nightly is below the minimum supported v0.87.0" \
+  || fail "floor refusal of an explicit nightly was unclear: $RUN_OUT"
 stop_server
 trap - EXIT
 rm -rf "$fdir"
@@ -1106,6 +1110,20 @@ rm -f "$CLEAN_PATH_DIR/cosign"
 echo "$RUN_OUT" | grep -q "has no Sigstore bundle" \
   || fail "missing-bundle refusal was unclear: $RUN_OUT"
 [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-bundle refusal must not install anything"
+printf '503\n' > "$fdir/SHA256SUMS.txt.sigstore.STATUS"
+printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/cosign"
+chmod +x "$CLEAN_PATH_DIR/cosign"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+[ "$RUN_RC" -ne 0 ] || fail "a bundle that failed to download must not be skipped: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "couldn't download the Sigstore bundle" \
+  || fail "a failed bundle download must not be reported as a missing bundle: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "has no Sigstore bundle" \
+  && fail "a failed bundle download is not a missing bundle: $RUN_OUT"
 rm -rf "$fdir"
 pass "with cosign installed, a release without a bundle is refused"
 
