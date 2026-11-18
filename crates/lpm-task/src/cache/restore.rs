@@ -1493,9 +1493,6 @@ fn output_already_restored(
     staged: &cap_std::fs::File,
     buffer: &mut Vec<u8>,
 ) -> Result<bool, LpmError> {
-    use std::io::Read as _;
-
-    const CHUNK: usize = 64 * 1024;
     let existing_metadata = existing.metadata()?;
     let staged_metadata = staged.metadata()?;
     if existing_metadata.len() != staged_metadata.len()
@@ -1504,24 +1501,45 @@ fn output_already_restored(
     {
         return Ok(false);
     }
+    Ok(same_bytes(
+        existing,
+        staged,
+        existing_metadata.len(),
+        buffer,
+    )?)
+}
+
+/// Whether both readers hold exactly `len` bytes, the same ones. A reader
+/// that ends early or goes on past `len`, as a file written to since its
+/// size was read does, doesn't match.
+pub(super) fn same_bytes(
+    mut existing: impl std::io::Read,
+    mut staged: impl std::io::Read,
+    len: u64,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    const CHUNK: usize = 64 * 1024;
     buffer.resize(2 * CHUNK, 0);
     let (existing_chunk, staged_chunk) = buffer.split_at_mut(CHUNK);
-    let (mut existing_reader, mut staged_reader) = (existing, staged);
-    let mut remaining = existing_metadata.len();
+    let mut remaining = len;
     while remaining > 0 {
         let length = usize::try_from(remaining.min(CHUNK as u64)).unwrap_or(CHUNK);
         for (reader, chunk) in [
-            (&mut existing_reader, &mut existing_chunk[..length]),
-            (&mut staged_reader, &mut staged_chunk[..length]),
+            (
+                &mut existing as &mut dyn std::io::Read,
+                &mut existing_chunk[..length],
+            ),
+            (
+                &mut staged as &mut dyn std::io::Read,
+                &mut staged_chunk[..length],
+            ),
         ] {
             match reader.read_exact(chunk) {
                 Ok(()) => {}
-                // A file that shrank since its metadata was read takes
-                // the full replacement path, which reports the change.
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                     return Ok(false);
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         if existing_chunk[..length] != staged_chunk[..length] {
@@ -1529,7 +1547,8 @@ fn output_already_restored(
         }
         remaining -= length as u64;
     }
-    Ok(true)
+    let mut extra = [0u8; 1];
+    Ok(existing.read(&mut extra)? == 0 && staged.read(&mut extra)? == 0)
 }
 
 #[cfg(unix)]

@@ -490,7 +490,7 @@ fn compute_validation_fingerprint(
         // link is its own canonical form; resolving it again costs a lookup
         // per component.
         let resolved = if crosses_linked_component(&relative, &linked_components) {
-            path.canonicalize().map_err(|error| {
+            canonicalize_input(&path).map_err(|error| {
                 LpmError::Task(format!(
                     "failed to resolve task cache validation path {}: {error}",
                     path.display()
@@ -511,6 +511,18 @@ fn compute_validation_fingerprint(
         hash_validation_path(&mut hasher, &key, &resolved, true)?;
     }
     Ok(hasher.finalize().into())
+}
+
+/// Resolves one input or validation path through the links it crosses.
+fn canonicalize_input(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    INPUT_CANONICALIZATIONS.with(|count| count.set(count.get() + 1));
+    path.canonicalize()
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPUT_CANONICALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn crosses_linked_component(
@@ -862,7 +874,7 @@ fn collect_input_files(
                 let (resolved, metadata) = match unlinked_metadata {
                     Some(metadata) => (entry.clone(), metadata),
                     None => {
-                        let resolved = entry.canonicalize().map_err(|error| {
+                        let resolved = canonicalize_input(&entry).map_err(|error| {
                             LpmError::Task(format!(
                                 "failed to resolve task cache input {}: {error}",
                                 entry.display()
@@ -2132,6 +2144,27 @@ mod tests {
             error.contains("failed to resolve task cache input")
                 && error.contains(&canonical.join("src/gone.ts").display().to_string()),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn inputs_without_links_are_hashed_and_validated_without_resolving_them() {
+        let project = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            let directory = project.path().join(format!("src/pkg{}/lib", index % 3));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(format!("f{index}.ts")), "x").unwrap();
+        }
+        let resolved_before = INPUT_CANONICALIZATIONS.with(std::cell::Cell::get);
+
+        let files = super::collect_input_files(project.path(), &["src/**".into()]).unwrap();
+        compute_validation_fingerprint(project.path(), &[], &["src/**".into()]).unwrap();
+
+        assert_eq!(files.len(), 12);
+        assert_eq!(
+            INPUT_CANONICALIZATIONS.with(std::cell::Cell::get) - resolved_before,
+            0,
+            "a path with no link component is already canonical"
         );
     }
 

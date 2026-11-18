@@ -4140,6 +4140,28 @@ mod tests {
     }
 
     #[test]
+    fn output_comparison_requires_both_files_to_end_at_the_compared_length() {
+        let cached = vec![7u8; 70_000];
+        let mut buffer = Vec::new();
+        let same = |existing: &[u8], staged: &[u8], buffer: &mut Vec<u8>| {
+            restore::same_bytes(existing, staged, cached.len() as u64, buffer).unwrap()
+        };
+        let mut grown = cached.clone();
+        grown.push(1);
+        let mut changed = cached.clone();
+        changed[69_999] = 8;
+
+        assert!(same(&cached, &cached, &mut buffer));
+        assert!(
+            !same(&grown, &cached, &mut buffer),
+            "an output appended to while compared"
+        );
+        assert!(!same(&cached, &grown, &mut buffer));
+        assert!(!same(&cached[..69_000], &cached, &mut buffer));
+        assert!(!same(&changed, &cached, &mut buffer));
+    }
+
+    #[test]
     fn restore_rollback_leaves_outputs_that_already_matched_in_place() {
         let (_archive_dir, archive_path) = archive_of_dist_outputs(2);
         let target = tempfile::tempdir().unwrap();
