@@ -6198,6 +6198,30 @@ fn opened_regular_files_stream_only_above_the_hybrid_buffer_limit() {
     }
 }
 
+#[test]
+fn small_files_that_decode_past_the_buffer_stream() {
+    use std::io::Write as _;
+    let gzip = |payload: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    };
+    for (decoded, streams) in [(4 * 1024 * 1024, false), (64 * 1024 * 1024, true)] {
+        let file = tempfile::tempfile().unwrap();
+        let compressed = gzip(&vec![0x5a; decoded]);
+        assert!(compressed.len() < 1024 * 1024);
+        (&file).write_all(&compressed).unwrap();
+        let reader = std::io::BufReader::new(file);
+        assert_eq!(file_exceeds_hybrid_buffer(&reader), streams, "{decoded}");
+        let mut cursor = reader.get_ref();
+        assert_eq!(
+            std::io::Seek::stream_position(&mut cursor).unwrap(),
+            compressed.len() as u64,
+            "reading the trailer must leave the cursor where it was"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn nonregular_file_handles_retain_the_hybrid_reader() {

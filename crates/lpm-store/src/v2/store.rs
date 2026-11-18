@@ -92,10 +92,15 @@ struct FileCasFinishContext<'a> {
     validation_batch: Option<&'a ReusableObjectValidationBatch>,
 }
 
+/// Whether a downloaded file is too large, compressed or as its gzip
+/// trailer declares it decoded, for the hybrid buffered path. Those go to
+/// the pipelined decoder, which writes their files in parallel.
 fn file_exceeds_hybrid_buffer(reader: &std::io::BufReader<std::fs::File>) -> bool {
-    reader.get_ref().metadata().is_ok_and(|metadata| {
-        metadata.is_file() && metadata.len() > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
-    })
+    reader
+        .get_ref()
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+        && !lpm_extractor::file_fits_buffered_extraction(reader.get_ref())
 }
 
 enum TarballInput<'a> {
