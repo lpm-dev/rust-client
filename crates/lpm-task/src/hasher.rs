@@ -432,7 +432,9 @@ fn compute_validation_fingerprint(
     for name in fixed_names {
         let path = canonical_root.join(name);
         match std::fs::symlink_metadata(&path) {
-            Ok(_) => hash_validation_path(&mut hasher, name.as_bytes(), &path, false)?,
+            Ok(_) => {
+                hash_validation_path(&mut hasher, name.as_bytes(), &path, false)?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 hash_record(&mut hasher, 20, &[name.as_bytes(), b"missing"]);
             }
@@ -474,19 +476,29 @@ fn compute_validation_fingerprint(
             lexical_components.insert(component_path.clone());
         }
     }
+    let mut linked_components = std::collections::HashSet::new();
     for relative in lexical_components {
         let path = canonical_root.join(&relative);
         let key = os_str_bytes(relative.as_os_str());
-        hash_validation_path(&mut hasher, &key, &path, false)?;
+        if hash_validation_path(&mut hasher, &key, &path, false)? {
+            linked_components.insert(relative);
+        }
     }
     for relative in entries {
         let path = canonical_root.join(&relative);
-        let resolved = path.canonicalize().map_err(|error| {
-            LpmError::Task(format!(
-                "failed to resolve task cache validation path {}: {error}",
-                path.display()
-            ))
-        })?;
+        // Below the canonical root, a path none of whose components is a
+        // link is its own canonical form; resolving it again costs a lookup
+        // per component.
+        let resolved = if crosses_linked_component(&relative, &linked_components) {
+            canonicalize_input(&path).map_err(|error| {
+                LpmError::Task(format!(
+                    "failed to resolve task cache validation path {}: {error}",
+                    path.display()
+                ))
+            })?
+        } else {
+            path.clone()
+        };
         let resolved_relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
             LpmError::Task(format!(
                 "task cache validation path resolves outside project: {}",
@@ -501,12 +513,39 @@ fn compute_validation_fingerprint(
     Ok(hasher.finalize().into())
 }
 
+/// Resolves one input or validation path through the links it crosses.
+fn canonicalize_input(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    INPUT_CANONICALIZATIONS.with(|count| count.set(count.get() + 1));
+    path.canonicalize()
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPUT_CANONICALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn crosses_linked_component(
+    relative: &Path,
+    linked_components: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    if linked_components.is_empty() {
+        return false;
+    }
+    let mut prefix = PathBuf::with_capacity(relative.as_os_str().len());
+    relative.components().any(|component| {
+        prefix.push(component);
+        linked_components.contains(&prefix)
+    })
+}
+
+/// Hashes `path`'s identity, and says whether it is a link.
 fn hash_validation_path(
     hasher: &mut Sha256,
     key: &[u8],
     path: &Path,
     follow: bool,
-) -> Result<(), LpmError> {
+) -> Result<bool, LpmError> {
     let metadata = if follow {
         std::fs::metadata(path)
     } else {
@@ -533,7 +572,7 @@ fn hash_validation_path(
     } else {
         hash_record(hasher, 21, &[key, &metadata_bytes]);
     }
-    Ok(())
+    Ok(is_link)
 }
 
 #[cfg(unix)]
@@ -812,6 +851,8 @@ fn collect_input_files(
         ))
     })?;
     let project = Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority())?;
+    let mut links = ComponentLinks::default();
+    let mut directories = InputDirectories::default();
 
     for pattern in globs {
         if !crate::cache::validate_glob_pattern(pattern) {
@@ -826,19 +867,29 @@ fn collect_input_files(
         for pat in &patterns {
             for_each_cache_glob_match(&canonical_project, pat, |relative| {
                 let entry = canonical_project.join(&relative);
-                let resolved = entry.canonicalize().map_err(|error| {
-                    LpmError::Task(format!(
-                        "failed to resolve task cache input {}: {error}",
-                        entry.display()
-                    ))
-                })?;
+                // A path below the canonical root with no linked component
+                // is its own canonical form, and its lstat is its stat.
+                let unlinked_metadata = links.unlinked_metadata(&canonical_project, &relative)?;
+                let unlinked = unlinked_metadata.is_some();
+                let (resolved, metadata) = match unlinked_metadata {
+                    Some(metadata) => (entry.clone(), metadata),
+                    None => {
+                        let resolved = canonicalize_input(&entry).map_err(|error| {
+                            LpmError::Task(format!(
+                                "failed to resolve task cache input {}: {error}",
+                                entry.display()
+                            ))
+                        })?;
+                        let metadata = std::fs::metadata(&resolved)?;
+                        (resolved, metadata)
+                    }
+                };
                 if !resolved.starts_with(&canonical_project) {
                     return Err(LpmError::Task(format!(
                         "task cache input resolves outside project: {}",
                         entry.display()
                     )));
                 }
-                let metadata = std::fs::metadata(&resolved)?;
                 if !metadata.is_file() {
                     return Ok(());
                 }
@@ -850,19 +901,23 @@ fn collect_input_files(
                                 entry.display()
                             ))
                         })?;
-                    let mut file = open_project_file_nofollow(&project, resolved_relative)?;
+                    let mut file = directories.open_file(&project, resolved_relative)?;
                     let content_hash = file_content_hash(&mut file).map_err(|error| {
                         LpmError::Task(format!(
                             "failed to hash task cache input {}: {error}",
                             entry.display()
                         ))
                     })?;
-                    let identity_hash = hash_input_path_identity(
-                        &canonical_project,
-                        &relative,
-                        &metadata,
-                        &content_hash,
-                    )?;
+                    let identity_hash = if unlinked {
+                        hash_unlinked_input_identity(&metadata, &content_hash)
+                    } else {
+                        hash_input_path_identity(
+                            &canonical_project,
+                            &relative,
+                            &metadata,
+                            &content_hash,
+                        )?
+                    };
                     files.push((relative, identity_hash));
                 }
                 Ok(())
@@ -873,6 +928,144 @@ fn collect_input_files(
     // Sort for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
+}
+
+/// Whether each directory below the project root is a link, looked up once
+/// per hashing pass.
+#[derive(Default)]
+struct ComponentLinks {
+    directories: HashMap<PathBuf, bool>,
+}
+
+impl ComponentLinks {
+    /// The lstat of `relative` when neither it nor a directory above it
+    /// (below `root`) is a link; `None` when one is.
+    fn unlinked_metadata(
+        &mut self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<Option<std::fs::Metadata>, LpmError> {
+        let inspect = |path: &Path| {
+            std::fs::symlink_metadata(root.join(path)).map_err(|error| {
+                LpmError::Task(format!(
+                    "failed to resolve task cache input {}: {error}",
+                    root.join(relative).display()
+                ))
+            })
+        };
+        let mut prefix = PathBuf::new();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Ok(None);
+            };
+            prefix.push(name);
+            if components.peek().is_none() {
+                let metadata = inspect(&prefix)?;
+                return Ok((!lpm_common::is_symlink_or_junction(&metadata)).then_some(metadata));
+            }
+            let linked = match self.directories.get(&prefix) {
+                Some(linked) => *linked,
+                None => {
+                    let metadata = inspect(&prefix)?;
+                    let linked = lpm_common::is_symlink_or_junction(&metadata);
+                    self.directories.insert(prefix.clone(), linked);
+                    linked
+                }
+            };
+            if linked {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Opens task inputs without following links, reusing the parent directory
+/// of the last input while inputs come from the same directory, which is
+/// how the glob walk yields them.
+#[derive(Default)]
+struct InputDirectories {
+    last_parent: Option<(PathBuf, Dir)>,
+}
+
+impl InputDirectories {
+    fn open_file(&mut self, project: &Dir, relative: &Path) -> Result<std::fs::File, LpmError> {
+        let invalid_path = || {
+            LpmError::Task(format!(
+                "invalid task cache input path: {}",
+                relative.display()
+            ))
+        };
+        let Some(name) = relative.file_name() else {
+            return Err(match relative.components().next() {
+                None => LpmError::Task("invalid empty task cache input path".into()),
+                Some(_) => invalid_path(),
+            });
+        };
+        if !matches!(
+            relative.components().next_back(),
+            Some(Component::Normal(_))
+        ) {
+            return Err(invalid_path());
+        }
+        let parent_path = relative.parent().unwrap_or_else(|| Path::new(""));
+        let reuse = self
+            .last_parent
+            .as_ref()
+            .is_some_and(|(path, _)| path == parent_path);
+        if !reuse {
+            let mut parent = project.try_clone()?;
+            for component in parent_path.components() {
+                let Component::Normal(component) = component else {
+                    return Err(invalid_path());
+                };
+                parent = parent.open_dir_nofollow(component).map_err(|error| {
+                    LpmError::Task(format!(
+                        "task cache input parent is unsafe at {}: {error}",
+                        relative.display()
+                    ))
+                })?;
+            }
+            self.last_parent = Some((parent_path.to_path_buf(), parent));
+        }
+        let (_, parent) = self
+            .last_parent
+            .as_ref()
+            .expect("input parent directory was opened");
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options).map_err(|error| {
+            LpmError::Task(format!(
+                "failed to open task cache input {} without following links: {error}",
+                relative.display()
+            ))
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(LpmError::Task(format!(
+                "task cache input is not a real file: {}",
+                relative.display()
+            )));
+        }
+        Ok(file.into_std())
+    }
+}
+
+/// [`hash_input_path_identity`] for a path none of whose components is a
+/// link: no component record applies.
+fn hash_unlinked_input_identity(
+    resolved_metadata: &std::fs::Metadata,
+    content_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_record(&mut hasher, 0, &[b"task-input-v3"]);
+    let semantic_metadata = input_semantic_metadata_bytes(resolved_metadata);
+    hash_record(
+        &mut hasher,
+        2,
+        &[&semantic_metadata, content_hash.as_bytes()],
+    );
+    hex::encode(hasher.finalize())
 }
 
 fn hash_input_path_identity(
@@ -969,44 +1162,6 @@ fn os_str_bytes(value: &OsStr) -> Vec<u8> {
 #[cfg(not(any(unix, windows)))]
 fn os_str_bytes(value: &OsStr) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
-}
-
-fn open_project_file_nofollow(project: &Dir, relative: &Path) -> Result<std::fs::File, LpmError> {
-    let mut components = relative.components().peekable();
-    let mut parent = project.try_clone()?;
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            return Err(LpmError::Task(format!(
-                "invalid task cache input path: {}",
-                relative.display()
-            )));
-        };
-        if components.peek().is_some() {
-            parent = parent.open_dir_nofollow(name).map_err(|error| {
-                LpmError::Task(format!(
-                    "task cache input parent is unsafe at {}: {error}",
-                    relative.display()
-                ))
-            })?;
-            continue;
-        }
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let file = parent.open_with(name, &options).map_err(|error| {
-            LpmError::Task(format!(
-                "failed to open task cache input {} without following links: {error}",
-                relative.display()
-            ))
-        })?;
-        if !file.metadata()?.is_file() {
-            return Err(LpmError::Task(format!(
-                "task cache input is not a real file: {}",
-                relative.display()
-            )));
-        }
-        return Ok(file.into_std());
-    }
-    Err(LpmError::Task("invalid empty task cache input path".into()))
 }
 
 fn expand_glob(pattern: &str) -> Vec<String> {
@@ -1946,6 +2101,122 @@ mod tests {
             error.to_string().contains("resolves outside project"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn unlinked_input_identity_matches_the_component_walk() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src/nested/deeper")).unwrap();
+        fs::write(project.path().join("src/top.txt"), "top").unwrap();
+        fs::write(project.path().join("src/nested/middle.txt"), "middle").unwrap();
+        fs::write(project.path().join("src/nested/deeper/leaf.txt"), "leaf").unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+
+        let files = super::collect_input_files(project.path(), &["src/**".into()]).unwrap();
+
+        assert_eq!(files.len(), 3);
+        for (relative, identity) in files {
+            let path = canonical.join(&relative);
+            let content_hash = file_content_hash(&mut fs::File::open(&path).unwrap()).unwrap();
+            let expected = hash_input_path_identity(
+                &canonical,
+                &relative,
+                &fs::metadata(&path).unwrap(),
+                &content_hash,
+            )
+            .unwrap();
+            assert_eq!(identity, expected, "{}", relative.display());
+        }
+    }
+
+    #[test]
+    fn an_input_that_vanished_after_the_walk_is_named_in_the_error() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("src")).unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+
+        let error = ComponentLinks::default()
+            .unlinked_metadata(&canonical, Path::new("src/gone.ts"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("failed to resolve task cache input")
+                && error.contains(&canonical.join("src/gone.ts").display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inputs_without_links_are_hashed_and_validated_without_resolving_them() {
+        let project = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            let directory = project.path().join(format!("src/pkg{}/lib", index % 3));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(format!("f{index}.ts")), "x").unwrap();
+        }
+        let resolved_before = INPUT_CANONICALIZATIONS.with(std::cell::Cell::get);
+
+        let files = super::collect_input_files(project.path(), &["src/**".into()]).unwrap();
+        compute_validation_fingerprint(project.path(), &[], &["src/**".into()]).unwrap();
+
+        assert_eq!(files.len(), 12);
+        assert_eq!(
+            INPUT_CANONICALIZATIONS.with(std::cell::Cell::get) - resolved_before,
+            0,
+            "a path with no link component is already canonical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_identity_records_a_directory_link_inside_the_project() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("real")).unwrap();
+        fs::write(project.path().join("real/value.txt"), "value").unwrap();
+        symlink("real", project.path().join("alias")).unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+        let real = canonical.join("real/value.txt");
+        let content_hash = file_content_hash(&mut fs::File::open(&real).unwrap()).unwrap();
+        let unlinked = hash_unlinked_input_identity(&fs::metadata(&real).unwrap(), &content_hash);
+
+        let linked = super::collect_input_files(project.path(), &["alias/**".into()]).unwrap();
+        let direct = super::collect_input_files(project.path(), &["real/**".into()]).unwrap();
+
+        assert_eq!(
+            direct,
+            vec![(PathBuf::from("real/value.txt"), unlinked.clone())]
+        );
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].0, PathBuf::from("alias/value.txt"));
+        assert_ne!(
+            linked[0].1, unlinked,
+            "an input reached through a directory link must record the link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_fingerprint_follows_a_retargeted_directory_link() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            fs::create_dir(project.path().join(name)).unwrap();
+            fs::write(project.path().join(name).join("value.txt"), "same").unwrap();
+        }
+        symlink("first", project.path().join("alias")).unwrap();
+        let before =
+            compute_validation_fingerprint(project.path(), &[], &["alias/**".into()]).unwrap();
+        fs::remove_file(project.path().join("alias")).unwrap();
+        symlink("second", project.path().join("alias")).unwrap();
+
+        let after =
+            compute_validation_fingerprint(project.path(), &[], &["alias/**".into()]).unwrap();
+
+        assert_ne!(before, after);
     }
 
     #[cfg(unix)]

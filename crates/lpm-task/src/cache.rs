@@ -88,9 +88,38 @@ struct BackupSyncFailure {
     relative: PathBuf,
 }
 
+// One slot per project, so tests that inject failures in parallel don't
+// clear each other's.
 #[cfg(test)]
-static BACKUP_SYNC_FAILURE: std::sync::Mutex<Option<BackupSyncFailure>> =
-    std::sync::Mutex::new(None);
+static BACKUP_SYNC_FAILURES: std::sync::Mutex<Vec<BackupSyncFailure>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct InjectedBackupSyncFailure(PathBuf);
+
+#[cfg(test)]
+impl InjectedBackupSyncFailure {
+    fn new(project: PathBuf, relative: &str) -> Self {
+        BACKUP_SYNC_FAILURES
+            .lock()
+            .unwrap()
+            .push(BackupSyncFailure {
+                project: project.clone(),
+                relative: PathBuf::from(relative),
+            });
+        Self(project)
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedBackupSyncFailure {
+    fn drop(&mut self) {
+        BACKUP_SYNC_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|failure| failure.project != self.0);
+    }
+}
 
 #[cfg(test)]
 static STAGING_CLEANUP_FAILURE: std::sync::Mutex<Option<std::ffi::OsString>> =
@@ -3980,6 +4009,212 @@ mod tests {
         );
     }
 
+    fn archive_of_dist_outputs(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("dist")).unwrap();
+        for index in 0..count {
+            fs::write(
+                source.path().join(format!("dist/value-{index:02}.txt")),
+                format!("cached-value-{index}"),
+            )
+            .unwrap();
+        }
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("outputs.tar.gz");
+        create_archive(source.path(), &["dist/**".into()], &archive_path).unwrap();
+        (archive_dir, archive_path)
+    }
+
+    fn set_test_mtime(path: &Path, modified: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    fn file_identity(path: &Path) -> same_file::Handle {
+        same_file::Handle::from_path(path).unwrap()
+    }
+
+    #[test]
+    fn restoring_outputs_that_already_match_leaves_them_in_place_without_syncs() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(64);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-07.txt");
+        let identity_before = file_identity(&output);
+
+        let (result, syncs) = count_restore_durability_syncs(|| {
+            restore_archive(&archive_path, target.path(), &["dist/**".into()])
+        });
+
+        result.unwrap();
+        assert!(
+            syncs <= 16,
+            "restoring 64 outputs that already match issued {syncs} durability syncs"
+        );
+        assert!(
+            file_identity(&output) == identity_before,
+            "an output that already matched was replaced"
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "cached-value-7");
+    }
+
+    #[test]
+    fn restoring_replaces_an_output_whose_bytes_differ_at_the_same_length() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-02.txt");
+        let restored_mtime = fs::metadata(&output).unwrap().modified().unwrap();
+        fs::write(&output, "cached-value-X").unwrap();
+        set_test_mtime(&output, restored_mtime);
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(fs::read_to_string(&output).unwrap(), "cached-value-2");
+    }
+
+    #[test]
+    fn restoring_resets_the_mtime_of_an_output_with_matching_bytes() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-01.txt");
+        let restored_mtime = fs::metadata(&output).unwrap().modified().unwrap();
+        let touched = restored_mtime + std::time::Duration::from_secs(3_600);
+        set_test_mtime(&output, touched);
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().modified().unwrap(),
+            restored_mtime,
+            "a restored output carries the archived mtime"
+        );
+    }
+
+    #[test]
+    fn restoring_resets_an_output_mtime_that_differs_within_the_same_second() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-00.txt");
+        let restored_mtime = fs::metadata(&output).unwrap().modified().unwrap();
+        let within_second = restored_mtime + std::time::Duration::from_millis(500);
+        set_test_mtime(&output, within_second);
+        if fs::metadata(&output).unwrap().modified().unwrap() != within_second {
+            return; // The file system keeps whole seconds only.
+        }
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().modified().unwrap(),
+            restored_mtime,
+            "an output whose mtime differs from the archive's, even within a second, is restored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_resets_the_mode_of_an_output_with_matching_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-03.txt");
+        let restored_mode = fs::metadata(&output).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(restored_mode, 0o600);
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o7777,
+            restored_mode
+        );
+    }
+
+    #[test]
+    fn output_comparison_requires_both_files_to_end_at_the_compared_length() {
+        let cached = vec![7u8; 70_000];
+        let mut buffer = Vec::new();
+        let same = |existing: &[u8], staged: &[u8], buffer: &mut Vec<u8>| {
+            restore::same_bytes(existing, staged, cached.len() as u64, buffer).unwrap()
+        };
+        let mut grown = cached.clone();
+        grown.push(1);
+        let mut changed = cached.clone();
+        changed[69_999] = 8;
+
+        assert!(same(&cached, &cached, &mut buffer));
+        assert!(
+            !same(&grown, &cached, &mut buffer),
+            "an output appended to while compared"
+        );
+        assert!(!same(&cached, &grown, &mut buffer));
+        assert!(!same(&cached[..69_000], &cached, &mut buffer));
+        assert!(!same(&changed, &cached, &mut buffer));
+    }
+
+    #[test]
+    fn output_comparison_retries_an_interrupted_end_of_file_check() {
+        struct InterruptedAtEnd<'a>(&'a [u8], bool);
+        impl std::io::Read for InterruptedAtEnd<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() && !self.1 {
+                    self.1 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let length = self.0.len().min(buffer.len());
+                buffer[..length].copy_from_slice(&self.0[..length]);
+                self.0 = &self.0[length..];
+                Ok(length)
+            }
+        }
+        let cached = vec![3u8; 1000];
+
+        let same = restore::same_bytes(
+            InterruptedAtEnd(&cached, false),
+            InterruptedAtEnd(&cached, false),
+            cached.len() as u64,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert!(same);
+    }
+
+    #[test]
+    fn restore_rollback_leaves_outputs_that_already_matched_in_place() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(2);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let matching = target.path().join("dist/value-00.txt");
+        let changed = target.path().join("dist/value-01.txt");
+        let matching_identity = file_identity(&matching);
+        fs::write(&changed, "locally edited").unwrap();
+        let injected = InjectedBackupSyncFailure::new(
+            std::fs::canonicalize(target.path()).unwrap(),
+            "dist/value-01.txt",
+        );
+
+        let result = restore_archive(&archive_path, target.path(), &["dist/**".into()]);
+        drop(injected);
+
+        assert!(
+            result.is_err(),
+            "the injected sync failure was not observed"
+        );
+        assert!(file_identity(&matching) == matching_identity);
+        assert_eq!(fs::read_to_string(&matching).unwrap(), "cached-value-0");
+        assert_eq!(fs::read_to_string(&changed).unwrap(), "locally edited");
+    }
+
     #[test]
     fn restore_transaction_rolls_back_files_after_apply_failure() {
         let project = tempfile::tempdir().unwrap();
@@ -4023,14 +4258,11 @@ mod tests {
         fs::create_dir(staging.path().join("backups")).unwrap();
         fs::write(staging.path().join("outputs/value.txt"), "replacement").unwrap();
         let project_path = project.path().to_path_buf();
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = Some(BackupSyncFailure {
-            project: project_path.clone(),
-            relative: PathBuf::from("value.txt"),
-        });
+        let injected = InjectedBackupSyncFailure::new(project_path.clone(), "value.txt");
 
         let mut transaction = RestoreTransaction::new(project_path, staging.path(), 1).unwrap();
         let result = transaction.install(Path::new("value.txt"), true);
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = None;
+        drop(injected);
         drop(transaction);
 
         assert!(
@@ -4052,13 +4284,10 @@ mod tests {
         fs::write(project.path().join("stale.txt"), "original").unwrap();
         let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
         let canonical_project = std::fs::canonicalize(project.path()).unwrap();
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = Some(BackupSyncFailure {
-            project: canonical_project,
-            relative: PathBuf::from("stale.txt"),
-        });
+        let injected = InjectedBackupSyncFailure::new(canonical_project, "stale.txt");
 
         let result = staged.apply(&["stale.txt".into()]);
-        *BACKUP_SYNC_FAILURE.lock().unwrap() = None;
+        drop(injected);
 
         assert!(
             result.is_err(),
