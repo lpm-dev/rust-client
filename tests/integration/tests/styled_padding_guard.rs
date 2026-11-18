@@ -4,6 +4,11 @@
 //! length. Pad first and color the padded text, or pass an
 //! `install_ui::TerminalFragment`, which pads by the columns it takes on
 //! screen.
+//!
+//! The guard sees a `Painted` call in a padded argument, in a local of the
+//! same function bound to one, and in format macros nested in other macros.
+//! It can't see through a helper function that returns painted text, so such
+//! a helper should return a `TerminalFragment` instead of a `String`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -34,6 +34,12 @@ enum Row {
 }
 
 #[derive(Debug)]
+struct Layout {
+    widths: Vec<usize>,
+    occupied: Vec<bool>,
+}
+
+#[derive(Debug)]
 struct Cell {
     text: TerminalFragment,
     width: usize,
@@ -107,18 +113,21 @@ impl Table {
 
     /// Lays the rows out in aligned columns.
     ///
-    /// With `max_width` (the terminal's width), a row too wide to fit moves
-    /// its last cell to the next line: under the rightmost earlier column it
-    /// fits under, or else ending at the right edge, so it reads as the end
-    /// of the row above rather than a row of its own. Only a cell wider than
-    /// the terminal still wraps; it starts just inside the row.
+    /// With `max_width` (the terminal's width), the rows that fit it set the
+    /// column widths, as long as at least half of them do. A row that can't
+    /// fit then sets only its first column, so one long value doesn't push
+    /// every other row past the edge. A row too wide to fit moves its last
+    /// cell to the next line: under the rightmost earlier column it fits
+    /// under, or else ending at the right edge, so it reads as the end of the
+    /// row above rather than a row of its own. Only a cell wider than the
+    /// terminal still wraps; it starts just inside the row.
     pub fn render(&self, max_width: Option<usize>) -> Vec<TerminalLine> {
-        let widths = self.column_widths();
+        let layout = self.layout(max_width);
         let mut lines = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
             match row {
                 Row::Line(line) => lines.push(line.clone()),
-                Row::Cells(cells) => self.render_cells(cells, &widths, max_width, &mut lines),
+                Row::Cells(cells) => self.render_cells(cells, &layout, max_width, &mut lines),
             }
         }
         lines
@@ -143,33 +152,66 @@ impl Table {
         self.alignments.get(column).copied().unwrap_or_default()
     }
 
+    /// The width of each column and whether any row holds something in it.
+    ///
     /// A cell sets its column's width unless it ends its row in a
-    /// left-aligned column, where nothing after it needs to line up.
-    fn column_widths(&self) -> Vec<usize> {
-        let mut widths: Vec<usize> = Vec::new();
-        for row in &self.rows {
-            let Row::Cells(cells) = row else { continue };
+    /// left-aligned column, where nothing after it needs to line up. When the
+    /// rows are fitted to `max_width` and at least half of them fit, a row
+    /// that doesn't sets only its first column.
+    fn layout(&self, max_width: Option<usize>) -> Layout {
+        let rows: Vec<&[Cell]> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Cells(cells) => Some(cells.as_slice()),
+                Row::Line(_) => None,
+            })
+            .collect();
+        let columns = rows.iter().map(|cells| cells.len()).max().unwrap_or(0);
+        let mut occupied = vec![false; columns];
+        for cells in &rows {
+            for (column, cell) in cells.iter().enumerate() {
+                occupied[column] |= cell.width > 0;
+            }
+        }
+
+        let fits = |cells: &[Cell]| max_width.is_none_or(|max| self.own_width(cells) <= max);
+        let fitting = rows.iter().filter(|cells| fits(cells)).count();
+        let fitted = max_width.is_some() && fitting * 2 >= rows.len();
+        let mut widths = vec![0; columns];
+        for cells in &rows {
+            let sets_every_column = !fitted || fits(cells);
             let last = cells.len().saturating_sub(1);
             for (column, cell) in cells.iter().enumerate() {
                 if column == last && self.alignment(column) == Align::Left {
                     continue;
                 }
-                if widths.len() <= column {
-                    widths.resize(column + 1, 0);
+                if !sets_every_column
+                    && (column > 0 || max_width.is_some_and(|max| self.indent + cell.width > max))
+                {
+                    continue;
                 }
                 widths[column] = widths[column].max(cell.width);
             }
         }
-        widths
+        Layout { widths, occupied }
+    }
+
+    /// The columns a row takes with no padding at all.
+    fn own_width(&self, cells: &[Cell]) -> usize {
+        self.indent
+            + cells.iter().map(|cell| cell.width).sum::<usize>()
+            + self.gap * cells.len().saturating_sub(1)
     }
 
     fn render_cells(
         &self,
         cells: &[Cell],
-        widths: &[usize],
+        layout: &Layout,
         max_width: Option<usize>,
         lines: &mut Vec<TerminalLine>,
     ) {
+        let widths = layout.widths.as_slice();
         let Some((last, leading)) = cells.split_last() else {
             lines.push(TerminalLine::new(""));
             return;
@@ -184,15 +226,17 @@ impl Table {
         push_spaces(&mut rendered, self.indent);
         let mut column_starts = Vec::with_capacity(cells.len());
         let mut column_start = self.indent;
+        let mut position = self.indent;
         for (column, cell) in leading.iter().enumerate() {
             column_starts.push(column_start);
-            let width = widths.get(column).copied().unwrap_or(cell.width);
-            if width == 0 {
+            if !layout.occupied[column] {
                 continue;
             }
+            let width = widths[column];
             self.push_cell(&mut rendered, column, cell, width);
             push_spaces(&mut rendered, self.gap);
             column_start += width + self.gap;
+            position += width.max(cell.width) + self.gap;
         }
 
         let last_column = leading.len();
@@ -201,7 +245,7 @@ impl Table {
         } else {
             last.width
         };
-        let Some(max) = max_width.filter(|max| column_start + last_width > *max) else {
+        let Some(max) = max_width.filter(|max| position + last_width > *max) else {
             self.push_cell(&mut rendered, last_column, last, last_width);
             lines.push(TerminalLine::from_rendered(rendered));
             return;
@@ -346,6 +390,57 @@ mod tests {
             visible(&table.render(None)),
             ["ok    command found", "warn  slow"]
         );
+    }
+
+    #[test]
+    fn a_row_too_wide_to_fit_does_not_widen_the_columns_of_rows_that_fit() {
+        let long_value = "x".repeat(70);
+        let mut table = Table::new();
+        table.row([
+            plain("release-age-policy"),
+            plain("direct"),
+            plain("default"),
+        ]);
+        table.row([
+            plain("minimum-release-age-exclude"),
+            plain(&long_value),
+            plain("~/.lpm/config.toml"),
+        ]);
+        table.row([plain("sigstore.verify"), plain("deny"), plain("default")]);
+
+        assert_eq!(
+            visible(&table.render(Some(60))),
+            [
+                "  release-age-policy           direct  default".to_owned(),
+                format!("  minimum-release-age-exclude  {long_value}"),
+                format!("{}~/.lpm/config.toml", " ".repeat(31)),
+                "  sigstore.verify              deny    default".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_that_mostly_overflow_keep_every_column_at_its_widest_cell() {
+        let mut table = Table::new();
+        table.row([plain("a"), plain(&"x".repeat(30)), plain("s")]);
+        table.row([plain("b"), plain(&"y".repeat(30)), plain("s")]);
+        table.row([plain("c"), plain("z"), plain("s")]);
+
+        let lines = visible(&table.render(Some(30)));
+
+        assert_eq!(
+            lines[4..],
+            ["  c  z".to_owned(), format!("{}s", " ".repeat(5))]
+        );
+    }
+
+    #[test]
+    fn a_column_holding_only_a_shorter_rows_last_cell_keeps_its_place() {
+        let mut table = Table::new();
+        table.row([plain("a"), plain(""), plain("c")]);
+        table.row([plain("d"), plain("b")]);
+
+        assert_eq!(visible(&table.render(None)), ["  a    c", "  d  b"]);
     }
 
     #[test]

@@ -195,15 +195,20 @@ impl EffectiveConfig {
 
 /// Lays out one group: built-in defaults dimmed so the values something set
 /// stand out, and a run of keys under one long dotted parent nested under
-/// that parent instead of repeating it on every row.
+/// that parent instead of repeating it on every row. Saved keys LPM doesn't
+/// know stay whole: a quoted TOML key can hold a dot, so their dotted form
+/// doesn't say where a parent ends.
 fn group_table(group: &[EffectiveConfigEntry]) -> install_ui::Table {
     const MIN_NESTED_RUN: usize = 3;
 
+    let nests = group
+        .first()
+        .is_some_and(|entry| entry.group != GROUP_ADDITIONAL);
     let mut table = install_ui::Table::new();
     let mut index = 0;
     while index < group.len() {
         let entry = &group[index];
-        if let Some(parent) = nested_parent(&entry.key) {
+        if nests && let Some(parent) = nested_parent(&entry.key) {
             let run = group[index..]
                 .iter()
                 .take_while(|entry| nested_parent(&entry.key) == Some(parent))

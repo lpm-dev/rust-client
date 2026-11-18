@@ -1549,6 +1549,41 @@ fn config_list_nests_firewall_policies_under_one_parent_key() {
 }
 
 #[test]
+fn config_list_keeps_unknown_keys_whole_when_their_names_contain_dots() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[mirrors]\n\"cdn.example.com\" = 1\n\"cdn.example.net\" = 2\n\"cdn.example.org\" = 3\n",
+    );
+
+    let output = lpm(&project)
+        .args(["config", "list"])
+        .output()
+        .expect("failed to run lpm config list");
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim() == "mirrors.cdn.example"),
+        "a dot inside a saved key must not invent a parent key, got:\n{stdout}"
+    );
+    for key in [
+        "mirrors.cdn.example.com",
+        "mirrors.cdn.example.net",
+        "mirrors.cdn.example.org",
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(key)),
+            "{key} must be listed whole, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn config_list_dims_defaults_and_highlights_values_that_were_set() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
     seed_config(&project, "save-exact = true\n");
