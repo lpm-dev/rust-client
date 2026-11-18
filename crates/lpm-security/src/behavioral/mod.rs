@@ -634,6 +634,23 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
     contents: PackageDirectory<'_>,
 ) -> (PackageAnalysis, Option<String>) {
+    let (analysis, fingerprint, directory_changed) =
+        analyze_package_from_open_dir_reading(package_dir, contents, true);
+    if !directory_changed {
+        return (analysis, fingerprint);
+    }
+    // Files read through a held handle came from a directory that has since
+    // been replaced; read the package again by path, as it is now.
+    let (analysis, fingerprint, _) =
+        analyze_package_from_open_dir_reading(package_dir, contents, false);
+    (analysis, fingerprint)
+}
+
+fn analyze_package_from_open_dir_reading(
+    package_dir: &cap_std::fs::Dir,
+    contents: PackageDirectory<'_>,
+    hold_directories: bool,
+) -> (PackageAnalysis, Option<String>, bool) {
     let limits = ScanLimits::INSTALL;
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
@@ -651,8 +668,14 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     native_artifacts.sort_unstable();
     let (candidates, found) = sources.into_read_order();
     let candidate_count = candidates.len();
-    let (mut analyzer, mut fingerprint, over_budget) =
-        analyze_cap_files_with_fingerprint(package_dir, candidates, limits, discovery_complete);
+    let (mut analyzer, mut fingerprint, over_budget, directory_changed) =
+        analyze_cap_files_with_fingerprint(
+            package_dir,
+            candidates,
+            limits,
+            discovery_complete,
+            hold_directories,
+        );
     let skipped = found - candidate_count + over_budget;
     analyzer.skip(skipped);
     let limit_reached = discovery_limit_reached || skipped > 0;
@@ -689,7 +712,7 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
         hasher.update([u8::from(limit_reached)]);
         format!("sha256-{}", hex::encode(hasher.finalize()))
     });
-    (analysis, fingerprint)
+    (analysis, fingerprint, directory_changed)
 }
 
 /// Hash the exact package inputs that can affect behavioral analysis.
@@ -862,7 +885,14 @@ struct PackageDirs<'a> {
     opened: std::collections::BTreeMap<std::path::PathBuf, DirectoryIdentity>,
     reopened_changed: bool,
     tracking_limit: usize,
+    holds_directories: bool,
 }
+
+/// Set once any analysis thread runs out of descriptors. From then on no
+/// [`PackageDirs`] holds directory handles, so the threads still holding
+/// theirs give them back at their next open rather than starving the rest.
+static DIRECTORY_HANDLES_EXHAUSTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectoryIdentity {
@@ -912,6 +942,15 @@ impl<'a> PackageDirs<'a> {
             opened: std::collections::BTreeMap::new(),
             reopened_changed: false,
             tracking_limit,
+            holds_directories: true,
+        }
+    }
+
+    /// Reaches every file by its path, holding one directory at a time.
+    fn holding_none(root: &'a cap_std::fs::Dir) -> Self {
+        Self {
+            holds_directories: false,
+            ..Self::with_tracking_limit(root, 0)
         }
     }
 
@@ -1013,11 +1052,14 @@ impl<'a> PackageDirs<'a> {
         }
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No).nonblock(true);
-        let file = if self.opened.len() >= self.tracking_limit {
+        let hold = self.holds_directories
+            && self.opened.len() < self.tracking_limit
+            && !DIRECTORY_HANDLES_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed);
+        let file = if hold {
+            self.open_through_chain(parent_path, leaf, &options)?
+        } else {
             self.chain.clear();
             self.open_holding_one_directory(parent_path, leaf, &options, false)?
-        } else {
-            self.open_through_chain(parent_path, leaf, &options)?
         };
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.is_symlink() {
@@ -1045,8 +1087,9 @@ impl<'a> PackageDirs<'a> {
             // Give the held handles back and open this file holding one
             // directory at a time, as reopening the path for each file did.
             Err(error) if runs_out_of_descriptors(&error) => {
+                DIRECTORY_HANDLES_EXHAUSTED.store(true, std::sync::atomic::Ordering::Relaxed);
                 self.chain.clear();
-                self.open_holding_one_directory(parent_path, leaf, options, true)
+                self.open_holding_one_directory(parent_path, leaf, options, false)
             }
             opened => opened,
         }
@@ -1202,12 +1245,16 @@ fn analyze_open_cap_source_file(
 /// Reads the `files` a directory walk kept, in read order, within the
 /// package's budgets. Returns the analysis, the input fingerprint unless a
 /// read failed, and how many files the budgets left unread.
+/// Analyses `files` and fingerprints what it read. The last value says a
+/// directory a held handle read from was replaced meanwhile, which also
+/// drops the fingerprint.
 fn analyze_cap_files_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
     files: Vec<SourceFile>,
     limits: ScanLimits,
     fingerprint_valid: bool,
-) -> (PackageAnalyzer, Option<Sha256>, usize) {
+    hold_directories: bool,
+) -> (PackageAnalyzer, Option<Sha256>, usize, bool) {
     use rayon::prelude::*;
 
     let mut analyzer = PackageAnalyzer::with_limits(limits);
@@ -1222,7 +1269,11 @@ fn analyze_cap_files_with_fingerprint(
         files.len().max(1)
     };
 
-    let mut directories = PackageDirs::new(package_dir);
+    let mut directories = if hold_directories {
+        PackageDirs::new(package_dir)
+    } else {
+        PackageDirs::holding_none(package_dir)
+    };
     let mut files = files.into_iter().peekable();
     while files.peek().is_some() {
         let mut opened = Vec::with_capacity(batch_size);
@@ -1284,10 +1335,11 @@ fn analyze_cap_files_with_fingerprint(
             }
         }
     }
-    if fingerprint.is_some() && directories.verify_unchanged().is_err() {
+    let directory_changed = directories.verify_unchanged().is_err();
+    if directory_changed {
         fingerprint = None;
     }
-    (analyzer, fingerprint, over_budget)
+    (analyzer, fingerprint, over_budget, directory_changed)
 }
 
 fn digest_cap_source_file(
@@ -2760,13 +2812,22 @@ mod tests {
             }
             limit += 1;
         }
-        let rlimit = libc::rlimit {
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the valid struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let lowered = libc::rlimit {
             rlim_cur: limit as libc::rlim_t,
-            rlim_max: limit as libc::rlim_t,
+            rlim_max: original.rlim_max,
         };
         // SAFETY: setrlimit reads the valid struct; this child process only
         // runs this test.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) }, 0);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
         let mut directories = PackageDirs::new(&root);
 
         let (_file, size) = directories.open_file(&leaf).unwrap();
@@ -2776,7 +2837,18 @@ mod tests {
             directories.chain.is_empty(),
             "the open ran out of descriptors and held one directory at a time"
         );
+        // SAFETY: as above; restores the soft limit the test lowered.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+            0
+        );
         directories.verify_unchanged().unwrap();
+        let mut other_thread = PackageDirs::new(&root);
+        other_thread.open_file(&leaf).unwrap();
+        assert!(
+            other_thread.chain.is_empty(),
+            "once any reader ran out, no reader holds directories"
+        );
     }
 
     #[test]
@@ -2787,10 +2859,11 @@ mod tests {
             let directory =
                 cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                     .unwrap();
-            let root = package.path().to_path_buf();
+            let displaced = tempfile::tempdir_in(package.path().parent().unwrap()).unwrap();
+            let (root, old_lib) = (package.path().to_path_buf(), displaced.path().join("lib"));
             AFTER_FIRST_SOURCE_OPEN.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || {
-                    std::fs::rename(root.join("lib"), root.join("lib-old")).unwrap();
+                    std::fs::rename(root.join("lib"), old_lib).unwrap();
                     std::fs::create_dir(root.join("lib")).unwrap();
                 }));
             });
@@ -2799,11 +2872,25 @@ mod tests {
                 package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
                     .expect_err("a fingerprint of a directory replaced mid-read was kept");
             } else {
-                let (_, fingerprint) = analyze_package_from_open_dir_with_fingerprint(
+                let (analysis, fingerprint) = analyze_package_from_open_dir_with_fingerprint(
                     &directory,
                     PackageDirectory::Published,
                 );
-                assert_eq!(fingerprint, None);
+                assert!(
+                    !analysis.source.eval && !analysis.source.child_process,
+                    "the analysis must describe the replaced, now empty, lib/"
+                );
+                assert_eq!(
+                    fingerprint,
+                    Some(
+                        package_input_fingerprint_from_open_dir(
+                            &directory,
+                            PackageDirectory::Published
+                        )
+                        .unwrap()
+                    ),
+                    "the package is read again by path and fingerprinted as it is now"
+                );
             }
             assert!(AFTER_FIRST_SOURCE_OPEN.with(|hook| hook.borrow().is_none()));
         }
