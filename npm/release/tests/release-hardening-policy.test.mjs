@@ -690,8 +690,12 @@ test("every release job that holds a signing secret or an OIDC token runs in a p
   // the environment, and the caller's copies are optional so the call
   // still works once the repository-level secrets are gone.
   const preflight = read(".github/workflows/release-preflight.yml");
-  const signing = jobsOf(preflight).find(([name]) => name === "macos-signing")?.[1];
-  assert.ok(signing, "missing macos-signing preflight job");
-  assert.match(signing, /^    environment: release$/m);
+  const preflightEnvironments = {};
+  for (const [name, job] of jobsOf(preflight)) {
+    if (/\$\{\{ secrets\.(?!GITHUB_TOKEN)/.test(job) || /^\s+id-token: write$/m.test(job)) {
+      preflightEnvironments[name] = job.match(/^    environment: (\S+)$/m)?.[1];
+    }
+  }
+  assert.deepEqual(preflightEnvironments, { "macos-signing": "release" });
   assert.doesNotMatch(preflight, /required: true/);
 });
