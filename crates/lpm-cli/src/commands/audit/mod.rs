@@ -189,12 +189,6 @@ pub async fn run(
         Some(s) => FailPolicy::parse(s)?,
         None => FailPolicy::All,
     };
-    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
-        client,
-        project_dir,
-        json_output,
-    )?;
-    let client = &read_context.client;
 
     let scan::AuditScan {
         discovery,
@@ -204,7 +198,14 @@ pub async fn run(
         osv_vulnerabilities: osv_vulns,
         osv_degraded_reason,
         checked_lpm,
-    } = scan::run_scan(client, project_dir, store_version, json_output, level).await?;
+    } = scan::run_scan(
+        scan::RegistryAccess::Project(client),
+        project_dir,
+        store_version,
+        json_output,
+        level,
+    )
+    .await?;
 
     if discovery.packages.is_empty() {
         if json_output {

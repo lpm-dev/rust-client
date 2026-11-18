@@ -236,14 +236,17 @@ async fn run_list_outdated(
         return Ok(());
     }
 
+    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
+        client,
+        &root.global_root(),
+    )?;
+    if !json_output {
+        read_context.announce();
+    }
     let crate::commands::registry_reads::RoutedReadContext {
         client,
         route_table: routes,
-    } = crate::commands::registry_reads::prepare_registry_read_context(
-        client,
-        &root.global_root(),
-        json_output,
-    )?;
+    } = read_context;
     let client = &client;
     let mut outdated: Vec<OutdatedRow> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();

@@ -103,7 +103,7 @@ fn configure_read_context(
         client.base_url(),
         client.npm_registry_url(),
     );
-    configure_read_context_for_origins(client, route_table, &eager_origins, json_output)
+    configure_read_context_for_origins(client, route_table, &eager_origins, !json_output)
 }
 
 pub fn prepare_locked_read_context(
@@ -113,23 +113,22 @@ pub fn prepare_locked_read_context(
 ) -> Result<RoutedReadContext, LpmError> {
     let route_table = RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
-    configure_read_context_for_origins(client, route_table, origins, true)
+    configure_read_context_for_origins(client, route_table, origins, false)
 }
 
 /// The route table that the `.npmrc` files in effect at `config_dir` define,
 /// and `client` with their TLS settings (`cafile=`, `ca=`, `strict-ssl`,
-/// per-origin certificates), for a command that reads registry metadata
-/// itself rather than through `lpm install`. `client`'s LPM and npm
-/// registries build their TLS clients now; any other origin with settings
-/// of its own builds them on first use.
+/// per-origin certificates), for a command that reads a registry itself
+/// rather than through `lpm install`. `client`'s LPM and npm registries
+/// build their TLS clients now; any other origin with settings of its own
+/// builds them on first use.
 ///
-/// `quiet` holds back the advisory `.npmrc` warnings and the TLS summary,
-/// for `--json` output or a command whose install step prints them.
-/// Security warnings always print.
+/// Security warnings print now. The advisory `.npmrc` warnings and the TLS
+/// summary wait for [`RoutedReadContext::announce`], which a command skips
+/// for `--json` output or when its install step prints them itself.
 pub fn prepare_registry_read_context(
     client: &RegistryClient,
     config_dir: &Path,
-    quiet: bool,
 ) -> Result<RoutedReadContext, LpmError> {
     let route_table = RouteTable::from_env_and_filesystem(config_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
@@ -137,19 +136,52 @@ pub fn prepare_registry_read_context(
         .into_iter()
         .filter_map(lpm_registry::npmrc::OriginKey::from_request_url)
         .collect();
-    configure_read_context_for_origins(client, route_table, &eager_origins, quiet)
+    configure_read_context_for_origins(client, route_table, &eager_origins, false)
+}
+
+/// [`prepare_registry_read_context`] for the current directory, announced
+/// unless the output is JSON: the client for a command that reads the
+/// registry without a project of its own.
+pub fn registry_client_for_current_directory(
+    client: &RegistryClient,
+    json_output: bool,
+) -> Result<RegistryClient, LpmError> {
+    let current_dir = std::env::current_dir().map_err(LpmError::Io)?;
+    let context = prepare_registry_read_context(client, &current_dir)?;
+    if !json_output {
+        context.announce();
+    }
+    Ok(context.client)
+}
+
+impl RoutedReadContext {
+    /// Print the advisory `.npmrc` warnings and the effective TLS summary.
+    pub fn announce(&self) {
+        print_npmrc_advisories(&self.route_table);
+        print_tls_summary(&self.client);
+    }
+}
+
+fn print_npmrc_advisories(route_table: &RouteTable) {
+    for warning in route_table.npmrc_warnings() {
+        install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
+    }
+}
+
+fn print_tls_summary(client: &RegistryClient) {
+    if let Some(summary) = client.render_effective_tls_summary() {
+        install_ui::phase_untrusted(&lpm_common::sanitize_terminal_inline(&summary));
+    }
 }
 
 fn configure_read_context_for_origins(
     client: &RegistryClient,
     route_table: RouteTable,
     eager_origins: &[lpm_registry::npmrc::OriginKey],
-    quiet: bool,
+    announce: bool,
 ) -> Result<RoutedReadContext, LpmError> {
-    if !quiet {
-        for warning in route_table.npmrc_warnings() {
-            install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
-        }
+    if announce {
+        print_npmrc_advisories(&route_table);
     }
 
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
@@ -172,8 +204,8 @@ fn configure_read_context_for_origins(
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
 
-    if !quiet && let Some(summary) = configured_client.render_effective_tls_summary() {
-        install_ui::phase_untrusted(&lpm_common::sanitize_terminal_inline(&summary));
+    if announce {
+        print_tls_summary(&configured_client);
     }
 
     Ok(RoutedReadContext {

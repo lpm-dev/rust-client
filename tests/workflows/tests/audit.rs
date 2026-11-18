@@ -4628,3 +4628,37 @@ async fn audit_signatures_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
     );
     assert!(stderr.contains("1 verified"), "{stderr}");
 }
+
+#[tokio::test]
+async fn audit_without_registry_reads_does_not_load_npmrc_tls_files() {
+    let project = TempProject::empty(
+        r#"{"name":"no-registry-audit","version":"1.0.0","dependencies":{"present":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"no-registry-audit","lockfileVersion":3,"packages":{"":{"dependencies":{"present":"1.0.0"}},"node_modules/present":{"version":"1.0.0","resolved":"https://registry.npmjs.org/present/-/present-1.0.0.tgz"}}}"#,
+    );
+    seed_node_modules_package(
+        &project,
+        "present",
+        &[("index.js", "module.exports = 1;\n")],
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "cafile={}\n",
+            project.home().join("missing-ca.pem").display()
+        ),
+    )
+    .unwrap();
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=vuln"]);
+    assert!(
+        output.status.success(),
+        "an audit that reads no registry must not depend on .npmrc TLS files\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

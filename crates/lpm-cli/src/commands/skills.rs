@@ -251,7 +251,21 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     match action {
         SkillsCmd::Add(args) => {
-            run_add(client, args, project_dir, invocation_dir, json_output).await
+            let context = crate::commands::registry_reads::prepare_registry_read_context(
+                client,
+                project_dir,
+            )?;
+            if !json_output {
+                context.announce();
+            }
+            run_add(
+                &context.client,
+                args,
+                project_dir,
+                invocation_dir,
+                json_output,
+            )
+            .await
         }
         SkillsCmd::List(args) => list_skills(project_dir, &args, json_output),
         SkillsCmd::View(args) => view_skill(project_dir, &args, json_output),

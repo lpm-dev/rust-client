@@ -15,14 +15,15 @@ pub async fn run_signatures(
 ) -> Result<(), LpmError> {
     let discovery = discovery::discover_packages_retaining_lpm_lockfile(project_dir)?;
     let inputs = registry_signature_inputs_from_discovery(discovery)?;
+    let read_context =
+        crate::commands::registry_reads::prepare_registry_read_context(client, project_dir)?;
+    if !json_output {
+        read_context.announce();
+    }
     let crate::commands::registry_reads::RoutedReadContext {
         client,
         route_table,
-    } = crate::commands::registry_reads::prepare_registry_read_context(
-        client,
-        project_dir,
-        json_output,
-    )?;
+    } = read_context;
     let report =
         crate::registry_signatures::verify_packages(Arc::new(client), route_table, inputs, true)
             .await;

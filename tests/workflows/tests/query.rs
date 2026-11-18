@@ -1672,3 +1672,41 @@ async fn query_leaves_out_optional_packages_install_skipped_on_this_platform() {
         "the dependency graph has no edge to a package left off this platform"
     );
 }
+
+#[tokio::test]
+async fn query_trusts_the_npmrc_cafile_of_the_lpm_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-query","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"cafile-query","lockfileVersion":3,"packages":{"":{"dependencies":{"@lpm.dev/acme.widget":"1.0.0"}},"node_modules/@lpm.dev/acme.widget":{"version":"1.0.0","resolved":"https://lpm.dev/api/registry/@lpm.dev/acme.widget/-/acme.widget-1.0.0.tgz"}}}"#,
+    );
+    seed_pkg_with_source(&project, "@lpm.dev/acme.widget", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/acme.widget",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": { "1.0.0": {
+            "name": "@lpm.dev/acme.widget",
+            "version": "1.0.0",
+            "deprecated": "use acme.gadget"
+        } }
+    })])
+    .await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front.write_user_npmrc(project.home(), "");
+
+    let output = lpm(&project)
+        .args(["--registry", &front.url, "--json", "query", ":deprecated"])
+        .output()
+        .expect("run lpm query :deprecated");
+    assert!(
+        output.status.success(),
+        "query must reach an LPM registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(matches[0]["name"], "@lpm.dev/acme.widget", "{matches}");
+}

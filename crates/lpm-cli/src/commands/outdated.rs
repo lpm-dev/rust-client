@@ -203,13 +203,12 @@ pub async fn run(
     let read_context = if jobs.is_empty() {
         None
     } else {
-        Some(
-            crate::commands::registry_reads::prepare_registry_read_context(
-                client,
-                project_dir,
-                json_output,
-            )?,
-        )
+        let context =
+            crate::commands::registry_reads::prepare_registry_read_context(client, project_dir)?;
+        if !json_output {
+            context.announce();
+        }
+        Some(context)
     };
     let client = read_context
         .as_ref()

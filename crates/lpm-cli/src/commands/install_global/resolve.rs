@@ -29,11 +29,7 @@ pub(super) async fn pre_resolve(
     let crate::commands::registry_reads::RoutedReadContext {
         client: registry,
         route_table,
-    } = crate::commands::registry_reads::prepare_registry_read_context(
-        registry,
-        routing_root,
-        true,
-    )?;
+    } = crate::commands::registry_reads::prepare_registry_read_context(registry, routing_root)?;
     let registry = &registry;
     let route = route_table.route_for_package(&name);
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the

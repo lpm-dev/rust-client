@@ -100,7 +100,10 @@ impl TlsFront {
                     let (stream, _) = tokio::select! {
                         accepted = listener.accept() => match accepted {
                             Ok(accepted) => accepted,
-                            Err(_) => continue,
+                            Err(_) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                continue;
+                            }
                         },
                         _ = &mut stopped => break,
                     };

@@ -930,10 +930,17 @@ async fn load_registry_package_state(
         .filter(|(name, _)| name.starts_with("@lpm.dev/"))
         .cloned()
         .collect::<Vec<_>>();
+    let context = crate::commands::registry_reads::prepare_routed_read_context(
+        client,
+        project_dir,
+        &names,
+        true,
+    )?;
     let mut metadata = if lpm_names.is_empty() {
         HashMap::new()
     } else {
-        client
+        context
+            .client
             .batch_metadata_deep_with_release_age_packages_and_package_specs(
                 &lpm_names,
                 &[],
@@ -953,12 +960,6 @@ async fn load_registry_package_state(
         .filter(|name| !name.starts_with("@lpm.dev/"))
         .collect::<Vec<_>>();
     if !npm_names.is_empty() {
-        let context = crate::commands::registry_reads::prepare_routed_read_context(
-            client,
-            project_dir,
-            &npm_names,
-            true,
-        )?;
         let routed = futures::stream::iter(npm_names.iter().map(|name| {
             let context = &context;
             async move {

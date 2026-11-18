@@ -52,11 +52,11 @@ pub async fn run_fix(
     json_output: bool,
     dry_run: bool,
 ) -> Result<(), LpmError> {
-    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
-        client,
-        project_dir,
-        json_output || !dry_run,
-    )?;
+    let read_context =
+        crate::commands::registry_reads::prepare_registry_read_context(client, project_dir)?;
+    if !json_output {
+        read_context.announce();
+    }
     run_fix_inner(&read_context.client, project_dir, json_output, dry_run).await
 }
 
