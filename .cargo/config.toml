@@ -9,6 +9,11 @@
 # run each test in parallel.
 [env]
 RUST_MIN_STACK = "16777216"
+# aws-lc seeds its random generator by sampling CPU timing jitter by default,
+# about 25 ms of CPU inside the first TLS handshake of every process. Without
+# it aws-lc seeds from the OS (getentropy/getrandom), as BoringSSL and ring do;
+# the jitter source is there for FIPS rule-of-two deployments.
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
 
 # Phase 46.2 round-4 (2026-05-12): the production binary's MAIN thread
 # stack on Windows is 1 MB by default (vs 8 MB on macOS / Linux), and
