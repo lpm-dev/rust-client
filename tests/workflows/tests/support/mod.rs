@@ -1258,6 +1258,24 @@ pub fn fallback_vault_file(home: &Path, vault_id: &str) -> PathBuf {
         .join(format!("{}.vault", hex::encode(digest.finalize())))
 }
 
+/// Links `folder` to the vault `vault_id` in `home`'s file vault backend, as
+/// LPM does for the folder that creates the vault.
+pub fn link_vault_folder(home: &Path, vault_id: &str, folder: &Path) {
+    let vault_file = fallback_vault_file(home, vault_id);
+    let links = vault_file.with_extension("links");
+    std::fs::create_dir_all(links.parent().expect("vaults directory")).unwrap();
+    let record = serde_json::json!({
+        "schemaVersion": 1,
+        "folders": [folder.canonicalize().unwrap()],
+    });
+    std::fs::write(&links, record.to_string()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&links, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 pub fn write_repeated_file(
     path: &Path,
     prefix: &[u8],

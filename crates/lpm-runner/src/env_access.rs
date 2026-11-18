@@ -100,9 +100,13 @@ impl EnvAccessScope {
         let failure = self.failure.lock().map_err(|_| {
             LpmError::EnvValidation("env approval state is unavailable".to_string())
         })?;
-        failure
-            .as_ref()
-            .map_or(Ok(()), |error| Err(LpmError::EnvValidation(error.clone())))
+        failure.as_ref().map_or(Ok(()), |error| {
+            Err(if lpm_vault::is_env_project_refusal(error) {
+                LpmError::EnvProjectRefused(error.clone())
+            } else {
+                LpmError::EnvValidation(error.clone())
+            })
+        })
     }
 
     fn read<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -264,6 +268,22 @@ mod tests {
             Ok(())
         });
         assert!(matches!(result, Err(LpmError::EnvValidation(error)) if error == "cancelled"));
+    }
+
+    #[test]
+    fn a_swallowed_env_project_refusal_fails_the_invocation_as_a_refusal() {
+        let scope = EnvAccessScope::default();
+        let refusal = "This folder isn't linked to env project vault, which its lpm.json names: \
+                       /work/copy. Run `lpm env link` in that folder to let it use the project's \
+                       values on this machine.";
+        assert!(lpm_vault::is_env_project_refusal(refusal));
+
+        let result = scope.run(|| {
+            let _ = read::<()>(|| Err(refusal.to_string()));
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(LpmError::EnvProjectRefused(error)) if error == refusal));
     }
 
     #[test]

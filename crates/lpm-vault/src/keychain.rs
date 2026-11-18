@@ -2000,7 +2000,9 @@ pub fn delete_vault(vault_id: &str) -> Result<(), String> {
 }
 
 fn delete_vault_unlocked(vault_id: &str) -> Result<(), String> {
-    delete_vault_with_storage_after_recovery(&mut KeychainProjectStorage, vault_id)
+    delete_vault_with_storage_after_recovery(&mut KeychainProjectStorage, vault_id)?;
+    crate::forget_listed(vault_id);
+    crate::links::forget_in_keychain(vault_id)
 }
 
 /// The selected environment's values and personal overrides, read together
@@ -2276,6 +2278,24 @@ fn read_project_metadata(
     }
     validate_vault_id(&record.id)?;
     Ok(Some(ProjectMetadataSnapshot { record }))
+}
+
+/// Whether the Keychain holds values for `vault_id`, found from the item's
+/// attributes without reading it, which could ask for the user's presence.
+pub(crate) fn holds_vault_values(vault_id: &str) -> Result<bool, String> {
+    Ok(crate::macos_keychain::claimed_access(&service(), vault_id)?.is_some())
+}
+
+/// The name and folder the project index records for `vault_id`. The index
+/// items need no approval to read.
+pub(crate) fn recorded_project(vault_id: &str) -> Result<Option<(String, String)>, String> {
+    let mut storage = KeychainProjectStorage;
+    let Some(marker) = read_text(&mut storage, PROJECT_INDEX_MARKER_ACCOUNT)? else {
+        return Ok(None);
+    };
+    let state = decode_project_index_marker(marker)?;
+    Ok(read_project_metadata(&mut storage, vault_id, &state)?
+        .map(|metadata| (metadata.record.name, metadata.record.path)))
 }
 
 fn read_project_discovery(

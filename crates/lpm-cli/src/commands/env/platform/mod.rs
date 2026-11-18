@@ -1920,6 +1920,10 @@ pub(super) async fn vars_connect(
         }
     };
     validate_platform_connect_arguments(platform, &args[1..], USAGE)?;
+    // A folder that isn't linked is refused before it's asked for a token.
+    if let Some(vault_id) = lpm_vault::vault_id::read_vault_id(project_dir) {
+        super::links::ensure_folder_linked_to(project_dir, &vault_id, json_output)?;
+    }
     let platform_token = if let Some(token) = parse_flag(args, "--token") {
         token.to_owned()
     } else {
@@ -1940,6 +1944,7 @@ pub(super) async fn vars_connect(
 
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Env)?;
+    super::links::ensure_folder_linked_to(project_dir, &vault_id, json_output)?;
     let expected_principal_id =
         expected_platform_principal(project_dir, registry_client.base_url(), org_slug)?;
     let platform_context = fetch_platform_context_with_recovery(
@@ -2183,6 +2188,7 @@ pub(super) async fn vars_platform_push(
     let clean = args.contains(&"--clean");
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let vault_id = manifest
         .vault
         .vault_id()
@@ -2478,6 +2484,7 @@ pub(super) async fn vars_platform_status(
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
         LpmError::Env("no env project configured. Run `lpm env set` first".into())
     })?;
+    super::links::ensure_folder_linked_to(project_dir, &vault_id, json_output)?;
     let expected_principal_id = Some(required_platform_principal(
         project_dir,
         registry_client.base_url(),
@@ -2749,6 +2756,7 @@ pub(super) async fn vars_platform_pull(
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Env)?;
+    super::links::ensure_folder_linked_to(project_dir, &vault_id, json_output)?;
     let expected_principal_id = Some(required_platform_principal(
         project_dir,
         registry_client.base_url(),

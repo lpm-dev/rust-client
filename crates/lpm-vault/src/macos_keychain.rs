@@ -27,6 +27,87 @@ thread_local! {
     static PURPOSE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
+/// The folder a command reads a vault for, and the project name the vault's
+/// own records give, so an approval prompt names both rather than an ID.
+struct Requester {
+    vault_id: String,
+    folder: std::path::PathBuf,
+    project_name: Option<String>,
+}
+
+thread_local! {
+    static REQUESTER: std::cell::RefCell<Option<Requester>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Name `folder`, which may use the vault `vault_id`, in the approval
+/// prompts for the vault's items. `project_name` runs only when the vault or
+/// the folder differs from the last one noted.
+pub(crate) fn note_requester(
+    vault_id: &str,
+    folder: &std::path::Path,
+    project_name: impl FnOnce() -> Option<String>,
+) {
+    let noted = REQUESTER.with_borrow(|requester| {
+        requester
+            .as_ref()
+            .is_some_and(|requester| requester.vault_id == vault_id && requester.folder == folder)
+    });
+    if noted {
+        return;
+    }
+    // Read outside the borrow: reading the project record builds prompts too.
+    let project_name = project_name().filter(|name| !name.is_empty());
+    REQUESTER.set(Some(Requester {
+        vault_id: vault_id.to_owned(),
+        folder: folder.to_path_buf(),
+        project_name,
+    }));
+}
+
+const PROMPT_NAME_CHARS: usize = 64;
+
+/// How the prompt names the project: its recorded name, quoted and cut
+/// short, or its vault ID.
+fn prompt_project(vault_id: &str, project_name: Option<&str>) -> String {
+    let Some(name) = project_name else {
+        return vault_id.to_owned();
+    };
+    let quoted = match name.char_indices().nth(PROMPT_NAME_CHARS) {
+        Some((end, _)) => format!("{:?}", format!("{}…", &name[..end])),
+        None => format!("{name:?}"),
+    };
+    lpm_common::sanitize_terminal_inline(&quoted).into_owned()
+}
+
+const PROMPT_FOLDER_CHARS: usize = 72;
+
+/// The folder as the prompt names it: quoted, with the home folder as `~`,
+/// and a long path cut short in the middle, where it says least.
+fn prompt_folder(folder: &std::path::Path) -> String {
+    let shown = dirs::home_dir()
+        .and_then(|home| folder.strip_prefix(home).ok())
+        .map_or_else(
+            || folder.display().to_string(),
+            |relative| {
+                std::path::Path::new("~")
+                    .join(relative)
+                    .display()
+                    .to_string()
+            },
+        );
+    let length = shown.chars().count();
+    let shown = if length > PROMPT_FOLDER_CHARS {
+        let head = PROMPT_FOLDER_CHARS / 3;
+        let tail = PROMPT_FOLDER_CHARS - head - 1;
+        let start: String = shown.chars().take(head).collect();
+        let end: String = shown.chars().skip(length - tail).collect();
+        format!("{start}…{end}")
+    } else {
+        shown
+    };
+    lpm_common::sanitize_terminal_inline(&format!("{shown:?}")).into_owned()
+}
+
 /// Run `run` with every approval prompt saying it's for the project's
 /// local history, as a history command's one prompt must.
 pub(crate) fn prompting_for_local_history<T>(run: impl FnOnce() -> T) -> T {
@@ -40,9 +121,10 @@ pub(crate) fn prompting_for_local_history<T>(run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// The reason the approval prompt gives for reading `account`: a values
-/// item is named by its vault ID, a companion record by what it holds, and
-/// either by what the running command reads for when it says.
+/// The reason the approval prompt gives for reading `account`: the folder
+/// asking and the project's recorded name when a link check noted them, else
+/// its vault ID; a companion record also by what it holds, and either by
+/// what the running command reads for when it says.
 fn operation_prompt(account: &str) -> String {
     use crate::companion::account::CompanionAccount;
     let history = lpm_env_companion::append_log::HISTORY;
@@ -53,9 +135,18 @@ fn operation_prompt(account: &str) -> String {
         Some(kind) if kind == history.kind || kind == history.head_kind => Some("local history"),
         _ => Some("newer data"),
     });
+    let (project, requester) = REQUESTER.with_borrow(|requester| match requester {
+        Some(requester) if requester.vault_id == vault_id => (
+            prompt_project(vault_id, requester.project_name.as_deref()),
+            format!(" in {}", prompt_folder(&requester.folder)),
+        ),
+        _ => (vault_id.to_owned(), String::new()),
+    });
     match holds {
-        Some(holds) => format!("Allow LPM CLI to access env project {vault_id}'s {holds}"),
-        None => format!("Allow LPM CLI to access env project {vault_id}"),
+        Some(holds) => {
+            format!("Allow LPM CLI{requester} to access env project {project}'s {holds}")
+        }
+        None => format!("Allow LPM CLI{requester} to access env project {project}"),
     }
 }
 
@@ -958,6 +1049,97 @@ mod tests {
             )),
             "Allow LPM CLI to access env project proj's newer data"
         );
+    }
+
+    #[test]
+    fn approval_prompts_name_the_folder_asking_and_the_recorded_project() {
+        let vault_id = "8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40";
+        let folder = std::path::Path::new("/srv/checkouts/proj-a");
+        note_requester(vault_id, folder, || Some("proj-a".into()));
+
+        assert_eq!(
+            operation_prompt(vault_id),
+            "Allow LPM CLI in \"/srv/checkouts/proj-a\" to access env project \"proj-a\""
+        );
+        assert_eq!(
+            operation_prompt(&crate::companion::account::record_account(
+                "overrides",
+                vault_id,
+                None
+            )),
+            "Allow LPM CLI in \"/srv/checkouts/proj-a\" to access env project \"proj-a\"'s personal overrides"
+        );
+        assert_eq!(
+            operation_prompt("another-vault"),
+            "Allow LPM CLI to access env project another-vault",
+            "another vault's prompt names nothing it wasn't checked for"
+        );
+    }
+
+    #[test]
+    fn a_requester_s_project_record_is_read_once_per_folder() {
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Some("proj-a".to_owned())
+        };
+        let own = std::path::Path::new("/srv/own");
+
+        note_requester("vault", own, read);
+        note_requester("vault", own, read);
+        note_requester("vault", std::path::Path::new("/srv/other"), read);
+
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn a_requester_without_a_recorded_name_is_prompted_for_by_vault_id() {
+        note_requester("vault", std::path::Path::new("/srv/own"), || {
+            Some(String::new())
+        });
+
+        assert_eq!(
+            operation_prompt("vault"),
+            "Allow LPM CLI in \"/srv/own\" to access env project vault"
+        );
+    }
+
+    #[test]
+    fn a_recorded_name_is_escaped_and_cut_short_in_the_prompt() {
+        let long = "n".repeat(100);
+        assert_eq!(
+            prompt_project("vault", Some("proj\nAllow everything\u{202e}")),
+            "\"proj\\nAllow everything\\u{202e}\""
+        );
+        assert_eq!(
+            prompt_project("vault", Some(&long)),
+            format!("\"{}…\"", "n".repeat(PROMPT_NAME_CHARS))
+        );
+    }
+
+    #[test]
+    fn a_folder_under_home_is_prompted_for_from_home() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        assert_eq!(
+            prompt_folder(&home.join("code").join("proj-a")),
+            "\"~/code/proj-a\""
+        );
+    }
+
+    #[test]
+    fn a_folder_in_the_prompt_is_quoted_and_a_long_one_cut_short_in_the_middle() {
+        let deep = std::path::Path::new("/srv")
+            .join("a".repeat(100))
+            .join("x to access env project \"other\" and");
+
+        let shown = prompt_folder(&deep);
+
+        assert!(shown.starts_with("\"/srv/aaa"), "{shown}");
+        assert!(shown.ends_with("\\\"other\\\" and\""), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
     }
 
     #[test]

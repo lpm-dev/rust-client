@@ -151,6 +151,17 @@ fn existing_legacy_vault_file_name(
         .then_some(legacy))
 }
 
+/// Whether the vault has a file, under its current or its legacy name, found
+/// without decrypting it.
+pub(crate) fn vault_file_exists(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<bool, String> {
+    let vaults = directory.open_or_create_directory("vaults")?;
+    Ok(vaults.entry_exists(&vault_file_name(vault_id))?
+        || existing_legacy_vault_file_name(&vaults, vault_id)?.is_some())
+}
+
 /// The vault's encrypted file and the name it's under, if it has one.
 fn read_vault_content(
     vaults: &crate::storage_transaction::VaultStorageDirectory,
@@ -908,10 +919,12 @@ pub(crate) fn write_vault_file_env(
 }
 
 /// Delete the encrypted vault files and every companion record through the
-/// deletion protocol.
+/// deletion protocol, then the folders linked to the vault.
 pub fn delete_vault_file(vault_id: &str) -> Result<(), String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        companion::delete_project_unlocked(directory, vault_id)
+        companion::delete_project_unlocked(directory, vault_id)?;
+        crate::forget_listed(vault_id);
+        crate::links::forget_in_files(directory, vault_id)
     })
 }
 
@@ -1265,6 +1278,26 @@ pub(crate) mod tests {
                 read_vault_file_env("Other-Vault", "default").expect("read theirs again"),
                 Some(secrets("theirs"))
             );
+        });
+    }
+
+    #[test]
+    fn deleting_a_vault_removes_its_folder_links() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let folder = home.join("project");
+            std::fs::create_dir_all(&folder).unwrap();
+            write_vault_file("linked-vault", &secrets("value")).expect("write");
+            with_storage_directory(|directory| {
+                crate::links::add(directory, &folder, "linked-vault").map(drop)
+            });
+
+            delete_vault_file("linked-vault").expect("delete");
+
+            let (folders, _) = with_storage_directory(|directory| {
+                crate::links::listing(directory, &folder, "linked-vault")
+            });
+            assert!(folders.is_empty(), "{folders:?}");
         });
     }
 

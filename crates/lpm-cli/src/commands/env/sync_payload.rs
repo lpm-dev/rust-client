@@ -54,6 +54,21 @@ impl CloudManifestSnapshot {
             sources,
         })
     }
+
+    /// Fails unless `project_dir` may use the env project this snapshot
+    /// names; at a terminal, asks whether to link it first.
+    pub fn ensure_folder_linked(
+        &self,
+        project_dir: &std::path::Path,
+        json_output: bool,
+    ) -> Result<(), LpmError> {
+        match self.vault.vault_id().map_err(LpmError::Env)? {
+            Some(vault_id) => {
+                super::links::ensure_folder_linked_to(project_dir, vault_id, json_output)
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 pub(super) fn verify_schema_snapshot(

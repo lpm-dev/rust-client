@@ -1654,8 +1654,12 @@ fn env_check_json_exits_nonzero_and_reports_invalid_environment() {
     insta::assert_json_snapshot!("env_check_json_invalid", envelope);
 }
 
+/// The transactions that read or write values, not those that check a
+/// folder's links.
 fn vault_transactions(log: &std::path::Path) -> usize {
-    std::fs::read_to_string(log).map_or(0, |log| log.lines().count())
+    std::fs::read_to_string(log).map_or(0, |log| {
+        log.lines().filter(|line| *line == "transaction").count()
+    })
 }
 
 #[test]

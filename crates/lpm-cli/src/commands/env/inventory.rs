@@ -142,6 +142,7 @@ pub(super) fn vars_init(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let vault_id = manifest
         .vault
         .vault_id()
@@ -393,6 +394,7 @@ fn effective_schema_vars<'a>(
 
 pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let vault_id = manifest
         .vault
         .vault_id()

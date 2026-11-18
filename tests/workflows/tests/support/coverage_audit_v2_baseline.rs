@@ -3900,6 +3900,36 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_history.rs", 3)],
         last_audited_at: "2026-11-05",
     },
+    // ── id 181: lpm env link / unlink / links ──
+    SurfaceV2 {
+        id: 181,
+        scenarios: 16,
+        failure_modes_tested: &[
+            "a folder that isn't linked gets none of the project's values, through run, exec or env",
+            "run, a script shortcut, run-file and a workspace run refuse it as a refusal",
+            "a run checks its folder's link once",
+            "env link replaces folder links that can't be read",
+            "env unlink takes a relative folder from where it runs",
+            "listing, syncing and comparing values refuse a folder that isn't linked",
+            "a folder that isn't linked is refused with its own JSON error envelope",
+            "a linked checkout of the same project uses its values",
+            "link asks first and needs --yes without a terminal",
+            "unlink stops a folder from using the project",
+            "a deleted folder is unlinked by its path",
+            "a vault from before links lets no folder use it until one is linked",
+            "a folder naming a vault this machine holds no values for isn't refused",
+            "env init in a fresh clone links the folder it imports into",
+            "a workspace run refuses a member that isn't linked",
+            "link, links and unlink report their JSON envelopes, including repeats",
+        ],
+        failure_modes_known: &[
+            "the Keychain backend's link item, which the workflow harness doesn't reach",
+            "the prompt that links a folder at a terminal when a command needs it",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/env_folder_links.rs", 16)],
+        last_audited_at: "2026-11-17",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

@@ -307,6 +307,7 @@ pub async fn run_external_shortcut(
     let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
 
     if script_or_task_exists(project_dir, command_name)? {
+        crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
         return run_multi(
             project_dir,
             std::slice::from_ref(command_name),
@@ -326,6 +327,7 @@ pub async fn run_external_shortcut(
         return Err(missing_external_shortcut_error(command_name));
     }
 
+    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
     let bin_hint = prepare_runtime(project_dir, json_output).await?;
     install_ui::phase_line(crate::install_ui::terminal_line!(
         "Executing {}",

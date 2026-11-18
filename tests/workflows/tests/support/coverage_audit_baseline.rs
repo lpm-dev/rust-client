@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 180;
+pub const EXPECTED_SURFACE_COUNT: usize = 181;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -2278,6 +2278,20 @@ pub const SURFACES: &[SurfaceBaseline] = &[
             "crates/lpm-cli/src/commands/env/history.rs",
             "crates/lpm-env-companion/src/history/rebuild/tests.rs",
             "tests/workflows/tests/env_history.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 181,
+        name: "`lpm env link / unlink / links`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/env/links.rs",
+            "crates/lpm-vault/src/links.rs",
+            "tests/workflows/tests/env_folder_links.rs",
         ],
     },
 ];

@@ -47,6 +47,7 @@ pub(super) async fn vars_push(
     let force = args.contains(&"--force");
     let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    manifest.ensure_folder_linked(project_dir, json_output)?;
     let schema_value = std::sync::Arc::new(super::sync_payload::checked_push_schema_value(
         manifest.config.as_ref(),
     )?);
