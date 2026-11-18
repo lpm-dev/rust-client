@@ -538,4 +538,43 @@ test("release metadata accepts only whole, valid dispatch inputs when its script
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+test("a published release must be immutable, checked after every publication path", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const jobs = jobsOf(workflow);
+  const entry = jobs.find(([name]) => name === "require-immutable-release");
+  assert.ok(entry, "missing require-immutable-release job");
+  const [, job] = entry;
+  assert.equal(jobs.at(-1)[0], "require-immutable-release", "the check runs after Homebrew, last");
+  for (const dependency of ["finalize-promotion-release", "publish-release", "release-metadata", "update-homebrew"]) {
+    assert.match(job, new RegExp(`\\n      - ${dependency}\\n`), `must wait for ${dependency}`);
+  }
+  assert.match(job, /needs\.finalize-promotion-release\.result == 'success' \|\|\s+needs\.publish-release\.result == 'success'/);
+  assert.match(job, /permissions:\n\s+contents: read\n/);
+  assert.match(job, /RELEASE_TAG: \$\{\{ needs\.release-metadata\.outputs\.tag \}\}/);
+  assert.match(job, /releases\/tags\/\$\{RELEASE_TAG\}/);
+  assert.match(job, /\.immutable == true/);
+  assert.match(job, /exit 1/);
+});
+
+test("the installer's security floor admits only releases that can update to main-signed releases", () => {
+  const installer = read("install.sh");
+  const floor = installer.match(/^MIN_VERSION="v(\d+)\.(\d+)\.(\d+)"$/m);
+  assert.ok(floor, "install.sh must set MIN_VERSION to vX.Y.Z");
+  const [major, minor, patch] = floor.slice(1).map(Number);
+  // 0.85.0 is the first release that follows the releases signed from main
+  // and binds a release to its signed source commit.
+  assert.ok(
+    major > 0 || minor > 85 || (minor === 85 && patch >= 0),
+    `MIN_VERSION v${major}.${minor}.${patch} is below v0.85.0`,
+  );
+  const workspace = read("Cargo.toml").match(/^\[workspace\.package\]\nversion = "(\d+)\.(\d+)\.(\d+)"$/m);
+  assert.ok(workspace, "missing workspace version");
+  const [wMajor, wMinor, wPatch] = workspace.slice(1).map(Number);
+  assert.ok(
+    major < wMajor || (major === wMajor && (minor < wMinor || (minor === wMinor && patch <= wPatch))),
+    "the floor can't be above the release being built, or every install of it is refused",
+  );
+
+  const harness = read("tests/install-sh/run.sh");
+  assert.match(harness, new RegExp(`^FIXTURE_VERSION="v${major}\\.${minor}\\.${patch}"$`, "m"));
 });

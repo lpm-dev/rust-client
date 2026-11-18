@@ -5,8 +5,10 @@
 # Installs the latest (or requested) LPM CLI binary to ~/.lpm/bin and adds it to PATH.
 # Every downloaded byte is verified against a signed SHA256SUMS.txt
 # manifest before chmod +x; cosign verify-blob runs opportunistically
-# when a cosign binary is on PATH. Set LPM_INSTALL_INSECURE=1 to skip
-# all integrity checks (NOT recommended; emergency-recovery only).
+# when a cosign binary is on PATH. Set LPM_INSTALL_REQUIRE_SIGSTORE=1 to
+# refuse to install unless cosign verifies who published the release.
+# Set LPM_INSTALL_INSECURE=1 to skip all integrity checks (NOT
+# recommended; emergency-recovery only).
 # Set LPM_INSTALL_CHANNEL=nightly to install the latest nightly.
 # Set LPM_INSTALL_VERSION=vX.Y.Z to install a specific release tag.
 
@@ -46,17 +48,20 @@ plist_array_contains_exact() {
   '
 }
 
-# Minimum version this installer is willing to deliver. Bumped manually
-# alongside each release that fixes a security-relevant gap. The floor
-# is a downgrade-resistance gate: an attacker who controls the GitHub
-# API response (or a downstream mirror) cannot point a fresh installer
-# at an old, known-vulnerable release — even one with a valid SHA-256
-# manifest and Sigstore signature (the old release IS authentically
-# signed; the floor refuses to install it anyway).
+# Minimum version this installer is willing to deliver. Raise it after
+# each stable release that fixes a security-relevant gap is published,
+# never before: a floor above the latest release refuses every install.
+# The floor is a downgrade-resistance gate: an attacker who controls the
+# GitHub API response (or a downstream mirror) cannot point a fresh
+# installer at an old, known-vulnerable release — even one with a valid
+# SHA-256 manifest and Sigstore signature (the old release IS
+# authentically signed; the floor refuses to install it anyway). It
+# can't go below v0.85.0, the first release that can update itself to
+# the releases signed from main.
 #
 # Override only as documented recovery; sets the same signal as
 # LPM_INSTALL_INSECURE but scoped to the floor check.
-MIN_VERSION="v0.43.0"
+MIN_VERSION="v0.87.0"
 
 # Strict POSIX vX.Y.Z[-prerelease] comparator. Pre-release suffixes are
 # trimmed before comparison: `v0.43.0-rc1 < v0.43.0` per the relaxed
@@ -150,6 +155,27 @@ else
     echo "Cannot verify the LPM download integrity without one of them."
     echo "Emergency workaround: LPM_INSTALL_INSECURE=1 sh install.sh"
     echo "                      (NOT recommended; skips ALL integrity checks)"
+    exit 1
+  fi
+fi
+
+REQUIRE_SIGSTORE="${LPM_INSTALL_REQUIRE_SIGSTORE:-0}"
+case "$REQUIRE_SIGSTORE" in
+  0|1) ;;
+  *)
+    echo "ERROR: LPM_INSTALL_REQUIRE_SIGSTORE must be 0 or 1 (got '$REQUIRE_SIGSTORE')"
+    exit 1
+    ;;
+esac
+if [ "$REQUIRE_SIGSTORE" = "1" ]; then
+  if [ "${LPM_INSTALL_INSECURE:-0}" = "1" ]; then
+    echo "ERROR: LPM_INSTALL_REQUIRE_SIGSTORE=1 asks for the signature check that LPM_INSTALL_INSECURE=1 skips."
+    echo "       Unset one of them."
+    exit 1
+  fi
+  if ! command -v cosign >/dev/null 2>&1; then
+    echo "ERROR: LPM_INSTALL_REQUIRE_SIGSTORE=1 needs cosign on PATH to verify who published the release."
+    echo "       Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/"
     exit 1
   fi
 fi
@@ -332,6 +358,7 @@ BUNDLE_PREVIOUS_LPX=""
 BUNDLE_FINAL_APP=""
 BUNDLE_FINAL_LPM="$INSTALL_DIR/$BINARY_NAME"
 BUNDLE_FINAL_LPX="$INSTALL_DIR/$ALIAS_NAME"
+STAGED_BINARY=""
 
 rollback_macos_bundle_transaction() {
   [ "$BUNDLE_TRANSACTION_ACTIVE" = "1" ] || return 0
@@ -411,6 +438,9 @@ rollback_macos_bundle_transaction() {
 
 cleanup() {
   rm -rf "$STAGE_DIR"
+  if [ -n "$STAGED_BINARY" ]; then
+    rm -f "$STAGED_BINARY"
+  fi
   if [ -n "$BUNDLE_STAGE_ROOT" ] && [ "$BUNDLE_ROLLBACK_INCOMPLETE" != "1" ]; then
     rm -rf "$BUNDLE_STAGE_ROOT"
   fi
@@ -450,11 +480,15 @@ elif [ -n "$SHA_TOOL" ]; then
     echo "Or set LPM_INSTALL_INSECURE=1 to skip integrity verification (NOT recommended)."
     exit 1
   fi
-  # Bundle is opportunistic — cosign verify only fires when both the
-  # bundle AND cosign are present. Bundle 404 is not an attack signal
-  # by itself (the SHA gate still runs), but missing-cosign means we
-  # cannot make a stronger claim, so we degrade quietly.
+  # Without cosign, or without a bundle, the SHA gate still runs; the
+  # installer then says that it couldn't verify who published the
+  # release. LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses that case instead.
   curl -fsSL --max-time 30 "$BUNDLE_URL" -o "$BUNDLE_TMP" 2>/dev/null || rm -f "$BUNDLE_TMP"
+  if [ "$REQUIRE_SIGSTORE" = "1" ] && [ ! -s "$BUNDLE_TMP" ]; then
+    echo "ERROR: release $VERSION has no Sigstore bundle ($BUNDLE_URL),"
+    echo "       so cosign can't verify who published it. LPM_INSTALL_REQUIRE_SIGSTORE=1 is set; refusing to install."
+    exit 1
+  fi
 fi
 
 RELEASE_ASSET="$PLATFORM"
@@ -524,8 +558,35 @@ elif [ -n "$SHA_TOOL" ]; then
         exit 1
       }
     echo "Verified Sigstore signature on manifest (identity-pinned to release.yml)"
+  elif [ "$MACOS_BUNDLE" != "1" ]; then
+    # On macOS the Developer ID signature and notarization checks below
+    # verify the publisher independently of GitHub.
+    if command -v cosign >/dev/null 2>&1; then
+      unverified_reason="the release has no Sigstore bundle"
+    else
+      unverified_reason="cosign isn't installed"
+    fi
+    echo "Note: the publisher of this release wasn't verified, because $unverified_reason."
+    echo "      The download matches the checksums published with the release."
+    echo "      Install cosign to verify the publisher, or set LPM_INSTALL_REQUIRE_SIGSTORE=1"
+    echo "      to refuse to install without that check."
   fi
 fi
+
+# A release's binary must report the version it was published as. This
+# catches an authentic signed manifest of another release served under
+# this version's path. The binary runs from the install directory, since
+# the temporary directory may be mounted noexec.
+require_reported_version() {
+  [ "${LPM_INSTALL_INSECURE:-0}" = "1" ] && return 0
+  expected_version_line="lpm ${VERSION#v}"
+  reported_version_line=$("$1" --version 2>/dev/null) || reported_version_line=""
+  if [ "$reported_version_line" != "$expected_version_line" ]; then
+    echo "ERROR: the downloaded binary reports '$reported_version_line', but the release is $VERSION."
+    echo "Refusing to install a binary from another release."
+    return 1
+  fi
+}
 
 # stapler validate checks the stapled ticket against Apple's CloudKit record
 # and exits with EX_NOHOST when CloudKit doesn't answer. CloudKit lookups have
@@ -715,6 +776,7 @@ install_macos_bundle() {
   "$MACOS_DITTO_TOOL" "$extracted_app" "$BUNDLE_STAGED_APP"
   validate_macos_bundle "$BUNDLE_STAGED_APP" "staged $EXPECTED_APP_NAME" \
     "$extracted_app" "$downloaded_cdhash"
+  require_reported_version "$BUNDLE_STAGED_APP/Contents/MacOS/lpm-rs" || return 1
   ln -s "$link_target" "$new_lpm"
   ln -s "$link_target" "$new_lpx"
 
@@ -803,8 +865,12 @@ install_macos_bundle() {
 if [ "$MACOS_BUNDLE" = "1" ] && [ "$LEGACY_MACOS" != "1" ]; then
   install_macos_bundle "$DOWNLOAD_TMP"
 else
-  mv "$DOWNLOAD_TMP" "$INSTALL_DIR/$BINARY_NAME"
-  chmod +x "$INSTALL_DIR/$BINARY_NAME"
+  STAGED_BINARY=$(mktemp "$INSTALL_DIR/.$BINARY_NAME.new.XXXXXX")
+  mv "$DOWNLOAD_TMP" "$STAGED_BINARY"
+  chmod +x "$STAGED_BINARY"
+  require_reported_version "$STAGED_BINARY" || exit 1
+  mv "$STAGED_BINARY" "$INSTALL_DIR/$BINARY_NAME"
+  STAGED_BINARY=""
   ln -sf "$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
 fi
 
