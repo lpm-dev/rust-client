@@ -4866,6 +4866,22 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     #[test]
+    fn release_provenance_rejects_nightly_certificate_issued_to_a_push() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.build_trigger = Some("push".to_string());
+        let err = validate_release_provenance(
+            "0.75.0-nightly.20260817.1.1e98fb8",
+            &snapshot,
+            &build,
+            &statement,
+            None,
+        )
+        .expect_err("nightlies are scheduled or started by hand");
+        assert!(err.to_string().contains("`push`"), "{err}");
+    }
+
+    #[test]
     fn release_provenance_rejects_certificate_without_build_claims() {
         let (snapshot, _, statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);

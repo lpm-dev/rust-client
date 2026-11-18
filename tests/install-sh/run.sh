@@ -288,6 +288,9 @@ run_install_sh() {
     LPM_INSTALL_TEST_INTERRUPT_AFTER="${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" \
     LPM_MV_FAILURE_COUNT_FILE="${LPM_MV_FAILURE_COUNT_FILE:-}" \
     LPM_TEST_TOOL_STATE="${LPM_TEST_TOOL_STATE:-}" \
+    LPM_TEST_COSIGN_REFUSES="${LPM_TEST_COSIGN_REFUSES:-}" \
+    LPM_TEST_COSIGN_REFUSED_TRIGGER="${LPM_TEST_COSIGN_REFUSED_TRIGGER:-}" \
+    RELEASE_COMMIT="${RELEASE_COMMIT:-}" \
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_MIN_VERSION_OVERRIDE="${LPM_INSTALL_MIN_VERSION_OVERRIDE:-}" \
@@ -1077,7 +1080,8 @@ case "$cosign_args" in
   *) fail "nightly cosign check must hold the main identity: $cosign_args" ;;
 esac
 case "$cosign_args" in
-  *--certificate-github-workflow-trigger*) fail "a nightly may come from either trigger: $cosign_args" ;;
+  *"--certificate-github-workflow-trigger schedule "*) ;;
+  *) fail "a nightly is first checked as a scheduled run: $cosign_args" ;;
 esac
 write_signed_release "$fdir" 'require-sigstore-binary-bytes' "$FIXTURE_VERSION"
 
@@ -1278,6 +1282,79 @@ trap - EXIT
 [ "$RUN_RC" -eq 0 ] || fail "only the first line of --version names the version: $RUN_OUT"
 rm -rf "$fdir"
 pass "only the first line of --version names the version"
+
+# ── Case 19: cosign's verdict and the signing identity's binding ──
+signer_commit="1e98fb8efbcc00f620678fc8091b512ed503768f"
+cosign_state="$(mktemp -d)"
+cat > "$CLEAN_PATH_DIR/cosign" <<'COSIGN'
+#!/bin/sh
+printf '%s\n' "$@" > "$LPM_TEST_TOOL_STATE/cosign-args"
+printf '%s\n' "$*" >> "$LPM_TEST_TOOL_STATE/cosign-calls"
+case " $* " in
+  *" --certificate-github-workflow-trigger ${LPM_TEST_COSIGN_REFUSED_TRIGGER:-none} "*) exit 1 ;;
+esac
+[ -z "${LPM_TEST_COSIGN_REFUSES:-}" ]
+COSIGN
+chmod +x "$CLEAN_PATH_DIR/cosign"
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "$signer_commit" > "$fdir/api.json"
+write_signed_release "$fdir" 'signer-binding-binary-bytes' "$FIXTURE_VERSION"
+trap 'stop_server' EXIT
+start_server "$fdir"
+
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSES=1 run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSES
+[ "$RUN_RC" -ne 0 ] || fail "a signature cosign refused must stop the install: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "cosign refused the signature on SHA256SUMS.txt" \
+  || fail "cosign refusal was unclear: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a refused signature must not install anything"
+
+for target in main ""; do
+  if [ -n "$target" ]; then
+    printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "$target" > "$fdir/api.json"
+  else
+    printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+  fi
+  rm -f "$cosign_state/cosign-args"
+  LPM_TEST_TOOL_STATE="$cosign_state" run_install_sh
+  unset LPM_TEST_TOOL_STATE
+  [ "$RUN_RC" -ne 0 ] || fail "a latest release without its commit ('$target') must not be verified unbound: $RUN_OUT"
+  echo "$RUN_OUT" | grep -q "doesn't name the commit" \
+    || fail "unbound latest release refusal was unclear: $RUN_OUT"
+  [ ! -e "$cosign_state/cosign-args" ] || fail "cosign ran without the release commit"
+done
+
+# An explicit version is never bound to a commit, whatever the caller's
+# environment holds.
+LPM_TEST_TOOL_STATE="$cosign_state" RELEASE_COMMIT="$signer_commit" LPM_INSTALL_VERSION="$FIXTURE_VERSION" \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE RELEASE_COMMIT LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "an explicit version must verify without a commit: $RUN_OUT"
+case "$(tr '\n' ' ' < "$cosign_state/cosign-args")" in
+  *--certificate-github-workflow-sha*) fail "an inherited RELEASE_COMMIT reached cosign" ;;
+esac
+
+# A nightly is scheduled or started by hand, and nothing else.
+write_signed_release "$fdir" 'nightly-trigger-binary-bytes' "$NIGHTLY_VERSION"
+rm -f "$cosign_state/cosign-calls"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSED_TRIGGER=schedule LPM_INSTALL_VERSION="$NIGHTLY_VERSION" \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSED_TRIGGER LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a nightly started by hand must verify: $RUN_OUT"
+grep -q -- '--certificate-github-workflow-trigger schedule ' "$cosign_state/cosign-calls" \
+  || fail "a nightly must first be checked as a scheduled run"
+grep -q -- '--certificate-github-workflow-trigger workflow_dispatch ' "$cosign_state/cosign-calls" \
+  || fail "a nightly must then be checked as a run started by hand"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSES=1 LPM_INSTALL_VERSION="$NIGHTLY_VERSION" \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSES LPM_INSTALL_VERSION
+[ "$RUN_RC" -ne 0 ] || fail "a nightly from any other trigger must be refused: $RUN_OUT"
+
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+rm -rf "$fdir" "$cosign_state"
+pass "cosign's verdict decides, and the signing identity is bound as each release allows"
 
 echo
 for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do

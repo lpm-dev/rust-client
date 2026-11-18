@@ -247,6 +247,7 @@ if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_SECURITY:-}${LPM_INSTA
 fi
 
 REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
+RELEASE_COMMIT=""
 INSTALL_CHANNEL="${LPM_INSTALL_CHANNEL:-stable}"
 
 case "$INSTALL_CHANNEL" in
@@ -281,7 +282,7 @@ else
     RELEASE_COMMIT=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"target_commitish"' | sed -E 's/.*"target_commitish": *"([0-9a-f]{40})".*/\1/')
   fi
 fi
-case "${RELEASE_COMMIT:-}" in
+case "$RELEASE_COMMIT" in
   *[!0-9a-f]*|"") RELEASE_COMMIT="" ;;
 esac
 [ "${#RELEASE_COMMIT}" -eq 40 ] || RELEASE_COMMIT=""
@@ -517,20 +518,21 @@ elif [ -n "$SHA_TOOL" ]; then
 fi
 
 # The one identity each release was signed with: release.yml in this
-# repository, run by hand on main for a stable release (by the schedule or
-# by hand for a nightly), at the commit the release records when the
-# installer knows it. Stable releases up to v0.76.5 were signed from their
-# own tag by a tag push. The staged version check below binds the rest.
+# repository, on main, run by hand for a stable release and by the schedule
+# or by hand for a nightly. When the installer looks up the latest stable
+# release itself, the signature must also be for the commit that release
+# records. Stable releases up to v0.76.5 were signed from their own tag by
+# a tag push. The staged version check below binds an explicit version.
 verify_manifest_signer() {
   if [ "$RESOLVED_CHANNEL" = "stable" ] && version_lt "$VERSION" "v0.77.0"; then
     signing_ref="refs/tags/$VERSION"
-    signing_trigger="push"
+    signing_triggers="push"
   elif [ "$RESOLVED_CHANNEL" = "stable" ]; then
     signing_ref="refs/heads/main"
-    signing_trigger="workflow_dispatch"
+    signing_triggers="workflow_dispatch"
   else
     signing_ref="refs/heads/main"
-    signing_trigger=""
+    signing_triggers="schedule workflow_dispatch"
   fi
   set -- \
     --bundle "$BUNDLE_TMP" \
@@ -538,13 +540,16 @@ verify_manifest_signer() {
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
     --certificate-github-workflow-repository "$REPO" \
     --certificate-github-workflow-ref "$signing_ref"
-  if [ -n "$signing_trigger" ]; then
-    set -- "$@" --certificate-github-workflow-trigger "$signing_trigger"
-  fi
   if [ -n "$RELEASE_COMMIT" ]; then
     set -- "$@" --certificate-github-workflow-sha "$RELEASE_COMMIT"
   fi
-  cosign verify-blob "$@" "$MANIFEST_TMP" >/dev/null 2>&1
+  for signing_trigger in $signing_triggers; do
+    if cosign verify-blob "$@" --certificate-github-workflow-trigger "$signing_trigger" \
+      "$MANIFEST_TMP" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 RELEASE_ASSET="$PLATFORM"
@@ -604,6 +609,11 @@ elif [ -n "$SHA_TOOL" ]; then
   # fail-closed on rejection. `cosign` absent → SHA-only floor.
   if command -v cosign >/dev/null 2>&1 && [ -s "$BUNDLE_TMP" ]; then
     echo "cosign detected; verifying manifest signature..."
+    if [ -z "$REQUESTED_VERSION" ] && [ "$RESOLVED_CHANNEL" = "stable" ] && [ -z "$RELEASE_COMMIT" ]; then
+      echo "ERROR: the latest-release lookup doesn't name the commit $VERSION was published from,"
+      echo "       so its signature can't be bound to that release. Refusing to install."
+      exit 1
+    fi
     verify_manifest_signer || {
       echo "ERROR: cosign refused the signature on SHA256SUMS.txt — manifest is not authentically from $REPO release.yml"
       exit 1
