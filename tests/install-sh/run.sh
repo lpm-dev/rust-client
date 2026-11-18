@@ -1069,6 +1069,93 @@ leftovers="$(find "$existing_home/.lpm" \( -name '.lpm.new.*' -o -name '.lpm-ins
 rm -rf "$fdir" "$existing_home"
 pass "a binary that reports another version is refused before install"
 
+# ── Case 15: a prerelease of the floor version is below the floor ──
+fdir="$(mktemp -d)"
+floor_nightly="0.87.0-nightly.20261111.264.1d26c11"
+printf '{"version": "%s"}\n' "$floor_nightly" > "$fdir/api.json"
+write_signed_release "$fdir" 'floor-nightly-binary-bytes' "v$floor_nightly"
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_CHANNEL=nightly run_install_sh
+unset LPM_INSTALL_CHANNEL
+[ "$RUN_RC" -ne 0 ] || fail "a nightly built before the floor release must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "detected version v$floor_nightly is below the minimum supported v0.87.0" \
+  || fail "floor refusal of a nightly was unclear: $RUN_OUT"
+LPM_INSTALL_VERSION="v$floor_nightly" run_install_sh
+unset LPM_INSTALL_VERSION
+[ "$RUN_RC" -ne 0 ] || fail "an explicit nightly built before the floor release must be refused: $RUN_OUT"
+stop_server
+trap - EXIT
+rm -rf "$fdir"
+pass "a nightly of the floor version is below the floor"
+
+# ── Case 16: with cosign installed, a release without a bundle is refused
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "1e98fb8efbcc00f620678fc8091b512ed503768f" > "$fdir/api.json"
+write_signed_release "$fdir" 'no-bundle-binary-bytes' "$FIXTURE_VERSION"
+rm -f "$fdir/SHA256SUMS.txt.sigstore"
+printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/cosign"
+chmod +x "$CLEAN_PATH_DIR/cosign"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+[ "$RUN_RC" -ne 0 ] || fail "with cosign installed, a release without a bundle must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "has no Sigstore bundle" \
+  || fail "missing-bundle refusal was unclear: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-bundle refusal must not install anything"
+rm -rf "$fdir"
+pass "with cosign installed, a release without a bundle is refused"
+
+# ── Case 17: a binary that can't run is reported as such ─────
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'unrunnable-binary-bytes' "$FIXTURE_VERSION"
+if [ "$HOST_OS" = "Darwin" ]; then
+  fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
+  printf '#!/bin/sh\necho "cannot execute on this system" >&2\nexit 126\n' > "$fixture_app/Contents/MacOS/lpm-rs"
+  rm -f "$fdir/$RELEASE_ASSET"
+  ditto -c -k --keepParent "$fixture_app" "$fdir/$RELEASE_ASSET"
+else
+  printf '#!/bin/sh\necho "cannot execute on this system" >&2\nexit 126\n' > "$fdir/$RELEASE_ASSET"
+fi
+unrunnable_sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$unrunnable_sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -ne 0 ] || fail "a binary that can't run must not be installed: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "couldn't run the downloaded binary to check its version" \
+  || fail "an unrunnable binary must not be reported as another release: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "cannot execute on this system" \
+  || fail "the binary's own error must be shown: $RUN_OUT"
+rm -rf "$fdir"
+pass "a binary that can't run is reported as such"
+
+if [ "$HOST_OS" = "Darwin" ]; then
+  # ── Case 18: the pre-bundle macOS asset has no Developer ID check ──
+  fdir="$(mktemp -d)"
+  fixture_executable 'legacy-raw-binary-bytes' v0.75.0 > "$fdir/$PLATFORM"
+  legacy_sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
+  printf '%s  %s\n' "$legacy_sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  trap 'stop_server' EXIT
+  start_server "$fdir"
+  LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.75.0 run_install_sh
+  unset LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
+  stop_server
+  trap - EXIT
+  [ "$RUN_RC" -eq 0 ] || fail "the pre-bundle macOS release must remain installable: $RUN_OUT"
+  echo "$RUN_OUT" | grep -q "publisher of this release wasn't verified, because cosign isn't installed" \
+    || fail "the pre-bundle macOS asset must say the publisher wasn't verified: $RUN_OUT"
+  rm -rf "$fdir"
+  pass "the pre-bundle macOS asset says when the publisher wasn't verified"
+fi
+
 echo
 for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do
   run_shell_setup_tests "$scenario"

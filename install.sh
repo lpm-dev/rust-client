@@ -63,10 +63,10 @@ plist_array_contains_exact() {
 # LPM_INSTALL_INSECURE but scoped to the floor check.
 MIN_VERSION="v0.87.0"
 
-# Strict POSIX vX.Y.Z[-prerelease] comparator. Pre-release suffixes are
-# trimmed before comparison: `v0.43.0-rc1 < v0.43.0` per the relaxed
-# pre-release-equals-stable convention we ship in this installer.
-# Returns 0 (true) if $1 < $2, non-zero otherwise.
+# POSIX vX.Y.Z[-prerelease] comparator. As in semver, a prerelease sorts
+# before its release, so `v0.87.0-nightly.… < v0.87.0`: a nightly of the
+# floor version was built before that release. Two prereleases of the same
+# version compare equal. Returns 0 (true) if $1 < $2, non-zero otherwise.
 version_lt() {
   v1_=${1#v}; v1_=${v1_%%-*}
   v2_=${2#v}; v2_=${v2_%%-*}
@@ -78,7 +78,12 @@ version_lt() {
   if [ "$a1_" -gt "$a2_" ]; then return 1; fi
   if [ "$b1_" -lt "$b2_" ]; then return 0; fi
   if [ "$b1_" -gt "$b2_" ]; then return 1; fi
-  [ "$c1_" -lt "$c2_" ]
+  if [ "$c1_" -lt "$c2_" ]; then return 0; fi
+  if [ "$c1_" -gt "$c2_" ]; then return 1; fi
+  case "$1" in
+    *-*) case "$2" in *-*) return 1 ;; *) return 0 ;; esac ;;
+  esac
+  return 1
 }
 
 # Detect platform
@@ -321,7 +326,7 @@ if version_lt "$VERSION" "$MIN_VERSION"; then
     echo "they predate at least one security fix that would otherwise be silently"
     echo "downgraded. If you are recovering from a release-pipeline incident and need"
     echo "an older release on purpose, set LPM_INSTALL_MIN_VERSION_OVERRIDE=1 to bypass"
-    echo "(NOT recommended; downloads will still be SHA-256 + Sigstore verified)."
+    echo "(NOT recommended; the download is still verified as usual)."
     echo ""
     echo "If you did NOT expect to land on an old release, treat this as an attack"
     echo "signal and check https://github.com/$REPO/releases directly."
@@ -480,13 +485,14 @@ elif [ -n "$SHA_TOOL" ]; then
     echo "Or set LPM_INSTALL_INSECURE=1 to skip integrity verification (NOT recommended)."
     exit 1
   fi
-  # Without cosign, or without a bundle, the SHA gate still runs; the
-  # installer then says that it couldn't verify who published the
-  # release. LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses that case instead.
+  # Without cosign the SHA gate still runs, and the installer says that it
+  # couldn't verify who published the release; LPM_INSTALL_REQUIRE_SIGSTORE=1
+  # refuses that case instead. With cosign, every release at or above the
+  # floor has a bundle to verify.
   curl -fsSL --max-time 30 "$BUNDLE_URL" -o "$BUNDLE_TMP" 2>/dev/null || rm -f "$BUNDLE_TMP"
-  if [ "$REQUIRE_SIGSTORE" = "1" ] && [ ! -s "$BUNDLE_TMP" ]; then
+  if [ ! -s "$BUNDLE_TMP" ] && { [ "$REQUIRE_SIGSTORE" = "1" ] || command -v cosign >/dev/null 2>&1; }; then
     echo "ERROR: release $VERSION has no Sigstore bundle ($BUNDLE_URL),"
-    echo "       so cosign can't verify who published it. LPM_INSTALL_REQUIRE_SIGSTORE=1 is set; refusing to install."
+    echo "       so cosign can't verify who published it. Refusing to install."
     exit 1
   fi
 fi
@@ -558,15 +564,10 @@ elif [ -n "$SHA_TOOL" ]; then
         exit 1
       }
     echo "Verified Sigstore signature on manifest (identity-pinned to release.yml)"
-  elif [ "$MACOS_BUNDLE" != "1" ]; then
+  elif [ "$MACOS_BUNDLE" != "1" ] || [ "$LEGACY_MACOS" = "1" ]; then
     # On macOS the Developer ID signature and notarization checks below
-    # verify the publisher independently of GitHub.
-    if command -v cosign >/dev/null 2>&1; then
-      unverified_reason="the release has no Sigstore bundle"
-    else
-      unverified_reason="cosign isn't installed"
-    fi
-    echo "Note: the publisher of this release wasn't verified, because $unverified_reason."
+    # verify the publisher of an app bundle independently of GitHub.
+    echo "Note: the publisher of this release wasn't verified, because cosign isn't installed."
     echo "      The download matches the checksums published with the release."
     echo "      Install cosign to verify the publisher, or set LPM_INSTALL_REQUIRE_SIGSTORE=1"
     echo "      to refuse to install without that check."
@@ -580,7 +581,13 @@ fi
 require_reported_version() {
   [ "${LPM_INSTALL_INSECURE:-0}" = "1" ] && return 0
   expected_version_line="lpm ${VERSION#v}"
-  reported_version_line=$("$1" --version 2>/dev/null) || reported_version_line=""
+  version_errors="$STAGE_DIR/version-check.err"
+  if ! reported_version_line=$("$1" --version 2>"$version_errors") || [ -z "$reported_version_line" ]; then
+    echo "ERROR: couldn't run the downloaded binary to check its version:"
+    sed -n '1,5s/^/  /p' "$version_errors"
+    echo "This can mean the binary doesn't suit this system, or that $INSTALL_DIR doesn't allow running programs."
+    return 1
+  fi
   if [ "$reported_version_line" != "$expected_version_line" ]; then
     echo "ERROR: the downloaded binary reports '$reported_version_line', but the release is $VERSION."
     echo "Refusing to install a binary from another release."
