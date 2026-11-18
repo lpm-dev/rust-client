@@ -6199,20 +6199,28 @@ fn opened_regular_files_stream_only_above_the_hybrid_buffer_limit() {
 }
 
 #[test]
-fn small_files_that_decode_past_the_buffer_stream() {
+fn small_files_that_decode_past_the_buffer_take_the_pipelined_decoder() {
     use std::io::Write as _;
     let gzip = |payload: &[u8]| {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(payload).unwrap();
         encoder.finish().unwrap()
     };
-    for (decoded, streams) in [(4 * 1024 * 1024, false), (64 * 1024 * 1024, true)] {
+    for (decoded, pipelined) in [(4 * 1024 * 1024, false), (64 * 1024 * 1024, true)] {
         let file = tempfile::tempfile().unwrap();
         let compressed = gzip(&vec![0x5a; decoded]);
         assert!(compressed.len() < 1024 * 1024);
         (&file).write_all(&compressed).unwrap();
         let reader = std::io::BufReader::new(file);
-        assert_eq!(file_exceeds_hybrid_buffer(&reader), streams, "{decoded}");
+        assert_eq!(
+            file_takes_pipelined_decoder(&reader),
+            pipelined,
+            "{decoded}"
+        );
+        assert!(
+            !file_exceeds_hybrid_buffer(&reader),
+            "inspecting extraction keeps buffering what it can't pipeline"
+        );
         let mut cursor = reader.get_ref();
         assert_eq!(
             std::io::Seek::stream_position(&mut cursor).unwrap(),
@@ -6232,7 +6240,7 @@ fn small_files_without_gzip_magic_keep_the_hybrid_diagnostic() {
     let reader = std::io::BufReader::new(file);
 
     assert!(
-        !file_exceeds_hybrid_buffer(&reader),
+        !file_takes_pipelined_decoder(&reader),
         "a trailer is only a declared size behind gzip's magic"
     );
 }

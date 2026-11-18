@@ -530,17 +530,19 @@ const MAX_BUFFERED_COMPRESSED_SIZE: u64 = 500 * 1024 * 1024;
 pub const MAX_HYBRID_BUFFERED_COMPRESSED_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Maximum decompressed output held by the buffered libdeflate path.
-///
-/// Several archives extract at once, and each buffered one holds its whole
-/// decoded tar until its last entry is written. Archives that unpack to more
-/// stream through a gzip decoder instead.
-const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
+const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
+/// Largest decoded size [`file_fits_buffered_extraction`] admits. Several
+/// archives extract at once, and each buffered one holds its whole decoded
+/// tar until its last entry is written, so larger downloads go to the
+/// pipelined decoder, which keeps at most 768 KiB queued.
+const MAX_ROUTED_BUFFERED_DECODE_SIZE: usize = 8 * 1024 * 1024;
 
 /// Whether a file-backed archive is small enough, both compressed and as
 /// its gzip trailer declares it decoded, for the hybrid buffered path.
-/// Callers can send the others straight to a pipelined decoder rather than
-/// let the hybrid path fall back to serial streaming. The trailer only
-/// routes: a buffered decode still stops at its cap whatever it declares.
+/// Callers that can pipeline send the others to
+/// [`extract_tarball_from_reader_pipelined_digests`]. The trailer only routes:
+/// a buffered decode still stops at its own cap whatever it declares.
 pub fn file_fits_buffered_extraction(file: &std::fs::File) -> bool {
     let Ok(metadata) = file.metadata() else {
         return false;
@@ -549,7 +551,7 @@ pub fn file_fits_buffered_extraction(file: &std::fs::File) -> bool {
         return false;
     }
     gzip_declared_size(file, metadata.len())
-        .is_none_or(|declared| declared as usize <= MAX_BUFFERED_DECOMPRESSED_SIZE)
+        .is_none_or(|declared| declared as usize <= MAX_ROUTED_BUFFERED_DECODE_SIZE)
 }
 
 /// The decoded size (mod 2^32) a gzip file's trailer declares, read without
@@ -759,14 +761,19 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
 const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Global ceiling on the sum of retained compressed input and in-flight
-/// gzip-decompress output across all rayon workers. The single-tarball
-/// buffered ceiling bounds one decode call, but a registry-mirror attacker
-/// can publish many small packages that each advertise that much, and in
-/// callers that buffer more than the default limits the peak can reach
-/// gigabytes and OOM containers running `vm.overcommit_memory=2` or
-/// cgroup-bounded CI runners. This budget caps the sum across workers so
-/// concurrent buffered decodes serialize at the budget boundary instead of
-/// competing for virtual memory.
+/// gzip-decompress output across all rayon workers. The single-tarball buffered
+/// ceiling bounds one decode call at 256 MiB, but a registry-mirror
+/// attacker can publish N small packages each of which advertises a
+/// 256 MiB ISIZE; with 8 concurrent workers the peak virtual allocation
+/// reaches ~2 GiB and OOMs containers running `vm.overcommit_memory=2`
+/// or cgroup-bounded CI runners. This budget caps the sum across workers
+/// so concurrent buffered decodes serialize at the budget boundary instead
+/// of competing for virtual memory.
+///
+/// 1 GiB lets 4 simultaneous worst-case (ISIZE=256 MiB) decompresses
+/// run in parallel and an arbitrary number of small ones; legitimate
+/// npm packages decompress well below the per-call cap and rarely
+/// hold a slot for more than a few ms.
 const PARALLEL_EXTRACT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Counting semaphore over bytes retained by buffered gzip decoding.
@@ -4403,9 +4410,9 @@ mod tests {
     fn buffered_decompression_cap_bounds_real_allocations() {
         assert_eq!(
             MAX_BUFFERED_DECOMPRESSED_SIZE,
-            8 * 1024 * 1024,
-            "each concurrent buffered extraction holds its whole decoded tar; \
-             the cap bounds that and defends against hostile gzip pre-allocation",
+            256 * 1024 * 1024,
+            "buffered decompression cap must stay ≤ 256 MiB to defend \
+             against hostile gzip pre-allocation and grow-loop attacks",
         );
         assert!(
             (MAX_BUFFERED_DECOMPRESSED_SIZE as u64) < MAX_EXTRACTION_SIZE,
