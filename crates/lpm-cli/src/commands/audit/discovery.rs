@@ -62,9 +62,9 @@ pub struct DiscoveredPackage {
     /// Whether `lpm install` leaves this `lpm.lock` package off the current
     /// platform: an optional package whose `os`, `cpu` or `libc` excludes
     /// it, or one reachable only through such a package. Only a row with an
-    /// instance id qualifies, since discovery resolves its install path from
-    /// its parent; when its source is absent, it isn't installed rather than
-    /// missing.
+    /// instance id qualifies, since only then can discovery resolve its
+    /// install path from its parent; when its source is absent, it isn't
+    /// installed rather than missing.
     pub platform_skipped: bool,
     /// Direct dependencies: (name, exact_version).
     /// Extracted from lockfile dependency edges. Used by the query engine
@@ -2558,17 +2558,13 @@ packages:
 
         let result = discover_packages(dir.path()).unwrap();
 
-        assert!(
+        assert_eq!(
             result
                 .packages
                 .iter()
-                .all(|package| package.scan_mode == ScanMode::LocalMissing),
-            "{:?}",
-            result
-                .packages
-                .iter()
-                .map(|p| p.scan_mode)
-                .collect::<Vec<_>>()
+                .map(|package| package.scan_mode)
+                .collect::<Vec<_>>(),
+            [ScanMode::LocalMissing, ScanMode::LocalMissing]
         );
     }
 
