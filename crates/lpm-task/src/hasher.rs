@@ -933,6 +933,14 @@ impl ComponentLinks {
         root: &Path,
         relative: &Path,
     ) -> Result<Option<std::fs::Metadata>, LpmError> {
+        let inspect = |path: &Path| {
+            std::fs::symlink_metadata(root.join(path)).map_err(|error| {
+                LpmError::Task(format!(
+                    "failed to resolve task cache input {}: {error}",
+                    root.join(relative).display()
+                ))
+            })
+        };
         let mut prefix = PathBuf::new();
         let mut components = relative.components().peekable();
         while let Some(component) = components.next() {
@@ -941,13 +949,13 @@ impl ComponentLinks {
             };
             prefix.push(name);
             if components.peek().is_none() {
-                let metadata = std::fs::symlink_metadata(root.join(&prefix))?;
+                let metadata = inspect(&prefix)?;
                 return Ok((!lpm_common::is_symlink_or_junction(&metadata)).then_some(metadata));
             }
             let linked = match self.directories.get(&prefix) {
                 Some(linked) => *linked,
                 None => {
-                    let metadata = std::fs::symlink_metadata(root.join(&prefix))?;
+                    let metadata = inspect(&prefix)?;
                     let linked = lpm_common::is_symlink_or_junction(&metadata);
                     self.directories.insert(prefix.clone(), linked);
                     linked
@@ -2107,6 +2115,24 @@ mod tests {
             .unwrap();
             assert_eq!(identity, expected, "{}", relative.display());
         }
+    }
+
+    #[test]
+    fn an_input_that_vanished_after_the_walk_is_named_in_the_error() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("src")).unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+
+        let error = ComponentLinks::default()
+            .unlinked_metadata(&canonical, Path::new("src/gone.ts"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("failed to resolve task cache input")
+                && error.contains(&canonical.join("src/gone.ts").display().to_string()),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
