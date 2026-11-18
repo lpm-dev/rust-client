@@ -1485,6 +1485,79 @@ enum DirectoryCreationDurability {
     Deferred,
 }
 
+/// Whether `existing` already holds what publishing `staged` over it would
+/// leave: the same bytes, permissions and whole-second modification time
+/// (archives record seconds). Both handles are left at an unspecified offset.
+fn output_already_restored(
+    existing: &cap_std::fs::File,
+    staged: &cap_std::fs::File,
+    buffer: &mut Vec<u8>,
+) -> Result<bool, LpmError> {
+    use std::io::Read as _;
+
+    const CHUNK: usize = 64 * 1024;
+    let existing_metadata = existing.metadata()?;
+    let staged_metadata = staged.metadata()?;
+    let existing_seconds = whole_seconds_since_epoch(existing_metadata.modified()?.into_std());
+    if existing_metadata.len() != staged_metadata.len()
+        || !restored_permissions_match(&existing_metadata, &staged_metadata)
+        || existing_seconds.is_none()
+        || existing_seconds != whole_seconds_since_epoch(staged_metadata.modified()?.into_std())
+    {
+        return Ok(false);
+    }
+    buffer.resize(2 * CHUNK, 0);
+    let (existing_chunk, staged_chunk) = buffer.split_at_mut(CHUNK);
+    let (mut existing_reader, mut staged_reader) = (existing, staged);
+    let mut remaining = existing_metadata.len();
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(CHUNK as u64)).unwrap_or(CHUNK);
+        for (reader, chunk) in [
+            (&mut existing_reader, &mut existing_chunk[..length]),
+            (&mut staged_reader, &mut staged_chunk[..length]),
+        ] {
+            match reader.read_exact(chunk) {
+                Ok(()) => {}
+                // A file that shrank since its metadata was read takes
+                // the full replacement path, which reports the change.
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if existing_chunk[..length] != staged_chunk[..length] {
+            return Ok(false);
+        }
+        remaining -= length as u64;
+    }
+    Ok(true)
+}
+
+fn whole_seconds_since_epoch(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+#[cfg(unix)]
+fn restored_permissions_match(
+    existing: &cap_std::fs::Metadata,
+    staged: &cap_std::fs::Metadata,
+) -> bool {
+    use cap_std::fs::PermissionsExt as _;
+
+    existing.permissions().mode() & 0o7777 == staged.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn restored_permissions_match(
+    existing: &cap_std::fs::Metadata,
+    staged: &cap_std::fs::Metadata,
+) -> bool {
+    existing.permissions().readonly() == staged.permissions().readonly()
+}
+
 fn publish_verified_file(
     source: cap_std::fs::File,
     destination_parent: &Dir,
@@ -2026,6 +2099,7 @@ pub(super) struct RestoreTransaction {
     installed_trees: Vec<PathBuf>,
     created_dirs: Vec<PathBuf>,
     mutated_dirs: HashSet<PathBuf>,
+    comparison_buffer: Vec<u8>,
     committed: bool,
 }
 
@@ -2077,6 +2151,7 @@ impl RestoreTransaction {
             installed_trees: Vec::new(),
             created_dirs: Vec::with_capacity(output_count.min(64)),
             mutated_dirs: HashSet::with_capacity(output_count.min(64)),
+            comparison_buffer: Vec::new(),
             committed: false,
         })
     }
@@ -2285,6 +2360,26 @@ impl RestoreTransaction {
                 "task cache restore destination changed during restore: {}",
                 destination.display()
             )));
+        }
+        // Replacing an output backs it up and removes it under several
+        // durability syncs. One that already holds what the restore would
+        // leave stays as it is: recovery and rollback never touch an
+        // existing output without a backup.
+        if let Some(existing) = &existing {
+            let staged = open_optional_regular_file(
+                output_parent,
+                destination_name,
+                "staged task cache output",
+            )?
+            .ok_or_else(|| {
+                LpmError::Task(format!(
+                    "staged task cache output disappeared: {}",
+                    relative.display()
+                ))
+            })?;
+            if output_already_restored(existing, &staged, &mut self.comparison_buffer)? {
+                return Ok(());
+            }
         }
         self.installed.push(AppliedOutput {
             relative: relative.to_path_buf(),

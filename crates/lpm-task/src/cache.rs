@@ -3980,6 +3980,140 @@ mod tests {
         );
     }
 
+    fn archive_of_dist_outputs(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("dist")).unwrap();
+        for index in 0..count {
+            fs::write(
+                source.path().join(format!("dist/value-{index:02}.txt")),
+                format!("cached-value-{index}"),
+            )
+            .unwrap();
+        }
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("outputs.tar.gz");
+        create_archive(source.path(), &["dist/**".into()], &archive_path).unwrap();
+        (archive_dir, archive_path)
+    }
+
+    fn set_test_mtime(path: &Path, modified: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    fn file_identity(path: &Path) -> same_file::Handle {
+        same_file::Handle::from_path(path).unwrap()
+    }
+
+    #[test]
+    fn restoring_outputs_that_already_match_leaves_them_in_place_without_syncs() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(64);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-07.txt");
+        let identity_before = file_identity(&output);
+
+        let (result, syncs) = count_restore_durability_syncs(|| {
+            restore_archive(&archive_path, target.path(), &["dist/**".into()])
+        });
+
+        result.unwrap();
+        assert!(
+            syncs <= 16,
+            "restoring 64 outputs that already match issued {syncs} durability syncs"
+        );
+        assert!(
+            file_identity(&output) == identity_before,
+            "an output that already matched was replaced"
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "cached-value-7");
+    }
+
+    #[test]
+    fn restoring_replaces_an_output_whose_bytes_differ_at_the_same_length() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-02.txt");
+        let restored_mtime = fs::metadata(&output).unwrap().modified().unwrap();
+        fs::write(&output, "cached-value-X").unwrap();
+        set_test_mtime(&output, restored_mtime);
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(fs::read_to_string(&output).unwrap(), "cached-value-2");
+    }
+
+    #[test]
+    fn restoring_resets_the_mtime_of_an_output_with_matching_bytes() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-01.txt");
+        let restored_mtime = fs::metadata(&output).unwrap().modified().unwrap();
+        let touched = restored_mtime + std::time::Duration::from_secs(3_600);
+        set_test_mtime(&output, touched);
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().modified().unwrap(),
+            restored_mtime,
+            "a restored output carries the archived mtime"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_resets_the_mode_of_an_output_with_matching_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(4);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let output = target.path().join("dist/value-03.txt");
+        let restored_mode = fs::metadata(&output).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(restored_mode, 0o600);
+
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o7777,
+            restored_mode
+        );
+    }
+
+    #[test]
+    fn restore_rollback_leaves_outputs_that_already_matched_in_place() {
+        let (_archive_dir, archive_path) = archive_of_dist_outputs(2);
+        let target = tempfile::tempdir().unwrap();
+        restore_archive(&archive_path, target.path(), &["dist/**".into()]).unwrap();
+        let matching = target.path().join("dist/value-00.txt");
+        let changed = target.path().join("dist/value-01.txt");
+        let matching_identity = file_identity(&matching);
+        fs::write(&changed, "locally edited").unwrap();
+        *BACKUP_SYNC_FAILURE.lock().unwrap() = Some(BackupSyncFailure {
+            project: std::fs::canonicalize(target.path()).unwrap(),
+            relative: PathBuf::from("dist/value-01.txt"),
+        });
+
+        let result = restore_archive(&archive_path, target.path(), &["dist/**".into()]);
+        *BACKUP_SYNC_FAILURE.lock().unwrap() = None;
+
+        assert!(
+            result.is_err(),
+            "the injected sync failure was not observed"
+        );
+        assert!(file_identity(&matching) == matching_identity);
+        assert_eq!(fs::read_to_string(&matching).unwrap(), "cached-value-0");
+        assert_eq!(fs::read_to_string(&changed).unwrap(), "locally edited");
+    }
+
     #[test]
     fn restore_transaction_rolls_back_files_after_apply_failure() {
         let project = tempfile::tempdir().unwrap();
