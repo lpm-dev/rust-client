@@ -1439,3 +1439,29 @@ async fn first_install_creates_the_signing_secret_while_it_downloads() {
         created.duration_since(served).unwrap_or_default()
     );
 }
+
+#[tokio::test]
+async fn bare_install_answers_from_the_fast_lane_for_a_manifest_that_starts_with_a_byte_order_mark()
+{
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({"name":"engine-free","version":"1.0.0"}),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        "\u{feff}{\"name\":\"consumer\",\"dependencies\":{\"engine-free\":\"1.0.0\"}}",
+    );
+    install(&project, &mock.url()).assert().success();
+    let output = bare_install(&project)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["up_to_date"], true, "{result}");
+    assert!(
+        result.get("counts").is_none(),
+        "the fast lane must answer a manifest that starts with a byte order mark: {result}"
+    );
+}
