@@ -876,8 +876,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+    use wiremock::MockServer;
+    #[cfg(unix)]
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    #[cfg(unix)]
+    use wiremock::{Mock, ResponseTemplate};
 
     fn valid_der_certificate() -> Vec<u8> {
         rcgen::generate_simple_self_signed(vec!["lpm.dev".to_string()])
