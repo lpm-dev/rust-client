@@ -2908,3 +2908,56 @@ async fn upgrade_yes_dry_run_json_envelope_with_full_enrichment_smoke() {
 
 #[path = "upgrade_contract/mod.rs"]
 mod upgrade_contract;
+
+#[tokio::test]
+async fn upgrade_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-upgrade","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front
+        .mount_package(
+            &mock,
+            "ms",
+            &[
+                ("2.1.3", make_tarball("ms", "2.1.3")),
+                ("2.5.0", make_tarball("ms", "2.5.0")),
+            ],
+        )
+        .await;
+    front.write_user_npmrc(project.home(), "");
+    project.write_file(
+        "package.json",
+        r#"{"name":"cafile-upgrade","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    project.write_file(
+        "package.json",
+        r#"{"name":"cafile-upgrade","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    for args in [
+        &["upgrade", "-y", "--dry-run", "--json"][..],
+        &["upgrade", "-y", "--json"][..],
+    ] {
+        let out = lpm_with_registry(&project, &front.url)
+            .args(args)
+            .output()
+            .expect("spawn lpm upgrade");
+        assert!(
+            out.status.success(),
+            "lpm {args:?} must reach a registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+        assert_eq!(envelope["upgraded"], 1, "{envelope:#}");
+    }
+    let lockfile = project.read_file("lpm.lock");
+    assert!(lockfile.contains("version = \"2.5.0\""), "{lockfile}");
+}

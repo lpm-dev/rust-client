@@ -227,8 +227,16 @@ pub async fn run(
         false,
         json_output,
     )?;
-    let planning_client = client.clone_with_config().without_metadata_memory_cache();
-    let install_client = client.clone_with_metadata_memory_cache();
+    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
+        client,
+        project_dir,
+        json_output || !dry_run,
+    )?;
+    let planning_client = read_context
+        .client
+        .clone_with_config()
+        .without_metadata_memory_cache();
+    let install_client = read_context.client.clone_with_metadata_memory_cache();
 
     // Read lockfile ONCE
     let lockfile = read_optional_project_lockfile(project_dir)?;

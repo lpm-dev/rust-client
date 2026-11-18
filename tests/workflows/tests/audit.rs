@@ -4497,3 +4497,134 @@ async fn audit_still_reports_an_absent_required_package_beside_an_absent_optiona
     assert_eq!(coverage["not_installed_packages"], 1, "{coverage}");
     assert_eq!(coverage["packages"][0]["name"], "missing", "{coverage}");
 }
+
+/// Run `lpm` against `front` with OSV answered by `mock`.
+fn lpm_through_front(
+    project: &TempProject,
+    mock: &MockRegistry,
+    front: &support::tls_front::TlsFront,
+    args: &[&str],
+) -> std::process::Output {
+    lpm_with_registry(project, &front.url)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(args)
+        .output()
+        .expect("spawn lpm")
+}
+
+#[tokio::test]
+async fn audit_trusts_the_npmrc_cafile_of_the_lpm_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-audit","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"cafile-audit","lockfileVersion":3,"packages":{"":{"dependencies":{"@lpm.dev/acme.widget":"1.0.0"}},"node_modules/@lpm.dev/acme.widget":{"version":"1.0.0","resolved":"https://lpm.dev/api/registry/@lpm.dev/acme.widget/-/acme.widget-1.0.0.tgz"}}}"#,
+    );
+    project.write_file(
+        "node_modules/@lpm.dev/acme.widget/package.json",
+        r#"{"name":"@lpm.dev/acme.widget","version":"1.0.0","license":"MIT"}"#,
+    );
+    project.write_file(
+        "node_modules/@lpm.dev/acme.widget/index.js",
+        "module.exports = 1;\n",
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/acme.widget",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": { "1.0.0": { "name": "@lpm.dev/acme.widget", "version": "1.0.0" } }
+    })])
+    .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front.write_user_npmrc(project.home(), "");
+
+    let out = lpm_through_front(&project, &mock, &front, &["--json", "audit"]);
+    assert!(
+        out.status.success(),
+        "audit must reach an LPM registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-audit-fix","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let tarball = |version: &str| {
+        make_tarball_from_pkg_json(
+            serde_json::json!({ "name": "vuln-pkg", "version": version, "license": "MIT" }),
+            &[],
+        )
+    };
+    front
+        .mount_package(
+            &mock,
+            "vuln-pkg",
+            &[("1.0.0", tarball("1.0.0")), ("1.0.1", tarball("1.0.1"))],
+        )
+        .await;
+    front.write_user_npmrc(project.home(), "");
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-cafile-fix",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+
+    let out = lpm_through_front(
+        &project,
+        &mock,
+        &front,
+        &["--json", "audit", "fix", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "audit fix must reach a registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["packages"][0]["to"], "1.0.1", "{envelope:#}");
+}
+
+#[tokio::test]
+async fn audit_signatures_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-signatures","version":"1.0.0","dependencies":{"signed-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let signer = RegistrySigningFixture::new();
+    mock.with_registry_signing_keys(&signer).await;
+    let tarball = make_tarball("signed-pkg", "1.0.0");
+    let metadata = front.advertise(
+        &mock,
+        mock.signed_package_metadata("signed-pkg", "1.0.0", &tarball, &signer),
+    );
+    mock.with_package_metadata("signed-pkg", "1.0.0", &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+    front.write_user_npmrc(project.home(), &format!("registry={}\n", front.url));
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+
+    let out = lpm_through_front(&project, &mock, &front, &["audit", "signatures"]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "audit signatures must reach a registry its .npmrc cafile trusts\n{stderr}"
+    );
+    assert!(stderr.contains("1 verified"), "{stderr}");
+}

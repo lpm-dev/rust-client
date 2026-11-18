@@ -2650,3 +2650,56 @@ fn invalid_windows_global_launcher_target_leaves_no_unjournaled_wrapper() {
         assert!(!text.contains("lpm&home"), "{}: {text}", artifact.display());
     }
 }
+
+#[tokio::test]
+async fn global_commands_trust_the_npmrc_cafile_of_the_registry_they_read() {
+    let project = TempProject::empty(r#"{"name":"global-cafile","version":"1.0.0"}"#);
+    seed_global_package(&project, "cafile-tool", vec!["cafile-tool".into()]);
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let tool = |name: &str, version: &str| {
+        support::mock_registry::make_tarball_from_pkg_json(
+            serde_json::json!({"name":name,"version":version,"bin":{name:"cli.js"}}),
+            &[("cli.js", b"#!/usr/bin/env node\n")],
+        )
+    };
+    front
+        .mount_package(
+            &mock,
+            "cafile-tool",
+            &[
+                ("1.0.0", tool("cafile-tool", "1.0.0")),
+                ("1.1.0", tool("cafile-tool", "1.1.0")),
+            ],
+        )
+        .await;
+    front
+        .mount_package(
+            &mock,
+            "other-tool",
+            &[("2.0.0", tool("other-tool", "2.0.0"))],
+        )
+        .await;
+    front.write_user_npmrc(project.home(), &format!("registry={}\n", front.url));
+
+    for args in [
+        vec!["global", "list", "--outdated", "--json"],
+        vec!["global", "update", "--dry-run", "--json"],
+        vec!["global", "update", "--json"],
+        vec!["--json", "install", "-g", "other-tool"],
+    ] {
+        let result = lpm_with_registry(&project, &front.url)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "lpm {args:?} must reach a registry its .npmrc cafile trusts\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let manifest = lpm_global::read_for(&isolated_lpm_root(&project)).unwrap();
+    assert_eq!(manifest.packages["cafile-tool"].resolved, "1.1.0");
+    assert_eq!(manifest.packages["other-tool"].resolved, "2.0.0");
+}

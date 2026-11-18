@@ -47,6 +47,7 @@ pub mod mock_registry;
 pub mod platform_skipped_optional;
 pub mod source_recovery;
 pub mod terminal;
+pub mod tls_front;
 pub mod verdaccio;
 pub mod verdaccio_proxy;
 

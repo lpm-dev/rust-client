@@ -4,7 +4,7 @@ use crate::save_spec::{
 };
 use lpm_common::LpmError;
 use lpm_global::PackageSource;
-use lpm_registry::{RegistryClient, RouteTable};
+use lpm_registry::RegistryClient;
 use lpm_semver::Version;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,8 +26,15 @@ pub(super) async fn pre_resolve(
     routing_root: &Path,
 ) -> Result<ResolvedSpec, LpmError> {
     let (name, intent) = parse_user_save_intent(spec)?;
-    let route_table = RouteTable::from_env_and_filesystem(routing_root)
-        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let crate::commands::registry_reads::RoutedReadContext {
+        client: registry,
+        route_table,
+    } = crate::commands::registry_reads::prepare_registry_read_context(
+        registry,
+        routing_root,
+        true,
+    )?;
+    let registry = &registry;
     let route = route_table.route_for_package(&name);
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
     // first-party registry path (PackageName parser); everything else

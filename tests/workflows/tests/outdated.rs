@@ -1785,3 +1785,51 @@ async fn outdated_json_envelope_with_one_outdated_pkg_matches_snapshot() {
 
 #[path = "outdated_contract/mod.rs"]
 mod outdated_contract;
+
+/// Serve `ms` 2.1.3 and 2.1.4 through an HTTPS front that only `.npmrc`'s
+/// per-origin `cafile=` makes `lpm` trust, then install 2.1.3 through it.
+async fn install_ms_through_a_registry_only_cafile_trusts(
+    project: &TempProject,
+    mock: &MockRegistry,
+) -> support::tls_front::TlsFront {
+    let front = support::tls_front::TlsFront::start(mock, project.home());
+    front
+        .mount_package(
+            mock,
+            "ms",
+            &[
+                ("2.1.3", make_tarball("ms", "2.1.3")),
+                ("2.1.4", make_tarball("ms", "2.1.4")),
+            ],
+        )
+        .await;
+    front.write_user_npmrc(project.home(), "");
+    lpm_with_registry(project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    front
+}
+
+#[tokio::test]
+async fn outdated_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-outdated","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = install_ms_through_a_registry_only_cafile_trusts(&project, &mock).await;
+
+    let out = lpm_with_registry(&project, &front.url)
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn lpm outdated --json");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert!(
+        out.status.success(),
+        "outdated must reach a registry its .npmrc cafile trusts\n{envelope:#}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(envelope["outdated_count"], 1, "{envelope:#}");
+    assert_eq!(envelope["packages"][0]["latest"], "2.1.4", "{envelope:#}");
+}

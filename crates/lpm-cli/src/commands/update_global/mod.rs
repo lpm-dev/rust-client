@@ -103,11 +103,19 @@ pub async fn run(
             return Err(LpmError::Script("local global links need recovery before a preview; run `lpm global list`, then retry".into()));
         }
     }
-    let planning_registry = client.clone_with_config().without_metadata_memory_cache();
-    let install_registry = client.clone_with_metadata_memory_cache();
+    let crate::commands::registry_reads::RoutedReadContext {
+        client: configured,
+        route_table: routes,
+    } = crate::commands::registry_reads::prepare_registry_read_context(
+        client,
+        &root.global_root(),
+        json_output || !dry_run,
+    )?;
+    let planning_registry = configured
+        .clone_with_config()
+        .without_metadata_memory_cache();
+    let install_registry = configured.clone_with_metadata_memory_cache();
     let manifest = read_for(&root)?;
-    let routes = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
-        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
 
     let targets = match package {
         Some(spec) => vec![parse_target(spec)?],

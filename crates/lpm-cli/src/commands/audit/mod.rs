@@ -189,6 +189,12 @@ pub async fn run(
         Some(s) => FailPolicy::parse(s)?,
         None => FailPolicy::All,
     };
+    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
+        client,
+        project_dir,
+        json_output,
+    )?;
+    let client = &read_context.client;
 
     let scan::AuditScan {
         discovery,

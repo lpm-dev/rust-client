@@ -116,13 +116,37 @@ pub fn prepare_locked_read_context(
     configure_read_context_for_origins(client, route_table, origins, true)
 }
 
+/// The route table that the `.npmrc` files in effect at `config_dir` define,
+/// and `client` with their TLS settings (`cafile=`, `ca=`, `strict-ssl`,
+/// per-origin certificates), for a command that reads registry metadata
+/// itself rather than through `lpm install`. `client`'s LPM and npm
+/// registries build their TLS clients now; any other origin with settings
+/// of its own builds them on first use.
+///
+/// `quiet` holds back the advisory `.npmrc` warnings and the TLS summary,
+/// for `--json` output or a command whose install step prints them.
+/// Security warnings always print.
+pub fn prepare_registry_read_context(
+    client: &RegistryClient,
+    config_dir: &Path,
+    quiet: bool,
+) -> Result<RoutedReadContext, LpmError> {
+    let route_table = RouteTable::from_env_and_filesystem(config_dir)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let eager_origins: Vec<_> = [client.base_url(), client.npm_registry_url()]
+        .into_iter()
+        .filter_map(lpm_registry::npmrc::OriginKey::from_request_url)
+        .collect();
+    configure_read_context_for_origins(client, route_table, &eager_origins, quiet)
+}
+
 fn configure_read_context_for_origins(
     client: &RegistryClient,
     route_table: RouteTable,
     eager_origins: &[lpm_registry::npmrc::OriginKey],
-    json_output: bool,
+    quiet: bool,
 ) -> Result<RoutedReadContext, LpmError> {
-    if !json_output {
+    if !quiet {
         for warning in route_table.npmrc_warnings() {
             install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
         }
@@ -148,7 +172,7 @@ fn configure_read_context_for_origins(
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
 
-    if !json_output && let Some(summary) = configured_client.render_effective_tls_summary() {
+    if !quiet && let Some(summary) = configured_client.render_effective_tls_summary() {
         install_ui::phase_untrusted(&lpm_common::sanitize_terminal_inline(&summary));
     }
 
