@@ -106,7 +106,7 @@ test("macOS release smoke executes only the provisioned app bundle", () => {
 
   const smoke = workflow.slice(start, end);
   assert.match(smoke, /LPM CLI\.app\/Contents\/MacOS\/lpm-rs/);
-  assert.doesNotMatch(smoke, /raw_actual|\.\/\$\{\{ matrix\.binary \}\}/);
+  assert.doesNotMatch(smoke, /raw_actual|\.\/\$\{MATRIX_BINARY\}/);
 });
 
 test("macOS release signing preserves the login Keychain search list", () => {

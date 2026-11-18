@@ -32,6 +32,53 @@ function stepsOf(job) {
   return start === -1 ? [] : job.slice(start).split("\n      - ").slice(1);
 }
 
+// Every step's `run:` script in a workflow, with the line its key is on. A
+// block scalar runs until the first non-blank line indented no deeper than
+// the key. A job output that happens to be named `run` is not a script.
+function runScripts(workflow) {
+  const lines = workflow.split("\n");
+  const scripts = [];
+  let stepsIndent = -1;
+  for (let index = 0; index < lines.length; index++) {
+    const lineIndent = lines[index].length - lines[index].trimStart().length;
+    if (stepsIndent !== -1 && lines[index].trim() !== "" && lineIndent <= stepsIndent) {
+      stepsIndent = -1;
+    }
+    const steps = /^(\s*)steps:\s*$/.exec(lines[index]);
+    if (steps) {
+      stepsIndent = steps[1].length;
+      continue;
+    }
+    if (stepsIndent === -1) continue;
+    const key = /^(\s*)(?:- )?run:(.*)$/.exec(lines[index]);
+    if (!key) continue;
+    const indent = key[1].length + (lines[index].trimStart().startsWith("- ") ? 2 : 0);
+    const value = key[2].trim();
+    if (!/^[|>][-+]?$/.test(value)) {
+      scripts.push({ line: index + 1, script: value });
+      continue;
+    }
+    const body = [];
+    let next = index + 1;
+    for (; next < lines.length; next++) {
+      const line = lines[next];
+      if (line.trim() !== "" && line.length - line.trimStart().length <= indent) break;
+      body.push(line);
+    }
+    scripts.push({ line: index + 1, script: body.join("\n") });
+    index = next - 1;
+  }
+  return scripts;
+}
+
+function workflowFiles() {
+  const directory = path.join(repoRoot, ".github/workflows");
+  return fs
+    .readdirSync(directory)
+    .filter((name) => /\.ya?ml$/.test(name))
+    .map((name) => `.github/workflows/${name}`);
+}
+
 test("nightly and candidate construction survives the unused verification branch being skipped", () => {
   const workflow = read(".github/workflows/release.yml");
   const constructionJobs = [
@@ -310,7 +357,7 @@ test("every SHA256SUMS.txt attestation passes the shipped self-update policy bef
     for (const step of steps.slice(attest + 1, gate)) {
       assert.match(
         step,
-        /run: cp "\$\{\{ steps\.attest\.outputs\.bundle-path \}\}" \S+\/SHA256SUMS\.txt\.sigstore\n/,
+        /env:\n\s+ATTESTATION_BUNDLE: \$\{\{ steps\.attest\.outputs\.bundle-path \}\}\n\s+run: cp "\$\{ATTESTATION_BUNDLE\}" \S+\/SHA256SUMS\.txt\.sigstore\n/,
         `${name} may only stage the bundle between attesting and verifying it`,
       );
     }
@@ -385,4 +432,42 @@ test("a promoted stable release passes the shipped self-update policy with its p
       `published-release gate must pass ${argument} after ${argumentPositions[index - 1]?.[0]}`,
     );
   }
+});
+
+test("workflow run scripts never expand template expressions", () => {
+  // Expressions are substituted into the script text before the shell
+  // parses it, so a dispatch input, an event field or an upstream output
+  // could run as code. Scripts read every such value through `env:`.
+  const expansions = [];
+  for (const file of workflowFiles()) {
+    for (const { line, script } of runScripts(read(file))) {
+      for (const match of script.matchAll(/\$\{\{[^}]*\}\}/g)) {
+        expansions.push(`${file}:${line} ${match[0]}`);
+      }
+    }
+  }
+  assert.deepEqual(expansions, []);
+});
+
+test("release metadata validates every dispatch input as a whole value before any job reads it", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const metadata = jobSource(workflow, "release-metadata", "verify");
+
+  assert.match(metadata, /INPUT_SOURCE_RUN_ID: \$\{\{ inputs\.source_run_id \}\}/);
+  assert.match(metadata, /source_run_id: \$\{\{ steps\.metadata\.outputs\.source_run_id \}\}/);
+  assert.match(metadata, /\[\[ "\$SOURCE_RUN_ID" =~ \^\[1-9\]\[0-9\]\{0,18\}\$ \]\]/);
+  assert.match(metadata, /promote \| windows-smoke-only \| npm-publish-only \| wrapper-only\)/);
+  assert.match(metadata, /candidate \| full\)/);
+  assert.match(metadata, /echo "source_run_id=\$SOURCE_RUN_ID"/);
+
+  // `grep` matches line by line, so a value with an embedded newline would
+  // pass on its first line and then write extra lines to $GITHUB_OUTPUT.
+  assert.doesNotMatch(metadata, /printf '%s\\n' "\$(?:VERSION|NPM_NIGHTLY|SOURCE_RUN_ID)" \|\s*grep/);
+  assert.match(metadata, /\[\[ "\$VERSION" =~ \$STABLE_VERSION_PATTERN \]\]/);
+  assert.match(metadata, /\[\[ "\$VERSION" =~ \$NIGHTLY_VERSION_PATTERN \]\]/);
+  assert.match(metadata, /\[\[ "\$NPM_NIGHTLY" =~ \$NIGHTLY_VERSION_PATTERN \]\]/);
+  assert.match(metadata, /case "\$MODE" in\n\s+candidate \| promote \| full \| wrapper-only \| windows-smoke-only \| npm-publish-only\) ;;/);
+
+  const outside = workflow.replace(metadata, "");
+  assert.doesNotMatch(outside, /inputs\.source_run_id/, "later jobs must read the validated run ID");
 });

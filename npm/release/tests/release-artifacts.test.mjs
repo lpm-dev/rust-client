@@ -156,7 +156,7 @@ test("macOS releases do not publish entitlement-free raw executables", () => {
   assert.doesNotMatch(releaseWorkflow, /--target-dir target\/legacy-macos-keychain/);
   assert.match(
     releaseWorkflow,
-    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs" "\$RUNNER_TEMP\/lpm-rs-app-bundle"/,
+    /cp "target\/\$\{MATRIX_TARGET\}\/release\/lpm-rs" "\$RUNNER_TEMP\/lpm-rs-app-bundle"/,
   );
   assert.doesNotMatch(releaseWorkflow, /--features legacy-macos-keychain/);
   assert.doesNotMatch(releaseWorkflow, /raw-notary|Sign raw binary|raw artifact|raw binary/i);
@@ -222,7 +222,7 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
     localBuild,
     /"\$APP_ASSEMBLER" "\$BINARY" "\$STAGING_DIR" "\$PROVISIONING_PROFILE"/,
   );
-  assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{\{ matrix\.binary \}\}"/);
+  assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{MATRIX_BINARY\}"/);
 });
 
 test("macOS notarization preserves the provisioned app bundle during extraction", () => {
@@ -256,7 +256,7 @@ test("macOS notarization preserves the provisioned app bundle during extraction"
   );
   assert.match(
     extract,
-    /ditto -x -k "notarization-input\/\$\{\{ matrix\.binary \}\}-bundle-notary\.zip" \\\s*"\$\(dirname "\$APP_BUNDLE"\)"/,
+    /ditto -x -k "notarization-input\/\$\{MATRIX_BINARY\}-bundle-notary\.zip" \\\s*"\$\(dirname "\$APP_BUNDLE"\)"/,
   );
   assert.doesNotMatch(releaseWorkflow, /LEGACY_NOTARY_ZIP|-legacy-notary\.zip/);
 });

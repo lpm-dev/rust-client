@@ -65,6 +65,7 @@ jobs:
       npm_tag: ${{ steps.metadata.outputs.npm_tag }}
       prerelease: ${{ steps.metadata.outputs.prerelease }}
       should_release: ${{ steps.metadata.outputs.should_release }}
+      source_run_id: ${{ steps.metadata.outputs.source_run_id }}
       tag: ${{ steps.metadata.outputs.tag }}
       version: ${{ steps.metadata.outputs.version }}
     steps:
@@ -81,20 +82,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_CHANNEL: ${{ inputs.channel }}
           INPUT_MODE: ${{ inputs.mode }}
+          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+
+          # Inputs are matched as whole values with [[ =~ ]]. grep matches line
+          # by line, so a value with an embedded newline would pass on its
+          # first line and then add lines of its own to $GITHUB_OUTPUT.
+          STABLE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          NIGHTLY_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'
 
           SHOULD_RELEASE=true
           if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             CHANNEL=nightly
             MODE=full
             VERSION=
+            SOURCE_RUN_ID=
           else
             CHANNEL="${INPUT_CHANNEL:-stable}"
             MODE="${INPUT_MODE:-candidate}"
             VERSION="${INPUT_VERSION:-}"
+            SOURCE_RUN_ID="${INPUT_SOURCE_RUN_ID:-}"
           fi
+
+          case "$MODE" in
+            candidate | promote | full | wrapper-only | windows-smoke-only | npm-publish-only) ;;
+            *)
+              echo "::error::Unknown release mode '$MODE'."
+              exit 1
+              ;;
+          esac
+
+          case "$MODE" in
+            promote | windows-smoke-only | npm-publish-only | wrapper-only)
+              if ! [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+                echo "::error::$MODE needs source_run_id, the ID of the run that built its artifacts."
+                exit 1
+              fi
+              ;;
+            candidate | full)
+              if [ -n "$SOURCE_RUN_ID" ]; then
+                echo "::error::$MODE builds its own artifacts; leave source_run_id empty."
+                exit 1
+              fi
+              ;;
+          esac
 
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::Release workflows must run from the main branch."
@@ -134,8 +167,7 @@ jobs:
                   fi
                 done
 
-                if ! printf '%s\n' "$NPM_NIGHTLY" |
-                  grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'; then
+                if ! [[ "$NPM_NIGHTLY" =~ $NIGHTLY_VERSION_PATTERN ]]; then
                   echo "::error::npm nightly dist-tag has an invalid version: '$NPM_NIGHTLY'."
                   exit 1
                 fi
@@ -207,7 +239,7 @@ jobs:
 
           case "$CHANNEL" in
             stable)
-              if ! printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+              if ! [[ "$VERSION" =~ $STABLE_VERSION_PATTERN ]]; then
                 echo "::error::Stable release version must be X.Y.Z, got '$VERSION'."
                 exit 1
               fi
@@ -220,9 +252,6 @@ jobs:
                   echo "::error::Tag v${VERSION} already exists; choose a new version before building a candidate."
                   exit 1
                 fi
-              elif [ "$MODE" = "promote" ] && [ -z "${{ inputs.source_run_id }}" ]; then
-                echo "::error::source_run_id is required when promoting a candidate."
-                exit 1
               fi
               NPM_TAG=latest
               PRERELEASE=false
@@ -232,7 +261,7 @@ jobs:
                 echo "::error::candidate and promote are stable-only modes."
                 exit 1
               fi
-              if ! printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'; then
+              if ! [[ "$VERSION" =~ $NIGHTLY_VERSION_PATTERN ]]; then
                 echo "::error::Generated nightly version has an invalid shape: '$VERSION'."
                 exit 1
               fi
@@ -260,6 +289,7 @@ jobs:
             echo "npm_tag=$NPM_TAG"
             echo "prerelease=$PRERELEASE"
             echo "should_release=$SHOULD_RELEASE"
+            echo "source_run_id=$SOURCE_RUN_ID"
             echo "tag=v$VERSION"
             echo "version=$VERSION"
           } >> "$GITHUB_OUTPUT"
@@ -530,14 +560,21 @@ jobs:
 
       - name: Build
         if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.portable_glibc != true
-        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$MATRIX_TARGET" -p lpm-cli
 
       - name: Preserve app-bundle macOS binary
         if: runner.os == 'macOS'
-        run: cp "target/${{ matrix.target }}/release/lpm-rs" "$RUNNER_TEMP/lpm-rs-app-bundle"
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: cp "target/${MATRIX_TARGET}/release/lpm-rs" "$RUNNER_TEMP/lpm-rs-app-bundle"
 
       - name: Build portable GNU Linux binary
         if: matrix.portable_glibc == true
+        env:
+          MATRIX_BUILD_IMAGE: ${{ matrix.build_image }}
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -550,29 +587,35 @@ jobs:
             --env CARGO_INCREMENTAL \
             --env HOME=/tmp/lpm-home \
             --env LPM_BUILD_VERSION \
+            --env MATRIX_TARGET \
             --env RUSTFLAGS \
             --env RUSTUP_HOME=/rustup \
             --env RUST_TOOLCHAIN \
-            "${{ matrix.build_image }}" \
+            "${MATRIX_BUILD_IMAGE}" \
             bash -ceu '
               export PATH="/cargo/bin:$PATH"
               cargo "+${RUST_TOOLCHAIN}" build \
                 --locked \
                 --release \
-                --target "${{ matrix.target }}" \
+                --target "${MATRIX_TARGET}" \
                 -p lpm-cli \
                 --features portable-linux
             '
 
       - name: Build static musl binary
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo rustc --locked --release --target ${{ matrix.target }} -p lpm-cli --bin lpm-rs -- -C link-arg=-static
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: cargo rustc --locked --release --target "$MATRIX_TARGET" -p lpm-cli --bin lpm-rs -- -C link-arg=-static
 
       - name: Stage non-macOS binary
         if: runner.os != 'macOS'
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
-          cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
-          chmod +x ${{ matrix.binary }}
+          cp "target/${MATRIX_TARGET}/release/lpm-rs" "$MATRIX_BINARY"
+          chmod +x "$MATRIX_BINARY"
 
       - name: Install Node 22 for GNU Linux ABI verification
         if: matrix.portable_glibc == true
@@ -582,42 +625,51 @@ jobs:
 
       - name: Verify GNU Linux ABI ceiling
         if: matrix.portable_glibc == true
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: >-
           node npm/release/verify-linux-abi.mjs
-          --binary "${{ matrix.binary }}"
+          --binary "${MATRIX_BINARY}"
           --max-glibc 2.28
 
       - name: Verify GNU Linux binary on glibc 2.28
         if: matrix.portable_glibc == true
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
+          MATRIX_RUNTIME_IMAGE: ${{ matrix.runtime_image }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.release-metadata.outputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           actual=$(docker run --rm --network none \
             -v "$PWD:/work:ro" \
-            "${{ matrix.runtime_image }}" \
-            "/work/${{ matrix.binary }}" --version)
+            "${MATRIX_RUNTIME_IMAGE}" \
+            "/work/${MATRIX_BINARY}" --version)
           test "$actual" = "lpm $VERSION"
 
       - name: Verify musl binary on Alpine
         if: matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           set -euo pipefail
-          file "${{ matrix.binary }}"
-          if readelf -l "${{ matrix.binary }}" | grep -q INTERP; then
-            echo "::error::${{ matrix.binary }} requires a runtime ELF interpreter"
-            readelf -l "${{ matrix.binary }}"
+          file "${MATRIX_BINARY}"
+          if readelf -l "${MATRIX_BINARY}" | grep -q INTERP; then
+            echo "::error::${MATRIX_BINARY} requires a runtime ELF interpreter"
+            readelf -l "${MATRIX_BINARY}"
             exit 1
           fi
-          if readelf -d "${{ matrix.binary }}" | grep -q '(NEEDED)'; then
-            echo "::error::${{ matrix.binary }} has dynamic library dependencies"
-            readelf -d "${{ matrix.binary }}"
+          if readelf -d "${MATRIX_BINARY}" | grep -q '(NEEDED)'; then
+            echo "::error::${MATRIX_BINARY} has dynamic library dependencies"
+            readelf -d "${MATRIX_BINARY}"
             exit 1
           fi
-          VERSION="${{ needs.release-metadata.outputs.version }}"
+          VERSION="${RELEASE_VERSION}"
           actual=$(docker run --rm \
             -v "$PWD:/work:ro" \
             alpine@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 \
-            /work/${{ matrix.binary }} --version)
+            "/work/${MATRIX_BINARY}" --version)
           test "$actual" = "lpm $VERSION"
 
       - name: Import Developer ID certificate (macOS)
@@ -656,6 +708,7 @@ jobs:
         if: runner.os == 'macOS'
         env:
           APPLE_CLI_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_CLI_PROVISIONING_PROFILE_BASE64 }}
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
 
@@ -666,7 +719,7 @@ jobs:
 
           PROFILE_PATH="$RUNNER_TEMP/lpm-cli.provisionprofile"
           PROFILE_PLIST="$RUNNER_TEMP/lpm-cli-profile.plist"
-          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          APP_BUNDLE="$RUNNER_TEMP/${MATRIX_BINARY}-bundle/LPM CLI.app"
           printf '%s' "$APPLE_CLI_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
           security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
 
@@ -697,7 +750,7 @@ jobs:
           codesign --verify --strict --verbose=4 "$APP_BUNDLE"
           codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1 | grep -E "Authority|Identifier|TeamIdentifier|Runtime|Timestamp"
 
-          SIGNED_ENTITLEMENTS="$RUNNER_TEMP/${{ matrix.binary }}-bundle-entitlements.plist"
+          SIGNED_ENTITLEMENTS="$RUNNER_TEMP/${MATRIX_BINARY}-bundle-entitlements.plist"
           codesign -d --entitlements :- "$APP_BUNDLE" > "$SIGNED_ENTITLEMENTS" 2>/dev/null
           SIGNED_ACCESS_GROUP=$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$SIGNED_ENTITLEMENTS")
           test "$SIGNED_ACCESS_GROUP" = "$APPLE_KEYCHAIN_ACCESS_GROUP"
@@ -708,11 +761,13 @@ jobs:
 
       - name: Archive signed macOS notarization inputs
         if: runner.os == 'macOS'
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          APP_BUNDLE="$RUNNER_TEMP/${MATRIX_BINARY}-bundle/LPM CLI.app"
           mkdir notarization-input
-          BUNDLE_NOTARY_ZIP="notarization-input/${{ matrix.binary }}-bundle-notary.zip"
+          BUNDLE_NOTARY_ZIP="notarization-input/${MATRIX_BINARY}-bundle-notary.zip"
           ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "$BUNDLE_NOTARY_ZIP"
 
       - name: Restore Keychain search list before executing release code (macOS)
@@ -734,6 +789,9 @@ jobs:
 
       - name: Build scheduled acceptance binary
         if: github.event_name == 'schedule' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          MATRIX_BUILD_IMAGE: ${{ matrix.build_image }}
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -746,15 +804,16 @@ jobs:
             --env CARGO_INCREMENTAL \
             --env HOME=/tmp/lpm-home \
             --env LPM_BUILD_VERSION \
+            --env MATRIX_TARGET \
             --env RUSTUP_HOME=/rustup \
             --env RUST_TOOLCHAIN \
-            "${{ matrix.build_image }}" \
+            "${MATRIX_BUILD_IMAGE}" \
             bash -ceu '
               export PATH="/cargo/bin:$PATH"
               cargo "+${RUST_TOOLCHAIN}" build \
                 --locked \
                 --release \
-                --target "${{ matrix.target }}" \
+                --target "${MATRIX_TARGET}" \
                 -p lpm-cli \
                 --features portable-linux,acceptance-test-hooks
             '
@@ -762,7 +821,7 @@ jobs:
           bundle="$RUNNER_TEMP/lpm-linux-x64-acceptance"
           mkdir "$bundle"
           install -m 0755 \
-            "target/${{ matrix.target }}/release/lpm-rs" \
+            "target/${MATRIX_TARGET}/release/lpm-rs" \
             "$bundle/lpm-rs"
           binary_sha256=$(sha256sum "$bundle/lpm-rs" | awk '{print $1}')
           jq -n \
@@ -771,7 +830,7 @@ jobs:
             --arg ref "$GITHUB_REF" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg sha "$GITHUB_SHA" \
-            --arg target "${{ matrix.target }}" \
+            --arg target "${MATRIX_TARGET}" \
             --arg version "$LPM_BUILD_VERSION" \
             --arg binarySha256 "$binary_sha256" \
             --argjson runId "$GITHUB_RUN_ID" \
@@ -822,10 +881,13 @@ jobs:
 
       - name: Execute release binary (Linux glibc)
         if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.release-metadata.outputs.version }}"
-          actual=$("./${{ matrix.binary }}" --version)
+          VERSION="${RELEASE_VERSION}"
+          actual=$("./${MATRIX_BINARY}" --version)
           test "$actual" = "lpm $VERSION"
 
       - name: Delete temporary signing keychain (macOS)
@@ -879,9 +941,10 @@ jobs:
         id: input
         env:
           GH_TOKEN: ${{ github.token }}
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          name="notarization-input-${{ matrix.binary }}"
+          name="notarization-input-${MATRIX_BINARY}"
           exact=$(gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" | \
             jq -c --arg name "$name" --arg sha "$GITHUB_SHA" --argjson run "$GITHUB_RUN_ID" \
@@ -920,9 +983,10 @@ jobs:
         id: state
         env:
           GH_TOKEN: ${{ github.token }}
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          prefix="notarization-state-${{ matrix.binary }}-"
+          prefix="notarization-state-${MATRIX_BINARY}-"
           matches=$(gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" | \
             jq -c --arg prefix "$prefix" --arg sha "$GITHUB_SHA" --argjson run "$GITHUB_RUN_ID" \
@@ -945,11 +1009,13 @@ jobs:
           echo "recovered=true" >> "$GITHUB_OUTPUT"
 
       - name: Extract and verify signed macOS inputs
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          APP_BUNDLE="$RUNNER_TEMP/${MATRIX_BINARY}-bundle/LPM CLI.app"
           mkdir -p "$(dirname "$APP_BUNDLE")"
-          ditto -x -k "notarization-input/${{ matrix.binary }}-bundle-notary.zip" \
+          ditto -x -k "notarization-input/${MATRIX_BINARY}-bundle-notary.zip" \
             "$(dirname "$APP_BUNDLE")"
           codesign --verify --strict --verbose=4 "$APP_BUNDLE"
 
@@ -961,6 +1027,7 @@ jobs:
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
           if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
@@ -983,7 +1050,7 @@ jobs:
           LPM_NOTARY_MODE=submit \
           LPM_NOTARY_STATE_PATH="notarization-state/bundle.json" \
             scripts/ci/notarize-with-retry.sh \
-              "notarization-input/${{ matrix.binary }}-bundle-notary.zip" "${NOTARY_AUTH[@]}"
+              "notarization-input/${MATRIX_BINARY}-bundle-notary.zip" "${NOTARY_AUTH[@]}"
 
       - name: Persist notarization submission IDs before polling
         if: always()
@@ -1001,6 +1068,7 @@ jobs:
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
           if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ]; then
@@ -1015,17 +1083,19 @@ jobs:
           LPM_NOTARY_MODE=poll \
           LPM_NOTARY_STATE_PATH="notarization-state/bundle.json" \
             scripts/ci/notarize-with-retry.sh \
-              "notarization-input/${{ matrix.binary }}-bundle-notary.zip" "${NOTARY_AUTH[@]}"
+              "notarization-input/${MATRIX_BINARY}-bundle-notary.zip" "${NOTARY_AUTH[@]}"
 
       - name: Staple validate and package notarized macOS artifacts
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          APP_BUNDLE="$RUNNER_TEMP/${MATRIX_BINARY}-bundle/LPM CLI.app"
           scripts/ci/with-apple-service-retry.sh stapler staple "$APP_BUNDLE"
           scripts/ci/with-apple-service-retry.sh stapler validate "$APP_BUNDLE"
           codesign --verify --strict --verbose=4 "$APP_BUNDLE"
           spctl --assess --type execute --verbose=4 "$APP_BUNDLE"
-          ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${{ matrix.binary }}.zip"
+          ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${MATRIX_BINARY}.zip"
 
       - name: Upload macOS app bundle
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1036,11 +1106,15 @@ jobs:
           retention-days: 1
 
       - name: Execute notarized app bundle
+        env:
+          MATRIX_BINARY: ${{ matrix.binary }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.release-metadata.outputs.version }}"
-          APP_EXECUTABLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app/Contents/MacOS/lpm-rs"
-          case "${{ matrix.target }}" in
+          VERSION="${RELEASE_VERSION}"
+          APP_EXECUTABLE="$RUNNER_TEMP/${MATRIX_BINARY}-bundle/LPM CLI.app/Contents/MacOS/lpm-rs"
+          case "${MATRIX_TARGET}" in
             aarch64-apple-darwin)
               actual=$(arch -arm64 "$APP_EXECUTABLE" --version)
               ;;
@@ -1094,15 +1168,25 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build CLI
-        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
+        shell: pwsh
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$env:MATRIX_TARGET" -p lpm-cli
 
       - name: Build sandbox helper
-        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
+        shell: pwsh
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$env:MATRIX_TARGET" -p lpm-sandbox --bin lpm-sandbox-helper
 
       - name: Stage unsigned binaries
+        shell: pwsh
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_TARGET: ${{ matrix.target }}
         run: |
-          cp target/${{ matrix.target }}/release/lpm-rs.exe lpm-${{ matrix.platform }}.exe
-          cp target/${{ matrix.target }}/release/lpm-sandbox-helper.exe lpm-sandbox-helper-${{ matrix.platform }}.exe
+          cp "target/$env:MATRIX_TARGET/release/lpm-rs.exe" "lpm-$env:MATRIX_PLATFORM.exe"
+          cp "target/$env:MATRIX_TARGET/release/lpm-sandbox-helper.exe" "lpm-sandbox-helper-$env:MATRIX_PLATFORM.exe"
 
       - name: Upload immutable unsigned binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1116,16 +1200,19 @@ jobs:
 
       - name: Execute release binary
         shell: pwsh
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
-          $version = "${{ needs.release-metadata.outputs.version }}"
-          $actual = (& ".\lpm-${{ matrix.platform }}.exe" --version | Out-String).Trim()
+          $version = $env:RELEASE_VERSION
+          $actual = (& ".\lpm-$env:MATRIX_PLATFORM.exe" --version | Out-String).Trim()
           if ($actual -ne "lpm $version") {
             Write-Error "Release binary reported '$actual', expected 'lpm $version'."
             exit 1
           }
           # Self-update replaces a helper that names another release, so one
           # that misreports would be replaced on every update check.
-          $helper = (& ".\lpm-sandbox-helper-${{ matrix.platform }}.exe" --version | Out-String).Trim()
+          $helper = (& ".\lpm-sandbox-helper-$env:MATRIX_PLATFORM.exe" --version | Out-String).Trim()
           if ($helper -ne $version) {
             Write-Error "Release sandbox helper reported '$helper', expected '$version'."
             exit 1
@@ -1340,12 +1427,14 @@ jobs:
           done
 
       - name: Pack and hash release packages
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           node npm/release/prepare-packages.mjs \
             --repo "$PWD" \
             --binaries "$PWD/binaries" \
             --output "$PWD/npm-release-packages" \
-            --version "${{ needs.release-metadata.outputs.version }}"
+            --version "${RELEASE_VERSION}"
 
       - name: Upload exact npm tarballs
         id: npm-artifact
@@ -1422,15 +1511,33 @@ jobs:
         run: npm install --global npm@11.12.1 --no-audit --no-fund
 
       - name: Install and execute exact npm tarballs
-        if: matrix.alpine != true
+        if: matrix.alpine != true && runner.os != 'Windows'
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          PACKED_VERSION: ${{ needs.pack-npm-packages.outputs.version }}
         run: >-
           node npm/release/smoke-install.mjs
           --tarballs npm-release-packages
-          --platform ${{ matrix.platform }}
-          --version ${{ needs.pack-npm-packages.outputs.version }}
+          --platform "$MATRIX_PLATFORM"
+          --version "$PACKED_VERSION"
+
+      - name: Install and execute exact npm tarballs on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          PACKED_VERSION: ${{ needs.pack-npm-packages.outputs.version }}
+        run: >-
+          node npm/release/smoke-install.mjs
+          --tarballs npm-release-packages
+          --platform "$env:MATRIX_PLATFORM"
+          --version "$env:PACKED_VERSION"
 
       - name: Install and execute exact npm tarballs on Alpine
         if: matrix.alpine == true
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          PACKED_VERSION: ${{ needs.pack-npm-packages.outputs.version }}
         run: |
           docker run --rm --network none \
             -v "$PWD:/work:ro" \
@@ -1438,8 +1545,8 @@ jobs:
             node:22-alpine@sha256:b74031e546d7f4faf561d797ac1b76beccac856a042815ca77db4fd047581605 \
             node npm/release/smoke-install.mjs \
               --tarballs npm-release-packages \
-              --platform ${{ matrix.platform }} \
-              --version ${{ needs.pack-npm-packages.outputs.version }}
+              --platform "$MATRIX_PLATFORM" \
+              --version "$PACKED_VERSION"
 
   smoke-windows-recovery:
     name: Smoke npm artifacts (${{ matrix.platform }} recovery)
@@ -1477,7 +1584,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
           VERSION: ${{ needs.release-metadata.outputs.version }}
           CHANNEL: ${{ needs.release-metadata.outputs.channel }}
         run: |
@@ -1503,11 +1610,15 @@ jobs:
         run: npm install --global npm@11.12.1 --no-audit --no-fund
 
       - name: Install and execute exact npm tarballs
+        shell: pwsh
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: >-
           node npm/release/smoke-install.mjs
           --tarballs npm-release-packages
-          --platform ${{ matrix.platform }}
-          --version ${{ needs.release-metadata.outputs.version }}
+          --platform "$env:MATRIX_PLATFORM"
+          --version "$env:RELEASE_VERSION"
 
   release:
     name: Stage Draft Release
@@ -1585,7 +1696,9 @@ jobs:
           subject-path: binaries/SHA256SUMS.txt
 
       - name: Stage Sigstore bundle next to manifest
-        run: cp "${{ steps.attest.outputs.bundle-path }}" binaries/SHA256SUMS.txt.sigstore
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "${ATTESTATION_BUNDLE}" binaries/SHA256SUMS.txt.sigstore
 
       # Run the verifier compiled into the binary being released, so a signing
       # identity that `lpm self-update` would refuse fails here, before any
@@ -1723,6 +1836,7 @@ jobs:
         env:
           EXPECTED_BINARY: ${{ matrix.binary }}
           LPM_INSTALL_VERSION: ${{ needs.release-metadata.outputs.tag }}
+          MATRIX_IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -1730,7 +1844,7 @@ jobs:
               -e LPM_INSTALL_VERSION \
               -v "$PWD:/work:ro" \
               -v "$PWD/staged-release:/release:ro" \
-              "${{ matrix.image }}" \
+              "${MATRIX_IMAGE}" \
             sh -ceu '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
@@ -1875,6 +1989,8 @@ jobs:
           "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" npm-release-packages
 
       - name: Seal candidate payload and source identity
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: >-
           node npm/release/seal-release-candidate.mjs
           --github-release "$PWD/staged-github-release"
@@ -1883,16 +1999,18 @@ jobs:
           --repository "$GITHUB_REPOSITORY"
           --source-sha "$GITHUB_SHA"
           --source-run-id "$GITHUB_RUN_ID"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --version "${RELEASE_VERSION}"
 
       - name: Verify sealed candidate
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: >-
           node npm/release/verify-release-candidate.mjs
           --candidate "$PWD/release-candidate"
           --repository "$GITHUB_REPOSITORY"
           --source-sha "$GITHUB_SHA"
           --source-run-id "$GITHUB_RUN_ID"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --version "${RELEASE_VERSION}"
 
       - name: Upload immutable stable candidate
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1937,7 +2055,7 @@ jobs:
       npm_artifact_digest: sha256:${{ steps.npm-scope.outputs['artifact-digest'] }}
       npm_artifact_id: ${{ steps.npm-scope.outputs['artifact-id'] }}
       source_sha: ${{ steps.source.outputs.source_sha }}
-      source_run_id: ${{ inputs.source_run_id }}
+      source_run_id: ${{ needs.release-metadata.outputs.source_run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1945,11 +2063,13 @@ jobs:
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
         run: >-
           node npm/release/validate-release-candidate-source.mjs
           --repository "$GITHUB_REPOSITORY"
-          --run-id "${{ inputs.source_run_id }}"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --run-id "${SOURCE_RUN_ID}"
+          --version "${RELEASE_VERSION}"
           --github-output "$GITHUB_OUTPUT"
 
       - name: Bind promotion provenance to candidate source
@@ -1971,19 +2091,25 @@ jobs:
             "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
 
       - name: Verify sealed candidate
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
         run: >-
           node npm/release/verify-release-candidate.mjs
           --candidate "$PWD/release-candidate"
           --repository "$GITHUB_REPOSITORY"
-          --source-sha "${{ steps.source.outputs.source_sha }}"
-          --source-run-id "${{ inputs.source_run_id }}"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --source-sha "${SOURCE_SHA}"
+          --source-run-id "${SOURCE_RUN_ID}"
+          --version "${RELEASE_VERSION}"
 
       - name: Verify exact npm package set
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: >-
           node npm/release/verify-packages.mjs
           --packages "$PWD/release-candidate/npm-release-packages"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --version "${RELEASE_VERSION}"
 
       - name: Split verified candidate into bounded promotion scopes
         run: |
@@ -2043,14 +2169,17 @@ jobs:
           "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
 
       - name: Verify sealed candidate before attestation
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
         run: >-
           node npm/release/verify-release-candidate.mjs
           --candidate "$PWD/release-candidate"
           --repository "$GITHUB_REPOSITORY"
           --scope github-release
           --source-sha "$SOURCE_SHA"
-          --source-run-id "${{ inputs.source_run_id }}"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --source-run-id "${SOURCE_RUN_ID}"
+          --version "${RELEASE_VERSION}"
 
       - name: Create fresh promotion-time Sigstore proof
         id: attest
@@ -2059,7 +2188,9 @@ jobs:
           subject-path: release-candidate/github-release/SHA256SUMS.txt
 
       - name: Replace candidate smoke proof with promotion proof
-        run: cp "${{ steps.attest.outputs.bundle-path }}" release-candidate/github-release/SHA256SUMS.txt.sigstore
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "${ATTESTATION_BUNDLE}" release-candidate/github-release/SHA256SUMS.txt.sigstore
 
       - name: Verify the promotion proof with the shipped self-update policy
         env:
@@ -2113,17 +2244,20 @@ jobs:
           "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
 
       - name: Verify candidate and exact npm tarballs
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
         run: |
           node npm/release/verify-release-candidate.mjs \
             --candidate "$PWD/release-candidate" \
             --repository "$GITHUB_REPOSITORY" \
             --scope npm-release-packages \
             --source-sha "$SOURCE_SHA" \
-            --source-run-id "${{ inputs.source_run_id }}" \
-            --version "${{ needs.release-metadata.outputs.version }}"
+            --source-run-id "${SOURCE_RUN_ID}" \
+            --version "${RELEASE_VERSION}"
           node npm/release/verify-packages.mjs \
             --packages "$PWD/release-candidate/npm-release-packages" \
-            --version "${{ needs.release-metadata.outputs.version }}"
+            --version "${RELEASE_VERSION}"
 
       - name: Install trusted-publisher npm client
         run: |
@@ -2261,6 +2395,9 @@ jobs:
           "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" promotion-github-release
 
       - name: Reverify candidate and promotion asset inventory
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
         run: |
           set -euo pipefail
           node npm/release/verify-release-candidate.mjs \
@@ -2268,8 +2405,8 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --scope github-release \
             --source-sha "$SOURCE_SHA" \
-            --source-run-id "${{ inputs.source_run_id }}" \
-            --version "${{ needs.release-metadata.outputs.version }}"
+            --source-run-id "${SOURCE_RUN_ID}" \
+            --version "${RELEASE_VERSION}"
           find release-candidate/github-release -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/candidate-assets"
           find promotion-github-release -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/promotion-assets"
           diff -u "$RUNNER_TEMP/candidate-assets" "$RUNNER_TEMP/promotion-assets"
@@ -2478,7 +2615,7 @@ jobs:
       - name: Record promotion recovery instructions
         if: always()
         env:
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
           VERSION: ${{ needs.release-metadata.outputs.version }}
         run: |
           {
@@ -2570,7 +2707,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
           VERSION: ${{ needs.release-metadata.outputs.version }}
           CHANNEL: ${{ needs.release-metadata.outputs.channel }}
         run: |
@@ -2608,10 +2745,12 @@ jobs:
           test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
 
       - name: Verify npm release package artifacts
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: >-
           node npm/release/verify-packages.mjs
           --packages "$PWD/npm-release-packages"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --version "${RELEASE_VERSION}"
 
       - name: Install pinned npm 11 (required for trusted publishers OIDC)
         run: |
@@ -2632,7 +2771,7 @@ jobs:
       - name: Publish platform packages via trusted publishers (OIDC, tokenless)
         env:
           EXPECTED_SOURCE_SHA: ${{ needs.release-metadata.outputs.mode == 'full' && github.sha || steps.source.outputs.source_sha }}
-          EXPECTED_SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.mode == 'full' && github.run_id || inputs.source_run_id }}
+          EXPECTED_SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.mode == 'full' && github.run_id || needs.release-metadata.outputs.source_run_id }}
         run: |
           set -euo pipefail
           MANIFEST=npm-release-packages/release-packages.json
@@ -2738,7 +2877,7 @@ jobs:
           (inputs.mode == 'npm-publish-only' || inputs.mode == 'wrapper-only')
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.source_run_id }}
           VERSION: ${{ needs.release-metadata.outputs.version }}
           CHANNEL: ${{ needs.release-metadata.outputs.channel }}
           RECOVERY_PURPOSE: ${{ inputs.mode == 'wrapper-only' && 'wrapper-publish' || 'npm-publish' }}
@@ -2774,10 +2913,12 @@ jobs:
           test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
 
       - name: Verify npm release package artifacts
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
         run: >-
           node npm/release/verify-packages.mjs
           --packages "$PWD/npm-release-packages"
-          --version "${{ needs.release-metadata.outputs.version }}"
+          --version "${RELEASE_VERSION}"
 
       - name: Smoke wrapper-only recovery artifact
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'
@@ -2805,7 +2946,7 @@ jobs:
       - name: Publish exact verified wrapper tarball
         env:
           EXPECTED_SOURCE_SHA: ${{ needs.release-metadata.outputs.mode == 'full' && github.sha || steps.source.outputs.source_sha }}
-          EXPECTED_SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.mode == 'full' && github.run_id || inputs.source_run_id }}
+          EXPECTED_SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.mode == 'full' && github.run_id || needs.release-metadata.outputs.source_run_id }}
         run: |
           set -euo pipefail
           MANIFEST=npm-release-packages/release-packages.json
@@ -2874,10 +3015,12 @@ jobs:
           cosign-release: "v3.0.6"
 
       - name: Verify release manifest and export Homebrew checksums
+        env:
+          RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
         run: |
           set -euo pipefail
 
-          VERSION="${{ needs.release-metadata.outputs.tag }}"
+          VERSION="${RELEASE_TAG}"
           BASE="https://github.com/lpm-dev/rust-client/releases/download/${VERSION}"
 
           curl -fsSL --retry 3 --max-time 60 "${BASE}/SHA256SUMS.txt" -o SHA256SUMS.txt
