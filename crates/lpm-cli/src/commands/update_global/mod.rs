@@ -103,19 +103,6 @@ pub async fn run(
             return Err(LpmError::Script("local global links need recovery before a preview; run `lpm global list`, then retry".into()));
         }
     }
-    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
-        client,
-        &root.global_root(),
-        crate::commands::registry_reads::RegistryReads::LPM_AND_NPM,
-    )?;
-    if !json_output && dry_run {
-        read_context.announce();
-    }
-    let planning_registry = read_context
-        .client
-        .clone_with_config()
-        .without_metadata_memory_cache();
-    let install_registry = read_context.client.clone_with_metadata_memory_cache();
     let manifest = read_for(&root)?;
 
     let targets = match package {
@@ -141,6 +128,33 @@ pub async fn run(
         return Ok(());
     }
 
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let routes_of_targets: Vec<_> = targets
+        .iter()
+        .map(|target| super::global_util::metadata_route(&route_table, &target.name))
+        .collect();
+    let reads = crate::commands::registry_reads::RegistryReads {
+        lpm: routes_of_targets
+            .iter()
+            .any(|route| matches!(route, lpm_registry::UpstreamRoute::LpmWorker)),
+        npm: routes_of_targets
+            .iter()
+            .any(|route| matches!(route, lpm_registry::UpstreamRoute::NpmDirect)),
+    };
+    let read_context = crate::commands::registry_reads::configure_registry_read_context(
+        client,
+        route_table,
+        reads,
+    )?;
+    if !json_output && dry_run {
+        read_context.announce();
+    }
+    let planning_registry = read_context
+        .client
+        .clone_with_config()
+        .without_metadata_memory_cache();
+    let install_registry = read_context.client.clone_with_metadata_memory_cache();
     let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
         &root.global_root(),
         None,

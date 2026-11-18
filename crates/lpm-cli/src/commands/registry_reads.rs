@@ -131,9 +131,9 @@ impl RegistryReads {
         lpm: true,
         npm: false,
     };
-    pub const LPM_AND_NPM: Self = Self {
-        lpm: true,
-        npm: true,
+    pub const NONE: Self = Self {
+        lpm: false,
+        npm: false,
     };
 }
 

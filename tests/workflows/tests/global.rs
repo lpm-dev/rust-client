@@ -2747,3 +2747,28 @@ async fn global_update_of_several_packages_names_the_npmrc_tls_settings_once() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn global_update_with_nothing_installed_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(r#"{"name":"global-empty","version":"1.0.0"}"#);
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "//lpm.dev/:cafile={}\n//registry.npmjs.org/:cafile={}\n",
+            project.home().join("missing-lpm-ca.pem").display(),
+            project.home().join("missing-npm-ca.pem").display()
+        ),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["global", "update"])
+        .output()
+        .expect("run lpm global update");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("No globally-installed packages to update"),
+        "{stderr}"
+    );
+}

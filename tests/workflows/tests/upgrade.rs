@@ -3059,4 +3059,9 @@ async fn upgrade_and_install_warn_about_strict_ssl_false_once() {
             "{args:?} must warn about strict-ssl=false once: {stderr}"
         );
     }
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("version = \"2.5.0\""),
+        "the upgrade must have installed: {lockfile}"
+    );
 }

@@ -236,10 +236,21 @@ async fn run_list_outdated(
         return Ok(());
     }
 
-    let read_context = crate::commands::registry_reads::prepare_registry_read_context(
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let reads = crate::commands::registry_reads::RegistryReads {
+        lpm: !lpm_names.is_empty(),
+        npm: npm_names.iter().any(|name| {
+            matches!(
+                super::global_util::metadata_route(&route_table, name),
+                lpm_registry::UpstreamRoute::NpmDirect
+            )
+        }),
+    };
+    let read_context = crate::commands::registry_reads::configure_registry_read_context(
         client,
-        &root.global_root(),
-        crate::commands::registry_reads::RegistryReads::LPM_AND_NPM,
+        route_table,
+        reads,
     )?;
     if !json_output {
         read_context.announce();

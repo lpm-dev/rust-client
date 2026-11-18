@@ -4574,6 +4574,7 @@ async fn audit_fix_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
         .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
+    front.write_user_npmrc_trusting_everywhere(project.home());
     mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
         "GHSA-cafile-fix",
         "vuln-pkg",
@@ -4759,4 +4760,64 @@ fn audit_signatures_with_nothing_to_verify_does_not_load_registry_tls_settings()
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+fn write_unreadable_registry_cafiles(project: &TempProject) {
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "//lpm.dev/:cafile={}\n//registry.npmjs.org/:cafile={}\n",
+            project.home().join("missing-lpm-ca.pem").display(),
+            project.home().join("missing-npm-ca.pem").display()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn audit_fix_with_nothing_to_fix_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(r#"{"name":"empty-fix","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
+    );
+    write_unreadable_registry_cafiles(&project);
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "fix", "--dry-run"])
+        .output()
+        .expect("run lpm audit fix");
+    assert!(
+        output.status.success(),
+        "fixing nothing reads no registry\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn audit_signatures_that_skips_every_package_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(
+        r#"{"name":"lpm-only-signatures","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+         [[packages]]\nname = \"@lpm.dev/acme.widget\"\nversion = \"1.0.0\"\n\
+         source = \"registry+https://lpm.dev\"\n",
+    );
+    write_unreadable_registry_cafiles(&project);
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "signatures"])
+        .output()
+        .expect("run lpm audit signatures");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "a first-party LPM package is skipped without a registry request\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(report.to_string().contains("acme.widget"), "{report}");
 }
