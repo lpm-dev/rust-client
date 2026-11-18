@@ -1661,7 +1661,11 @@ async fn query_leaves_out_optional_packages_install_skipped_on_this_platform() {
         );
     }
     let root_children = query(&[&format!(":root > #{HOST}")]);
-    assert_eq!(root_children.as_array().map(Vec::len), Some(1), "{root_children}");
+    assert_eq!(
+        root_children.as_array().map(Vec::len),
+        Some(1),
+        "{root_children}"
+    );
     assert_eq!(
         query(&[&format!("#{HOST} > #{SKIPPED_OPTIONAL}")]),
         serde_json::json!([]),

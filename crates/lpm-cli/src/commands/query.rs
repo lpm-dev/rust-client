@@ -1129,6 +1129,40 @@ fn output_mermaid(
     all_packages: &[lpm_lockfile::LockedPackage],
     selector_str: &str,
 ) {
+    let (nodes, edges) = mermaid_graph(matched_indices, all_packages);
+
+    println!("graph TD");
+    println!("    %% lpm query \"{}\"", selector_str);
+    for index in nodes {
+        let package = &all_packages[index];
+        let instance_suffix = package
+            .instance_id
+            .map(|instance_id| format!("\\n{}", &instance_id.to_string()[..12]))
+            .unwrap_or_default();
+        println!(
+            "    n{index}[\"{}@{}{}\"]",
+            package.name, package.version, instance_suffix
+        );
+    }
+    for (from, to) in edges {
+        println!("    n{from} --> n{to}");
+    }
+    if !matched_indices.is_empty() {
+        let ids = matched_indices
+            .iter()
+            .map(|index| format!("n{index}"))
+            .collect::<Vec<_>>();
+        println!("    style {} fill:#f96,stroke:#333", ids.join(","));
+    }
+}
+
+/// The packages and edges of the Mermaid subgraph around `matched_indices`:
+/// each edge touching a matched package, by index into `all_packages`, both
+/// sorted.
+fn mermaid_graph(
+    matched_indices: &[usize],
+    all_packages: &[lpm_lockfile::LockedPackage],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
     let key_by_instance: HashMap<_, _> = all_packages
         .iter()
         .enumerate()
@@ -1151,7 +1185,9 @@ fn output_mermaid(
             .chain(package.peer_targets.values())
             .filter_map(|instance_id| key_by_instance.get(instance_id).copied())
             .collect::<Vec<_>>();
-        let targets = if exact_targets.is_empty() {
+        let records_exact_targets =
+            !package.dependency_targets.is_empty() || !package.peer_targets.is_empty();
+        let targets = if !records_exact_targets {
             package
                 .dependencies
                 .iter()
@@ -1178,29 +1214,7 @@ fn output_mermaid(
     let mut edges = edges.into_iter().collect::<Vec<_>>();
     edges.sort_unstable();
 
-    println!("graph TD");
-    println!("    %% lpm query \"{}\"", selector_str);
-    for index in nodes {
-        let package = &all_packages[index];
-        let instance_suffix = package
-            .instance_id
-            .map(|instance_id| format!("\\n{}", &instance_id.to_string()[..12]))
-            .unwrap_or_default();
-        println!(
-            "    n{index}[\"{}@{}{}\"]",
-            package.name, package.version, instance_suffix
-        );
-    }
-    for (from, to) in edges {
-        println!("    n{from} --> n{to}");
-    }
-    if !matched_indices.is_empty() {
-        let ids = matched_indices
-            .iter()
-            .map(|index| format!("n{index}"))
-            .collect::<Vec<_>>();
-        println!("    style {} fill:#f96,stroke:#333", ids.join(","));
-    }
+    (nodes, edges)
 }
 
 #[cfg(test)]
@@ -1397,5 +1411,32 @@ mod tests {
         let package_dir =
             cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
         assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+    }
+
+    #[test]
+    fn mermaid_draws_no_edge_to_a_stand_in_for_a_removed_exact_target() {
+        let instance = |n: u8| lpm_common::PackageInstanceId::parse(&format!("{n:064x}")).unwrap();
+        let parent = lpm_lockfile::LockedPackage {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            instance_id: Some(instance(1)),
+            dependencies: vec!["child@1.0.0".to_string()],
+            dependency_targets: std::collections::BTreeMap::from([(
+                "child".to_string(),
+                instance(9),
+            )]),
+            ..Default::default()
+        };
+        let other_child = lpm_lockfile::LockedPackage {
+            name: "child".to_string(),
+            version: "1.0.0".to_string(),
+            instance_id: Some(instance(2)),
+            ..Default::default()
+        };
+
+        let (nodes, edges) = mermaid_graph(&[0], &[parent, other_child]);
+
+        assert_eq!(nodes, [0]);
+        assert!(edges.is_empty(), "{edges:?}");
     }
 }

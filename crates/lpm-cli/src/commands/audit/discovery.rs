@@ -427,8 +427,7 @@ fn lpm_platform_skipped_packages(
     lockfile: &lpm_lockfile::Lockfile,
 ) -> Vec<bool> {
     crate::commands::manifest_metadata::platform_skipped_package_flags(lockfile, || {
-        crate::commands::manifest_metadata::read_json_file(&project_root.join("package.json"))
-            .unwrap_or(serde_json::Value::Null)
+        crate::commands::manifest_metadata::read_json_file(&project_root.join("package.json")).ok()
     })
 }
 

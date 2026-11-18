@@ -384,20 +384,51 @@ fn mismatched_installed_manifest(
 /// Which of `lockfile`'s packages install leaves off the current platform,
 /// aligned with `lockfile.packages`: each optional package whose `os`,
 /// `cpu` or `libc` excludes this platform, and each optional package
-/// reachable only through one. `root_json` gives the importer's
-/// `package.json`, whose optional dependencies can keep a package
-/// reachable; it is read only when some package is excluded.
+/// reachable only through one. A root dependency keeps a package reachable:
+/// the lockfile's exact root resolutions name them, and a lockfile without
+/// them falls back to `root_json`, the importer's `package.json`, read only
+/// when some package is excluded. Without either, only packages whose own
+/// `os`, `cpu` or `libc` excludes this platform count.
 pub(crate) fn platform_skipped_package_flags(
     lockfile: &Lockfile,
-    root_json: impl FnOnce() -> Value,
+    root_json: impl FnOnce() -> Option<Value>,
 ) -> Vec<bool> {
     let blocked = platform_blocked_packages(lockfile);
     if !blocked.contains(&true) {
         return blocked;
     }
     let indexes = graph::PackageIndexes::new(&lockfile.packages);
-    let roots = graph::selected_roots(&root_json(), lockfile, &indexes);
-    platform_skipped_from_blocked(lockfile, &indexes, &roots, blocked)
+    let roots = match exact_root_indexes(lockfile, &indexes) {
+        Some(roots) => roots,
+        None => match root_json() {
+            Some(root_json) => graph::selected_roots(&root_json, lockfile, &indexes)
+                .into_iter()
+                .map(|(_, index, _)| index)
+                .collect(),
+            None => return blocked,
+        },
+    };
+    platform_skipped_from_blocked(lockfile, &indexes, roots, blocked)
+}
+
+/// The rows the lockfile's root resolutions select, when every resolution
+/// names an exact instance the lockfile holds.
+fn exact_root_indexes(
+    lockfile: &Lockfile,
+    indexes: &graph::PackageIndexes<'_>,
+) -> Option<Vec<usize>> {
+    if lockfile.root_resolutions.is_empty() {
+        return None;
+    }
+    lockfile
+        .root_resolutions
+        .values()
+        .map(|resolution| {
+            resolution
+                .instance_id
+                .and_then(|id| indexes.by_instance.get(&id).copied())
+        })
+        .collect()
 }
 
 fn platform_skipped_packages(
@@ -409,7 +440,12 @@ fn platform_skipped_packages(
     if !blocked.contains(&true) {
         return blocked;
     }
-    platform_skipped_from_blocked(lockfile, indexes, roots, blocked)
+    platform_skipped_from_blocked(
+        lockfile,
+        indexes,
+        roots.iter().map(|(_, index, _)| *index),
+        blocked,
+    )
 }
 
 fn platform_blocked_packages(lockfile: &Lockfile) -> Vec<bool> {
@@ -423,7 +459,7 @@ fn platform_blocked_packages(lockfile: &Lockfile) -> Vec<bool> {
 fn platform_skipped_from_blocked(
     lockfile: &Lockfile,
     indexes: &graph::PackageIndexes<'_>,
-    roots: &[(String, usize, graph::PackageScope)],
+    roots: impl IntoIterator<Item = usize>,
     blocked: Vec<bool>,
 ) -> Vec<bool> {
     let packages = &lockfile.packages;
@@ -447,7 +483,7 @@ fn platform_skipped_from_blocked(
         );
     }
     let mut reachable = vec![false; packages.len()];
-    queue.extend(roots.iter().map(|(_, index, _)| *index));
+    queue.extend(roots);
     queue.extend(
         packages
             .iter()
@@ -574,7 +610,58 @@ mod tests {
             packages,
             ..Lockfile::new()
         };
-        platform_skipped_package_flags(&lockfile, || Value::Null)
+        platform_skipped_package_flags(&lockfile, || Some(serde_json::json!({})))
+    }
+
+    fn instance(n: u8) -> lpm_common::PackageInstanceId {
+        lpm_common::PackageInstanceId::parse(&format!("{n:064x}")).unwrap()
+    }
+
+    fn wasm_only_parent_of_runtime() -> (LockedPackage, LockedPackage) {
+        let mut wasm = locked_package("wasm-only", true);
+        wasm.instance_id = Some(instance(1));
+        wasm.cpu = vec!["wasm32".to_string()];
+        wasm.dependencies = vec!["runtime@1.0.0".to_string()];
+        wasm.dependency_targets =
+            std::collections::BTreeMap::from([("runtime".to_string(), instance(2))]);
+        let mut runtime = locked_package("runtime", true);
+        runtime.instance_id = Some(instance(2));
+        (wasm, runtime)
+    }
+
+    #[test]
+    fn platform_skip_keeps_an_exact_root_reachable_without_reading_the_manifest() {
+        let (wasm, runtime) = wasm_only_parent_of_runtime();
+        let lockfile = Lockfile {
+            packages: vec![wasm, runtime],
+            root_resolutions: std::collections::BTreeMap::from([(
+                "runtime".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance(2)),
+                    ..Default::default()
+                },
+            )]),
+            ..Lockfile::new()
+        };
+
+        let skipped = platform_skipped_package_flags(&lockfile, || {
+            panic!("exact root resolutions need no package.json")
+        });
+
+        assert_eq!(skipped, [true, false]);
+    }
+
+    #[test]
+    fn platform_skip_without_known_roots_exempts_only_packages_that_exclude_this_platform() {
+        let (wasm, runtime) = wasm_only_parent_of_runtime();
+        let lockfile = Lockfile {
+            packages: vec![wasm, runtime],
+            ..Lockfile::new()
+        };
+
+        let skipped = platform_skipped_package_flags(&lockfile, || None);
+
+        assert_eq!(skipped, [true, false]);
     }
 
     fn locked_package(name: &str, optional: bool) -> LockedPackage {
