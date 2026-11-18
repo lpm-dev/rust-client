@@ -25,7 +25,9 @@ pub(crate) fn is_up_to_date(
     {
         return Ok(false);
     }
-    let Ok(package) = serde_json::from_str::<lpm_workspace::PackageJson>(package_json) else {
+    let Ok(package) = serde_json::from_str::<lpm_workspace::PackageJson>(
+        lpm_common::strip_utf8_bom_str(package_json),
+    ) else {
         return Ok(false);
     };
     if crate::install_recovery::pending(project_dir)

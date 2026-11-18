@@ -3154,13 +3154,20 @@ fn recursive_install_stays_up_to_date_after_member_and_root_script_edits() {
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value");
-    for target in envelope["targets"]
+    let targets = envelope["targets"]
         .as_array()
-        .expect("targets should be an array")
-    {
+        .expect("targets should be an array");
+    for name in ["workspace-root", "@fixture/core"] {
+        let target = targets
+            .iter()
+            .find(|target| target["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be an install target: {envelope}"));
         assert_eq!(
             target["up_to_date"], true,
-            "edits to scripts no install step runs must leave every target fresh: {target}",
+            "edits to scripts no install step runs must leave {name} fresh: {target}",
         );
+    }
+    for target in targets {
+        assert_eq!(target["up_to_date"], true, "{target}");
     }
 }

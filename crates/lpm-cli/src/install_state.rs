@@ -946,7 +946,11 @@ fn check_install_state_with_paths(
     //
     // The hash is still returned as Some so callers like dev.rs::needs_install()
     // know the file exists and can trigger a full install which surfaces the error.
-    if serde_json::from_str::<lpm_workspace::PackageJson>(pkg_content).is_err() {
+    if serde_json::from_str::<lpm_workspace::PackageJson>(lpm_common::strip_utf8_bom_str(
+        pkg_content,
+    ))
+    .is_err()
+    {
         return InstallState {
             up_to_date: false,
             hash: Some(current_hash),

@@ -19009,3 +19009,35 @@ async fn install_stays_up_to_date_after_edits_to_scripts_install_never_runs() {
     );
     assert_eq!(project.read_file("postinstall.log"), "ran");
 }
+
+#[tokio::test]
+async fn install_stays_up_to_date_for_a_manifest_that_starts_with_a_byte_order_mark() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "ms", "version": "2.1.3"}), &[])
+        .await;
+    let manifest = |dev: &str| {
+        format!(
+            "\u{feff}{{\"name\":\"bom-manifest\",\"version\":\"1.0.0\",\"dependencies\":{{\"ms\":\"2.1.3\"}},\"scripts\":{{\"dev\":\"{dev}\"}}}}"
+        )
+    };
+    let project = TempProject::empty(&manifest("vite"));
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+
+    for dev in ["vite", "vite --host"] {
+        project.write_file("package.json", &manifest(dev));
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
+            .output()
+            .expect("run lpm install --json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = assertions::parse_json_output(&output.stdout);
+        assert_eq!(result["up_to_date"], true, "dev = {dev}: {result:#}");
+    }
+}
