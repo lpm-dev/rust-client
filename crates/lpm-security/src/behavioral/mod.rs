@@ -861,6 +861,7 @@ struct PackageDirs<'a> {
     chain: Vec<(std::path::PathBuf, cap_std::fs::Dir)>,
     opened: std::collections::BTreeMap<std::path::PathBuf, DirectoryIdentity>,
     reopened_changed: bool,
+    tracking_limit: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -895,19 +896,30 @@ impl<'a> PackageDirs<'a> {
     /// Each held handle is a descriptor on top of the files every analysis
     /// thread has open, so a deep path keeps only its deepest directories.
     const MAX_HELD: usize = 8;
+    /// Directories whose identities a package's read keeps for the final
+    /// check. Past this, files are reached holding no handle, so nothing they
+    /// read can come from a replaced directory and nothing more is tracked.
+    const MAX_TRACKED: usize = 4096;
 
     fn new(root: &'a cap_std::fs::Dir) -> Self {
+        Self::with_tracking_limit(root, Self::MAX_TRACKED)
+    }
+
+    fn with_tracking_limit(root: &'a cap_std::fs::Dir, tracking_limit: usize) -> Self {
         Self {
             root,
             chain: Vec::with_capacity(Self::MAX_HELD),
             opened: std::collections::BTreeMap::new(),
             reopened_changed: false,
+            tracking_limit,
         }
     }
 
     /// Whether every directory opened below the root still has the identity
     /// it had then, reopened top-down from the root without following links.
-    fn verify_unchanged(&self) -> std::io::Result<()> {
+    /// Gives back the handles the reads held first.
+    fn verify_unchanged(&mut self) -> std::io::Result<()> {
+        self.chain.clear();
         if self.reopened_changed {
             return Err(package_directory_changed());
         }
@@ -1001,17 +1013,11 @@ impl<'a> PackageDirs<'a> {
         }
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No).nonblock(true);
-        let file = match self
-            .directory(parent_path)
-            .and_then(|parent| parent.open_with(leaf, &options))
-        {
-            // Give the held handles back and open this file holding one
-            // directory at a time, as reopening the path for each file did.
-            Err(error) if runs_out_of_descriptors(&error) => {
-                self.chain.clear();
-                self.open_holding_one_directory(parent_path, leaf, &options)?
-            }
-            opened => opened?,
+        let file = if self.opened.len() >= self.tracking_limit {
+            self.chain.clear();
+            self.open_holding_one_directory(parent_path, leaf, &options, false)?
+        } else {
+            self.open_through_chain(parent_path, leaf, &options)?
         };
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.is_symlink() {
@@ -1024,6 +1030,26 @@ impl<'a> PackageDirs<'a> {
             hook();
         }
         Ok((file, metadata.len()))
+    }
+
+    fn open_through_chain(
+        &mut self,
+        parent_path: &Path,
+        leaf: &std::ffi::OsStr,
+        options: &cap_std::fs::OpenOptions,
+    ) -> std::io::Result<cap_std::fs::File> {
+        match self
+            .directory(parent_path)
+            .and_then(|parent| parent.open_with(leaf, options))
+        {
+            // Give the held handles back and open this file holding one
+            // directory at a time, as reopening the path for each file did.
+            Err(error) if runs_out_of_descriptors(&error) => {
+                self.chain.clear();
+                self.open_holding_one_directory(parent_path, leaf, options, true)
+            }
+            opened => opened,
+        }
     }
 
     /// The handle of `relative`, a path of normal components, opened from
@@ -1070,6 +1096,7 @@ impl<'a> PackageDirs<'a> {
         parent_path: &Path,
         leaf: &std::ffi::OsStr,
         options: &cap_std::fs::OpenOptions,
+        track: bool,
     ) -> std::io::Result<cap_std::fs::File> {
         use cap_fs_ext::DirExt as _;
 
@@ -1080,8 +1107,10 @@ impl<'a> PackageDirs<'a> {
                 Some(directory) => directory.open_dir_nofollow(name)?,
                 None => self.root.open_dir_nofollow(name)?,
             };
-            prefix.push(name);
-            self.record_opened(&prefix, &next)?;
+            if track {
+                prefix.push(name);
+                self.record_opened(&prefix, &next)?;
+            }
             current = Some(next);
         }
         current
@@ -2778,6 +2807,98 @@ mod tests {
             }
             assert!(AFTER_FIRST_SOURCE_OPEN.with(|hook| hook.borrow().is_none()));
         }
+    }
+
+    #[test]
+    fn package_dirs_stop_tracking_and_holding_directories_past_their_limit() {
+        let package = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            let directory = package.path().join(format!("lib/m{index}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("index.js"), format!("{index}")).unwrap();
+        }
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::with_tracking_limit(&root, 3);
+
+        for index in 0..4 {
+            directories
+                .open_file(Path::new(&format!("lib/m{index}/index.js")))
+                .unwrap();
+        }
+        let tracked = directories.opened.len();
+        std::fs::rename(
+            package.path().join("lib/m5"),
+            package.path().join("lib/m5-old"),
+        )
+        .unwrap();
+        std::fs::create_dir(package.path().join("lib/m5")).unwrap();
+        std::fs::write(package.path().join("lib/m5/index.js"), "new").unwrap();
+        let (_, size) = directories.open_file(Path::new("lib/m5/index.js")).unwrap();
+
+        assert!((3..=4).contains(&tracked), "{tracked}");
+        assert_eq!(
+            directories.opened.len(),
+            tracked,
+            "past the limit nothing more is tracked"
+        );
+        assert!(
+            directories.chain.is_empty(),
+            "past the limit no handle is held"
+        );
+        assert_eq!(
+            size, 3,
+            "an untracked open reads the directory as it is now"
+        );
+        directories.verify_unchanged().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_dirs_verify_after_reads_with_one_descriptor_left() {
+        const CHILD: &str = "LPM_TEST_PACKAGE_DIRS_VERIFY_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "behavioral::tests::package_dirs_verify_after_reads_with_one_descriptor_left",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let package = tempfile::tempdir().unwrap();
+        let leaf = deep_package(package.path(), 12);
+        let root = cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut directories = PackageDirs::new(&root);
+        drop(directories.open_file(&leaf).unwrap());
+        assert_eq!(directories.chain.len(), PackageDirs::MAX_HELD);
+        let mut limit = 0;
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        while unsafe { libc::fcntl(limit, libc::F_GETFD) } != -1 {
+            limit += 1;
+        }
+        // One free descriptor below the limit besides the held handles.
+        let limit = limit + 1;
+        let rlimit = libc::rlimit {
+            rlim_cur: limit as libc::rlim_t,
+            rlim_max: limit as libc::rlim_t,
+        };
+        // SAFETY: setrlimit reads the valid struct; this child process only
+        // runs this test.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) }, 0);
+
+        directories.verify_unchanged().unwrap();
     }
 
     #[test]
