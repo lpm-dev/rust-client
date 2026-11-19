@@ -91,28 +91,31 @@ pub(crate) fn is_up_to_date(
     {
         return Ok(false);
     }
-    // Replaying the lockfile needs each root to resolve to an instance the
-    // manifest still accepts; the full pipeline's own up-to-date answer
-    // checks the same before it answers.
+    // Replaying the lockfile needs its catalog snapshot to match and each
+    // root to resolve to an instance the manifest still accepts; the full
+    // pipeline's own up-to-date answer checks the same before it answers.
     let mut manifest_deps = super::manifest::manifest_install_deps(&package);
-    // The full install checks a `catalog:` dependency against the lockfile's
-    // catalog snapshot, which this check doesn't read.
-    if manifest_deps
-        .values()
-        .any(|spec| spec.starts_with("catalog:"))
-        || super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err()
-    {
+    if super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err() {
         return Ok(false);
     }
+    let mut manifest_deps = std::borrow::Cow::Owned(manifest_deps);
+    let Some(catalog_resolutions) =
+        super::lockfile::current_catalog_resolutions(&package, None, &mut manifest_deps)
+    else {
+        return Ok(false);
+    };
     let optional_root_names: std::collections::HashSet<String> =
         package.optional_dependencies.keys().cloned().collect();
     let locked_packages: Vec<&lpm_lockfile::LockedPackage> =
         project_lockfile.lockfile.packages.iter().collect();
-    if !super::lockfile::locked_roots_satisfy_manifest(
+    if !super::lockfile::locked_catalogs_and_roots_match_manifest(
         &project_lockfile.lockfile,
         &locked_packages,
-        &manifest_deps,
-        &optional_root_names,
+        super::lockfile::LockedManifest {
+            deps: &manifest_deps,
+            catalog_resolutions: &catalog_resolutions,
+            optional_root_names: &optional_root_names,
+        },
         project_dir,
         false,
     ) {

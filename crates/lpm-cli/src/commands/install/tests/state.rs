@@ -400,11 +400,18 @@ fn installed_project_rooting_leaf_at(dir: &std::path::Path, root_version: &str) 
         dir,
         r#"{"name":"consumer","dependencies":{"leaf":"1.0.0"}}"#,
         root_version,
+        lpm_lockfile::CatalogSnapshots::new(),
     );
 }
 
-/// [`installed_project_rooting_leaf_at`] with `pkg` as `package.json`.
-fn installed_project(dir: &std::path::Path, pkg: &str, root_version: &str) {
+/// [`installed_project_rooting_leaf_at`] with `pkg` as `package.json` and
+/// `catalogs` as the lockfile's catalog snapshot.
+fn installed_project(
+    dir: &std::path::Path,
+    pkg: &str,
+    root_version: &str,
+    catalogs: lpm_lockfile::CatalogSnapshots,
+) {
     std::fs::write(dir.join("package.json"), pkg).unwrap();
     let source = "registry+https://registry.npmjs.org";
     let instance_id =
@@ -426,6 +433,7 @@ fn installed_project(dir: &std::path::Path, pkg: &str, root_version: &str) {
             source: Some(source.to_string()),
         },
     );
+    lockfile.catalogs = catalogs;
     lockfile
         .write_all(&dir.join(lpm_lockfile::LOCKFILE_NAME))
         .unwrap();
@@ -479,7 +487,7 @@ fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
 }
 
 #[test]
-fn the_up_to_date_check_leaves_catalog_dependencies_to_the_full_install() {
+fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog_snapshot() {
     let home = tempfile::tempdir().unwrap();
     let _env = crate::test_env::ScopedEnv::update([
         ("HOME", Some(home.path().as_os_str().to_owned())),
@@ -494,17 +502,68 @@ fn the_up_to_date_check_leaves_catalog_dependencies_to_the_full_install() {
         frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
         no_skills: true,
     };
-    // The full install checks a catalog dependency against the lockfile's
-    // catalog snapshot, which the quick check doesn't read.
-    let project = tempfile::tempdir().unwrap();
-    installed_project(
-        project.path(),
-        r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"optionalDependencies":{"leaf":"catalog:"}}"#,
-        "1.0.0",
-    );
-    let pkg = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    let snapshot = |specifier: &str, version: &str| {
+        lpm_lockfile::CatalogSnapshots::from([(
+            "default".to_string(),
+            std::collections::BTreeMap::from([(
+                "leaf".to_string(),
+                lpm_lockfile::CatalogSnapshotEntry {
+                    specifier: specifier.to_string(),
+                    version: version.to_string(),
+                    reference: "catalog:".to_string(),
+                },
+            )]),
+        )])
+    };
+    let required = r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"catalog:"}}"#;
+    let optional = r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"optionalDependencies":{"leaf":"catalog:"}}"#;
+    let cases = [
+        (
+            "a matching snapshot",
+            required,
+            snapshot("1.0.0", "1.0.0"),
+            true,
+        ),
+        (
+            "a matching snapshot for an optional dependency",
+            optional,
+            snapshot("1.0.0", "1.0.0"),
+            true,
+        ),
+        (
+            "a snapshot of an older catalog entry",
+            required,
+            snapshot("^0.9.0", "1.0.0"),
+            false,
+        ),
+        (
+            "a snapshot naming another version than the locked root",
+            required,
+            snapshot("1.0.0", "1.0.1"),
+            false,
+        ),
+        (
+            "no snapshot for an installed optional dependency",
+            optional,
+            lpm_lockfile::CatalogSnapshots::new(),
+            false,
+        ),
+        (
+            "a reference to a catalog the manifest doesn't define",
+            r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"catalog:testing"}}"#,
+            snapshot("1.0.0", "1.0.0"),
+            false,
+        ),
+    ];
 
-    assert!(
-        !crate::commands::install::sync_noop::is_up_to_date(project.path(), &pkg, mode).unwrap()
-    );
+    for (case, pkg, catalogs, up_to_date) in cases {
+        let project = tempfile::tempdir().unwrap();
+        installed_project(project.path(), pkg, "1.0.0", catalogs);
+
+        assert_eq!(
+            crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap(),
+            up_to_date,
+            "{case}"
+        );
+    }
 }

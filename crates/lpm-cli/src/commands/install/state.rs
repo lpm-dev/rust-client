@@ -288,7 +288,7 @@ pub(super) async fn run_install_freshness_phase(
             let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);
             let fast =
                 validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
-                    .and_then(|(lockfile_deps, workspace_deps_filtered)| {
+                    .and_then(|(mut lockfile_deps, workspace_deps_filtered)| {
                         if workspace_deps_filtered
                             && lockfile_deps.is_empty()
                             && workspace_lockfile::exists(input.lockfile_path)
@@ -296,11 +296,32 @@ pub(super) async fn run_install_freshness_phase(
                             return Some(Vec::new());
                         }
                         let route_table = route_table.as_ref()?;
+                        // A plain install outside `--recursive` has no active
+                        // workspace; its catalogs come from the discovered root,
+                        // as the cold install's do.
+                        let catalog_workspace = match &workspace {
+                            Some(workspace) => Some(Arc::clone(workspace)),
+                            None if lockfile_deps
+                                .values()
+                                .any(|spec| spec.starts_with("catalog:")) =>
+                            {
+                                crate::workspace_discovery_cache::discover_workspace(
+                                    input.project_dir,
+                                )
+                                .ok()?
+                            }
+                            None => None,
+                        };
+                        let catalog_resolutions = super::lockfile::current_catalog_resolutions(
+                            input.package,
+                            catalog_workspace.as_deref(),
+                            &mut lockfile_deps,
+                        )?;
                         try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
                             lockfile_path: input.lockfile_path,
                             deps: &lockfile_deps,
                             optional_root_names: input.root_optional_dependency_names,
-                            catalog_resolutions: &[],
+                            catalog_resolutions: &catalog_resolutions,
                             workspace: workspace.as_deref(),
                             route_table,
                             client: input.client,

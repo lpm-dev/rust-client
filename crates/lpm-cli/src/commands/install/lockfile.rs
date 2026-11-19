@@ -1465,6 +1465,33 @@ pub(super) struct OverrideResolutionState<'a> {
     pub(super) override_set: OverrideSet,
 }
 
+/// Resolves each `catalog:` spec in `deps` as an install of `package` does,
+/// and returns every catalog resolution the install compares with the
+/// lockfile's catalog snapshot, its overrides' and resolutions' included.
+/// `None` when a reference doesn't resolve; the install reports why.
+pub(super) fn current_catalog_resolutions(
+    package: &lpm_workspace::PackageJson,
+    workspace: Option<&lpm_workspace::Workspace>,
+    deps: &mut Cow<'_, HashMap<String, String>>,
+) -> Option<Vec<lpm_workspace::CatalogProtocolResolution>> {
+    let catalogs = workspace.map_or(&package.catalogs, |workspace| {
+        &workspace.root_package.catalogs
+    });
+    let mut catalog_resolutions =
+        if !catalogs.is_empty() && deps.values().any(|spec| spec.starts_with("catalog:")) {
+            lpm_workspace::resolve_catalog_protocol(deps.to_mut(), catalogs).ok()?
+        } else {
+            Vec::new()
+        };
+    prepare_override_resolution_state(OverrideResolutionInput {
+        package,
+        workspace,
+        catalog_resolutions: &mut catalog_resolutions,
+    })
+    .ok()?;
+    Some(catalog_resolutions)
+}
+
 pub(super) fn prepare_override_resolution_state<'a>(
     input: OverrideResolutionInput<'a>,
 ) -> Result<OverrideResolutionState<'a>, LpmError> {
@@ -1756,23 +1783,22 @@ pub(super) fn lockfile_catalog_snapshots_match_current(
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
 ) -> bool {
     let packages = lockfile.packages.iter().collect::<Vec<_>>();
-    lockfile_catalog_snapshots_match_current_with_packages(
+    lockfile_catalog_snapshots_match_rows(
         lockfile,
-        &packages,
+        &LockedRows::new(&packages),
         deps,
         catalog_resolutions,
         &HashSet::new(),
     )
 }
 
-fn lockfile_catalog_snapshots_match_current_with_packages(
+fn lockfile_catalog_snapshots_match_rows(
     lockfile: &lpm_lockfile::Lockfile,
-    packages: &[&lpm_lockfile::LockedPackage],
+    rows: &LockedRows<'_, '_>,
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     optional_root_names: &HashSet<String>,
 ) -> bool {
-    let rows = LockedRows::new(packages);
     let mut current_resolutions = HashMap::with_capacity(catalog_resolutions.len());
     for resolution in catalog_resolutions {
         let key = (
@@ -1805,7 +1831,7 @@ fn lockfile_catalog_snapshots_match_current_with_packages(
                 .map_or(resolution.specifier.as_str(), String::as_str);
             let Some(locked_package) = select_locked_root_package_from_rows(
                 lockfile,
-                &rows,
+                rows,
                 package_name,
                 target,
                 requested_spec,
@@ -2823,49 +2849,78 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
         }
     }
 
-    if !lockfile_catalog_snapshots_match_current_with_packages(
+    locked_catalogs_and_roots_match_manifest(
         lockfile,
         packages,
-        deps,
-        catalog_resolutions,
-        optional_root_names,
-    ) {
-        if policy.emit_warnings {
-            tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
-        }
-        return false;
-    }
-
-    locked_roots_satisfy_manifest(
-        lockfile,
-        packages,
-        deps,
-        optional_root_names,
+        LockedManifest {
+            deps,
+            catalog_resolutions,
+            optional_root_names,
+        },
         lockfile_dir,
         policy.emit_warnings,
     )
 }
 
-/// Whether every dependency in `deps` resolves, through the lockfile's root
+/// The manifest side of a lockfile replay: dependency specs with `catalog:`
+/// references resolved, the catalog resolutions behind them, and the roots
+/// that may be missing.
+#[derive(Clone, Copy)]
+pub(super) struct LockedManifest<'a> {
+    pub(super) deps: &'a HashMap<String, String>,
+    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) optional_root_names: &'a HashSet<String>,
+}
+
+/// Whether the lockfile's catalog snapshot matches the manifest's catalog
+/// resolutions and every dependency resolves, through the lockfile's root
 /// records, to a locked instance its requested range and source accept, as
-/// replaying the lockfile requires. A root in `optional_root_names` may be
-/// missing.
-pub(super) fn locked_roots_satisfy_manifest(
+/// replaying the lockfile requires.
+pub(super) fn locked_catalogs_and_roots_match_manifest(
     lockfile: &lpm_lockfile::Lockfile,
     packages: &[&lpm_lockfile::LockedPackage],
+    manifest: LockedManifest<'_>,
+    lockfile_dir: &Path,
+    emit_warnings: bool,
+) -> bool {
+    let rows = LockedRows::new(packages);
+    if !lockfile_catalog_snapshots_match_rows(
+        lockfile,
+        &rows,
+        manifest.deps,
+        manifest.catalog_resolutions,
+        manifest.optional_root_names,
+    ) {
+        if emit_warnings {
+            tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
+        }
+        return false;
+    }
+    locked_roots_satisfy_manifest(
+        lockfile,
+        &rows,
+        manifest.deps,
+        manifest.optional_root_names,
+        lockfile_dir,
+        emit_warnings,
+    )
+}
+
+fn locked_roots_satisfy_manifest(
+    lockfile: &lpm_lockfile::Lockfile,
+    rows: &LockedRows<'_, '_>,
     deps: &HashMap<String, String>,
     optional_root_names: &HashSet<String>,
     lockfile_dir: &Path,
     emit_warnings: bool,
 ) -> bool {
-    let rows = LockedRows::new(packages);
     for (local, requested_spec) in deps {
         let target = lockfile
             .root_aliases
             .get(local)
             .map_or(local.as_str(), String::as_str);
         let selected =
-            select_locked_root_package_from_rows(lockfile, &rows, local, target, requested_spec);
+            select_locked_root_package_from_rows(lockfile, rows, local, target, requested_spec);
         if selected.is_none_or(|package| {
             !locked_source_identity_matches_requested_spec(package, requested_spec, lockfile_dir)
         }) && !optional_root_names.contains(local)
