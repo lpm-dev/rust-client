@@ -630,12 +630,7 @@ impl RegistryClient {
         tls: &TlsOverrides,
         eager_origins: &[OriginKey],
     ) -> Result<Self, LpmError> {
-        let needs_rebuild = !tls.extra_roots.is_empty()
-            || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value)
-            || tls.identity_certfile.is_some()
-            || tls.identity_keyfile.is_some()
-            || !tls.per_origin.is_empty();
-        if !needs_rebuild {
+        if !tls_settings_apply(tls) {
             return Ok(self);
         }
         // Reuse the existing passphrase provider so its inner cache
@@ -777,14 +772,21 @@ impl RegistryClient {
         self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;
         self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
-        // A silent refresh goes to the same registry and needs the same
-        // trust and client certificate as the requests it refreshes for.
-        if let Some(session) = &self.session {
+        self.share_tls_settings_with_session();
+        Ok(self)
+    }
+
+    /// A silent refresh goes to the same registry and needs the same trust
+    /// and client certificate as the requests it refreshes for, however the
+    /// client and its session were put together.
+    fn share_tls_settings_with_session(&self) {
+        if let Some(session) = &self.session
+            && tls_settings_apply(&self.http.tls_overrides)
+        {
             session.use_refresh_client_source(
                 Arc::clone(&self.http) as Arc<dyn lpm_auth::RefreshClientSource>
             );
         }
-        Ok(self)
     }
 
     /// Whether `--insecure` is enabled on this client.
@@ -906,6 +908,7 @@ impl RegistryClient {
     pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
         self.session = Some(session);
         self.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
+        self.share_tls_settings_with_session();
         self
     }
 
@@ -1013,6 +1016,7 @@ impl RegistryClient {
         client.session = Some(session);
         client.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
         client.token = None;
+        client.share_tls_settings_with_session();
         client
     }
 
@@ -1059,6 +1063,16 @@ impl Default for RegistryClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `.npmrc` TLS settings change how clients connect: extra roots,
+/// `strict-ssl=false`, a client certificate, or per-origin settings.
+fn tls_settings_apply(tls: &TlsOverrides) -> bool {
+    !tls.extra_roots.is_empty()
+        || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value)
+        || tls.identity_certfile.is_some()
+        || tls.identity_keyfile.is_some()
+        || !tls.per_origin.is_empty()
 }
 
 #[cfg(test)]

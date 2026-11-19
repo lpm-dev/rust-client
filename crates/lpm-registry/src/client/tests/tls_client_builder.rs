@@ -12,6 +12,11 @@ struct CaSignedHttpsServer {
 
 impl CaSignedHttpsServer {
     async fn start() -> Self {
+        Self::start_answering("ok").await
+    }
+
+    /// The server, answering every request `200` with `body` as JSON.
+    async fn start_answering(body: &'static str) -> Self {
         let ca_key = rcgen::KeyPair::generate().expect("CA key");
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params
@@ -58,11 +63,11 @@ impl CaSignedHttpsServer {
                     };
                     let mut request = [0u8; 4096];
                     let _ = tls.read(&mut request).await;
-                    let _ = tls
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-                        )
-                        .await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tls.write_all(response.as_bytes()).await;
                     let _ = tls.shutdown().await;
                 });
             }
@@ -204,4 +209,63 @@ async fn a_tls_client_builder_with_strict_ssl_off_accepts_an_untrusted_certifica
     )
     .await
     .expect("strict-ssl=false skips certificate verification, as the pooled clients do");
+}
+
+#[tokio::test]
+async fn a_session_attached_after_its_tls_settings_refreshes_over_them() {
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let server = CaSignedHttpsServer::start_answering(
+        r#"{"token":"rotated-access","refreshToken":"rotated-refresh","expiresAt":"2099-01-01T00:00:00Z"}"#,
+    )
+    .await;
+    let url = format!("https://localhost:{}", server.port);
+    lpm_auth::store_refresh_backed_session(
+        &url,
+        "stale-access",
+        "valid-refresh",
+        "2099-01-01T00:00:00Z",
+    )
+    .await
+    .expect("store a refresh-backed session");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &server.ca_pem).expect("write the CA");
+    let mut per_origin = HashMap::new();
+    per_origin.insert(
+        OriginKey {
+            host_lower: "localhost".into(),
+            port: Some(server.port),
+        },
+        OriginTlsOverrides {
+            cafiles: vec![TaggedPath {
+                path: ca_path,
+                source: "test .npmrc".into(),
+                line: 1,
+                source_dir: None,
+            }],
+            certfile: None,
+            keyfile: None,
+        },
+    );
+
+    let client = RegistryClient::new()
+        .with_base_url(&url)
+        .with_tls_overrides(&TlsOverrides {
+            per_origin,
+            ..Default::default()
+        })
+        .expect("TLS overrides")
+        .with_session(Arc::new(lpm_auth::SessionManager::new(url.clone(), None)));
+    let refreshed = client
+        .session()
+        .expect("attached session")
+        .refresh_now()
+        .await;
+
+    assert!(
+        refreshed.is_ok(),
+        "the refresh must trust the origin's cafile: {refreshed:?}"
+    );
 }

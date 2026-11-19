@@ -299,3 +299,39 @@ fn local_directories_named_in_other_bytes_have_their_own_identity() {
         lpm_store::compute_sri_hash(&written.join(&0)),
     );
 }
+
+#[test]
+fn the_up_to_date_paths_client_carries_the_npmrc_tls_settings_of_the_lpm_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::update([
+        ("HOME", Some(home.path().as_os_str().to_owned())),
+        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+        ("NPM_CONFIG_USERCONFIG", None),
+        ("NPM_CONFIG_GLOBALCONFIG", None),
+    ]);
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["lpm.dev".to_string()]).expect("certificate");
+    let ca_path = home.path().join("corporate-ca.pem");
+    std::fs::write(&ca_path, certified.cert.pem()).unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        format!("//lpm.dev/:cafile={}\n", ca_path.display()),
+    )
+    .unwrap();
+    let routes = lpm_registry::RouteTable::from_env_and_filesystem(project.path()).unwrap();
+
+    let client = crate::commands::install::state::up_to_date_request_client(
+        &lpm_registry::RegistryClient::new(),
+        Some(&routes),
+    )
+    .unwrap();
+
+    let summary = client.render_effective_tls_summary();
+    assert!(
+        summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("per-origin TLS for //lpm.dev/")),
+        "{summary:?}"
+    );
+}

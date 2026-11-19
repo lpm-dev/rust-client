@@ -265,6 +265,9 @@ pub(super) async fn run_install_freshness_phase(
             input.compatibility_bin_names,
         );
     let fast_path_base_eligible = install_state.up_to_date && compatibility_bins_ready;
+    let route_table = fast_path_base_eligible
+        .then(|| RouteTable::from_env_and_filesystem(input.project_dir).ok())
+        .flatten();
     let fast_path_packages = if fast_path_base_eligible {
         std::thread::scope(|scope| -> Result<_, LpmError> {
             let _runtime_probe = if !matches!(dependency_engine_key.as_str(), "none" | "legacy")
@@ -290,15 +293,14 @@ pub(super) async fn run_install_freshness_phase(
                         {
                             return Some(Vec::new());
                         }
-                        let route_table =
-                            RouteTable::from_env_and_filesystem(input.project_dir).ok()?;
+                        let route_table = route_table.as_ref()?;
                         try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
                             lockfile_path: input.lockfile_path,
                             deps: &lockfile_deps,
                             optional_root_names: input.root_optional_dependency_names,
                             catalog_resolutions: &[],
                             workspace: workspace.as_deref(),
-                            route_table: &route_table,
+                            route_table,
                             client: input.client,
                             gate_stats: &gate_stats,
                             accept_unsafe_sources: false,
@@ -386,15 +388,17 @@ pub(super) async fn run_install_freshness_phase(
         && source_analysis_caches_ready
         && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
+        let request_client = up_to_date_request_client(input.client, route_table.as_ref())?;
         let mut warnings =
-            verify_lpm_install_access(input.client, fast_path_packages, input.json_output).await?;
+            verify_lpm_install_access(&request_client, fast_path_packages, input.json_output)
+                .await?;
         let direct = selected_package_skills(fast_path_packages)?
             .into_iter()
             .map(|(name, _)| name)
             .collect();
         warnings.extend(
             install_project_skills(ProjectSkills {
-                client: input.client,
+                client: &request_client,
                 project_dir: input.project_dir,
                 dependencies: &[],
                 direct: &direct,
@@ -429,8 +433,12 @@ pub(super) async fn run_install_freshness_phase(
                 input.dependency_engine_policy,
             );
         }
-        report_pool_install_attribution(input.client, fast_path_packages, input.install_accounting)
-            .await?;
+        report_pool_install_attribution(
+            &request_client,
+            fast_path_packages,
+            input.install_accounting,
+        )
+        .await?;
         let elapsed = input.start.elapsed();
         let total_ms = elapsed.as_millis();
         if input.emit_install_report {
@@ -513,6 +521,24 @@ pub(super) async fn run_install_freshness_phase(
         cleanup_catalogs_in_pipeline,
         completed: false,
     })
+}
+
+/// The client the up-to-date path sends its requests with: `client` with
+/// the `.npmrc` TLS settings of the project's routes, which a cold install
+/// applies before it sends anything too. A silent refresh on its session
+/// takes the same settings. Without routes it is `client` as it is.
+pub(super) fn up_to_date_request_client(
+    client: &RegistryClient,
+    route_table: Option<&RouteTable>,
+) -> Result<RegistryClient, LpmError> {
+    let configured = client.clone_with_config();
+    let Some(route_table) = route_table else {
+        return Ok(configured);
+    };
+    let lpm_origin: Vec<_> = lpm_registry::npmrc::OriginKey::from_request_url(client.base_url())
+        .into_iter()
+        .collect();
+    configured.with_tls_overrides_for(route_table.tls_overrides(), &lpm_origin)
 }
 
 pub(super) fn source_analysis_caches_are_current(
