@@ -137,7 +137,23 @@ pub async fn unpair_all(
     auth_token: &str,
     expected_principal_id: &str,
 ) -> Result<(), SyncError> {
-    let client = sync_http_client()?;
+    unpair_all_with_client(
+        sync_http_client()?,
+        registry_url,
+        auth_token,
+        expected_principal_id,
+    )
+    .await
+}
+
+/// [`unpair_all`] over `client`, for a caller that builds its own client,
+/// such as one with `.npmrc` TLS settings.
+pub async fn unpair_all_with_client(
+    client: &reqwest::Client,
+    registry_url: &str,
+    auth_token: &str,
+    expected_principal_id: &str,
+) -> Result<(), SyncError> {
     let url = format!("{registry_url}/api/vault/pair/revoke-all");
 
     let response = client

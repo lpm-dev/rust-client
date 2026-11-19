@@ -341,7 +341,9 @@ pub async fn get_my_public_key_state(
     get_my_public_key_state_with_client(client, registry_url, auth_token).await
 }
 
-async fn get_my_public_key_state_with_client(
+/// [`get_my_public_key_state`] over `client`, for a caller that builds its
+/// own client, such as one with `.npmrc` TLS settings.
+pub async fn get_my_public_key_state_with_client(
     client: &reqwest::Client,
     registry_url: &str,
     auth_token: &str,

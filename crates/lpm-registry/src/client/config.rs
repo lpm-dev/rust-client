@@ -208,6 +208,36 @@ impl RegistryClient {
         })
     }
 
+    /// A client builder that trusts `tls`'s roots, keeps its `strict-ssl`
+    /// setting and presents `identity`, with nothing else configured.
+    pub(super) fn tls_client_builder(
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> Result<reqwest::ClientBuilder, LpmError> {
+        let roots = Self::prepare_tls_roots(tls)?;
+        Ok(Self::apply_tls_settings(
+            roots.client_builder(),
+            tls,
+            identity,
+        ))
+    }
+
+    fn apply_tls_settings(
+        mut builder: reqwest::ClientBuilder,
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> reqwest::ClientBuilder {
+        if let Some(tagged) = tls.strict_ssl.as_ref()
+            && !tagged.value
+        {
+            builder = builder.tls_danger_accept_invalid_certs(true);
+        }
+        if let Some(identity) = identity {
+            builder = builder.identity(identity);
+        }
+        builder
+    }
+
     fn prepare_tls_roots(tls: &TlsOverrides) -> Result<TrustedRoots, LpmError> {
         let mut certificates = Vec::with_capacity(tls.extra_roots.len());
         for root in &tls.extra_roots {
@@ -280,14 +310,7 @@ impl RegistryClient {
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
         }
-        if let Some(tagged) = tls.strict_ssl.as_ref()
-            && !tagged.value
-        {
-            b = b.tls_danger_accept_invalid_certs(true);
-        }
-        if let Some(id) = identity {
-            b = b.identity(id);
-        }
+        b = Self::apply_tls_settings(b, tls, identity);
         b.build().map_err(|e| {
             let chain: Vec<String> =
                 std::iter::successors(Some(&e as &dyn std::error::Error), |err| err.source())
@@ -555,6 +578,16 @@ impl RegistryClient {
         self
     }
 
+    /// A client builder for requests to `url` with this client's `.npmrc`
+    /// TLS settings for `url`'s origin, for a request that needs its own
+    /// redirect policy or timeouts. See [`HttpClients::tls_client_builder_for`].
+    pub async fn tls_client_builder_for(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::ClientBuilder, LpmError> {
+        self.http.tls_client_builder_for(url).await
+    }
+
     /// Apply `.npmrc`-derived TLS overrides to this client.
     ///
     /// Rebuilds the inner default `reqwest::Client` with `cafile`/`ca`
@@ -597,12 +630,7 @@ impl RegistryClient {
         tls: &TlsOverrides,
         eager_origins: &[OriginKey],
     ) -> Result<Self, LpmError> {
-        let needs_rebuild = !tls.extra_roots.is_empty()
-            || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value)
-            || tls.identity_certfile.is_some()
-            || tls.identity_keyfile.is_some()
-            || !tls.per_origin.is_empty();
-        if !needs_rebuild {
+        if !tls_settings_apply(tls) {
             return Ok(self);
         }
         // Reuse the existing passphrase provider so its inner cache
@@ -744,7 +772,21 @@ impl RegistryClient {
         self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;
         self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
+        self.share_tls_settings_with_session();
         Ok(self)
+    }
+
+    /// A silent refresh goes to the same registry and needs the same trust
+    /// and client certificate as the requests it refreshes for, however the
+    /// client and its session were put together.
+    fn share_tls_settings_with_session(&self) {
+        if let Some(session) = &self.session
+            && tls_settings_apply(&self.http.tls_overrides)
+        {
+            session.use_refresh_client_source(
+                Arc::clone(&self.http) as Arc<dyn lpm_auth::RefreshClientSource>
+            );
+        }
     }
 
     /// Whether `--insecure` is enabled on this client.
@@ -866,6 +908,7 @@ impl RegistryClient {
     pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
         self.session = Some(session);
         self.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
+        self.share_tls_settings_with_session();
         self
     }
 
@@ -973,6 +1016,7 @@ impl RegistryClient {
         client.session = Some(session);
         client.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
         client.token = None;
+        client.share_tls_settings_with_session();
         client
     }
 
@@ -1019,6 +1063,16 @@ impl Default for RegistryClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `.npmrc` TLS settings change how clients connect: extra roots,
+/// `strict-ssl=false`, a client certificate, or per-origin settings.
+fn tls_settings_apply(tls: &TlsOverrides) -> bool {
+    !tls.extra_roots.is_empty()
+        || matches!(tls.strict_ssl.as_ref(), Some(t) if !t.value)
+        || tls.identity_certfile.is_some()
+        || tls.identity_keyfile.is_some()
+        || !tls.per_origin.is_empty()
 }
 
 #[cfg(test)]

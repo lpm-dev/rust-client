@@ -48,6 +48,7 @@ pub async fn run(
         approval: &approval,
     };
     let (response, _) = send_with_second_factor(
+        client,
         &change,
         registry_url,
         otp.as_ref(),

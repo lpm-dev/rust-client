@@ -246,6 +246,7 @@ pub(super) async fn publish_to_lpm(
             auth_url, done_url, ..
         }) if !json_output => {
             let token = crate::commands::web_auth::complete_lpm_browser_approval(
+                client,
                 &auth_url,
                 &done_url,
                 registry_url,

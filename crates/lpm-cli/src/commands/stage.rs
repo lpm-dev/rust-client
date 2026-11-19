@@ -20,19 +20,23 @@ pub(crate) struct StagePublishOptions<'a> {
     pub(crate) json_output: bool,
 }
 
+/// Every npm request goes over a client with `tls`'s `.npmrc` TLS settings
+/// for the stage registry, as in the other `lpm stage` commands.
 pub(crate) async fn publish_current_project(
+    tls: &lpm_registry::RegistryClient,
     project_dir: &Path,
     options: StagePublishOptions<'_>,
 ) -> Result<(), LpmError> {
     publish::with_publish_install_lock_for_project(
         project_dir,
         false,
-        publish_current_project_locked(project_dir, options),
+        publish_current_project_locked(tls, project_dir, options),
     )
     .await
 }
 
 async fn publish_current_project_locked(
+    tls: &lpm_registry::RegistryClient,
     project_dir: &Path,
     options: StagePublishOptions<'_>,
 ) -> Result<(), LpmError> {
@@ -192,6 +196,7 @@ async fn publish_current_project_locked(
     }
 
     let auth = npm_auth::resolve_publish_auth_with_policy(
+        tls,
         &npm_name,
         registry.url(),
         auth_policy(&registry),
@@ -201,7 +206,7 @@ async fn publish_current_project_locked(
         install_ui::phase("Using npm Trusted Publishing (OIDC)");
     }
     let metadata =
-        npm_stage::fetch_package_metadata(auth.token(), &npm_name, registry.url()).await?;
+        npm_stage::fetch_package_metadata(tls, auth.token(), &npm_name, registry.url()).await?;
     publish_npm::enforce_npm_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
     let artifact = if let Some(artifact) = file_artifact {
         drop(provenance_request);
@@ -238,6 +243,7 @@ async fn publish_current_project_locked(
     };
 
     let result = npm_stage::stage_publish(
+        tls,
         auth.token(),
         &npm_name,
         &prepared.version,
@@ -278,6 +284,7 @@ async fn publish_current_project_locked(
 }
 
 pub(crate) async fn list(
+    tls: &lpm_registry::RegistryClient,
     cwd: &Path,
     package: Option<&str>,
     npm_registry: Option<&str>,
@@ -289,7 +296,8 @@ pub(crate) async fn list(
     let package_filter = npm_stage::parse_stage_list_filter(package)?;
     let token = npm_token(&registry)?;
     let result =
-        npm_stage::list_staged_packages(&token, registry.url(), package_filter.as_deref()).await?;
+        npm_stage::list_staged_packages(tls, &token, registry.url(), package_filter.as_deref())
+            .await?;
 
     if json_output {
         print_json(serde_json::json!({
@@ -311,6 +319,7 @@ pub(crate) async fn list(
 }
 
 pub(crate) async fn view(
+    tls: &lpm_registry::RegistryClient,
     cwd: &Path,
     stage_id: &str,
     npm_registry: Option<&str>,
@@ -320,7 +329,7 @@ pub(crate) async fn view(
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let token = npm_token(&registry)?;
-    let data = npm_stage::view_staged_package(&token, registry.url(), stage_id).await?;
+    let data = npm_stage::view_staged_package(tls, &token, registry.url(), stage_id).await?;
 
     if json_output {
         print_json(serde_json::json!({
@@ -338,6 +347,7 @@ pub(crate) async fn view(
 }
 
 pub(crate) async fn approve(
+    tls: &lpm_registry::RegistryClient,
     cwd: &Path,
     stage_id: &str,
     otp: Option<&str>,
@@ -345,10 +355,21 @@ pub(crate) async fn approve(
     json_output: bool,
     yes: bool,
 ) -> Result<(), LpmError> {
-    mutate_stage(cwd, stage_id, otp, npm_registry, json_output, yes, true).await
+    mutate_stage(
+        tls,
+        cwd,
+        stage_id,
+        otp,
+        npm_registry,
+        json_output,
+        yes,
+        true,
+    )
+    .await
 }
 
 pub(crate) async fn reject(
+    tls: &lpm_registry::RegistryClient,
     cwd: &Path,
     stage_id: &str,
     otp: Option<&str>,
@@ -356,10 +377,21 @@ pub(crate) async fn reject(
     json_output: bool,
     yes: bool,
 ) -> Result<(), LpmError> {
-    mutate_stage(cwd, stage_id, otp, npm_registry, json_output, yes, false).await
+    mutate_stage(
+        tls,
+        cwd,
+        stage_id,
+        otp,
+        npm_registry,
+        json_output,
+        yes,
+        false,
+    )
+    .await
 }
 
 pub(crate) async fn download(
+    tls: &lpm_registry::RegistryClient,
     cwd: &Path,
     stage_id: &str,
     npm_registry: Option<&str>,
@@ -369,7 +401,8 @@ pub(crate) async fn download(
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let token = npm_token(&registry)?;
-    let result = npm_stage::download_staged_package(&token, registry.url(), stage_id, cwd).await?;
+    let result =
+        npm_stage::download_staged_package(tls, &token, registry.url(), stage_id, cwd).await?;
 
     if json_output {
         print_json(serde_json::json!({
@@ -391,7 +424,9 @@ pub(crate) async fn download(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mutate_stage(
+    tls: &lpm_registry::RegistryClient,
     cwd: &Path,
     stage_id: &str,
     otp: Option<&str>,
@@ -405,11 +440,27 @@ async fn mutate_stage(
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let token = npm_token(&registry)?;
     let data = if approve {
-        npm_stage::approve_staged_package(&token, registry.url(), stage_id, otp, json_output, yes)
-            .await?
+        npm_stage::approve_staged_package(
+            tls,
+            &token,
+            registry.url(),
+            stage_id,
+            otp,
+            json_output,
+            yes,
+        )
+        .await?
     } else {
-        npm_stage::reject_staged_package(&token, registry.url(), stage_id, otp, json_output, yes)
-            .await?
+        npm_stage::reject_staged_package(
+            tls,
+            &token,
+            registry.url(),
+            stage_id,
+            otp,
+            json_output,
+            yes,
+        )
+        .await?
     };
     let action = if approve { "approved" } else { "rejected" };
 

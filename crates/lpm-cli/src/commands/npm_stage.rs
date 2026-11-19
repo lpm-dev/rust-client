@@ -208,26 +208,27 @@ fn validate_package_filter_name(name: &str) -> Result<(), LpmError> {
 }
 
 pub(crate) async fn fetch_package_metadata(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     npm_name: &str,
     registry_url: &str,
 ) -> Result<crate::commands::publish_npm::NpmVersionPolicyMetadata, LpmError> {
-    let client = stage_http_client(Duration::from_secs(60))?;
+    let timeout = Duration::from_secs(60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
     let url = endpoint_url(registry_url, &urlencoding::encode(npm_name));
-    let response = web_auth::add_npm_web_auth_headers(client.get(url), NPM_COMMAND_STAGE)
-        .header(
-            reqwest::header::ACCEPT,
-            "application/vnd.npm.install-v1+json",
-        )
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| {
-            LpmError::Registry(format!(
-                "npm package metadata request failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
+    let response = send_stage_get(
+        &clients,
+        web_auth::add_npm_web_auth_headers(client.get(url), NPM_COMMAND_STAGE)
+            .header(
+                reqwest::header::ACCEPT,
+                "application/vnd.npm.install-v1+json",
+            )
+            .bearer_auth(token),
+        timeout,
+    )
+    .await
+    .map_err(|e| LpmError::Registry(format!("npm package metadata request failed: {e}")))?;
 
     let status = response.status();
     let bytes = read_stage_response_body_with_limit(
@@ -262,6 +263,7 @@ pub(crate) async fn fetch_package_metadata(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_publish(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     npm_name: &str,
     version: &str,
@@ -274,6 +276,7 @@ pub(crate) async fn stage_publish(
     registry_url: &str,
 ) -> Result<StagePublishResult, LpmError> {
     stage_publish_impl(
+        tls,
         token,
         npm_name,
         version,
@@ -290,6 +293,7 @@ pub(crate) async fn stage_publish(
 
 #[allow(clippy::too_many_arguments)]
 async fn stage_publish_impl(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     npm_name: &str,
     version: &str,
@@ -320,7 +324,8 @@ async fn stage_publish_impl(
     )?;
     let tarball_mb = tarball_data.len() as u64 / (1024 * 1024);
     let timeout = Duration::from_secs(std::cmp::min(60 + tarball_mb * 2, 600));
-    let client = stage_manual_redirect_http_client(timeout)?;
+    let hop_clients = stage_hop_clients(tls, timeout);
+    let client = hop_clients.for_registry(registry_url).await?;
     let url = endpoint_url(
         registry_url,
         &format!("-/stage/package/{}", urlencoding::encode(npm_name)),
@@ -335,7 +340,7 @@ async fn stage_publish_impl(
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to build npm stage request: {e}")))?;
     let response =
-        lpm_http::send_with_replayable_redirects(&client, request, Some(payload.replayable()))
+        lpm_http::send_with_replayable_redirects(&hop_clients, request, Some(payload.replayable()))
             .await
             .map_err(|e| LpmError::Registry(format!("npm stage publish request failed: {e}")))?;
 
@@ -366,12 +371,15 @@ async fn stage_publish_impl(
 }
 
 pub(crate) async fn list_staged_packages(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     package_filter: Option<&str>,
 ) -> Result<StageListResult, LpmError> {
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(Duration::from_secs(60))?;
+    let timeout = Duration::from_secs(60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
     let mut page = 0_usize;
     let mut items = Vec::new();
 
@@ -383,20 +391,18 @@ pub(crate) async fn list_staged_packages(
             query.push(("package", package.to_string()));
         }
 
-        let response = web_auth::add_npm_web_auth_headers(
-            client.get(endpoint_url(registry_url, "-/stage")),
-            NPM_COMMAND_STAGE,
+        let response = send_stage_get(
+            &clients,
+            web_auth::add_npm_web_auth_headers(
+                client.get(endpoint_url(registry_url, "-/stage")),
+                NPM_COMMAND_STAGE,
+            )
+            .query(&query)
+            .bearer_auth(token),
+            timeout,
         )
-        .query(&query)
-        .bearer_auth(token)
-        .send()
         .await
-        .map_err(|e| {
-            LpmError::Registry(format!(
-                "npm stage list request failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
+        .map_err(|e| LpmError::Registry(format!("npm stage list request failed: {e}")))?;
 
         let status = response.status();
         let body = response_json_or_empty(response, "npm stage list").await?;
@@ -451,12 +457,14 @@ pub(crate) async fn list_staged_packages(
 }
 
 pub(crate) async fn view_staged_package(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     stage_id: &str,
 ) -> Result<serde_json::Value, LpmError> {
     validate_stage_id(stage_id)?;
     stage_json_get(
+        tls,
         token,
         registry_url,
         &format!("-/stage/{stage_id}"),
@@ -466,6 +474,7 @@ pub(crate) async fn view_staged_package(
 }
 
 pub(crate) async fn approve_staged_package(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     stage_id: &str,
@@ -475,6 +484,7 @@ pub(crate) async fn approve_staged_package(
 ) -> Result<serde_json::Value, LpmError> {
     validate_stage_id(stage_id)?;
     stage_otp_mutation(
+        tls,
         token,
         registry_url,
         &format!("-/stage/{stage_id}/approve"),
@@ -489,6 +499,7 @@ pub(crate) async fn approve_staged_package(
 }
 
 pub(crate) async fn reject_staged_package(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     stage_id: &str,
@@ -498,6 +509,7 @@ pub(crate) async fn reject_staged_package(
 ) -> Result<serde_json::Value, LpmError> {
     validate_stage_id(stage_id)?;
     stage_otp_mutation(
+        tls,
         token,
         registry_url,
         &format!("-/stage/{stage_id}"),
@@ -512,6 +524,7 @@ pub(crate) async fn reject_staged_package(
 }
 
 pub(crate) async fn download_staged_package(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     stage_id: &str,
@@ -519,23 +532,23 @@ pub(crate) async fn download_staged_package(
 ) -> Result<StageDownloadResult, LpmError> {
     validate_stage_id(stage_id)?;
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(Duration::from_secs(10 * 60))?;
-    let response = web_auth::add_npm_web_auth_headers(
-        client.get(endpoint_url(
-            registry_url,
-            &format!("-/stage/{stage_id}/tarball"),
-        )),
-        NPM_COMMAND_STAGE,
+    let timeout = Duration::from_secs(10 * 60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
+    let response = send_stage_get(
+        &clients,
+        web_auth::add_npm_web_auth_headers(
+            client.get(endpoint_url(
+                registry_url,
+                &format!("-/stage/{stage_id}/tarball"),
+            )),
+            NPM_COMMAND_STAGE,
+        )
+        .bearer_auth(token),
+        timeout,
     )
-    .bearer_auth(token)
-    .send()
     .await
-    .map_err(|e| {
-        LpmError::Registry(format!(
-            "npm stage download request failed: {}",
-            lpm_http::display_error(&e)
-        ))
-    })?;
+    .map_err(|e| LpmError::Registry(format!("npm stage download request failed: {e}")))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -630,26 +643,27 @@ pub(crate) async fn download_staged_package(
 }
 
 async fn stage_json_get(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     route: &str,
     action: &str,
 ) -> Result<serde_json::Value, LpmError> {
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(Duration::from_secs(60))?;
-    let response = web_auth::add_npm_web_auth_headers(
-        client.get(endpoint_url(registry_url, route)),
-        NPM_COMMAND_STAGE,
+    let timeout = Duration::from_secs(60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
+    let response = send_stage_get(
+        &clients,
+        web_auth::add_npm_web_auth_headers(
+            client.get(endpoint_url(registry_url, route)),
+            NPM_COMMAND_STAGE,
+        )
+        .bearer_auth(token),
+        timeout,
     )
-    .bearer_auth(token)
-    .send()
     .await
-    .map_err(|e| {
-        LpmError::Registry(format!(
-            "{action} request failed: {}",
-            lpm_http::display_error(&e)
-        ))
-    })?;
+    .map_err(|e| LpmError::Registry(format!("{action} request failed: {e}")))?;
 
     let status = response.status();
     let body = response_json_or_empty(response, action).await?;
@@ -664,6 +678,7 @@ async fn stage_json_get(
 
 #[allow(clippy::too_many_arguments)]
 async fn stage_otp_mutation(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     registry_url: &str,
     route: &str,
@@ -676,9 +691,9 @@ async fn stage_otp_mutation(
 ) -> Result<serde_json::Value, LpmError> {
     validate_npm_stage_registry(registry_url)?;
     let timeout = Duration::from_secs(60);
-    let mutation_client = stage_manual_redirect_http_client(timeout)?;
+    let mutation_clients = stage_hop_clients(tls, timeout);
     let response = send_stage_mutation(
-        &mutation_client,
+        &mutation_clients,
         token,
         registry_url,
         route,
@@ -705,6 +720,7 @@ async fn stage_otp_mutation(
             }
 
             let otp = web_auth::complete_web_auth_challenge(
+                tls,
                 &challenge,
                 action,
                 json_output,
@@ -714,7 +730,7 @@ async fn stage_otp_mutation(
             )
             .await?;
             let retry = send_stage_mutation(
-                &mutation_client,
+                &mutation_clients,
                 token,
                 registry_url,
                 route,
@@ -740,7 +756,7 @@ async fn stage_otp_mutation(
 
             let otp = prompt_npm_otp()?;
             let retry = send_stage_mutation(
-                &mutation_client,
+                &mutation_clients,
                 token,
                 registry_url,
                 route,
@@ -762,14 +778,18 @@ async fn stage_otp_mutation(
 }
 
 async fn send_stage_mutation(
-    client: &reqwest::Client,
+    clients: &crate::commands::publish_npm::NpmRegistryClients,
     token: &str,
     registry_url: &str,
     route: &str,
     method: Method,
     otp: Option<&str>,
     timeout: Duration,
-) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<std::convert::Infallible>> {
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
+    let client = clients
+        .for_registry(registry_url)
+        .await
+        .map_err(lpm_http::ReplayableRequestError::Client)?;
     let mut request = web_auth::add_npm_web_auth_headers(
         client.request(method, endpoint_url(registry_url, route)),
         NPM_COMMAND_STAGE,
@@ -782,7 +802,7 @@ async fn send_stage_mutation(
         .timeout(timeout)
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
-    lpm_http::send_with_replayable_redirects(client, request, None).await
+    lpm_http::send_with_replayable_redirects(clients, request, None).await
 }
 
 async fn stage_mutation_response(
@@ -801,16 +821,35 @@ async fn stage_mutation_response(
     )))
 }
 
-fn stage_http_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
-        .timeout(timeout)
-        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
-        .build()
-        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
+/// The clients a stage request follows redirects with: each hop gets the
+/// client for its own origin, with that origin's `.npmrc` TLS settings.
+fn stage_hop_clients(
+    tls: &lpm_registry::RegistryClient,
+    timeout: Duration,
+) -> crate::commands::publish_npm::NpmRegistryClients {
+    crate::commands::publish_npm::NpmRegistryClients::new(tls, move |builder| {
+        stage_manual_redirect_http_client(builder, timeout)
+    })
 }
 
-fn stage_manual_redirect_http_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+/// Sends a stage GET, following its redirects within one `timeout`.
+async fn send_stage_get(
+    clients: &crate::commands::publish_npm::NpmRegistryClients,
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
+    let request = request
+        .timeout(timeout)
+        .build()
+        .map_err(lpm_http::ReplayableRequestError::request)?;
+    lpm_http::send_with_replayable_redirects(clients, request, None).await
+}
+
+fn stage_manual_redirect_http_client(
+    builder: reqwest::ClientBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
@@ -1147,6 +1186,7 @@ mod tests {
         let tarball = std::sync::Arc::new(b"fake-tarball".to_vec());
         let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let result = stage_publish_impl(
+            &lpm_registry::RegistryClient::new(),
             "npm-token",
             "plain-pkg",
             "1.0.0",
@@ -1198,9 +1238,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let metadata = fetch_package_metadata("npm-token", "plain-pkg", &server.uri())
-            .await
-            .expect("irrelevant packument documents must not affect stage policy metadata");
+        let metadata = fetch_package_metadata(
+            &lpm_registry::RegistryClient::new(),
+            "npm-token",
+            "plain-pkg",
+            &server.uri(),
+        )
+        .await
+        .expect("irrelevant packument documents must not affect stage policy metadata");
 
         assert!(
             crate::commands::publish_npm::enforce_npm_version_policy(
@@ -1230,9 +1275,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let metadata = fetch_package_metadata("npm-token", "plain-pkg", &server.uri())
-            .await
-            .expect("large abbreviated packuments within the npm metadata cap must be accepted");
+        let metadata = fetch_package_metadata(
+            &lpm_registry::RegistryClient::new(),
+            "npm-token",
+            "plain-pkg",
+            &server.uri(),
+        )
+        .await
+        .expect("large abbreviated packuments within the npm metadata cap must be accepted");
 
         assert!(
             crate::commands::publish_npm::enforce_npm_version_policy(
@@ -1268,9 +1318,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = list_staged_packages("npm-token", &server.uri(), None)
-            .await
-            .expect_err("an unbounded remote pagination total must be rejected");
+        let error = list_staged_packages(
+            &lpm_registry::RegistryClient::new(),
+            "npm-token",
+            &server.uri(),
+            None,
+        )
+        .await
+        .expect_err("an unbounded remote pagination total must be rejected");
 
         assert!(
             error.to_string().contains("limit"),
@@ -1298,9 +1353,15 @@ mod tests {
         std::fs::create_dir_all(output.join("plain-pkg-1.0.0")).unwrap();
         let escaped = root.path().join(format!("escaped-{stage_id}.tgz"));
 
-        let error = download_staged_package("npm-token", &server.uri(), stage_id, &output)
-            .await
-            .expect_err("manifest identity must not influence the destination path");
+        let error = download_staged_package(
+            &lpm_registry::RegistryClient::new(),
+            "npm-token",
+            &server.uri(),
+            stage_id,
+            &output,
+        )
+        .await
+        .expect_err("manifest identity must not influence the destination path");
 
         assert!(error.to_string().contains("version"));
         assert!(
@@ -1322,10 +1383,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = list_staged_packages(token, &server.uri(), None)
-            .await
-            .expect_err("registry rejection must remain an error")
-            .to_string();
+        let error = list_staged_packages(
+            &lpm_registry::RegistryClient::new(),
+            token,
+            &server.uri(),
+            None,
+        )
+        .await
+        .expect_err("registry rejection must remain an error")
+        .to_string();
 
         assert!(
             !error.contains(token),
@@ -1360,6 +1426,7 @@ mod tests {
         let output = tempfile::tempdir().unwrap();
 
         let error = download_staged_package(
+            &lpm_registry::RegistryClient::new(),
             "npm-token",
             &format!("http://{address}"),
             "123e4567-e89b-12d3-a456-426614174000",
@@ -1397,6 +1464,7 @@ mod tests {
         let tarball = std::sync::Arc::new(b"redirected-tarball".to_vec());
         let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let result = stage_publish_impl(
+            &lpm_registry::RegistryClient::new(),
             "npm-token",
             "plain-pkg",
             "1.0.0",
@@ -1452,6 +1520,7 @@ mod tests {
             .await;
 
         let result = stage_otp_mutation(
+            &lpm_registry::RegistryClient::new(),
             "npm-token",
             &redirector.uri(),
             "-/stage/stage-id/approve",

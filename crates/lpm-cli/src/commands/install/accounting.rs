@@ -105,13 +105,30 @@ pub(super) fn build_managed_install_graph(
     ManagedInstallGraph { nodes, roots }
 }
 
+/// Where an install's LPM.dev requests get their client. Each request asks
+/// for it only once it knows it has something to send.
+pub(super) trait InstallRequestClient {
+    fn request_client(&self) -> Result<&RegistryClient, LpmError>;
+}
+
+impl InstallRequestClient for RegistryClient {
+    #[inline]
+    fn request_client(&self) -> Result<&RegistryClient, LpmError> {
+        Ok(self)
+    }
+}
+
 pub(super) async fn report_pool_install_attribution(
-    client: &RegistryClient,
+    client: &(dyn InstallRequestClient + Sync),
     packages: &[InstallPackage],
     accounting: ManagedInstallAccounting,
 ) -> Result<(), LpmError> {
     let graph = build_managed_install_graph(packages);
+    if graph.nodes.is_empty() {
+        return Ok(());
+    }
     client
+        .request_client()?
         .report_managed_pool_install(&graph, accounting)
         .await
         .map_err(|error| LpmError::PoolAttributionUnconfirmed {
@@ -120,7 +137,7 @@ pub(super) async fn report_pool_install_attribution(
 }
 
 pub(super) async fn verify_lpm_install_access(
-    client: &RegistryClient,
+    client: &(dyn InstallRequestClient + Sync),
     packages: &[InstallPackage],
     json_output: bool,
 ) -> Result<Vec<String>, LpmError> {
@@ -135,7 +152,13 @@ pub(super) async fn verify_lpm_install_access(
         })
         .map(|package| ManagedInstallRoot::new(&package.name, &package.version))
         .collect();
-    let warnings = client.check_install_access(&exact).await?;
+    if exact.is_empty() {
+        return Ok(Vec::new());
+    }
+    let warnings = client
+        .request_client()?
+        .check_install_access(&exact)
+        .await?;
     if !json_output {
         for warning in &warnings {
             output::warn(warning);

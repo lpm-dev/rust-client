@@ -1465,3 +1465,34 @@ async fn bare_install_answers_from_the_fast_lane_for_a_manifest_that_starts_with
         "the fast lane must answer a manifest that starts with a byte order mark: {result}"
     );
 }
+
+#[tokio::test]
+async fn unchanged_workspace_member_install_that_sends_nothing_warns_about_no_npmrc_setting() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"leaf":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"1.0.0"}}"#,
+    );
+    install(&project, &mock.url()).assert().success();
+    std::fs::write(project.home().join(".npmrc"), "strict-ssl=false\n").unwrap();
+
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .current_dir(project.path().join("packages/app"))
+        .env("LPM_REGISTRY_URL", mock.url());
+    let output = unchanged.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["up_to_date"], true, "{result}");
+    assert!(
+        !stderr.contains("TLS certificate verification is DISABLED"),
+        "an install that sends nothing has no verification to disable: {stderr}"
+    );
+}

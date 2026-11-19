@@ -25,7 +25,7 @@ pub(super) fn selected_package_skills(
 
 /// The skills an install materializes besides its dependencies' files.
 pub(super) struct ProjectSkills<'a> {
-    pub(super) client: &'a RegistryClient,
+    pub(super) client: &'a (dyn super::accounting::InstallRequestClient + Sync),
     pub(super) project_dir: &'a Path,
     /// Direct LPM.dev dependencies whose package skills to fetch, by name
     /// and selected version.
@@ -68,15 +68,27 @@ pub(super) async fn install_project_skills(input: ProjectSkills<'_>) -> Vec<Stri
                 .map(|(name, version)| (name.as_str(), version.as_str())),
         );
         if !packages.is_empty() {
-            warnings.extend(
-                install_skills_for_packages(
-                    input.client,
-                    &packages,
-                    input.project_dir,
-                    input.json_output,
-                )
-                .await,
-            );
+            match input.client.request_client() {
+                Ok(client) => warnings.extend(
+                    install_skills_for_packages(
+                        client,
+                        &packages,
+                        input.project_dir,
+                        input.json_output,
+                    )
+                    .await,
+                ),
+                Err(error) => {
+                    let warning = format!(
+                        "package skills were not installed: {}",
+                        crate::commands::skills::warning_detail(&error)
+                    );
+                    if !input.json_output {
+                        output::warn(&lpm_common::sanitize_terminal_inline(&warning));
+                    }
+                    warnings.push(warning);
+                }
+            }
         }
     }
     if input.managed_skills {

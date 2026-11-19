@@ -44,6 +44,7 @@ pub(crate) struct RegistryChange<'a> {
 /// code can't be asked for, but the approval URL is printed and waited for,
 /// so a change from CI can be approved by whoever reads its log.
 pub(crate) async fn send_with_second_factor<T>(
+    tls: &lpm_registry::RegistryClient,
     change: &RegistryChange<'_>,
     registry_url: &str,
     otp: Option<&OtpCode>,
@@ -88,6 +89,7 @@ pub(crate) async fn send_with_second_factor<T>(
                 });
             }
             let approval = crate::commands::web_auth::complete_lpm_browser_approval(
+                tls,
                 &auth_url,
                 &done_url,
                 registry_url,

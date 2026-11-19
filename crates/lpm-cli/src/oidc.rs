@@ -346,21 +346,25 @@ pub async fn resolve_registry_exchange_jwt() -> Result<String, LpmError> {
     }))
 }
 
-/// Exchange a CI OIDC token for an LPM session token.
+/// Exchange a CI OIDC token for an LPM session token, over a client with
+/// `tls`'s `.npmrc` TLS settings.
 pub async fn exchange_oidc_token(
+    tls: &lpm_registry::RegistryClient,
     registry_url: &str,
     package_name: Option<&str>,
     scope: &str,
 ) -> Result<OidcToken, LpmError> {
-    exchange_oidc_token_request(registry_url, package_name, scope, None).await
+    exchange_oidc_token_request(tls, registry_url, package_name, scope, None).await
 }
 
 pub async fn exchange_publish_oidc_token(
+    tls: &lpm_registry::RegistryClient,
     registry_url: &str,
     package_name: &str,
     publication_wait_timeout: Option<std::time::Duration>,
 ) -> Result<OidcToken, LpmError> {
     exchange_oidc_token_request(
+        tls,
         registry_url,
         Some(package_name),
         "publish",
@@ -369,8 +373,10 @@ pub async fn exchange_publish_oidc_token(
     .await
 }
 
-pub(crate) fn build_registry_oidc_exchange_client() -> Result<reqwest::Client, LpmError> {
-    build_registry_oidc_exchange_client_with_timeout(REGISTRY_OIDC_TIMEOUT)
+pub(crate) fn build_registry_oidc_exchange_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, LpmError> {
+    build_registry_oidc_exchange_client_with_timeout(builder, REGISTRY_OIDC_TIMEOUT)
 }
 
 pub(crate) async fn exchange_publish_oidc_token_with_client_and_jwt(
@@ -393,12 +399,14 @@ pub(crate) async fn exchange_publish_oidc_token_with_client_and_jwt(
 }
 
 async fn exchange_oidc_token_request(
+    tls: &lpm_registry::RegistryClient,
     registry_url: &str,
     package_name: Option<&str>,
     scope: &str,
     publication_wait_timeout: Option<std::time::Duration>,
 ) -> Result<OidcToken, LpmError> {
     exchange_oidc_token_request_with_timeout(
+        tls,
         registry_url,
         package_name,
         scope,
@@ -409,13 +417,17 @@ async fn exchange_oidc_token_request(
 }
 
 async fn exchange_oidc_token_request_with_timeout(
+    tls: &lpm_registry::RegistryClient,
     registry_url: &str,
     package_name: Option<&str>,
     scope: &str,
     publication_wait_timeout: Option<std::time::Duration>,
     request_timeout: std::time::Duration,
 ) -> Result<OidcToken, LpmError> {
-    let client = build_registry_oidc_exchange_client_with_timeout(request_timeout)?;
+    let client = build_registry_oidc_exchange_client_with_timeout(
+        tls.tls_client_builder_for(registry_url).await?,
+        request_timeout,
+    )?;
     exchange_oidc_token_request_with_client(
         &client,
         registry_url,
@@ -427,9 +439,10 @@ async fn exchange_oidc_token_request_with_timeout(
 }
 
 fn build_registry_oidc_exchange_client_with_timeout(
+    builder: reqwest::ClientBuilder,
     request_timeout: std::time::Duration,
 ) -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(request_timeout)
         .build()
@@ -825,6 +838,7 @@ mod tests {
         let _environment = scoped(&[("LPM_OIDC_TOKEN", "registry-jwt-must-not-be-sent")]);
 
         let error = exchange_oidc_token_request_with_timeout(
+            &lpm_registry::RegistryClient::new(),
             "http://192.0.2.1:4873",
             Some("@lpm.dev/acme.package"),
             "publish",
@@ -865,8 +879,13 @@ mod tests {
             .mount(&source)
             .await;
 
-        let result =
-            exchange_publish_oidc_token(&source.uri(), "@lpm.dev/acme.package", None).await;
+        let result = exchange_publish_oidc_token(
+            &lpm_registry::RegistryClient::new(),
+            &source.uri(),
+            "@lpm.dev/acme.package",
+            None,
+        )
+        .await;
 
         assert!(result.is_err(), "OIDC exchange followed a redirect");
         sink.verify().await;
@@ -882,10 +901,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = exchange_publish_oidc_token(&server.uri(), "@lpm.dev/acme.package", None)
-            .await
-            .expect_err("oversized OIDC response must fail")
-            .to_string();
+        let error = exchange_publish_oidc_token(
+            &lpm_registry::RegistryClient::new(),
+            &server.uri(),
+            "@lpm.dev/acme.package",
+            None,
+        )
+        .await
+        .expect_err("oversized OIDC response must fail")
+        .to_string();
 
         assert!(error.contains("exceeds"), "wrong size error: {error}");
     }
@@ -903,10 +927,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = exchange_publish_oidc_token(&server.uri(), "@lpm.dev/acme.package", None)
-            .await
-            .expect_err("rejected OIDC exchange must fail")
-            .to_string();
+        let error = exchange_publish_oidc_token(
+            &lpm_registry::RegistryClient::new(),
+            &server.uri(),
+            "@lpm.dev/acme.package",
+            None,
+        )
+        .await
+        .expect_err("rejected OIDC exchange must fail")
+        .to_string();
 
         assert!(!error.contains(jwt), "OIDC error exposed the JWT: {error}");
     }
@@ -927,6 +956,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = exchange_oidc_token_request_with_timeout(
+            &lpm_registry::RegistryClient::new(),
             &server.uri(),
             Some("@lpm.dev/acme.package"),
             "publish",

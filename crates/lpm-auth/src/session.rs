@@ -158,10 +158,9 @@ pub struct SessionManager {
     /// In-process single-flight gate around refresh coordination. The
     /// per-registry file lock provides the matching cross-process gate.
     refresh_lock: Mutex<()>,
-    /// HTTP client used for silent refresh. Constructed lazily on
-    /// first refresh attempt (no startup cost when refresh never
-    /// happens).
-    http: tokio::sync::OnceCell<reqwest::Client>,
+    /// The silent refresh's HTTP client, built on the first refresh (no
+    /// startup cost when refresh never happens), and where it comes from.
+    refresh_client: std::sync::Mutex<RefreshClient>,
     auth_storage_notice: Option<Arc<dyn Fn(AuthStorageAccessKind) + Send + Sync + 'static>>,
     auth_storage_notice_bits: AtomicU8,
     /// Whether a refresh saves the rotated pair, or keeps it in memory for a
@@ -170,6 +169,26 @@ pub struct SessionManager {
     /// The pair a refresh rotated to while `persists_refreshed_session` is
     /// off: the stored refresh token is spent once the Registry rotates it.
     unsaved_rotation: std::sync::Mutex<Option<UnsavedRotation>>,
+}
+
+/// Builds the HTTP client a silent refresh sends with, for a registry whose
+/// TLS settings, such as `.npmrc`'s `cafile=` or client certificate, the
+/// bundled trust store doesn't cover.
+pub trait RefreshClientSource: Send + Sync {
+    fn refresh_client_builder<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<reqwest::ClientBuilder, LpmError>> + Send + 'a>,
+    >;
+}
+
+/// The silent refresh's HTTP client and the source it is built from.
+#[derive(Default)]
+struct RefreshClient {
+    source: Option<Arc<dyn RefreshClientSource>>,
+    /// Built from `source` on the first refresh after it was set.
+    client: Option<reqwest::Client>,
 }
 
 /// A rotated session a revocation keeps in memory instead of saving.
@@ -280,7 +299,7 @@ impl SessionManager {
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
-            http: tokio::sync::OnceCell::new(),
+            refresh_client: std::sync::Mutex::new(RefreshClient::default()),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -546,7 +565,10 @@ impl SessionManager {
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
-            http: tokio::sync::OnceCell::new(),
+            refresh_client: std::sync::Mutex::new(RefreshClient {
+                source: self.refresh_client_source(),
+                client: None,
+            }),
             auth_storage_notice: self.auth_storage_notice.clone(),
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -563,6 +585,77 @@ impl SessionManager {
             persists_refreshed_session: false,
             ..self.stored_session_only()
         }
+    }
+
+    /// Build silent refreshes from `source`'s client builder, such as one
+    /// with the registry's `.npmrc` TLS settings. The next refresh builds
+    /// its client from it, and a session derived from this one keeps it.
+    pub fn use_refresh_client_source(&self, source: Arc<dyn RefreshClientSource>) {
+        *self
+            .refresh_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RefreshClient {
+            source: Some(source),
+            client: None,
+        };
+    }
+
+    fn refresh_client_source(&self) -> Option<Arc<dyn RefreshClientSource>> {
+        self.refresh_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .source
+            .clone()
+    }
+
+    async fn refresh_http_client(&self, refresh_url: &str) -> Result<reqwest::Client, LpmError> {
+        let source = {
+            let state = self
+                .refresh_client
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(client) = &state.client {
+                return Ok(client.clone());
+            }
+            state.source.clone()
+        };
+        let builder = match &source {
+            Some(source) => source.refresh_client_builder(refresh_url).await?,
+            None => lpm_http::client_builder(),
+        };
+        let origin = reqwest::Url::parse(refresh_url)
+            .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))?
+            .origin();
+        // A refresh carries the refresh token, and the registry's client
+        // certificate when `.npmrc` names one: neither may follow a
+        // redirect to another origin.
+        let client = builder
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // `previous` holds the first URL too, as in `Policy::limited`.
+                if attempt.previous().len() > lpm_http::DEFAULT_REDIRECT_LIMIT {
+                    attempt.error("too many redirects")
+                } else if attempt.url().origin() == origin {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))?;
+        let mut state = self
+            .refresh_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_unchanged = match (&state.source, &source) {
+            (Some(current), Some(used)) => Arc::ptr_eq(current, used),
+            (None, None) => true,
+            _ => false,
+        };
+        if source_unchanged {
+            state.client = Some(client.clone());
+        }
+        Ok(client)
     }
 
     /// **Step-3 transition bridge — do not introduce new callers.**
@@ -895,15 +988,7 @@ impl SessionManager {
         let device_fingerprint = compute_device_fingerprint();
         let refresh_url = format!("{}/api/cli/refresh", self.registry_url);
 
-        let http = self
-            .http
-            .get_or_try_init(|| async {
-                lpm_http::client_builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))
-            })
-            .await?;
+        let http = self.refresh_http_client(&refresh_url).await?;
 
         let resp = http
             .post(&refresh_url)
@@ -930,6 +1015,23 @@ impl SessionManager {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.clear_rejected_session_if_current(rejected_access, refresh_token)?;
                 return Err(LpmError::SessionExpired);
+            }
+            let redirected_elsewhere = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| resp.url().join(location).ok())
+                .is_some_and(|target| target.origin() != resp.url().origin());
+            // The statuses the redirect policy decides on; reqwest hands any
+            // other 3xx back without asking it.
+            let followable = matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
+            if followable && redirected_elsewhere {
+                return Err(LpmError::Http {
+                    status: status.as_u16(),
+                    message: "the registry redirected the session refresh to another origin, \
+                              which a refresh doesn't follow"
+                        .to_string(),
+                });
             }
             let reason = lpm_http::read_body_capped(resp, 64 * 1024)
                 .await
@@ -1490,7 +1592,7 @@ mod tests {
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
-            http: tokio::sync::OnceCell::new(),
+            refresh_client: std::sync::Mutex::new(RefreshClient::default()),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -1506,7 +1608,7 @@ mod tests {
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
-            http: tokio::sync::OnceCell::new(),
+            refresh_client: std::sync::Mutex::new(RefreshClient::default()),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -2388,7 +2490,7 @@ mod refresh_http_tests {
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
-            http: tokio::sync::OnceCell::new(),
+            refresh_client: std::sync::Mutex::new(RefreshClient::default()),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -2441,6 +2543,187 @@ mod refresh_http_tests {
         });
 
         (format!("http://{address}"), task)
+    }
+
+    /// Rotates to a new pair on every refresh: `at-1`/`rt-1`, `at-2`/`rt-2`, …
+    struct EveryCallRotates {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for EveryCallRotates {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": format!("at-{call}"),
+                "refreshToken": format!("rt-{call}"),
+                "expiresAt": "2099-01-01T00:00:00Z",
+            }))
+        }
+    }
+
+    /// A refresh client source that counts the builders it hands out.
+    struct CountingRefreshClientSource {
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl RefreshClientSource for CountingRefreshClientSource {
+        fn refresh_client_builder<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<reqwest::ClientBuilder, LpmError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.builds.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Ok(lpm_http::client_builder()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_refresh_does_not_follow_a_redirect_to_another_origin() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-elsewhere",
+                "refreshToken": "rt-elsewhere",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&elsewhere)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/api/cli/refresh", elsewhere.uri())),
+            )
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let mgr = manager_for(&server.uri());
+
+        let error = mgr
+            .refresh_now()
+            .await
+            .expect_err("a refresh redirected elsewhere fails");
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the refresh token must not leave the registry's origin"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("redirected the session refresh to another origin"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_refresh_answered_with_a_redirect_it_cant_follow_isnt_called_cross_origin() {
+        for (status, location) in [
+            (300, "/api/cli/refresh"),
+            (307, "http://[::1"),
+            (304, "https://elsewhere.example/api/cli/refresh"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/cli/refresh"))
+                .respond_with(ResponseTemplate::new(status).insert_header("location", location))
+                .mount(&server)
+                .await;
+
+            let _isolated = isolate_test_env();
+            let mgr = manager_for(&server.uri());
+
+            let error = mgr
+                .refresh_now()
+                .await
+                .expect_err("a refresh answered with a redirect it can't follow fails");
+            assert!(
+                matches!(
+                    &error,
+                    LpmError::Http { status: answered, message }
+                        if *answered == status
+                            && message.contains("couldn't refresh the session")
+                ),
+                "{status} to {location}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_refresh_follows_as_many_same_origin_redirects_as_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/hop/1"))
+            .mount(&server)
+            .await;
+        for hop in 1..lpm_http::DEFAULT_REDIRECT_LIMIT {
+            Mock::given(method("POST"))
+                .and(path(format!("/hop/{hop}")))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("location", format!("/hop/{}", hop + 1)),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(format!("/hop/{}", lpm_http::DEFAULT_REDIRECT_LIMIT)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-after-redirects",
+                "refreshToken": "rt-after-redirects",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let mgr = manager_for(&server.uri());
+
+        mgr.refresh_now()
+            .await
+            .expect("a refresh follows the redirect limit's worth of same-origin hops");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_client_source_set_after_a_refresh_builds_the_next_refresh_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(EveryCallRotates {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .mount(&server)
+            .await;
+        let _isolated = isolate_test_env();
+        let mgr = manager_for(&server.uri());
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+
+        mgr.use_refresh_client_source(Arc::new(CountingRefreshClientSource {
+            builds: Arc::clone(&first),
+        }));
+        mgr.refresh_now().await.expect("first refresh");
+        mgr.use_refresh_client_source(Arc::new(CountingRefreshClientSource {
+            builds: Arc::clone(&second),
+        }));
+        mgr.refresh_now().await.expect("second refresh");
+
+        assert_eq!(
+            (
+                first.load(AtomicOrdering::SeqCst),
+                second.load(AtomicOrdering::SeqCst)
+            ),
+            (1, 1),
+            "each source builds the refresh client for the refreshes after it was set"
+        );
     }
 
     #[tokio::test]

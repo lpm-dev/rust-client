@@ -10,7 +10,13 @@ const NPM_DISPLAY: &str = "npmjs.org";
 const GITHUB_DISPLAY: &str = "github.com";
 const GITLAB_DISPLAY: &str = "gitlab.com";
 
-pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), LpmError> {
+/// `client` is the registry client the web login's requests take their
+/// `.npmrc` TLS settings from; a token given outright needs no request.
+pub async fn run_npm(
+    client: &lpm_registry::RegistryClient,
+    token: Option<String>,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if let Some(token) = token {
         return store_builtin_token(
             NPM_DISPLAY,
@@ -38,9 +44,17 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
         ));
     }
 
-    let client = npm_web_auth_client()?;
-    let challenge = web_auth::fetch_npm_web_login_challenge(&client, NPM_REGISTRY_URL).await?;
+    let current_dir = std::env::current_dir().map_err(LpmError::Io)?;
+    let tls = crate::commands::registry_reads::registry_client_for_directory(
+        client,
+        &current_dir,
+        crate::commands::registry_reads::RegistryReads::NONE,
+        json_output,
+    )?;
+    let http = npm_web_auth_client(tls.tls_client_builder_for(NPM_REGISTRY_URL).await?)?;
+    let challenge = web_auth::fetch_npm_web_login_challenge(&http, NPM_REGISTRY_URL).await?;
     let token = web_auth::complete_web_auth_challenge(
+        &tls,
         &challenge,
         "log in",
         json_output,
@@ -398,8 +412,8 @@ fn print_success_json(
     );
 }
 
-fn npm_web_auth_client() -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+fn npm_web_auth_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()

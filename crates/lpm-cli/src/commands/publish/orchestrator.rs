@@ -65,34 +65,43 @@ struct ResolvedNpmTargetCredential {
 }
 
 pub(crate) struct ReleasePublishClients {
-    npm_preflight: Option<reqwest::Client>,
+    npm_preflight: Option<publish_npm::NpmRegistryClients>,
     registry_oidc: Option<reqwest::Client>,
-    npm_oidc: Option<reqwest::Client>,
+    npm_oidc: Option<publish_npm::NpmRegistryClients>,
     registry_provider_jwt: tokio::sync::OnceCell<String>,
     npm_provider_jwt: tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>,
     lpm_whoami: tokio::sync::OnceCell<lpm_registry::WhoamiResponse>,
-    npm_publish: Option<publish_npm::NpmPublishClients>,
+    npm_publish: Option<publish_npm::NpmRegistryClients>,
 }
 
 impl ReleasePublishClients {
-    pub(crate) fn new(
+    /// The clients a release shares across its packages, each with `tls`'s
+    /// `.npmrc` TLS settings for the registry it talks to.
+    pub(crate) async fn new(
+        tls: &RegistryClient,
         has_npm_compatible_targets: bool,
         has_lpm_target: bool,
         has_npm_target: bool,
         prepare_upload_clients: bool,
     ) -> Result<Self, LpmError> {
-        let registry_oidc = (has_lpm_target && oidc::registry_exchange_jwt_available())
-            .then(oidc::build_registry_oidc_exchange_client)
-            .transpose()?;
-        let npm_oidc = (has_npm_target && oidc::npm_trusted_publish_jwt_available())
-            .then(npm_auth::build_npm_oidc_exchange_client)
-            .transpose()?;
-        let npm_preflight = has_npm_compatible_targets
-            .then(publish_npm::build_npm_publish_preflight_client)
-            .transpose()?;
+        let registry_oidc = if has_lpm_target && oidc::registry_exchange_jwt_available() {
+            Some(oidc::build_registry_oidc_exchange_client(
+                tls.tls_client_builder_for(tls.base_url()).await?,
+            )?)
+        } else {
+            None
+        };
+        let npm_oidc = (has_npm_target && oidc::npm_trusted_publish_jwt_available()).then(|| {
+            publish_npm::NpmRegistryClients::new(tls, npm_auth::build_npm_oidc_exchange_client)
+        });
+        let npm_preflight = has_npm_compatible_targets.then(|| {
+            publish_npm::NpmRegistryClients::new(
+                tls,
+                publish_npm::build_npm_publish_preflight_client,
+            )
+        });
         let npm_publish = (has_npm_compatible_targets && prepare_upload_clients)
-            .then(publish_npm::build_npm_publish_clients)
-            .transpose()?;
+            .then(|| publish_npm::NpmRegistryClients::for_publishing(tls));
         Ok(Self {
             npm_preflight,
             registry_oidc,
@@ -370,9 +379,14 @@ impl PublishIntent {
                         resolved.target.display_name()
                     ))
                 })?;
-                let npm_client = clients.npm_preflight.as_ref().ok_or_else(|| {
-                    LpmError::Registry("npm publish preflight client is unavailable".into())
-                })?;
+                let npm_client = clients
+                    .npm_preflight
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LpmError::Registry("npm publish preflight client is unavailable".into())
+                    })?
+                    .for_registry(&endpoint.registry_url)
+                    .await?;
                 let permit_count = if endpoint.tag_explicit {
                     1
                 } else {
@@ -380,6 +394,7 @@ impl PublishIntent {
                 };
                 let _permit = acquire_preflight_permits(permits, permit_count).await?;
                 let credential = resolve_npm_target_credential(
+                    client,
                     &resolved.target,
                     &resolved.name,
                     &endpoint.registry_url,
@@ -388,7 +403,7 @@ impl PublishIntent {
                 .await?;
                 matches!(
                     publish_npm::preflight_npm_publish_version_with_client(
-                        npm_client,
+                        &npm_client,
                         &credential.token,
                         &resolved.name,
                         &self.package_version,
@@ -1427,6 +1442,7 @@ async fn execute_prepared_inner(
                 .await
         } else {
             oidc::exchange_publish_oidc_token(
+                client,
                 client.base_url(),
                 resolved_lpm_name,
                 publication_wait_timeout,
@@ -1540,9 +1556,18 @@ async fn execute_prepared_inner(
             }
         }
         if !npm_version_preflighted && targets.iter().any(is_npm_compatible_target) {
-            let preflight_client = release_clients
-                .and_then(|clients| clients.npm_preflight.clone())
-                .map_or_else(publish_npm::build_npm_publish_preflight_client, Ok)?;
+            let owned_preflight_clients;
+            let preflight_clients =
+                match release_clients.and_then(|clients| clients.npm_preflight.as_ref()) {
+                    Some(shared) => shared,
+                    None => {
+                        owned_preflight_clients = publish_npm::NpmRegistryClients::new(
+                            client,
+                            publish_npm::build_npm_publish_preflight_client,
+                        );
+                        &owned_preflight_clients
+                    }
+                };
             for target in targets
                 .iter()
                 .filter(|target| is_npm_compatible_target(target))
@@ -1558,12 +1583,16 @@ async fn execute_prepared_inner(
                         ))
                     })?;
                 let credential = resolve_npm_target_credential(
+                    client,
                     target,
                     target_name,
                     &endpoint.registry_url,
                     release_clients,
                 )
                 .await?;
+                let preflight_client = preflight_clients
+                    .for_registry(&endpoint.registry_url)
+                    .await?;
                 if matches!(
                     publish_npm::preflight_npm_publish_version_with_client(
                         &preflight_client,
@@ -1675,12 +1704,13 @@ async fn execute_prepared_inner(
         ProvenanceRequest::File(_) => None,
         request => materialize_provenance_request(request).await?,
     };
-    let npm_preflight_client =
-        if !npm_version_preflighted && targets.iter().any(is_npm_compatible_target) {
-            Some(publish_npm::build_npm_publish_preflight_client()?)
-        } else {
-            None
-        };
+    let npm_preflight_clients =
+        (!npm_version_preflighted && targets.iter().any(is_npm_compatible_target)).then(|| {
+            publish_npm::NpmRegistryClients::new(
+                client,
+                publish_npm::build_npm_publish_preflight_client,
+            )
+        });
 
     // Publish sequentially so per-target auth prompts and summaries stay deterministic.
     // All per-target errors are caught and collected — the loop NEVER aborts early.
@@ -1888,6 +1918,7 @@ async fn execute_prepared_inner(
                             ))
                         })?;
                     let credential = resolve_npm_target_credential(
+                        client,
                         target,
                         npm_name_str,
                         &endpoint.registry_url,
@@ -1926,10 +1957,11 @@ async fn execute_prepared_inner(
                         )));
                     }
                     let npm_tag = publish_npm::resolve_npm_tag(npm_config);
-                    if let Some(preflight_client) = npm_preflight_client.as_ref()
-                        && matches!(
+                    if let Some(preflight_clients) = npm_preflight_clients.as_ref() {
+                        let preflight_client = preflight_clients.for_registry(&registry_url).await?;
+                        if matches!(
                             publish_npm::preflight_npm_publish_version_with_client(
-                                preflight_client,
+                                &preflight_client,
                                 &token,
                                 npm_name_str,
                                 &version,
@@ -1938,11 +1970,11 @@ async fn execute_prepared_inner(
                             )
                             .await?,
                             publish_npm::NpmPublishVersionPreflight::AlreadyPublished
-                        )
-                    {
-                        return Err(LpmError::Registry(format!(
-                            "version {version} already exists on npm for {npm_name_str}"
-                        )));
+                        ) {
+                            return Err(LpmError::Registry(format!(
+                                "version {version} already exists on npm for {npm_name_str}"
+                            )));
+                        }
                     }
 
                     // OTP preemption
@@ -2009,6 +2041,7 @@ async fn execute_prepared_inner(
                         .await?
                     } else {
                         publish_npm::publish_to_npm(
+                            client,
                             &token,
                             npm_name_str,
                             &version,
@@ -2939,7 +2972,10 @@ mod npm_compatible_publish_endpoint_tests {
     }
 }
 
+/// `tls` is the registry client whose `.npmrc` TLS settings an npm Trusted
+/// Publishing exchange outside a release uses.
 async fn resolve_npm_target_credential(
+    tls: &RegistryClient,
     target: &PublishTarget,
     npm_name: &str,
     registry_url: &str,
@@ -2947,21 +2983,23 @@ async fn resolve_npm_target_credential(
 ) -> Result<ResolvedNpmTargetCredential, LpmError> {
     match target {
         PublishTarget::Npm => {
-            let npm_auth = if let Some((client, provider_jwt)) = release_clients.and_then(|clients| {
-                clients
-                    .npm_oidc
-                    .as_ref()
-                    .map(|client| (client, &clients.npm_provider_jwt))
-            }) {
+            let npm_auth = if let Some((oidc_clients, provider_jwt)) =
+                release_clients.and_then(|clients| {
+                    clients
+                        .npm_oidc
+                        .as_ref()
+                        .map(|oidc_clients| (oidc_clients, &clients.npm_provider_jwt))
+                }) {
+                let oidc_client = oidc_clients.for_registry(registry_url).await?;
                 npm_auth::resolve_publish_auth_with_oidc_context(
                     npm_name,
                     registry_url,
-                    client,
+                    &oidc_client,
                     provider_jwt,
                 )
                 .await?
             } else {
-                npm_auth::resolve_publish_auth(npm_name, registry_url).await?
+                npm_auth::resolve_publish_auth(tls, npm_name, registry_url).await?
             };
             Ok(ResolvedNpmTargetCredential {
                 token: npm_auth.token().to_string(),

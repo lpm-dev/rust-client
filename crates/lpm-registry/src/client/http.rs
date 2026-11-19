@@ -274,6 +274,59 @@ impl HttpClients {
         )
     }
 
+    /// A client builder for requests to `url` with the TLS settings this
+    /// client set's `.npmrc` gives `url`'s origin: the roots it trusts, its
+    /// `strict-ssl` setting and its client certificate. It is for a caller
+    /// that sets its own redirect policy and timeouts; with no `.npmrc` TLS
+    /// settings it trusts the bundled roots, as [`lpm_http::client_builder`]
+    /// does.
+    ///
+    /// An origin with `.npmrc` TLS settings of its own reads their files on
+    /// each call.
+    pub async fn tls_client_builder_for(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::ClientBuilder, LpmError> {
+        let configured = OriginKey::from_request_url(url).and_then(|origin| {
+            let per_origin = self.tls_overrides.per_origin.get(&origin)?.clone();
+            Some((origin, per_origin))
+        });
+        let Some((origin, per_origin)) = configured else {
+            return RegistryClient::tls_client_builder(
+                &self.tls_overrides,
+                self.global_identity
+                    .as_ref()
+                    .map(|loaded| loaded.identity.clone()),
+            );
+        };
+        let preloaded_cert_pem = match self.lazy_identity_material(&origin) {
+            Some(Ok(material)) => Some(Arc::clone(&material.cert_pem)),
+            Some(Err(error)) => return Err(LpmError::Cert(error.to_string())),
+            None => None,
+        };
+        let global = Arc::clone(&self.tls_overrides);
+        let passphrase = Arc::clone(&self.passphrase);
+        let global_identity = self.global_identity.clone();
+        let material_budget = Arc::clone(&self.tls_material_budget);
+        tokio::task::spawn_blocking(move || {
+            let material = read_origin_tls_material(
+                &global,
+                &per_origin,
+                &origin,
+                passphrase.as_ref(),
+                global_identity.as_deref(),
+                preloaded_cert_pem.as_ref(),
+                &material_budget,
+            )?;
+            RegistryClient::tls_client_builder(
+                &material.overrides,
+                material.identity.map(|loaded| loaded.identity),
+            )
+        })
+        .await
+        .map_err(|error| LpmError::Cert(format!("TLS client builder task failed: {error}")))?
+    }
+
     /// Look up (or lazily build) a client for `url`. Returns the eager
     /// or lazy per-origin client if one exists OR can be constructed
     /// for an origin that has per-origin TLS configuration; otherwise
@@ -404,6 +457,17 @@ impl HttpClients {
     }
 }
 
+impl lpm_auth::RefreshClientSource for HttpClients {
+    fn refresh_client_builder<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<reqwest::ClientBuilder, LpmError>> + Send + 'a>,
+    > {
+        Box::pin(self.tls_client_builder_for(url))
+    }
+}
+
 fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
     match pool {
         ClientPool::General => cached.client.clone(),
@@ -442,6 +506,66 @@ pub(super) fn build_per_origin_http_client(
     preloaded_cert_pem: Option<&Arc<Vec<u8>>>,
     material_budget: &TlsMaterialBudget,
 ) -> Result<CachedClient, LpmError> {
+    let material = read_origin_tls_material(
+        global,
+        per_origin,
+        origin,
+        passphrase,
+        global_identity,
+        preloaded_cert_pem,
+        material_budget,
+    )?;
+
+    // Hash the cert PEM once so cache-key composition doesn't re-read
+    // or re-hash on every request.
+    let identity_fp = material
+        .identity
+        .as_ref()
+        .map(|l| cert_pem_fingerprint(&l.cert_pem));
+    let context = format!("per-origin TLS for {origin}");
+    let reserved_bytes = material_budget.reserve_client_set(
+        material.root_bytes,
+        material.identity_bytes,
+        &context,
+    )?;
+    let clients = RegistryClient::build_http_client_set_with_tls_and_identity(
+        CONNECT_TIMEOUT,
+        READ_TIMEOUT,
+        &material.overrides,
+        material.identity.map(|l| l.identity),
+    );
+    let clients = match clients {
+        Ok(clients) => clients,
+        Err(error) => {
+            material_budget.release(reserved_bytes);
+            return Err(error);
+        }
+    };
+    drop(material.reservations);
+    Ok(clients.cached(identity_fp))
+}
+
+/// One origin's TLS settings with their files read: the global roots plus
+/// the origin's `cafile=`s, the global `strict-ssl`, and the origin's client
+/// identity or the global one it inherits. The reservations hold the files'
+/// bytes against the material budget until the caller has built from them.
+struct OriginTlsMaterial<'a> {
+    overrides: TlsOverrides,
+    identity: Option<crate::tls_identity::LoadedIdentity>,
+    root_bytes: u64,
+    identity_bytes: Option<u64>,
+    reservations: Vec<super::state::TlsMaterialReservation<'a>>,
+}
+
+fn read_origin_tls_material<'a>(
+    global: &TlsOverrides,
+    per_origin: &OriginTlsOverrides,
+    origin: &OriginKey,
+    passphrase: &dyn PassphraseProvider,
+    global_identity: Option<&LoadedIdentity>,
+    preloaded_cert_pem: Option<&Arc<Vec<u8>>>,
+    material_budget: &'a TlsMaterialBudget,
+) -> Result<OriginTlsMaterial<'a>, LpmError> {
     // Compose extra roots: global + per-origin (additive).
     // Per-origin cafiles are deferred-read; do the IO here.
     let mut all_roots: Vec<TaggedRoot> = global.extra_roots.clone();
@@ -542,42 +666,21 @@ pub(super) fn build_per_origin_http_client(
         .as_ref()
         .and_then(|_| loaded.as_ref().map(|identity| identity.material_bytes));
 
-    // Hash the cert PEM once so cache-key composition doesn't re-read
-    // or re-hash on every request.
-    let identity_fp = loaded.as_ref().map(|l| cert_pem_fingerprint(&l.cert_pem));
-    let identity = loaded.map(|l| l.identity);
-
-    // Synthesize a per-origin TlsOverrides view: combined
-    // roots + global strict_ssl. Per-origin map cleared (this is a
-    // single-origin client — no further dispatch lives below it).
-    let synthetic = TlsOverrides {
-        extra_roots: all_roots,
-        strict_ssl: global.strict_ssl.clone(),
-        identity_certfile: None,
-        identity_keyfile: None,
-        per_origin: HashMap::new(),
-    };
-    let context = format!("per-origin TLS for {origin}");
-    let reserved_bytes = material_budget.reserve_client_set(
-        origin_root_bytes,
-        per_origin_identity_bytes,
-        &context,
-    )?;
-    let clients = RegistryClient::build_http_client_set_with_tls_and_identity(
-        CONNECT_TIMEOUT,
-        READ_TIMEOUT,
-        &synthetic,
-        identity,
-    );
-    let clients = match clients {
-        Ok(clients) => clients,
-        Err(error) => {
-            material_budget.release(reserved_bytes);
-            return Err(error);
-        }
-    };
-    drop(source_material_reservations);
-    Ok(clients.cached(identity_fp))
+    // A single-origin view: combined roots and the global strict_ssl, with
+    // no per-origin map, since no further dispatch lives below it.
+    Ok(OriginTlsMaterial {
+        overrides: TlsOverrides {
+            extra_roots: all_roots,
+            strict_ssl: global.strict_ssl.clone(),
+            identity_certfile: None,
+            identity_keyfile: None,
+            per_origin: HashMap::new(),
+        },
+        identity: loaded,
+        root_bytes: origin_root_bytes,
+        identity_bytes: per_origin_identity_bytes,
+        reservations: source_material_reservations,
+    })
 }
 
 impl lpm_http::ReplayableHttpClientProvider for HttpClients {

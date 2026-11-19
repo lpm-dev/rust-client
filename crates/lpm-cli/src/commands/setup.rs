@@ -206,7 +206,7 @@ pub async fn run(
             uses_env_var: false,
         }
     } else if use_oidc {
-        oidc::exchange_oidc_token(registry.service_base(), None, "read")
+        oidc::exchange_oidc_token(client, registry.service_base(), None, "read")
             .await
             .map(|oidc_token| ResolvedSetupBearer::oidc(oidc_token.token))
             .map_err(|error| {

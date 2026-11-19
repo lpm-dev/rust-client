@@ -1487,7 +1487,7 @@ async fn run_with_options_under_store_lock(
     }
 
     let mut install_warnings =
-        verify_lpm_install_access(&arc_client, &packages, json_output).await?;
+        verify_lpm_install_access(arc_client.as_ref(), &packages, json_output).await?;
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,

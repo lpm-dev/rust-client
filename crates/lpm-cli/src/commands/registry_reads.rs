@@ -183,7 +183,21 @@ pub fn registry_client_for_current_directory(
     json_output: bool,
 ) -> Result<RegistryClient, LpmError> {
     let current_dir = std::env::current_dir().map_err(LpmError::Io)?;
-    let context = prepare_registry_read_context(client, &current_dir, RegistryReads::LPM)?;
+    registry_client_for_directory(client, &current_dir, RegistryReads::LPM, json_output)
+}
+
+/// `client` with the `.npmrc` TLS settings in effect at `config_dir`,
+/// announced unless the output is JSON: the client for a command that sends
+/// to a registry, or that builds its own HTTP clients from
+/// [`RegistryClient::tls_client_builder_for`]. The registries in `reads`
+/// load their TLS files now; any other origin loads them on first use.
+pub fn registry_client_for_directory(
+    client: &RegistryClient,
+    config_dir: &Path,
+    reads: RegistryReads,
+    json_output: bool,
+) -> Result<RegistryClient, LpmError> {
+    let context = prepare_registry_read_context(client, config_dir, reads)?;
     if !json_output {
         context.announce();
     }
