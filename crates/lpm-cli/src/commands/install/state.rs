@@ -200,8 +200,8 @@ pub(super) struct InstallFreshnessResult {
 }
 
 fn validated_lockfile_deps_for_freshness<'a>(
-    project_dir: &Path,
     manifest_deps: &'a HashMap<String, String>,
+    discover_workspace: impl FnOnce() -> Option<Arc<lpm_workspace::Workspace>>,
 ) -> Option<(Cow<'a, HashMap<String, String>>, bool)> {
     if !manifest_deps
         .values()
@@ -210,12 +210,23 @@ fn validated_lockfile_deps_for_freshness<'a>(
         return Some((Cow::Borrowed(manifest_deps), false));
     }
 
-    let workspace = crate::workspace_discovery_cache::discover_workspace(project_dir)
-        .ok()
-        .flatten()?;
+    let workspace = discover_workspace()?;
     let mut lockfile_deps = manifest_deps.clone();
     extract_workspace_protocol_deps(&mut lockfile_deps, &workspace).ok()?;
     Some((Cow::Owned(lockfile_deps), true))
+}
+
+/// Whether `package` names a catalog in `deps` or in its overrides or
+/// resolutions.
+fn names_a_catalog(package: &lpm_workspace::PackageJson, deps: &HashMap<String, String>) -> bool {
+    let is_catalog = |spec: &String| spec.starts_with("catalog:");
+    deps.values().any(is_catalog)
+        || package.overrides.values().any(is_catalog)
+        || package.resolutions.values().any(is_catalog)
+        || package
+            .lpm
+            .as_ref()
+            .is_some_and(|lpm| lpm.overrides.values().any(is_catalog))
 }
 
 pub(super) async fn run_install_freshness_phase(
@@ -286,8 +297,20 @@ pub(super) async fn run_install_freshness_phase(
             };
             let gate_stats = GateStats::default();
             let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);
+            // Discovery reads every member's manifest, so it runs at most
+            // once, and only for a `workspace:` or `catalog:` reference.
+            let discovered_workspace = std::cell::OnceCell::new();
+            let discover_workspace = || {
+                discovered_workspace
+                    .get_or_init(|| {
+                        crate::workspace_discovery_cache::discover_workspace(input.project_dir)
+                            .ok()
+                            .flatten()
+                    })
+                    .clone()
+            };
             let fast =
-                validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
+                validated_lockfile_deps_for_freshness(input.manifest_deps, discover_workspace)
                     .and_then(|(mut lockfile_deps, workspace_deps_filtered)| {
                         if workspace_deps_filtered
                             && lockfile_deps.is_empty()
@@ -298,17 +321,13 @@ pub(super) async fn run_install_freshness_phase(
                         let route_table = route_table.as_ref()?;
                         // A plain install outside `--recursive` has no active
                         // workspace; its catalogs come from the discovered root,
-                        // as the cold install's do.
+                        // as the cold install's do. A member whose only catalog
+                        // references are the root's overrides answers from the
+                        // full install.
                         let catalog_workspace = match &workspace {
                             Some(workspace) => Some(Arc::clone(workspace)),
-                            None if lockfile_deps
-                                .values()
-                                .any(|spec| spec.starts_with("catalog:")) =>
-                            {
-                                crate::workspace_discovery_cache::discover_workspace(
-                                    input.project_dir,
-                                )
-                                .ok()?
+                            None if names_a_catalog(input.package, &lockfile_deps) => {
+                                discover_workspace()
                             }
                             None => None,
                         };
@@ -1098,7 +1117,12 @@ mod workspace_freshness_tests {
         ]);
 
         let (lockfile_deps, workspace_deps_filtered) =
-            validated_lockfile_deps_for_freshness(&member_dir, &manifest_deps).unwrap();
+            validated_lockfile_deps_for_freshness(&manifest_deps, || {
+                crate::workspace_discovery_cache::discover_workspace(&member_dir)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap();
 
         assert!(workspace_deps_filtered);
         assert_eq!(

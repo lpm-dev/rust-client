@@ -1632,3 +1632,24 @@ async fn unchanged_workspace_installs_with_catalog_dependencies_answer_up_to_dat
         assert_up_to_date(unchanged);
     }
 }
+
+#[tokio::test]
+async fn unchanged_member_install_whose_only_catalog_reference_is_an_override_answers_up_to_date() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"catalogs":{"default":{"leaf":"1.0.0"}}}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"^1.0.0"},"overrides":{"leaf":"catalog:"}}"#,
+    );
+    install(&project, &mock.url()).assert().success();
+
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .current_dir(project.path().join("packages/app"))
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
+}
