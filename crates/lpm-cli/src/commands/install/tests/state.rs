@@ -300,6 +300,26 @@ fn local_directories_named_in_other_bytes_have_their_own_identity() {
     );
 }
 
+/// HOME and USERPROFILE moved to `home`, with npm's user and global config
+/// paths inside it, so no `.npmrc` of the machine running the test is read.
+fn npm_env_under(home: &std::path::Path) -> [(&'static str, Option<std::ffi::OsString>); 7] {
+    [
+        ("HOME", Some(home.as_os_str().to_owned())),
+        ("USERPROFILE", Some(home.as_os_str().to_owned())),
+        ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
+        (
+            "NPM_CONFIG_USERCONFIG",
+            Some(home.join(".npmrc").into_os_string()),
+        ),
+        (
+            "NPM_CONFIG_GLOBALCONFIG",
+            Some(home.join("global-npmrc").into_os_string()),
+        ),
+        ("npm_config_userconfig", None),
+        ("npm_config_globalconfig", None),
+    ]
+}
+
 /// A home whose `~/.npmrc` is `npmrc`, and the routes of a project in it.
 fn routes_under_user_npmrc(
     npmrc: impl FnOnce(&std::path::Path) -> String,
@@ -309,18 +329,8 @@ fn routes_under_user_npmrc(
     lpm_registry::RouteTable,
 ) {
     let home = tempfile::tempdir().unwrap();
-    let user_npmrc = home.path().join(".npmrc");
-    let env = crate::test_env::ScopedEnv::update([
-        ("HOME", Some(home.path().as_os_str().to_owned())),
-        ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
-        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
-        (
-            "NPM_CONFIG_USERCONFIG",
-            Some(user_npmrc.as_os_str().to_owned()),
-        ),
-        ("NPM_CONFIG_GLOBALCONFIG", None),
-    ]);
-    std::fs::write(&user_npmrc, npmrc(home.path())).unwrap();
+    let env = crate::test_env::ScopedEnv::update(npm_env_under(home.path()));
+    std::fs::write(home.path().join(".npmrc"), npmrc(home.path())).unwrap();
     let project = home.path().join("project");
     std::fs::create_dir(&project).unwrap();
     let routes = lpm_registry::RouteTable::from_env_and_filesystem(&project).unwrap();
