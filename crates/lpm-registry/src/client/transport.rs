@@ -618,18 +618,21 @@ impl RegistryClient {
 
                         // Rate limit — respect Retry-After
                         429 => {
-                            if attempt < MAX_RETRIES
-                                && let Some(wait) = rate_limit_wait(&facts, &mut waited_long)
-                            {
-                                // Honor the test-only backoff override so
-                                // 429-flood retry-exhaustion tests don't
-                                // hang on the server-supplied Retry-After.
-                                tokio::time::sleep(backoff_override().unwrap_or(wait)).await;
-                                continue;
-                            }
+                            let wait = if attempt < MAX_RETRIES {
+                                rate_limit_wait(&facts, &mut waited_long)
+                            } else {
+                                None
+                            };
                             let body = read_publish_error_text(response, &headers, bearer).await;
                             last_error = Some(registry_refusal(status, &facts, &body, &origin));
-                            break;
+                            let Some(wait) = wait else {
+                                break;
+                            };
+                            // Honor the test-only backoff override so
+                            // 429-flood retry-exhaustion tests don't
+                            // hang on the server-supplied Retry-After.
+                            tokio::time::sleep(backoff_override().unwrap_or(wait)).await;
+                            continue;
                         }
 
                         // Retryable gateway errors only (NOT 500)

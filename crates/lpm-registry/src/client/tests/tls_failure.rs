@@ -375,13 +375,34 @@ async fn a_publish_whose_deadline_runs_out_before_it_is_sent_is_neither_sent_nor
 
 #[tokio::test]
 async fn a_publish_retry_whose_deadline_runs_out_before_it_is_sent_keeps_the_earlier_failure() {
+    for (first_answer, earlier_failure) in [
+        (wiremock::ResponseTemplate::new(502), "502"),
+        (
+            wiremock::ResponseTemplate::new(429).insert_header("retry-after", "1"),
+            "rate limited",
+        ),
+    ] {
+        let rendered = publish_whose_retry_times_out_before_it_is_sent(first_answer).await;
+        assert!(
+            rendered.contains("retry timed out before it was sent")
+                && rendered.contains(earlier_failure),
+            "{rendered}"
+        );
+    }
+}
+
+/// The error of a publish whose first attempt meets `first_answer` and
+/// whose retry's deadline has already passed when it starts.
+async fn publish_whose_retry_times_out_before_it_is_sent(
+    first_answer: wiremock::ResponseTemplate,
+) -> String {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let registry = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/api/registry/@lpm.dev/owner.pkg"))
-        .respond_with(ResponseTemplate::new(502))
+        .respond_with(first_answer)
         .expect(1)
         .mount(&registry)
         .await;
@@ -423,9 +444,5 @@ async fn a_publish_retry_whose_deadline_runs_out_before_it_is_sent_keeps_the_ear
     let Err(error) = outcome else {
         panic!("a publish the registry never stored fails");
     };
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("retry timed out before it was sent") && rendered.contains("502"),
-        "{rendered}"
-    );
+    error.to_string()
 }
