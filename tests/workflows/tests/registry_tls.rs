@@ -7,7 +7,7 @@
 mod support;
 
 use support::TempProject;
-use support::auth_state::{SessionSeed, seed_sessions};
+use support::auth_state::{SessionSeed, credentials_path, seed_sessions};
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json, mount_tarball_uploads};
 use support::tls_front::TlsFront;
 use wiremock::matchers::{method, path, path_regex};
@@ -255,6 +255,85 @@ async fn logout_revoke_reaches_the_registry_over_its_npmrc_cafile() {
     assert!(
         !errors.contains("UnknownIssuer") && errors.contains("signing key"),
         "{json}"
+    );
+}
+
+#[tokio::test]
+async fn logout_revoke_refreshes_an_expired_session_over_the_registrys_npmrc_cafile() {
+    let project = TempProject::empty(r#"{"name":"registry-tls-logout-refresh","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let front = TlsFront::start(&mock, project.home());
+    trust_only_the_front(&project, &front);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &front.url,
+            access_token: Some("expired-access-token"),
+            refresh_token: Some("tls-refresh-token"),
+            session_access_expires_at: Some("2020-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_refresh_expected(
+        "tls-refresh-token",
+        "refreshed-access-token",
+        "rotated-refresh-token",
+        "2032-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_current_principal("refreshed-access-token", "account-1", 1)
+        .await;
+    mock.with_revoke_token("refreshed-access-token").await;
+
+    let output = support::lpm(&project)
+        .args(["--registry", &front.url, "--json", "logout", "--revoke"])
+        .output()
+        .expect("run lpm logout --revoke");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout prints one JSON document");
+    assert_eq!(json["server_revoked"], true, "{json}");
+    assert_eq!(json["local_cleared"], true, "{json}");
+    assert!(!credentials_path(project.home()).exists());
+}
+
+#[tokio::test]
+async fn logout_revoke_with_a_broken_npmrc_cafile_reports_it_and_still_clears_the_session() {
+    let project = TempProject::empty(r#"{"name":"registry-tls-logout-broken","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "cafile={}\n",
+            project.home().join("missing-ca.pem").display()
+        ),
+    )
+    .unwrap();
+    signed_in(&project, &mock.url());
+
+    let output = support::lpm(&project)
+        .args(["--registry", &mock.url(), "--json", "logout", "--revoke"])
+        .output()
+        .expect("run lpm logout --revoke");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout prints one JSON document");
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    assert_eq!(json["server_revoked"], false, "{json}");
+    assert_eq!(json["local_cleared"], true, "{json}");
+    let errors = json["errors"].as_array().expect("errors array");
+    assert!(
+        errors.len() == 1
+            && errors[0]
+                .as_str()
+                .is_some_and(|error| error.starts_with("session revocation")
+                    && error.contains("missing-ca.pem")),
+        "{json}"
+    );
+    assert!(!credentials_path(project.home()).exists());
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "nothing may be sent without the .npmrc trust settings"
     );
 }
 
