@@ -305,6 +305,9 @@ pub enum ReplayableRequestError<E> {
     NonReplayableBody,
     TooManyRedirects,
     Timeout,
+    /// The deadline ran out before the first request was sent, while its
+    /// client was still being prepared, so no server received anything.
+    TimeoutBeforeRequest,
     HttpsDowngrade,
     CleartextNonLoopback,
     UnsupportedRedirectScheme,
@@ -326,6 +329,14 @@ impl<E> ReplayableRequestError<E> {
             Self::RequestAfterRedirect(error.without_url())
         }
     }
+
+    fn timeout_before_sending(redirects_followed: usize) -> Self {
+        if redirects_followed == 0 {
+            Self::TimeoutBeforeRequest
+        } else {
+            Self::Timeout
+        }
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
@@ -338,6 +349,9 @@ impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
             Self::NonReplayableBody => formatter.write_str("request body cannot be replayed"),
             Self::TooManyRedirects => formatter.write_str("too many redirects"),
             Self::Timeout => formatter.write_str("request timed out"),
+            Self::TimeoutBeforeRequest => {
+                formatter.write_str("request timed out before it was sent")
+            }
             Self::HttpsDowngrade => formatter.write_str(HTTPS_DOWNGRADE_REFUSAL),
             Self::CleartextNonLoopback => {
                 formatter.write_str("refused cleartext redirect to a non-loopback host")
@@ -366,6 +380,7 @@ where
             Self::NonReplayableBody
             | Self::TooManyRedirects
             | Self::Timeout
+            | Self::TimeoutBeforeRequest
             | Self::HttpsDowngrade
             | Self::CleartextNonLoopback
             | Self::UnsupportedRedirectScheme
@@ -441,7 +456,7 @@ where
         let client = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, client_future)
                 .await
-                .map_err(|_| ReplayableRequestError::Timeout)?
+                .map_err(|_| ReplayableRequestError::timeout_before_sending(redirects_followed))?
                 .map_err(ReplayableRequestError::Client)?,
             None => client_future
                 .await
@@ -451,7 +466,9 @@ where
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(ReplayableRequestError::Timeout);
+                    return Err(ReplayableRequestError::timeout_before_sending(
+                        redirects_followed,
+                    ));
                 }
                 Some(remaining)
             }
@@ -1774,10 +1791,72 @@ mod tests {
             .expect_err("provider latency must consume the request timeout");
 
         assert!(
-            matches!(error, ReplayableRequestError::Timeout)
-                || matches!(error, ReplayableRequestError::Request(ref error) if error.is_timeout())
+            matches!(error, ReplayableRequestError::TimeoutBeforeRequest),
+            "nothing was sent before the deadline: {error:?}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Delays the client for every hop after the first.
+    struct LaterHopsDelayedClientProvider {
+        client: reqwest::Client,
+        delay: std::time::Duration,
+        hops: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReplayableHttpClientProvider for LaterHopsDelayedClientProvider {
+        type Error = std::convert::Infallible;
+
+        fn client_for_url(
+            &self,
+            _url: &reqwest::Url,
+        ) -> impl Future<Output = Result<reqwest::Client, Self::Error>> + Send {
+            let client = self.client.clone();
+            let first_hop = self.hops.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let delay = self.delay;
+            async move {
+                if !first_hop {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(client)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deadline_that_runs_out_after_a_redirect_is_not_reported_as_before_sending() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/initial"))
+            .respond_with(ResponseTemplate::new(303).insert_header("location", "/status"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = LaterHopsDelayedClientProvider {
+            client: reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .unwrap(),
+            delay: std::time::Duration::from_secs(5),
+            hops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut request = reqwest::Request::new(
+            reqwest::Method::PUT,
+            reqwest::Url::parse(&format!("{}/initial", server.uri())).unwrap(),
+        );
+        *request.timeout_mut() = Some(std::time::Duration::from_millis(200));
+
+        let error = send_with_replayable_redirects(&provider, request, None)
+            .await
+            .expect_err("the redirect hop's client misses the deadline");
+
+        assert!(
+            matches!(error, ReplayableRequestError::Timeout),
+            "the first hop was sent: {error:?}"
+        );
     }
 
     #[tokio::test]

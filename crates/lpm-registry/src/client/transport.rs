@@ -689,6 +689,12 @@ impl RegistryClient {
                             false,
                             false,
                         ),
+                        // A probe would wait on the same unprepared client.
+                        lpm_http::ReplayableRequestError::TimeoutBeforeRequest => {
+                            return Err(LpmError::Network(
+                                "publish request timed out before it was sent".into(),
+                            ));
+                        }
                         refused => return Err(LpmError::Network(refused.to_string())),
                     };
                     // A handshake refused on the first hop means the registry

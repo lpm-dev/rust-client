@@ -248,17 +248,18 @@ async fn a_publish_whose_answer_misses_its_deadline_is_reconciled_with_the_regis
     assert!(matches!(response, PublishSafeResponse::Recovered(_)));
 }
 
-#[tokio::test]
-async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_with_the_registry() {
-    let status = wiremock::MockServer::start().await;
-    let status_url = format!("{}/status", status.uri());
-    let registry = registry_redirecting_publishes_to(&status_url, true).await;
-    let (mut client, _tmp) = client_with_mock_server(&registry.uri());
-    let status_origin = OriginKey::from_request_url(&status_url).expect("status origin");
+/// Gives `client` lazy `.npmrc` TLS settings for `url`'s origin and holds
+/// that origin's client build open, as a passphrase prompt nobody answers
+/// would. Abort the returned task to release it.
+async fn hold_client_build_open(
+    client: &mut RegistryClient,
+    url: &str,
+) -> tokio::task::JoinHandle<()> {
+    let origin = OriginKey::from_request_url(url).expect("origin");
     let mut tls_overrides = TlsOverrides::default();
     tls_overrides
         .per_origin
-        .insert(status_origin.clone(), OriginTlsOverrides::default());
+        .insert(origin.clone(), OriginTlsOverrides::default());
     let lazy = tls_overrides
         .per_origin
         .keys()
@@ -279,12 +280,10 @@ async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_w
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: AtomicUsize::new(0),
     });
-    // The redirect target's TLS client is still being built (a passphrase
-    // prompt, say) when the publish's deadline passes.
     let (building_tx, building_rx) = tokio::sync::oneshot::channel();
     let http = Arc::clone(&client.http);
     let held_build = tokio::spawn(async move {
-        http.lazy[&status_origin]
+        http.lazy[&origin]
             .get_or_init(|| {
                 let _ = building_tx.send(());
                 std::future::pending()
@@ -293,18 +292,23 @@ async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_w
     });
     building_rx
         .await
-        .expect("the status origin's build started");
-    let url = format!("{}/api/registry/@lpm.dev/owner.pkg", registry.uri());
+        .expect("the origin's client build started");
+    held_build
+}
+
+async fn publish_with_a_200ms_deadline(
+    client: &RegistryClient,
+    url: &str,
+) -> Result<PublishSafeResponse, LpmError> {
     let payload = lpm_http::ReplayableRequestBody::from_bytes(
         serde_json::to_vec(&serde_json::json!({ "name": "@lpm.dev/owner.pkg" })).unwrap(),
     );
     let request_client = reqwest::Client::new();
-
-    let response = client
+    client
         .send_publish_safe(
             || {
                 Ok(request_client
-                    .put(&url)
+                    .put(url)
                     .timeout(std::time::Duration::from_millis(200))
                     .body(payload.body()))
             },
@@ -314,7 +318,24 @@ async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_w
             "1.0.0",
             "sha512-test",
         )
-        .await;
+        .await
+}
+
+#[tokio::test]
+async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_with_the_registry() {
+    let status = wiremock::MockServer::start().await;
+    let status_url = format!("{}/status", status.uri());
+    let registry = registry_redirecting_publishes_to(&status_url, true).await;
+    let (mut client, _tmp) = client_with_mock_server(&registry.uri());
+    // The redirect target's client is still being built when the deadline
+    // passes.
+    let held_build = hold_client_build_open(&mut client, &status_url).await;
+
+    let response = publish_with_a_200ms_deadline(
+        &client,
+        &format!("{}/api/registry/@lpm.dev/owner.pkg", registry.uri()),
+    )
+    .await;
     held_build.abort();
 
     assert!(
@@ -323,4 +344,30 @@ async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_w
         response.err()
     );
     assert!(status.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_publish_whose_deadline_runs_out_before_it_is_sent_is_neither_sent_nor_probed() {
+    let registry = wiremock::MockServer::start().await;
+    let (mut client, _tmp) = client_with_mock_server(&registry.uri());
+    let url = format!("{}/api/registry/@lpm.dev/owner.pkg", registry.uri());
+    let held_build = hold_client_build_open(&mut client, &url).await;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        publish_with_a_200ms_deadline(&client, &url),
+    )
+    .await;
+    held_build.abort();
+
+    let Err(error) =
+        outcome.expect("a publish nothing received must not wait on a reconciliation probe")
+    else {
+        panic!("a publish that was never sent fails");
+    };
+    assert!(
+        error.to_string().contains("before it was sent"),
+        "the error says nothing reached the registry: {error}"
+    );
+    assert!(registry.received_requests().await.unwrap().is_empty());
 }
