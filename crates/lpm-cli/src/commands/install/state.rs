@@ -29,7 +29,7 @@ pub(super) fn write_post_install_hash(
     }
 }
 
-fn write_post_install_hash_with_context(
+pub(super) fn write_post_install_hash_with_context(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,

@@ -91,6 +91,27 @@ pub(crate) fn is_up_to_date(
     {
         return Ok(false);
     }
+    // Replaying the lockfile needs each root to resolve to an instance the
+    // manifest still accepts; the full pipeline's own up-to-date answer
+    // checks the same before it answers.
+    let mut manifest_deps = super::manifest::manifest_install_deps(&package);
+    if super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err() {
+        return Ok(false);
+    }
+    let optional_root_names: std::collections::HashSet<String> =
+        package.optional_dependencies.keys().cloned().collect();
+    let locked_packages: Vec<&lpm_lockfile::LockedPackage> =
+        project_lockfile.lockfile.packages.iter().collect();
+    if !super::lockfile::locked_roots_satisfy_manifest(
+        &project_lockfile.lockfile,
+        &locked_packages,
+        &manifest_deps,
+        &optional_root_names,
+        project_dir,
+        false,
+    ) {
+        return Ok(false);
+    }
     let frozen = match mode.frozen_lockfile {
         super::FrozenLockfileMode::Always => true,
         super::FrozenLockfileMode::Never => false,

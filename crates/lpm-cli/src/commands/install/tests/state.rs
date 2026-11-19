@@ -391,3 +391,81 @@ async fn the_up_to_date_paths_first_request_warns_and_reads_each_origins_tls_fil
         .expect_err("contacting LPM.dev reads its cafile");
     assert!(error.to_string().contains("missing-ca.pem"), "{error}");
 }
+
+/// A project `lpm install` would leave behind with `lpm.lock` rooting `leaf`
+/// at `root_version` while `package.json` asks for `leaf@1.0.0`, and the
+/// install hash an install writes for exactly these files.
+fn installed_project_rooting_leaf_at(dir: &std::path::Path, root_version: &str) {
+    let pkg = r#"{"name":"consumer","dependencies":{"leaf":"1.0.0"}}"#;
+    std::fs::write(dir.join("package.json"), pkg).unwrap();
+    let source = "registry+https://registry.npmjs.org";
+    let instance_id =
+        lpm_common::PackageInstanceId::derive("leaf", root_version, source, "root/leaf");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(instance_id),
+        name: "leaf".to_string(),
+        version: root_version.to_string(),
+        source: Some(source.to_string()),
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        "leaf".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(instance_id),
+            package: "leaf".to_string(),
+            version: root_version.to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+    lockfile
+        .write_all(&dir.join(lpm_lockfile::LOCKFILE_NAME))
+        .unwrap();
+    std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+
+    let global = crate::commands::config::GlobalConfig::load_checked().unwrap();
+    let linker =
+        crate::linker_config::resolve_effective_linker_from_bytes(None, pkg, &global, dir).unwrap();
+    let integrity = crate::commands::config::resolve_object_integrity_policy(&global).unwrap();
+    let lock = crate::commands::install::workspace_lockfile::active_lockfile_snapshot(dir);
+    crate::commands::install::state::write_post_install_hash_with_context(
+        dir,
+        linker,
+        integrity,
+        lpm_store::SecurityAnalysisPolicy::Disabled,
+        "none",
+        None,
+        &lock,
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::update([
+        ("HOME", Some(home.path().as_os_str().to_owned())),
+        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+        ("LPM_LINKER", None),
+        (lpm_store::StoreVersion::ENV_VAR, None),
+        (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
+    ]);
+    let mode = crate::install_state::FastLaneMode {
+        json: true,
+        timing: false,
+        frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+        no_skills: true,
+    };
+
+    for (root_version, up_to_date) in [("1.0.0", true), ("2.0.0", false)] {
+        let project = tempfile::tempdir().unwrap();
+        installed_project_rooting_leaf_at(project.path(), root_version);
+        let pkg = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+
+        assert_eq!(
+            crate::commands::install::sync_noop::is_up_to_date(project.path(), &pkg, mode).unwrap(),
+            up_to_date,
+            "leaf rooted at {root_version} for a manifest asking for 1.0.0"
+        );
+    }
+}

@@ -1557,8 +1557,17 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
     let mut frozen_lockfile = None;
     let mut no_skills = false;
     let mut found_install = false;
+    // clap refuses a flag given twice, so the fast lane must not answer for it.
+    let mut seen: Vec<&str> = Vec::with_capacity(args.len());
 
     for arg in args {
+        let flag = if *arg == "-v" { "--verbose" } else { *arg };
+        if flag.starts_with('-') {
+            if seen.contains(&flag) {
+                return None;
+            }
+            seen.push(flag);
+        }
         match *arg {
             "--json" => json = true,
             "--timing" if found_install => timing = true,
@@ -1781,6 +1790,20 @@ mod tests {
             None
         );
         assert_eq!(mode(&["--frozen-lockfile", "install"]), None);
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_leaves_a_repeated_flag_to_clap() {
+        for args in [
+            &["--json", "--json", "install"][..],
+            &["-v", "--verbose", "install"][..],
+            &["install", "--timing", "--timing"][..],
+            &["install", "--frozen-lockfile", "--frozen-lockfile"][..],
+            &["install", "--no-skills", "--no-skills"][..],
+            &["install", "--no-security-summary", "--no-security-summary"][..],
+        ] {
+            assert_eq!(fast_lane_mode_from_args(args), None, "{args:?}");
+        }
     }
 
     #[test]

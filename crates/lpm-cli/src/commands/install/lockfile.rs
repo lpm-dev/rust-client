@@ -2805,6 +2805,28 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
         return false;
     }
 
+    locked_roots_satisfy_manifest(
+        lockfile,
+        packages,
+        deps,
+        optional_root_names,
+        lockfile_dir,
+        policy.emit_warnings,
+    )
+}
+
+/// Whether every dependency in `deps` resolves, through the lockfile's root
+/// records, to a locked instance its requested range and source accept, as
+/// replaying the lockfile requires. A root in `optional_root_names` may be
+/// missing.
+pub(super) fn locked_roots_satisfy_manifest(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
+    deps: &HashMap<String, String>,
+    optional_root_names: &HashSet<String>,
+    lockfile_dir: &Path,
+    emit_warnings: bool,
+) -> bool {
     for (local, requested_spec) in deps {
         let target = lockfile
             .root_aliases
@@ -2816,7 +2838,7 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
             !locked_source_identity_matches_requested_spec(package, requested_spec, lockfile_dir)
         }) && !optional_root_names.contains(local)
         {
-            if policy.emit_warnings {
+            if emit_warnings {
                 tracing::debug!(
                     "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
                 );
@@ -2824,7 +2846,6 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
             return false;
         }
     }
-
     true
 }
 
