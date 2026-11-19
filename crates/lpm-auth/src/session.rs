@@ -2621,23 +2621,27 @@ mod refresh_http_tests {
     }
 
     #[tokio::test]
-    async fn a_silent_refresh_answered_with_a_same_origin_redirect_it_cant_follow_isnt_called_cross_origin()
-     {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/cli/refresh"))
-            .respond_with(ResponseTemplate::new(300).insert_header("location", "/api/cli/refresh"))
-            .mount(&server)
-            .await;
+    async fn a_silent_refresh_answered_with_a_redirect_it_cant_follow_isnt_called_cross_origin() {
+        for (status, location) in [(300, "/api/cli/refresh"), (307, "http://[::1")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/cli/refresh"))
+                .respond_with(ResponseTemplate::new(status).insert_header("location", location))
+                .mount(&server)
+                .await;
 
-        let _isolated = isolate_test_env();
-        let mgr = manager_for(&server.uri());
+            let _isolated = isolate_test_env();
+            let mgr = manager_for(&server.uri());
 
-        let error = mgr
-            .refresh_now()
-            .await
-            .expect_err("a refresh answered with 300 fails");
-        assert!(!error.to_string().contains("another origin"), "{error}");
+            let error = mgr
+                .refresh_now()
+                .await
+                .expect_err("a refresh answered with a redirect it can't follow fails");
+            assert!(
+                !error.to_string().contains("another origin"),
+                "{status} to {location}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
