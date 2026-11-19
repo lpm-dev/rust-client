@@ -440,3 +440,156 @@ async fn stage_publish_reaches_the_npm_registry_over_its_npmrc_cafile() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+#[tokio::test]
+async fn an_npm_publish_redirect_trusts_the_npmrc_cafile_of_the_registry_it_reaches() {
+    let project = TempProject::empty(
+        r#"{"name":"@lpm.dev/testuser.tls-redirect","version":"1.0.0","main":"index.js","license":"MIT"}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    let mock = MockRegistry::start().await;
+    let ca_dirs = [project.home().join("ca-a"), project.home().join("ca-b")];
+    for dir in &ca_dirs {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    // Two registries, each signed by a CA of its own that only its own
+    // per-origin cafile trusts.
+    let publishing = TlsFront::start(&mock, &ca_dirs[0]);
+    let redirected = TlsFront::start(&mock, &ca_dirs[1]);
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "{}{}",
+            publishing.per_origin_cafile_line(),
+            redirected.per_origin_cafile_line()
+        ),
+    )
+    .unwrap();
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"tls-redirect","registry":"{}","access":"public"}}}}}}"#,
+            publishing.url
+        ),
+    );
+    Mock::given(method("GET"))
+        .and(path("/tls-redirect"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/tls-redirect"))
+        .respond_with(ResponseTemplate::new(303).insert_header(
+            "location",
+            format!("{}/-/published/tls-redirect", redirected.url),
+        ))
+        .mount(mock.server())
+        .await;
+    answer(
+        &mock,
+        "GET",
+        "/-/published/tls-redirect",
+        serde_json::json!({ "ok": true }),
+    )
+    .await;
+    let login = support::lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &publishing.url,
+            "--token",
+            "npm-token",
+        ])
+        .output()
+        .expect("store the npm registry's token");
+    assert!(login.status.success(), "{login:?}");
+
+    let output = support::lpm(&project)
+        .args(["--json", "publish", "--yes", "--npm"])
+        .output()
+        .expect("run lpm publish");
+
+    assert!(
+        output.status.success() && redirected.connections() > 0,
+        "the redirect must reach its registry over that registry's own cafile\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn an_expired_session_refreshes_over_the_registrys_npmrc_cafile() {
+    let project = TempProject::empty(r#"{"name":"registry-tls-refresh","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let front = TlsFront::start(&mock, project.home());
+    trust_only_the_front(&project, &front);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &front.url,
+            access_token: Some("expired-access-token"),
+            refresh_token: Some("tls-refresh-token"),
+            session_access_expires_at: Some("2020-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_refresh(
+        "tls-refresh-token",
+        "refreshed-access-token",
+        "rotated-refresh-token",
+        "2032-01-01T00:00:00Z",
+    )
+    .await;
+    mock.with_whoami("tls-user", "tls-user@example.com").await;
+
+    let output = run(&project, &front, &["--json", "whoami"]);
+
+    let refreshes = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("record requests")
+        .iter()
+        .filter(|request| request.url.path() == "/api/cli/refresh")
+        .count();
+    assert!(
+        output.is_ok() && refreshes == 1,
+        "the refresh must trust the registry's .npmrc cafile ({refreshes} refresh requests reached it):\n{}",
+        output.unwrap_or_else(|failure| failure)
+    );
+}
+
+#[tokio::test]
+async fn commands_that_send_nothing_ignore_a_broken_npmrc_tls_setting() {
+    let project = TempProject::empty(
+        r#"{"name":"@lpm.dev/testuser.tls-check","version":"1.0.0","main":"index.js","license":"MIT"}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("lpm.json", r#"{"publish":{"npm":{"name":"tls-check"}}}"#);
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "cafile={}\n",
+            project.home().join("missing-ca.pem").display()
+        ),
+    )
+    .unwrap();
+
+    let failures: Vec<String> = [
+        &["publish", "--check", "--npm"][..],
+        &["--json", "logout", "--revoke"][..],
+    ]
+    .into_iter()
+    .filter_map(|args| {
+        let output = support::lpm(&project).args(args).output().expect("run lpm");
+        (!output.status.success()).then(|| {
+            format!(
+                "lpm {args:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        })
+    })
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

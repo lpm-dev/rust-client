@@ -457,6 +457,17 @@ impl HttpClients {
     }
 }
 
+impl lpm_auth::RefreshClientSource for HttpClients {
+    fn refresh_client_builder<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<reqwest::ClientBuilder, LpmError>> + Send + 'a>,
+    > {
+        Box::pin(self.tls_client_builder_for(url))
+    }
+}
+
 fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
     match pool {
         ClientPool::General => cached.client.clone(),

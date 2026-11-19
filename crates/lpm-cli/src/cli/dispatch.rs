@@ -1434,16 +1434,23 @@ async fn async_main(cli: Cli) -> Result<()> {
                 project_relative_path(&invocation_dir, &cwd, &path)
             });
 
-            let client = commands::registry_reads::registry_client_for_directory(
-                &client,
-                &cwd,
-                commands::registry_reads::RegistryReads::NONE,
-                cli.json,
-            )?;
+            // `--check` validates locally and sends nothing.
+            let configured_client;
+            let client = if check {
+                &client
+            } else {
+                configured_client = commands::registry_reads::registry_client_for_directory(
+                    &client,
+                    &cwd,
+                    commands::registry_reads::RegistryReads::NONE,
+                    cli.json,
+                )?;
+                &configured_client
+            };
             // OIDC auto-exchange happens inside publish::run after package.json
             // is parsed — the origin requires `package` for `scope=publish`.
             commands::publish::run(
-                &client,
+                client,
                 &cwd,
                 dry_run,
                 check,
@@ -1732,15 +1739,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                 .registry
                 .as_deref()
                 .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-            let revoke_client;
-            let client = if revoke {
-                revoke_client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
-                &revoke_client
-            } else {
-                &client
-            };
             commands::logout::run(
-                client,
+                &client,
                 &session,
                 registry,
                 revoke,

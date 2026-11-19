@@ -777,6 +777,13 @@ impl RegistryClient {
         self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;
         self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
+        // A silent refresh goes to the same registry and needs the same
+        // trust and client certificate as the requests it refreshes for.
+        if let Some(session) = &self.session {
+            session.use_refresh_client_source(
+                Arc::clone(&self.http) as Arc<dyn lpm_auth::RefreshClientSource>
+            );
+        }
         Ok(self)
     }
 

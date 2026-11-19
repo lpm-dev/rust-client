@@ -779,24 +779,32 @@ pub(crate) async fn publish_to_npm_with_clients(
     .await
 }
 
+type NpmClientBuild =
+    Box<dyn Fn(reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError> + Send + Sync>;
+
 /// HTTP clients for npm-compatible registries, one per origin, each built
 /// on first use with that registry's `.npmrc` TLS settings, so a release
 /// reuses connections across its packages without one registry's
-/// certificate authority deciding another's trust.
+/// certificate authority deciding another's trust. As the client provider
+/// for redirects, it gives each hop the client for the hop's own origin, so
+/// a redirect never carries one registry's client certificate to another.
 pub(crate) struct NpmRegistryClients {
     tls: lpm_registry::RegistryClient,
-    build: fn(reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError>,
+    build: NpmClientBuild,
     clients: tokio::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
 }
 
 impl NpmRegistryClients {
     pub(crate) fn new(
         tls: &lpm_registry::RegistryClient,
-        build: fn(reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError>,
+        build: impl Fn(reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             tls: tls.clone_with_config(),
-            build,
+            build: Box::new(build),
             clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -827,6 +835,17 @@ impl NpmRegistryClients {
         let client = (self.build)(self.tls.tls_client_builder_for(registry_url).await?)?;
         clients.insert(origin, client.clone());
         Ok(client)
+    }
+}
+
+impl lpm_http::ReplayableHttpClientProvider for NpmRegistryClients {
+    type Error = LpmError;
+
+    fn client_for_url(
+        &self,
+        url: &reqwest::Url,
+    ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
+        self.for_registry(url.as_str())
     }
 }
 
@@ -931,13 +950,17 @@ async fn publish_to_npm_impl(
     let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    let client = &match clients {
-        NpmPublishClientSource::Shared(shared) => shared.for_registry(registry_url).await?,
-        NpmPublishClientSource::Build(tls) => build_npm_publish_request_client(
-            tls.tls_client_builder_for(registry_url).await?,
-            timeout,
-        )?,
+    let owned_clients;
+    let hop_clients = match clients {
+        NpmPublishClientSource::Shared(shared) => shared,
+        NpmPublishClientSource::Build(tls) => {
+            owned_clients = NpmRegistryClients::new(tls, move |builder| {
+                build_npm_publish_request_client(builder, timeout)
+            });
+            &owned_clients
+        }
     };
+    let client = &hop_clients.for_registry(registry_url).await?;
 
     let encoded_name = urlencoding::encode(npm_name);
     let registry_url = registry_url.trim_end_matches('/');
@@ -958,7 +981,7 @@ async fn publish_to_npm_impl(
         req = req.header("npm-otp", code);
     }
 
-    let response = execute_npm_publish_request(client, req, &payload)
+    let response = execute_npm_publish_request(hop_clients, req, &payload)
         .await
         .map_err(|e| LpmError::Registry(format!("npm publish request failed: {e}")))?;
 
@@ -989,7 +1012,7 @@ async fn publish_to_npm_impl(
             let retry_req =
                 npm_publish_request(client, &url, &payload, token, timeout).header("npm-otp", &otp);
 
-            let retry_response = execute_npm_publish_request(client, retry_req, &payload)
+            let retry_response = execute_npm_publish_request(hop_clients, retry_req, &payload)
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
@@ -1015,7 +1038,7 @@ async fn publish_to_npm_impl(
             let retry_req =
                 npm_publish_request(client, &url, &payload, token, timeout).header("npm-otp", &otp);
 
-            let retry_response = execute_npm_publish_request(client, retry_req, &payload)
+            let retry_response = execute_npm_publish_request(hop_clients, retry_req, &payload)
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
@@ -1068,10 +1091,10 @@ fn npm_publish_request(
 }
 
 async fn execute_npm_publish_request(
-    client: &reqwest::Client,
+    hop_clients: &NpmRegistryClients,
     request: reqwest::RequestBuilder,
     payload: &crate::commands::publish_common::PreparedPublishBody,
-) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<std::convert::Infallible>> {
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
     let request = request
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
@@ -1088,7 +1111,7 @@ async fn execute_npm_publish_request(
                 .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
     };
     lpm_http::send_with_replayable_redirects_and_authorization_scope(
-        client,
+        hop_clients,
         request,
         Some(payload.replayable()),
         Some(&authorization_allowed),

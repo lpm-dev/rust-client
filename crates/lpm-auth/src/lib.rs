@@ -48,8 +48,8 @@ mod keychain_migration;
 mod legacy_key;
 mod session;
 pub use session::{
-    AuthRequirement, AuthStorageAccessKind, RefreshPolicy, SessionManager, TokenSource,
-    compute_device_fingerprint,
+    AuthRequirement, AuthStorageAccessKind, RefreshClientSource, RefreshPolicy, SessionManager,
+    TokenSource, compute_device_fingerprint,
 };
 
 /// Keychain service name (matches JS CLI).

@@ -327,10 +327,10 @@ async fn stage_publish_impl(
     )?;
     let tarball_mb = tarball_data.len() as u64 / (1024 * 1024);
     let timeout = Duration::from_secs(std::cmp::min(60 + tarball_mb * 2, 600));
-    let client = stage_manual_redirect_http_client(
-        tls.tls_client_builder_for(registry_url).await?,
-        timeout,
-    )?;
+    let hop_clients = crate::commands::publish_npm::NpmRegistryClients::new(tls, move |builder| {
+        stage_manual_redirect_http_client(builder, timeout)
+    });
+    let client = hop_clients.for_registry(registry_url).await?;
     let url = endpoint_url(
         registry_url,
         &format!("-/stage/package/{}", urlencoding::encode(npm_name)),
@@ -345,7 +345,7 @@ async fn stage_publish_impl(
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to build npm stage request: {e}")))?;
     let response =
-        lpm_http::send_with_replayable_redirects(&client, request, Some(payload.replayable()))
+        lpm_http::send_with_replayable_redirects(&hop_clients, request, Some(payload.replayable()))
             .await
             .map_err(|e| LpmError::Registry(format!("npm stage publish request failed: {e}")))?;
 
@@ -705,12 +705,12 @@ async fn stage_otp_mutation(
 ) -> Result<serde_json::Value, LpmError> {
     validate_npm_stage_registry(registry_url)?;
     let timeout = Duration::from_secs(60);
-    let mutation_client = stage_manual_redirect_http_client(
-        tls.tls_client_builder_for(registry_url).await?,
-        timeout,
-    )?;
+    let mutation_clients =
+        crate::commands::publish_npm::NpmRegistryClients::new(tls, move |builder| {
+            stage_manual_redirect_http_client(builder, timeout)
+        });
     let response = send_stage_mutation(
-        &mutation_client,
+        &mutation_clients,
         token,
         registry_url,
         route,
@@ -747,7 +747,7 @@ async fn stage_otp_mutation(
             )
             .await?;
             let retry = send_stage_mutation(
-                &mutation_client,
+                &mutation_clients,
                 token,
                 registry_url,
                 route,
@@ -773,7 +773,7 @@ async fn stage_otp_mutation(
 
             let otp = prompt_npm_otp()?;
             let retry = send_stage_mutation(
-                &mutation_client,
+                &mutation_clients,
                 token,
                 registry_url,
                 route,
@@ -795,14 +795,18 @@ async fn stage_otp_mutation(
 }
 
 async fn send_stage_mutation(
-    client: &reqwest::Client,
+    clients: &crate::commands::publish_npm::NpmRegistryClients,
     token: &str,
     registry_url: &str,
     route: &str,
     method: Method,
     otp: Option<&str>,
     timeout: Duration,
-) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<std::convert::Infallible>> {
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
+    let client = clients
+        .for_registry(registry_url)
+        .await
+        .map_err(lpm_http::ReplayableRequestError::Client)?;
     let mut request = web_auth::add_npm_web_auth_headers(
         client.request(method, endpoint_url(registry_url, route)),
         NPM_COMMAND_STAGE,
@@ -815,7 +819,7 @@ async fn send_stage_mutation(
         .timeout(timeout)
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
-    lpm_http::send_with_replayable_redirects(client, request, None).await
+    lpm_http::send_with_replayable_redirects(clients, request, None).await
 }
 
 async fn stage_mutation_response(

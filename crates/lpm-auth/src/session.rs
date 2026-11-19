@@ -162,6 +162,9 @@ pub struct SessionManager {
     /// first refresh attempt (no startup cost when refresh never
     /// happens).
     http: tokio::sync::OnceCell<reqwest::Client>,
+    /// Where the refresh client comes from when the registry needs TLS
+    /// settings of its own, such as `.npmrc`'s.
+    refresh_client_source: std::sync::Mutex<Option<Arc<dyn RefreshClientSource>>>,
     auth_storage_notice: Option<Arc<dyn Fn(AuthStorageAccessKind) + Send + Sync + 'static>>,
     auth_storage_notice_bits: AtomicU8,
     /// Whether a refresh saves the rotated pair, or keeps it in memory for a
@@ -170,6 +173,18 @@ pub struct SessionManager {
     /// The pair a refresh rotated to while `persists_refreshed_session` is
     /// off: the stored refresh token is spent once the Registry rotates it.
     unsaved_rotation: std::sync::Mutex<Option<UnsavedRotation>>,
+}
+
+/// Builds the HTTP client a silent refresh sends with, for a registry whose
+/// TLS settings, such as `.npmrc`'s `cafile=` or client certificate, the
+/// bundled trust store doesn't cover.
+pub trait RefreshClientSource: Send + Sync {
+    fn refresh_client_builder<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<reqwest::ClientBuilder, LpmError>> + Send + 'a>,
+    >;
 }
 
 /// A rotated session a revocation keeps in memory instead of saving.
@@ -281,6 +296,7 @@ impl SessionManager {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            refresh_client_source: std::sync::Mutex::new(None),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -547,6 +563,7 @@ impl SessionManager {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            refresh_client_source: std::sync::Mutex::new(self.refresh_client_source()),
             auth_storage_notice: self.auth_storage_notice.clone(),
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -563,6 +580,24 @@ impl SessionManager {
             persists_refreshed_session: false,
             ..self.stored_session_only()
         }
+    }
+
+    /// Build silent refreshes from `source`'s client builder, such as one
+    /// with the registry's `.npmrc` TLS settings. A session derived from
+    /// this one keeps the source; a refresh that already built its client
+    /// keeps that client.
+    pub fn use_refresh_client_source(&self, source: Arc<dyn RefreshClientSource>) {
+        *self
+            .refresh_client_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    fn refresh_client_source(&self) -> Option<Arc<dyn RefreshClientSource>> {
+        self.refresh_client_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// **Step-3 transition bridge — do not introduce new callers.**
@@ -898,7 +933,11 @@ impl SessionManager {
         let http = self
             .http
             .get_or_try_init(|| async {
-                lpm_http::client_builder()
+                let builder = match self.refresh_client_source() {
+                    Some(source) => source.refresh_client_builder(&refresh_url).await?,
+                    None => lpm_http::client_builder(),
+                };
+                builder
                     .timeout(std::time::Duration::from_secs(10))
                     .build()
                     .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))
@@ -1491,6 +1530,7 @@ mod tests {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            refresh_client_source: std::sync::Mutex::new(None),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -1507,6 +1547,7 @@ mod tests {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            refresh_client_source: std::sync::Mutex::new(None),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,
@@ -2389,6 +2430,7 @@ mod refresh_http_tests {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            refresh_client_source: std::sync::Mutex::new(None),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
             persists_refreshed_session: true,

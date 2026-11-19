@@ -62,42 +62,54 @@ pub async fn run(
     let mut server_revoked = false;
 
     if targets.clear_lpm && revoke && had_lpm_session && lpm_session_presence_known {
-        let stored_session = Arc::new(session.stored_session_for_revocation());
-        match stored_session
-            .bearer_string_for(AuthRequirement::SessionRequired)
-            .await
-        {
-            Ok(_) => {
-                let revocation_client = client.clone_with_session_only(stored_session);
-                match revoke_pairings(&revocation_client).await {
-                    Ok(()) => {
-                        pairings_revoked = true;
-                        if !json_output {
-                            install_ui::done("Revoked browser pairings");
+        // Only revoking sends a request, so only revoking reads the
+        // `.npmrc` TLS settings; a broken one can't stop the local clear.
+        // Configuring the client also gives the session's silent refresh
+        // those settings, which the revocation session derived below keeps.
+        match crate::commands::registry_reads::registry_client_for_current_directory(
+            client,
+            json_output,
+        ) {
+            Err(error) => errors.push(bounded_error("session revocation", &error.to_string())),
+            Ok(tls_client) => {
+                let stored_session = Arc::new(session.stored_session_for_revocation());
+                match stored_session
+                    .bearer_string_for(AuthRequirement::SessionRequired)
+                    .await
+                {
+                    Ok(_) => {
+                        let revocation_client = tls_client.clone_with_session_only(stored_session);
+                        match revoke_pairings(&revocation_client).await {
+                            Ok(()) => {
+                                pairings_revoked = true;
+                                if !json_output {
+                                    install_ui::done("Revoked browser pairings");
+                                }
+                            }
+                            Err(error) => {
+                                errors.push(bounded_error("pairing revocation", &error.to_string()));
+                            }
                         }
-                    }
-                    Err(error) => {
-                        errors.push(bounded_error("pairing revocation", &error.to_string()));
-                    }
-                }
 
-                match revocation_client.revoke_session().await {
-                    Ok(()) => {
-                        server_revoked = true;
-                        if !json_output {
-                            install_ui::done("Revoked server-side CLI session");
+                        match revocation_client.revoke_session().await {
+                            Ok(()) => {
+                                server_revoked = true;
+                                if !json_output {
+                                    install_ui::done("Revoked server-side CLI session");
+                                }
+                            }
+                            Err(error) => {
+                                errors.push(bounded_error("session revocation", &error.to_string()));
+                            }
                         }
                     }
-                    Err(error) => {
-                        errors.push(bounded_error("session revocation", &error.to_string()));
-                    }
+                    Err(LpmError::AuthRequired | LpmError::SessionExpired) => errors.push(
+                        "session revocation: the stored credential is not a refresh-backed CLI session"
+                            .to_string(),
+                    ),
+                    Err(error) => errors.push(bounded_error("session revocation", &error.to_string())),
                 }
             }
-            Err(LpmError::AuthRequired | LpmError::SessionExpired) => errors.push(
-                "session revocation: the stored credential is not a refresh-backed CLI session"
-                    .to_string(),
-            ),
-            Err(error) => errors.push(bounded_error("session revocation", &error.to_string())),
         }
     }
 
