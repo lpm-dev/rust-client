@@ -103,6 +103,7 @@ fn osv_skips_lpm_packages() {
             scan_mode: ScanMode::RegistryAndStore,
             is_dev: false,
             is_optional: false,
+            platform_skipped: false,
             dependencies: Vec::new(),
         },
         DiscoveredPackage {
@@ -117,6 +118,7 @@ fn osv_skips_lpm_packages() {
             scan_mode: ScanMode::FullLocal,
             is_dev: false,
             is_optional: false,
+            platform_skipped: false,
             dependencies: Vec::new(),
         },
     ];

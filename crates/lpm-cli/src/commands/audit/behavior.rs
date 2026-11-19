@@ -20,6 +20,8 @@ pub(super) struct BehavioralCoverage {
     scanned_packages: usize,
     partial_packages: usize,
     unavailable_packages: usize,
+    /// Packages the install left out, which have no source to scan.
+    pub(super) not_installed_packages: usize,
     packages: Vec<PackageCoverageGap>,
 }
 
@@ -42,6 +44,7 @@ impl BehavioralCoverage {
             scanned_packages: 0,
             partial_packages: 0,
             unavailable_packages: 0,
+            not_installed_packages: 0,
             packages: Vec::new(),
         }
     }
@@ -94,14 +97,27 @@ pub(super) fn run_behavioral_analysis(
         })
         .collect();
 
-    let (analyses, source_paths) = inventory::load_behavioral_analyses(discovery, store_version);
+    let inventory::BehavioralAnalyses {
+        analyses,
+        source_paths,
+        not_installed,
+    } = inventory::load_behavioral_analyses(discovery, store_version);
 
     let mut scanned = 0usize;
     let mut with_actionable_findings = 0usize;
     let mut coverage = BehavioralCoverage::new();
 
-    for ((pkg, analysis), source_path) in discovery.packages.iter().zip(analyses).zip(source_paths)
+    for (((pkg, analysis), source_path), not_installed) in discovery
+        .packages
+        .iter()
+        .zip(analyses)
+        .zip(source_paths)
+        .zip(not_installed)
     {
+        if not_installed {
+            coverage.not_installed_packages += 1;
+            continue;
+        }
         let resolved_path = source_path.map_or_else(
             || pkg.path.clone(),
             |path| path.to_string_lossy().into_owned(),
@@ -331,6 +347,7 @@ mod tests {
                 scan_mode: ScanMode::FullLocal,
                 is_dev: false,
                 is_optional: false,
+                platform_skipped: false,
                 dependencies: Vec::new(),
             }],
             lpm_lockfile: None,
@@ -395,6 +412,7 @@ mod tests {
                 scan_mode: ScanMode::FullLocal,
                 is_dev: false,
                 is_optional: false,
+                platform_skipped: false,
                 dependencies: Vec::new(),
             }],
             lpm_lockfile: None,

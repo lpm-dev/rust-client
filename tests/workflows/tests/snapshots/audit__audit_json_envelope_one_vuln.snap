@@ -10,6 +10,7 @@ expression: envelope
     "scanned_packages": 1,
     "partial_packages": 0,
     "unavailable_packages": 0,
+    "not_installed_packages": 0,
     "packages": []
   },
   "manager": "lpm",

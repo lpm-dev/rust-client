@@ -10,6 +10,7 @@ expression: json
     "scanned_packages": 0,
     "partial_packages": 0,
     "unavailable_packages": 1,
+    "not_installed_packages": 0,
     "packages": [
       {
         "name": "missing",

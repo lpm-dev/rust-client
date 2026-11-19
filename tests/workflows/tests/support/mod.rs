@@ -44,6 +44,7 @@ pub mod build_state;
 pub mod fault_registry;
 pub mod lpm_dependency_advisory;
 pub mod mock_registry;
+pub mod platform_skipped_optional;
 pub mod source_recovery;
 pub mod terminal;
 pub mod verdaccio;
