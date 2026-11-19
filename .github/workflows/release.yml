@@ -3141,3 +3141,41 @@ jobs:
           done
           echo "::error::Timed out waiting for correlated Homebrew workflow ${run_id}."
           exit 1
+
+  # Checking the repository setting itself needs administration access, which
+  # no workflow token has, so the release confirms it after publication: a
+  # release published without immutability keeps assets and a tag that can
+  # still be changed, and this run turns red to say so.
+  require-immutable-release:
+    name: Require an immutable published release
+    needs:
+      - finalize-promotion-release
+      - publish-release
+      - release-metadata
+      - update-homebrew
+    if: >-
+      always() &&
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.finalize-promotion-release.result == 'success' ||
+      needs.publish-release.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the published release to be immutable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" |
+              jq -e '.draft == false and .immutable == true' >/dev/null; then
+              echo "$RELEASE_TAG is published as an immutable release."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::$RELEASE_TAG was published without immutability, so its assets and tag can still be changed. Turn on immutable releases in the repository settings."
+          exit 1

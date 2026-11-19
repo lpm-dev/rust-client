@@ -6,12 +6,16 @@
 #   - fail-closed when SHA tools missing (no LPM_INSTALL_INSECURE)
 #   - LPM_INSTALL_INSECURE=1 opt-out succeeds without integrity gate
 #   - LPM_INSTALL_TEST_API_URL / _DOWNLOAD_BASE loopback enforcement
-#   - happy path (manifest + binary match, no cosign on PATH)
+#   - happy path (manifest + binary match, no cosign on PATH), with a
+#     notice on Linux that the publisher wasn't verified
+#   - security floor refuses older releases before any download
+#   - LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses installs cosign can't verify
+#   - a binary that reports another version is refused before install
 #   - nightly channel lookup and strict stable/nightly separation
 #   - explicit LPM_INSTALL_VERSION path (no latest-release API fetch)
 #   - explicit installation of a signed pre-icon macOS bundle
 #   - manifest 404 (release predates signed-install gate)
-#   - bundle 404 (manifest present, bundle missing → fail-closed)
+#   - bundle 404 (manifest present, bundle missing → SHA gate only)
 #   - SHA mismatch (manifest declares one SHA, binary has another)
 #   - missing platform entry in manifest
 #   - insecure opt-out bypasses missing-manifest gate
@@ -33,9 +37,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 SERVE_PY="$SCRIPT_DIR/serve.py"
-FIXTURE_VERSION="v0.43.1"
-NIGHTLY_VERSION="v0.71.0-nightly.20260728.42.d82ceea"
-LEADING_ZERO_NIGHTLY_VERSION="v0.71.0-nightly.20260728.43.g0123456"
+FIXTURE_VERSION="v0.87.0"
+NIGHTLY_VERSION="v0.88.0-nightly.20261118.42.d82ceea"
+LEADING_ZERO_NIGHTLY_VERSION="v0.88.0-nightly.20261118.43.g0123456"
 
 if [ ! -f "$INSTALL_SH" ]; then
   echo "FAIL: install.sh not found at $INSTALL_SH" >&2
@@ -139,12 +143,19 @@ make_happy_fixture() {
   printf 'dummy-sigstore-bundle' > "$FIXTURE_DIR/SHA256SUMS.txt.sigstore"
 }
 
+# A release executable is a script that reports `lpm <version>` the way
+# the real binary does. The marker line keeps each fixture's bytes distinct.
+fixture_executable() {
+  printf '#!/bin/sh\n# %s\necho '"'"'lpm %s'"'"'\n' "$1" "${2#v}"
+}
+
 write_release_asset() {
   destination_dir="$1"
   executable_bytes="$2"
   include_macos_icon="${3:-1}"
+  reported_version="${4:-$FIXTURE_VERSION}"
   if [ "$HOST_OS" != "Darwin" ]; then
-    printf '%s' "$executable_bytes" > "$destination_dir/$RELEASE_ASSET"
+    fixture_executable "$executable_bytes" "$reported_version" > "$destination_dir/$RELEASE_ASSET"
     LAST_FIXTURE_EXECUTABLE="$destination_dir/$RELEASE_ASSET"
     return
   fi
@@ -152,7 +163,7 @@ write_release_asset() {
   fixture_bundle_root="$destination_dir/.bundle-fixture"
   fixture_app="$fixture_bundle_root/LPM CLI.app"
   mkdir -p "$fixture_app/Contents/MacOS" "$fixture_app/Contents/Resources" "$fixture_app/Contents/_CodeSignature"
-  printf '%s' "$executable_bytes" > "$fixture_app/Contents/MacOS/lpm-rs"
+  fixture_executable "$executable_bytes" "$reported_version" > "$fixture_app/Contents/MacOS/lpm-rs"
   chmod 755 "$fixture_app/Contents/MacOS/lpm-rs"
   if [ "$include_macos_icon" = "1" ]; then
     printf '<plist><dict><key>CFBundleIdentifier</key><string>dev.lpm.cli</string><key>CFBundleIconFile</key><string>LPMCLI.icns</string></dict></plist>\n' \
@@ -169,6 +180,15 @@ write_release_asset() {
   printf 'fixture-signature' > "$fixture_app/Contents/_CodeSignature/CodeResources"
   ditto -c -k --keepParent "$fixture_app" "$destination_dir/$RELEASE_ASSET"
   LAST_FIXTURE_EXECUTABLE="$fixture_app/Contents/MacOS/lpm-rs"
+}
+
+# Write a release asset that reports `version`, its manifest entry, and a
+# placeholder Sigstore bundle.
+write_signed_release() {
+  write_release_asset "$1" "$2" "${4:-1}" "$3"
+  signed_release_sha="$($SHA_TOOL "$1/$RELEASE_ASSET" | awk '{print $1}')"
+  printf '%s  %s\n' "$signed_release_sha" "$RELEASE_ASSET" > "$1/SHA256SUMS.txt"
+  printf 'dummy-sigstore-bundle' > "$1/SHA256SUMS.txt.sigstore"
 }
 
 # Build a controlled PATH that has the essentials install.sh needs
@@ -270,6 +290,8 @@ run_install_sh() {
     LPM_TEST_TOOL_STATE="${LPM_TEST_TOOL_STATE:-}" \
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
+    LPM_INSTALL_MIN_VERSION_OVERRIDE="${LPM_INSTALL_MIN_VERSION_OVERRIDE:-}" \
+    LPM_INSTALL_REQUIRE_SIGSTORE="${LPM_INSTALL_REQUIRE_SIGSTORE:-}" \
     LPM_INSTALL_VERSION="${LPM_INSTALL_VERSION:-}" \
     LPM_INSTALL_CHANNEL="${LPM_INSTALL_CHANNEL:-}" \
     sh "$INSTALL_SH" 2>&1
@@ -390,7 +412,7 @@ printf '#!/bin/sh\necho "musl libc (x86_64)" >&2\nexit 1\n' > "$CLEAN_PATH_DIR/l
 chmod +x "$CLEAN_PATH_DIR/ldd"
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-printf 'musl-binary-bytes' > "$fdir/lpm-linux-x64-musl"
+fixture_executable 'musl-binary-bytes' "$FIXTURE_VERSION" > "$fdir/lpm-linux-x64-musl"
 sha="$($SHA_TOOL "$fdir/lpm-linux-x64-musl" | awk '{print $1}')"
 printf '%s  %s\n' "$sha" "lpm-linux-x64-musl" > "$fdir/SHA256SUMS.txt"
 printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
@@ -608,7 +630,7 @@ pass "happy path installs the verified binary"
 # ── Case 6: nightly channel installs the verified nightly ──────
 fdir="$(mktemp -d)"
 printf '{"version": "%s"}\n' "${NIGHTLY_VERSION#v}" > "$fdir/api.json"
-write_release_asset "$fdir" 'nightly-binary-bytes'
+write_release_asset "$fdir" 'nightly-binary-bytes' 1 "$NIGHTLY_VERSION"
 sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
 printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
 printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
@@ -663,10 +685,7 @@ pass "invalid install channel fails closed"
 
 # ── Case 9: explicit version skips the latest-release API ──────
 fdir="$(mktemp -d)"
-write_release_asset "$fdir" 'explicit-version-binary-bytes'
-sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
-printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
-printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+write_signed_release "$fdir" 'explicit-version-binary-bytes' "$FIXTURE_VERSION"
 # Deliberately omit api.json. If install.sh still fetches the latest
 # release API while LPM_INSTALL_VERSION is set, this case fails closed.
 trap 'stop_server' EXIT
@@ -681,6 +700,7 @@ echo "$RUN_OUT" | grep -q "Using requested version $FIXTURE_VERSION" \
 [ -x "$RUN_INSTALL_DIR/lpm" ] \
   || fail "explicit-version path did not produce executable at $RUN_INSTALL_DIR/lpm"
 
+write_signed_release "$fdir" 'explicit-nightly-binary-bytes' "$NIGHTLY_VERSION"
 trap 'stop_server' EXIT
 start_server "$fdir"
 LPM_INSTALL_VERSION="$NIGHTLY_VERSION" run_install_sh
@@ -691,6 +711,7 @@ trap - EXIT
 echo "$RUN_OUT" | grep -q "Installing LPM CLI $NIGHTLY_VERSION (nightly channel)" \
   || fail "explicit nightly version did not infer the nightly channel: $RUN_OUT"
 
+write_signed_release "$fdir" 'leading-zero-nightly-binary-bytes' "$LEADING_ZERO_NIGHTLY_VERSION"
 trap 'stop_server' EXIT
 start_server "$fdir"
 LPM_INSTALL_VERSION="$LEADING_ZERO_NIGHTLY_VERSION" run_install_sh
@@ -706,14 +727,11 @@ pass "explicit stable and nightly versions install without latest-release API"
 
 if [ "$HOST_OS" = "Darwin" ]; then
   fdir="$(mktemp -d)"
-  write_release_asset "$fdir" 'pre-icon-bundle-binary-bytes' 0
-  sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
-  printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
-  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  write_signed_release "$fdir" 'pre-icon-bundle-binary-bytes' v0.76.5 0
   trap 'stop_server' EXIT
   start_server "$fdir"
-  LPM_INSTALL_VERSION="v0.76.5" run_install_sh
-  unset LPM_INSTALL_VERSION
+  LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION="v0.76.5" run_install_sh
+  unset LPM_INSTALL_VERSION LPM_INSTALL_MIN_VERSION_OVERRIDE
   stop_server
   trap - EXIT
   [ "$RUN_RC" -eq 0 ] \
@@ -724,14 +742,11 @@ if [ "$HOST_OS" = "Darwin" ]; then
   pass "signed pre-icon macOS bundle remains installable"
 
   fdir="$(mktemp -d)"
-  write_release_asset "$fdir" 'missing-icon-bundle-binary-bytes' 0
-  sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
-  printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
-  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  write_signed_release "$fdir" 'missing-icon-bundle-binary-bytes' v0.76.6 0
   trap 'stop_server' EXIT
   start_server "$fdir"
-  LPM_INSTALL_VERSION="v0.76.6" run_install_sh
-  unset LPM_INSTALL_VERSION
+  LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION="v0.76.6" run_install_sh
+  unset LPM_INSTALL_VERSION LPM_INSTALL_MIN_VERSION_OVERRIDE
   stop_server
   trap - EXIT
   [ "$RUN_RC" -ne 0 ] || fail "icon-bearing macOS release installed without its icon"
@@ -868,7 +883,7 @@ echo "$RUN_OUT" | grep -q "does not ship a signed checksums manifest" \
 rm -rf "$fdir"
 pass "manifest 404 fails closed"
 
-# ── Case 8: bundle 404 fails closed ───────────────────────────
+# ── Case 8: bundle 404 installs through the SHA gate only ─────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 write_release_asset "$fdir" 'placeholder'
@@ -889,6 +904,13 @@ echo "$RUN_OUT" | grep -q "Verified SHA-256:" \
 echo "$RUN_OUT" | grep -q "Verified Sigstore" \
   && fail "bundle-404 should NOT claim Sigstore verification: $RUN_OUT"
 [ -x "$RUN_INSTALL_DIR/lpm" ] || fail "bundle-404 SHA path did not install"
+if [ "$HOST_OS" = "Darwin" ]; then
+  echo "$RUN_OUT" | grep -q "publisher of this release wasn't verified" \
+    && fail "macOS checks the publisher through Developer ID; no notice expected: $RUN_OUT"
+else
+  echo "$RUN_OUT" | grep -q "publisher of this release wasn't verified, because cosign isn't installed" \
+    || fail "a Linux install without cosign must say the publisher wasn't verified: $RUN_OUT"
+fi
 rm -rf "$fdir"
 pass "bundle 404 falls back to SHA-only floor"
 
@@ -949,6 +971,261 @@ echo "$RUN_OUT" | grep -q "LPM_INSTALL_INSECURE=1" \
 [ -x "$RUN_INSTALL_DIR/lpm" ] || fail "insecure opt-out should install"
 rm -rf "$fdir"
 pass "LPM_INSTALL_INSECURE=1 bypasses missing-manifest gate"
+
+# ── Case 12: the security floor refuses older releases ───────
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "v0.86.0" > "$fdir/api.json"
+write_signed_release "$fdir" 'below-floor-binary-bytes' v0.86.0
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -ne 0 ] || fail "a release below the floor must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "detected version v0.86.0 is below the minimum supported v0.87.0" \
+  || fail "floor refusal did not name both versions: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Fetching signed checksums manifest" \
+  && fail "floor refusal must come before any release download: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "floor refusal must not install anything"
+rm -rf "$fdir"
+pass "security floor refuses releases older than v0.87.0 before downloading"
+
+# ── Case 13: LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses unverifiable installs
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'require-sigstore-binary-bytes' "$FIXTURE_VERSION"
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_REQUIRE_SIGSTORE=1 run_install_sh
+unset LPM_INSTALL_REQUIRE_SIGSTORE
+[ "$RUN_RC" -ne 0 ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 without cosign must fail: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "LPM_INSTALL_REQUIRE_SIGSTORE=1 needs cosign on PATH" \
+  || fail "missing-cosign refusal was unclear: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Fetching signed checksums manifest" \
+  && fail "missing-cosign refusal must come before any download: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-cosign refusal must not install anything"
+
+LPM_INSTALL_REQUIRE_SIGSTORE=1 LPM_INSTALL_INSECURE=1 run_install_sh
+unset LPM_INSTALL_REQUIRE_SIGSTORE LPM_INSTALL_INSECURE
+[ "$RUN_RC" -ne 0 ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 with LPM_INSTALL_INSECURE=1 must fail: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "asks for the signature check that LPM_INSTALL_INSECURE=1 skips" \
+  || fail "contradictory settings refusal was unclear: $RUN_OUT"
+
+LPM_INSTALL_REQUIRE_SIGSTORE=yes run_install_sh
+unset LPM_INSTALL_REQUIRE_SIGSTORE
+[ "$RUN_RC" -ne 0 ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE accepts only 0 or 1: $RUN_OUT"
+
+cosign_state="$(mktemp -d)"
+cat > "$CLEAN_PATH_DIR/cosign" <<'COSIGN'
+#!/bin/sh
+printf '%s\n' "$@" > "$LPM_TEST_TOOL_STATE/cosign-args"
+exit 0
+COSIGN
+chmod +x "$CLEAN_PATH_DIR/cosign"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_REQUIRE_SIGSTORE=1 run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_INSTALL_REQUIRE_SIGSTORE
+[ "$RUN_RC" -eq 0 ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 with a verified bundle must install: $RUN_OUT"
+[ -s "$cosign_state/cosign-args" ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 did not run cosign"
+echo "$RUN_OUT" | grep -q "Verified Sigstore signature on manifest" \
+  || fail "strict install did not report the Sigstore verification: $RUN_OUT"
+
+rm -f "$fdir/SHA256SUMS.txt.sigstore" "$cosign_state/cosign-args"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_REQUIRE_SIGSTORE=1 run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_INSTALL_REQUIRE_SIGSTORE
+[ "$RUN_RC" -ne 0 ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 must refuse a release without a bundle: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "has no Sigstore bundle" \
+  || fail "missing-bundle refusal was unclear: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-bundle refusal must not install anything"
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+rm -rf "$fdir" "$cosign_state"
+pass "LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses installs cosign can't verify"
+
+# ── Case 14: a binary that reports another version is refused ──
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'current-binary-bytes' "$FIXTURE_VERSION"
+existing_home="$(mktemp -d)"
+trap 'stop_server' EXIT
+start_server "$fdir"
+RUN_INSTALL_ROOT_OVERRIDE="$existing_home" run_install_sh
+[ "$RUN_RC" -eq 0 ] || fail "baseline install for the version check failed: $RUN_OUT"
+existing_sha="$($SHA_TOOL "$RUN_INSTALL_DIR/lpm" | awk '{print $1}')"
+# An authentic manifest and binary of another release, served under this
+# release's path.
+write_signed_release "$fdir" 'other-release-binary-bytes' v0.86.9
+RUN_INSTALL_ROOT_OVERRIDE="$existing_home" run_install_sh
+unset RUN_INSTALL_ROOT_OVERRIDE
+stop_server
+trap - EXIT
+[ "$RUN_RC" -ne 0 ] || fail "a binary reporting another version must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "the downloaded binary reports 'lpm 0.86.9', but the release is $FIXTURE_VERSION" \
+  || fail "version mismatch refusal was unclear: $RUN_OUT"
+[ "$($SHA_TOOL "$RUN_INSTALL_DIR/lpm" | awk '{print $1}')" = "$existing_sha" ] \
+  || fail "a refused binary replaced the existing installation"
+leftovers="$(find "$existing_home/.lpm" \( -name '.lpm.new.*' -o -name '.lpm-install.*' \) -print | head -1)"
+[ -z "$leftovers" ] || fail "a refused install left staging files behind: $leftovers"
+rm -rf "$fdir" "$existing_home"
+pass "a binary that reports another version is refused before install"
+
+# ── Case 15: a prerelease of the floor version is below the floor ──
+fdir="$(mktemp -d)"
+floor_nightly="0.87.0-nightly.20261111.264.1d26c11"
+printf '{"version": "%s"}\n' "$floor_nightly" > "$fdir/api.json"
+write_signed_release "$fdir" 'floor-nightly-binary-bytes' "v$floor_nightly"
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_CHANNEL=nightly run_install_sh
+unset LPM_INSTALL_CHANNEL
+[ "$RUN_RC" -ne 0 ] || fail "a nightly built before the floor release must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "The latest nightly, v$floor_nightly, was built before v0.87.0" \
+  || fail "the nightly channel must say the latest nightly predates the floor: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "attack signal" \
+  && fail "a nightly that predates the floor is not a tampering signal: $RUN_OUT"
+LPM_INSTALL_VERSION="v$floor_nightly" run_install_sh
+unset LPM_INSTALL_VERSION
+[ "$RUN_RC" -ne 0 ] || fail "an explicit nightly built before the floor release must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "detected version v$floor_nightly is below the minimum supported v0.87.0" \
+  || fail "floor refusal of an explicit nightly was unclear: $RUN_OUT"
+stop_server
+trap - EXIT
+rm -rf "$fdir"
+pass "a nightly of the floor version is below the floor"
+
+# ── Case 16: with cosign installed, a release without a bundle is refused
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "1e98fb8efbcc00f620678fc8091b512ed503768f" > "$fdir/api.json"
+write_signed_release "$fdir" 'no-bundle-binary-bytes' "$FIXTURE_VERSION"
+rm -f "$fdir/SHA256SUMS.txt.sigstore"
+printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/cosign"
+chmod +x "$CLEAN_PATH_DIR/cosign"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+[ "$RUN_RC" -ne 0 ] || fail "with cosign installed, a release without a bundle must be refused: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "has no Sigstore bundle" \
+  || fail "missing-bundle refusal was unclear: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-bundle refusal must not install anything"
+printf '503\n' > "$fdir/SHA256SUMS.txt.sigstore.STATUS"
+printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/cosign"
+chmod +x "$CLEAN_PATH_DIR/cosign"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+[ "$RUN_RC" -ne 0 ] || fail "a bundle that failed to download must not be skipped: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "couldn't download the Sigstore bundle" \
+  || fail "a failed bundle download must not be reported as a missing bundle: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "has no Sigstore bundle" \
+  && fail "a failed bundle download is not a missing bundle: $RUN_OUT"
+rm -rf "$fdir"
+pass "with cosign installed, a release without a bundle is refused"
+
+# ── Case 17: a binary that can't run is reported as such ─────
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'unrunnable-binary-bytes' "$FIXTURE_VERSION"
+if [ "$HOST_OS" = "Darwin" ]; then
+  fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
+  printf '#!/bin/sh\necho "cannot execute on this system" >&2\nexit 126\n' > "$fixture_app/Contents/MacOS/lpm-rs"
+  rm -f "$fdir/$RELEASE_ASSET"
+  ditto -c -k --keepParent "$fixture_app" "$fdir/$RELEASE_ASSET"
+else
+  printf '#!/bin/sh\necho "cannot execute on this system" >&2\nexit 126\n' > "$fdir/$RELEASE_ASSET"
+fi
+unrunnable_sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$unrunnable_sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -ne 0 ] || fail "a binary that can't run must not be installed: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "couldn't run the downloaded binary to check its version" \
+  || fail "an unrunnable binary must not be reported as another release: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "cannot execute on this system" \
+  || fail "the binary's own error must be shown: $RUN_OUT"
+if [ "$HOST_OS" = "Darwin" ]; then staged_parent=".lpm/libexec"; else staged_parent=".lpm/bin"; fi
+echo "$RUN_OUT" | grep -q "$staged_parent doesn't allow running programs" \
+  || fail "the message must name the directory the binary ran from: $RUN_OUT"
+rm -rf "$fdir"
+pass "a binary that can't run is reported as such"
+
+if [ "$HOST_OS" = "Darwin" ]; then
+  # ── Case 18: the pre-bundle macOS asset has no Developer ID check ──
+  fdir="$(mktemp -d)"
+  fixture_executable 'legacy-raw-binary-bytes' v0.75.0 > "$fdir/$PLATFORM"
+  legacy_sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
+  printf '%s  %s\n' "$legacy_sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  trap 'stop_server' EXIT
+  start_server "$fdir"
+  LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.75.0 run_install_sh
+  unset LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
+  stop_server
+  trap - EXIT
+  [ "$RUN_RC" -eq 0 ] || fail "the pre-bundle macOS release must remain installable: $RUN_OUT"
+  echo "$RUN_OUT" | grep -q "publisher of this release wasn't verified, because cosign isn't installed" \
+    || fail "the pre-bundle macOS asset must say the publisher wasn't verified: $RUN_OUT"
+  rm -rf "$fdir"
+  pass "the pre-bundle macOS asset says when the publisher wasn't verified"
+fi
+
+# ── Case 20: an update notice after the version line is not a mismatch ──
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'notice-binary-bytes' "$FIXTURE_VERSION"
+# This fixture prints its notice first unless asked for no update check,
+# so it installs only when the installer sets LPM_NO_UPDATE_CHECK.
+notice_executable=$(printf '#!/bin/sh\n# notice-binary-bytes\n[ -n "${LPM_NO_UPDATE_CHECK:-}" ] || echo '"'"'Update available: 0.88.0'"'"'\necho '"'"'lpm %s'"'"'\n' "${FIXTURE_VERSION#v}")
+if [ "$HOST_OS" = "Darwin" ]; then
+  fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
+  printf '%s\n' "$notice_executable" > "$fixture_app/Contents/MacOS/lpm-rs"
+  rm -f "$fdir/$RELEASE_ASSET"
+  ditto -c -k --keepParent "$fixture_app" "$fdir/$RELEASE_ASSET"
+else
+  printf '%s\n' "$notice_executable" > "$fdir/$RELEASE_ASSET"
+fi
+notice_sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$notice_sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "a binary that also prints an update notice must install: $RUN_OUT"
+rm -rf "$fdir"
+pass "an update notice after the version line is not a mismatch"
+
+# A binary from an earlier release ignores LPM_NO_UPDATE_CHECK.
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+write_signed_release "$fdir" 'stubborn-notice-binary-bytes' "$FIXTURE_VERSION"
+notice_executable=$(printf '#!/bin/sh\n# stubborn-notice-binary-bytes\necho '"'"'lpm %s'"'"'\nprintf '"'"'\\nUpdate available: 0.88.0\\n'"'"'\n' "${FIXTURE_VERSION#v}")
+if [ "$HOST_OS" = "Darwin" ]; then
+  fixture_app="$fdir/.bundle-fixture/LPM CLI.app"
+  printf '%s\n' "$notice_executable" > "$fixture_app/Contents/MacOS/lpm-rs"
+  rm -f "$fdir/$RELEASE_ASSET"
+  ditto -c -k --keepParent "$fixture_app" "$fdir/$RELEASE_ASSET"
+else
+  printf '%s\n' "$notice_executable" > "$fdir/$RELEASE_ASSET"
+fi
+notice_sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$notice_sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+trap 'stop_server' EXIT
+start_server "$fdir"
+run_install_sh
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "only the first line of --version names the version: $RUN_OUT"
+rm -rf "$fdir"
+pass "only the first line of --version names the version"
 
 echo
 for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do

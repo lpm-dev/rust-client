@@ -11,6 +11,9 @@ logs so the harness output stays clean.
 Special-case: a fixture file named `*.NOCL` is served WITHOUT a
 Content-Length header so the harness can exercise the streaming-cap
 path (mid-stream guard). The `.NOCL` suffix is stripped from the URL.
+
+A fixture file named `*.STATUS` holds an HTTP status code; the URL
+without that suffix answers with that status and an empty body.
 """
 
 import http.server
@@ -31,6 +34,14 @@ def main() -> int:
             rel = self.path.lstrip("/").split("?", 1)[0]
             local = os.path.join(fixture_dir, rel)
             nocl = os.path.join(fixture_dir, rel + ".NOCL")
+            status = os.path.join(fixture_dir, rel + ".STATUS")
+            if os.path.isfile(status):
+                with open(status, encoding="ascii") as f:
+                    code = int(f.read().strip())
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if os.path.isfile(local):
                 with open(local, "rb") as f:
                     body = f.read()
