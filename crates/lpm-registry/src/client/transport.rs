@@ -691,9 +691,12 @@ impl RegistryClient {
                         ),
                         // A probe would wait on the same unprepared client.
                         lpm_http::ReplayableRequestError::TimeoutBeforeRequest => {
-                            return Err(LpmError::Network(
-                                "publish request timed out before it was sent".into(),
-                            ));
+                            return Err(LpmError::Network(match last_error.take() {
+                                Some(earlier) => format!(
+                                    "publish retry timed out before it was sent, after: {earlier}"
+                                ),
+                                None => "publish request timed out before it was sent".into(),
+                            }));
                         }
                         refused => return Err(LpmError::Network(refused.to_string())),
                     };

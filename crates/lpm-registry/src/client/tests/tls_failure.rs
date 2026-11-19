@@ -372,3 +372,60 @@ async fn a_publish_whose_deadline_runs_out_before_it_is_sent_is_neither_sent_nor
     );
     assert!(registry.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_publish_retry_whose_deadline_runs_out_before_it_is_sent_keeps_the_earlier_failure() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let registry = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/owner.pkg"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(1)
+        .mount(&registry)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/owner.pkg"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&registry)
+        .await;
+    let (client, _tmp) = client_with_mock_server(&registry.uri());
+    let url = format!("{}/api/registry/@lpm.dev/owner.pkg", registry.uri());
+    let payload = lpm_http::ReplayableRequestBody::from_bytes(
+        serde_json::to_vec(&serde_json::json!({ "name": "@lpm.dev/owner.pkg" })).unwrap(),
+    );
+    let request_client = reqwest::Client::new();
+    let attempts = AtomicUsize::new(0);
+
+    let outcome = client
+        .send_publish_safe(
+            || {
+                // The retry's deadline has already passed when it starts.
+                let deadline = if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                Ok(request_client
+                    .put(&url)
+                    .timeout(deadline)
+                    .body(payload.body()))
+            },
+            &payload,
+            None,
+            "@lpm.dev/owner.pkg",
+            "1.0.0",
+            "sha512-test",
+        )
+        .await;
+
+    let Err(error) = outcome else {
+        panic!("a publish the registry never stored fails");
+    };
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("retry timed out before it was sent") && rendered.contains("502"),
+        "{rendered}"
+    );
+}
