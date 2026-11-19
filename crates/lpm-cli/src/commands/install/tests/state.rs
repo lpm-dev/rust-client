@@ -469,16 +469,11 @@ fn installed_project_locked_as(
 #[test]
 fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
     let home = tempfile::tempdir().unwrap();
-    let _env = crate::test_env::ScopedEnv::update([
-        ("HOME", Some(home.path().as_os_str().to_owned())),
-        ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
-        ("NPM_CONFIG_USERCONFIG", None),
-        ("NPM_CONFIG_GLOBALCONFIG", None),
-        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+    let _env = crate::test_env::ScopedEnv::update(npm_env_under(home.path()).into_iter().chain([
         ("LPM_LINKER", None),
         (lpm_store::StoreVersion::ENV_VAR, None),
         (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
-    ]);
+    ]));
     let mode = crate::install_state::FastLaneMode {
         json: true,
         timing: false,
@@ -502,16 +497,11 @@ fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
 #[test]
 fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog_snapshot() {
     let home = tempfile::tempdir().unwrap();
-    let _env = crate::test_env::ScopedEnv::update([
-        ("HOME", Some(home.path().as_os_str().to_owned())),
-        ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
-        ("NPM_CONFIG_USERCONFIG", None),
-        ("NPM_CONFIG_GLOBALCONFIG", None),
-        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+    let _env = crate::test_env::ScopedEnv::update(npm_env_under(home.path()).into_iter().chain([
         ("LPM_LINKER", None),
         (lpm_store::StoreVersion::ENV_VAR, None),
         (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
-    ]);
+    ]));
     let mode = crate::install_state::FastLaneMode {
         json: true,
         timing: false,
@@ -587,16 +577,11 @@ fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog
 #[test]
 fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() {
     let home = tempfile::tempdir().unwrap();
-    let _env = crate::test_env::ScopedEnv::update([
-        ("HOME", Some(home.path().as_os_str().to_owned())),
-        ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
-        ("NPM_CONFIG_USERCONFIG", None),
-        ("NPM_CONFIG_GLOBALCONFIG", None),
-        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+    let _env = crate::test_env::ScopedEnv::update(npm_env_under(home.path()).into_iter().chain([
         ("LPM_LINKER", None),
         (lpm_store::StoreVersion::ENV_VAR, None),
         (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
-    ]);
+    ]));
     let mode = crate::install_state::FastLaneMode {
         json: true,
         timing: false,
@@ -651,16 +636,11 @@ fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() 
 #[test]
 fn the_up_to_date_check_accepts_an_unapplied_catalog_override_of_a_direct_dependency() {
     let home = tempfile::tempdir().unwrap();
-    let _env = crate::test_env::ScopedEnv::update([
-        ("HOME", Some(home.path().as_os_str().to_owned())),
-        ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
-        ("NPM_CONFIG_USERCONFIG", None),
-        ("NPM_CONFIG_GLOBALCONFIG", None),
-        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+    let _env = crate::test_env::ScopedEnv::update(npm_env_under(home.path()).into_iter().chain([
         ("LPM_LINKER", None),
         (lpm_store::StoreVersion::ENV_VAR, None),
         (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
-    ]);
+    ]));
     let mode = crate::install_state::FastLaneMode {
         json: true,
         timing: false,
