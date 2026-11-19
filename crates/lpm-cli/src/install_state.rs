@@ -1526,13 +1526,16 @@ fn write_install_hash_with_metadata(
 pub struct FastLaneMode {
     pub json: bool,
     pub timing: bool,
+    /// What `--frozen-lockfile` or `--no-frozen-lockfile` asked for, else
+    /// frozen under CI. A frozen check also makes the checks a frozen
+    /// install makes before it resolves.
+    pub(crate) frozen_lockfile: crate::commands::install::FrozenLockfileMode,
+    /// `--no-skills`: the install neither materializes package skills nor
+    /// restores managed ones, so their state doesn't decide freshness.
+    pub(crate) no_skills: bool,
 }
 
 pub fn argv_qualifies_for_fast_lane() -> Option<FastLaneMode> {
-    if ci_env_is_truthy() {
-        return None;
-    }
-
     // Use args_os() to avoid panicking on non-UTF-8 arguments.
     // Any argument that isn't valid UTF-8 causes a conservative bail
     // (fall through to the full pipeline where clap handles it).
@@ -1547,8 +1550,12 @@ pub fn argv_qualifies_for_fast_lane() -> Option<FastLaneMode> {
 }
 
 fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
+    use crate::commands::install::FrozenLockfileMode;
+
     let mut json = false;
     let mut timing = false;
+    let mut frozen_lockfile = None;
+    let mut no_skills = false;
     let mut found_install = false;
 
     for arg in args {
@@ -1568,26 +1575,30 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
             // The subcommand itself
             "install" | "i" if !found_install => found_install = true,
 
+            // Flags the check honours. Both frozen flags at once are left to
+            // clap to refuse.
+            "--frozen-lockfile" | "--no-frozen-lockfile" if found_install => {
+                let mode = if *arg == "--frozen-lockfile" {
+                    FrozenLockfileMode::Always
+                } else {
+                    FrozenLockfileMode::Never
+                };
+                if frozen_lockfile
+                    .replace(mode)
+                    .is_some_and(|earlier| earlier != mode)
+                {
+                    return None;
+                }
+            }
+            "--no-skills" if found_install => no_skills = true,
+            // An up-to-date install has no security summary to leave out.
+            "--no-security-summary" if found_install => {}
+
             // Install-specific flags that disqualify the fast lane.
             // ANY of these means semantics differ from a bare `lpm install`.
-            "--force"
-            | "--offline"
-            | "--frozen-lockfile"
-            | "--no-frozen-lockfile"
-            | "--filter"
-            | "-w"
-            | "--workspace-root"
-            | "--fail-if-no-match"
-            | "--allow-new"
-            | "--linker"
-            | "--exact"
-            | "--tilde"
-            | "--save-prefix"
-            | "-D"
-            | "--save-dev"
-            | "--no-skills"
-            | "--no-security-summary"
-            | "--auto-build"
+            "--force" | "--offline" | "--filter" | "-w" | "--workspace-root"
+            | "--fail-if-no-match" | "--allow-new" | "--linker" | "--exact" | "--tilde"
+            | "--save-prefix" | "-D" | "--save-dev" | "--auto-build"
                 if found_install =>
             {
                 return None;
@@ -1609,11 +1620,12 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
         }
     }
 
-    if found_install {
-        Some(FastLaneMode { json, timing })
-    } else {
-        None
-    }
+    found_install.then_some(FastLaneMode {
+        json,
+        timing,
+        frozen_lockfile: frozen_lockfile.unwrap_or_default(),
+        no_skills,
+    })
 }
 
 pub(crate) fn ci_env_is_truthy() -> bool {
@@ -1737,9 +1749,38 @@ mod tests {
             fast_lane_mode_from_args(&["--json", "install", "--timing"]),
             Some(FastLaneMode {
                 json: true,
-                timing: true
+                timing: true,
+                frozen_lockfile: crate::commands::install::FrozenLockfileMode::Auto,
+                no_skills: false,
             })
         );
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_carries_the_frozen_lockfile_and_skills_flags() {
+        use crate::commands::install::FrozenLockfileMode;
+
+        let mode = |args: &[&str]| {
+            fast_lane_mode_from_args(args).map(|mode| (mode.frozen_lockfile, mode.no_skills))
+        };
+        assert_eq!(
+            mode(&["install", "--frozen-lockfile"]),
+            Some((FrozenLockfileMode::Always, false))
+        );
+        assert_eq!(
+            mode(&[
+                "i",
+                "--no-frozen-lockfile",
+                "--no-skills",
+                "--no-security-summary"
+            ]),
+            Some((FrozenLockfileMode::Never, true))
+        );
+        assert_eq!(
+            mode(&["install", "--frozen-lockfile", "--no-frozen-lockfile"]),
+            None
+        );
+        assert_eq!(mode(&["--frozen-lockfile", "install"]), None);
     }
 
     #[test]

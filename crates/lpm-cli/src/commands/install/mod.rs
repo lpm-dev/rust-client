@@ -737,6 +737,8 @@ async fn run_with_options_under_store_lock(
         project_dir,
         pkg_json_path: &pkg_json_path,
         lockfile_path: &lockfile_path,
+        package: &pkg,
+        auto_install_peers,
         manifest_deps: &manifest_deps,
         root_optional_dependency_names: &root_optional_dependency_names,
         production_dependency_names: &production_dependency_names,

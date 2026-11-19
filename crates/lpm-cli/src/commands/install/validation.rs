@@ -128,29 +128,121 @@ pub(super) fn importer_snapshot_for_current_manifest(
     }
 }
 
-pub(super) fn validate_install_lockfile_state(
-    input: LockfileValidationInput<'_>,
-) -> Result<LockfileValidationState, LpmError> {
-    let current_patches: HashMap<String, PatchedDependencyEntry> = input
-        .package
+/// What the project's root importer is now, for checking its lockfile: the
+/// patches the manifest declares, the patch records they make, and the
+/// importer snapshot of the manifest as it stands.
+struct CurrentImporterState {
+    patches: HashMap<String, PatchedDependencyEntry>,
+    patch_fingerprint: String,
+    lockfile_patches: lpm_lockfile::LockfilePatches,
+    importer_snapshot: lpm_lockfile::ImporterSnapshot,
+}
+
+fn current_importer_state(
+    project_dir: &Path,
+    package: &lpm_workspace::PackageJson,
+    lpm_overrides: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+    resolutions: &HashMap<String, String>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+    auto_install_peers: bool,
+) -> Result<CurrentImporterState, LpmError> {
+    let patches: HashMap<String, PatchedDependencyEntry> = package
         .lpm
         .as_ref()
         .map(|l| l.patched_dependencies.clone())
         .unwrap_or_default();
-    let current_patch_fingerprint = patch_state::compute_fingerprint(&current_patches);
-    let current_importer_patch_fingerprint =
-        (!current_patches.is_empty()).then_some(current_patch_fingerprint.as_str());
-    let current_lockfile_patches =
-        patch_state::lockfile_patches_from_manifest(input.project_dir, &current_patches)?;
-    let mut current_importer_snapshot = importer_snapshot_for_current_manifest(
+    let patch_fingerprint = patch_state::compute_fingerprint(&patches);
+    let importer_patch_fingerprint = (!patches.is_empty()).then_some(patch_fingerprint.as_str());
+    let lockfile_patches = patch_state::lockfile_patches_from_manifest(project_dir, &patches)?;
+    let importer_snapshot = importer_snapshot_for_current_manifest(
+        package,
+        lpm_overrides,
+        overrides,
+        resolutions,
+        catalogs,
+        importer_patch_fingerprint,
+        auto_install_peers,
+    );
+    Ok(CurrentImporterState {
+        patches,
+        patch_fingerprint,
+        lockfile_patches,
+        importer_snapshot,
+    })
+}
+
+impl CurrentImporterState {
+    /// Records the workspace root's peer providers as `lockfile` locks them,
+    /// which the snapshot compares only once a lockfile is read.
+    fn with_locked_root_providers(
+        mut self,
+        project_dir: &Path,
+        lockfile: Option<&lpm_lockfile::Lockfile>,
+    ) -> Self {
+        let locked_root_providers = lockfile
+            .and_then(|lockfile| lockfile.importers.get("."))
+            .and_then(|importer| {
+                importer
+                    .workspace_root_peer_providers_fingerprint
+                    .as_deref()
+            });
+        self.importer_snapshot
+            .workspace_root_peer_providers_fingerprint =
+            crate::workspace_discovery_cache::root_provider_fingerprint_for_locked_member(
+                project_dir,
+                locked_root_providers,
+            )
+            .map(|fingerprint| fingerprint.to_string());
+        self
+    }
+}
+
+/// Whether a frozen install would accept `lockfile` for the project as it
+/// stands: the checks a frozen install makes before it resolves, for an
+/// up-to-date answer that would otherwise skip them. `workspace` is the
+/// workspace the project belongs to, whose root overrides and catalogs it
+/// inherits.
+pub(super) fn frozen_install_accepts_lockfile(
+    project_dir: &Path,
+    lockfile_path: &Path,
+    package: &lpm_workspace::PackageJson,
+    workspace: Option<&lpm_workspace::Workspace>,
+    lockfile: &lpm_lockfile::Lockfile,
+    auto_install_peers: bool,
+) -> Result<(), LpmError> {
+    let mut catalog_resolutions = Vec::new();
+    let overrides = prepare_override_resolution_state(OverrideResolutionInput {
+        package,
+        workspace,
+        catalog_resolutions: &mut catalog_resolutions,
+    })?;
+    let current = current_importer_state(
+        project_dir,
+        package,
+        &overrides.lpm_overrides,
+        overrides.overrides.as_ref(),
+        overrides.resolutions.as_ref(),
+        overrides.override_catalogs,
+        auto_install_peers,
+    )?
+    .with_locked_root_providers(project_dir, Some(lockfile));
+    validate_lockfile_patch_records(lockfile_path, lockfile, &current.lockfile_patches)?;
+    validate_frozen_importer_snapshot(lockfile_path, lockfile, &current.importer_snapshot)
+}
+
+pub(super) fn validate_install_lockfile_state(
+    input: LockfileValidationInput<'_>,
+) -> Result<LockfileValidationState, LpmError> {
+    let current = current_importer_state(
+        input.project_dir,
         input.package,
         input.lpm_overrides,
         input.overrides,
         input.resolutions,
         input.catalogs,
-        current_importer_patch_fingerprint,
         input.auto_install_peers,
-    );
+    )?;
     let lockfile_for_validation = if workspace_lockfile::exists(input.lockfile_path)
         || input.frozen_lockfile_active
     {
@@ -163,7 +255,7 @@ pub(super) fn validate_install_lockfile_state(
                     e,
                 )));
             }
-            Err(e) if !current_lockfile_patches.is_empty() => {
+            Err(e) if !current.lockfile_patches.is_empty() => {
                 return Err(LpmError::Registry(format!(
                     "Patch lockfile mismatch\n  lockfile    {}\n  error       {}\n  hint        run `lpm install` after restoring a readable lpm.lock",
                     input.lockfile_path.display(),
@@ -175,20 +267,12 @@ pub(super) fn validate_install_lockfile_state(
     } else {
         None
     };
-    let locked_root_providers = lockfile_for_validation
-        .as_ref()
-        .and_then(|lockfile| lockfile.importers.get("."))
-        .and_then(|importer| {
-            importer
-                .workspace_root_peer_providers_fingerprint
-                .as_deref()
-        });
-    current_importer_snapshot.workspace_root_peer_providers_fingerprint =
-        crate::workspace_discovery_cache::root_provider_fingerprint_for_locked_member(
-            input.project_dir,
-            locked_root_providers,
-        )
-        .map(|fingerprint| fingerprint.to_string());
+    let CurrentImporterState {
+        patches: current_patches,
+        patch_fingerprint: current_patch_fingerprint,
+        lockfile_patches: current_lockfile_patches,
+        importer_snapshot: current_importer_snapshot,
+    } = current.with_locked_root_providers(input.project_dir, lockfile_for_validation.as_deref());
     if let Some(lockfile) = lockfile_for_validation.as_ref() {
         validate_lockfile_patch_records(input.lockfile_path, lockfile, &current_lockfile_patches)?;
     }
