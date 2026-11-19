@@ -1496,3 +1496,70 @@ async fn unchanged_workspace_member_install_that_sends_nothing_warns_about_no_np
         "an install that sends nothing has no verification to disable: {stderr}"
     );
 }
+
+async fn installed_leaf_project() -> (MockRegistry, TempProject) {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","dependencies":{"leaf":"1.0.0"}}"#);
+    install(&project, &mock.url()).assert().success();
+    (mock, project)
+}
+
+#[tokio::test]
+async fn unchanged_ci_and_unsummarized_installs_answer_from_the_quick_check() {
+    let (_mock, project) = installed_leaf_project().await;
+
+    for (ci, args) in [
+        (true, &[][..]),
+        (true, &["--frozen-lockfile"][..]),
+        (false, &["--frozen-lockfile"][..]),
+        (false, &["--no-frozen-lockfile"][..]),
+        (false, &["--no-skills", "--no-security-summary"][..]),
+    ] {
+        let mut command = bare_install(&project);
+        if ci {
+            command.env("CI", "1");
+        }
+        let output = command.args(args).assert().success().get_output().clone();
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut keys: Vec<&str> = result
+            .as_object()
+            .expect("an install answers with a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["duration_ms", "schema_version", "success", "up_to_date"],
+            "CI={ci} {args:?} must take the quick check: {result}"
+        );
+        assert_eq!(result["up_to_date"], true, "{result}");
+    }
+}
+
+#[tokio::test]
+async fn unchanged_frozen_install_refuses_a_lockfile_a_frozen_install_would_refuse() {
+    let (_mock, project) = installed_leaf_project().await;
+    // The lockfile recorded peers installed automatically; a frozen install
+    // now asked not to install them must refuse it, up to date or not.
+    std::fs::write(
+        project.home().join(".lpm/config.toml"),
+        "auto-install-peers = false\n",
+    )
+    .unwrap();
+
+    for (ci, args) in [(true, &[][..]), (false, &["--frozen-lockfile"][..])] {
+        let mut command = bare_install(&project);
+        if ci {
+            command.env("CI", "1");
+        }
+        let output = command.args(args).assert().failure().get_output().clone();
+        let result = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            result.contains("Frozen lockfile mismatch") && result.contains("auto install peers"),
+            "CI={ci} {args:?}: {result}"
+        );
+    }
+}
