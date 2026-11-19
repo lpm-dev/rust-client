@@ -20,8 +20,42 @@ pub(super) struct AuditScan {
     pub(super) checked_lpm: usize,
 }
 
+/// The registry client an audit scan reads `@lpm.dev` metadata with.
+pub(super) enum RegistryAccess<'a> {
+    /// A client that already carries the project's `.npmrc` TLS settings,
+    /// such as the one an install used.
+    Configured(&'a RegistryClient),
+    /// A base client. The scan applies the project's `.npmrc` TLS settings
+    /// only when it reads the registry, so an audit of packages that are
+    /// all on npm doesn't depend on `.npmrc` files.
+    Project(&'a RegistryClient),
+}
+
+impl RegistryAccess<'_> {
+    fn client_for(
+        &self,
+        project_dir: &Path,
+        json_output: bool,
+    ) -> Result<RegistryClient, LpmError> {
+        match *self {
+            Self::Configured(client) => Ok(client.clone_with_config()),
+            Self::Project(client) => {
+                let context = crate::commands::registry_reads::prepare_registry_read_context(
+                    client,
+                    project_dir,
+                    crate::commands::registry_reads::RegistryReads::LPM,
+                )?;
+                if !json_output {
+                    context.announce();
+                }
+                Ok(context.client)
+            }
+        }
+    }
+}
+
 pub(super) async fn run_scan(
-    client: &RegistryClient,
+    registry: RegistryAccess<'_>,
     project_dir: &Path,
     store_version: lpm_store::StoreVersion,
     json_output: bool,
@@ -48,7 +82,7 @@ pub(super) async fn run_scan(
         None
     } else {
         let names: Vec<String> = lpm_packages.iter().map(|(name, _)| name.clone()).collect();
-        let client = client.clone_with_config();
+        let client = registry.client_for(project_dir, json_output)?;
         Some(tokio::spawn(async move {
             client.batch_metadata(&names).await.map_err(|error| {
                 // A refused credential or a registry's own refusal keeps its

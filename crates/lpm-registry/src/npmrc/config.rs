@@ -188,17 +188,6 @@ impl NpmrcConfig {
             // (None, None) → no global mTLS, nothing to check.
             _ => {}
         }
-        if let Some(strict_ssl) = self.tls.strict_ssl.as_ref()
-            && !strict_ssl.value
-        {
-            let source = strict_ssl.source.clone();
-            let line = strict_ssl.line;
-            self.push_warning(&source, || {
-                format!(
-                    "{source}:{line}: strict-ssl=false — TLS certificate verification will be DISABLED for this install"
-                )
-            });
-        }
         let strict_npmrc = self
             .strict_npmrc
             .as_ref()

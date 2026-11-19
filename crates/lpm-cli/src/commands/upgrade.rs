@@ -227,9 +227,6 @@ pub async fn run(
         false,
         json_output,
     )?;
-    let planning_client = client.clone_with_config().without_metadata_memory_cache();
-    let install_client = client.clone_with_metadata_memory_cache();
-
     // Read lockfile ONCE
     let lockfile = read_optional_project_lockfile(project_dir)?;
     let roots = LockfileRootIndex::new(lockfile.as_ref());
@@ -340,6 +337,20 @@ pub async fn run(
         }
     }
 
+    let reads = crate::commands::registry_reads::RegistryReads {
+        lpm: jobs.iter().any(|job| job.route != MetadataRoute::PublicNpm),
+        npm: jobs.iter().any(|job| job.route == MetadataRoute::PublicNpm),
+    };
+    let read_context =
+        crate::commands::registry_reads::prepare_registry_read_context(client, project_dir, reads)?;
+    if !json_output && dry_run {
+        read_context.announce();
+    }
+    let planning_client = read_context
+        .client
+        .clone_with_config()
+        .without_metadata_memory_cache();
+    let install_client = read_context.client.clone_with_metadata_memory_cache();
     let planning_client_ref = &planning_client;
     let release_age_policy_ref = &release_age_policy;
     let fetches = futures::stream::iter(jobs.into_iter().map(move |job| async move {
@@ -465,6 +476,9 @@ pub async fn run(
                 &skipped_non_registry,
             )?;
         } else {
+            if !dry_run {
+                read_context.announce();
+            }
             if let Some(message) = up_to_date_message(
                 upgradeable_deps.len(),
                 skipped_private.len() + skipped_non_registry.len(),
@@ -485,6 +499,9 @@ pub async fn run(
         ResolvedMode::Interactive => {
             let selection = select_candidates_interactively(&candidates)?;
             if selection.is_empty() {
+                if !dry_run {
+                    read_context.announce();
+                }
                 install_ui::phase("No packages selected. package.json is unchanged.");
                 return Ok(());
             }

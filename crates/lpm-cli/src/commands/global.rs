@@ -236,6 +236,30 @@ async fn run_list_outdated(
         return Ok(());
     }
 
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let reads = crate::commands::registry_reads::RegistryReads {
+        lpm: !lpm_names.is_empty(),
+        npm: npm_names.iter().any(|name| {
+            matches!(
+                super::global_util::metadata_route(&route_table, name),
+                lpm_registry::UpstreamRoute::NpmDirect
+            )
+        }),
+    };
+    let read_context = crate::commands::registry_reads::configure_registry_read_context(
+        client,
+        route_table,
+        reads,
+    )?;
+    if !json_output {
+        read_context.announce();
+    }
+    let crate::commands::registry_reads::RoutedReadContext {
+        client,
+        route_table: routes,
+    } = read_context;
+    let client = &client;
     let mut outdated: Vec<OutdatedRow> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();
     let mut unresolved: Vec<UnresolvedRow> = Vec::new();
@@ -315,8 +339,6 @@ async fn run_list_outdated(
         }));
     }
 
-    let routes = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
-        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
     let routes = &routes;
     let release_age_policy_ref = &release_age_policy;
     let npm_fetches = futures::stream::iter(npm_names.into_iter().map(|name| async move {

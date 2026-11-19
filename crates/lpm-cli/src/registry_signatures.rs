@@ -431,6 +431,33 @@ async fn hydrate_publish_time(
     Ok(())
 }
 
+/// The registries [`verify_packages`] reads for `inputs`: a package routed
+/// through the LPM worker or straight to npm takes npm's signing keys and
+/// may need its metadata from that route; a first-party LPM package or a
+/// non-registry source reads nothing, and a custom registry builds its TLS
+/// client when first used.
+pub(crate) fn registries_read(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    inputs: &[RegistrySignatureInput],
+) -> crate::commands::registry_reads::RegistryReads {
+    let mut reads = crate::commands::registry_reads::RegistryReads::NONE;
+    for input in inputs {
+        if input.name.starts_with("@lpm.dev/") && is_lpm_registry_source(client, input) {
+            continue;
+        }
+        match route_for_input(client, route_table, input) {
+            Ok(Some(UpstreamRoute::LpmWorker)) => {
+                reads.lpm = true;
+                reads.npm = true;
+            }
+            Ok(Some(UpstreamRoute::NpmDirect)) => reads.npm = true,
+            Ok(Some(UpstreamRoute::Custom { .. })) | Ok(None) | Err(_) => {}
+        }
+    }
+    reads
+}
+
 fn route_for_input(
     client: &RegistryClient,
     route_table: &RouteTable,

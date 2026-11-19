@@ -103,11 +103,7 @@ pub async fn run(
             return Err(LpmError::Script("local global links need recovery before a preview; run `lpm global list`, then retry".into()));
         }
     }
-    let planning_registry = client.clone_with_config().without_metadata_memory_cache();
-    let install_registry = client.clone_with_metadata_memory_cache();
     let manifest = read_for(&root)?;
-    let routes = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
-        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
 
     let targets = match package {
         Some(spec) => vec![parse_target(spec)?],
@@ -132,6 +128,33 @@ pub async fn run(
         return Ok(());
     }
 
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let routes_of_targets: Vec<_> = targets
+        .iter()
+        .map(|target| super::global_util::metadata_route(&route_table, &target.name))
+        .collect();
+    let reads = crate::commands::registry_reads::RegistryReads {
+        lpm: routes_of_targets
+            .iter()
+            .any(|route| matches!(route, lpm_registry::UpstreamRoute::LpmWorker)),
+        npm: routes_of_targets
+            .iter()
+            .any(|route| matches!(route, lpm_registry::UpstreamRoute::NpmDirect)),
+    };
+    let read_context = crate::commands::registry_reads::configure_registry_read_context(
+        client,
+        route_table,
+        reads,
+    )?;
+    if !json_output && dry_run {
+        read_context.announce();
+    }
+    let planning_registry = read_context
+        .client
+        .clone_with_config()
+        .without_metadata_memory_cache();
+    let install_registry = read_context.client.clone_with_metadata_memory_cache();
     let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
         &root.global_root(),
         None,
@@ -143,7 +166,7 @@ pub async fn run(
     let planning_registry_ref = &planning_registry;
     let release_age_policy_ref = &release_age_policy;
     let aliases_by_package_ref = &aliases_by_package;
-    let routes = &routes;
+    let routes = &read_context.route_table;
     let planning = futures::stream::iter(targets.into_iter().enumerate().map(
         move |(target_index, target)| async move {
             let result = plan_upgrade(
@@ -262,6 +285,10 @@ pub async fn run(
         }
     }
 
+    // A lone upgrade's install prints these itself; a batch installs quietly.
+    if !json_output && upgrades.len() != 1 {
+        read_context.announce();
+    }
     if upgrades.len() == 1 {
         let (index, prep) = upgrades.pop().expect("one queued global upgrade");
         ordered_results[index] = Some(

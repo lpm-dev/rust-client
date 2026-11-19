@@ -447,6 +447,9 @@ fn emit_route_warnings(route_table: &RouteTable, json_output: bool) {
     }
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
         && !tagged.value
+        && crate::commands::registry_reads::first_npmrc_security_warning(
+            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
+        )
     {
         crate::output::warn(&format!(
             "strict-ssl=false in {}:{} — TLS certificate verification is DISABLED for this fetch across ALL registries. This is a security risk.",
@@ -455,7 +458,9 @@ fn emit_route_warnings(route_table: &RouteTable, json_output: bool) {
         ));
     }
     for warning in route_table.npmrc_security_warnings() {
-        crate::output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        if crate::commands::registry_reads::first_npmrc_security_warning(warning) {
+            crate::output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        }
     }
 }
 

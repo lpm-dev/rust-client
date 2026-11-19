@@ -103,7 +103,7 @@ fn configure_read_context(
         client.base_url(),
         client.npm_registry_url(),
     );
-    configure_read_context_for_origins(client, route_table, &eager_origins, json_output)
+    configure_read_context_for_origins(client, route_table, &eager_origins, !json_output)
 }
 
 pub fn prepare_locked_read_context(
@@ -113,23 +113,135 @@ pub fn prepare_locked_read_context(
 ) -> Result<RoutedReadContext, LpmError> {
     let route_table = RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
-    configure_read_context_for_origins(client, route_table, origins, true)
+    configure_read_context_for_origins(client, route_table, origins, false)
+}
+
+/// Which of `client`'s registries a command reads. Their TLS clients build
+/// up front, so a broken setting for one of them fails before any request;
+/// a registry the command doesn't read never loads its per-origin TLS files
+/// (a global `cafile=` loads with the `.npmrc` itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryReads {
+    pub lpm: bool,
+    pub npm: bool,
+}
+
+impl RegistryReads {
+    pub const LPM: Self = Self {
+        lpm: true,
+        npm: false,
+    };
+    pub const NONE: Self = Self {
+        lpm: false,
+        npm: false,
+    };
+}
+
+/// The route table that the `.npmrc` files in effect at `config_dir` define,
+/// and `client` with their TLS settings (`cafile=`, `ca=`, `strict-ssl`,
+/// per-origin certificates), for a command that reads a registry itself
+/// rather than through `lpm install`. The registries in `reads` build their
+/// TLS clients now; any other origin with settings of its own builds them
+/// on first use.
+///
+/// Security warnings print now. The advisory `.npmrc` warnings and the TLS
+/// summary wait for [`RoutedReadContext::announce`], which a command skips
+/// for `--json` output or when its install step prints them itself.
+pub fn prepare_registry_read_context(
+    client: &RegistryClient,
+    config_dir: &Path,
+    reads: RegistryReads,
+) -> Result<RoutedReadContext, LpmError> {
+    let route_table = RouteTable::from_env_and_filesystem(config_dir)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    configure_registry_read_context(client, route_table, reads)
+}
+
+/// [`prepare_registry_read_context`] with a route table the caller already
+/// read.
+pub fn configure_registry_read_context(
+    client: &RegistryClient,
+    route_table: RouteTable,
+    reads: RegistryReads,
+) -> Result<RoutedReadContext, LpmError> {
+    let eager_origins: Vec<_> = [
+        reads.lpm.then(|| client.base_url()),
+        reads.npm.then(|| client.npm_registry_url()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(lpm_registry::npmrc::OriginKey::from_request_url)
+    .collect();
+    configure_read_context_for_origins(client, route_table, &eager_origins, false)
+}
+
+/// [`prepare_registry_read_context`] for the current directory, announced
+/// unless the output is JSON: the client for a command that reads the LPM
+/// registry without a project of its own.
+pub fn registry_client_for_current_directory(
+    client: &RegistryClient,
+    json_output: bool,
+) -> Result<RegistryClient, LpmError> {
+    let current_dir = std::env::current_dir().map_err(LpmError::Io)?;
+    let context = prepare_registry_read_context(client, &current_dir, RegistryReads::LPM)?;
+    if !json_output {
+        context.announce();
+    }
+    Ok(context.client)
+}
+
+impl RoutedReadContext {
+    /// Print the advisory `.npmrc` warnings and the effective TLS summary.
+    pub fn announce(&self) {
+        print_npmrc_advisories(&self.route_table);
+        print_tls_summary(&self.client);
+    }
+}
+
+/// Whether this process has yet to print the `.npmrc` security warning
+/// `key`. A command that reads a registry and then installs loads the same
+/// `.npmrc` settings again, and each load warns about them.
+pub(crate) fn first_npmrc_security_warning(key: &str) -> bool {
+    static SHOWN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SHOWN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_owned())
+}
+
+/// The [`first_npmrc_security_warning`] key of a `strict-ssl=false` line,
+/// which each command words for itself.
+pub(crate) fn strict_ssl_warning_key(source: &str, line: usize) -> String {
+    format!("strict-ssl\0{source}\0{line}")
+}
+
+fn print_npmrc_advisories(route_table: &RouteTable) {
+    for warning in route_table.npmrc_warnings() {
+        install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
+    }
+}
+
+fn print_tls_summary(client: &RegistryClient) {
+    if let Some(summary) = client.render_effective_tls_summary() {
+        install_ui::phase_untrusted(&lpm_common::sanitize_terminal_inline(&summary));
+    }
 }
 
 fn configure_read_context_for_origins(
     client: &RegistryClient,
     route_table: RouteTable,
     eager_origins: &[lpm_registry::npmrc::OriginKey],
-    json_output: bool,
+    announce: bool,
 ) -> Result<RoutedReadContext, LpmError> {
-    if !json_output {
-        for warning in route_table.npmrc_warnings() {
-            install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
-        }
+    if announce {
+        print_npmrc_advisories(&route_table);
     }
 
     if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
         && !tagged.value
+        && first_npmrc_security_warning(&strict_ssl_warning_key(&tagged.source, tagged.line))
     {
         install_ui::warn_untrusted(&format!(
             "strict-ssl=false in {}:{} — TLS certificate verification is \
@@ -141,15 +253,17 @@ fn configure_read_context_for_origins(
     }
 
     for warning in route_table.npmrc_security_warnings() {
-        install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
+        if first_npmrc_security_warning(warning) {
+            install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
+        }
     }
 
     let configured_client = client
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
 
-    if !json_output && let Some(summary) = configured_client.render_effective_tls_summary() {
-        install_ui::phase_untrusted(&lpm_common::sanitize_terminal_inline(&summary));
+    if announce {
+        print_tls_summary(&configured_client);
     }
 
     Ok(RoutedReadContext {
@@ -237,6 +351,25 @@ fn validate_metadata_registry_base(base_url: &str) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_npmrc_security_warning_prints_once_per_process() {
+        let key = "registry-reads-test: project .npmrc refused ca";
+        assert!(first_npmrc_security_warning(key));
+        assert!(!first_npmrc_security_warning(key));
+        assert!(first_npmrc_security_warning(&strict_ssl_warning_key(
+            "/a/.npmrc",
+            1
+        )));
+        assert!(first_npmrc_security_warning(&strict_ssl_warning_key(
+            "/a/.npmrc",
+            2
+        )));
+        assert!(!first_npmrc_security_warning(&strict_ssl_warning_key(
+            "/a/.npmrc",
+            1
+        )));
+    }
 
     #[test]
     fn split_package_and_inline_version_handles_unscoped_npm_specs() {

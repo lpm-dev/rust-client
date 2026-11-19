@@ -2908,3 +2908,160 @@ async fn upgrade_yes_dry_run_json_envelope_with_full_enrichment_smoke() {
 
 #[path = "upgrade_contract/mod.rs"]
 mod upgrade_contract;
+
+#[tokio::test]
+async fn upgrade_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-upgrade","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front
+        .mount_package(
+            &mock,
+            "ms",
+            &[
+                ("2.1.3", make_tarball("ms", "2.1.3")),
+                ("2.5.0", make_tarball("ms", "2.5.0")),
+            ],
+        )
+        .await;
+    front.write_user_npmrc(project.home(), "");
+    project.write_file(
+        "package.json",
+        r#"{"name":"cafile-upgrade","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    project.write_file(
+        "package.json",
+        r#"{"name":"cafile-upgrade","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    for args in [
+        &["upgrade", "-y", "--dry-run", "--json"][..],
+        &["upgrade", "-y", "--json"][..],
+    ] {
+        let out = lpm_with_registry(&project, &front.url)
+            .args(args)
+            .output()
+            .expect("spawn lpm upgrade");
+        assert!(
+            out.status.success(),
+            "lpm {args:?} must reach a registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+        assert_eq!(envelope["upgraded"], 1, "{envelope:#}");
+    }
+    let lockfile = project.read_file("lpm.lock");
+    assert!(lockfile.contains("version = \"2.5.0\""), "{lockfile}");
+}
+
+#[tokio::test]
+async fn upgrade_names_the_npmrc_tls_settings_once_in_human_output() {
+    let project = TempProject::empty(
+        r#"{"name":"tls-summary-upgrade","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front
+        .mount_package(
+            &mock,
+            "ms",
+            &[
+                ("2.1.3", make_tarball("ms", "2.1.3")),
+                ("2.5.0", make_tarball("ms", "2.5.0")),
+            ],
+        )
+        .await;
+    front.write_user_npmrc_trusting_everywhere(project.home());
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    project.write_file(
+        "package.json",
+        r#"{"name":"tls-summary-upgrade","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    for (args, case) in [
+        (&["upgrade", "-y", "--dry-run"][..], "dry run"),
+        (&["upgrade", "-y"][..], "upgrade that installs"),
+        (&["upgrade", "-y"][..], "nothing left to upgrade"),
+    ] {
+        let out = lpm_with_registry(&project, &front.url)
+            .args(args)
+            .output()
+            .expect("spawn lpm upgrade");
+        assert!(
+            out.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            support::tls_front::tls_summary_count(&out.stderr),
+            1,
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn upgrade_and_install_warn_about_strict_ssl_false_once() {
+    let project = TempProject::empty(
+        r#"{"name":"strict-ssl-once","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n\
+         source = \"registry+https://registry.npmjs.org\"\n",
+    );
+    std::fs::write(project.home().join(".npmrc"), "strict-ssl=false\n").unwrap();
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "ms",
+        "2.5.0",
+        &[
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.5.0",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.5.0")),
+            ),
+        ],
+    )
+    .await;
+
+    for args in [
+        &["install", "--no-security-summary", "--no-skills"][..],
+        &["upgrade", "-y"][..],
+    ] {
+        let out = lpm_with_registry(&project, &mock.url())
+            .args(args)
+            .output()
+            .expect("spawn lpm");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.matches("strict-ssl=false").count(),
+            1,
+            "{args:?} must warn about strict-ssl=false once: {stderr}"
+        );
+    }
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("version = \"2.5.0\""),
+        "the upgrade must have installed: {lockfile}"
+    );
+}

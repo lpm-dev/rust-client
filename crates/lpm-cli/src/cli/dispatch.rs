@@ -578,11 +578,21 @@ async fn async_main(cli: Cli) -> Result<()> {
             commands::search::run(&client, &cwd, &query, limit, cli.json).await
         }
         Commands::Quality(args) => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
             commands::quality::run(&client, &args.package, cli.json).await
         }
-        Commands::Whoami => commands::whoami::run(&client, cli.json).await,
-        Commands::VerifyNpm => commands::verify_npm::run(&client, cli.json).await,
-        Commands::Health => commands::health::run(&client, registry_url, cli.json).await,
+        Commands::Whoami => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
+            commands::whoami::run(&client, cli.json).await
+        }
+        Commands::VerifyNpm => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
+            commands::verify_npm::run(&client, cli.json).await
+        }
+        Commands::Health => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
+            commands::health::run(&client, registry_url, cli.json).await
+        }
         Commands::Download(args) => {
             let registry_args::DownloadArgs {
                 package,
@@ -1922,7 +1932,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             );
             commands::trust::run(&action, &cwd, cli.json).await
         }
-        Commands::Pool => commands::pool::run(&client, cli.json).await,
+        Commands::Pool => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
+            commands::pool::run(&client, cli.json).await
+        }
         Commands::Skills(args) => {
             let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cwd = package_root_for(&invocation_dir, cli.json);

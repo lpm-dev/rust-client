@@ -39,6 +39,10 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 rcgen = { version = "0.14", features = ["pem"] }
+# HTTPS front for MockRegistry, so commands meet a registry signed by a
+# private CA that only `.npmrc` `cafile=` makes them trust.
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
 reqwest = { workspace = true }
 lpm-runtime = { path = "../../crates/lpm-runtime" }
 lpm-plugin = { path = "../../crates/lpm-plugin" }

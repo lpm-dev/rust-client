@@ -4497,3 +4497,327 @@ async fn audit_still_reports_an_absent_required_package_beside_an_absent_optiona
     assert_eq!(coverage["not_installed_packages"], 1, "{coverage}");
     assert_eq!(coverage["packages"][0]["name"], "missing", "{coverage}");
 }
+
+/// Run `lpm` against `front` with OSV answered by `mock`.
+fn lpm_through_front(
+    project: &TempProject,
+    mock: &MockRegistry,
+    front: &support::tls_front::TlsFront,
+    args: &[&str],
+) -> std::process::Output {
+    lpm_with_registry(project, &front.url)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(args)
+        .output()
+        .expect("spawn lpm")
+}
+
+#[tokio::test]
+async fn audit_trusts_the_npmrc_cafile_of_the_lpm_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-audit","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"cafile-audit","lockfileVersion":3,"packages":{"":{"dependencies":{"@lpm.dev/acme.widget":"1.0.0"}},"node_modules/@lpm.dev/acme.widget":{"version":"1.0.0","resolved":"https://lpm.dev/api/registry/@lpm.dev/acme.widget/-/acme.widget-1.0.0.tgz"}}}"#,
+    );
+    project.write_file(
+        "node_modules/@lpm.dev/acme.widget/package.json",
+        r#"{"name":"@lpm.dev/acme.widget","version":"1.0.0","license":"MIT"}"#,
+    );
+    project.write_file(
+        "node_modules/@lpm.dev/acme.widget/index.js",
+        "module.exports = 1;\n",
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/acme.widget",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": { "1.0.0": { "name": "@lpm.dev/acme.widget", "version": "1.0.0" } }
+    })])
+    .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    front.write_user_npmrc(project.home(), "");
+
+    let out = lpm_through_front(&project, &mock, &front, &["--json", "audit"]);
+    assert!(
+        out.status.success(),
+        "audit must reach an LPM registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-audit-fix","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let tarball = |version: &str| {
+        make_tarball_from_pkg_json(
+            serde_json::json!({ "name": "vuln-pkg", "version": version, "license": "MIT" }),
+            &[],
+        )
+    };
+    front
+        .mount_package(
+            &mock,
+            "vuln-pkg",
+            &[("1.0.0", tarball("1.0.0")), ("1.0.1", tarball("1.0.1"))],
+        )
+        .await;
+    front.write_user_npmrc(project.home(), "");
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    front.write_user_npmrc_trusting_everywhere(project.home());
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-cafile-fix",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+
+    let human = lpm_through_front(&project, &mock, &front, &["audit", "fix", "--dry-run"]);
+    assert_eq!(
+        support::tls_front::tls_summary_count(&human.stderr),
+        1,
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let out = lpm_through_front(
+        &project,
+        &mock,
+        &front,
+        &["--json", "audit", "fix", "--dry-run"],
+    );
+    assert_eq!(support::tls_front::tls_summary_count(&out.stderr), 0);
+    assert!(
+        out.status.success(),
+        "audit fix must reach a registry its .npmrc cafile trusts\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["packages"][0]["to"], "1.0.1", "{envelope:#}");
+
+    let applied = lpm_through_front(&project, &mock, &front, &["audit", "fix"]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(
+        support::tls_front::tls_summary_count(&applied.stderr),
+        1,
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+}
+
+#[tokio::test]
+async fn audit_signatures_trusts_the_npmrc_cafile_of_the_registry_it_reads() {
+    let project = TempProject::empty(
+        r#"{"name":"cafile-signatures","version":"1.0.0","dependencies":{"signed-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let signer = RegistrySigningFixture::new();
+    mock.with_registry_signing_keys(&signer).await;
+    let tarball = make_tarball("signed-pkg", "1.0.0");
+    let metadata = front.advertise(
+        &mock,
+        mock.signed_package_metadata("signed-pkg", "1.0.0", &tarball, &signer),
+    );
+    mock.with_package_metadata("signed-pkg", "1.0.0", &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+    front.write_user_npmrc(project.home(), &format!("registry={}\n", front.url));
+    lpm_with_registry(&project, &front.url)
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+
+    let out = lpm_through_front(&project, &mock, &front, &["audit", "signatures"]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "audit signatures must reach a registry its .npmrc cafile trusts\n{stderr}"
+    );
+    assert!(stderr.contains("1 verified"), "{stderr}");
+}
+
+#[tokio::test]
+async fn audit_without_registry_reads_does_not_load_npmrc_tls_files() {
+    let project = TempProject::empty(
+        r#"{"name":"no-registry-audit","version":"1.0.0","dependencies":{"present":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"no-registry-audit","lockfileVersion":3,"packages":{"":{"dependencies":{"present":"1.0.0"}},"node_modules/present":{"version":"1.0.0","resolved":"https://registry.npmjs.org/present/-/present-1.0.0.tgz"}}}"#,
+    );
+    seed_node_modules_package(
+        &project,
+        "present",
+        &[("index.js", "module.exports = 1;\n")],
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "cafile={}\n",
+            project.home().join("missing-ca.pem").display()
+        ),
+    )
+    .unwrap();
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = run_audit_json(&project, &mock, &["--fail-on=vuln"]);
+    assert!(
+        output.status.success(),
+        "an audit that reads no registry must not depend on .npmrc TLS files\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn audit_reading_only_the_lpm_registry_ignores_tls_settings_of_other_registries() {
+    let project = TempProject::empty(
+        r#"{"name":"lpm-only-audit","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"name":"lpm-only-audit","lockfileVersion":3,"packages":{"":{"dependencies":{"@lpm.dev/acme.widget":"1.0.0"}},"node_modules/@lpm.dev/acme.widget":{"version":"1.0.0","resolved":"https://lpm.dev/api/registry/@lpm.dev/acme.widget/-/acme.widget-1.0.0.tgz"}}}"#,
+    );
+    seed_node_modules_package(
+        &project,
+        "@lpm.dev/acme.widget",
+        &[("index.js", "module.exports = 1;\n")],
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/acme.widget",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": { "1.0.0": { "name": "@lpm.dev/acme.widget", "version": "1.0.0" } }
+    })])
+    .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let front = support::tls_front::TlsFront::start(&mock, project.home());
+    let unreadable = project.home().join("missing-npm-ca.pem");
+    front.write_user_npmrc(
+        project.home(),
+        &format!("//registry.npmjs.org/:cafile={}\n", unreadable.display()),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &front.url,
+            "--json",
+            "audit",
+            "--fail-on=vuln",
+        ])
+        .output()
+        .expect("run lpm audit");
+    assert!(
+        output.status.success(),
+        "an audit that reads only the LPM registry must not load another registry's TLS files\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn audit_signatures_with_nothing_to_verify_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(r#"{"name":"empty-signatures","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
+    );
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "//lpm.dev/:cafile={}\n//registry.npmjs.org/:cafile={}\n",
+            project.home().join("missing-lpm-ca.pem").display(),
+            project.home().join("missing-npm-ca.pem").display()
+        ),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "signatures"])
+        .output()
+        .expect("run lpm audit signatures");
+    assert!(
+        output.status.success(),
+        "verifying no packages reads no registry\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn write_unreadable_registry_cafiles(project: &TempProject) {
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "//lpm.dev/:cafile={}\n//registry.npmjs.org/:cafile={}\n",
+            project.home().join("missing-lpm-ca.pem").display(),
+            project.home().join("missing-npm-ca.pem").display()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn audit_fix_with_nothing_to_fix_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(r#"{"name":"empty-fix","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
+    );
+    write_unreadable_registry_cafiles(&project);
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "fix", "--dry-run"])
+        .output()
+        .expect("run lpm audit fix");
+    assert!(
+        output.status.success(),
+        "fixing nothing reads no registry\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn audit_signatures_that_skips_every_package_does_not_load_registry_tls_settings() {
+    let project = TempProject::empty(
+        r#"{"name":"lpm-only-signatures","version":"1.0.0","dependencies":{"@lpm.dev/acme.widget":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+         [[packages]]\nname = \"@lpm.dev/acme.widget\"\nversion = \"1.0.0\"\n\
+         source = \"registry+https://lpm.dev\"\n",
+    );
+    write_unreadable_registry_cafiles(&project);
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "signatures"])
+        .output()
+        .expect("run lpm audit signatures");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "a first-party LPM package is skipped without a registry request\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(report.to_string().contains("acme.widget"), "{report}");
+}

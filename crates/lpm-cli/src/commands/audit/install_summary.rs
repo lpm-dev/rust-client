@@ -4,7 +4,7 @@ use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 
 use super::registry::registry_audit_result;
-use super::scan::run_scan;
+use super::scan::{RegistryAccess, run_scan};
 use super::types::{AuditCounts, summarize_findings};
 
 pub fn summarize_registry_install(
@@ -72,7 +72,7 @@ pub async fn run_install_summary(
 ) -> Result<Option<AuditCounts>, LpmError> {
     let started = std::time::Instant::now();
     let scan = run_scan(
-        client,
+        RegistryAccess::Configured(client),
         project_dir,
         store_version,
         /* json_output */ true,

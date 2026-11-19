@@ -128,6 +128,31 @@ async fn run_fix_inner(
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
     let root_index = LockfileRootIndex::new(Some(lockfile));
+    let reads = audit_fix_registry_reads(
+        project_dir,
+        &doc,
+        lockfile,
+        &root_index,
+        &vulns_by_instance,
+        &lpm_advisories,
+        client,
+    );
+    let read_context = if reads.lpm || reads.npm {
+        let context = crate::commands::registry_reads::prepare_registry_read_context(
+            client,
+            project_dir,
+            reads,
+        )?;
+        if !json_output {
+            context.announce();
+        }
+        Some(context)
+    } else {
+        None
+    };
+    let client = read_context
+        .as_ref()
+        .map_or(client, |context| &context.client);
     for dep in audit_fix_direct_deps_from_value(&doc) {
         let target_name = dep.target_name.as_str();
         let locked_package = match select_installed_direct_locked_package(
@@ -573,6 +598,50 @@ fn audit_fix_direct_deps_from_value(doc: &serde_json::Value) -> Vec<AuditFixDire
         }
     }
     deps
+}
+
+/// The registries the fix plan reads: a direct dependency with an advisory
+/// fetches its metadata from its recorded source, and an `@lpm.dev` package
+/// with a vulnerable npm dependency reads both registries.
+fn audit_fix_registry_reads(
+    project_dir: &Path,
+    doc: &serde_json::Value,
+    lockfile: &lpm_lockfile::Lockfile,
+    root_index: &LockfileRootIndex<'_>,
+    vulns_by_instance: &HashMap<(String, String), Vec<&OsvVulnerability>>,
+    lpm_advisories: &LpmDependencyAdvisories<'_>,
+    client: &RegistryClient,
+) -> crate::commands::registry_reads::RegistryReads {
+    let mut reads = crate::commands::registry_reads::RegistryReads::NONE;
+    for dep in audit_fix_direct_deps_from_value(doc) {
+        if dep.unsupported_reason.is_some() {
+            continue;
+        }
+        let Ok(locked_package) = select_installed_direct_locked_package(
+            project_dir,
+            lockfile,
+            root_index,
+            &dep.local_name,
+            &dep.target_name,
+        ) else {
+            continue;
+        };
+        if dep.target_name.starts_with("@lpm.dev/") {
+            if !lpm_advisories.of(locked_package).is_empty() {
+                reads.lpm = true;
+                reads.npm = true;
+            }
+        } else if vulns_by_instance
+            .contains_key(&(dep.target_name.clone(), locked_package.version.clone()))
+        {
+            match locked_package_npm_metadata_source(locked_package, client) {
+                Some(NpmMetadataSource::PublicNpm) => reads.npm = true,
+                Some(NpmMetadataSource::ConfiguredRegistry) => reads.lpm = true,
+                None => {}
+            }
+        }
+    }
+    reads
 }
 
 async fn fetch_audit_fix_metadata(

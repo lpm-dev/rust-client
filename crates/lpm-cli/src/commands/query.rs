@@ -283,8 +283,14 @@ pub async fn run(
     };
 
     let external_state = if requirements.vulnerabilities || requirements.deprecations {
-        load_external_package_state(client, project_root, &inv.discovery.packages, requirements)
-            .await?
+        load_external_package_state(
+            client,
+            project_root,
+            &inv.discovery.packages,
+            requirements,
+            json_output,
+        )
+        .await?
     } else {
         ExternalPackageState::default()
     };
@@ -855,6 +861,7 @@ async fn load_external_package_state(
     project_dir: &Path,
     packages: &[crate::commands::audit::discovery::DiscoveredPackage],
     requirements: QueryDataRequirements,
+    json_output: bool,
 ) -> Result<ExternalPackageState, LpmError> {
     if !requirements.vulnerabilities && !requirements.deprecations {
         return Ok(ExternalPackageState::default());
@@ -878,8 +885,13 @@ async fn load_external_package_state(
         }
     }
 
-    let registry_future =
-        load_registry_package_state(client, project_dir, &registry_pairs, requirements);
+    let registry_future = load_registry_package_state(
+        client,
+        project_dir,
+        &registry_pairs,
+        requirements,
+        json_output,
+    );
     let osv_future = async {
         if osv_pairs.is_empty() {
             Ok(HashMap::new())
@@ -908,6 +920,7 @@ async fn load_registry_package_state(
     project_dir: &Path,
     packages: &[(String, String)],
     requirements: QueryDataRequirements,
+    json_output: bool,
 ) -> Result<ExternalPackageState, LpmError> {
     if packages.is_empty() {
         return Ok(ExternalPackageState::default());
@@ -930,10 +943,17 @@ async fn load_registry_package_state(
         .filter(|(name, _)| name.starts_with("@lpm.dev/"))
         .cloned()
         .collect::<Vec<_>>();
+    let context = crate::commands::registry_reads::prepare_routed_read_context(
+        client,
+        project_dir,
+        &names,
+        json_output,
+    )?;
     let mut metadata = if lpm_names.is_empty() {
         HashMap::new()
     } else {
-        client
+        context
+            .client
             .batch_metadata_deep_with_release_age_packages_and_package_specs(
                 &lpm_names,
                 &[],
@@ -953,12 +973,6 @@ async fn load_registry_package_state(
         .filter(|name| !name.starts_with("@lpm.dev/"))
         .collect::<Vec<_>>();
     if !npm_names.is_empty() {
-        let context = crate::commands::registry_reads::prepare_routed_read_context(
-            client,
-            project_dir,
-            &npm_names,
-            true,
-        )?;
         let routed = futures::stream::iter(npm_names.iter().map(|name| {
             let context = &context;
             async move {

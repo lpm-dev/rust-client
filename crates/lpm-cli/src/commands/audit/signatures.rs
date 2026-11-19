@@ -17,13 +17,22 @@ pub async fn run_signatures(
     let inputs = registry_signature_inputs_from_discovery(discovery)?;
     let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
-    let report = crate::registry_signatures::verify_packages(
-        Arc::new(client.clone_with_config()),
+    let reads = crate::registry_signatures::registries_read(client, &route_table, &inputs);
+    let read_context = crate::commands::registry_reads::configure_registry_read_context(
+        client,
         route_table,
-        inputs,
-        true,
-    )
-    .await;
+        reads,
+    )?;
+    if !json_output {
+        read_context.announce();
+    }
+    let crate::commands::registry_reads::RoutedReadContext {
+        client,
+        route_table,
+    } = read_context;
+    let report =
+        crate::registry_signatures::verify_packages(Arc::new(client), route_table, inputs, true)
+            .await;
 
     if json_output {
         println!(
