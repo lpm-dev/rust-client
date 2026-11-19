@@ -139,3 +139,64 @@ async fn a_tarball_upload_to_storage_with_an_untrusted_certificate_fails_on_the_
     );
     assert_eq!(server.connections(), 1);
 }
+
+/// A registry that stores a publish and then redirects to `status_url`,
+/// answering the reconciliation probe with `stored` or a 404.
+async fn registry_redirecting_publishes_to(status_url: &str, stored: bool) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/owner.pkg"))
+        .respond_with(ResponseTemplate::new(303).insert_header("location", status_url))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let probe = if stored {
+        ResponseTemplate::new(200).set_body_string(test_metadata_json("@lpm.dev/owner.pkg"))
+    } else {
+        ResponseTemplate::new(404)
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/owner.pkg"))
+        .respond_with(probe)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn a_publish_whose_redirect_meets_an_untrusted_certificate_is_reconciled_and_not_replayed() {
+    let status = UntrustedHttpsServer::start().await;
+    let status_url = format!("{}/status", status.url);
+    let encoded_name = "@lpm.dev/owner.pkg";
+    let payload = lpm_http::ReplayableRequestBody::from_bytes(
+        serde_json::to_vec(&serde_json::json!({ "name": encoded_name })).unwrap(),
+    );
+
+    for stored in [true, false] {
+        let registry = registry_redirecting_publishes_to(&status_url, stored).await;
+        let connections_before = status.connections();
+        let (client, _tmp) = client_with_mock_server(&registry.uri());
+
+        let result = client
+            .with_token("publish-token")
+            .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
+            .await;
+
+        if stored {
+            let published = result.expect("the registry kept the publish before redirecting");
+            assert_eq!(published["name"], encoded_name);
+        } else {
+            assert_untrusted_certificate(
+                &result.expect_err("a publish the registry doesn't have must fail"),
+            );
+        }
+        assert_eq!(
+            status.connections() - connections_before,
+            1,
+            "stored={stored}: the publish must not be replayed into the same certificate"
+        );
+    }
+}

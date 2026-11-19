@@ -299,6 +299,9 @@ impl ReplayableHttpClientProvider for reqwest::Client {
 pub enum ReplayableRequestError<E> {
     Client(E),
     Request(reqwest::Error),
+    /// A request that failed after following at least one redirect, so an
+    /// earlier hop's server may already have acted on it.
+    RequestAfterRedirect(reqwest::Error),
     NonReplayableBody,
     TooManyRedirects,
     Timeout,
@@ -315,13 +318,23 @@ impl<E> ReplayableRequestError<E> {
     pub fn request(error: reqwest::Error) -> Self {
         Self::Request(error.without_url())
     }
+
+    fn request_after_redirects(error: reqwest::Error, redirects_followed: usize) -> Self {
+        if redirects_followed == 0 {
+            Self::request(error)
+        } else {
+            Self::RequestAfterRedirect(error.without_url())
+        }
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Client(error) => error.fmt(formatter),
-            Self::Request(error) => display_error(error).fmt(formatter),
+            Self::Request(error) | Self::RequestAfterRedirect(error) => {
+                display_error(error).fmt(formatter)
+            }
             Self::NonReplayableBody => formatter.write_str("request body cannot be replayed"),
             Self::TooManyRedirects => formatter.write_str("too many redirects"),
             Self::Timeout => formatter.write_str("request timed out"),
@@ -349,7 +362,7 @@ where
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Client(error) => Some(error),
-            Self::Request(error) => Some(error),
+            Self::Request(error) | Self::RequestAfterRedirect(error) => Some(error),
             Self::NonReplayableBody
             | Self::TooManyRedirects
             | Self::Timeout
@@ -449,10 +462,12 @@ where
             Some(deadline) => tokio::time::timeout_at(deadline, response_future)
                 .await
                 .map_err(|_| ReplayableRequestError::Timeout)?
-                .map_err(ReplayableRequestError::request)?,
-            None => response_future
-                .await
-                .map_err(ReplayableRequestError::request)?,
+                .map_err(|error| {
+                    ReplayableRequestError::request_after_redirects(error, redirects_followed)
+                })?,
+            None => response_future.await.map_err(|error| {
+                ReplayableRequestError::request_after_redirects(error, redirects_followed)
+            })?,
         };
         let Some((next_method, next_has_body)) =
             redirected_method_and_body(response.status(), &method, send_body)

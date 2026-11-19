@@ -670,11 +670,24 @@ impl RegistryClient {
                     }
                 }
                 Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
-                Err(lpm_http::ReplayableRequestError::Request(error)) => {
+                Err(
+                    failure @ (lpm_http::ReplayableRequestError::Request(_)
+                    | lpm_http::ReplayableRequestError::RequestAfterRedirect(_)),
+                ) => {
+                    let redirected = matches!(
+                        failure,
+                        lpm_http::ReplayableRequestError::RequestAfterRedirect(_)
+                    );
+                    let (lpm_http::ReplayableRequestError::Request(error)
+                    | lpm_http::ReplayableRequestError::RequestAfterRedirect(error)) = failure
+                    else {
+                        unreachable!("the arm matched one of the two request failures");
+                    };
                     let permanent = lpm_http::is_permanent_tls_failure(&error);
                     let error = LpmError::Network(lpm_http::error_chain(&error));
-                    // The handshake failed, so no server read the publish.
-                    if permanent {
+                    // A handshake refused on the first hop means the registry
+                    // never read the publish. After a redirect it may have.
+                    if permanent && !redirected {
                         return Err(error);
                     }
                     last_error = Some(error);
@@ -697,6 +710,10 @@ impl RegistryClient {
                         Err(probe_error) => {
                             return Err(ambiguous_publish_reconciliation_error(probe_error));
                         }
+                    }
+                    // Replaying the publish would meet the same certificate.
+                    if permanent {
+                        break;
                     }
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
@@ -880,7 +897,10 @@ impl RegistryClient {
                 {
                     Ok(response) => Ok(response),
                     Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
-                    Err(lpm_http::ReplayableRequestError::Request(error)) => Err(error),
+                    Err(
+                        lpm_http::ReplayableRequestError::Request(error)
+                        | lpm_http::ReplayableRequestError::RequestAfterRedirect(error),
+                    ) => Err(error),
                     Err(error) => return Err(LpmError::Network(error.to_string())),
                 }
             } else {
