@@ -513,6 +513,19 @@ tokio::task_local! {
     static ACTIVE_PROJECT_INSTALL_ROOT: PathBuf;
 }
 
+/// The root of the workspace whose lockfile this install runs under, a
+/// member's or the root's own, as the install discovered it.
+pub(crate) fn active_workspace_root() -> Option<PathBuf> {
+    ACTIVE_TARGET
+        .try_with(|target| target.coordinator.root.clone())
+        .ok()
+        .or_else(|| {
+            ACTIVE_TRANSACTION
+                .try_with(|transaction| transaction.root.clone())
+                .ok()
+        })
+}
+
 pub(crate) fn active_install_root() -> Option<PathBuf> {
     ACTIVE_TARGET
         .try_with(|target| target.coordinator.root.clone())

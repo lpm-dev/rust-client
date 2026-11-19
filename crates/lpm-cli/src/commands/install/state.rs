@@ -218,19 +218,6 @@ fn validated_lockfile_deps_for_freshness<'a>(
     Some((Cow::Owned(lockfile_deps), true))
 }
 
-/// Whether `package` names a catalog in `deps` or in its overrides or
-/// resolutions.
-fn names_a_catalog(package: &lpm_workspace::PackageJson, deps: &HashMap<String, String>) -> bool {
-    let is_catalog = |spec: &String| spec.starts_with("catalog:");
-    deps.values().any(is_catalog)
-        || package.overrides.values().any(is_catalog)
-        || package.resolutions.values().any(is_catalog)
-        || package
-            .lpm
-            .as_ref()
-            .is_some_and(|lpm| lpm.overrides.values().any(is_catalog))
-}
-
 pub(super) async fn run_install_freshness_phase(
     input: InstallFreshnessInput<'_>,
 ) -> Result<InstallFreshnessResult, LpmError> {
@@ -310,20 +297,16 @@ pub(super) async fn run_install_freshness_phase(
                         }
                         let route_table = route_table.as_ref()?;
                         // A plain install outside `--recursive` has no active
-                        // workspace, but the cold install applies the
-                        // workspace root's catalogs, overrides and resolutions.
-                        // A member keeps no lockfile of its own. Finding the
-                        // root reads no member manifest.
-                        let found_root = (workspace.is_none()
-                            && (!input.lockfile_path.exists()
-                                || names_a_catalog(input.package, &lockfile_deps)))
-                        .then(|| {
-                            lpm_workspace::find_workspace_root_package(input.project_dir)
-                                .ok()
-                                .flatten()
-                                .map(|(_, root)| root)
-                        })
-                        .flatten();
+                        // workspace, but a member or root still installs under
+                        // its workspace's lockfile, whose root's catalogs,
+                        // overrides and resolutions the cold install applies.
+                        let found_root = workspace
+                            .is_none()
+                            .then(workspace_lockfile::active_workspace_root)
+                            .flatten()
+                            .and_then(|root| {
+                                lpm_workspace::read_workspace_root_package(&root).ok()
+                            });
                         let workspace_root = workspace
                             .as_deref()
                             .map(|workspace| &workspace.root_package)
