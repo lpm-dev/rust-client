@@ -2911,10 +2911,23 @@ jobs:
           export_manifest_hash lpm-linux-x64 SHA_LINUX_X64
           echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
+      # The token reaches only homebrew-lpm, with only what the dispatch and
+      # the wait below need, and expires within the hour.
+      - name: Create a token for the Homebrew tap
+        id: tap-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: lpm-dev
+          repositories: homebrew-lpm
+          permission-contents: write
+          permission-actions: read
+
       - name: Dispatch correlated Homebrew update
         id: homebrew
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
         run: |
           set -euo pipefail
           correlation_id="rust-client-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -2946,7 +2959,7 @@ jobs:
         env:
           CORRELATION_ID: ${{ steps.homebrew.outputs.correlation_id }}
           DISPATCHED_AT: ${{ steps.homebrew.outputs.dispatched_at }}
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
         run: |
           set -euo pipefail
           run_id=

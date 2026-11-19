@@ -269,6 +269,28 @@ test("promotion waits for the correlated Homebrew update", () => {
   assert.match(promotion, /conclusion.*success/);
 });
 
+test("the Homebrew update reaches the tap only with a per-run app token scoped to it", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const job = jobsOf(workflow).find(([name]) => name === "update-homebrew")?.[1];
+  assert.ok(job, "missing update-homebrew job");
+
+  assert.doesNotMatch(workflow, /HOMEBREW_TAP_TOKEN/, "no job may use the long-lived tap token");
+  const mint = stepsOf(job).find((step) => step.startsWith("name: Create a token for the Homebrew tap"));
+  assert.ok(mint, "update-homebrew must mint its own tap token");
+  assert.match(mint, /uses: actions\/create-github-app-token@[0-9a-f]{40} #/);
+  assert.match(mint, /client-id: \$\{\{ vars\.HOMEBREW_APP_CLIENT_ID \}\}/);
+  assert.match(mint, /private-key: \$\{\{ secrets\.HOMEBREW_APP_PRIVATE_KEY \}\}/);
+  assert.match(mint, /owner: lpm-dev\n\s+repositories: homebrew-lpm\n/);
+  assert.match(mint, /permission-contents: write\n\s+permission-actions: read\n/);
+  assert.doesNotMatch(mint, /permission-(?!contents|actions)/, "the token needs no other permission");
+
+  const tokenUses = [...job.matchAll(/GH_TOKEN: (.+)/g)].map((match) => match[1]);
+  assert.ok(tokenUses.length >= 2, "the dispatch and the wait both need the tap token");
+  for (const use of tokenUses) {
+    assert.equal(use, "${{ steps.tap-token.outputs.token }}");
+  }
+});
+
 test("every SHA256SUMS.txt attestation passes the shipped self-update policy before anything else runs", () => {
   const workflow = read(".github/workflows/release.yml");
   const attestingJobs = jobsOf(workflow).filter(([, job]) =>
