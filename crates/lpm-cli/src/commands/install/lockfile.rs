@@ -1856,6 +1856,34 @@ fn lockfile_catalog_snapshots_match_rows(
         }
     }
 
+    let looked_up_as_root = |package_name: &str| {
+        deps.contains_key(package_name)
+            || lockfile.root_resolutions.contains_key(package_name)
+            || lockfile.metadata.lockfile_version
+                < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+    };
+    // An override's snapshot can name a package only other packages depend
+    // on. Gather the rows of every such package in one pass.
+    let transitive_names: HashSet<&str> = lockfile
+        .catalogs
+        .values()
+        .flat_map(|entries| entries.keys())
+        .map(String::as_str)
+        .filter(|package_name| !looked_up_as_root(package_name))
+        .collect();
+    let mut transitive_rows: HashMap<&str, Vec<&lpm_lockfile::LockedPackage>> =
+        HashMap::with_capacity(transitive_names.len());
+    if !transitive_names.is_empty() {
+        for &package in rows.packages {
+            if let Some(&package_name) = transitive_names.get(package.name.as_str()) {
+                transitive_rows
+                    .entry(package_name)
+                    .or_default()
+                    .push(package);
+            }
+        }
+    }
+
     for (catalog_name, entries) in &lockfile.catalogs {
         for (package_name, entry) in entries {
             let Some(resolution) = current_resolutions
@@ -1872,11 +1900,7 @@ fn lockfile_catalog_snapshots_match_rows(
                 .root_aliases
                 .get(package_name)
                 .map_or(package_name.as_str(), String::as_str);
-            let locked_package = if deps.contains_key(package_name)
-                || lockfile.root_resolutions.contains_key(package_name)
-                || lockfile.metadata.lockfile_version
-                    < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
-            {
+            let locked_package = if looked_up_as_root(package_name) {
                 let requested_spec = deps
                     .get(package_name)
                     .map_or(resolution.specifier.as_str(), String::as_str);
@@ -1888,14 +1912,14 @@ fn lockfile_catalog_snapshots_match_rows(
                     requested_spec,
                 )
             } else {
-                // An override's snapshot can name a package only other
-                // packages depend on. Its writer picked that package's best
-                // locked version for the catalog range.
+                // Its writer picked the package's best locked version for
+                // the catalog range.
                 best_locked_candidate(
-                    rows.packages
-                        .iter()
-                        .copied()
-                        .filter(|package| package.name == *package_name),
+                    transitive_rows
+                        .get(package_name.as_str())
+                        .into_iter()
+                        .flatten()
+                        .copied(),
                     lpm_resolver::NpmRange::parse(&resolution.specifier)
                         .ok()
                         .as_ref(),
@@ -1909,7 +1933,9 @@ fn lockfile_catalog_snapshots_match_rows(
 
     // The install records a snapshot for every catalog dependency it
     // installs, but for an override's catalog entry only when the override
-    // applied, which it doesn't to a direct dependency.
+    // changed a selection, which a lockfile alone can't tell. A changed
+    // catalog behind an override changes the importer snapshot, which sends
+    // a replay to fresh resolution, and the install hash, before this check.
     for resolution in catalog_resolutions.dependencies() {
         let selected_optional = lockfile
             .root_resolutions
