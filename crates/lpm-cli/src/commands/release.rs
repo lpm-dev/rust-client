@@ -490,11 +490,13 @@ async fn publish_intent_members(
     let has_lpm_target = members.iter().any(|member| member.intent.has_lpm_target());
     let has_npm_target = members.iter().any(|member| member.intent.has_npm_target());
     let publish_clients = publish::ReleasePublishClients::new(
+        client,
         has_npm_compatible_targets,
         has_lpm_target,
         has_npm_target,
         !options.dry_run,
-    )?;
+    )
+    .await?;
     let already_published = preflight_publish_members(client, &members, &publish_clients).await?;
     let mut workspace = refresh_release_publish_workspace(&initial_root, &members)?;
 

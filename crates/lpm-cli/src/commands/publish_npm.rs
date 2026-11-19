@@ -463,8 +463,10 @@ pub fn resolve_npm_tag(npm_config: Option<&NpmPublishConfig>) -> String {
         .to_string()
 }
 
-pub(crate) fn build_npm_publish_preflight_client() -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+pub(crate) fn build_npm_publish_preflight_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
@@ -699,11 +701,13 @@ fn reject_implicit_latest_downgrade(
     Ok(())
 }
 
-/// Publish a package to the npm registry.
+/// Publish a package to the npm registry, over a client with `tls`'s
+/// `.npmrc` TLS settings for `registry_url`.
 ///
 /// Handles OTP detection and retry, npm-specific error codes.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_to_npm(
+    tls: &lpm_registry::RegistryClient,
     token: &str,
     npm_name: &str,
     version: &str,
@@ -733,14 +737,14 @@ pub async fn publish_to_npm(
         json_output,
         yes,
         NpmPublishRuntime::production(),
-        None,
+        NpmPublishClientSource::Build(tls),
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_to_npm_with_clients(
-    clients: &NpmPublishClients,
+    clients: &NpmRegistryClients,
     token: &str,
     npm_name: &str,
     version: &str,
@@ -770,17 +774,79 @@ pub(crate) async fn publish_to_npm_with_clients(
         json_output,
         yes,
         NpmPublishRuntime::production(),
-        Some(clients),
+        NpmPublishClientSource::Shared(clients),
     )
     .await
 }
 
-pub(crate) struct NpmPublishClients {
-    request: reqwest::Client,
+/// HTTP clients for npm-compatible registries, one per origin, each built
+/// on first use with that registry's `.npmrc` TLS settings, so a release
+/// reuses connections across its packages without one registry's
+/// certificate authority deciding another's trust.
+pub(crate) struct NpmRegistryClients {
+    tls: lpm_registry::RegistryClient,
+    build: fn(reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError>,
+    clients: tokio::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
 }
 
-pub(crate) fn build_npm_publish_clients() -> Result<NpmPublishClients, LpmError> {
-    build_npm_publish_clients_with_timeout(Duration::from_secs(600))
+impl NpmRegistryClients {
+    pub(crate) fn new(
+        tls: &lpm_registry::RegistryClient,
+        build: fn(reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError>,
+    ) -> Self {
+        Self {
+            tls: tls.clone_with_config(),
+            build,
+            clients: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The release's shared npm publish clients.
+    pub(crate) fn for_publishing(tls: &lpm_registry::RegistryClient) -> Self {
+        Self::new(tls, |builder| {
+            build_npm_publish_request_client(builder, Duration::from_secs(600))
+        })
+    }
+
+    pub(crate) fn tls(&self) -> &lpm_registry::RegistryClient {
+        &self.tls
+    }
+
+    pub(crate) async fn for_registry(
+        &self,
+        registry_url: &str,
+    ) -> Result<reqwest::Client, LpmError> {
+        let origin = reqwest::Url::parse(registry_url).map_or_else(
+            |_| registry_url.to_string(),
+            |url| url.origin().ascii_serialization(),
+        );
+        let mut clients = self.clients.lock().await;
+        if let Some(client) = clients.get(&origin) {
+            return Ok(client.clone());
+        }
+        let client = (self.build)(self.tls.tls_client_builder_for(registry_url).await?)?;
+        clients.insert(origin, client.clone());
+        Ok(client)
+    }
+}
+
+/// Where an npm publish gets its HTTP client.
+#[derive(Clone, Copy)]
+enum NpmPublishClientSource<'a> {
+    /// A release's clients, shared across its packages.
+    Shared(&'a NpmRegistryClients),
+    /// Built for this publish with the registry client's `.npmrc` TLS
+    /// settings.
+    Build(&'a lpm_registry::RegistryClient),
+}
+
+impl NpmPublishClientSource<'_> {
+    fn tls(&self) -> &lpm_registry::RegistryClient {
+        match self {
+            Self::Shared(clients) => clients.tls(),
+            Self::Build(tls) => tls,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -831,7 +897,7 @@ async fn publish_to_npm_impl(
     json_output: bool,
     yes: bool,
     runtime: NpmPublishRuntime,
-    shared_clients: Option<&NpmPublishClients>,
+    clients: NpmPublishClientSource<'_>,
 ) -> Result<NpmPublishResult, LpmError> {
     let start = std::time::Instant::now();
 
@@ -865,14 +931,13 @@ async fn publish_to_npm_impl(
     let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    let owned_clients;
-    let clients = if let Some(clients) = shared_clients {
-        clients
-    } else {
-        owned_clients = build_npm_publish_clients_with_timeout(timeout)?;
-        &owned_clients
+    let client = &match clients {
+        NpmPublishClientSource::Shared(shared) => shared.for_registry(registry_url).await?,
+        NpmPublishClientSource::Build(tls) => build_npm_publish_request_client(
+            tls.tls_client_builder_for(registry_url).await?,
+            timeout,
+        )?,
     };
-    let client = &clients.request;
 
     let encoded_name = urlencoding::encode(npm_name);
     let registry_url = registry_url.trim_end_matches('/');
@@ -911,6 +976,7 @@ async fn publish_to_npm_impl(
             }
 
             let otp = web_auth::complete_web_auth_challenge(
+                clients.tls(),
                 &challenge,
                 "publish",
                 json_output,
@@ -964,9 +1030,10 @@ async fn publish_to_npm_impl(
     handle_npm_response(response, token, npm_name, version, start).await
 }
 
-fn build_npm_publish_clients_with_timeout(
+fn build_npm_publish_request_client(
+    builder: reqwest::ClientBuilder,
     timeout: Duration,
-) -> Result<NpmPublishClients, LpmError> {
+) -> Result<reqwest::Client, LpmError> {
     #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
     if let Ok(path) = std::env::var(NPM_PUBLISH_CLIENT_BUILD_MARKER_ENV) {
         use std::io::Write as _;
@@ -977,13 +1044,12 @@ fn build_npm_publish_clients_with_timeout(
             .map_err(LpmError::Io)?;
         writeln!(marker, "build").map_err(LpmError::Io)?;
     }
-    let request = lpm_http::client_builder()
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
-        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
-    Ok(NpmPublishClients { request })
+        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
 }
 
 fn npm_publish_request(
@@ -1295,7 +1361,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect_err("an LPM credential must be rejected");
@@ -1316,7 +1382,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = build_npm_publish_preflight_client().unwrap();
+        let client = build_npm_publish_preflight_client(lpm_http::client_builder()).unwrap();
 
         let outcome = preflight_npm_publish_version_with_client(
             &client,
@@ -1344,7 +1410,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = build_npm_publish_preflight_client().unwrap();
+        let client = build_npm_publish_preflight_client(lpm_http::client_builder()).unwrap();
 
         let error = preflight_npm_publish_version_with_client(
             &client,
@@ -1439,7 +1505,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect("publish should succeed");
@@ -1496,7 +1562,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect("registry rejection is represented in the publish result");
@@ -1546,7 +1612,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect("same-origin 307 should replay npm publish");
@@ -1623,7 +1689,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect("cross-origin 303 should complete without forwarding credentials");
@@ -1669,7 +1735,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect_err("oversized npm response must be rejected");
@@ -1707,7 +1773,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect("publish should succeed");
@@ -1769,7 +1835,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .expect("publish should complete after web-auth OTP retry");
@@ -1847,7 +1913,7 @@ mod tests {
             true,
             false,
             NpmPublishRuntime::test(),
-            None,
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
         )
         .await
         .unwrap_err();

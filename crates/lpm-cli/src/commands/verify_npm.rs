@@ -52,7 +52,7 @@ enum Cleanup {
 
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
     let npm_token = npm_auth::resolve_token_auth()?;
-    let http = npm_http_client()?;
+    let http = npm_http_client(client.tls_client_builder_for(NPM_REGISTRY_URL).await?)?;
 
     let npm_username = npm_whoami(&http, NPM_REGISTRY_URL, npm_token.token()).await?;
     if !json_output {
@@ -81,6 +81,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         install_ui::phase_untrusted(&format!("Publishing {package_name}@{version} to npm"));
     }
     let published = publish_npm::publish_to_npm(
+        client,
         npm_token.token(),
         &package_name,
         &version,
@@ -115,6 +116,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         let removed = if existed {
             unpublish_npm_version(
                 &http,
+                client,
                 NPM_REGISTRY_URL,
                 &package_name,
                 &version,
@@ -125,6 +127,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         } else {
             unpublish_npm_package(
                 &http,
+                client,
                 NPM_REGISTRY_URL,
                 &package_name,
                 npm_token.token(),
@@ -159,8 +162,8 @@ fn proof_is_final(error: &LpmError) -> bool {
     registry_code(error).is_some_and(|code| FINAL_CODES.contains(&code))
 }
 
-fn npm_http_client() -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+fn npm_http_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(NPM_REQUEST_TIMEOUT)
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
@@ -386,8 +389,10 @@ fn revision_of(document: &serde_json::Value, package_name: &str) -> Result<Strin
 }
 
 /// Sends an npm write, answering npm's ask for the account's second factor
-/// once and keeping the code for the writes after it.
+/// once and keeping the code for the writes after it. A browser challenge's
+/// polling uses `tls`'s `.npmrc` TLS settings.
 async fn send_npm_write(
+    tls: &RegistryClient,
     request: impl Fn(Option<&str>) -> reqwest::RequestBuilder,
     registry_url: &str,
     package_name: &str,
@@ -429,6 +434,7 @@ async fn send_npm_write(
     let code = match challenge {
         Some(challenge) => {
             web_auth::complete_web_auth_challenge(
+                tls,
                 &challenge,
                 "unpublish",
                 json_output,
@@ -459,6 +465,7 @@ fn npm_write_refused(package_name: &str, status: reqwest::StatusCode) -> LpmErro
 /// does: reads its revision, then deletes that revision.
 async fn unpublish_npm_package(
     http: &reqwest::Client,
+    tls: &RegistryClient,
     registry_url: &str,
     package_name: &str,
     token: &str,
@@ -476,6 +483,7 @@ async fn unpublish_npm_package(
         urlencoding::encode(&revision)
     );
     send_npm_write(
+        tls,
         |otp| npm_write(http.delete(&url), token, otp),
         registry_url,
         package_name,
@@ -491,6 +499,7 @@ async fn unpublish_npm_package(
 /// Only the registry's own host gets the token.
 async fn unpublish_npm_version(
     http: &reqwest::Client,
+    tls: &RegistryClient,
     registry_url: &str,
     package_name: &str,
     version: &str,
@@ -514,7 +523,8 @@ async fn unpublish_npm_version(
         return Ok(());
     };
     if versions.is_empty() {
-        return unpublish_npm_package(http, registry_url, package_name, token, json_output).await;
+        return unpublish_npm_package(http, tls, registry_url, package_name, token, json_output)
+            .await;
     }
     let remaining_highest = versions
         .keys()
@@ -556,6 +566,7 @@ async fn unpublish_npm_version(
         urlencoding::encode(&revision)
     );
     send_npm_write(
+        tls,
         |code| npm_write(http.put(&document_url).json(&document), token, code),
         registry_url,
         package_name,
@@ -572,6 +583,7 @@ async fn unpublish_npm_version(
         urlencoding::encode(&revision_of(&updated, package_name)?)
     );
     send_npm_write(
+        tls,
         |code| npm_write(http.delete(&tarball_url), token, code),
         registry_url,
         package_name,
@@ -908,9 +920,13 @@ mod tests {
             .mount(&npm)
             .await;
 
-        let name = npm_whoami(&npm_http_client().unwrap(), &npm.uri(), "npm_token")
-            .await
-            .unwrap();
+        let name = npm_whoami(
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &npm.uri(),
+            "npm_token",
+        )
+        .await
+        .unwrap();
         assert_eq!(name, "tootallnate");
     }
 
@@ -923,9 +939,13 @@ mod tests {
             .mount(&npm)
             .await;
 
-        let error = npm_whoami(&npm_http_client().unwrap(), &npm.uri(), "stale")
-            .await
-            .unwrap_err();
+        let error = npm_whoami(
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &npm.uri(),
+            "stale",
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("lpm login --npm"));
     }
 
@@ -952,7 +972,8 @@ mod tests {
             .await;
 
         unpublish_npm_package(
-            &npm_http_client().unwrap(),
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &RegistryClient::new(),
             &npm.uri(),
             "@me/lpm-verify",
             "npm_token",
@@ -972,7 +993,8 @@ mod tests {
             .await;
 
         unpublish_npm_package(
-            &npm_http_client().unwrap(),
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &RegistryClient::new(),
             &npm.uri(),
             "@me/lpm-verify",
             "npm_token",
@@ -1000,7 +1022,8 @@ mod tests {
             .await;
 
         let error = unpublish_npm_package(
-            &npm_http_client().unwrap(),
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &RegistryClient::new(),
             &npm.uri(),
             "@me/lpm-verify",
             "npm_token",
@@ -1144,7 +1167,8 @@ mod tests {
             .await;
 
         unpublish_npm_version(
-            &npm_http_client().unwrap(),
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &RegistryClient::new(),
             &npm.uri(),
             "@me/lpm-verify",
             "1.0.99",
@@ -1200,7 +1224,8 @@ mod tests {
             .await;
 
         unpublish_npm_version(
-            &npm_http_client().unwrap(),
+            &npm_http_client(lpm_http::client_builder()).unwrap(),
+            &RegistryClient::new(),
             &npm.uri(),
             "@me/lpm-verify",
             "1.0.99",

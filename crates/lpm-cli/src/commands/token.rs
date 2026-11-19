@@ -62,6 +62,7 @@ pub async fn run_rotate(
         approval: "rotate this token",
     };
     let sent = send_with_second_factor(
+        client,
         &change,
         registry_url,
         otp.as_ref(),

@@ -140,6 +140,7 @@ async fn approval_step_up(
     )
     .await?;
     let token = crate::commands::web_auth::complete_lpm_browser_approval(
+        client,
         &approval.auth_url,
         &approval.done_url,
         client.base_url(),

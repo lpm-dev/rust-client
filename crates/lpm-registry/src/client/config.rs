@@ -208,6 +208,36 @@ impl RegistryClient {
         })
     }
 
+    /// A client builder that trusts `tls`'s roots, keeps its `strict-ssl`
+    /// setting and presents `identity`, with nothing else configured.
+    pub(super) fn tls_client_builder(
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> Result<reqwest::ClientBuilder, LpmError> {
+        let roots = Self::prepare_tls_roots(tls)?;
+        Ok(Self::apply_tls_settings(
+            roots.client_builder(),
+            tls,
+            identity,
+        ))
+    }
+
+    fn apply_tls_settings(
+        mut builder: reqwest::ClientBuilder,
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> reqwest::ClientBuilder {
+        if let Some(tagged) = tls.strict_ssl.as_ref()
+            && !tagged.value
+        {
+            builder = builder.tls_danger_accept_invalid_certs(true);
+        }
+        if let Some(identity) = identity {
+            builder = builder.identity(identity);
+        }
+        builder
+    }
+
     fn prepare_tls_roots(tls: &TlsOverrides) -> Result<TrustedRoots, LpmError> {
         let mut certificates = Vec::with_capacity(tls.extra_roots.len());
         for root in &tls.extra_roots {
@@ -280,14 +310,7 @@ impl RegistryClient {
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
         }
-        if let Some(tagged) = tls.strict_ssl.as_ref()
-            && !tagged.value
-        {
-            b = b.tls_danger_accept_invalid_certs(true);
-        }
-        if let Some(id) = identity {
-            b = b.identity(id);
-        }
+        b = Self::apply_tls_settings(b, tls, identity);
         b.build().map_err(|e| {
             let chain: Vec<String> =
                 std::iter::successors(Some(&e as &dyn std::error::Error), |err| err.source())
@@ -572,6 +595,16 @@ impl RegistryClient {
     ///
     /// **Orthogonal to `--insecure`.** That flag widens scheme acceptance
     /// (HTTP non-localhost); this widens cert verification.
+    /// A client builder for requests to `url` with this client's `.npmrc`
+    /// TLS settings for `url`'s origin, for a request that needs its own
+    /// redirect policy or timeouts. See [`HttpClients::tls_client_builder_for`].
+    pub async fn tls_client_builder_for(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::ClientBuilder, LpmError> {
+        self.http.tls_client_builder_for(url).await
+    }
+
     pub fn with_tls_overrides(self, tls: &TlsOverrides) -> Result<Self, LpmError> {
         // Empty effective set → no eager per-origin clients. Δ1 default.
         self.with_tls_overrides_for(tls, &[])

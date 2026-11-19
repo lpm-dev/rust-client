@@ -188,7 +188,10 @@ pub async fn run(
         install_ui::phase("Exchanging authorization code");
     }
     let exchange_url = format!("{registry_url}/api/cli/exchange");
-    let http_client = exchange_client(std::time::Duration::from_secs(30))?;
+    let http_client = exchange_client(
+        client.tls_client_builder_for(&exchange_url).await?,
+        std::time::Duration::from_secs(30),
+    )?;
     let body = exchange_authorization_code(
         &http_client,
         &exchange_url,
@@ -310,8 +313,11 @@ fn retry_after_wait(retry_after: Option<&str>) -> std::time::Duration {
         .min(EXCHANGE_RETRY_MAX_WAIT)
 }
 
-fn exchange_client(timeout: std::time::Duration) -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+fn exchange_client(
+    builder: reqwest::ClientBuilder,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()
@@ -771,13 +777,16 @@ mod tests {
             .respond_with(ResponseTemplate::new(307).insert_header("location", destination.uri()))
             .mount(&source)
             .await;
-        let response = exchange_client(std::time::Duration::from_secs(1))
-            .unwrap()
-            .post(source.uri())
-            .json(&serde_json::json!({"code":"secret-code", "code_verifier":"secret-verifier"}))
-            .send()
-            .await
-            .unwrap();
+        let response = exchange_client(
+            lpm_http::client_builder(),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+        .post(source.uri())
+        .json(&serde_json::json!({"code":"secret-code", "code_verifier":"secret-verifier"}))
+        .send()
+        .await
+        .unwrap();
         assert!(response.status().is_redirection());
         assert!(destination.received_requests().await.unwrap().is_empty());
     }
@@ -800,7 +809,11 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             });
-            let client = exchange_client(std::time::Duration::from_millis(50)).unwrap();
+            let client = exchange_client(
+                lpm_http::client_builder(),
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 match client.post(format!("http://{address}")).send().await {
                     Ok(response) => read_capped_exchange_body(response).await.map(|_| ()),
@@ -845,7 +858,11 @@ mod tests {
             ResponseTemplate::new(200).set_body_json(valid_exchange_session()),
         ])
         .await;
-        let client = exchange_client(std::time::Duration::from_secs(5)).unwrap();
+        let client = exchange_client(
+            lpm_http::client_builder(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
 
         let body = exchange_authorization_code(
             &client,
@@ -881,7 +898,11 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = exchange_client(std::time::Duration::from_secs(5)).unwrap();
+        let client = exchange_client(
+            lpm_http::client_builder(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         let started = std::time::Instant::now();
 
         let error = exchange_authorization_code(
@@ -931,7 +952,11 @@ mod tests {
             ResponseTemplate::new(200).set_body_json(valid_exchange_session()),
         ])
         .await;
-        let client = exchange_client(std::time::Duration::from_secs(5)).unwrap();
+        let client = exchange_client(
+            lpm_http::client_builder(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
 
         let error = exchange_authorization_code(
             &client,

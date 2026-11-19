@@ -1434,6 +1434,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 project_relative_path(&invocation_dir, &cwd, &path)
             });
 
+            let client = commands::registry_reads::registry_client_for_directory(
+                &client,
+                &cwd,
+                commands::registry_reads::RegistryReads::NONE,
+                cli.json,
+            )?;
             // OIDC auto-exchange happens inside publish::run after package.json
             // is parsed — the origin requires `package` for `scope=publish`.
             commands::publish::run(
@@ -1538,6 +1544,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                         no_provenance,
                         provenance_file,
                     };
+                    let client = commands::registry_reads::registry_client_for_directory(
+                        &client,
+                        &cwd,
+                        commands::registry_reads::RegistryReads::NONE,
+                        cli.json,
+                    )?;
                     commands::release::publish(&client, &cwd, &selection, &options, cli.json).await
                 }
             }
@@ -1556,6 +1568,12 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let cwd = package_root_for(&invocation_dir, cli.json);
+            let tls = commands::registry_reads::registry_client_for_directory(
+                &client,
+                &cwd,
+                commands::registry_reads::RegistryReads::NONE,
+                cli.json,
+            )?;
             match command {
                 StageCommands::Publish {
                     tag,
@@ -1574,6 +1592,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         project_relative_path(&invocation_dir, &cwd, &path)
                     });
                     commands::stage::publish_current_project(
+                        &tls,
                         &cwd,
                         commands::stage::StagePublishOptions {
                             tag: tag.as_deref(),
@@ -1597,6 +1616,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     npm_registry,
                 } => {
                     commands::stage::list(
+                        &tls,
                         &cwd,
                         package.as_deref(),
                         npm_registry.as_deref(),
@@ -1609,6 +1629,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     npm_registry,
                 } => {
                     commands::stage::view(
+                        &tls,
                         &cwd,
                         &stage_id,
                         npm_registry.as_deref(),
@@ -1622,6 +1643,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     npm_registry,
                 } => {
                     commands::stage::approve(
+                        &tls,
                         &cwd,
                         &stage_id,
                         otp.as_deref(),
@@ -1637,6 +1659,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     npm_registry,
                 } => {
                     commands::stage::reject(
+                        &tls,
                         &cwd,
                         &stage_id,
                         otp.as_deref(),
@@ -1651,6 +1674,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     npm_registry,
                 } => {
                     commands::stage::download(
+                        &tls,
                         &cwd,
                         &stage_id,
                         npm_registry.as_deref(),
@@ -1670,7 +1694,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 save_env_token,
             } = args;
             if npm {
-                commands::third_party_login::run_npm(token, cli.json).await
+                commands::third_party_login::run_npm(&client, token, cli.json).await
             } else if github {
                 commands::third_party_login::run_github(token, save_env_token, cli.json)
             } else if gitlab {
@@ -1683,6 +1707,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     .registry
                     .as_deref()
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+                let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
                 commands::login::run(&client, registry, cli.json).await
             }
         }
@@ -1707,8 +1732,15 @@ async fn async_main(cli: Cli) -> Result<()> {
                 .registry
                 .as_deref()
                 .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+            let revoke_client;
+            let client = if revoke {
+                revoke_client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
+                &revoke_client
+            } else {
+                &client
+            };
             commands::logout::run(
-                &client,
+                client,
                 &session,
                 registry,
                 revoke,
@@ -1737,6 +1769,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                     commands::setup::CiSetupTarget::Npmrc => {
                         let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
                         let npmrc_dir = npmrc_project_dir(&cwd, cli.json);
+                        let client = commands::registry_reads::registry_client_for_directory(
+                            &client,
+                            &cwd,
+                            commands::registry_reads::RegistryReads::LPM,
+                            cli.json,
+                        )?;
                         commands::setup::run(
                             &client,
                             &session,
@@ -1761,13 +1799,21 @@ async fn async_main(cli: Cli) -> Result<()> {
             SetupAction::Local { days } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 let npmrc_dir = npmrc_project_dir(&cwd, cli.json);
+                let client = commands::registry_reads::registry_client_for_directory(
+                    &client,
+                    &cwd,
+                    commands::registry_reads::RegistryReads::LPM,
+                    cli.json,
+                )?;
                 commands::npmrc::run(&client, &npmrc_dir, registry_url, days, cli.json).await
             }
         },
         Commands::TokenRotate(args) => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
             commands::token::run_rotate(&client, registry_url, args.otp, cli.json).await
         }
         Commands::Unpublish(args) => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
             commands::unpublish::run(
                 &client,
                 registry_url,
@@ -1779,6 +1825,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             .await
         }
         Commands::Deprecate(args) => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
             commands::deprecate::run_deprecate(
                 &client,
                 registry_url,
@@ -1790,6 +1837,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             .await
         }
         Commands::Undeprecate(args) => {
+            let client = commands::registry_reads::registry_client_for_current_directory(&client, cli.json)?;
             commands::deprecate::run_undeprecate(
                 &client,
                 registry_url,

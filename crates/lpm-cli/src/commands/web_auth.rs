@@ -133,7 +133,10 @@ pub async fn fetch_npm_web_login_challenge(
     parse_web_login_response(&body, registry_url)
 }
 
+/// `tls` is the registry client whose `.npmrc` TLS settings the polling
+/// requests use.
 pub async fn complete_web_auth_challenge(
+    tls: &lpm_registry::RegistryClient,
     challenge: &WebAuthChallenge,
     action: &str,
     json_output: bool,
@@ -162,7 +165,7 @@ pub async fn complete_web_auth_challenge(
         install_ui::phase("Waiting for browser authentication");
     }
 
-    poll_for_web_auth_token(&challenge.done_url, timeout, poll_interval).await
+    poll_for_web_auth_token(tls, &challenge.done_url, timeout, poll_interval).await
 }
 
 /// How long the user has to approve an lpm.dev request in the browser.
@@ -173,6 +176,7 @@ const LPM_APPROVAL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// passkey or authenticator: shows and opens `auth_url`, then waits on
 /// `done_url` for the one-time token the request is sent with.
 pub async fn complete_lpm_browser_approval(
+    tls: &lpm_registry::RegistryClient,
     auth_url: &str,
     done_url: &str,
     registry_url: &str,
@@ -195,6 +199,7 @@ pub async fn complete_lpm_browser_approval(
     }
     install_ui::phase("Waiting for your approval");
     poll_for_token(
+        tls,
         &challenge.done_url,
         LPM_APPROVAL_TIMEOUT,
         LPM_APPROVAL_POLL_INTERVAL,
@@ -204,24 +209,36 @@ pub async fn complete_lpm_browser_approval(
 }
 
 pub async fn poll_for_web_auth_token(
+    tls: &lpm_registry::RegistryClient,
     done_url: &str,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<String, LpmError> {
-    poll_for_token(done_url, timeout, poll_interval, "npm web authentication").await
+    poll_for_token(
+        tls,
+        done_url,
+        timeout,
+        poll_interval,
+        "npm web authentication",
+    )
+    .await
 }
 
 /// Polls `done_url` until it gives a token: 202 while pending, 200 with
 /// `{ token }` once approved, 410 once denied or expired. `label` names the
 /// flow in errors.
 async fn poll_for_token(
+    tls: &lpm_registry::RegistryClient,
     done_url: &str,
     timeout: Duration,
     poll_interval: Duration,
     label: &str,
 ) -> Result<String, LpmError> {
     let expected_url = validate_web_auth_url(done_url, "doneUrl")?;
-    let client = build_web_auth_client(timeout)?;
+    let client = build_web_auth_client(
+        tls.tls_client_builder_for(expected_url.as_str()).await?,
+        timeout,
+    )?;
     let started_at = Instant::now();
 
     loop {
@@ -331,8 +348,11 @@ async fn poll_for_token(
     }
 }
 
-fn build_web_auth_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+fn build_web_auth_client(
+    builder: reqwest::ClientBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
@@ -569,6 +589,7 @@ mod tests {
             .await;
 
         let token = poll_for_web_auth_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_secs(1),
             Duration::from_millis(1),
@@ -592,6 +613,7 @@ mod tests {
             .await;
 
         let error = poll_for_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_secs(5),
             Duration::from_millis(1),
@@ -618,6 +640,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = poll_for_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_secs(30),
             Duration::from_millis(1),
@@ -665,6 +688,7 @@ mod tests {
             .await;
 
         let token = poll_for_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_secs(5),
             Duration::from_millis(1),
@@ -680,6 +704,7 @@ mod tests {
     #[tokio::test]
     async fn complete_lpm_browser_approval_refuses_a_done_url_outside_the_registry() {
         let error = complete_lpm_browser_approval(
+            &lpm_registry::RegistryClient::new(),
             "https://lpm.dev/cli/approve/approval-1",
             "https://elsewhere.example/api/auth/cli-approvals/approval-1/secret",
             "https://lpm.dev",
@@ -716,6 +741,7 @@ mod tests {
             .await;
 
         let error = poll_for_web_auth_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", registry.uri()),
             Duration::from_secs(1),
             Duration::from_millis(1),
@@ -747,6 +773,7 @@ mod tests {
             .await;
 
         let err = poll_for_web_auth_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_millis(10),
             Duration::from_millis(1),
@@ -779,6 +806,7 @@ mod tests {
         });
 
         let err = poll_for_web_auth_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("https://127.0.0.1:{port}/poll-secret-value"),
             Duration::from_secs(2),
             Duration::from_millis(1),
@@ -810,6 +838,7 @@ mod tests {
             .await;
 
         let error = poll_for_web_auth_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_secs(1),
             Duration::from_millis(1),
@@ -835,6 +864,7 @@ mod tests {
 
         let started = Instant::now();
         let error = poll_for_web_auth_token(
+            &lpm_registry::RegistryClient::new(),
             &format!("{}/done", server.uri()),
             Duration::from_millis(25),
             Duration::from_millis(1),

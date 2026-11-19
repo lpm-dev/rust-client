@@ -45,11 +45,25 @@ impl NpmAuth {
     }
 }
 
+/// Where an npm Trusted Publishing exchange gets its HTTP client.
+#[derive(Clone, Copy)]
+enum OidcExchangeClient<'a> {
+    /// One a release shares across its packages.
+    Shared(&'a reqwest::Client),
+    /// Built for the exchange with this registry client's `.npmrc` TLS
+    /// settings.
+    Build(&'a lpm_registry::RegistryClient),
+}
+
+/// `tls` is the registry client whose `.npmrc` TLS settings a Trusted
+/// Publishing exchange uses.
 pub(crate) async fn resolve_publish_auth(
+    tls: &lpm_registry::RegistryClient,
     npm_name: &str,
     registry_url: &str,
 ) -> Result<NpmAuth, LpmError> {
     resolve_publish_auth_with_policy(
+        tls,
         npm_name,
         registry_url,
         NpmRegistryAuthPolicy::RequireRegistryScopedToken,
@@ -67,26 +81,33 @@ pub(crate) async fn resolve_publish_auth_with_oidc_context(
         npm_name,
         registry_url,
         NpmRegistryAuthPolicy::RequireRegistryScopedToken,
-        Some(oidc_client),
+        OidcExchangeClient::Shared(oidc_client),
         Some(provider_jwt),
     )
     .await
 }
 
 pub(crate) async fn resolve_publish_auth_with_policy(
+    tls: &lpm_registry::RegistryClient,
     npm_name: &str,
     registry_url: &str,
     policy: NpmRegistryAuthPolicy,
 ) -> Result<NpmAuth, LpmError> {
-    resolve_publish_auth_with_policy_and_oidc_client(npm_name, registry_url, policy, None, None)
-        .await
+    resolve_publish_auth_with_policy_and_oidc_client(
+        npm_name,
+        registry_url,
+        policy,
+        OidcExchangeClient::Build(tls),
+        None,
+    )
+    .await
 }
 
 async fn resolve_publish_auth_with_policy_and_oidc_client(
     npm_name: &str,
     registry_url: &str,
     policy: NpmRegistryAuthPolicy,
-    oidc_client: Option<&reqwest::Client>,
+    oidc_client: OidcExchangeClient<'_>,
     provider_jwt: Option<&tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>>,
 ) -> Result<NpmAuth, LpmError> {
     if oidc::npm_trusted_publish_jwt_available() {
@@ -192,8 +213,10 @@ fn normalized_registry_url(registry_url: &str) -> String {
     registry_url.trim_end_matches('/').to_string()
 }
 
-pub(crate) fn build_npm_oidc_exchange_client() -> Result<reqwest::Client, LpmError> {
-    lpm_http::client_builder()
+pub(crate) fn build_npm_oidc_exchange_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, LpmError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
@@ -204,7 +227,7 @@ pub(crate) fn build_npm_oidc_exchange_client() -> Result<reqwest::Client, LpmErr
 async fn exchange_trusted_publish_token(
     npm_name: &str,
     registry_url: &str,
-    shared_client: Option<&reqwest::Client>,
+    oidc_client: OidcExchangeClient<'_>,
     provider_jwt: Option<&tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>>,
 ) -> Result<String, LpmError> {
     let owned_jwt;
@@ -216,14 +239,15 @@ async fn exchange_trusted_publish_token(
         owned_jwt = oidc::resolve_npm_trusted_publish_jwt().await?;
         &owned_jwt
     };
-    let owned_client;
-    let client = if let Some(client) = shared_client {
-        client
-    } else {
-        owned_client = build_npm_oidc_exchange_client()?;
-        &owned_client
-    };
     let url = npm_oidc_exchange_url(registry_url, npm_name);
+    let owned_client;
+    let client = match oidc_client {
+        OidcExchangeClient::Shared(client) => client,
+        OidcExchangeClient::Build(tls) => {
+            owned_client = build_npm_oidc_exchange_client(tls.tls_client_builder_for(&url).await?)?;
+            &owned_client
+        }
+    };
 
     let response = client
         .post(url)
@@ -390,9 +414,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = resolve_publish_auth("@scope/pkg", &server.uri())
-            .await
-            .expect("OIDC exchange should resolve npm auth");
+        let auth = resolve_publish_auth(
+            &lpm_registry::RegistryClient::new(),
+            "@scope/pkg",
+            &server.uri(),
+        )
+        .await
+        .expect("OIDC exchange should resolve npm auth");
 
         assert_eq!(auth.token(), "short-lived-npm-token");
         assert_eq!(auth.source(), NpmAuthSource::Oidc);
@@ -410,10 +438,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = exchange_trusted_publish_token("@scope/pkg", &server.uri(), None, None)
-            .await
-            .expect_err("the reflected JWT response must fail")
-            .to_string();
+        let tls = lpm_registry::RegistryClient::new();
+        let error = exchange_trusted_publish_token(
+            "@scope/pkg",
+            &server.uri(),
+            OidcExchangeClient::Build(&tls),
+            None,
+        )
+        .await
+        .expect_err("the reflected JWT response must fail")
+        .to_string();
 
         assert!(!error.contains(NPM_ID_TOKEN), "OIDC JWT leaked: {error}");
         assert!(error.contains("HTTP 403") || error.contains("403 Forbidden"));
@@ -435,6 +469,7 @@ mod tests {
             .await;
 
         let auth = resolve_publish_auth_with_policy(
+            &lpm_registry::RegistryClient::new(),
             "@scope/pkg",
             &server.uri(),
             NpmRegistryAuthPolicy::AllowAmbientNpmToken,
@@ -454,6 +489,7 @@ mod tests {
         ]);
 
         let auth = resolve_publish_auth_with_policy(
+            &lpm_registry::RegistryClient::new(),
             "@scope/pkg",
             "https://registry.example.test",
             NpmRegistryAuthPolicy::AllowAmbientNpmToken,

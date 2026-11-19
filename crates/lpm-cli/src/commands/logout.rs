@@ -231,10 +231,16 @@ pub async fn run(
 }
 
 async fn revoke_pairings(client: &RegistryClient) -> Result<(), LpmError> {
+    let http = &client
+        .tls_client_builder_for(client.base_url())
+        .await?
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build http client: {error}")))?;
     let expected_principal_id = crate::commands::env::auth::execute_sync_with_bearer(
         client,
         |registry_url, auth_token| async move {
-            lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await
+            lpm_vault::sync::get_my_public_key_state_with_client(http, &registry_url, &auth_token)
+                .await
         },
     )
     .await?
@@ -243,7 +249,13 @@ async fn revoke_pairings(client: &RegistryClient) -> Result<(), LpmError> {
     crate::commands::env::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
         let expected_principal_id = expected_principal_id.clone();
         async move {
-            lpm_vault::sync::unpair_all(&registry_url, &auth_token, &expected_principal_id).await
+            lpm_vault::sync::unpair_all_with_client(
+                http,
+                &registry_url,
+                &auth_token,
+                &expected_principal_id,
+            )
+            .await
         }
     })
     .await
