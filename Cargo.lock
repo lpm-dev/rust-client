@@ -3897,10 +3897,13 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde_json",
  "syn 3.0.10",
  "tokio",
+ "tokio-rustls",
  "webpki-root-certs",
  "wiremock",
 ]

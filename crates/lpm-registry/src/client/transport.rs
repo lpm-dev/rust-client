@@ -671,9 +671,13 @@ impl RegistryClient {
                 }
                 Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
                 Err(lpm_http::ReplayableRequestError::Request(error)) => {
-                    last_error = Some(LpmError::Network(
-                        lpm_http::display_error(&error).to_string(),
-                    ));
+                    let permanent = lpm_http::is_permanent_tls_failure(&error);
+                    let error = LpmError::Network(lpm_http::error_chain(&error));
+                    // The handshake failed, so no server read the publish.
+                    if permanent {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
                     match self
                         .reconcile_publish_artifact(
                             encoded_name,
@@ -753,7 +757,9 @@ impl RegistryClient {
 
     /// Send a request with retry logic for transient failures.
     ///
-    /// Retries on: 408 (timeout), 429 (rate limit), 500, 502, 503, 504.
+    /// Retries on: 408 (timeout), 429 (rate limit), 500, 502, 503, 504, and
+    /// network failures other than a TLS failure no retry can change, such as
+    /// an untrusted certificate.
     /// Uses exponential backoff with jitter.
     /// Non-retryable errors (401, 403, 404, 422) fail immediately.
     pub(super) async fn send_with_retry(
@@ -856,10 +862,7 @@ impl RegistryClient {
             })?;
 
             let response = if let Some(client) = client_override.as_ref() {
-                client
-                    .execute(req)
-                    .await
-                    .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+                client.execute(req).await
             } else if can_reselect_redirect_clients {
                 let authorization_allowed = |url: &reqwest::Url| {
                     auth.is_none_or(|credential| credential.matches_destination(url))
@@ -877,9 +880,7 @@ impl RegistryClient {
                 {
                     Ok(response) => Ok(response),
                     Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
-                    Err(lpm_http::ReplayableRequestError::Request(error)) => {
-                        Err(LpmError::Network(lpm_http::error_chain(&error)))
-                    }
+                    Err(lpm_http::ReplayableRequestError::Request(error)) => Err(error),
                     Err(error) => return Err(LpmError::Network(error.to_string())),
                 }
             } else {
@@ -888,7 +889,6 @@ impl RegistryClient {
                     .await?
                     .execute(req)
                     .await
-                    .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
             };
             match response {
                 Ok(response) => {
@@ -968,7 +968,11 @@ impl RegistryClient {
                 }
                 Err(error) => {
                     tracing::event!(name: "request_failed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
-                    // Network-level errors (DNS, connection refused, timeout) are retryable
+                    let permanent = lpm_http::is_permanent_tls_failure(&error);
+                    let error = LpmError::Network(lpm_http::error_chain(&error));
+                    if permanent {
+                        return Err(error);
+                    }
                     last_error = Some(error);
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);

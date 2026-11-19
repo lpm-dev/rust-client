@@ -793,6 +793,53 @@ pub fn is_https_downgrade(error: &reqwest::Error) -> bool {
     false
 }
 
+/// Return whether a reqwest failure is a TLS failure no retry can change: the
+/// server's certificate isn't trusted, doesn't name the host or was revoked,
+/// the server refused this client's certificate, or the two sides share no
+/// protocol version or cipher suite.
+pub fn is_permanent_tls_failure(error: &reqwest::Error) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = next {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return rustls_error_is_permanent(tls);
+        }
+        // `io::Error::source` skips the error it wraps, and the connector
+        // nests the TLS error two `io::Error`s deep, so step into the
+        // wrapped error instead.
+        next = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => current.source(),
+        };
+    }
+    false
+}
+
+fn rustls_error_is_permanent(error: &rustls::Error) -> bool {
+    use rustls::AlertDescription as Alert;
+    match error {
+        rustls::Error::InvalidCertificate(_)
+        | rustls::Error::InvalidCertRevocationList(_)
+        | rustls::Error::NoCertificatesPresented
+        | rustls::Error::UnsupportedNameType
+        | rustls::Error::PeerIncompatible(_) => true,
+        rustls::Error::AlertReceived(alert) => matches!(
+            alert,
+            Alert::BadCertificate
+                | Alert::UnsupportedCertificate
+                | Alert::CertificateRevoked
+                | Alert::CertificateExpired
+                | Alert::CertificateUnknown
+                | Alert::UnknownCA
+                | Alert::CertificateRequired
+                | Alert::ProtocolVersion
+                | Alert::InsufficientSecurity
+        ),
+        _ => false,
+    }
+}
+
 fn refusal_message(error: &reqwest::Error) -> Option<&'static str> {
     let mut source = error.source();
     while let Some(current) = source {
@@ -1852,5 +1899,99 @@ mod tests {
             .expect_err("truncated body must fail");
 
         assert!(!error.to_string().contains("should-not-appear"));
+    }
+}
+
+#[cfg(test)]
+mod permanent_tls_failure_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn request_error(url: String) -> reqwest::Error {
+        client_builder()
+            .build()
+            .expect("client")
+            .get(url)
+            .send()
+            .await
+            .expect_err("the request must fail")
+    }
+
+    async fn listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        (listener, port)
+    }
+
+    #[tokio::test]
+    async fn a_certificate_no_trusted_authority_issued_is_a_permanent_tls_failure() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed certificate");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into()),
+        )
+        .expect("TLS server configuration");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let (listener, port) = listener().await;
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+
+        let error = request_error(format!("https://localhost:{port}/")).await;
+
+        assert!(is_permanent_tls_failure(&error), "{}", error_chain(&error));
+    }
+
+    #[tokio::test]
+    async fn a_certificate_alert_from_the_server_is_a_permanent_tls_failure() {
+        let (listener, port) = listener().await;
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut client_hello = [0u8; 2048];
+            let _ = stream.read(&mut client_hello).await;
+            // A fatal unknown_ca alert record.
+            let _ = stream
+                .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 48])
+                .await;
+            let _ = stream.flush().await;
+        });
+
+        let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+
+        assert!(is_permanent_tls_failure(&error), "{}", error_chain(&error));
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_during_the_handshake_is_not_a_permanent_tls_failure() {
+        let (listener, port) = listener().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+
+        let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+
+        assert!(!is_permanent_tls_failure(&error), "{}", error_chain(&error));
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_not_a_permanent_tls_failure() {
+        let (listener, port) = listener().await;
+        drop(listener);
+
+        let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+
+        assert!(!is_permanent_tls_failure(&error), "{}", error_chain(&error));
     }
 }

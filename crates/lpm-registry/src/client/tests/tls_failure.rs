@@ -116,8 +116,7 @@ async fn a_publish_to_a_registry_with_an_untrusted_certificate_fails_once_and_un
 }
 
 #[tokio::test]
-async fn a_tarball_upload_to_storage_with_an_untrusted_certificate_fails_on_the_first_handshake()
-{
+async fn a_tarball_upload_to_storage_with_an_untrusted_certificate_fails_on_the_first_handshake() {
     let server = UntrustedHttpsServer::start().await;
     let upload: PublishUpload = serde_json::from_value(serde_json::json!({
         "id": "11111111-1111-4111-8111-111111111111",
