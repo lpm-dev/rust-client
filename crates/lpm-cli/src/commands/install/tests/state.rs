@@ -309,13 +309,18 @@ fn routes_under_user_npmrc(
     lpm_registry::RouteTable,
 ) {
     let home = tempfile::tempdir().unwrap();
+    let user_npmrc = home.path().join(".npmrc");
     let env = crate::test_env::ScopedEnv::update([
         ("HOME", Some(home.path().as_os_str().to_owned())),
+        ("USERPROFILE", Some(home.path().as_os_str().to_owned())),
         ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
-        ("NPM_CONFIG_USERCONFIG", None),
+        (
+            "NPM_CONFIG_USERCONFIG",
+            Some(user_npmrc.as_os_str().to_owned()),
+        ),
         ("NPM_CONFIG_GLOBALCONFIG", None),
     ]);
-    std::fs::write(home.path().join(".npmrc"), npmrc(home.path())).unwrap();
+    std::fs::write(&user_npmrc, npmrc(home.path())).unwrap();
     let project = home.path().join("project");
     std::fs::create_dir(&project).unwrap();
     let routes = lpm_registry::RouteTable::from_env_and_filesystem(&project).unwrap();
