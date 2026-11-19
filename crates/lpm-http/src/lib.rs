@@ -812,6 +812,10 @@ pub fn is_https_downgrade(error: &reqwest::Error) -> bool {
 /// server's certificate isn't trusted, doesn't name the host or was revoked,
 /// the server refused this client's certificate, or the two sides share no
 /// protocol version or cipher suite.
+///
+/// An expired or mismatched certificate counts too, though a retry could
+/// land on another backend mid-rotation: failing at once names the wrong
+/// certificate instead of hiding it behind seconds of backoff.
 pub fn is_permanent_tls_failure(error: &reqwest::Error) -> bool {
     let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = next {
@@ -839,9 +843,13 @@ fn rustls_error_is_permanent(error: &rustls::Error) -> bool {
         | rustls::Error::NoCertificatesPresented
         | rustls::Error::UnsupportedNameType
         | rustls::Error::PeerIncompatible(_) => true,
+        // A server sends `handshake_failure` for no shared cipher suite and,
+        // under TLS 1.2, for a client certificate it required and didn't get.
         rustls::Error::AlertReceived(alert) => matches!(
             alert,
-            Alert::BadCertificate
+            Alert::HandshakeFailure
+                | Alert::AccessDenied
+                | Alert::BadCertificate
                 | Alert::UnsupportedCertificate
                 | Alert::CertificateRevoked
                 | Alert::CertificateExpired
@@ -1969,22 +1977,29 @@ mod permanent_tls_failure_tests {
     }
 
     #[tokio::test]
-    async fn a_certificate_alert_from_the_server_is_a_permanent_tls_failure() {
-        let (listener, port) = listener().await;
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut client_hello = [0u8; 2048];
-            let _ = stream.read(&mut client_hello).await;
-            // A fatal unknown_ca alert record.
-            let _ = stream
-                .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 48])
-                .await;
-            let _ = stream.flush().await;
-        });
+    async fn a_refusing_alert_from_the_server_is_a_permanent_tls_failure() {
+        // unknown_ca, handshake_failure, access_denied.
+        for alert in [48u8, 40, 49] {
+            let (listener, port) = listener().await;
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut client_hello = [0u8; 2048];
+                let _ = stream.read(&mut client_hello).await;
+                // A fatal alert record.
+                let _ = stream
+                    .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, alert])
+                    .await;
+                let _ = stream.flush().await;
+            });
 
-        let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+            let error = request_error(format!("https://127.0.0.1:{port}/")).await;
 
-        assert!(is_permanent_tls_failure(&error), "{}", error_chain(&error));
+            assert!(
+                is_permanent_tls_failure(&error),
+                "alert {alert}: {}",
+                error_chain(&error)
+            );
+        }
     }
 
     #[tokio::test]
