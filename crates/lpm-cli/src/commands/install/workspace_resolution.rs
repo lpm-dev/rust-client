@@ -1421,14 +1421,20 @@ fn direct_provider_identities(
 ) -> Vec<ProviderIdentity> {
     let deps = super::manifest_install_deps(package);
     let mut direct = Vec::with_capacity(deps.len());
+    let packages = lockfile.packages.iter().collect::<Vec<_>>();
+    let rows = super::lockfile::LockedRows::indexed(&packages);
     for (local_name, requested_spec) in &deps {
         let target = lockfile
             .root_aliases
             .get(local_name)
             .map_or(local_name.as_str(), String::as_str);
-        if let Some(package) =
-            super::select_locked_root_package(lockfile, local_name, target, requested_spec)
-        {
+        if let Some(package) = super::lockfile::select_locked_root_package_from_rows(
+            lockfile,
+            &rows,
+            local_name,
+            target,
+            requested_spec,
+        ) {
             direct.push(ProviderIdentity {
                 name: package.name.clone(),
                 version: package.version.clone(),

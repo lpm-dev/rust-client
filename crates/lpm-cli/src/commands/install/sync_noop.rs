@@ -110,7 +110,7 @@ pub(crate) fn is_up_to_date(
         project_lockfile.lockfile.packages.iter().collect();
     if !super::lockfile::locked_catalogs_and_roots_match_manifest(
         &project_lockfile.lockfile,
-        &locked_packages,
+        &super::lockfile::LockedRows::indexed(&locked_packages),
         super::lockfile::LockedManifest {
             deps: &manifest_deps,
             catalog_resolutions: &catalog_resolutions,

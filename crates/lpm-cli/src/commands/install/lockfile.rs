@@ -1785,7 +1785,7 @@ pub(super) fn lockfile_catalog_snapshots_match_current(
     let packages = lockfile.packages.iter().collect::<Vec<_>>();
     lockfile_catalog_snapshots_match_rows(
         lockfile,
-        &LockedRows::new(&packages),
+        &LockedRows::indexed(&packages),
         deps,
         catalog_resolutions,
         &HashSet::new(),
@@ -1957,22 +1957,23 @@ pub(crate) fn select_locked_root_package<'a>(
     let packages = lockfile.packages.iter().collect::<Vec<_>>();
     select_locked_root_package_from_rows(
         lockfile,
-        &LockedRows::new(&packages),
+        &LockedRows::scanned(&packages),
         local_name,
         target,
         requested_spec,
     )
 }
 
-/// A lockfile's package rows with an index by instance, so looking up every
-/// root costs one pass over the rows instead of one per root.
+/// A lockfile's package rows, optionally indexed by instance.
 pub(super) struct LockedRows<'rows, 'a> {
     packages: &'rows [&'a lpm_lockfile::LockedPackage],
-    by_instance: HashMap<lpm_common::PackageInstanceId, &'a lpm_lockfile::LockedPackage>,
+    by_instance: Option<HashMap<lpm_common::PackageInstanceId, &'a lpm_lockfile::LockedPackage>>,
 }
 
 impl<'rows, 'a> LockedRows<'rows, 'a> {
-    pub(super) fn new(packages: &'rows [&'a lpm_lockfile::LockedPackage]) -> Self {
+    /// Indexes the rows once, so looking up every root costs one pass over
+    /// them instead of one per root.
+    pub(super) fn indexed(packages: &'rows [&'a lpm_lockfile::LockedPackage]) -> Self {
         let mut by_instance = HashMap::with_capacity(packages.len());
         for &package in packages {
             if let Some(instance_id) = package.instance_id {
@@ -1981,12 +1982,36 @@ impl<'rows, 'a> LockedRows<'rows, 'a> {
         }
         Self {
             packages,
-            by_instance,
+            by_instance: Some(by_instance),
+        }
+    }
+
+    /// For a single lookup, where building the index costs more than the
+    /// scan it saves.
+    pub(super) fn scanned(packages: &'rows [&'a lpm_lockfile::LockedPackage]) -> Self {
+        Self {
+            packages,
+            by_instance: None,
+        }
+    }
+
+    #[inline]
+    fn instance(
+        &self,
+        instance_id: lpm_common::PackageInstanceId,
+    ) -> Option<&'a lpm_lockfile::LockedPackage> {
+        match &self.by_instance {
+            Some(by_instance) => by_instance.get(&instance_id).copied(),
+            None => self
+                .packages
+                .iter()
+                .copied()
+                .find(|package| package.instance_id == Some(instance_id)),
         }
     }
 }
 
-fn select_locked_root_package_from_rows<'a>(
+pub(super) fn select_locked_root_package_from_rows<'a>(
     lockfile: &lpm_lockfile::Lockfile,
     rows: &LockedRows<'_, 'a>,
     local_name: &str,
@@ -2001,20 +2026,13 @@ fn select_locked_root_package_from_rows<'a>(
             >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
         {
             let instance_id = selection.instance_id?;
-            return rows
-                .by_instance
-                .get(&instance_id)
-                .copied()
-                .filter(|package| {
-                    package.name == selection.package
-                        && package.version == selection.version
-                        && package.source == selection.source
-                        && locked_source_kind_matches_requested_spec(package, requested_spec)
-                        && locked_version_satisfies_requested_range(
-                            &package.version,
-                            requested_spec,
-                        )
-                });
+            return rows.instance(instance_id).filter(|package| {
+                package.name == selection.package
+                    && package.version == selection.version
+                    && package.source == selection.source
+                    && locked_source_kind_matches_requested_spec(package, requested_spec)
+                    && locked_version_satisfies_requested_range(&package.version, requested_spec)
+            });
         }
         return rows
             .packages
@@ -2782,20 +2800,21 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages(
     packages: &[&lpm_lockfile::LockedPackage],
     input: LockfileReplayInput<'_>,
 ) -> bool {
-    lockfile_satisfies_fast_path_with_packages_and_optional_roots(
+    lockfile_satisfies_fast_path_with_rows_and_optional_roots(
         lockfile,
-        packages,
+        &LockedRows::indexed(packages),
         &HashSet::new(),
         input,
     )
 }
 
-pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
+fn lockfile_satisfies_fast_path_with_rows_and_optional_roots(
     lockfile: &lpm_lockfile::Lockfile,
-    packages: &[&lpm_lockfile::LockedPackage],
+    rows: &LockedRows<'_, '_>,
     optional_root_names: &HashSet<String>,
     input: LockfileReplayInput<'_>,
 ) -> bool {
+    let packages = rows.packages;
     let LockfileReplayInput {
         lockfile_dir,
         deps,
@@ -2879,7 +2898,7 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
 
     locked_catalogs_and_roots_match_manifest(
         lockfile,
-        packages,
+        rows,
         LockedManifest {
             deps,
             catalog_resolutions,
@@ -2906,15 +2925,14 @@ pub(super) struct LockedManifest<'a> {
 /// replaying the lockfile requires.
 pub(super) fn locked_catalogs_and_roots_match_manifest(
     lockfile: &lpm_lockfile::Lockfile,
-    packages: &[&lpm_lockfile::LockedPackage],
+    rows: &LockedRows<'_, '_>,
     manifest: LockedManifest<'_>,
     lockfile_dir: &Path,
     emit_warnings: bool,
 ) -> bool {
-    let rows = LockedRows::new(packages);
     if !lockfile_catalog_snapshots_match_rows(
         lockfile,
-        &rows,
+        rows,
         manifest.deps,
         manifest.catalog_resolutions,
         manifest.optional_root_names,
@@ -2926,7 +2944,7 @@ pub(super) fn locked_catalogs_and_roots_match_manifest(
     }
     locked_roots_satisfy_manifest(
         lockfile,
-        &rows,
+        rows,
         manifest.deps,
         manifest.optional_root_names,
         lockfile_dir,
@@ -3244,9 +3262,10 @@ fn try_lockfile_fast_path_from_rows(
 ) -> Option<LockfileFastPath> {
     let obsolete_binary_lockfile = obsolete_binary_lockfile_exists(input.lockfile_path);
 
-    if !lockfile_satisfies_fast_path_with_packages_and_optional_roots(
+    let rows = LockedRows::indexed(package_rows);
+    if !lockfile_satisfies_fast_path_with_rows_and_optional_roots(
         lockfile,
-        package_rows,
+        &rows,
         input.optional_root_names,
         LockfileReplayInput {
             lockfile_dir: input.lockfile_path.parent()?,
@@ -3272,7 +3291,6 @@ fn try_lockfile_fast_path_from_rows(
     // same-version packages from different registries, tarballs, or
     // Git commits without allocating a hashed PackageKey per lookup.
     let mut root_link_map: HashMap<lpm_common::PackageInstanceId, Vec<String>> = HashMap::new();
-    let rows = LockedRows::new(package_rows);
     for (local, requested_spec) in input.deps {
         let target = lockfile
             .root_aliases
