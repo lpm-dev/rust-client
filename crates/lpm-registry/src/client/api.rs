@@ -599,7 +599,8 @@ impl RegistryClient {
     /// so storage answering that it has the tarball already (412) means an
     /// earlier try stored it; the publish checks the bytes either way. A
     /// timeout, a rate limit, a server error or a network failure is
-    /// retried.
+    /// retried, except a TLS failure no retry can change, such as an
+    /// untrusted certificate.
     pub async fn upload_publish_tarball(
         &self,
         upload: &PublishUpload,
@@ -644,7 +645,12 @@ impl RegistryClient {
                     Arc::clone(&progress),
                 )));
             let sent = tokio::select! {
-                sent = request.send() => sent.map_err(tarball_upload_network_error),
+                sent = request.send() => match sent {
+                    Err(error) if lpm_http::is_permanent_tls_failure(&error) => {
+                        return Err(tarball_upload_network_error(error));
+                    }
+                    sent => sent.map_err(tarball_upload_network_error),
+                },
                 () = progress.stalled(TARBALL_UPLOAD_STALL) => Err(LpmError::Network(format!(
                     "tarball upload stalled: nothing was sent or answered for {} s",
                     TARBALL_UPLOAD_STALL.as_secs()
@@ -741,7 +747,9 @@ impl RegistryClient {
     ///
     /// Uses publish-safe retry logic (S4): does NOT retry on HTTP 500
     /// (the server may have stored the version before crashing). Only retries
-    /// on gateway errors (502/503/504) and network-level failures.
+    /// on gateway errors (502/503/504) and network-level failures; a TLS
+    /// failure no retry can change, such as an untrusted certificate, fails
+    /// at once without a reconciliation probe.
     ///
     /// Timeout is scaled based on tarball size (S3): 60s + 2s per MB, cap 600s.
     pub async fn publish_package(

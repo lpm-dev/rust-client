@@ -12,13 +12,17 @@ base64 = { workspace = true }
 bytes = "1"
 futures = { workspace = true }
 reqwest = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio = { workspace = true }
 webpki-root-certs = { workspace = true }
 
 [dev-dependencies]
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
+rcgen = "0.14"
+rustls = { version = "0.23", features = ["ring"] }
 serde_json = { workspace = true }
 syn = { version = "3", features = ["full", "visit"] }
+tokio-rustls = "0.26"
 wiremock = "0.6"
 
 [lints]

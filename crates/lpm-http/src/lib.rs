@@ -299,9 +299,15 @@ impl ReplayableHttpClientProvider for reqwest::Client {
 pub enum ReplayableRequestError<E> {
     Client(E),
     Request(reqwest::Error),
+    /// A request that failed after following at least one redirect, so an
+    /// earlier hop's server may already have acted on it.
+    RequestAfterRedirect(reqwest::Error),
     NonReplayableBody,
     TooManyRedirects,
     Timeout,
+    /// The deadline ran out before the first request was sent, while its
+    /// client was still being prepared, so no server received anything.
+    TimeoutBeforeRequest,
     HttpsDowngrade,
     CleartextNonLoopback,
     UnsupportedRedirectScheme,
@@ -315,16 +321,37 @@ impl<E> ReplayableRequestError<E> {
     pub fn request(error: reqwest::Error) -> Self {
         Self::Request(error.without_url())
     }
+
+    fn request_after_redirects(error: reqwest::Error, redirects_followed: usize) -> Self {
+        if redirects_followed == 0 {
+            Self::request(error)
+        } else {
+            Self::RequestAfterRedirect(error.without_url())
+        }
+    }
+
+    fn timeout_before_sending(redirects_followed: usize) -> Self {
+        if redirects_followed == 0 {
+            Self::TimeoutBeforeRequest
+        } else {
+            Self::Timeout
+        }
+    }
 }
 
 impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Client(error) => error.fmt(formatter),
-            Self::Request(error) => display_error(error).fmt(formatter),
+            Self::Request(error) | Self::RequestAfterRedirect(error) => {
+                display_error(error).fmt(formatter)
+            }
             Self::NonReplayableBody => formatter.write_str("request body cannot be replayed"),
             Self::TooManyRedirects => formatter.write_str("too many redirects"),
             Self::Timeout => formatter.write_str("request timed out"),
+            Self::TimeoutBeforeRequest => {
+                formatter.write_str("request timed out before it was sent")
+            }
             Self::HttpsDowngrade => formatter.write_str(HTTPS_DOWNGRADE_REFUSAL),
             Self::CleartextNonLoopback => {
                 formatter.write_str("refused cleartext redirect to a non-loopback host")
@@ -349,10 +376,11 @@ where
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Client(error) => Some(error),
-            Self::Request(error) => Some(error),
+            Self::Request(error) | Self::RequestAfterRedirect(error) => Some(error),
             Self::NonReplayableBody
             | Self::TooManyRedirects
             | Self::Timeout
+            | Self::TimeoutBeforeRequest
             | Self::HttpsDowngrade
             | Self::CleartextNonLoopback
             | Self::UnsupportedRedirectScheme
@@ -428,7 +456,7 @@ where
         let client = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, client_future)
                 .await
-                .map_err(|_| ReplayableRequestError::Timeout)?
+                .map_err(|_| ReplayableRequestError::timeout_before_sending(redirects_followed))?
                 .map_err(ReplayableRequestError::Client)?,
             None => client_future
                 .await
@@ -438,7 +466,9 @@ where
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(ReplayableRequestError::Timeout);
+                    return Err(ReplayableRequestError::timeout_before_sending(
+                        redirects_followed,
+                    ));
                 }
                 Some(remaining)
             }
@@ -449,10 +479,12 @@ where
             Some(deadline) => tokio::time::timeout_at(deadline, response_future)
                 .await
                 .map_err(|_| ReplayableRequestError::Timeout)?
-                .map_err(ReplayableRequestError::request)?,
-            None => response_future
-                .await
-                .map_err(ReplayableRequestError::request)?,
+                .map_err(|error| {
+                    ReplayableRequestError::request_after_redirects(error, redirects_followed)
+                })?,
+            None => response_future.await.map_err(|error| {
+                ReplayableRequestError::request_after_redirects(error, redirects_followed)
+            })?,
         };
         let Some((next_method, next_has_body)) =
             redirected_method_and_body(response.status(), &method, send_body)
@@ -791,6 +823,61 @@ pub fn is_https_downgrade(error: &reqwest::Error) -> bool {
         source = current.source();
     }
     false
+}
+
+/// Return whether a reqwest failure is a TLS failure no retry can change: the
+/// server's certificate isn't trusted, doesn't name the host or was revoked,
+/// the server refused this client's certificate, or the two sides share no
+/// protocol version or cipher suite.
+///
+/// An expired or mismatched certificate counts too, though a retry could
+/// land on another backend mid-rotation: failing at once names the wrong
+/// certificate instead of hiding it behind seconds of backoff.
+pub fn is_permanent_tls_failure(error: &reqwest::Error) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = next {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return rustls_error_is_permanent(tls);
+        }
+        // `io::Error::source` skips the error it wraps, and the connector
+        // nests the TLS error two `io::Error`s deep, so step into the
+        // wrapped error instead.
+        next = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => current.source(),
+        };
+    }
+    false
+}
+
+fn rustls_error_is_permanent(error: &rustls::Error) -> bool {
+    use rustls::AlertDescription as Alert;
+    match error {
+        rustls::Error::InvalidCertificate(_)
+        | rustls::Error::InvalidCertRevocationList(_)
+        | rustls::Error::NoCertificatesPresented
+        | rustls::Error::UnsupportedNameType
+        | rustls::Error::PeerIncompatible(_) => true,
+        // A server sends `handshake_failure` for no shared cipher suite and,
+        // under TLS 1.2, for a client certificate it required and didn't get.
+        rustls::Error::AlertReceived(alert) => matches!(
+            alert,
+            Alert::HandshakeFailure
+                | Alert::AccessDenied
+                | Alert::BadCertificate
+                | Alert::UnsupportedCertificate
+                | Alert::CertificateRevoked
+                | Alert::CertificateExpired
+                | Alert::CertificateUnknown
+                | Alert::UnknownCA
+                | Alert::CertificateRequired
+                | Alert::ProtocolVersion
+                | Alert::InsufficientSecurity
+        ),
+        _ => false,
+    }
 }
 
 fn refusal_message(error: &reqwest::Error) -> Option<&'static str> {
@@ -1704,10 +1791,72 @@ mod tests {
             .expect_err("provider latency must consume the request timeout");
 
         assert!(
-            matches!(error, ReplayableRequestError::Timeout)
-                || matches!(error, ReplayableRequestError::Request(ref error) if error.is_timeout())
+            matches!(error, ReplayableRequestError::TimeoutBeforeRequest),
+            "nothing was sent before the deadline: {error:?}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Delays the client for every hop after the first.
+    struct LaterHopsDelayedClientProvider {
+        client: reqwest::Client,
+        delay: std::time::Duration,
+        hops: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReplayableHttpClientProvider for LaterHopsDelayedClientProvider {
+        type Error = std::convert::Infallible;
+
+        fn client_for_url(
+            &self,
+            _url: &reqwest::Url,
+        ) -> impl Future<Output = Result<reqwest::Client, Self::Error>> + Send {
+            let client = self.client.clone();
+            let first_hop = self.hops.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let delay = self.delay;
+            async move {
+                if !first_hop {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(client)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deadline_that_runs_out_after_a_redirect_is_not_reported_as_before_sending() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/initial"))
+            .respond_with(ResponseTemplate::new(303).insert_header("location", "/status"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = LaterHopsDelayedClientProvider {
+            client: reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .unwrap(),
+            delay: std::time::Duration::from_secs(5),
+            hops: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut request = reqwest::Request::new(
+            reqwest::Method::PUT,
+            reqwest::Url::parse(&format!("{}/initial", server.uri())).unwrap(),
+        );
+        *request.timeout_mut() = Some(std::time::Duration::from_millis(200));
+
+        let error = send_with_replayable_redirects(&provider, request, None)
+            .await
+            .expect_err("the redirect hop's client misses the deadline");
+
+        assert!(
+            matches!(error, ReplayableRequestError::Timeout),
+            "the first hop was sent: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1852,5 +2001,106 @@ mod tests {
             .expect_err("truncated body must fail");
 
         assert!(!error.to_string().contains("should-not-appear"));
+    }
+}
+
+#[cfg(test)]
+mod permanent_tls_failure_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn request_error(url: String) -> reqwest::Error {
+        client_builder()
+            .build()
+            .expect("client")
+            .get(url)
+            .send()
+            .await
+            .expect_err("the request must fail")
+    }
+
+    async fn listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        (listener, port)
+    }
+
+    #[tokio::test]
+    async fn a_certificate_no_trusted_authority_issued_is_a_permanent_tls_failure() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self-signed certificate");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into()),
+        )
+        .expect("TLS server configuration");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let (listener, port) = listener().await;
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+
+        let error = request_error(format!("https://localhost:{port}/")).await;
+
+        assert!(is_permanent_tls_failure(&error), "{}", error_chain(&error));
+    }
+
+    #[tokio::test]
+    async fn a_refusing_alert_from_the_server_is_a_permanent_tls_failure() {
+        // unknown_ca, handshake_failure, access_denied.
+        for alert in [48u8, 40, 49] {
+            let (listener, port) = listener().await;
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut client_hello = [0u8; 2048];
+                let _ = stream.read(&mut client_hello).await;
+                // A fatal alert record.
+                let _ = stream
+                    .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, alert])
+                    .await;
+                let _ = stream.flush().await;
+            });
+
+            let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+
+            assert!(
+                is_permanent_tls_failure(&error),
+                "alert {alert}: {}",
+                error_chain(&error)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_during_the_handshake_is_not_a_permanent_tls_failure() {
+        let (listener, port) = listener().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+
+        let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+
+        assert!(!is_permanent_tls_failure(&error), "{}", error_chain(&error));
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_not_a_permanent_tls_failure() {
+        let (listener, port) = listener().await;
+        drop(listener);
+
+        let error = request_error(format!("https://127.0.0.1:{port}/")).await;
+
+        assert!(!is_permanent_tls_failure(&error), "{}", error_chain(&error));
     }
 }

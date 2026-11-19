@@ -618,18 +618,21 @@ impl RegistryClient {
 
                         // Rate limit — respect Retry-After
                         429 => {
-                            if attempt < MAX_RETRIES
-                                && let Some(wait) = rate_limit_wait(&facts, &mut waited_long)
-                            {
-                                // Honor the test-only backoff override so
-                                // 429-flood retry-exhaustion tests don't
-                                // hang on the server-supplied Retry-After.
-                                tokio::time::sleep(backoff_override().unwrap_or(wait)).await;
-                                continue;
-                            }
+                            let wait = if attempt < MAX_RETRIES {
+                                rate_limit_wait(&facts, &mut waited_long)
+                            } else {
+                                None
+                            };
                             let body = read_publish_error_text(response, &headers, bearer).await;
                             last_error = Some(registry_refusal(status, &facts, &body, &origin));
-                            break;
+                            let Some(wait) = wait else {
+                                break;
+                            };
+                            // Honor the test-only backoff override so
+                            // 429-flood retry-exhaustion tests don't
+                            // hang on the server-supplied Retry-After.
+                            tokio::time::sleep(backoff_override().unwrap_or(wait)).await;
+                            continue;
                         }
 
                         // Retryable gateway errors only (NOT 500)
@@ -669,11 +672,44 @@ impl RegistryClient {
                         }
                     }
                 }
-                Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
-                Err(lpm_http::ReplayableRequestError::Request(error)) => {
-                    last_error = Some(LpmError::Network(
-                        lpm_http::display_error(&error).to_string(),
-                    ));
+                Err(failure) => {
+                    let (error, permanent, redirected) = match failure {
+                        lpm_http::ReplayableRequestError::Client(error) => return Err(error),
+                        lpm_http::ReplayableRequestError::Request(error) => (
+                            LpmError::Network(lpm_http::error_chain(&error)),
+                            lpm_http::is_permanent_tls_failure(&error),
+                            false,
+                        ),
+                        lpm_http::ReplayableRequestError::RequestAfterRedirect(error) => (
+                            LpmError::Network(lpm_http::error_chain(&error)),
+                            lpm_http::is_permanent_tls_failure(&error),
+                            true,
+                        ),
+                        // The deadline can run out between redirect hops,
+                        // after the registry read the publish.
+                        lpm_http::ReplayableRequestError::Timeout => (
+                            LpmError::Network("publish request timed out".into()),
+                            false,
+                            false,
+                        ),
+                        // A probe would wait on the same unprepared client. On
+                        // a retry, the earlier attempt's answer, already
+                        // reconciled, is why the publish failed.
+                        lpm_http::ReplayableRequestError::TimeoutBeforeRequest => {
+                            return Err(last_error.take().unwrap_or_else(|| {
+                                LpmError::Network(
+                                    "publish request timed out before it was sent".into(),
+                                )
+                            }));
+                        }
+                        refused => return Err(LpmError::Network(refused.to_string())),
+                    };
+                    // A handshake refused on the first hop means the registry
+                    // never read the publish. After a redirect it may have.
+                    if permanent && !redirected {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
                     match self
                         .reconcile_publish_artifact(
                             encoded_name,
@@ -694,13 +730,16 @@ impl RegistryClient {
                             return Err(ambiguous_publish_reconciliation_error(probe_error));
                         }
                     }
+                    // Replaying the publish would meet the same certificate.
+                    if permanent {
+                        break;
+                    }
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;
                         continue;
                     }
                 }
-                Err(error) => return Err(LpmError::Network(error.to_string())),
             }
         }
 
@@ -753,7 +792,9 @@ impl RegistryClient {
 
     /// Send a request with retry logic for transient failures.
     ///
-    /// Retries on: 408 (timeout), 429 (rate limit), 500, 502, 503, 504.
+    /// Retries on: 408 (timeout), 429 (rate limit), 500, 502, 503, 504, and
+    /// network failures other than a TLS failure no retry can change, such as
+    /// an untrusted certificate.
     /// Uses exponential backoff with jitter.
     /// Non-retryable errors (401, 403, 404, 422) fail immediately.
     pub(super) async fn send_with_retry(
@@ -856,10 +897,7 @@ impl RegistryClient {
             })?;
 
             let response = if let Some(client) = client_override.as_ref() {
-                client
-                    .execute(req)
-                    .await
-                    .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+                client.execute(req).await
             } else if can_reselect_redirect_clients {
                 let authorization_allowed = |url: &reqwest::Url| {
                     auth.is_none_or(|credential| credential.matches_destination(url))
@@ -877,9 +915,10 @@ impl RegistryClient {
                 {
                     Ok(response) => Ok(response),
                     Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
-                    Err(lpm_http::ReplayableRequestError::Request(error)) => {
-                        Err(LpmError::Network(lpm_http::error_chain(&error)))
-                    }
+                    Err(
+                        lpm_http::ReplayableRequestError::Request(error)
+                        | lpm_http::ReplayableRequestError::RequestAfterRedirect(error),
+                    ) => Err(error),
                     Err(error) => return Err(LpmError::Network(error.to_string())),
                 }
             } else {
@@ -888,7 +927,6 @@ impl RegistryClient {
                     .await?
                     .execute(req)
                     .await
-                    .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
             };
             match response {
                 Ok(response) => {
@@ -968,7 +1006,11 @@ impl RegistryClient {
                 }
                 Err(error) => {
                     tracing::event!(name: "request_failed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
-                    // Network-level errors (DNS, connection refused, timeout) are retryable
+                    let permanent = lpm_http::is_permanent_tls_failure(&error);
+                    let error = LpmError::Network(lpm_http::error_chain(&error));
+                    if permanent {
+                        return Err(error);
+                    }
                     last_error = Some(error);
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);

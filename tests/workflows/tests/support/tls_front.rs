@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
@@ -22,6 +23,7 @@ pub struct TlsFront {
     pub url: String,
     /// The test CA's certificate, for a `cafile=` line.
     pub ca_path: PathBuf,
+    connections: Arc<AtomicUsize>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -85,6 +87,8 @@ impl TlsFront {
             .expect("make the TLS front listener non-blocking");
         let port = listener.local_addr().expect("TLS front address").port();
         let (shutdown, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let handshakes = Arc::clone(&connections);
         // The test thread blocks on the `lpm` child process, so the front
         // serves from a runtime of its own.
         let thread = std::thread::spawn(move || {
@@ -107,6 +111,7 @@ impl TlsFront {
                         },
                         _ = &mut stopped => break,
                     };
+                    handshakes.fetch_add(1, Ordering::SeqCst);
                     let acceptor = acceptor.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(stream).await else {
@@ -124,9 +129,16 @@ impl TlsFront {
         Self {
             url: format!("https://localhost:{port}"),
             ca_path,
+            connections,
             shutdown: Some(shutdown),
             thread: Some(thread),
         }
+    }
+
+    /// How many TCP connections the front has accepted, each one a TLS
+    /// handshake attempt.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 
     /// The `.npmrc` line that trusts the test CA for this front only.

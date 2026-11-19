@@ -64,6 +64,7 @@ mod policy_transport;
 mod projection;
 mod retry_error_body;
 mod tarball;
+mod tls_failure;
 mod transport;
 mod url_gate;
 

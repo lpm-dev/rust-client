@@ -312,6 +312,14 @@ async fn poll_for_token(
                     lpm_http::display_error(&error)
                 )));
             }
+            // No later poll gets past a certificate failure. The doneUrl
+            // carries the poll's secret, so the error leaves it out.
+            Err(error) if lpm_http::is_permanent_tls_failure(&error) => {
+                return Err(LpmError::Registry(format!(
+                    "{label} failed: {}",
+                    lpm_http::error_chain(&error.without_url())
+                )));
+            }
             Err(_) => poll_interval,
         };
 
@@ -749,6 +757,43 @@ mod tests {
         assert!(
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_for_web_auth_token_stops_at_a_certificate_failure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Every handshake gets a fatal unknown_ca alert, as from a server
+        // that refuses this client.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut client_hello = [0u8; 2048];
+                let _ = stream.read(&mut client_hello).await;
+                let _ = stream
+                    .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 48])
+                    .await;
+            }
+        });
+
+        let err = poll_for_web_auth_token(
+            &format!("https://127.0.0.1:{port}/poll-secret-value"),
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            !err.contains("timed out") && err.contains("UnknownCA"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("poll-secret-value"),
+            "the poll secret leaked: {err}"
         );
     }
 
