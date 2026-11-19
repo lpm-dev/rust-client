@@ -213,25 +213,22 @@ pub(crate) async fn fetch_package_metadata(
     npm_name: &str,
     registry_url: &str,
 ) -> Result<crate::commands::publish_npm::NpmVersionPolicyMetadata, LpmError> {
-    let client = stage_http_client(
-        tls.tls_client_builder_for(registry_url).await?,
-        Duration::from_secs(60),
-    )?;
+    let timeout = Duration::from_secs(60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
     let url = endpoint_url(registry_url, &urlencoding::encode(npm_name));
-    let response = web_auth::add_npm_web_auth_headers(client.get(url), NPM_COMMAND_STAGE)
-        .header(
-            reqwest::header::ACCEPT,
-            "application/vnd.npm.install-v1+json",
-        )
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| {
-            LpmError::Registry(format!(
-                "npm package metadata request failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
+    let response = send_stage_get(
+        &clients,
+        web_auth::add_npm_web_auth_headers(client.get(url), NPM_COMMAND_STAGE)
+            .header(
+                reqwest::header::ACCEPT,
+                "application/vnd.npm.install-v1+json",
+            )
+            .bearer_auth(token),
+        timeout,
+    )
+    .await
+    .map_err(|e| LpmError::Registry(format!("npm package metadata request failed: {e}")))?;
 
     let status = response.status();
     let bytes = read_stage_response_body_with_limit(
@@ -327,9 +324,7 @@ async fn stage_publish_impl(
     )?;
     let tarball_mb = tarball_data.len() as u64 / (1024 * 1024);
     let timeout = Duration::from_secs(std::cmp::min(60 + tarball_mb * 2, 600));
-    let hop_clients = crate::commands::publish_npm::NpmRegistryClients::new(tls, move |builder| {
-        stage_manual_redirect_http_client(builder, timeout)
-    });
+    let hop_clients = stage_hop_clients(tls, timeout);
     let client = hop_clients.for_registry(registry_url).await?;
     let url = endpoint_url(
         registry_url,
@@ -382,10 +377,9 @@ pub(crate) async fn list_staged_packages(
     package_filter: Option<&str>,
 ) -> Result<StageListResult, LpmError> {
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(
-        tls.tls_client_builder_for(registry_url).await?,
-        Duration::from_secs(60),
-    )?;
+    let timeout = Duration::from_secs(60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
     let mut page = 0_usize;
     let mut items = Vec::new();
 
@@ -397,20 +391,18 @@ pub(crate) async fn list_staged_packages(
             query.push(("package", package.to_string()));
         }
 
-        let response = web_auth::add_npm_web_auth_headers(
-            client.get(endpoint_url(registry_url, "-/stage")),
-            NPM_COMMAND_STAGE,
+        let response = send_stage_get(
+            &clients,
+            web_auth::add_npm_web_auth_headers(
+                client.get(endpoint_url(registry_url, "-/stage")),
+                NPM_COMMAND_STAGE,
+            )
+            .query(&query)
+            .bearer_auth(token),
+            timeout,
         )
-        .query(&query)
-        .bearer_auth(token)
-        .send()
         .await
-        .map_err(|e| {
-            LpmError::Registry(format!(
-                "npm stage list request failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
+        .map_err(|e| LpmError::Registry(format!("npm stage list request failed: {e}")))?;
 
         let status = response.status();
         let body = response_json_or_empty(response, "npm stage list").await?;
@@ -540,26 +532,23 @@ pub(crate) async fn download_staged_package(
 ) -> Result<StageDownloadResult, LpmError> {
     validate_stage_id(stage_id)?;
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(
-        tls.tls_client_builder_for(registry_url).await?,
-        Duration::from_secs(10 * 60),
-    )?;
-    let response = web_auth::add_npm_web_auth_headers(
-        client.get(endpoint_url(
-            registry_url,
-            &format!("-/stage/{stage_id}/tarball"),
-        )),
-        NPM_COMMAND_STAGE,
+    let timeout = Duration::from_secs(10 * 60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
+    let response = send_stage_get(
+        &clients,
+        web_auth::add_npm_web_auth_headers(
+            client.get(endpoint_url(
+                registry_url,
+                &format!("-/stage/{stage_id}/tarball"),
+            )),
+            NPM_COMMAND_STAGE,
+        )
+        .bearer_auth(token),
+        timeout,
     )
-    .bearer_auth(token)
-    .send()
     .await
-    .map_err(|e| {
-        LpmError::Registry(format!(
-            "npm stage download request failed: {}",
-            lpm_http::display_error(&e)
-        ))
-    })?;
+    .map_err(|e| LpmError::Registry(format!("npm stage download request failed: {e}")))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -661,23 +650,20 @@ async fn stage_json_get(
     action: &str,
 ) -> Result<serde_json::Value, LpmError> {
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(
-        tls.tls_client_builder_for(registry_url).await?,
-        Duration::from_secs(60),
-    )?;
-    let response = web_auth::add_npm_web_auth_headers(
-        client.get(endpoint_url(registry_url, route)),
-        NPM_COMMAND_STAGE,
+    let timeout = Duration::from_secs(60);
+    let clients = stage_hop_clients(tls, timeout);
+    let client = clients.for_registry(registry_url).await?;
+    let response = send_stage_get(
+        &clients,
+        web_auth::add_npm_web_auth_headers(
+            client.get(endpoint_url(registry_url, route)),
+            NPM_COMMAND_STAGE,
+        )
+        .bearer_auth(token),
+        timeout,
     )
-    .bearer_auth(token)
-    .send()
     .await
-    .map_err(|e| {
-        LpmError::Registry(format!(
-            "{action} request failed: {}",
-            lpm_http::display_error(&e)
-        ))
-    })?;
+    .map_err(|e| LpmError::Registry(format!("{action} request failed: {e}")))?;
 
     let status = response.status();
     let body = response_json_or_empty(response, action).await?;
@@ -705,10 +691,7 @@ async fn stage_otp_mutation(
 ) -> Result<serde_json::Value, LpmError> {
     validate_npm_stage_registry(registry_url)?;
     let timeout = Duration::from_secs(60);
-    let mutation_clients =
-        crate::commands::publish_npm::NpmRegistryClients::new(tls, move |builder| {
-            stage_manual_redirect_http_client(builder, timeout)
-        });
+    let mutation_clients = stage_hop_clients(tls, timeout);
     let response = send_stage_mutation(
         &mutation_clients,
         token,
@@ -838,15 +821,28 @@ async fn stage_mutation_response(
     )))
 }
 
-fn stage_http_client(
-    builder: reqwest::ClientBuilder,
+/// The clients a stage request follows redirects with: each hop gets the
+/// client for its own origin, with that origin's `.npmrc` TLS settings.
+fn stage_hop_clients(
+    tls: &lpm_registry::RegistryClient,
     timeout: Duration,
-) -> Result<reqwest::Client, LpmError> {
-    builder
+) -> crate::commands::publish_npm::NpmRegistryClients {
+    crate::commands::publish_npm::NpmRegistryClients::new(tls, move |builder| {
+        stage_manual_redirect_http_client(builder, timeout)
+    })
+}
+
+/// Sends a stage GET, following its redirects within one `timeout`.
+async fn send_stage_get(
+    clients: &crate::commands::publish_npm::NpmRegistryClients,
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
+    let request = request
         .timeout(timeout)
-        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
-        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
+        .map_err(lpm_http::ReplayableRequestError::request)?;
+    lpm_http::send_with_replayable_redirects(clients, request, None).await
 }
 
 fn stage_manual_redirect_http_client(

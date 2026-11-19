@@ -182,3 +182,26 @@ async fn a_tls_client_builder_trusts_a_global_cafile_for_every_origin() {
         .expect("a global cafile applies to every origin");
     }
 }
+
+#[tokio::test]
+async fn a_tls_client_builder_with_strict_ssl_off_accepts_an_untrusted_certificate() {
+    let server = CaSignedHttpsServer::start().await;
+    let client = RegistryClient::new()
+        .with_tls_overrides(&TlsOverrides {
+            strict_ssl: Some(crate::npmrc::TaggedBool {
+                value: false,
+                source: "test .npmrc".into(),
+                line: 1,
+            }),
+            ..Default::default()
+        })
+        .expect("TLS overrides");
+    let url = format!("https://localhost:{}/", server.port);
+
+    get_with(
+        client.tls_client_builder_for(&url).await.expect("builder"),
+        url,
+    )
+    .await
+    .expect("strict-ssl=false skips certificate verification, as the pooled clients do");
+}

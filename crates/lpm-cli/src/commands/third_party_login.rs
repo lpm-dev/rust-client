@@ -48,10 +48,7 @@ pub async fn run_npm(
     let tls = crate::commands::registry_reads::registry_client_for_directory(
         client,
         &current_dir,
-        crate::commands::registry_reads::RegistryReads {
-            lpm: false,
-            npm: true,
-        },
+        crate::commands::registry_reads::RegistryReads::NONE,
         json_output,
     )?;
     let http = npm_web_auth_client(tls.tls_client_builder_for(NPM_REGISTRY_URL).await?)?;

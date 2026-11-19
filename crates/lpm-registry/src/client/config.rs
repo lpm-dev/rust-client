@@ -578,6 +578,16 @@ impl RegistryClient {
         self
     }
 
+    /// A client builder for requests to `url` with this client's `.npmrc`
+    /// TLS settings for `url`'s origin, for a request that needs its own
+    /// redirect policy or timeouts. See [`HttpClients::tls_client_builder_for`].
+    pub async fn tls_client_builder_for(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::ClientBuilder, LpmError> {
+        self.http.tls_client_builder_for(url).await
+    }
+
     /// Apply `.npmrc`-derived TLS overrides to this client.
     ///
     /// Rebuilds the inner default `reqwest::Client` with `cafile`/`ca`
@@ -595,16 +605,6 @@ impl RegistryClient {
     ///
     /// **Orthogonal to `--insecure`.** That flag widens scheme acceptance
     /// (HTTP non-localhost); this widens cert verification.
-    /// A client builder for requests to `url` with this client's `.npmrc`
-    /// TLS settings for `url`'s origin, for a request that needs its own
-    /// redirect policy or timeouts. See [`HttpClients::tls_client_builder_for`].
-    pub async fn tls_client_builder_for(
-        &self,
-        url: &str,
-    ) -> Result<reqwest::ClientBuilder, LpmError> {
-        self.http.tls_client_builder_for(url).await
-    }
-
     pub fn with_tls_overrides(self, tls: &TlsOverrides) -> Result<Self, LpmError> {
         // Empty effective set → no eager per-origin clients. Δ1 default.
         self.with_tls_overrides_for(tls, &[])

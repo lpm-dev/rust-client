@@ -8,7 +8,7 @@ mod support;
 
 use support::TempProject;
 use support::auth_state::{SessionSeed, seed_sessions};
-use support::mock_registry::{MockRegistry, mount_tarball_uploads};
+use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json, mount_tarball_uploads};
 use support::tls_front::TlsFront;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, Request, ResponseTemplate};
@@ -592,4 +592,64 @@ async fn commands_that_send_nothing_ignore_a_broken_npmrc_tls_setting() {
     })
     .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn a_stage_download_redirect_trusts_the_npmrc_cafile_of_the_host_it_reaches() {
+    let project = TempProject::empty(r#"{"name":"registry-tls-stage-download","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let ca_dirs = [project.home().join("ca-a"), project.home().join("ca-b")];
+    for dir in &ca_dirs {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let registry = TlsFront::start(&mock, &ca_dirs[0]);
+    let storage = TlsFront::start(&mock, &ca_dirs[1]);
+    std::fs::write(
+        project.home().join(".npmrc"),
+        format!(
+            "{}{}",
+            registry.per_origin_cafile_line(),
+            storage.per_origin_cafile_line()
+        ),
+    )
+    .unwrap();
+    let stage_id = "123e4567-e89b-12d3-a456-426614174000";
+    Mock::given(method("GET"))
+        .and(path(format!("/-/stage/{stage_id}/tarball")))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/storage/staged.tgz", storage.url)),
+        )
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/storage/staged.tgz"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(make_tarball_from_pkg_json(
+                serde_json::json!({ "name": "tls-staged", "version": "1.0.0" }),
+                &[],
+            )),
+        )
+        .mount(mock.server())
+        .await;
+
+    let output = support::lpm(&project)
+        .env("NPM_TOKEN", "stage-token")
+        .args([
+            "--json",
+            "stage",
+            "download",
+            stage_id,
+            "--npm-registry",
+            &registry.url,
+        ])
+        .output()
+        .expect("run lpm stage download");
+
+    assert!(
+        output.status.success() && storage.connections() > 0,
+        "the redirect must reach storage over its own cafile\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
