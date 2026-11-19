@@ -1561,12 +1561,11 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
     let mut seen: Vec<&str> = Vec::with_capacity(args.len());
 
     for arg in args {
-        let flag = if *arg == "-v" { "--verbose" } else { *arg };
-        if flag.starts_with('-') {
-            if seen.contains(&flag) {
+        if arg.starts_with('-') {
+            if seen.contains(arg) {
                 return None;
             }
-            seen.push(flag);
+            seen.push(arg);
         }
         match *arg {
             "--json" => json = true,
@@ -1578,8 +1577,9 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
             _ if arg.starts_with("--token=") || arg.starts_with("--registry=") => return None,
             "--insecure" => return None,
 
-            // Harmless global flags — skip
-            "--verbose" | "-v" => {}
+            // Harmless global flags — skip. `-v` is clap's `--version`, not
+            // this.
+            "--verbose" => {}
 
             // The subcommand itself
             "install" | "i" if !found_install => found_install = true,
@@ -1796,7 +1796,7 @@ mod tests {
     fn fast_lane_mode_from_args_leaves_a_repeated_flag_to_clap() {
         for args in [
             &["--json", "--json", "install"][..],
-            &["-v", "--verbose", "install"][..],
+            &["--verbose", "--verbose", "install"][..],
             &["install", "--timing", "--timing"][..],
             &["install", "--frozen-lockfile", "--frozen-lockfile"][..],
             &["install", "--no-skills", "--no-skills"][..],
@@ -1804,6 +1804,12 @@ mod tests {
         ] {
             assert_eq!(fast_lane_mode_from_args(args), None, "{args:?}");
         }
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_leaves_the_version_flag_to_clap() {
+        assert_eq!(fast_lane_mode_from_args(&["-v", "install"]), None);
+        assert_eq!(fast_lane_mode_from_args(&["install", "-v"]), None);
     }
 
     #[test]

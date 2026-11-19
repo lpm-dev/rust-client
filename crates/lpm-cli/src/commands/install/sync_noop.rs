@@ -95,7 +95,13 @@ pub(crate) fn is_up_to_date(
     // manifest still accepts; the full pipeline's own up-to-date answer
     // checks the same before it answers.
     let mut manifest_deps = super::manifest::manifest_install_deps(&package);
-    if super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err() {
+    // The full install checks a `catalog:` dependency against the lockfile's
+    // catalog snapshot, which this check doesn't read.
+    if manifest_deps
+        .values()
+        .any(|spec| spec.starts_with("catalog:"))
+        || super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err()
+    {
         return Ok(false);
     }
     let optional_root_names: std::collections::HashSet<String> =

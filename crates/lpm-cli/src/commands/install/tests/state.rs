@@ -396,7 +396,15 @@ async fn the_up_to_date_paths_first_request_warns_and_reads_each_origins_tls_fil
 /// at `root_version` while `package.json` asks for `leaf@1.0.0`, and the
 /// install hash an install writes for exactly these files.
 fn installed_project_rooting_leaf_at(dir: &std::path::Path, root_version: &str) {
-    let pkg = r#"{"name":"consumer","dependencies":{"leaf":"1.0.0"}}"#;
+    installed_project(
+        dir,
+        r#"{"name":"consumer","dependencies":{"leaf":"1.0.0"}}"#,
+        root_version,
+    );
+}
+
+/// [`installed_project_rooting_leaf_at`] with `pkg` as `package.json`.
+fn installed_project(dir: &std::path::Path, pkg: &str, root_version: &str) {
     std::fs::write(dir.join("package.json"), pkg).unwrap();
     let source = "registry+https://registry.npmjs.org";
     let instance_id =
@@ -468,4 +476,35 @@ fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
             "leaf rooted at {root_version} for a manifest asking for 1.0.0"
         );
     }
+}
+
+#[test]
+fn the_up_to_date_check_leaves_catalog_dependencies_to_the_full_install() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::update([
+        ("HOME", Some(home.path().as_os_str().to_owned())),
+        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+        ("LPM_LINKER", None),
+        (lpm_store::StoreVersion::ENV_VAR, None),
+        (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
+    ]);
+    let mode = crate::install_state::FastLaneMode {
+        json: true,
+        timing: false,
+        frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+        no_skills: true,
+    };
+    // The full install checks a catalog dependency against the lockfile's
+    // catalog snapshot, which the quick check doesn't read.
+    let project = tempfile::tempdir().unwrap();
+    installed_project(
+        project.path(),
+        r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"optionalDependencies":{"leaf":"catalog:"}}"#,
+        "1.0.0",
+    );
+    let pkg = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+
+    assert!(
+        !crate::commands::install::sync_noop::is_up_to_date(project.path(), &pkg, mode).unwrap()
+    );
 }
