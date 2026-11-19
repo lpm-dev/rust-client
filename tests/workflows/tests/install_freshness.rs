@@ -1563,3 +1563,47 @@ async fn unchanged_frozen_install_refuses_a_lockfile_a_frozen_install_would_refu
         );
     }
 }
+
+#[tokio::test]
+async fn unchanged_frozen_workspace_member_install_refuses_a_lockfile_a_frozen_install_would_refuse()
+ {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"leaf":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"1.0.0"}}"#,
+    );
+    install(&project, &mock.url()).assert().success();
+
+    let member = project.path().join("packages/app");
+    // A member's unchanged install answers up to date before the change.
+    bare_install(&project)
+        .current_dir(&member)
+        .env("CI", "1")
+        .env("LPM_REGISTRY_URL", mock.url())
+        .assert()
+        .success();
+    std::fs::write(
+        project.home().join(".lpm/config.toml"),
+        "auto-install-peers = false\n",
+    )
+    .unwrap();
+
+    let output = bare_install(&project)
+        .current_dir(&member)
+        .env("CI", "1")
+        .env("LPM_REGISTRY_URL", mock.url())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let result = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        result.contains("Frozen lockfile mismatch") && result.contains("auto install peers"),
+        "{result}"
+    );
+}
