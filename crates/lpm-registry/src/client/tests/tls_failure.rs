@@ -208,6 +208,7 @@ async fn a_publish_whose_answer_misses_its_deadline_is_reconciled_with_the_regis
 
     let server = MockServer::start().await;
     // The registry stores the publish, then answers after the deadline.
+    // reqwest's own timer for the hop fires here, before the executor's.
     Mock::given(method("PUT"))
         .and(path("/api/registry/@lpm.dev/owner.pkg"))
         .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
