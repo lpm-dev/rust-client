@@ -162,12 +162,15 @@ spdx = { version = "0.13.5", default-features = false }
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4"
 libc = "0.2"
+rustix = { version = "1.1", features = ["fs"] }
+
+# macOS keeps its system allocator; see the `global_allocator` in main.rs.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 # `no_thp` drops mimalloc's MADV_HUGEPAGE on its arena (Linux only): under
 # THP's `madvise` mode each sparsely touched 2 MiB region became resident,
 # adding 100-160 MiB to an install's peak RSS. Unlike MIMALLOC_ALLOW_THP=0
 # it doesn't call PR_SET_THP_DISABLE, which lifecycle scripts would inherit.
 mimalloc = { version = "0.1", features = ["no_thp"] }
-rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6", default-features = false, features = ["std"] }
@@ -204,7 +207,9 @@ portable-linux = ["lpm-keyring/vendored"]
 # Usage: cargo build -p lpm-cli --features dhat-heap
 #        cd bench/fixture-large && ../../target/debug/lpm-rs install
 dhat-heap = ["dep:dhat"]
-# Disable mimalloc for comparison builds (e.g. benchmarking allocator impact).
+# Build Unix targets other than macOS with the system allocator instead of
+# mimalloc, for allocator comparisons. macOS always uses its system
+# allocator.
 # cargo build --release --features no-mimalloc
 no-mimalloc = []
 # Wire `tracing` spans to a Tracy collector so the install pipeline can be
