@@ -200,3 +200,127 @@ async fn a_publish_whose_redirect_meets_an_untrusted_certificate_is_reconciled_a
         );
     }
 }
+
+#[tokio::test]
+async fn a_publish_whose_answer_misses_its_deadline_is_reconciled_with_the_registry() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // The registry stores the publish, then answers after the deadline.
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/owner.pkg"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/owner.pkg"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json("@lpm.dev/owner.pkg")),
+        )
+        .mount(&server)
+        .await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let url = format!("{}/api/registry/@lpm.dev/owner.pkg", server.uri());
+    let payload = lpm_http::ReplayableRequestBody::from_bytes(
+        serde_json::to_vec(&serde_json::json!({ "name": "@lpm.dev/owner.pkg" })).unwrap(),
+    );
+    let request_client = reqwest::Client::new();
+
+    let response = client
+        .send_publish_safe(
+            || {
+                Ok(request_client
+                    .put(&url)
+                    .timeout(std::time::Duration::from_millis(200))
+                    .body(payload.body()))
+            },
+            &payload,
+            None,
+            "@lpm.dev/owner.pkg",
+            "1.0.0",
+            "sha512-test",
+        )
+        .await
+        .expect("a publish the registry has must not be reported as failed");
+
+    assert!(matches!(response, PublishSafeResponse::Recovered(_)));
+}
+
+#[tokio::test]
+async fn a_publish_whose_deadline_runs_out_between_redirect_hops_is_reconciled_with_the_registry() {
+    let status = wiremock::MockServer::start().await;
+    let status_url = format!("{}/status", status.uri());
+    let registry = registry_redirecting_publishes_to(&status_url, true).await;
+    let (mut client, _tmp) = client_with_mock_server(&registry.uri());
+    let status_origin = OriginKey::from_request_url(&status_url).expect("status origin");
+    let mut tls_overrides = TlsOverrides::default();
+    tls_overrides
+        .per_origin
+        .insert(status_origin.clone(), OriginTlsOverrides::default());
+    let lazy = tls_overrides
+        .per_origin
+        .keys()
+        .map(|origin| (origin.clone(), tokio::sync::OnceCell::new()))
+        .collect();
+    client.http = Arc::new(HttpClients {
+        default: DefaultClient::built(cached(RegistryClient::build_http_client(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+        ))),
+        eager: HashMap::new(),
+        lazy,
+        built_client_sets: AtomicUsize::new(0),
+        tls_overrides: Arc::new(tls_overrides),
+        passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
+        next_request_lane: AtomicUsize::new(0),
+    });
+    // The redirect target's TLS client is still being built (a passphrase
+    // prompt, say) when the publish's deadline passes.
+    let (building_tx, building_rx) = tokio::sync::oneshot::channel();
+    let http = Arc::clone(&client.http);
+    let held_build = tokio::spawn(async move {
+        http.lazy[&status_origin]
+            .get_or_init(|| {
+                let _ = building_tx.send(());
+                std::future::pending()
+            })
+            .await;
+    });
+    building_rx
+        .await
+        .expect("the status origin's build started");
+    let url = format!("{}/api/registry/@lpm.dev/owner.pkg", registry.uri());
+    let payload = lpm_http::ReplayableRequestBody::from_bytes(
+        serde_json::to_vec(&serde_json::json!({ "name": "@lpm.dev/owner.pkg" })).unwrap(),
+    );
+    let request_client = reqwest::Client::new();
+
+    let response = client
+        .send_publish_safe(
+            || {
+                Ok(request_client
+                    .put(&url)
+                    .timeout(std::time::Duration::from_millis(200))
+                    .body(payload.body()))
+            },
+            &payload,
+            None,
+            "@lpm.dev/owner.pkg",
+            "1.0.0",
+            "sha512-test",
+        )
+        .await;
+    held_build.abort();
+
+    assert!(
+        matches!(response, Ok(PublishSafeResponse::Recovered(_))),
+        "the registry kept the publish before redirecting: {:?}",
+        response.err()
+    );
+    assert!(status.received_requests().await.unwrap().is_empty());
+}

@@ -669,22 +669,28 @@ impl RegistryClient {
                         }
                     }
                 }
-                Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
-                Err(
-                    failure @ (lpm_http::ReplayableRequestError::Request(_)
-                    | lpm_http::ReplayableRequestError::RequestAfterRedirect(_)),
-                ) => {
-                    let redirected = matches!(
-                        failure,
-                        lpm_http::ReplayableRequestError::RequestAfterRedirect(_)
-                    );
-                    let (lpm_http::ReplayableRequestError::Request(error)
-                    | lpm_http::ReplayableRequestError::RequestAfterRedirect(error)) = failure
-                    else {
-                        unreachable!("the arm matched one of the two request failures");
+                Err(failure) => {
+                    let (error, permanent, redirected) = match failure {
+                        lpm_http::ReplayableRequestError::Client(error) => return Err(error),
+                        lpm_http::ReplayableRequestError::Request(error) => (
+                            LpmError::Network(lpm_http::error_chain(&error)),
+                            lpm_http::is_permanent_tls_failure(&error),
+                            false,
+                        ),
+                        lpm_http::ReplayableRequestError::RequestAfterRedirect(error) => (
+                            LpmError::Network(lpm_http::error_chain(&error)),
+                            lpm_http::is_permanent_tls_failure(&error),
+                            true,
+                        ),
+                        // The deadline can run out between redirect hops,
+                        // after the registry read the publish.
+                        lpm_http::ReplayableRequestError::Timeout => (
+                            LpmError::Network("publish request timed out".into()),
+                            false,
+                            false,
+                        ),
+                        refused => return Err(LpmError::Network(refused.to_string())),
                     };
-                    let permanent = lpm_http::is_permanent_tls_failure(&error);
-                    let error = LpmError::Network(lpm_http::error_chain(&error));
                     // A handshake refused on the first hop means the registry
                     // never read the publish. After a redirect it may have.
                     if permanent && !redirected {
@@ -721,7 +727,6 @@ impl RegistryClient {
                         continue;
                     }
                 }
-                Err(error) => return Err(LpmError::Network(error.to_string())),
             }
         }
 
