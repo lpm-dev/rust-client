@@ -631,7 +631,8 @@ impl SessionManager {
         // redirect to another origin.
         let client = builder
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= lpm_http::DEFAULT_REDIRECT_LIMIT {
+                // `previous` holds the first URL too, as in `Policy::limited`.
+                if attempt.previous().len() > lpm_http::DEFAULT_REDIRECT_LIMIT {
                     attempt.error("too many redirects")
                 } else if attempt.url().origin() == origin {
                     attempt.follow()
@@ -1014,6 +1015,14 @@ impl SessionManager {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.clear_rejected_session_if_current(rejected_access, refresh_token)?;
                 return Err(LpmError::SessionExpired);
+            }
+            if status.is_redirection() && resp.headers().contains_key(reqwest::header::LOCATION) {
+                return Err(LpmError::Http {
+                    status: status.as_u16(),
+                    message: "the registry redirected the session refresh to another origin, \
+                              which a refresh doesn't follow"
+                        .to_string(),
+                });
             }
             let reason = lpm_http::read_body_capped(resp, 64 * 1024)
                 .await
@@ -2589,11 +2598,56 @@ mod refresh_http_tests {
         let _isolated = isolate_test_env();
         let mgr = manager_for(&server.uri());
 
-        assert!(mgr.refresh_now().await.is_err());
+        let error = mgr
+            .refresh_now()
+            .await
+            .expect_err("a refresh redirected elsewhere fails");
         assert!(
             elsewhere.received_requests().await.unwrap().is_empty(),
             "the refresh token must not leave the registry's origin"
         );
+        assert!(
+            error
+                .to_string()
+                .contains("redirected the session refresh to another origin"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_refresh_follows_as_many_same_origin_redirects_as_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/hop/1"))
+            .mount(&server)
+            .await;
+        for hop in 1..lpm_http::DEFAULT_REDIRECT_LIMIT {
+            Mock::given(method("POST"))
+                .and(path(format!("/hop/{hop}")))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("location", format!("/hop/{}", hop + 1)),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path(format!("/hop/{}", lpm_http::DEFAULT_REDIRECT_LIMIT)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-after-redirects",
+                "refreshToken": "rt-after-redirects",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let mgr = manager_for(&server.uri());
+
+        mgr.refresh_now()
+            .await
+            .expect("a refresh follows the redirect limit's worth of same-origin hops");
     }
 
     #[tokio::test]
