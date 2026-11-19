@@ -6,7 +6,9 @@ mod support;
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+};
 use support::{TempProject, lpm, lpm_with_registry};
 
 fn bare_install(project: &TempProject) -> assert_cmd::Command {
@@ -1494,5 +1496,293 @@ async fn unchanged_workspace_member_install_that_sends_nothing_warns_about_no_np
     assert!(
         !stderr.contains("TLS certificate verification is DISABLED"),
         "an install that sends nothing has no verification to disable: {stderr}"
+    );
+}
+
+async fn installed_leaf_project() -> (MockRegistry, TempProject) {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","dependencies":{"leaf":"1.0.0"}}"#);
+    install(&project, &mock.url()).assert().success();
+    (mock, project)
+}
+
+#[tokio::test]
+async fn unchanged_ci_and_unsummarized_installs_answer_from_the_quick_check() {
+    let (_mock, project) = installed_leaf_project().await;
+
+    for (ci, args) in [
+        (true, &[][..]),
+        (true, &["--frozen-lockfile"][..]),
+        (false, &["--frozen-lockfile"][..]),
+        (false, &["--no-frozen-lockfile"][..]),
+        (false, &["--no-skills", "--no-security-summary"][..]),
+    ] {
+        let mut command = bare_install(&project);
+        if ci {
+            command.env("CI", "1");
+        }
+        let output = command.args(args).assert().success().get_output().clone();
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut keys: Vec<&str> = result
+            .as_object()
+            .expect("an install answers with a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["duration_ms", "schema_version", "success", "up_to_date"],
+            "CI={ci} {args:?} must take the quick check: {result}"
+        );
+        assert_eq!(result["up_to_date"], true, "{result}");
+    }
+}
+
+#[tokio::test]
+async fn unchanged_frozen_install_refuses_a_lockfile_a_frozen_install_would_refuse() {
+    let (_mock, project) = installed_leaf_project().await;
+    // The lockfile recorded peers installed automatically; a frozen install
+    // now asked not to install them must refuse it, up to date or not.
+    std::fs::write(
+        project.home().join(".lpm/config.toml"),
+        "auto-install-peers = false\n",
+    )
+    .unwrap();
+
+    for (ci, args) in [(true, &[][..]), (false, &["--frozen-lockfile"][..])] {
+        let mut command = bare_install(&project);
+        if ci {
+            command.env("CI", "1");
+        }
+        let output = command.args(args).assert().failure().get_output().clone();
+        let result = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            result.contains("Frozen lockfile mismatch") && result.contains("auto install peers"),
+            "CI={ci} {args:?}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unchanged_frozen_workspace_member_install_refuses_a_lockfile_a_frozen_install_would_refuse()
+ {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"leaf":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"1.0.0"}}"#,
+    );
+    install(&project, &mock.url()).assert().success();
+
+    let member = project.path().join("packages/app");
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .current_dir(&member)
+        .env("CI", "1")
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
+    std::fs::write(
+        project.home().join(".lpm/config.toml"),
+        "auto-install-peers = false\n",
+    )
+    .unwrap();
+
+    let output = bare_install(&project)
+        .current_dir(&member)
+        .env("CI", "1")
+        .env("LPM_REGISTRY_URL", mock.url())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let result = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        result.contains("Frozen lockfile mismatch") && result.contains("auto install peers"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_workspace_installs_with_catalog_dependencies_answer_up_to_date() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"catalog:"}}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"catalog:"}}"#,
+    );
+    install(&project, &mock.url()).assert().success();
+
+    for dir in [
+        project.path().to_path_buf(),
+        project.path().join("packages/app"),
+    ] {
+        let mut unchanged = bare_install(&project);
+        unchanged
+            .current_dir(&dir)
+            .env("LPM_REGISTRY_URL", mock.url());
+        assert_up_to_date(unchanged);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_member_install_whose_only_catalog_reference_is_an_override_answers_up_to_date() {
+    let mock = MockRegistry::start().await;
+    serve_leaf_1_0_0_and_1_1_0(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"catalogs":{"default":{"leaf":"1.0.0"}}}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"^1.0.0"},"overrides":{"leaf":"catalog:"}}"#,
+    );
+    install(&project, &mock.url()).assert().success();
+    assert_override_pinned_leaf_to_its_catalog_entry(&project);
+
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .current_dir(project.path().join("packages/app"))
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
+}
+
+#[tokio::test]
+async fn unchanged_member_install_under_a_root_catalog_override_answers_up_to_date() {
+    // Catalogs only in pnpm-workspace.yaml, named only by the root's
+    // override: a member of a package.json workspace installs on its own; a
+    // member of a pnpm-workspace.yaml one installs recursively.
+    for (root_manifest, workspace_yaml) in [
+        (
+            r#"{"name":"root","private":true,"workspaces":["packages/*"],"overrides":{"leaf":"catalog:"}}"#,
+            "catalog:\n  leaf: 1.0.0\n",
+        ),
+        (
+            r#"{"name":"root","private":true,"overrides":{"leaf":"catalog:"}}"#,
+            "packages:\n  - packages/*\ncatalog:\n  leaf: 1.0.0\n",
+        ),
+    ] {
+        let mock = MockRegistry::start().await;
+        serve_leaf_1_0_0_and_1_1_0(&mock).await;
+        mock.with_manifest_package(
+            serde_json::json!({"name": "parent", "version": "1.0.0", "dependencies": {"leaf": "^1.0.0"}}),
+            &[],
+        )
+        .await;
+        let project = TempProject::empty(root_manifest);
+        project.write_file("pnpm-workspace.yaml", workspace_yaml);
+        project.write_file(
+            "packages/app/package.json",
+            r#"{"name":"app","version":"1.0.0","dependencies":{"parent":"1.0.0"}}"#,
+        );
+        install(&project, &mock.url()).assert().success();
+        assert_override_pinned_leaf_to_its_catalog_entry(&project);
+
+        let mut unchanged = bare_install(&project);
+        unchanged
+            .current_dir(project.path().join("packages/app"))
+            .env("LPM_REGISTRY_URL", mock.url());
+        assert_up_to_date(unchanged);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_non_recursive_root_install_with_a_catalog_only_in_pnpm_workspace_yaml_answers_up_to_date()
+ {
+    let mock = MockRegistry::start().await;
+    serve_leaf_1_0_0_and_1_1_0(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"leaf":"catalog:"}}"#,
+    );
+    project.write_file("pnpm-workspace.yaml", "catalog:\n  leaf: 1.0.0\n");
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0"}"#,
+    );
+    install(&project, &mock.url())
+        .arg("--no-recursive")
+        .assert()
+        .success();
+
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .arg("--no-recursive")
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
+}
+
+#[tokio::test]
+async fn unchanged_install_of_a_project_a_workspace_glob_covers_but_doesnt_own_uses_its_own_catalogs()
+ {
+    let mock = MockRegistry::start().await;
+    serve_leaf_1_0_0_and_1_1_0(&mock).await;
+    // Discovery skips node_modules, so the workspace doesn't own this
+    // project although its glob covers the path.
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["sandbox/**"],"catalogs":{"default":{"leaf":"1.1.0"}}}"#,
+    );
+    project.write_file(
+        "sandbox/node_modules/app/package.json",
+        r#"{"name":"app","version":"1.0.0","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"catalog:"}}"#,
+    );
+    let app = project.path().join("sandbox/node_modules/app");
+    install(&project, &mock.url())
+        .current_dir(&app)
+        .arg("--no-recursive")
+        .assert()
+        .success();
+
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .current_dir(&app)
+        .arg("--no-recursive")
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
+}
+
+/// `leaf` 1.0.0 and 1.1.0, so an override to 1.0.0 changes what `^1.0.0`
+/// selects.
+async fn serve_leaf_1_0_0_and_1_1_0(mock: &MockRegistry) {
+    mock.with_full_package_metadata(
+        "leaf",
+        "1.1.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("leaf", "1.0.0")),
+            ),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("leaf", "1.1.0")),
+            ),
+        ],
+    )
+    .await;
+}
+
+fn assert_override_pinned_leaf_to_its_catalog_entry(project: &TempProject) {
+    let member = lpm_lockfile::Lockfile::read_for_project(&project.path().join("packages/app"))
+        .expect("the member's lockfile")
+        .lockfile;
+    let snapshot = member
+        .catalogs
+        .get("default")
+        .and_then(|catalog| catalog.get("leaf"));
+    assert_eq!(
+        snapshot.map(|entry| entry.version.as_str()),
+        Some("1.0.0"),
+        "the applied override records its catalog snapshot\n{}",
+        project.read_file("lpm.lock")
     );
 }

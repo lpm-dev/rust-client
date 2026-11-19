@@ -77,7 +77,7 @@ fn lockfile_replay_warning_redacts_source_credentials_and_url_components() {
             LockfileReplayInput {
                 lockfile_dir: Path::new("."),
                 deps: &HashMap::new(),
-                catalog_resolutions: &[],
+                catalog_resolutions: CatalogResolutions::default(),
                 workspace: None,
                 registry_source: RegistrySourceContext::new(&route_table, &client),
                 policy: LockfileReplayPolicy {
@@ -400,7 +400,7 @@ fn prepare_override_resolution_state_resolves_catalog_backed_override_maps() {
 
     let state = prepare_override_resolution_state(OverrideResolutionInput {
         package: &package,
-        workspace: None,
+        workspace_root: None,
         catalog_resolutions: &mut catalog_resolutions,
     })
     .expect("catalog-backed overrides should resolve");
@@ -461,7 +461,7 @@ fn prepare_override_resolution_state_inherits_root_maps_with_member_precedence()
 
     let state = prepare_override_resolution_state(OverrideResolutionInput {
         package: &member_package,
-        workspace: Some(&workspace),
+        workspace_root: Some(&workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     })
     .expect("workspace override maps should merge");
@@ -559,7 +559,93 @@ fn lockfile_catalog_replay_allows_configured_override_that_was_not_applied() {
     assert!(lockfile_catalog_snapshots_match_current(
         &lockfile,
         &deps,
-        &[direct, applied_override, unused_override],
+        &[direct],
+        &[applied_override, unused_override],
+    ));
+}
+
+#[test]
+fn lockfile_catalog_replay_checks_an_override_snapshot_of_a_transitive_package_as_its_writer_chose_it()
+ {
+    let leaf_override = catalog_resolution("leaf", "^2.0.0");
+    let transitive = |version: &str| lpm_lockfile::LockedPackage {
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            "leaf",
+            version,
+            TEST_REGISTRY_SOURCE,
+            "root/parent/leaf",
+        )),
+        name: "leaf".to_string(),
+        version: version.to_string(),
+        source: Some(TEST_REGISTRY_SOURCE.to_string()),
+        ..Default::default()
+    };
+    let deps = HashMap::from([("parent".to_string(), "1.0.0".to_string())]);
+
+    for (case, locked, snapshot, matches) in [
+        ("the locked version", &["2.1.0"][..], "2.1.0", true),
+        (
+            "the best version the range accepts",
+            &["1.5.0", "2.1.0", "2.0.4"][..],
+            "2.1.0",
+            true,
+        ),
+        ("another version", &["2.1.0"][..], "2.0.4", false),
+        ("a version nothing locks", &[][..], "2.1.0", false),
+    ] {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        add_catalog_snapshot(
+            &mut lockfile,
+            &catalog_resolution("parent", "1.0.0"),
+            "1.0.0",
+        );
+        lockfile
+            .catalogs
+            .get_mut("default")
+            .unwrap()
+            .remove("parent");
+        for version in locked {
+            lockfile.add_package(transitive(version));
+        }
+        lockfile
+            .catalogs
+            .entry("default".to_string())
+            .or_default()
+            .insert(
+                "leaf".to_string(),
+                lpm_lockfile::CatalogSnapshotEntry {
+                    specifier: leaf_override.specifier.clone(),
+                    version: snapshot.to_string(),
+                    reference: leaf_override.reference.clone(),
+                },
+            );
+
+        assert_eq!(
+            lockfile_catalog_snapshots_match_current(
+                &lockfile,
+                &deps,
+                &[],
+                std::slice::from_ref(&leaf_override),
+            ),
+            matches,
+            "a snapshot naming {case}"
+        );
+    }
+}
+
+#[test]
+fn lockfile_catalog_replay_allows_an_unapplied_override_of_a_direct_dependency() {
+    let override_of_direct = catalog_resolution("direct-package", "1.1.0");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    add_catalog_snapshot(&mut lockfile, &override_of_direct, "1.1.0");
+    lockfile.catalogs.clear();
+    let deps = HashMap::from([("direct-package".to_string(), "^1.0.0".to_string())]);
+
+    assert!(lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[],
+        &[override_of_direct],
     ));
 }
 
@@ -572,6 +658,7 @@ fn lockfile_catalog_replay_rejects_missing_direct_snapshot() {
         &lpm_lockfile::Lockfile::new(),
         &deps,
         &[direct],
+        &[],
     ));
 }
 
@@ -588,6 +675,7 @@ fn lockfile_catalog_replay_rejects_snapshot_for_removed_override() {
         &lockfile,
         &deps,
         &[direct],
+        &[],
     ));
 }
 
@@ -609,11 +697,13 @@ fn lockfile_catalog_replay_rejects_changed_specifier_or_reference() {
         &lockfile,
         &deps,
         &[changed_specifier],
+        &[],
     ));
     assert!(!lockfile_catalog_snapshots_match_current(
         &lockfile,
         &deps,
         &[changed_reference],
+        &[],
     ));
 }
 
@@ -634,6 +724,7 @@ fn lockfile_catalog_replay_rejects_snapshot_version_drift() {
         &lockfile,
         &deps,
         &[direct],
+        &[],
     ));
 }
 
@@ -2424,7 +2515,7 @@ fn replay_keeps_ambient_peer_non_direct_when_optional_declaration_is_unresolved(
         lockfile_path: &path,
         deps: &deps,
         optional_root_names: &optional,
-        catalog_resolutions: &[],
+        catalog_resolutions: CatalogResolutions::default(),
         workspace: None,
         route_table: &routes,
         client: &client,

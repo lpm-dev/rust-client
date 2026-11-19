@@ -98,7 +98,7 @@ pub(crate) fn run() -> Result<()> {
             || install_state::has_pnpm_workspace_yaml(&cwd);
 
         if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
-            match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, fast_lane.json) {
+            match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, fast_lane) {
                 Ok(true) => {
                     let elapsed_ms = start.elapsed().as_millis();
                     if fast_lane.json {

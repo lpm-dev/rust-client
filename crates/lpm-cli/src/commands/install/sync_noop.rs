@@ -5,8 +5,9 @@ use lpm_common::LpmError;
 pub(crate) fn is_up_to_date(
     project_dir: &Path,
     package_json: &str,
-    json_output: bool,
+    mode: crate::install_state::FastLaneMode,
 ) -> Result<bool, LpmError> {
+    let json_output = mode.json;
     let package_json = lpm_common::strip_utf8_bom_str(package_json);
     let Ok(cached_state) = lpm_common::read_text_file_capped(
         &project_dir.join(".lpm/install-hash"),
@@ -90,6 +91,55 @@ pub(crate) fn is_up_to_date(
     {
         return Ok(false);
     }
+    // Replaying the lockfile needs its catalog snapshot to match and each
+    // root to resolve to an instance the manifest still accepts; the full
+    // pipeline's own up-to-date answer checks the same before it answers.
+    let mut manifest_deps = super::manifest::manifest_install_deps(&package);
+    if super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err() {
+        return Ok(false);
+    }
+    let mut manifest_deps = std::borrow::Cow::Owned(manifest_deps);
+    let Some(catalog_resolutions) =
+        super::lockfile::current_catalog_resolutions(&package, None, &mut manifest_deps)
+    else {
+        return Ok(false);
+    };
+    let optional_root_names: std::collections::HashSet<String> =
+        package.optional_dependencies.keys().cloned().collect();
+    let locked_packages: Vec<&lpm_lockfile::LockedPackage> =
+        project_lockfile.lockfile.packages.iter().collect();
+    if !super::lockfile::locked_catalogs_and_roots_match_manifest(
+        &project_lockfile.lockfile,
+        &super::lockfile::LockedRows::indexed(&locked_packages),
+        super::lockfile::LockedManifest {
+            deps: &manifest_deps,
+            catalog_resolutions: catalog_resolutions.as_resolutions(),
+            optional_root_names: &optional_root_names,
+        },
+        project_dir,
+        false,
+    ) {
+        return Ok(false);
+    }
+    let frozen = match mode.frozen_lockfile {
+        super::FrozenLockfileMode::Always => true,
+        super::FrozenLockfileMode::Never => false,
+        super::FrozenLockfileMode::Auto => super::install_running_in_ci(),
+    };
+    if frozen
+        && super::validation::frozen_install_accepts_lockfile(
+            project_dir,
+            &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+            &package,
+            None,
+            &project_lockfile.lockfile,
+            super::setup::resolve_auto_install_peers(&package, &global),
+        )
+        .is_err()
+    {
+        // The full install reports why a frozen install refuses it.
+        return Ok(false);
+    }
     let routes = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
     for package in &project_lockfile.lockfile.packages {
@@ -125,9 +175,13 @@ pub(crate) fn is_up_to_date(
         json_output,
     )?;
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
-    let skills_ready = (!crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
-        || crate::commands::skills::package::materialization_complete(project_dir, package_json))
-        && crate::commands::skills::project_skills_ready(project_dir);
+    let skills_ready = mode.no_skills
+        || ((!crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
+            || crate::commands::skills::package::materialization_complete(
+                project_dir,
+                package_json,
+            ))
+            && crate::commands::skills::project_skills_ready(project_dir));
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }

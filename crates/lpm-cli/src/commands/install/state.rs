@@ -29,7 +29,7 @@ pub(super) fn write_post_install_hash(
     }
 }
 
-fn write_post_install_hash_with_context(
+pub(super) fn write_post_install_hash_with_context(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
@@ -162,6 +162,8 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) pkg_json_path: &'a Path,
     pub(super) lockfile_path: &'a Path,
+    pub(super) package: &'a lpm_workspace::PackageJson,
+    pub(super) auto_install_peers: bool,
     pub(super) manifest_deps: &'a HashMap<String, String>,
     pub(super) root_optional_dependency_names: &'a HashSet<String>,
     pub(super) production_dependency_names: &'a HashSet<String>,
@@ -286,7 +288,7 @@ pub(super) async fn run_install_freshness_phase(
             let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);
             let fast =
                 validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
-                    .and_then(|(lockfile_deps, workspace_deps_filtered)| {
+                    .and_then(|(mut lockfile_deps, workspace_deps_filtered)| {
                         if workspace_deps_filtered
                             && lockfile_deps.is_empty()
                             && workspace_lockfile::exists(input.lockfile_path)
@@ -294,11 +296,31 @@ pub(super) async fn run_install_freshness_phase(
                             return Some(Vec::new());
                         }
                         let route_table = route_table.as_ref()?;
+                        // A plain install outside `--recursive` has no active
+                        // workspace, but a member or root still installs under
+                        // its workspace's lockfile, whose root's catalogs,
+                        // overrides and resolutions the cold install applies.
+                        let found_root = workspace
+                            .is_none()
+                            .then(workspace_lockfile::active_workspace_root)
+                            .flatten()
+                            .and_then(|root| {
+                                lpm_workspace::read_workspace_root_package(&root).ok()
+                            });
+                        let workspace_root = workspace
+                            .as_deref()
+                            .map(|workspace| &workspace.root_package)
+                            .or(found_root.as_ref());
+                        let catalog_resolutions = super::lockfile::current_catalog_resolutions(
+                            input.package,
+                            workspace_root,
+                            &mut lockfile_deps,
+                        )?;
                         try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
                             lockfile_path: input.lockfile_path,
                             deps: &lockfile_deps,
                             optional_root_names: input.root_optional_dependency_names,
-                            catalog_resolutions: &[],
+                            catalog_resolutions: catalog_resolutions.as_resolutions(),
                             workspace: workspace.as_deref(),
                             route_table,
                             client: input.client,
@@ -357,6 +379,10 @@ pub(super) async fn run_install_freshness_phase(
     } else {
         None
     };
+    // A frozen install refuses a lockfile that no longer matches the project,
+    // and an unchanged install hash doesn't excuse it from saying so.
+    let fast_path_packages = fast_path_packages
+        .filter(|_| !input.frozen_lockfile || frozen_install_still_accepts_lockfile(&input));
     let source_analysis_caches_ready = fast_path_packages.as_deref().is_none_or(|packages| {
         source_analysis_caches_are_current(
             input.lpm_root,
@@ -567,6 +593,24 @@ fn up_to_date_request_client(
     };
     super::source_resolution::warn_about_npmrc_security_settings(route_table);
     configured.with_tls_overrides_for(route_table.tls_overrides(), &[])
+}
+
+fn frozen_install_still_accepts_lockfile(input: &InstallFreshnessInput<'_>) -> bool {
+    let Ok(lockfile) = workspace_lockfile::read_metadata_shared(input.lockfile_path) else {
+        return false;
+    };
+    let workspace = crate::workspace_discovery_cache::discover_workspace(input.project_dir)
+        .ok()
+        .flatten();
+    super::validation::frozen_install_accepts_lockfile(
+        input.project_dir,
+        input.lockfile_path,
+        input.package,
+        workspace.as_deref(),
+        &lockfile,
+        input.auto_install_peers,
+    )
+    .is_ok()
 }
 
 pub(super) fn source_analysis_caches_are_current(

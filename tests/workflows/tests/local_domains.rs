@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use support::{TempProject, lpm, lpm_spawnable};
 
+/// How long a `lpm dev` route may take to register on a loaded machine.
+#[cfg(unix)]
+const PROXY_ROUTE_WAIT: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 #[test]
 fn dev_registers_proxy_routes_and_prepares_cert_without_enabling_app_https() {
@@ -563,8 +567,9 @@ fn concurrent_dev_projects_share_one_https_proxy_daemon() {
         .stdin(Stdio::null());
     let dev_b = dev_b_command.spawn().expect("spawn second lpm dev");
 
-    let alpha_route = wait_for_proxy_route(&project_a, "alpha.localhost");
-    let beta_route = wait_for_proxy_route(&project_a, "beta.localhost");
+    let (alpha_route, dev_a) =
+        wait_for_proxy_route_or_dev_exit(&project_a, "alpha.localhost", dev_a);
+    let (beta_route, dev_b) = wait_for_proxy_route_or_dev_exit(&project_a, "beta.localhost", dev_b);
     assert_ne!(
         alpha_route["upstreamPort"], beta_route["upstreamPort"],
         "concurrent projects must receive distinct upstream ports"
@@ -585,6 +590,8 @@ fn concurrent_dev_projects_share_one_https_proxy_daemon() {
         "shared daemon should contain both project routes: {routes:?}"
     );
 
+    stop_service(&project_a);
+    stop_service(&project_b);
     let output_a = dev_a.wait_with_output().expect("wait for first lpm dev");
     let output_b = dev_b.wait_with_output().expect("wait for second lpm dev");
     assert!(
@@ -672,6 +679,7 @@ fn concurrent_dev_projects_reject_duplicate_proxy_host_on_shared_daemon() {
         "duplicate project must not replace the first lease"
     );
 
+    stop_service(&project_a);
     let output_a = dev_a.wait_with_output().expect("wait for first lpm dev");
     assert!(
         output_a.status.success(),
@@ -758,6 +766,7 @@ fn dev_removes_hosts_file_entry_when_proxy_route_registration_fails() {
         "duplicate project must not replace the first lease"
     );
 
+    stop_service(&project_a);
     let output_a = dev_a.wait_with_output().expect("wait for first lpm dev");
     assert!(
         output_a.status.success(),
@@ -824,15 +833,33 @@ fn dev_rejects_configured_host_when_proxy_has_no_https_listener() {
 }
 
 #[cfg(unix)]
+/// A project whose `web` service serves `host` until [`stop_service`] tells
+/// it to end, so a slow machine can't end it before the test has checked
+/// its route.
 fn write_localhost_service_project(project: &TempProject, host: &str) {
     project.write_file(
         "server.js",
         r#"
+const fs = require('fs');
 const http = require('http');
+const path = require('path');
 
+const stop = path.join(__dirname, 'stop');
 const server = http.createServer((_, response) => response.end('ok'));
 server.listen(process.env.PORT, '127.0.0.1', () => {
-  setTimeout(() => server.close(() => process.exit(0)), 8000);
+  const end = () => {
+    server.close(() => process.exit(0));
+    server.closeAllConnections();
+  };
+  // The cap only ends a server that a failed test left running.
+  const cap = setTimeout(end, 60000);
+  const poll = setInterval(() => {
+    if (fs.existsSync(stop)) {
+      clearInterval(poll);
+      clearTimeout(cap);
+      end();
+    }
+  }, 50);
 });
 "#,
     );
@@ -867,9 +894,15 @@ fn wait_for_proxy_running(project: &TempProject, child: &mut Child) {
     panic!("proxy daemon did not become ready");
 }
 
+/// Ends the service [`write_localhost_service_project`] started.
+#[cfg(unix)]
+fn stop_service(project: &TempProject) {
+    project.write_file("stop", "");
+}
+
 #[cfg(unix)]
 fn wait_for_proxy_route(project: &TempProject, host: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROXY_ROUTE_WAIT;
     while Instant::now() < deadline {
         let status = proxy_status(project);
         if let Some(route) = status["routes"]
@@ -891,7 +924,7 @@ fn wait_for_proxy_route_or_dev_exit(
     host: &str,
     mut dev: Child,
 ) -> (serde_json::Value, Child) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROXY_ROUTE_WAIT;
     while Instant::now() < deadline {
         let status = proxy_status(project);
         if let Some(route) = status["routes"]

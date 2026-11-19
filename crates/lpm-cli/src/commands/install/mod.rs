@@ -737,6 +737,8 @@ async fn run_with_options_under_store_lock(
         project_dir,
         pkg_json_path: &pkg_json_path,
         lockfile_path: &lockfile_path,
+        package: &pkg,
+        auto_install_peers,
         manifest_deps: &manifest_deps,
         root_optional_dependency_names: &root_optional_dependency_names,
         production_dependency_names: &production_dependency_names,
@@ -864,7 +866,9 @@ async fn run_with_options_under_store_lock(
         override_set,
     } = prepare_override_resolution_state(OverrideResolutionInput {
         package: &pkg,
-        workspace: workspace.as_deref(),
+        workspace_root: workspace
+            .as_deref()
+            .map(|workspace| &workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     })?;
 
@@ -1062,7 +1066,10 @@ async fn run_with_options_under_store_lock(
             lockfile_deps: &direct_dependency_snapshot,
             pkg: &pkg,
             lockfile_path: &lockfile_path,
-            catalog_resolutions: &catalog_resolutions,
+            catalog_resolutions: lockfile::CatalogResolutions::new(
+                &catalog_resolutions,
+                dependency_catalog_resolution_count,
+            ),
             gate_stats: &gate_stats,
             override_set: &override_set,
             override_drift: &override_drift,
@@ -1111,7 +1118,10 @@ async fn run_with_options_under_store_lock(
         lockfile_path: &lockfile_path,
         deps: &direct_dependency_snapshot,
         optional_root_names: &root_optional_dependency_names,
-        catalog_resolutions: &catalog_resolutions,
+        catalog_resolutions: lockfile::CatalogResolutions::new(
+            &catalog_resolutions,
+            dependency_catalog_resolution_count,
+        ),
         workspace: workspace.as_deref(),
         route_table: &route_table,
         client,
@@ -1359,7 +1369,10 @@ async fn run_with_options_under_store_lock(
             &spike_pre_resolved_install_pkgs,
             &spike_pre_resolved_source_deps,
             &workspace_member_deps,
-            &catalog_resolutions,
+            lockfile::CatalogResolutions::new(
+                &catalog_resolutions,
+                dependency_catalog_resolution_count,
+            ),
             &current_patches,
             &current_lockfile_patches,
             &prior_patch_state,

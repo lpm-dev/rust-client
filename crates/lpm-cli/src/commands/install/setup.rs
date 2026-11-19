@@ -170,12 +170,7 @@ pub(super) fn prepare_install_setup_context(
         .unwrap_or(lpm_resolver::TrustPolicyMode::Off);
     let minimum_release_age_exclude = release_age_config.minimum_release_age_exclude;
 
-    let auto_install_peers: bool = pkg
-        .lpm
-        .as_ref()
-        .and_then(|l| l.auto_install_peers)
-        .or_else(|| global_config.get_bool("auto-install-peers"))
-        .unwrap_or(true);
+    let auto_install_peers = resolve_auto_install_peers(&pkg, &global_config);
     let strict_peer_dependencies = resolve_strict_peer_dependencies(
         input.strict_peer_dependencies_override,
         &pkg,
@@ -297,6 +292,19 @@ pub(super) fn check_project_policy(
         json_output,
     )?;
     Ok(firewall_mode)
+}
+
+/// Whether the install adds missing peers itself: the manifest's
+/// `lpm.autoInstallPeers`, else the global `auto-install-peers`, else yes.
+pub(super) fn resolve_auto_install_peers(
+    pkg: &lpm_workspace::PackageJson,
+    global_config: &crate::commands::config::GlobalConfig,
+) -> bool {
+    pkg.lpm
+        .as_ref()
+        .and_then(|l| l.auto_install_peers)
+        .or_else(|| global_config.get_bool("auto-install-peers"))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

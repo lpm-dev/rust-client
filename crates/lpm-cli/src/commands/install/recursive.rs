@@ -1059,7 +1059,7 @@ fn target_lockfile_is_replay_ready(
     };
     let Ok(overrides) = prepare_override_resolution_state(OverrideResolutionInput {
         package,
-        workspace: Some(workspace),
+        workspace_root: Some(&workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     }) else {
         return false;
@@ -1089,6 +1089,7 @@ fn target_lockfile_is_replay_ready(
     if lockfile.importers.get(".") != Some(&current_importer) {
         return false;
     }
+    let dependency_catalog_resolution_count = overrides.dependency_catalog_resolution_count;
 
     let Ok(route_table) = RouteTable::from_env_and_filesystem(project_dir) else {
         return false;
@@ -1099,7 +1100,10 @@ fn target_lockfile_is_replay_ready(
         super::lockfile::LockfileReplayInput {
             lockfile_dir: project_dir,
             deps: &deps,
-            catalog_resolutions: &catalog_resolutions,
+            catalog_resolutions: super::lockfile::CatalogResolutions::new(
+                &catalog_resolutions,
+                dependency_catalog_resolution_count,
+            ),
             workspace: Some(workspace),
             registry_source: RegistrySourceContext::new(&route_table, client),
             policy: super::lockfile::LockfileReplayPolicy {
