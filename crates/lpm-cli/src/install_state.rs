@@ -1557,7 +1557,8 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
     let mut frozen_lockfile = None;
     let mut no_skills = false;
     let mut found_install = false;
-    // clap refuses a flag given twice, so the fast lane must not answer for it.
+    // clap refuses a flag given twice on one side of `install`, so the fast
+    // lane must not answer for it.
     let mut seen: Vec<&str> = Vec::with_capacity(args.len());
 
     for arg in args {
@@ -1582,7 +1583,10 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
             "--verbose" => {}
 
             // The subcommand itself
-            "install" | "i" if !found_install => found_install = true,
+            "install" | "i" if !found_install => {
+                found_install = true;
+                seen.clear();
+            }
 
             // Flags the check honours. Both frozen flags at once are left to
             // clap to refuse.
@@ -1803,6 +1807,16 @@ mod tests {
             &["install", "--no-security-summary", "--no-security-summary"][..],
         ] {
             assert_eq!(fast_lane_mode_from_args(args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_accepts_a_global_flag_given_on_both_sides_of_install() {
+        for args in [
+            &["--json", "install", "--json"][..],
+            &["--verbose", "install", "--verbose"][..],
+        ] {
+            assert!(fast_lane_mode_from_args(args).is_some(), "{args:?}");
         }
     }
 

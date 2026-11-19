@@ -1580,13 +1580,12 @@ async fn unchanged_frozen_workspace_member_install_refuses_a_lockfile_a_frozen_i
     install(&project, &mock.url()).assert().success();
 
     let member = project.path().join("packages/app");
-    // A member's unchanged install answers up to date before the change.
-    bare_install(&project)
+    let mut unchanged = bare_install(&project);
+    unchanged
         .current_dir(&member)
         .env("CI", "1")
-        .env("LPM_REGISTRY_URL", mock.url())
-        .assert()
-        .success();
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
     std::fs::write(
         project.home().join(".lpm/config.toml"),
         "auto-install-peers = false\n",
