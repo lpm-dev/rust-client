@@ -760,7 +760,7 @@ pub(in crate::commands::install) async fn run(
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
 
-    report_pool_install_attribution(&client, &install_packages, install_accounting).await?;
+    report_pool_install_attribution(client.as_ref(), &install_packages, install_accounting).await?;
 
     if emit_install_report && json_output {
         let package_json: Vec<serde_json::Value> = install_packages

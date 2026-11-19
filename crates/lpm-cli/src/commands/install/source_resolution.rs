@@ -328,6 +328,30 @@ pub(crate) fn load_install_route_table(
     Ok(route_table)
 }
 
+/// Warns once per run, in every output mode, about `.npmrc` settings that
+/// weaken an install's security, such as `strict-ssl=false`.
+pub(super) fn warn_about_npmrc_security_settings(route_table: &RouteTable) {
+    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+        && !tagged.value
+        && crate::commands::registry_reads::first_npmrc_security_warning(
+            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
+        )
+    {
+        output::warn(&format!(
+            "strict-ssl=false in {}:{} — TLS certificate verification is \
+             DISABLED for this install across ALL registries. This is a \
+             security risk.",
+            lpm_common::sanitize_terminal_inline(&tagged.source),
+            tagged.line
+        ));
+    }
+    for warning in route_table.npmrc_security_warnings() {
+        if crate::commands::registry_reads::first_npmrc_security_warning(warning) {
+            output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        }
+    }
+}
+
 pub(super) fn prepare_install_routing_context(
     project_dir: &Path,
     deps: &HashMap<String, String>,
@@ -349,25 +373,7 @@ pub(super) fn prepare_install_routing_context(
             output::warn(&lpm_common::sanitize_terminal_inline(warning));
         }
     }
-    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
-        && !tagged.value
-        && crate::commands::registry_reads::first_npmrc_security_warning(
-            &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
-        )
-    {
-        output::warn(&format!(
-            "strict-ssl=false in {}:{} — TLS certificate verification is \
-             DISABLED for this install across ALL registries. This is a \
-             security risk.",
-            lpm_common::sanitize_terminal_inline(&tagged.source),
-            tagged.line
-        ));
-    }
-    for warning in route_table.npmrc_security_warnings() {
-        if crate::commands::registry_reads::first_npmrc_security_warning(warning) {
-            output::warn(&lpm_common::sanitize_terminal_inline(warning));
-        }
-    }
+    warn_about_npmrc_security_settings(&route_table);
 
     let top_level_specs = top_level_registry_specs(deps);
     let eager_origins = route_table.effective_registry_origins(

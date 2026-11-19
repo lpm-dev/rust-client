@@ -388,7 +388,7 @@ pub(super) async fn run_install_freshness_phase(
         && source_analysis_caches_ready
         && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
-        let request_client = up_to_date_request_client(input.client, route_table.as_ref())?;
+        let request_client = UpToDateRequestClient::new(input.client, route_table.as_ref());
         let mut warnings =
             verify_lpm_install_access(&request_client, fast_path_packages, input.json_output)
                 .await?;
@@ -523,11 +523,41 @@ pub(super) async fn run_install_freshness_phase(
     })
 }
 
-/// The client the up-to-date path sends its requests with: `client` with
-/// the `.npmrc` TLS settings of the project's routes, which a cold install
-/// applies before it sends anything too. A silent refresh on its session
-/// takes the same settings. Without routes it is `client` as it is.
-pub(super) fn up_to_date_request_client(
+/// The client the up-to-date path sends its requests with, built when the
+/// first request needs it, so an install that sends nothing reads no
+/// `.npmrc` TLS file and has no security setting to warn about.
+pub(super) struct UpToDateRequestClient<'a> {
+    client: &'a RegistryClient,
+    route_table: Option<&'a RouteTable>,
+    configured: std::sync::OnceLock<RegistryClient>,
+}
+
+impl<'a> UpToDateRequestClient<'a> {
+    pub(super) fn new(client: &'a RegistryClient, route_table: Option<&'a RouteTable>) -> Self {
+        Self {
+            client,
+            route_table,
+            configured: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl super::accounting::InstallRequestClient for UpToDateRequestClient<'_> {
+    fn request_client(&self) -> Result<&RegistryClient, LpmError> {
+        if let Some(configured) = self.configured.get() {
+            return Ok(configured);
+        }
+        let configured = up_to_date_request_client(self.client, self.route_table)?;
+        Ok(self.configured.get_or_init(|| configured))
+    }
+}
+
+/// `client` with the `.npmrc` TLS settings of the project's routes, which a
+/// cold install applies before it sends anything too, and the same security
+/// warnings. A silent refresh on its session takes the same settings. Each
+/// origin's TLS files are read only when a request goes to it. Without
+/// routes it is `client` as it is.
+fn up_to_date_request_client(
     client: &RegistryClient,
     route_table: Option<&RouteTable>,
 ) -> Result<RegistryClient, LpmError> {
@@ -535,10 +565,8 @@ pub(super) fn up_to_date_request_client(
     let Some(route_table) = route_table else {
         return Ok(configured);
     };
-    let lpm_origin: Vec<_> = lpm_registry::npmrc::OriginKey::from_request_url(client.base_url())
-        .into_iter()
-        .collect();
-    configured.with_tls_overrides_for(route_table.tls_overrides(), &lpm_origin)
+    super::source_resolution::warn_about_npmrc_security_settings(route_table);
+    configured.with_tls_overrides_for(route_table.tls_overrides(), &[])
 }
 
 pub(super) fn source_analysis_caches_are_current(

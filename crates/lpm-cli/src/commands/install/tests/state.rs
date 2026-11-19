@@ -300,38 +300,79 @@ fn local_directories_named_in_other_bytes_have_their_own_identity() {
     );
 }
 
-#[test]
-fn the_up_to_date_paths_client_carries_the_npmrc_tls_settings_of_the_lpm_registry() {
+/// A home whose `~/.npmrc` is `npmrc`, and the routes of a project in it.
+fn routes_under_user_npmrc(
+    npmrc: impl FnOnce(&std::path::Path) -> String,
+) -> (
+    tempfile::TempDir,
+    crate::test_env::ScopedEnv,
+    lpm_registry::RouteTable,
+) {
     let home = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    let _env = crate::test_env::ScopedEnv::update([
+    let env = crate::test_env::ScopedEnv::update([
         ("HOME", Some(home.path().as_os_str().to_owned())),
         ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
         ("NPM_CONFIG_USERCONFIG", None),
         ("NPM_CONFIG_GLOBALCONFIG", None),
     ]);
-    let certified =
-        rcgen::generate_simple_self_signed(vec!["lpm.dev".to_string()]).expect("certificate");
-    let ca_path = home.path().join("corporate-ca.pem");
-    std::fs::write(&ca_path, certified.cert.pem()).unwrap();
-    std::fs::write(
-        home.path().join(".npmrc"),
-        format!("//lpm.dev/:cafile={}\n", ca_path.display()),
-    )
-    .unwrap();
-    let routes = lpm_registry::RouteTable::from_env_and_filesystem(project.path()).unwrap();
+    std::fs::write(home.path().join(".npmrc"), npmrc(home.path())).unwrap();
+    let project = home.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let routes = lpm_registry::RouteTable::from_env_and_filesystem(&project).unwrap();
+    (home, env, routes)
+}
 
-    let client = crate::commands::install::state::up_to_date_request_client(
-        &lpm_registry::RegistryClient::new(),
-        Some(&routes),
+fn strict_ssl_warning_is_pending(routes: &lpm_registry::RouteTable) -> bool {
+    let tagged = routes.tls_overrides().strict_ssl.as_ref().unwrap();
+    crate::commands::registry_reads::first_npmrc_security_warning(
+        &crate::commands::registry_reads::strict_ssl_warning_key(&tagged.source, tagged.line),
     )
-    .unwrap();
+}
 
-    let summary = client.render_effective_tls_summary();
-    assert!(
-        summary
-            .as_deref()
-            .is_some_and(|summary| summary.contains("per-origin TLS for //lpm.dev/")),
-        "{summary:?}"
-    );
+#[tokio::test]
+async fn an_up_to_date_install_that_sends_nothing_builds_no_client_and_warns_about_no_npmrc_setting()
+ {
+    let (_home, _env, routes) = routes_under_user_npmrc(|_| "strict-ssl=false\n".to_string());
+    let base = lpm_registry::RegistryClient::new();
+    let client = crate::commands::install::state::UpToDateRequestClient::new(&base, Some(&routes));
+
+    let warnings =
+        crate::commands::install::accounting::verify_lpm_install_access(&client, &[], true)
+            .await
+            .expect("an install without LPM.dev packages checks no access");
+    crate::commands::install::accounting::report_pool_install_attribution(
+        &client,
+        &[],
+        lpm_registry::ManagedInstallAccounting,
+    )
+    .await
+    .expect("an install without packages reports no attribution");
+
+    assert!(warnings.is_empty());
+    assert!(strict_ssl_warning_is_pending(&routes));
+}
+
+#[tokio::test]
+async fn the_up_to_date_paths_first_request_warns_and_reads_each_origins_tls_files_only_to_contact_it()
+ {
+    let (_home, _env, routes) = routes_under_user_npmrc(|home| {
+        format!(
+            "strict-ssl=false\n//lpm.dev/:cafile={}\n",
+            home.join("missing-ca.pem").display()
+        )
+    });
+    let base = lpm_registry::RegistryClient::new();
+    let client = crate::commands::install::state::UpToDateRequestClient::new(&base, Some(&routes));
+
+    let configured =
+        crate::commands::install::accounting::InstallRequestClient::request_client(&client)
+            .expect("a request that doesn't go to LPM.dev doesn't read its cafile");
+
+    assert!(!strict_ssl_warning_is_pending(&routes));
+    let error = configured
+        .http()
+        .for_url("https://lpm.dev/api/registry/@lpm.dev/acme.kit")
+        .await
+        .expect_err("contacting LPM.dev reads its cafile");
+    assert!(error.to_string().contains("missing-ca.pem"), "{error}");
 }
