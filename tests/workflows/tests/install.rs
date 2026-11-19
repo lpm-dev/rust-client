@@ -18960,3 +18960,121 @@ fn a_command_refuses_an_lpm_home_git_could_commit() {
         );
     }
 }
+
+#[tokio::test]
+async fn install_stays_up_to_date_after_edits_to_scripts_install_never_runs() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "ms", "version": "2.1.3"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"},"scripts":{"dev":"vite"}}"#,
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+    let reinstall = || {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
+            .output()
+            .expect("run lpm install --json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assertions::parse_json_output(&output.stdout)
+    };
+
+    for manifest in [
+        "{\n  \"name\": \"scripts-edit\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": { \"ms\": \"2.1.3\" },\n  \"scripts\": { \"dev\": \"vite --host\", \"build\": \"vite build\" }\n}\n",
+        r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    ] {
+        project.write_file("package.json", manifest);
+        let result = reinstall();
+        assert_eq!(
+            result["up_to_date"], true,
+            "an edit to scripts no install step runs must leave the install fresh: {manifest}\n{result:#}"
+        );
+    }
+
+    project.write_file(
+        "package.json",
+        r#"{"name":"scripts-edit","version":"1.0.0","dependencies":{"ms":"2.1.3"},"scripts":{"postinstall":"node -e \"require('fs').writeFileSync('postinstall.log','ran')\""}}"#,
+    );
+    let result = reinstall();
+    assert_ne!(
+        result["up_to_date"], true,
+        "adding a lifecycle script must make the install run again: {result:#}"
+    );
+    assert_eq!(project.read_file("postinstall.log"), "ran");
+}
+
+#[tokio::test]
+async fn install_stays_up_to_date_for_a_manifest_that_starts_with_a_byte_order_mark() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name": "ms", "version": "2.1.3"}), &[])
+        .await;
+    let manifest = |dev: &str| {
+        format!(
+            "\u{feff}{{\"name\":\"bom-manifest\",\"version\":\"1.0.0\",\"dependencies\":{{\"ms\":\"2.1.3\"}},\"scripts\":{{\"dev\":\"{dev}\"}}}}"
+        )
+    };
+    let project = TempProject::empty(&manifest("vite"));
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-security-summary", "--no-skills"])
+        .assert()
+        .success();
+
+    for dev in ["vite", "vite --host"] {
+        project.write_file("package.json", &manifest(dev));
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
+            .output()
+            .expect("run lpm install --json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = assertions::parse_json_output(&output.stdout);
+        assert_eq!(result["up_to_date"], true, "dev = {dev}: {result:#}");
+    }
+}
+
+#[tokio::test]
+async fn install_rechecks_a_local_dependency_of_a_manifest_that_starts_with_a_byte_order_mark() {
+    let project = TempProject::empty(
+        "\u{feff}{\"name\":\"bom-local\",\"version\":\"1.0.0\",\"dependencies\":{\"local-dep\":\"file:./local-dep\"}}",
+    );
+    project.write_file(
+        "local-dep/package.json",
+        r#"{"name":"local-dep","version":"1.0.0"}"#,
+    );
+    project.write_file("local-dep/index.js", "module.exports = 1;\n");
+    let mock = MockRegistry::start().await;
+    let install = || {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
+            .output()
+            .expect("run lpm install --json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assertions::parse_json_output(&output.stdout)
+    };
+    install();
+    assert_eq!(install()["up_to_date"], true);
+
+    project.write_file(
+        "local-dep/package.json",
+        r#"{"name":"local-dep","version":"1.0.0","scripts":{"postinstall":"node -e 0"}}"#,
+    );
+    let result = install();
+    assert_ne!(
+        result["up_to_date"], true,
+        "a local dependency's new lifecycle script must make the install run again: {result:#}"
+    );
+}

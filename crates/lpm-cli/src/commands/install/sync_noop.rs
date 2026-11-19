@@ -7,6 +7,7 @@ pub(crate) fn is_up_to_date(
     package_json: &str,
     json_output: bool,
 ) -> Result<bool, LpmError> {
+    let package_json = lpm_common::strip_utf8_bom_str(package_json);
     let Ok(cached_state) = lpm_common::read_text_file_capped(
         &project_dir.join(".lpm/install-hash"),
         lpm_common::STATE_FILE_SIZE_CAP_BYTES,

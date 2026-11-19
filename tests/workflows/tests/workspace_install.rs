@@ -3120,3 +3120,54 @@ fn install_with_settings_only_pnpm_workspace_yaml_installs_the_standalone_projec
     );
     assert_target_installed(&project, "");
 }
+
+#[test]
+fn recursive_install_stays_up_to_date_after_member_and_root_script_edits() {
+    let project = workspace_project();
+    let seed = lpm(&project)
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("seed recursive workspace install");
+    assert_install_succeeded(&seed, "seed recursive install should succeed");
+
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"@fixture/core","version":"1.0.0","private":true,"scripts":{"build":"tsc","test":"vitest"}}"#,
+    );
+    project.write_file(
+        "package.json",
+        r#"{"name":"workspace-root","version":"1.0.0","private":true,"workspaces":["packages/*"],"scripts":{"lint":"eslint ."}}"#,
+    );
+    let output = lpm(&project)
+        .arg("--json")
+        .arg("install")
+        .arg("--recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("rerun recursive workspace install after script edits");
+    assert_install_succeeded(
+        &output,
+        "recursive install after script edits should succeed",
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should contain one JSON value");
+    let targets = envelope["targets"]
+        .as_array()
+        .expect("targets should be an array");
+    for name in ["workspace-root", "@fixture/core"] {
+        let target = targets
+            .iter()
+            .find(|target| target["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be an install target: {envelope}"));
+        assert_eq!(
+            target["up_to_date"], true,
+            "edits to scripts no install step runs must leave {name} fresh: {target}",
+        );
+    }
+    for target in targets {
+        assert_eq!(target["up_to_date"], true, "{target}");
+    }
+}
