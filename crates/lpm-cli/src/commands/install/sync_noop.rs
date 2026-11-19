@@ -113,7 +113,7 @@ pub(crate) fn is_up_to_date(
         &super::lockfile::LockedRows::indexed(&locked_packages),
         super::lockfile::LockedManifest {
             deps: &manifest_deps,
-            catalog_resolutions: &catalog_resolutions,
+            catalog_resolutions: catalog_resolutions.as_resolutions(),
             optional_root_names: &optional_root_names,
         },
         project_dir,

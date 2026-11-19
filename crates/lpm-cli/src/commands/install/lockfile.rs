@@ -50,7 +50,7 @@ pub(super) struct LockfileSelectionInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
     pub(super) optional_root_names: &'a HashSet<String>,
-    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) catalog_resolutions: CatalogResolutions<'a>,
     pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
     pub(super) client: &'a RegistryClient,
     pub(super) route_table: &'a RouteTable,
@@ -1080,7 +1080,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) lockfile_deps: &'a HashMap<String, String>,
     pub(super) pkg: &'a lpm_workspace::PackageJson,
     pub(super) lockfile_path: &'a Path,
-    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) catalog_resolutions: CatalogResolutions<'a>,
     pub(super) gate_stats: &'a GateStats,
     pub(super) override_set: &'a OverrideSet,
     pub(super) override_drift: &'a OverrideDrift,
@@ -1465,6 +1465,19 @@ pub(super) struct OverrideResolutionState<'a> {
     pub(super) override_set: OverrideSet,
 }
 
+/// Every catalog resolution an install compares with the lockfile's catalog
+/// snapshot, as [`current_catalog_resolutions`] computes them.
+pub(super) struct CurrentCatalogResolutions {
+    all: Vec<lpm_workspace::CatalogProtocolResolution>,
+    dependency_count: usize,
+}
+
+impl CurrentCatalogResolutions {
+    pub(super) fn as_resolutions(&self) -> CatalogResolutions<'_> {
+        CatalogResolutions::new(&self.all, self.dependency_count)
+    }
+}
+
 /// Resolves each `catalog:` spec in `deps` as an install of `package` does,
 /// and returns every catalog resolution the install compares with the
 /// lockfile's catalog snapshot, its overrides' and resolutions' included.
@@ -1473,7 +1486,7 @@ pub(super) fn current_catalog_resolutions(
     package: &lpm_workspace::PackageJson,
     workspace: Option<&lpm_workspace::Workspace>,
     deps: &mut Cow<'_, HashMap<String, String>>,
-) -> Option<Vec<lpm_workspace::CatalogProtocolResolution>> {
+) -> Option<CurrentCatalogResolutions> {
     let catalogs = workspace.map_or(&package.catalogs, |workspace| {
         &workspace.root_package.catalogs
     });
@@ -1483,13 +1496,17 @@ pub(super) fn current_catalog_resolutions(
         } else {
             Vec::new()
         };
-    prepare_override_resolution_state(OverrideResolutionInput {
+    let dependency_count = prepare_override_resolution_state(OverrideResolutionInput {
         package,
         workspace,
         catalog_resolutions: &mut catalog_resolutions,
     })
-    .ok()?;
-    Some(catalog_resolutions)
+    .ok()?
+    .dependency_catalog_resolution_count;
+    Some(CurrentCatalogResolutions {
+        all: catalog_resolutions,
+        dependency_count,
+    })
 }
 
 pub(super) fn prepare_override_resolution_state<'a>(
@@ -1776,18 +1793,47 @@ pub(super) fn package_matches_catalog_resolution(
             .is_some_and(|names| names.iter().any(|name| name == package_name))
 }
 
+/// The catalog resolutions an install compares with the lockfile's catalog
+/// snapshot: its dependencies' first, then those its overrides and
+/// resolutions name.
+#[derive(Clone, Copy, Default)]
+pub(super) struct CatalogResolutions<'a> {
+    all: &'a [lpm_workspace::CatalogProtocolResolution],
+    dependency_count: usize,
+}
+
+impl<'a> CatalogResolutions<'a> {
+    pub(super) fn new(
+        all: &'a [lpm_workspace::CatalogProtocolResolution],
+        dependency_count: usize,
+    ) -> Self {
+        debug_assert!(dependency_count <= all.len());
+        Self {
+            all,
+            dependency_count: dependency_count.min(all.len()),
+        }
+    }
+
+    #[inline]
+    fn dependencies(self) -> &'a [lpm_workspace::CatalogProtocolResolution] {
+        &self.all[..self.dependency_count]
+    }
+}
+
 #[cfg(test)]
 pub(super) fn lockfile_catalog_snapshots_match_current(
     lockfile: &lpm_lockfile::Lockfile,
     deps: &HashMap<String, String>,
-    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    dependency_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    override_resolutions: &[lpm_workspace::CatalogProtocolResolution],
 ) -> bool {
     let packages = lockfile.packages.iter().collect::<Vec<_>>();
+    let all = [dependency_resolutions, override_resolutions].concat();
     lockfile_catalog_snapshots_match_rows(
         lockfile,
         &LockedRows::indexed(&packages),
         deps,
-        catalog_resolutions,
+        CatalogResolutions::new(&all, dependency_resolutions.len()),
         &HashSet::new(),
     )
 }
@@ -1796,11 +1842,11 @@ fn lockfile_catalog_snapshots_match_rows(
     lockfile: &lpm_lockfile::Lockfile,
     rows: &LockedRows<'_, '_>,
     deps: &HashMap<String, String>,
-    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    catalog_resolutions: CatalogResolutions<'_>,
     optional_root_names: &HashSet<String>,
 ) -> bool {
-    let mut current_resolutions = HashMap::with_capacity(catalog_resolutions.len());
-    for resolution in catalog_resolutions {
+    let mut current_resolutions = HashMap::with_capacity(catalog_resolutions.all.len());
+    for resolution in catalog_resolutions.all {
         let key = (
             resolution.catalog_name.as_str(),
             resolution.package_name.as_str(),
@@ -1861,7 +1907,10 @@ fn lockfile_catalog_snapshots_match_rows(
         }
     }
 
-    for resolution in catalog_resolutions {
+    // The install records a snapshot for every catalog dependency it
+    // installs, but for an override's catalog entry only when the override
+    // applied, which it doesn't to a direct dependency.
+    for resolution in catalog_resolutions.dependencies() {
         let selected_optional = lockfile
             .root_resolutions
             .contains_key(&resolution.package_name)
@@ -2915,7 +2964,7 @@ fn lockfile_satisfies_fast_path_with_rows_and_optional_roots(
 #[derive(Clone, Copy)]
 pub(super) struct LockedManifest<'a> {
     pub(super) deps: &'a HashMap<String, String>,
-    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) catalog_resolutions: CatalogResolutions<'a>,
     pub(super) optional_root_names: &'a HashSet<String>,
 }
 
@@ -3029,7 +3078,7 @@ pub(super) struct LockfileReplayPolicy {
 pub(super) struct LockfileReplayInput<'a> {
     pub(super) lockfile_dir: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
-    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) catalog_resolutions: CatalogResolutions<'a>,
     pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
     pub(super) registry_source: RegistrySourceContext<'a>,
     pub(super) policy: LockfileReplayPolicy,
@@ -3219,7 +3268,10 @@ pub(super) fn try_lockfile_fast_path(
         lockfile_path,
         deps,
         optional_root_names: &HashSet::new(),
-        catalog_resolutions,
+        catalog_resolutions: CatalogResolutions::new(
+            catalog_resolutions,
+            catalog_resolutions.len(),
+        ),
         workspace,
         route_table: &route_table,
         client,
@@ -3233,7 +3285,7 @@ pub(super) struct TryLockfileFastPathInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
     pub(super) optional_root_names: &'a HashSet<String>,
-    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) catalog_resolutions: CatalogResolutions<'a>,
     pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
     pub(super) route_table: &'a RouteTable,
     pub(super) client: &'a RegistryClient,

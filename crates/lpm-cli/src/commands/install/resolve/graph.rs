@@ -51,7 +51,7 @@ pub(super) struct MergeOutcome {
 pub(super) fn load_lockfile_graph_packages(
     project_dir: &Path,
     deps: &HashMap<String, String>,
-    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    catalog_resolutions: super::super::lockfile::CatalogResolutions<'_>,
     route_table: &RouteTable,
     client: &RegistryClient,
     gate_stats: &GateStats,

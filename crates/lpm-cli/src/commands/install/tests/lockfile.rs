@@ -77,7 +77,7 @@ fn lockfile_replay_warning_redacts_source_credentials_and_url_components() {
             LockfileReplayInput {
                 lockfile_dir: Path::new("."),
                 deps: &HashMap::new(),
-                catalog_resolutions: &[],
+                catalog_resolutions: CatalogResolutions::default(),
                 workspace: None,
                 registry_source: RegistrySourceContext::new(&route_table, &client),
                 policy: LockfileReplayPolicy {
@@ -559,7 +559,8 @@ fn lockfile_catalog_replay_allows_configured_override_that_was_not_applied() {
     assert!(lockfile_catalog_snapshots_match_current(
         &lockfile,
         &deps,
-        &[direct, applied_override, unused_override],
+        &[direct],
+        &[applied_override, unused_override],
     ));
 }
 
@@ -623,12 +624,29 @@ fn lockfile_catalog_replay_checks_an_override_snapshot_of_a_transitive_package_a
             lockfile_catalog_snapshots_match_current(
                 &lockfile,
                 &deps,
+                &[],
                 std::slice::from_ref(&leaf_override),
             ),
             matches,
             "a snapshot naming {case}"
         );
     }
+}
+
+#[test]
+fn lockfile_catalog_replay_allows_an_unapplied_override_of_a_direct_dependency() {
+    let override_of_direct = catalog_resolution("direct-package", "1.1.0");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    add_catalog_snapshot(&mut lockfile, &override_of_direct, "1.1.0");
+    lockfile.catalogs.clear();
+    let deps = HashMap::from([("direct-package".to_string(), "^1.0.0".to_string())]);
+
+    assert!(lockfile_catalog_snapshots_match_current(
+        &lockfile,
+        &deps,
+        &[],
+        &[override_of_direct],
+    ));
 }
 
 #[test]
@@ -640,6 +658,7 @@ fn lockfile_catalog_replay_rejects_missing_direct_snapshot() {
         &lpm_lockfile::Lockfile::new(),
         &deps,
         &[direct],
+        &[],
     ));
 }
 
@@ -656,6 +675,7 @@ fn lockfile_catalog_replay_rejects_snapshot_for_removed_override() {
         &lockfile,
         &deps,
         &[direct],
+        &[],
     ));
 }
 
@@ -677,11 +697,13 @@ fn lockfile_catalog_replay_rejects_changed_specifier_or_reference() {
         &lockfile,
         &deps,
         &[changed_specifier],
+        &[],
     ));
     assert!(!lockfile_catalog_snapshots_match_current(
         &lockfile,
         &deps,
         &[changed_reference],
+        &[],
     ));
 }
 
@@ -702,6 +724,7 @@ fn lockfile_catalog_replay_rejects_snapshot_version_drift() {
         &lockfile,
         &deps,
         &[direct],
+        &[],
     ));
 }
 
@@ -2492,7 +2515,7 @@ fn replay_keeps_ambient_peer_non_direct_when_optional_declaration_is_unresolved(
         lockfile_path: &path,
         deps: &deps,
         optional_root_names: &optional,
-        catalog_resolutions: &[],
+        catalog_resolutions: CatalogResolutions::default(),
         workspace: None,
         route_table: &routes,
         client: &client,

@@ -638,3 +638,33 @@ fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() 
 
     assert!(crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap());
 }
+
+#[test]
+fn the_up_to_date_check_accepts_an_unapplied_catalog_override_of_a_direct_dependency() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::update([
+        ("HOME", Some(home.path().as_os_str().to_owned())),
+        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+        ("LPM_LINKER", None),
+        (lpm_store::StoreVersion::ENV_VAR, None),
+        (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
+    ]);
+    let mode = crate::install_state::FastLaneMode {
+        json: true,
+        timing: false,
+        frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+        no_skills: true,
+    };
+    // The install doesn't apply an override to a direct dependency, so the
+    // lockfile records no snapshot for it.
+    let pkg = r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"^1.0.0"},"overrides":{"leaf":"catalog:"}}"#;
+    let project = tempfile::tempdir().unwrap();
+    installed_project(
+        project.path(),
+        pkg,
+        "1.0.0",
+        lpm_lockfile::CatalogSnapshots::new(),
+    );
+
+    assert!(crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap());
+}

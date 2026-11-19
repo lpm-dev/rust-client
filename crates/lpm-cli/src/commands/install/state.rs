@@ -321,7 +321,7 @@ pub(super) async fn run_install_freshness_phase(
                             lockfile_path: input.lockfile_path,
                             deps: &lockfile_deps,
                             optional_root_names: input.root_optional_dependency_names,
-                            catalog_resolutions: &catalog_resolutions,
+                            catalog_resolutions: catalog_resolutions.as_resolutions(),
                             workspace: workspace.as_deref(),
                             route_table,
                             client: input.client,
