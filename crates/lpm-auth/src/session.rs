@@ -1022,7 +1022,10 @@ impl SessionManager {
                 .and_then(|location| location.to_str().ok())
                 .and_then(|location| resp.url().join(location).ok())
                 .is_some_and(|target| target.origin() != resp.url().origin());
-            if status.is_redirection() && redirected_elsewhere {
+            // The statuses the redirect policy decides on; reqwest hands any
+            // other 3xx back without asking it.
+            let followable = matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
+            if followable && redirected_elsewhere {
                 return Err(LpmError::Http {
                     status: status.as_u16(),
                     message: "the registry redirected the session refresh to another origin, \
@@ -2622,7 +2625,11 @@ mod refresh_http_tests {
 
     #[tokio::test]
     async fn a_silent_refresh_answered_with_a_redirect_it_cant_follow_isnt_called_cross_origin() {
-        for (status, location) in [(300, "/api/cli/refresh"), (307, "http://[::1")] {
+        for (status, location) in [
+            (300, "/api/cli/refresh"),
+            (307, "http://[::1"),
+            (304, "https://elsewhere.example/api/cli/refresh"),
+        ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/api/cli/refresh"))
@@ -2638,7 +2645,12 @@ mod refresh_http_tests {
                 .await
                 .expect_err("a refresh answered with a redirect it can't follow fails");
             assert!(
-                !error.to_string().contains("another origin"),
+                matches!(
+                    &error,
+                    LpmError::Http { status: answered, message }
+                        if *answered == status
+                            && message.contains("couldn't refresh the session")
+                ),
                 "{status} to {location}: {error}"
             );
         }
