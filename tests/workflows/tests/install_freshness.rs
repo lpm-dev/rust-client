@@ -1658,29 +1658,93 @@ async fn unchanged_member_install_whose_only_catalog_reference_is_an_override_an
 
 #[tokio::test]
 async fn unchanged_member_install_under_a_root_catalog_override_answers_up_to_date() {
+    // Catalogs only in pnpm-workspace.yaml, named only by the root's
+    // override: a member of a package.json workspace installs on its own; a
+    // member of a pnpm-workspace.yaml one installs recursively.
+    for (root_manifest, workspace_yaml) in [
+        (
+            r#"{"name":"root","private":true,"workspaces":["packages/*"],"overrides":{"leaf":"catalog:"}}"#,
+            "catalog:\n  leaf: 1.0.0\n",
+        ),
+        (
+            r#"{"name":"root","private":true,"overrides":{"leaf":"catalog:"}}"#,
+            "packages:\n  - packages/*\ncatalog:\n  leaf: 1.0.0\n",
+        ),
+    ] {
+        let mock = MockRegistry::start().await;
+        serve_leaf_1_0_0_and_1_1_0(&mock).await;
+        mock.with_manifest_package(
+            serde_json::json!({"name": "parent", "version": "1.0.0", "dependencies": {"leaf": "^1.0.0"}}),
+            &[],
+        )
+        .await;
+        let project = TempProject::empty(root_manifest);
+        project.write_file("pnpm-workspace.yaml", workspace_yaml);
+        project.write_file(
+            "packages/app/package.json",
+            r#"{"name":"app","version":"1.0.0","dependencies":{"parent":"1.0.0"}}"#,
+        );
+        install(&project, &mock.url()).assert().success();
+        assert_override_pinned_leaf_to_its_catalog_entry(&project);
+
+        let mut unchanged = bare_install(&project);
+        unchanged
+            .current_dir(project.path().join("packages/app"))
+            .env("LPM_REGISTRY_URL", mock.url());
+        assert_up_to_date(unchanged);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_non_recursive_root_install_with_a_catalog_only_in_pnpm_workspace_yaml_answers_up_to_date()
+ {
     let mock = MockRegistry::start().await;
     serve_leaf_1_0_0_and_1_1_0(&mock).await;
-    mock.with_manifest_package(
-        serde_json::json!({"name": "parent", "version": "1.0.0", "dependencies": {"leaf": "^1.0.0"}}),
-        &[],
-    )
-    .await;
-    // The catalog lives only in pnpm-workspace.yaml, only the root's
-    // override names it, and the member's own install isn't recursive.
     let project = TempProject::empty(
-        r#"{"name":"root","private":true,"workspaces":["packages/*"],"overrides":{"leaf":"catalog:"}}"#,
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"dependencies":{"leaf":"catalog:"}}"#,
     );
     project.write_file("pnpm-workspace.yaml", "catalog:\n  leaf: 1.0.0\n");
     project.write_file(
         "packages/app/package.json",
-        r#"{"name":"app","version":"1.0.0","dependencies":{"parent":"1.0.0"}}"#,
+        r#"{"name":"app","version":"1.0.0"}"#,
     );
-    install(&project, &mock.url()).assert().success();
-    assert_override_pinned_leaf_to_its_catalog_entry(&project);
+    install(&project, &mock.url())
+        .arg("--no-recursive")
+        .assert()
+        .success();
 
     let mut unchanged = bare_install(&project);
     unchanged
-        .current_dir(project.path().join("packages/app"))
+        .arg("--no-recursive")
+        .env("LPM_REGISTRY_URL", mock.url());
+    assert_up_to_date(unchanged);
+}
+
+#[tokio::test]
+async fn unchanged_install_of_a_project_a_workspace_glob_covers_but_doesnt_own_uses_its_own_catalogs()
+ {
+    let mock = MockRegistry::start().await;
+    serve_leaf_1_0_0_and_1_1_0(&mock).await;
+    // Discovery skips node_modules, so the workspace doesn't own this
+    // project although its glob covers the path.
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["sandbox/**"],"catalogs":{"default":{"leaf":"1.1.0"}}}"#,
+    );
+    project.write_file(
+        "sandbox/node_modules/app/package.json",
+        r#"{"name":"app","version":"1.0.0","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"catalog:"}}"#,
+    );
+    let app = project.path().join("sandbox/node_modules/app");
+    install(&project, &mock.url())
+        .current_dir(&app)
+        .arg("--no-recursive")
+        .assert()
+        .success();
+
+    let mut unchanged = bare_install(&project);
+    unchanged
+        .current_dir(&app)
+        .arg("--no-recursive")
         .env("LPM_REGISTRY_URL", mock.url());
     assert_up_to_date(unchanged);
 }
