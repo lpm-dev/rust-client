@@ -92,11 +92,90 @@ impl IdentityExpectations {
 #[derive(Debug, Clone)]
 pub struct VerifiedProvenance {
     pub snapshot: lpm_workspace::ProvenanceSnapshot,
+    pub build: CertificateBuildClaims,
     pub statement: serde_json::Value,
     pub integrated_time: SystemTime,
     pub leaf_cert_sha256: String,
     pub log_id: String,
     pub log_index: i64,
+}
+
+/// What the Fulcio certificate itself says about the build that signed,
+/// from its v2 extensions. Fulcio copies these from the CI provider's
+/// OIDC token, so they don't depend on the in-toto statement the build
+/// wrote. A field is `None` when the certificate doesn't carry it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CertificateBuildClaims {
+    /// `1.3.6.1.4.1.57264.1.12`, e.g. `https://github.com/lpm-dev/rust-client`.
+    pub source_repository_uri: Option<String>,
+    /// `1.3.6.1.4.1.57264.1.13`: the commit the build ran from.
+    pub source_repository_digest: Option<String>,
+    /// `1.3.6.1.4.1.57264.1.14`, e.g. `refs/heads/main`.
+    pub source_repository_ref: Option<String>,
+    /// `1.3.6.1.4.1.57264.1.20`: the event that started the build.
+    pub build_trigger: Option<String>,
+    /// `1.3.6.1.4.1.57264.1.11`: `github-hosted` or `self-hosted`.
+    pub runner_environment: Option<String>,
+}
+
+const FULCIO_SOURCE_REPOSITORY_URI_OID: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 12];
+const FULCIO_SOURCE_REPOSITORY_DIGEST_OID: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 13];
+const FULCIO_SOURCE_REPOSITORY_REF_OID: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 14];
+const FULCIO_BUILD_TRIGGER_OID: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 20];
+const FULCIO_RUNNER_ENVIRONMENT_OID: [u64; 9] = [1, 3, 6, 1, 4, 1, 57264, 1, 11];
+
+/// Read the Fulcio v2 build extensions. Each v2 extension is a DER
+/// UTF8String; one that is malformed or appears twice fails the bundle.
+pub(super) fn extract_certificate_build_claims(
+    leaf: &X509Certificate<'_>,
+) -> Result<CertificateBuildClaims, VerifyError> {
+    let mut claims = CertificateBuildClaims::default();
+    for ext in leaf.extensions() {
+        let Some(components) = ext.oid.iter() else {
+            continue;
+        };
+        let components: Vec<u64> = components.collect();
+        let (slot, name) = match components.as_slice() {
+            oid if oid == FULCIO_SOURCE_REPOSITORY_URI_OID => {
+                (&mut claims.source_repository_uri, "source repository URI")
+            }
+            oid if oid == FULCIO_SOURCE_REPOSITORY_DIGEST_OID => (
+                &mut claims.source_repository_digest,
+                "source repository digest",
+            ),
+            oid if oid == FULCIO_SOURCE_REPOSITORY_REF_OID => {
+                (&mut claims.source_repository_ref, "source repository ref")
+            }
+            oid if oid == FULCIO_BUILD_TRIGGER_OID => (&mut claims.build_trigger, "build trigger"),
+            oid if oid == FULCIO_RUNNER_ENVIRONMENT_OID => {
+                (&mut claims.runner_environment, "runner environment")
+            }
+            _ => continue,
+        };
+        let value = decode_der_utf8_string(ext.value).ok_or_else(|| {
+            VerifyError::BundleParse(format!("Fulcio {name} extension is not a DER UTF8String"))
+        })?;
+        if slot.replace(value.to_string()).is_some() {
+            return Err(VerifyError::BundleParse(format!(
+                "Fulcio {name} extension appears more than once"
+            )));
+        }
+    }
+    Ok(claims)
+}
+
+/// The whole of `bytes` must be one DER UTF8String (tag 0x0C).
+fn decode_der_utf8_string(bytes: &[u8]) -> Option<&str> {
+    let (&tag, rest) = bytes.split_first()?;
+    if tag != 0x0C {
+        return None;
+    }
+    let (len, consumed) = der_decode_length(rest)?;
+    let body = rest.get(consumed..)?;
+    if body.len() != len {
+        return None;
+    }
+    std::str::from_utf8(body).ok()
 }
 
 /// Verify a Sigstore bundle end-to-end.
@@ -226,9 +305,11 @@ pub fn verify_sigstore_bundle(
         hex::encode(Sha256::digest(&components.leaf_cert_der))
     );
     let snapshot = build_provenance_snapshot(&leaf_parsed, &leaf_cert_sha256);
+    let build = extract_certificate_build_claims(&leaf_parsed)?;
 
     Ok(VerifiedProvenance {
         snapshot,
+        build,
         statement: components.statement,
         integrated_time: at_time,
         leaf_cert_sha256,

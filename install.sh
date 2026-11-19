@@ -247,6 +247,7 @@ if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_SECURITY:-}${LPM_INSTA
 fi
 
 REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
+RELEASE_COMMIT=""
 INSTALL_CHANNEL="${LPM_INSTALL_CHANNEL:-stable}"
 
 case "$INSTALL_CHANNEL" in
@@ -276,8 +277,15 @@ else
     VERSION=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"version"' | sed -E 's/.*"version": *"([^"]+)".*/v\1/')
   else
     VERSION=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+    # The commit the release was published from; cosign binds the
+    # signature to it below.
+    RELEASE_COMMIT=$(printf '%s\n' "$API_RESPONSE" | grep -m 1 '"target_commitish"' | sed -E 's/.*"target_commitish": *"([0-9a-f]{40})".*/\1/')
   fi
 fi
+case "$RELEASE_COMMIT" in
+  *[!0-9a-f]*|"") RELEASE_COMMIT="" ;;
+esac
+[ "${#RELEASE_COMMIT}" -eq 40 ] || RELEASE_COMMIT=""
 
 if [ -z "$VERSION" ]; then
   echo "Failed to detect latest $INSTALL_CHANNEL version. Check https://github.com/$REPO/releases"
@@ -509,6 +517,42 @@ elif [ -n "$SHA_TOOL" ]; then
   fi
 fi
 
+# The identities releases are signed with: release.yml in this repository,
+# run from main by hand for a stable release, and by the schedule or by hand
+# for a nightly. Most stable releases before v0.77.0 were signed from their
+# own tag by a tag push, and v0.60.0, v0.61.0 and v0.68.0 from main by hand.
+# When the installer looks up the latest stable release itself, the
+# signature must also be for the commit that release records. An explicit
+# version isn't bound to a commit: a build the release workflow signed for
+# that version passes, and the staged check below confirms the version.
+verify_manifest_signer() {
+  if [ "$RESOLVED_CHANNEL" = "stable" ] && version_lt "$VERSION" "v0.77.0"; then
+    signers="refs/tags/$VERSION@push refs/heads/main@workflow_dispatch"
+  elif [ "$RESOLVED_CHANNEL" = "stable" ]; then
+    signers="refs/heads/main@workflow_dispatch"
+  else
+    signers="refs/heads/main@schedule refs/heads/main@workflow_dispatch"
+  fi
+  for signer in $signers; do
+    signing_ref=${signer%@*}
+    signing_trigger=${signer##*@}
+    set -- \
+      --bundle "$BUNDLE_TMP" \
+      --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@$signing_ref" \
+      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+      --certificate-github-workflow-repository "$REPO" \
+      --certificate-github-workflow-ref "$signing_ref" \
+      --certificate-github-workflow-trigger "$signing_trigger"
+    if [ -n "$RELEASE_COMMIT" ]; then
+      set -- "$@" --certificate-github-workflow-sha "$RELEASE_COMMIT"
+    fi
+    if cosign verify-blob "$@" "$MANIFEST_TMP" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 RELEASE_ASSET="$PLATFORM"
 if [ "$MACOS_BUNDLE" = "1" ]; then
   RELEASE_ASSET="$PLATFORM.zip"
@@ -566,15 +610,15 @@ elif [ -n "$SHA_TOOL" ]; then
   # fail-closed on rejection. `cosign` absent → SHA-only floor.
   if command -v cosign >/dev/null 2>&1 && [ -s "$BUNDLE_TMP" ]; then
     echo "cosign detected; verifying manifest signature..."
-    cosign verify-blob \
-      --bundle "$BUNDLE_TMP" \
-      --certificate-identity-regexp "^https://github\\.com/lpm-dev/rust-client/\\.github/workflows/release\\.yml@.+" \
-      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-      "$MANIFEST_TMP" >/dev/null 2>&1 \
-      || {
-        echo "ERROR: cosign refused the signature on SHA256SUMS.txt — manifest is not authentically from $REPO release.yml"
-        exit 1
-      }
+    if [ -z "$REQUESTED_VERSION" ] && [ "$RESOLVED_CHANNEL" = "stable" ] && [ -z "$RELEASE_COMMIT" ]; then
+      echo "ERROR: the latest-release lookup doesn't name the commit $VERSION was published from,"
+      echo "       so its signature can't be bound to that release. Refusing to install."
+      exit 1
+    fi
+    verify_manifest_signer || {
+      echo "ERROR: cosign refused the signature on SHA256SUMS.txt — manifest is not authentically from $REPO release.yml"
+      exit 1
+    }
     echo "Verified Sigstore signature on manifest (identity-pinned to release.yml)"
   elif [ "$MACOS_BUNDLE" != "1" ] || [ "$LEGACY_MACOS" = "1" ]; then
     # On macOS the Developer ID signature and notarization checks below

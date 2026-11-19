@@ -154,8 +154,7 @@ test("stable releases build a candidate before promotion creates the tag", () =>
   assert.match(promotion, /Verify exact draft and publish stable release/);
   assert.match(promotion, /Create fresh promotion-time Sigstore proof/);
   assert.match(promotion, /files: promotion-github-release\/\*/);
-  assert.match(promotion, /cosign verify-blob/);
-  assert.match(promotion, /refs\/heads\/main\$/);
+  assert.match(promotion, /scripts\/ci\/verify-stable-release-signer\.sh/);
   assert.match(promotion, /releases\/latest/);
   assert.match(promotion, /--source-run-id trusted/);
   assert.match(promotion, /stable promotion recovery/i);
@@ -333,10 +332,14 @@ test("the Homebrew update reaches the tap only with a per-run app token scoped t
   assert.match(mint, /permission-contents: write\n\s+permission-actions: read\n/);
   assert.doesNotMatch(mint, /permission-(?!contents|actions)/, "the token needs no other permission");
 
-  const tokenUses = [...job.matchAll(/GH_TOKEN: (.+)/g)].map((match) => match[1]);
-  assert.ok(tokenUses.length >= 2, "the dispatch and the wait both need the tap token");
-  for (const use of tokenUses) {
-    assert.equal(use, "${{ steps.tap-token.outputs.token }}");
+  const tapSteps = ["Dispatch correlated Homebrew update", "Await correlated Homebrew workflow"];
+  for (const step of stepsOf(job)) {
+    const token = step.match(/GH_TOKEN: (.+)/)?.[1];
+    if (tapSteps.some((name) => step.startsWith(`name: ${name}`))) {
+      assert.equal(token, "${{ steps.tap-token.outputs.token }}", step.split("\n")[0]);
+    } else if (token !== undefined) {
+      assert.equal(token, "${{ github.token }}", `${step.split("\n")[0]} must not hold the tap token`);
+    }
   }
 });
 
@@ -579,4 +582,86 @@ test("the installer's security floor admits only releases that can update to mai
 
   const harness = read("tests/install-sh/run.sh");
   assert.match(harness, new RegExp(`^FIXTURE_VERSION="v${major}\\.${minor}\\.${patch}"$`, "m"));
+});
+
+test("every stable release signature check holds the one exact signing identity", () => {
+  const workflow = read(".github/workflows/release.yml");
+  for (const file of [...workflowFiles(), "install.sh"]) {
+    assert.doesNotMatch(read(file), /certificate-identity-regexp/, `${file} must match the exact identity`);
+  }
+  assert.doesNotMatch(workflow, /cosign verify-blob/, "release.yml checks signatures through the shared script");
+  const calls = [...workflow.matchAll(/scripts\/ci\/verify-stable-release-signer\.sh(?: \\)?\n\s+(\S+)(?: \\)?\n\s+(\S+)(?: \\)?\n\s+(\S+)\n/g)];
+  assert.equal(calls.length, 5, "four promotion checks and the Homebrew exporter");
+  for (const [, manifest, bundle, commit] of calls) {
+    assert.match(manifest, /SHA256SUMS\.txt"?$/);
+    assert.equal(bundle, manifest.replace(/SHA256SUMS\.txt("?)$/, "SHA256SUMS.txt.sigstore$1"));
+    assert.equal(commit, '"$SOURCE_SHA"');
+  }
+});
+
+test("the stable signer script passes cosign the exact identity and refuses a malformed commit", {
+  skip: process.platform === "win32" && "runs the signer script with bash",
+}, () => {
+  const script = path.join(repoRoot, "scripts/ci/verify-stable-release-signer.sh");
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-cosign-stub-"));
+  const argsFile = path.join(bin, "args");
+  fs.writeFileSync(path.join(bin, "cosign"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsFile}"\n`, { mode: 0o755 });
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
+  const commit = "ef061b3e90d93f5822b870a844a5b37adc9059d4";
+  try {
+    const ok = spawnSync("bash", [script, "SHA256SUMS.txt", "SHA256SUMS.txt.sigstore", commit], { env, encoding: "utf8" });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.deepEqual(fs.readFileSync(argsFile, "utf8").trimEnd().split("\n"), [
+      "verify-blob",
+      "--bundle", "SHA256SUMS.txt.sigstore",
+      "--certificate-identity", "https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main",
+      "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+      "--certificate-github-workflow-repository", "lpm-dev/rust-client",
+      "--certificate-github-workflow-ref", "refs/heads/main",
+      "--certificate-github-workflow-sha", commit,
+      "--certificate-github-workflow-trigger", "workflow_dispatch",
+      "SHA256SUMS.txt",
+    ]);
+
+    fs.rmSync(argsFile);
+    for (const bad of ["ef061b3", `${commit}\nx`, commit.toUpperCase(), ""]) {
+      const refused = spawnSync("bash", [script, "SHA256SUMS.txt", "SHA256SUMS.txt.sigstore", bad], { env, encoding: "utf8" });
+      assert.equal(refused.status, 2, `must refuse ${JSON.stringify(bad)}`);
+      assert.equal(fs.existsSync(argsFile), false, "cosign must not run for a malformed commit");
+    }
+  } finally {
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("the Homebrew formula takes its checksums from the published release, verified against the promoted commit", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const job = jobsOf(workflow).find(([name]) => name === "update-homebrew")?.[1];
+  assert.ok(job, "missing update-homebrew job");
+
+  assert.doesNotMatch(job, /mode == 'full'/, "stable releases are never built in full mode");
+  assert.match(job, /needs\.release-metadata\.outputs\.mode == 'promote' &&/);
+  assert.match(job, /SOURCE_SHA: \$\{\{ needs\.prepare-promotion\.outputs\.source_sha \}\}/);
+  // An immutable release is read on its own, so a retry works for as long as
+  // it exists. A release whose files can still change must be the same bytes
+  // as the manifest the promotion verified, kept for a day.
+  assert.match(job, /immutable=\$\(jq -r '\.immutable' "\$RUNNER_TEMP\/published-release\.json"\)/);
+  assert.match(job, /if \[ "\$immutable" != true \]; then\n[\s\S]*?scripts\/ci\/download-verified-artifact\.sh "\$GITHUB_REPOSITORY" "\$ARTIFACT_ID" "\$ARTIFACT_DIGEST" promotion-github-release\n\s+cmp promotion-github-release\/SHA256SUMS\.txt "\$published\/SHA256SUMS\.txt"\n\s+fi\n/);
+  assert.match(job, /ARTIFACT_ID: \$\{\{ needs\.stage-promotion-release\.outputs\.artifact_id \}\}/);
+  assert.match(job, /permissions:\n\s+actions: read\n\s+contents: read\n/);
+  assert.match(job, /\[ "\$target_commit" != "\$SOURCE_SHA" \]/);
+  assert.match(job, /--pattern SHA256SUMS\.txt --pattern SHA256SUMS\.txt\.sigstore --pattern lpm-linux-x64/);
+  assert.match(job, /grep -E '\^\[0-9a-f\]\{64\}  lpm-linux-x64\$' SHA256SUMS\.txt \| sha256sum --check --strict/);
+  assert.doesNotMatch(job, /releases\/download/, "the published release is read through the API, not by URL");
+
+  const order = [
+    "verify-stable-release-signer.sh",
+    "sha256sum --check --strict",
+    "verify-release-signing-policy.sh",
+    "export_manifest_hash lpm-darwin-arm64.zip",
+    "Create a token for the Homebrew tap",
+  ];
+  const positions = order.map((needle) => job.indexOf(needle));
+  assert.ok(positions.every((position) => position !== -1), JSON.stringify(positions));
+  assert.deepEqual([...positions].sort((a, b) => a - b), positions, "checks run before the checksums are exported and dispatched");
 });

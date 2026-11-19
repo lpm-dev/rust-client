@@ -288,6 +288,9 @@ run_install_sh() {
     LPM_INSTALL_TEST_INTERRUPT_AFTER="${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" \
     LPM_MV_FAILURE_COUNT_FILE="${LPM_MV_FAILURE_COUNT_FILE:-}" \
     LPM_TEST_TOOL_STATE="${LPM_TEST_TOOL_STATE:-}" \
+    LPM_TEST_COSIGN_REFUSES="${LPM_TEST_COSIGN_REFUSES:-}" \
+    LPM_TEST_COSIGN_REFUSED_TRIGGER="${LPM_TEST_COSIGN_REFUSED_TRIGGER:-}" \
+    RELEASE_COMMIT="${RELEASE_COMMIT:-}" \
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_MIN_VERSION_OVERRIDE="${LPM_INSTALL_MIN_VERSION_OVERRIDE:-}" \
@@ -991,8 +994,9 @@ rm -rf "$fdir"
 pass "security floor refuses releases older than v0.87.0 before downloading"
 
 # ── Case 13: LPM_INSTALL_REQUIRE_SIGSTORE=1 refuses unverifiable installs
+release_commit="1e98fb8efbcc00f620678fc8091b512ed503768f"
 fdir="$(mktemp -d)"
-printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "$release_commit" > "$fdir/api.json"
 write_signed_release "$fdir" 'require-sigstore-binary-bytes' "$FIXTURE_VERSION"
 trap 'stop_server' EXIT
 start_server "$fdir"
@@ -1028,6 +1032,58 @@ unset LPM_TEST_TOOL_STATE LPM_INSTALL_REQUIRE_SIGSTORE
 [ -s "$cosign_state/cosign-args" ] || fail "LPM_INSTALL_REQUIRE_SIGSTORE=1 did not run cosign"
 echo "$RUN_OUT" | grep -q "Verified Sigstore signature on manifest" \
   || fail "strict install did not report the Sigstore verification: $RUN_OUT"
+# cosign must hold the exact stable identity, bound to the release's commit.
+cosign_args="$(tr '\n' ' ' < "$cosign_state/cosign-args")"
+for expected in \
+  "--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main " \
+  "--certificate-oidc-issuer https://token.actions.githubusercontent.com " \
+  "--certificate-github-workflow-repository lpm-dev/rust-client " \
+  "--certificate-github-workflow-ref refs/heads/main " \
+  "--certificate-github-workflow-trigger workflow_dispatch " \
+  "--certificate-github-workflow-sha $release_commit "
+do
+  case "$cosign_args" in
+    *"$expected"*) ;;
+    *) fail "stable cosign check is missing '$expected': $cosign_args" ;;
+  esac
+done
+case "$cosign_args" in
+  *regexp*) fail "cosign must match the exact identity, not a pattern: $cosign_args" ;;
+esac
+
+# Releases up to v0.76.5 were signed from their own tag by a tag push.
+write_signed_release "$fdir" 'tag-signed-binary-bytes' v0.76.5
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.76.5 \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a tag-signed release must verify with its tag identity: $RUN_OUT"
+cosign_args="$(tr '\n' ' ' < "$cosign_state/cosign-args")"
+for expected in \
+  "--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v0.76.5 " \
+  "--certificate-github-workflow-ref refs/tags/v0.76.5 " \
+  "--certificate-github-workflow-trigger push "
+do
+  case "$cosign_args" in
+    *"$expected"*) ;;
+    *) fail "tag-signed cosign check is missing '$expected': $cosign_args" ;;
+  esac
+done
+
+# A nightly comes from main, started by the schedule or by hand.
+write_signed_release "$fdir" 'nightly-signer-binary-bytes' "$NIGHTLY_VERSION"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_VERSION="$NIGHTLY_VERSION" run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a nightly must verify with the main identity: $RUN_OUT"
+cosign_args="$(tr '\n' ' ' < "$cosign_state/cosign-args")"
+case "$cosign_args" in
+  *"--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main "*) ;;
+  *) fail "nightly cosign check must hold the main identity: $cosign_args" ;;
+esac
+case "$cosign_args" in
+  *"--certificate-github-workflow-trigger schedule "*) ;;
+  *) fail "a nightly is first checked as a scheduled run: $cosign_args" ;;
+esac
+write_signed_release "$fdir" 'require-sigstore-binary-bytes' "$FIXTURE_VERSION"
 
 rm -f "$fdir/SHA256SUMS.txt.sigstore" "$cosign_state/cosign-args"
 LPM_TEST_TOOL_STATE="$cosign_state" LPM_INSTALL_REQUIRE_SIGSTORE=1 run_install_sh
@@ -1226,6 +1282,99 @@ trap - EXIT
 [ "$RUN_RC" -eq 0 ] || fail "only the first line of --version names the version: $RUN_OUT"
 rm -rf "$fdir"
 pass "only the first line of --version names the version"
+
+# ── Case 19: cosign's verdict and the signing identity's binding ──
+signer_commit="1e98fb8efbcc00f620678fc8091b512ed503768f"
+cosign_state="$(mktemp -d)"
+cat > "$CLEAN_PATH_DIR/cosign" <<'COSIGN'
+#!/bin/sh
+printf '%s\n' "$@" > "$LPM_TEST_TOOL_STATE/cosign-args"
+printf '%s\n' "$*" >> "$LPM_TEST_TOOL_STATE/cosign-calls"
+case " $* " in
+  *" --certificate-github-workflow-trigger ${LPM_TEST_COSIGN_REFUSED_TRIGGER:-none} "*) exit 1 ;;
+esac
+[ -z "${LPM_TEST_COSIGN_REFUSES:-}" ]
+COSIGN
+chmod +x "$CLEAN_PATH_DIR/cosign"
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "$signer_commit" > "$fdir/api.json"
+write_signed_release "$fdir" 'signer-binding-binary-bytes' "$FIXTURE_VERSION"
+trap 'stop_server' EXIT
+start_server "$fdir"
+
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSES=1 run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSES
+[ "$RUN_RC" -ne 0 ] || fail "a signature cosign refused must stop the install: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "cosign refused the signature on SHA256SUMS.txt" \
+  || fail "cosign refusal was unclear: $RUN_OUT"
+[ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a refused signature must not install anything"
+
+for target in main ""; do
+  if [ -n "$target" ]; then
+    printf '{"tag_name": "%s", "target_commitish": "%s"}\n' "$FIXTURE_VERSION" "$target" > "$fdir/api.json"
+  else
+    printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+  fi
+  rm -f "$cosign_state/cosign-args"
+  LPM_TEST_TOOL_STATE="$cosign_state" run_install_sh
+  unset LPM_TEST_TOOL_STATE
+  [ "$RUN_RC" -ne 0 ] || fail "a latest release without its commit ('$target') must not be verified unbound: $RUN_OUT"
+  echo "$RUN_OUT" | grep -q "doesn't name the commit" \
+    || fail "unbound latest release refusal was unclear: $RUN_OUT"
+  [ ! -e "$cosign_state/cosign-args" ] || fail "cosign ran without the release commit"
+done
+
+# An explicit version is never bound to a commit, whatever the caller's
+# environment holds.
+LPM_TEST_TOOL_STATE="$cosign_state" RELEASE_COMMIT="$signer_commit" LPM_INSTALL_VERSION="$FIXTURE_VERSION" \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE RELEASE_COMMIT LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "an explicit version must verify without a commit: $RUN_OUT"
+case "$(tr '\n' ' ' < "$cosign_state/cosign-args")" in
+  *--certificate-github-workflow-sha*) fail "an inherited RELEASE_COMMIT reached cosign" ;;
+esac
+
+# Most releases before v0.77.0 were signed from their tag by a tag push;
+# v0.60.0, v0.61.0 and v0.68.0 were signed from main by hand.
+write_signed_release "$fdir" 'main-signed-legacy-binary-bytes' v0.60.0
+rm -f "$cosign_state/cosign-calls"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSED_TRIGGER=push \
+  LPM_INSTALL_MIN_VERSION_OVERRIDE=1 LPM_INSTALL_VERSION=v0.60.0 run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSED_TRIGGER LPM_INSTALL_MIN_VERSION_OVERRIDE LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a release before v0.77.0 signed from main must verify: $RUN_OUT"
+[ "$(grep -c '' "$cosign_state/cosign-calls")" -eq 2 ] \
+  || fail "a release before v0.77.0 has exactly two signing identities: $(cat "$cosign_state/cosign-calls")"
+sed -n 1p "$cosign_state/cosign-calls" | grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v0.60.0 .*--certificate-github-workflow-trigger push ' \
+  || fail "a release before v0.77.0 is first checked against its tag"
+sed -n 2p "$cosign_state/cosign-calls" | grep -q -- '--certificate-identity https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/heads/main .*--certificate-github-workflow-trigger workflow_dispatch ' \
+  || fail "a release before v0.77.0 is then checked as signed from main by hand"
+
+# A nightly is scheduled or started by hand, and nothing else.
+write_signed_release "$fdir" 'nightly-trigger-binary-bytes' "$NIGHTLY_VERSION"
+rm -f "$cosign_state/cosign-calls"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSED_TRIGGER=schedule LPM_INSTALL_VERSION="$NIGHTLY_VERSION" \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSED_TRIGGER LPM_INSTALL_VERSION
+[ "$RUN_RC" -eq 0 ] || fail "a nightly started by hand must verify: $RUN_OUT"
+[ "$(grep -c '' "$cosign_state/cosign-calls")" -eq 2 ] \
+  || fail "a nightly has exactly two signing identities: $(cat "$cosign_state/cosign-calls")"
+sed -n 1p "$cosign_state/cosign-calls" | grep -q -- '--certificate-github-workflow-trigger schedule ' \
+  || fail "a nightly must first be checked as a scheduled run"
+sed -n 2p "$cosign_state/cosign-calls" | grep -q -- '--certificate-github-workflow-trigger workflow_dispatch ' \
+  || fail "a nightly must then be checked as a run started by hand"
+rm -f "$cosign_state/cosign-calls"
+LPM_TEST_TOOL_STATE="$cosign_state" LPM_TEST_COSIGN_REFUSES=1 LPM_INSTALL_VERSION="$NIGHTLY_VERSION" \
+  run_install_sh
+unset LPM_TEST_TOOL_STATE LPM_TEST_COSIGN_REFUSES LPM_INSTALL_VERSION
+[ "$RUN_RC" -ne 0 ] || fail "a nightly no identity verifies must be refused: $RUN_OUT"
+[ "$(grep -c '' "$cosign_state/cosign-calls")" -eq 2 ] \
+  || fail "a nightly is tried as scheduled and as started by hand, and nothing else: $(cat "$cosign_state/cosign-calls")"
+
+stop_server
+trap - EXIT
+rm -f "$CLEAN_PATH_DIR/cosign"
+rm -rf "$fdir" "$cosign_state"
+pass "cosign's verdict decides, and the signing identity is bound as each release allows"
 
 echo
 for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do

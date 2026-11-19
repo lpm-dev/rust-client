@@ -5,7 +5,7 @@ use crate::release_lookup::{
     is_newer_semver, operating_system_home_dir, probe_release, read_cache_at, write_cache_at,
 };
 use crate::sigstore_verify::{
-    IdentityExpectations, VerifiedProvenance, VerifyError, VerifyOptions,
+    CertificateBuildClaims, IdentityExpectations, VerifiedProvenance, VerifyError, VerifyOptions,
     extract_subject_digest_from_statement, verify_sigstore_bundle,
 };
 use lpm_common::LpmError;
@@ -1930,6 +1930,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Git ref the release workflow is required to run from.
 const RELEASE_WORKFLOW_BRANCH_REF: &str = "refs/heads/main";
 
+/// The last stable release signed from its own tag. Every later release
+/// is signed only from `refs/heads/main`.
+const LAST_TAG_SIGNED_RELEASE: &str = "0.76.5";
+
+fn signed_from_its_tag(version: &str) -> bool {
+    match (
+        lpm_semver::Version::parse(version),
+        lpm_semver::Version::parse(LAST_TAG_SIGNED_RELEASE),
+    ) {
+        (Ok(version), Ok(last)) => version <= last,
+        _ => false,
+    }
+}
+
 /// Which accepted workflow ref signed a release manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseSigningRef {
@@ -1937,7 +1951,7 @@ enum ReleaseSigningRef {
     /// published since the release workflow became main-only.
     MainBranch,
     /// `refs/tags/v{version}`: stable releases signed from their own tag
-    /// before that guard (v0.75.0 through v0.76.x).
+    /// before that guard, up to [`LAST_TAG_SIGNED_RELEASE`].
     VersionTag,
 }
 
@@ -1948,7 +1962,14 @@ enum ReleaseSigningRef {
 /// The certificate, the predicate's `workflow.ref`, and the
 /// `resolvedDependencies` source URI must all name one accepted ref:
 /// `refs/heads/main` for any channel, or `refs/tags/v{version}` for a
-/// stable release. Every other ref is rejected.
+/// stable release up to [`LAST_TAG_SIGNED_RELEASE`]. Every other ref is
+/// rejected.
+///
+/// The certificate's own Fulcio build claims must agree: issued to a
+/// GitHub-hosted build of this repository at that ref and at the
+/// statement's source commit, started by a tag push for a tag-signed
+/// release, by hand for a stable release from main, and by the schedule
+/// or by hand for a nightly.
 ///
 /// A tag ref names the version it signs. A main-branch ref does not, and
 /// a nightly can share the exact commit of a stable release, so the
@@ -1964,6 +1985,7 @@ enum ReleaseSigningRef {
 fn validate_release_provenance(
     version: &str,
     snapshot: &lpm_workspace::ProvenanceSnapshot,
+    build: &CertificateBuildClaims,
     statement: &serde_json::Value,
     release_target_commit: Option<&str>,
 ) -> Result<String, LpmError> {
@@ -1985,17 +2007,21 @@ fn validate_release_provenance(
     let signing_ref = match (channel, snapshot.workflow_ref.as_deref()) {
         _ if !signed_by_release_workflow => None,
         (_, Some(RELEASE_WORKFLOW_BRANCH_REF)) => Some(ReleaseSigningRef::MainBranch),
-        (ReleaseChannel::Stable, Some(signed_ref)) if signed_ref == version_tag_ref => {
+        (ReleaseChannel::Stable, Some(signed_ref))
+            if signed_ref == version_tag_ref && signed_from_its_tag(version) =>
+        {
             Some(ReleaseSigningRef::VersionTag)
         }
         _ => None,
     };
     let Some(signing_ref) = signing_ref else {
         let accepted_refs = match channel {
-            ReleaseChannel::Stable => {
+            ReleaseChannel::Stable if signed_from_its_tag(version) => {
                 format!("`{RELEASE_WORKFLOW_BRANCH_REF}` or `{version_tag_ref}`")
             }
-            ReleaseChannel::Nightly => format!("`{RELEASE_WORKFLOW_BRANCH_REF}`"),
+            ReleaseChannel::Stable | ReleaseChannel::Nightly => {
+                format!("`{RELEASE_WORKFLOW_BRANCH_REF}`")
+            }
         };
         return Err(invalid(format!(
             "certificate identity must be `{PUBLISHER}` workflow `{WORKFLOW_PATH}` at {accepted_refs}"
@@ -2059,6 +2085,72 @@ fn validate_release_provenance(
         return Err(invalid(
             "source commit must be a 40-character lowercase hexadecimal Git object ID".to_string(),
         ));
+    }
+
+    fn certificate_claim<'a>(
+        claim: &'a Option<String>,
+        extension: &str,
+        invalid: &dyn Fn(String) -> LpmError,
+    ) -> Result<&'a str, LpmError> {
+        claim.as_deref().ok_or_else(|| {
+            invalid(format!(
+                "the signing certificate has no Fulcio {extension} extension"
+            ))
+        })
+    }
+    let certificate_repository =
+        certificate_claim(&build.source_repository_uri, "source repository", &invalid)?;
+    if certificate_repository != REPOSITORY {
+        return Err(invalid(format!(
+            "the signing certificate was issued to a build of `{certificate_repository}`, not `{REPOSITORY}`"
+        )));
+    }
+    let certificate_ref = certificate_claim(
+        &build.source_repository_ref,
+        "source repository ref",
+        &invalid,
+    )?;
+    if certificate_ref != expected_ref {
+        return Err(invalid(format!(
+            "the signing certificate was issued for `{certificate_ref}`, not `{expected_ref}`"
+        )));
+    }
+    let certificate_commit = certificate_claim(
+        &build.source_repository_digest,
+        "source repository digest",
+        &invalid,
+    )?;
+    if certificate_commit != source_commit {
+        return Err(invalid(format!(
+            "the signing certificate was issued for commit `{certificate_commit}`, but the \
+             attestation names source commit `{source_commit}`"
+        )));
+    }
+    let runner = certificate_claim(&build.runner_environment, "runner environment", &invalid)?;
+    if runner != "github-hosted" {
+        return Err(invalid(format!(
+            "the signing certificate was issued to a `{runner}` runner; LPM releases build on \
+             GitHub-hosted runners"
+        )));
+    }
+    let trigger = certificate_claim(&build.build_trigger, "build trigger", &invalid)?;
+    let trigger_matches = match (channel, signing_ref) {
+        (ReleaseChannel::Nightly, _) => trigger == "schedule" || trigger == "workflow_dispatch",
+        (ReleaseChannel::Stable, ReleaseSigningRef::MainBranch) => trigger == "workflow_dispatch",
+        (ReleaseChannel::Stable, ReleaseSigningRef::VersionTag) => trigger == "push",
+    };
+    if !trigger_matches {
+        let expected = match (channel, signing_ref) {
+            (ReleaseChannel::Nightly, _) => "a scheduled or `workflow_dispatch` release run",
+            (ReleaseChannel::Stable, ReleaseSigningRef::MainBranch) => {
+                "a `workflow_dispatch` release run"
+            }
+            (ReleaseChannel::Stable, ReleaseSigningRef::VersionTag) => "a push of its tag",
+        };
+        return Err(invalid(format!(
+            "the signing certificate was issued to a `{trigger}` run; this release must come from \
+             {expected}"
+        )));
     }
 
     match (channel, signing_ref) {
@@ -2135,6 +2227,7 @@ fn verify_release_manifest(
 
     let VerifiedProvenance {
         snapshot,
+        build,
         statement,
         integrated_time,
         leaf_cert_sha256,
@@ -2145,6 +2238,7 @@ fn verify_release_manifest(
     let source_commit = validate_release_provenance(
         version,
         &snapshot,
+        &build,
         &statement,
         release.target_commitish.as_deref(),
     )?;
@@ -4397,7 +4491,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     fn release_provenance_fixture(
         workflow_ref: &str,
         source_commit: &str,
-    ) -> (lpm_workspace::ProvenanceSnapshot, serde_json::Value) {
+    ) -> (
+        lpm_workspace::ProvenanceSnapshot,
+        CertificateBuildClaims,
+        serde_json::Value,
+    ) {
         let snapshot = lpm_workspace::ProvenanceSnapshot {
             present: true,
             publisher: Some("github:lpm-dev/rust-client".to_string()),
@@ -4431,7 +4529,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 },
             },
         });
-        (snapshot, statement)
+        let build = CertificateBuildClaims {
+            source_repository_uri: Some("https://github.com/lpm-dev/rust-client".to_string()),
+            source_repository_digest: Some(source_commit.to_string()),
+            source_repository_ref: Some(workflow_ref.to_string()),
+            build_trigger: Some(
+                if workflow_ref.starts_with("refs/tags/") {
+                    "push"
+                } else {
+                    "workflow_dispatch"
+                }
+                .to_string(),
+            ),
+            runner_environment: Some("github-hosted".to_string()),
+        };
+        (snapshot, build, statement)
     }
 
     const FIXTURE_SOURCE_COMMIT: &str = "1e98fb8efbcc00f620678fc8091b512ed503768f";
@@ -4444,9 +4556,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_stable_workflow_ref_for_another_version() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/tags/v0.74.1", FIXTURE_SOURCE_COMMIT);
-        let err = validate_release_provenance("0.75.0", &snapshot, &statement, None)
+        let err = validate_release_provenance("0.75.0", &snapshot, &build, &statement, None)
             .expect_err("a tag-signed stable release must be signed from its requested tag");
         let message = err.to_string();
         assert!(
@@ -4457,29 +4569,28 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_stable_release_signed_from_another_branch() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/heads/codex/x", FIXTURE_SOURCE_COMMIT);
         let err = validate_release_provenance(
             "0.84.0",
             &snapshot,
+            &build,
             &statement,
             Some(FIXTURE_SOURCE_COMMIT),
         )
         .expect_err("only main may sign a stable release");
         let message = err.to_string();
-        assert!(
-            message.contains("`refs/heads/main` or `refs/tags/v0.84.0`"),
-            "{message}"
-        );
+        assert!(message.ends_with("at `refs/heads/main`"), "{message}");
     }
 
     #[test]
     fn release_provenance_rejects_nightly_version_from_another_commit() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         let err = validate_release_provenance(
             "0.75.0-nightly.20260817.1.fffffff",
             &snapshot,
+            &build,
             &statement,
             None,
         )
@@ -4490,9 +4601,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[test]
     fn release_provenance_rejects_nightly_signed_from_a_tag() {
         let version = "0.75.0-nightly.20260817.1.1e98fb8";
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture(&format!("refs/tags/v{version}"), FIXTURE_SOURCE_COMMIT);
-        let err = validate_release_provenance(version, &snapshot, &statement, None)
+        let err = validate_release_provenance(version, &snapshot, &build, &statement, None)
             .expect_err("nightlies are only ever signed from main");
         let message = err.to_string();
         assert!(message.ends_with("at `refs/heads/main`"), "{message}");
@@ -4500,19 +4611,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_accepts_exact_stable_tag_and_source_commit() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/tags/v0.74.1", FIXTURE_SOURCE_COMMIT);
-        let verified = validate_release_provenance("0.74.1", &snapshot, &statement, None).unwrap();
+        let verified =
+            validate_release_provenance("0.74.1", &snapshot, &build, &statement, None).unwrap();
         assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
     }
 
     #[test]
     fn release_provenance_accepts_main_signed_stable_release_targeting_its_source_commit() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         let verified = validate_release_provenance(
             "0.84.0",
             &snapshot,
+            &build,
             &statement,
             Some(FIXTURE_SOURCE_COMMIT),
         )
@@ -4522,11 +4635,17 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_main_signed_stable_release_targeting_another_commit() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         let other_commit = "35edeab28d25a6851519629e99e478c3cd810c3a";
-        let err = validate_release_provenance("0.84.0", &snapshot, &statement, Some(other_commit))
-            .expect_err("the GitHub release must target the signed commit");
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &build,
+            &statement,
+            Some(other_commit),
+        )
+        .expect_err("the GitHub release must target the signed commit");
         let message = err.to_string();
         assert!(message.contains(other_commit), "{message}");
         assert!(message.contains(FIXTURE_SOURCE_COMMIT), "{message}");
@@ -4534,9 +4653,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_main_signed_stable_release_without_recorded_target() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
-        let err = validate_release_provenance("0.84.0", &snapshot, &statement, None)
+        let err = validate_release_provenance("0.84.0", &snapshot, &build, &statement, None)
             .expect_err("a main-signed stable release needs its target commit to bind the version");
         assert!(
             err.to_string().contains("does not record the commit"),
@@ -4546,7 +4665,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_scheduled_run_as_stable_release() {
-        let (snapshot, mut statement) =
+        let (snapshot, build, mut statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         set_statement_field(
             &mut statement,
@@ -4556,6 +4675,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let err = validate_release_provenance(
             "0.84.0",
             &snapshot,
+            &build,
             &statement,
             Some(FIXTURE_SOURCE_COMMIT),
         )
@@ -4565,8 +4685,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_accepts_scheduled_nightly() {
-        let (snapshot, mut statement) =
+        let (snapshot, mut build, mut statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.build_trigger = Some("schedule".to_string());
         set_statement_field(
             &mut statement,
             "/predicate/buildDefinition/internalParameters/github/event_name",
@@ -4575,6 +4696,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let verified = validate_release_provenance(
             "0.75.0-nightly.20260817.1.1e98fb8",
             &snapshot,
+            &build,
             &statement,
             None,
         )
@@ -4584,7 +4706,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_predicate_ref_that_differs_from_certificate_ref() {
-        let (snapshot, mut statement) =
+        let (snapshot, build, mut statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         set_statement_field(
             &mut statement,
@@ -4594,6 +4716,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let err = validate_release_provenance(
             "0.84.0",
             &snapshot,
+            &build,
             &statement,
             Some(FIXTURE_SOURCE_COMMIT),
         )
@@ -4606,7 +4729,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_rejects_source_uri_that_differs_from_certificate_ref() {
-        let (snapshot, mut statement) =
+        let (snapshot, build, mut statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         set_statement_field(
             &mut statement,
@@ -4616,6 +4739,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let err = validate_release_provenance(
             "0.84.0",
             &snapshot,
+            &build,
             &statement,
             Some(FIXTURE_SOURCE_COMMIT),
         )
@@ -4629,16 +4753,165 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn release_provenance_accepts_nightly_commit_suffix() {
-        let (snapshot, statement) =
+        let (snapshot, build, statement) =
             release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
         let verified = validate_release_provenance(
             "0.75.0-nightly.20260817.1.1e98fb8",
             &snapshot,
+            &build,
             &statement,
             None,
         )
         .unwrap();
         assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
+    }
+
+    #[test]
+    fn release_provenance_rejects_tag_signed_stable_release_newer_than_last_tag_signed_version() {
+        let (snapshot, build, statement) =
+            release_provenance_fixture("refs/tags/v0.87.0", FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance("0.87.0", &snapshot, &build, &statement, None)
+            .expect_err("only releases up to v0.76.5 were signed from their tag");
+        let message = err.to_string();
+        assert!(message.contains("`refs/heads/main`"), "{message}");
+        assert!(!message.contains("refs/tags/v0.87.0`"), "{message}");
+    }
+
+    #[test]
+    fn release_provenance_accepts_the_last_tag_signed_release() {
+        let (snapshot, build, statement) =
+            release_provenance_fixture("refs/tags/v0.76.5", FIXTURE_SOURCE_COMMIT);
+        let verified =
+            validate_release_provenance("0.76.5", &snapshot, &build, &statement, None).unwrap();
+        assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
+    }
+
+    #[test]
+    fn release_provenance_rejects_certificate_commit_that_differs_from_statement_commit() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let other_commit = "35edeab28d25a6851519629e99e478c3cd810c3a";
+        build.source_repository_digest = Some(other_commit.to_string());
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &build,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("the certificate and the statement must name one commit");
+        let message = err.to_string();
+        assert!(message.contains(other_commit), "{message}");
+        assert!(message.contains(FIXTURE_SOURCE_COMMIT), "{message}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_certificate_from_another_repository() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.source_repository_uri = Some("https://github.com/some-outsider/caller".to_string());
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &build,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("a build in another repository can't sign an LPM release");
+        assert!(err.to_string().contains("some-outsider/caller"), "{err}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_certificate_ref_that_differs_from_workflow_ref() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.source_repository_ref = Some("refs/heads/codex/x".to_string());
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &build,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("the certificate must have been issued for the signing ref");
+        assert!(err.to_string().contains("refs/heads/codex/x"), "{err}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_stable_certificate_issued_to_a_scheduled_run() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.build_trigger = Some("schedule".to_string());
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &build,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("the certificate's trigger binds a stable release to a manual run");
+        assert!(err.to_string().contains("`schedule`"), "{err}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_tag_signed_certificate_not_issued_to_a_tag_push() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/tags/v0.74.1", FIXTURE_SOURCE_COMMIT);
+        build.build_trigger = Some("workflow_dispatch".to_string());
+        let err = validate_release_provenance("0.74.1", &snapshot, &build, &statement, None)
+            .expect_err("tag-signed releases came from a tag push");
+        assert!(err.to_string().contains("`workflow_dispatch`"), "{err}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_nightly_certificate_issued_to_a_push() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.build_trigger = Some("push".to_string());
+        let err = validate_release_provenance(
+            "0.75.0-nightly.20260817.1.1e98fb8",
+            &snapshot,
+            &build,
+            &statement,
+            None,
+        )
+        .expect_err("nightlies are scheduled or started by hand");
+        assert!(err.to_string().contains("`push`"), "{err}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_certificate_without_build_claims() {
+        let (snapshot, _, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &CertificateBuildClaims::default(),
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("a certificate without Fulcio build claims can't be bound to a release");
+        assert!(
+            err.to_string()
+                .contains("the signing certificate has no Fulcio source repository extension"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn release_provenance_rejects_certificate_issued_to_a_self_hosted_runner() {
+        let (snapshot, mut build, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        build.runner_environment = Some("self-hosted".to_string());
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &build,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("LPM releases build only on GitHub-hosted runners");
+        assert!(err.to_string().contains("self-hosted"), "{err}");
     }
 
     const REAL_V0_84_0_SOURCE_COMMIT: &str = "35edeab28d25a6851519629e99e478c3cd810c3a";
@@ -4662,6 +4935,91 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             published_at: lpm_common::Timestamp::parse_rfc3339(published_at).unwrap(),
             target_commitish: target_commitish.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn real_v0_84_0_certificate_names_its_build() {
+        let (_, bundle) = real_v0_84_0_release_assets();
+        let verified = verify_sigstore_bundle(
+            &bundle,
+            &IdentityExpectations::none(),
+            VerifyOptions::strict(),
+        )
+        .expect("the published v0.84.0 bundle must verify");
+        assert_eq!(
+            verified.build,
+            CertificateBuildClaims {
+                source_repository_uri: Some("https://github.com/lpm-dev/rust-client".to_string()),
+                source_repository_digest: Some(REAL_V0_84_0_SOURCE_COMMIT.to_string()),
+                source_repository_ref: Some("refs/heads/main".to_string()),
+                build_trigger: Some("workflow_dispatch".to_string()),
+                runner_environment: Some("github-hosted".to_string()),
+            }
+        );
+    }
+
+    /// Real published release assets: `(manifest, bundle)`. Refresh with
+    /// `gh release download <tag> -R lpm-dev/rust-client -p 'SHA256SUMS.txt*'`.
+    fn real_release_assets(manifest: &str, bundle: &str) -> (Vec<u8>, Vec<u8>) {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        (
+            std::fs::read(fixtures.join("release_manifests").join(manifest))
+                .expect("manifest fixture must exist"),
+            std::fs::read(fixtures.join("sigstore_bundles").join(bundle))
+                .expect("bundle fixture must exist"),
+        )
+    }
+
+    #[test]
+    fn real_tag_signed_release_v0_76_5_verifies_as_a_tag_push() {
+        let (manifest, bundle) = real_release_assets(
+            "lpm-v0.76.5-SHA256SUMS.txt",
+            "22-real-lpm-release-v0.76.5.json",
+        );
+        let release = github_release(
+            "2026-08-28T06:16:00Z",
+            Some("faa77c3cb0ccea39886f12e7005575bae4273505"),
+        );
+        let verified = verify_release_manifest("0.76.5", &manifest, &bundle, &release)
+            .expect("the last tag-signed release must satisfy the self-update policy");
+        assert_eq!(verified.workflow_ref.as_deref(), Some("refs/tags/v0.76.5"));
+        assert_eq!(
+            verified.source_commit,
+            "faa77c3cb0ccea39886f12e7005575bae4273505"
+        );
+        let certificate = verify_sigstore_bundle(
+            &bundle,
+            &IdentityExpectations::none(),
+            VerifyOptions::strict(),
+        )
+        .unwrap();
+        assert_eq!(certificate.build.build_trigger.as_deref(), Some("push"));
+    }
+
+    #[test]
+    fn real_scheduled_nightly_verifies() {
+        let version = "0.86.0-nightly.20261109.260.daa536a";
+        let (manifest, bundle) = real_release_assets(
+            "lpm-v0.86.0-nightly.20261109.260.daa536a-SHA256SUMS.txt",
+            "23-real-lpm-nightly-v0.86.0-nightly.20261109.260.daa536a.json",
+        );
+        let release = github_release(
+            "2026-11-09T13:26:19Z",
+            Some("daa536a898e160442cbab72191131164c3e7656a"),
+        );
+        let verified = verify_release_manifest(version, &manifest, &bundle, &release)
+            .expect("a scheduled nightly must satisfy the self-update policy");
+        assert_eq!(
+            verified.source_commit,
+            "daa536a898e160442cbab72191131164c3e7656a"
+        );
+        let certificate = verify_sigstore_bundle(
+            &bundle,
+            &IdentityExpectations::none(),
+            VerifyOptions::strict(),
+        )
+        .unwrap();
+        assert_eq!(certificate.build.build_trigger.as_deref(), Some("schedule"));
     }
 
     #[test]

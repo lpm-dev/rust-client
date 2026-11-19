@@ -3861,3 +3861,82 @@ fn build_signed_sct_bundle_for_bench() -> BenchSctBundle {
         ct_log_key,
     }
 }
+
+const FULCIO_SOURCE_REPOSITORY_URI: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 12];
+const FULCIO_SOURCE_REPOSITORY_DIGEST: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 13];
+const FULCIO_BUILD_TRIGGER: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 20];
+
+fn der_utf8_string(value: &str) -> Vec<u8> {
+    let mut der = vec![0x0C, u8::try_from(value.len()).unwrap()];
+    der.extend_from_slice(value.as_bytes());
+    der
+}
+
+fn build_claims_of(
+    extensions: Vec<(&[u64], Vec<u8>)>,
+) -> Result<CertificateBuildClaims, VerifyError> {
+    let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::default();
+    for (oid, content) in extensions {
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(oid, content));
+    }
+    let cert_der = params.self_signed(&kp).unwrap().der().to_vec();
+    let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+    super::bundle::extract_certificate_build_claims(&cert)
+}
+
+#[test]
+fn certificate_build_claims_read_fulcio_v2_utf8_strings() {
+    let claims = build_claims_of(vec![
+        (
+            FULCIO_SOURCE_REPOSITORY_URI,
+            der_utf8_string("https://github.com/lpm-dev/rust-client"),
+        ),
+        (
+            FULCIO_SOURCE_REPOSITORY_DIGEST,
+            der_utf8_string("1e98fb8efbcc00f620678fc8091b512ed503768f"),
+        ),
+        (FULCIO_BUILD_TRIGGER, der_utf8_string("workflow_dispatch")),
+    ])
+    .unwrap();
+    assert_eq!(
+        claims,
+        CertificateBuildClaims {
+            source_repository_uri: Some("https://github.com/lpm-dev/rust-client".to_string()),
+            source_repository_digest: Some("1e98fb8efbcc00f620678fc8091b512ed503768f".to_string()),
+            source_repository_ref: None,
+            build_trigger: Some("workflow_dispatch".to_string()),
+            runner_environment: None,
+        }
+    );
+}
+
+#[test]
+fn certificate_build_claims_refuse_a_value_that_is_not_one_der_utf8_string() {
+    let mut trailing = der_utf8_string("push");
+    trailing.push(0);
+    let mut short = der_utf8_string("push");
+    short.pop();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("a raw string, as v1 extensions carry", b"push".to_vec()),
+        ("an IA5String", {
+            let mut ia5 = der_utf8_string("push");
+            ia5[0] = 0x16;
+            ia5
+        }),
+        ("bytes after the string", trailing),
+        ("a length past the end", short),
+        ("invalid UTF-8", vec![0x0C, 0x02, 0xC3, 0x28]),
+    ];
+    for (case, content) in cases {
+        let err = build_claims_of(vec![(FULCIO_BUILD_TRIGGER, content)])
+            .expect_err(&format!("{case} must not be read as a build trigger"));
+        assert!(
+            err.to_string()
+                .contains("build trigger extension is not a DER UTF8String"),
+            "{case}: {err}"
+        );
+    }
+}
