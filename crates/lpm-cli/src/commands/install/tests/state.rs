@@ -412,7 +412,6 @@ fn installed_project(
     root_version: &str,
     catalogs: lpm_lockfile::CatalogSnapshots,
 ) {
-    std::fs::write(dir.join("package.json"), pkg).unwrap();
     let source = "registry+https://registry.npmjs.org";
     let instance_id =
         lpm_common::PackageInstanceId::derive("leaf", root_version, source, "root/leaf");
@@ -434,6 +433,17 @@ fn installed_project(
         },
     );
     lockfile.catalogs = catalogs;
+    installed_project_locked_as(dir, pkg, &lockfile);
+}
+
+/// A project installed from `pkg` and `lockfile`, with a matching install
+/// hash.
+fn installed_project_locked_as(
+    dir: &std::path::Path,
+    pkg: &str,
+    lockfile: &lpm_lockfile::Lockfile,
+) {
+    std::fs::write(dir.join("package.json"), pkg).unwrap();
     lockfile
         .write_all(&dir.join(lpm_lockfile::LOCKFILE_NAME))
         .unwrap();
@@ -566,4 +576,65 @@ fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog
             "{case}"
         );
     }
+}
+
+#[test]
+fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::update([
+        ("HOME", Some(home.path().as_os_str().to_owned())),
+        ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+        ("LPM_LINKER", None),
+        (lpm_store::StoreVersion::ENV_VAR, None),
+        (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
+    ]);
+    let mode = crate::install_state::FastLaneMode {
+        json: true,
+        timing: false,
+        frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+        no_skills: true,
+    };
+    let source = "registry+https://registry.npmjs.org";
+    let locked = |name: &str, path: &str| lpm_lockfile::LockedPackage {
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            name, "1.0.0", source, path,
+        )),
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(source.to_string()),
+        ..Default::default()
+    };
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    let leaf = locked("leaf", "root/parent/leaf");
+    let mut parent = locked("parent", "root/parent");
+    parent.dependencies = vec!["leaf@1.0.0".to_string()];
+    parent.dependency_targets =
+        std::collections::BTreeMap::from([("leaf".to_string(), leaf.instance_id.unwrap())]);
+    lockfile.root_resolutions.insert(
+        "parent".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: parent.instance_id,
+            package: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+    lockfile.add_package(parent);
+    lockfile.add_package(leaf);
+    lockfile.catalogs.insert(
+        "default".to_string(),
+        std::collections::BTreeMap::from([(
+            "leaf".to_string(),
+            lpm_lockfile::CatalogSnapshotEntry {
+                specifier: "1.0.0".to_string(),
+                version: "1.0.0".to_string(),
+                reference: "catalog:".to_string(),
+            },
+        )]),
+    );
+    let pkg = r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"parent":"1.0.0"},"overrides":{"leaf":"catalog:"}}"#;
+    let project = tempfile::tempdir().unwrap();
+    installed_project_locked_as(project.path(), pkg, &lockfile);
+
+    assert!(crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap());
 }

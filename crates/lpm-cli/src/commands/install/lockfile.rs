@@ -1826,19 +1826,36 @@ fn lockfile_catalog_snapshots_match_rows(
                 .root_aliases
                 .get(package_name)
                 .map_or(package_name.as_str(), String::as_str);
-            let requested_spec = deps
-                .get(package_name)
-                .map_or(resolution.specifier.as_str(), String::as_str);
-            let Some(locked_package) = select_locked_root_package_from_rows(
-                lockfile,
-                rows,
-                package_name,
-                target,
-                requested_spec,
-            ) else {
-                return false;
+            let locked_package = if deps.contains_key(package_name)
+                || lockfile.root_resolutions.contains_key(package_name)
+                || lockfile.metadata.lockfile_version
+                    < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+            {
+                let requested_spec = deps
+                    .get(package_name)
+                    .map_or(resolution.specifier.as_str(), String::as_str);
+                select_locked_root_package_from_rows(
+                    lockfile,
+                    rows,
+                    package_name,
+                    target,
+                    requested_spec,
+                )
+            } else {
+                // An override's snapshot can name a package only other
+                // packages depend on. Its writer picked that package's best
+                // locked version for the catalog range.
+                best_locked_candidate(
+                    rows.packages
+                        .iter()
+                        .copied()
+                        .filter(|package| package.name == *package_name),
+                    lpm_resolver::NpmRange::parse(&resolution.specifier)
+                        .ok()
+                        .as_ref(),
+                )
             };
-            if locked_package.version != entry.version {
+            if locked_package.is_none_or(|package| package.version != entry.version) {
                 return false;
             }
         }
@@ -1880,15 +1897,26 @@ fn select_locked_package_for_requested_spec_from_rows<'a>(
 ) -> Option<&'a lpm_lockfile::LockedPackage> {
     let requested_range = requested_range_for_locked_lookup(requested_spec)
         .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+    let start = packages.partition_point(|pkg| pkg.name.as_str() < target);
+    let end = start + packages[start..].partition_point(|pkg| pkg.name.as_str() == target);
+    best_locked_candidate(
+        packages[start..end].iter().copied(),
+        requested_range.as_ref(),
+    )
+}
+
+/// The candidate an install picks for a range: the highest version it
+/// accepts, else the highest version, else the first candidate.
+fn best_locked_candidate<'a>(
+    candidates: impl IntoIterator<Item = &'a lpm_lockfile::LockedPackage>,
+    requested_range: Option<&lpm_resolver::NpmRange>,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
     let mut first_match: Option<&lpm_lockfile::LockedPackage> = None;
     let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> =
         None;
     let mut best_any: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
 
-    let start = packages.partition_point(|pkg| pkg.name.as_str() < target);
-    let end = start + packages[start..].partition_point(|pkg| pkg.name.as_str() == target);
-
-    for &candidate in &packages[start..end] {
+    for candidate in candidates {
         if first_match.is_none() {
             first_match = Some(candidate);
         }
@@ -1902,7 +1930,7 @@ fn select_locked_package_for_requested_spec_from_rows<'a>(
             best_any = Some((version.clone(), candidate));
         }
 
-        if let Some(range) = requested_range.as_ref()
+        if let Some(range) = requested_range
             && range.satisfies(&version)
         {
             let better_satisfying = best_satisfying
