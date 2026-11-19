@@ -732,3 +732,45 @@ async fn a_stage_download_redirect_trusts_the_npmrc_cafile_of_the_host_it_reache
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+#[tokio::test]
+async fn an_unchanged_install_restores_a_recorded_skill_over_the_registrys_npmrc_cafile() {
+    let project = TempProject::empty(r#"{"name":"registry-tls-skills","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let front = TlsFront::start(&mock, project.home());
+    front.write_user_npmrc(project.home(), "");
+    run(&project, &front, &["install"]).expect("the cold install reaches the front");
+    project.write_file(
+        "lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    let content = "---\nname: widget-guide\ndescription: Use the widget\n---\nRender it.";
+    mock.with_package_skills_for_version_expected(
+        "owner.widget",
+        "1.4.0",
+        vec![serde_json::json!({
+            "name": "widget-guide",
+            "description": "Use the widget",
+            "sizeBytes": content.len(),
+            "rawContent": content,
+        })],
+        1,
+    )
+    .await;
+
+    let output = run(&project, &front, &["--json", "install"]).expect("unchanged install");
+
+    assert!(output.contains("\"up_to_date\": true"), "{output}");
+    assert!(
+        project.file_exists(".lpm/skills/owner.widget/widget-guide.md"),
+        "the skill comes over the registry's .npmrc trust:\n{output}"
+    );
+}
