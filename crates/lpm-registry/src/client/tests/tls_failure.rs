@@ -382,11 +382,10 @@ async fn a_publish_retry_whose_deadline_runs_out_before_it_is_sent_keeps_the_ear
             "rate limited",
         ),
     ] {
-        let rendered = publish_whose_retry_times_out_before_it_is_sent(first_answer).await;
+        let error = publish_whose_retry_times_out_before_it_is_sent(first_answer).await;
         assert!(
-            rendered.contains("retry timed out before it was sent")
-                && rendered.contains(earlier_failure),
-            "{rendered}"
+            !matches!(error, LpmError::Network(_)) && error.to_string().contains(earlier_failure),
+            "the publish fails with the registry's answer: {error:?}"
         );
     }
 }
@@ -395,7 +394,7 @@ async fn a_publish_retry_whose_deadline_runs_out_before_it_is_sent_keeps_the_ear
 /// whose retry's deadline has already passed when it starts.
 async fn publish_whose_retry_times_out_before_it_is_sent(
     first_answer: wiremock::ResponseTemplate,
-) -> String {
+) -> LpmError {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -444,5 +443,5 @@ async fn publish_whose_retry_times_out_before_it_is_sent(
     let Err(error) = outcome else {
         panic!("a publish the registry never stored fails");
     };
-    error.to_string()
+    error
 }

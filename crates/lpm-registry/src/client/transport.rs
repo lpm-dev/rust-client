@@ -692,13 +692,14 @@ impl RegistryClient {
                             false,
                             false,
                         ),
-                        // A probe would wait on the same unprepared client.
+                        // A probe would wait on the same unprepared client. On
+                        // a retry, the earlier attempt's answer, already
+                        // reconciled, is why the publish failed.
                         lpm_http::ReplayableRequestError::TimeoutBeforeRequest => {
-                            return Err(LpmError::Network(match last_error.take() {
-                                Some(earlier) => format!(
-                                    "publish retry timed out before it was sent, after: {earlier}"
-                                ),
-                                None => "publish request timed out before it was sent".into(),
+                            return Err(last_error.take().unwrap_or_else(|| {
+                                LpmError::Network(
+                                    "publish request timed out before it was sent".into(),
+                                )
                             }));
                         }
                         refused => return Err(LpmError::Network(refused.to_string())),
