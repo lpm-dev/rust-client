@@ -88,3 +88,31 @@ async fn registry_api_reads_trust_the_npmrc_cafile_of_the_registry() {
     );
     assert!(project.file_exists(".lpm/skills/owner.package/guide.md"));
 }
+
+#[tokio::test]
+async fn a_registry_certificate_nothing_trusts_fails_on_the_first_handshake() {
+    let project = TempProject::empty(r#"{"name":"registry-tls","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("tls-user", "tls-user@example.com").await;
+    let front = TlsFront::start(&mock, project.home());
+
+    let output = support::lpm(&project)
+        .env("LPM_TOKEN", "tls-session-token")
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "1")
+        .args(["--registry", &front.url, "--json", "whoami"])
+        .output()
+        .expect("run lpm");
+
+    let rendered = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!output.status.success(), "{rendered}");
+    assert!(rendered.contains("UnknownIssuer"), "{rendered}");
+    assert_eq!(
+        front.connections(),
+        1,
+        "a certificate no configured authority issued can't pass on a retry:\n{rendered}"
+    );
+}
