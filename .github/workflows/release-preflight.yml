@@ -2,19 +2,22 @@ name: Release Preflight
 
 on:
   workflow_call:
+    # Optional: once the signing secrets live only in the main-only release
+    # environment, the caller has none to pass, and macos-signing reads them
+    # from that environment instead.
     secrets:
       APPLE_CLI_PROVISIONING_PROFILE_BASE64:
-        required: true
+        required: false
       APPLE_DEVELOPER_ID_P12_BASE64:
-        required: true
+        required: false
       APPLE_DEVELOPER_ID_P12_PASSWORD:
-        required: true
+        required: false
       APPLE_NOTARY_ISSUER_ID:
-        required: true
+        required: false
       APPLE_NOTARY_KEY_BASE64:
-        required: true
+        required: false
       APPLE_NOTARY_KEY_ID:
-        required: true
+        required: false
   workflow_dispatch:
 
 permissions:
@@ -44,6 +47,7 @@ jobs:
   macos-signing:
     name: macOS signing and notarization credentials
     runs-on: macos-15
+    environment: release
     timeout-minutes: 10
     env:
       APPLE_CODESIGN_IDENTITY: "Developer ID Application: Tolga Ergin (823S8YKMRW)"

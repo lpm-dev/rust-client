@@ -504,6 +504,7 @@ jobs:
       ((needs.release-metadata.outputs.mode == 'full' && needs.verify.result == 'success') ||
       (needs.release-metadata.outputs.mode == 'candidate' && needs.verify-candidate-source.result == 'success'))
     runs-on: ${{ matrix.os }}
+    environment: release
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
@@ -919,6 +920,7 @@ jobs:
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
+    environment: release
     timeout-minutes: 120
     permissions:
       actions: read
@@ -1632,6 +1634,7 @@ jobs:
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 10
     permissions:
       actions: read
@@ -2143,6 +2146,7 @@ jobs:
       - release-metadata
     if: needs.prepare-promotion.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 10
     permissions:
       actions: read
@@ -2218,6 +2222,7 @@ jobs:
       - release-metadata
     if: needs.finalize-promotion-release.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 90
     permissions:
       actions: read
@@ -2681,6 +2686,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
       needs.release-metadata.outputs.mode == 'npm-publish-only'))
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 45
     permissions:
       contents: read
@@ -2837,6 +2843,7 @@ jobs:
       needs.release-metadata.outputs.mode == 'npm-publish-only' &&
       needs.publish-npm-platform.result == 'success'))
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 90
     permissions:
       contents: read
@@ -2998,6 +3005,7 @@ jobs:
       needs.finalize-promotion-release.result == 'success' &&
       needs.publish-promotion-platform.result == 'success'
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 15
     permissions:
       actions: read
