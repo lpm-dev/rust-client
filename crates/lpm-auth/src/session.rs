@@ -1016,7 +1016,13 @@ impl SessionManager {
                 self.clear_rejected_session_if_current(rejected_access, refresh_token)?;
                 return Err(LpmError::SessionExpired);
             }
-            if status.is_redirection() && resp.headers().contains_key(reqwest::header::LOCATION) {
+            let redirected_elsewhere = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| resp.url().join(location).ok())
+                .is_some_and(|target| target.origin() != resp.url().origin());
+            if status.is_redirection() && redirected_elsewhere {
                 return Err(LpmError::Http {
                     status: status.as_u16(),
                     message: "the registry redirected the session refresh to another origin, \
@@ -2612,6 +2618,26 @@ mod refresh_http_tests {
                 .contains("redirected the session refresh to another origin"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_silent_refresh_answered_with_a_same_origin_redirect_it_cant_follow_isnt_called_cross_origin()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(300).insert_header("location", "/api/cli/refresh"))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let mgr = manager_for(&server.uri());
+
+        let error = mgr
+            .refresh_now()
+            .await
+            .expect_err("a refresh answered with 300 fails");
+        assert!(!error.to_string().contains("another origin"), "{error}");
     }
 
     #[tokio::test]
