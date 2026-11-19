@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import os from "node:os";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -30,6 +32,53 @@ function jobsOf(workflow) {
 function stepsOf(job) {
   const start = job.indexOf("\n    steps:\n");
   return start === -1 ? [] : job.slice(start).split("\n      - ").slice(1);
+}
+
+// Every step's `run:` script in a workflow, with the line its key is on. A
+// block scalar runs until the first non-blank line indented no deeper than
+// the key. A job output that happens to be named `run` is not a script.
+function runScripts(workflow) {
+  const lines = workflow.split("\n");
+  const scripts = [];
+  let stepsIndent = -1;
+  for (let index = 0; index < lines.length; index++) {
+    const lineIndent = lines[index].length - lines[index].trimStart().length;
+    if (stepsIndent !== -1 && lines[index].trim() !== "" && lineIndent <= stepsIndent) {
+      stepsIndent = -1;
+    }
+    const steps = /^(\s*)steps:\s*$/.exec(lines[index]);
+    if (steps) {
+      stepsIndent = steps[1].length;
+      continue;
+    }
+    if (stepsIndent === -1) continue;
+    const key = /^(\s*)(?:- )?run:(.*)$/.exec(lines[index]);
+    if (!key) continue;
+    const indent = key[1].length + (lines[index].trimStart().startsWith("- ") ? 2 : 0);
+    const value = key[2].trim();
+    if (!/^[|>][-+]?$/.test(value)) {
+      scripts.push({ line: index + 1, script: value });
+      continue;
+    }
+    const body = [];
+    let next = index + 1;
+    for (; next < lines.length; next++) {
+      const line = lines[next];
+      if (line.trim() !== "" && line.length - line.trimStart().length <= indent) break;
+      body.push(line);
+    }
+    scripts.push({ line: index + 1, script: body.join("\n") });
+    index = next - 1;
+  }
+  return scripts;
+}
+
+function workflowFiles() {
+  const directory = path.join(repoRoot, ".github/workflows");
+  return fs
+    .readdirSync(directory)
+    .filter((name) => /\.ya?ml$/.test(name))
+    .map((name) => `.github/workflows/${name}`);
 }
 
 test("nightly and candidate construction survives the unused verification branch being skipped", () => {
@@ -310,7 +359,7 @@ test("every SHA256SUMS.txt attestation passes the shipped self-update policy bef
     for (const step of steps.slice(attest + 1, gate)) {
       assert.match(
         step,
-        /run: cp "\$\{\{ steps\.attest\.outputs\.bundle-path \}\}" \S+\/SHA256SUMS\.txt\.sigstore\n/,
+        /env:\n\s+ATTESTATION_BUNDLE: \$\{\{ steps\.attest\.outputs\.bundle-path \}\}\n\s+run: cp "\$\{ATTESTATION_BUNDLE\}" \S+\/SHA256SUMS\.txt\.sigstore\n/,
         `${name} may only stage the bundle between attesting and verifying it`,
       );
     }
@@ -384,5 +433,109 @@ test("a promoted stable release passes the shipped self-update policy with its p
       index === 0 || position > argumentPositions[index - 1][1],
       `published-release gate must pass ${argument} after ${argumentPositions[index - 1]?.[0]}`,
     );
+  }
+});
+
+test("workflow run scripts never expand template expressions", () => {
+  // Expressions are substituted into the script text before the shell
+  // parses it, so a dispatch input, an event field or an upstream output
+  // could run as code. Scripts read every such value through `env:`.
+  const expansions = [];
+  for (const file of workflowFiles()) {
+    for (const { line, script } of runScripts(read(file))) {
+      for (const match of script.matchAll(/\$\{\{[^}]*\}\}/g)) {
+        expansions.push(`${file}:${line} ${match[0]}`);
+      }
+    }
+  }
+  assert.deepEqual(expansions, []);
+});
+
+test("release metadata validates every dispatch input as a whole value before any job reads it", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const metadata = jobSource(workflow, "release-metadata", "verify");
+
+  assert.match(metadata, /INPUT_SOURCE_RUN_ID: \$\{\{ inputs\.source_run_id \}\}/);
+  assert.match(metadata, /source_run_id: \$\{\{ steps\.metadata\.outputs\.source_run_id \}\}/);
+  assert.match(metadata, /\[\[ "\$SOURCE_RUN_ID" =~ \^\[1-9\]\[0-9\]\{0,18\}\$ \]\]/);
+  assert.match(metadata, /promote \| windows-smoke-only \| npm-publish-only \| wrapper-only\)/);
+  assert.match(metadata, /candidate \| full\)/);
+  assert.match(metadata, /echo "source_run_id=\$SOURCE_RUN_ID"/);
+
+  // Each input is matched as one whole value, never line by line.
+  assert.doesNotMatch(metadata, /printf '%s\\n' "\$(?:VERSION|NPM_NIGHTLY|SOURCE_RUN_ID)" \|\s*grep/);
+  assert.match(metadata, /\[\[ "\$VERSION" =~ \$STABLE_VERSION_PATTERN \]\]/);
+  assert.match(metadata, /\[\[ "\$VERSION" =~ \$NIGHTLY_VERSION_PATTERN \]\]/);
+  assert.match(metadata, /\[\[ "\$NPM_NIGHTLY" =~ \$NIGHTLY_VERSION_PATTERN \]\]/);
+  assert.match(metadata, /case "\$MODE" in\n\s+candidate \| promote \| full \| wrapper-only \| windows-smoke-only \| npm-publish-only\) ;;/);
+
+  const outside = workflow.replace(metadata, "");
+  assert.doesNotMatch(outside, /inputs\.source_run_id/, "later jobs must read the validated run ID");
+});
+
+test("release metadata accepts only whole, valid dispatch inputs when its script runs", {
+  skip: process.platform === "win32" && "runs the release metadata script with bash",
+}, () => {
+  const workflow = read(".github/workflows/release.yml");
+  const metadata = jobSource(workflow, "release-metadata", "verify");
+  const scripts = runScripts(metadata).filter(({ script }) => script.includes("STABLE_VERSION_PATTERN="));
+  assert.equal(scripts.length, 1, "missing the metadata script");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-metadata-"));
+  const script = path.join(directory, "metadata.sh");
+  fs.writeFileSync(script, scripts[0].script.replace(/^ {10}/gm, ""));
+  const run = (mode, version, sourceRunId, channel = "stable") => {
+    const output = path.join(directory, "output");
+    fs.rmSync(output, { force: true });
+    const result = spawnSync("bash", ["-e", script], {
+      encoding: "utf8",
+      env: {
+        PATH: "/usr/bin:/bin",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_REF: "refs/heads/main",
+        GITHUB_OUTPUT: output,
+        GITHUB_REPOSITORY: "lpm-dev/rust-client",
+        INPUT_CHANNEL: channel,
+        INPUT_MODE: mode,
+        INPUT_VERSION: version,
+        INPUT_SOURCE_RUN_ID: sourceRunId,
+      },
+    });
+    const written = fs.existsSync(output) ? fs.readFileSync(output, "utf8") : "";
+    return { status: result.status, written, stderr: result.stdout + result.stderr };
+  };
+  try {
+    const promote = run("promote", "0.88.0", "123");
+    assert.equal(promote.status, 0, promote.stderr);
+    assert.match(promote.written, /^source_run_id=123$/m);
+    assert.match(promote.written, /^tag=v0\.88\.0$/m);
+    const recovery = run("npm-publish-only", "0.88.0", "456");
+    assert.equal(recovery.status, 0, recovery.stderr);
+    assert.match(recovery.written, /^source_run_id=456$/m);
+    const nightly = "0.88.0-nightly.20261119.270.abcdef0";
+    const nightlyRecovery = run("npm-publish-only", nightly, "789", "nightly");
+    assert.equal(nightlyRecovery.status, 0, nightlyRecovery.stderr);
+    assert.match(nightlyRecovery.written, /^npm_tag=nightly$/m);
+    assert.match(nightlyRecovery.written, new RegExp(`^version=${nightly.replaceAll(".", "\\.")}$`, "m"));
+
+    for (const [mode, version, sourceRunId, channel = "stable"] of [
+      ["promote", "0.88.0", "12a3"],
+      ["promote", "0.88.0\ntag=v9.9.9", "123"],
+      ["promote", "0.88.0", ""],
+      ["promote", "0.88.0", "0123"],
+      ["promote", "0.88.0", "123\n456"],
+      ["candidate", "0.88.0", "123"],
+      ["unknown", "0.88.0", "123"],
+      ["npm-publish-only", `${"0.88.0-nightly.20261119.270.abcdef0"}\ntag=v9.9.9`, "789", "nightly"],
+      ["npm-publish-only", "0.88.0", "789", "nightly"],
+      ["promote", "0.88.0-nightly.20261119.270.abcdef0", "789", "nightly"],
+      ["promote", "0.88.0", "123", "beta"],
+    ]) {
+      const refused = run(mode, version, sourceRunId, channel);
+      const label = JSON.stringify({ mode, version, sourceRunId, channel });
+      assert.notEqual(refused.status, 0, `${label} must be refused`);
+      assert.equal(refused.written, "", `${label} must write no outputs`);
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });

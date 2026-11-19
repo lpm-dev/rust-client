@@ -39,9 +39,10 @@ jobs:
       - name: Publish the signed key list
         env:
           GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
           set -euo pipefail
-          cp "${{ steps.attest.outputs.bundle-path }}" relay-trust.json.sigstore
+          cp "${ATTESTATION_BUNDLE}" relay-trust.json.sigstore
           if ! gh release view relay-trust >/dev/null 2>&1; then
             gh release create relay-trust --target "$GITHUB_SHA" --prerelease --latest=false \
               --title "Approved relay keys" --notes "Signed key authorization for tunnel clients."
