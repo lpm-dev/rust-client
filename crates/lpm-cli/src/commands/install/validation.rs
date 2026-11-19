@@ -214,7 +214,7 @@ pub(super) fn frozen_install_accepts_lockfile(
     let mut catalog_resolutions = Vec::new();
     let overrides = prepare_override_resolution_state(OverrideResolutionInput {
         package,
-        workspace,
+        workspace_root: workspace.map(|workspace| &workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     })?;
     let current = current_importer_state(

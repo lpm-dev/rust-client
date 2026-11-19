@@ -1059,7 +1059,7 @@ fn target_lockfile_is_replay_ready(
     };
     let Ok(overrides) = prepare_override_resolution_state(OverrideResolutionInput {
         package,
-        workspace: Some(workspace),
+        workspace_root: Some(&workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     }) else {
         return false;

@@ -1451,7 +1451,9 @@ pub(super) type OverrideCatalogResolution<'a> = (
 
 pub(super) struct OverrideResolutionInput<'a> {
     pub(super) package: &'a lpm_workspace::PackageJson,
-    pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
+    /// The `package.json` of the workspace `package` belongs to, whose
+    /// catalogs, overrides and resolutions apply to it.
+    pub(super) workspace_root: Option<&'a lpm_workspace::PackageJson>,
     pub(super) catalog_resolutions: &'a mut Vec<lpm_workspace::CatalogProtocolResolution>,
 }
 
@@ -1484,12 +1486,10 @@ impl CurrentCatalogResolutions {
 /// `None` when a reference doesn't resolve; the install reports why.
 pub(super) fn current_catalog_resolutions(
     package: &lpm_workspace::PackageJson,
-    workspace: Option<&lpm_workspace::Workspace>,
+    workspace_root: Option<&lpm_workspace::PackageJson>,
     deps: &mut Cow<'_, HashMap<String, String>>,
 ) -> Option<CurrentCatalogResolutions> {
-    let catalogs = workspace.map_or(&package.catalogs, |workspace| {
-        &workspace.root_package.catalogs
-    });
+    let catalogs = workspace_root.map_or(&package.catalogs, |root| &root.catalogs);
     let mut catalog_resolutions =
         if !catalogs.is_empty() && deps.values().any(|spec| spec.starts_with("catalog:")) {
             lpm_workspace::resolve_catalog_protocol(deps.to_mut(), catalogs).ok()?
@@ -1498,7 +1498,7 @@ pub(super) fn current_catalog_resolutions(
         };
     let dependency_count = prepare_override_resolution_state(OverrideResolutionInput {
         package,
-        workspace,
+        workspace_root,
         catalog_resolutions: &mut catalog_resolutions,
     })
     .ok()?
@@ -1519,13 +1519,13 @@ pub(super) fn prepare_override_resolution_state<'a>(
         .as_ref()
         .map_or(&empty_lpm_overrides, |lpm| &lpm.overrides);
     let root_lpm_overrides = input
-        .workspace
-        .and_then(|workspace| workspace.root_package.lpm.as_ref())
+        .workspace_root
+        .and_then(|root| root.lpm.as_ref())
         .map(|lpm| &lpm.overrides);
     let dependency_catalog_resolution_count = input.catalog_resolutions.len();
     let override_catalogs = input
-        .workspace
-        .map_or(&input.package.catalogs, |ws| &ws.root_package.catalogs);
+        .workspace_root
+        .map_or(&input.package.catalogs, |root| &root.catalogs);
     let (lpm_overrides_map, lpm_override_catalog_resolutions) = resolve_effective_override_map(
         package_lpm_overrides,
         root_lpm_overrides,
@@ -1533,16 +1533,12 @@ pub(super) fn prepare_override_resolution_state<'a>(
     )?;
     let (overrides_map, npm_override_catalog_resolutions) = resolve_effective_override_map(
         &input.package.overrides,
-        input
-            .workspace
-            .map(|workspace| &workspace.root_package.overrides),
+        input.workspace_root.map(|root| &root.overrides),
         override_catalogs,
     )?;
     let (resolutions_map, resolution_catalog_resolutions) = resolve_effective_override_map(
         &input.package.resolutions,
-        input
-            .workspace
-            .map(|workspace| &workspace.root_package.resolutions),
+        input.workspace_root.map(|root| &root.resolutions),
         override_catalogs,
     )?;
     let mut override_catalog_resolutions = Vec::new();

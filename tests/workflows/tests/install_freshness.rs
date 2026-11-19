@@ -6,7 +6,9 @@ mod support;
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+};
 use support::{TempProject, lpm, lpm_with_registry};
 
 fn bare_install(project: &TempProject) -> assert_cmd::Command {
@@ -1636,8 +1638,7 @@ async fn unchanged_workspace_installs_with_catalog_dependencies_answer_up_to_dat
 #[tokio::test]
 async fn unchanged_member_install_whose_only_catalog_reference_is_an_override_answers_up_to_date() {
     let mock = MockRegistry::start().await;
-    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
-        .await;
+    serve_leaf_1_0_0_and_1_1_0(&mock).await;
     let project = TempProject::empty(
         r#"{"name":"root","private":true,"workspaces":["packages/*"],"catalogs":{"default":{"leaf":"1.0.0"}}}"#,
     );
@@ -1646,6 +1647,7 @@ async fn unchanged_member_install_whose_only_catalog_reference_is_an_override_an
         r#"{"name":"app","version":"1.0.0","dependencies":{"leaf":"^1.0.0"},"overrides":{"leaf":"catalog:"}}"#,
     );
     install(&project, &mock.url()).assert().success();
+    assert_override_pinned_leaf_to_its_catalog_entry(&project);
 
     let mut unchanged = bare_install(&project);
     unchanged
@@ -1657,30 +1659,66 @@ async fn unchanged_member_install_whose_only_catalog_reference_is_an_override_an
 #[tokio::test]
 async fn unchanged_member_install_under_a_root_catalog_override_answers_up_to_date() {
     let mock = MockRegistry::start().await;
-    mock.with_manifest_package(serde_json::json!({"name": "leaf", "version": "1.0.0"}), &[])
-        .await;
+    serve_leaf_1_0_0_and_1_1_0(&mock).await;
     mock.with_manifest_package(
         serde_json::json!({"name": "parent", "version": "1.0.0", "dependencies": {"leaf": "^1.0.0"}}),
         &[],
     )
     .await;
-    // The catalog lives only in pnpm-workspace.yaml, and only the root's
-    // override names it.
-    let project =
-        TempProject::empty(r#"{"name":"root","private":true,"overrides":{"leaf":"catalog:"}}"#);
-    project.write_file(
-        "pnpm-workspace.yaml",
-        "packages:\n  - packages/*\ncatalog:\n  leaf: 1.0.0\n",
+    // The catalog lives only in pnpm-workspace.yaml, only the root's
+    // override names it, and the member's own install isn't recursive.
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"overrides":{"leaf":"catalog:"}}"#,
     );
+    project.write_file("pnpm-workspace.yaml", "catalog:\n  leaf: 1.0.0\n");
     project.write_file(
         "packages/app/package.json",
         r#"{"name":"app","version":"1.0.0","dependencies":{"parent":"1.0.0"}}"#,
     );
     install(&project, &mock.url()).assert().success();
+    assert_override_pinned_leaf_to_its_catalog_entry(&project);
 
     let mut unchanged = bare_install(&project);
     unchanged
         .current_dir(project.path().join("packages/app"))
         .env("LPM_REGISTRY_URL", mock.url());
     assert_up_to_date(unchanged);
+}
+
+/// `leaf` 1.0.0 and 1.1.0, so an override to 1.0.0 changes what `^1.0.0`
+/// selects.
+async fn serve_leaf_1_0_0_and_1_1_0(mock: &MockRegistry) {
+    mock.with_full_package_metadata(
+        "leaf",
+        "1.1.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("leaf", "1.0.0")),
+            ),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("leaf", "1.1.0")),
+            ),
+        ],
+    )
+    .await;
+}
+
+fn assert_override_pinned_leaf_to_its_catalog_entry(project: &TempProject) {
+    let member = lpm_lockfile::Lockfile::read_for_project(&project.path().join("packages/app"))
+        .expect("the member's lockfile")
+        .lockfile;
+    let snapshot = member
+        .catalogs
+        .get("default")
+        .and_then(|catalog| catalog.get("leaf"));
+    assert_eq!(
+        snapshot.map(|entry| entry.version.as_str()),
+        Some("1.0.0"),
+        "the applied override records its catalog snapshot\n{}",
+        project.read_file("lpm.lock")
+    );
 }

@@ -400,7 +400,7 @@ fn prepare_override_resolution_state_resolves_catalog_backed_override_maps() {
 
     let state = prepare_override_resolution_state(OverrideResolutionInput {
         package: &package,
-        workspace: None,
+        workspace_root: None,
         catalog_resolutions: &mut catalog_resolutions,
     })
     .expect("catalog-backed overrides should resolve");
@@ -461,7 +461,7 @@ fn prepare_override_resolution_state_inherits_root_maps_with_member_precedence()
 
     let state = prepare_override_resolution_state(OverrideResolutionInput {
         package: &member_package,
-        workspace: Some(&workspace),
+        workspace_root: Some(&workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     })
     .expect("workspace override maps should merge");

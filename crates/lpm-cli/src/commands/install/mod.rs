@@ -866,7 +866,9 @@ async fn run_with_options_under_store_lock(
         override_set,
     } = prepare_override_resolution_state(OverrideResolutionInput {
         package: &pkg,
-        workspace: workspace.as_deref(),
+        workspace_root: workspace
+            .as_deref()
+            .map(|workspace| &workspace.root_package),
         catalog_resolutions: &mut catalog_resolutions,
     })?;
 

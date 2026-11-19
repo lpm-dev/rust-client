@@ -655,8 +655,8 @@ fn the_up_to_date_check_accepts_an_unapplied_catalog_override_of_a_direct_depend
         frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
         no_skills: true,
     };
-    // The install doesn't apply an override to a direct dependency, so the
-    // lockfile records no snapshot for it.
+    // The override doesn't change what the dependency's range selects, so
+    // the lockfile records no snapshot for it.
     let pkg = r#"{"name":"consumer","catalogs":{"default":{"leaf":"1.0.0"}},"dependencies":{"leaf":"^1.0.0"},"overrides":{"leaf":"catalog:"}}"#;
     let project = tempfile::tempdir().unwrap();
     installed_project(
