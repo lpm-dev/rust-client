@@ -236,12 +236,16 @@ impl IdentityRecord {
 /// Records at `path` that the identity belongs to `owner`'s package in
 /// its project, unless that is recorded already. A record that says the
 /// package left is of an earlier stay: the package is back, and keeps the
-/// identity. A run goes on without a record it couldn't write, and says
-/// what that leaves.
-pub(super) fn record_identity(path: &Path, owner: &IdentityOwner) {
+/// identity.
+///
+/// A run that can't record its identity fails, as nothing could find what
+/// it set. One that can't say its package is back goes on: the record
+/// still names the identity, so the next sweep takes its access, and the
+/// run after that sets it up again.
+pub(crate) fn record_identity(path: &Path, owner: &IdentityOwner) -> Result<(), AppContainerError> {
     let recorded = path.exists();
     if recorded && !IdentityRecord::read(path).is_some_and(|record| record.left_behind) {
-        return;
+        return Ok(());
     }
     let record = IdentityRecord {
         version: IDENTITY_RECORD_VERSION,
@@ -249,23 +253,23 @@ pub(super) fn record_identity(path: &Path, owner: &IdentityOwner) {
         package: owner.package.clone(),
         left_behind: false,
     };
-    let Err(error) = record.write(path) else {
-        return;
-    };
-    let (package, project) = (&owner.package, owner.project.display());
-    if recorded {
-        tracing::warn!(
-            target: "lpm_sandbox::helper_appcontainer",
-            "couldn't record that {package} is back in {project}, so the next `lpm cache clean` \
-             removes the sandbox access its scripts have there, and the run after that sets \
-             it up again: {error}",
-        );
-    } else {
-        tracing::warn!(
-            target: "lpm_sandbox::helper_appcontainer",
-            "couldn't record the sandbox identity of {package} in {project}, so removing the \
-             package won't remove the access its scripts had: {error}",
-        );
+    match record.write(path) {
+        Ok(()) => Ok(()),
+        Err(error) if recorded => {
+            tracing::warn!(
+                target: "lpm_sandbox::helper_appcontainer",
+                "couldn't record that {} is back in {}, so the next `lpm cache clean` removes \
+                 the sandbox access its scripts have there, and the run after that sets it up \
+                 again: {error}",
+                owner.package,
+                owner.project.display(),
+            );
+            Ok(())
+        }
+        Err(source) => Err(AppContainerError::IdentityRecord {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -1019,7 +1023,7 @@ mod tests {
     /// run would have, and says where.
     fn identity_recorded_beside(record: &Path) -> PathBuf {
         let path = identity_recorded_beside_path(record);
-        record_identity(&path, &owner());
+        record_identity(&path, &owner()).unwrap();
         path
     }
 
@@ -1028,14 +1032,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("identity.json");
 
-        record_identity(&path, &owner());
+        record_identity(&path, &owner()).unwrap();
         let first = IdentityRecord::read(&path).expect("a record the run wrote");
         let recorded = std::fs::read(&path).unwrap();
         let elsewhere = IdentityOwner {
             project: PathBuf::from(r"C:\elsewhere"),
             package: "other".to_owned(),
         };
-        record_identity(&path, &elsewhere);
+        record_identity(&path, &elsewhere).unwrap();
         let kept = std::fs::read(&path).unwrap();
         IdentityRecord {
             left_behind: true,
@@ -1043,7 +1047,7 @@ mod tests {
         }
         .write(&path)
         .unwrap();
-        record_identity(&path, &owner());
+        record_identity(&path, &owner()).unwrap();
         let back = IdentityRecord::read(&path).unwrap();
 
         assert_eq!(first.project, owner().project);
@@ -1057,10 +1061,25 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_cannot_record_its_identity_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let not_a_folder = directory.path().join("file");
+        std::fs::write(&not_a_folder, "").unwrap();
+        let path = not_a_folder.join("identity.json");
+
+        let error = record_identity(&path, &owner()).unwrap_err();
+
+        assert!(
+            matches!(&error, AppContainerError::IdentityRecord { path: named, .. } if named == &path),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn forgetting_an_identity_removes_its_record_and_one_already_gone_is_forgotten() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("identity.json");
-        record_identity(&path, &owner());
+        record_identity(&path, &owner()).unwrap();
 
         forget_identity(&path).unwrap();
         forget_identity(&path).unwrap();

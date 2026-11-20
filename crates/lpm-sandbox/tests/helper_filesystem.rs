@@ -1965,6 +1965,9 @@ fn a_run_says_that_it_waits_for_the_process_that_holds_its_identity() {
 /// to grant access that nothing names.
 #[test]
 fn a_run_records_its_identity_only_once_it_holds_it() {
+    use std::io::Read as _;
+
+    const WAITING: &[u8] = b"waiting for the process that holds";
     let project = tempfile::tempdir().expect("project tempdir");
     let mut argv = helper_argv_base();
     argv.extend(
@@ -1983,27 +1986,47 @@ fn a_run_records_its_identity_only_once_it_holds_it() {
     let mut held = HeldIdentity::hold(profile_of(&argv));
     let mut run = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
         .args(&argv)
-        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn helper");
+    let mut stderr = run.stderr.take().expect("the run's stderr");
+    let (says_it_waits, waits) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut printed = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stderr.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                return printed;
+            }
+            printed.extend_from_slice(&buffer[..read]);
+            if printed.windows(WAITING.len()).any(|said| said == WAITING) {
+                let _ = says_it_waits.send(());
+            }
+        }
+    });
 
-    let ended_while_held = ends_within(&mut run, std::time::Duration::from_secs(3));
+    let waited = waits
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .is_ok();
     let recorded_while_held = record.exists();
     held.release();
     let ended = ends_within(&mut run, std::time::Duration::from_secs(120));
     let _ = run.kill();
-    let output = run.wait_with_output().expect("the run's output");
+    let status = run.wait().expect("the run's exit status");
+    let printed = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
 
     assert!(
-        !ended_while_held,
-        "the run didn't wait for the identity: {output:?}"
+        waited,
+        "the run never said that it waits for its identity: {printed}"
     );
     assert!(
         !recorded_while_held,
         "the run recorded an identity it didn't hold"
     );
-    assert!(ended && output.status.success(), "{output:?}");
+    assert!(ended && status.success(), "{status:?}: {printed}");
     let recorded: serde_json::Value =
         serde_json::from_slice(&fs::read(&record).expect("the run recorded its identity"))
             .expect("an identity record");
@@ -2174,21 +2197,13 @@ fn helper_denies_read_to_path_outside_any_allow_set() {
     );
 }
 
-#[test]
-fn helper_refuses_reparse_point_root_with_named_error() {
-    // Refuse a reparse-point root as a writable-dir / readable-dir
-    // grant target: granting on it would grant its target.
-    //
-    // Build a junction inside a tmpdir pointing at the parent
-    // tmpdir, then ask the helper to grant on the junction. The
-    // walker must refuse rather than follow.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let real_dir = tmp.path().join("real");
-    let junction = tmp.path().join("junction");
+/// A junction in `folder` to a folder beside it, or `None` where none can
+/// be made. `mklink /J` makes one without administrator rights, unlike a
+/// symbolic link.
+fn junction_in(folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    let real_dir = folder.join("real");
+    let junction = folder.join("junction");
     fs::create_dir(&real_dir).expect("create real dir");
-
-    // `mklink /J <link> <target>` creates an NTFS directory
-    // junction without admin (unlike symlinks).
     let status = std::process::Command::new("cmd")
         .args([
             "/c",
@@ -2198,14 +2213,58 @@ fn helper_refuses_reparse_point_root_with_named_error() {
             &real_dir.to_string_lossy(),
         ])
         .status();
-    let Ok(s) = status else {
-        eprintln!("skipping: mklink /J not available in this environment");
+    match status {
+        Ok(status) if status.success() => Some(junction),
+        Ok(_) => {
+            eprintln!("skipping: mklink /J failed (junction creation unsupported here)");
+            None
+        }
+        Err(_) => {
+            eprintln!("skipping: mklink /J not available in this environment");
+            None
+        }
+    }
+}
+
+/// A run records its identity before it sets anything, so one refused
+/// partway still leaves the record its release starts from.
+#[test]
+fn a_run_refused_after_it_holds_its_identity_leaves_it_recorded() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let Some(junction) = junction_in(tmp.path()) else {
         return;
     };
-    if !s.success() {
-        eprintln!("skipping: mklink /J failed (junction creation unsupported here)");
+    let mut argv = helper_argv_base();
+    argv.extend([
+        "--writable-dir".into(),
+        junction.to_string_lossy().into_owned(),
+        "--".into(),
+        r"C:\Windows\System32\whoami.exe".into(),
+    ]);
+    let record = identity_record_of(&argv);
+
+    let out = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&argv)
+        .output()
+        .expect("spawn helper");
+
+    assert!(
+        !out.status.success(),
+        "the run should be refused at the junction: {out:?}"
+    );
+    assert!(record.exists(), "the refused run left no record: {out:?}");
+}
+
+#[test]
+fn helper_refuses_reparse_point_root_with_named_error() {
+    // Refuse a reparse-point root as a writable-dir / readable-dir
+    // grant target: granting on it would grant its target. The walker
+    // must refuse rather than follow the junction.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let Some(junction) = junction_in(tmp.path()) else {
         return;
-    }
+    };
 
     let mut argv = helper_argv_base();
     argv.extend([

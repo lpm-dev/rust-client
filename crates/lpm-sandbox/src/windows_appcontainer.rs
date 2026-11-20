@@ -598,23 +598,15 @@ impl AppContainerSandbox {
             }),
         }
     }
-}
 
-/// Posture decision. Pure (inputs in, outcome out). Never refuses:
-/// AppContainer delivers strict on every Windows host the helper runs on,
-/// so `allow-degraded` has nothing to fall back to here.
-pub(crate) fn decide_appcontainer_posture(deny_outbound_network: bool) -> BackendPosture {
-    if deny_outbound_network {
-        BackendPosture::Strict
-    } else {
-        BackendPosture::Default
-    }
-}
-
-// ── Sandbox trait impl ───────────────────────────────────────────────
-
-impl Sandbox for AppContainerSandbox {
-    fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+    /// The helper invocation that runs `cmd` in the sandbox, apart from
+    /// its stdio, and the run to keep track of. `records` is where the LPM
+    /// home keeps identity records; without it the run records nothing.
+    fn helper_command(
+        &self,
+        cmd: &SandboxedCommand,
+        records: Option<PathBuf>,
+    ) -> Result<(Command, Option<StartedRun>), SandboxError> {
         for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
             crate::config::revalidate_effective_write_dir(path, index)?;
         }
@@ -640,7 +632,7 @@ impl Sandbox for AppContainerSandbox {
             .arg(PROTOCOL_VERSION.to_string());
         let name = appcontainer_name_for(&self.spec.project_dir, &self.spec.package_name);
         helper_cmd.arg("--appcontainer-name").arg(&name);
-        let record = identity_records().map(|records| {
+        let record = records.map(|records| {
             helper_cmd
                 .arg("--identity-record")
                 .arg(identity_record_path(&records, &name))
@@ -704,7 +696,7 @@ impl Sandbox for AppContainerSandbox {
         // these PATH-derived entries opt into the WARN-and-continue
         // semantics. See "Other (non-MSVC)
         // COM-dependent lifecycle scripts still break" row.
-        for dir in tool_dirs_needing_explicit_grant(&cmd, &self.spec) {
+        for dir in tool_dirs_needing_explicit_grant(cmd, &self.spec) {
             helper_cmd.arg("--readable-dir-best-effort").arg(dir);
         }
         // Narrow-write grants mirror the macOS/Linux writable set.
@@ -811,6 +803,27 @@ impl Sandbox for AppContainerSandbox {
         for a in &cmd.args {
             helper_cmd.arg(a);
         }
+
+        Ok((helper_cmd, started))
+    }
+}
+
+/// Posture decision. Pure (inputs in, outcome out). Never refuses:
+/// AppContainer delivers strict on every Windows host the helper runs on,
+/// so `allow-degraded` has nothing to fall back to here.
+pub(crate) fn decide_appcontainer_posture(deny_outbound_network: bool) -> BackendPosture {
+    if deny_outbound_network {
+        BackendPosture::Strict
+    } else {
+        BackendPosture::Default
+    }
+}
+
+// ── Sandbox trait impl ───────────────────────────────────────────────
+
+impl Sandbox for AppContainerSandbox {
+    fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+        let (mut helper_cmd, started) = self.helper_command(&cmd, identity_records())?;
 
         // The parent connects its own stdio to the helper; the
         // helper inherits + forwards to the lifecycle child. The
@@ -1798,14 +1811,11 @@ mod tests {
         fn run_of(&self, package: &str) -> PathBuf {
             let name = appcontainer_name_for(&self.project(), package);
             let record = identity_record_path(&self.records(), &name);
-            IdentityRecord {
-                version: IDENTITY_RECORD_VERSION,
+            let owner = crate::helper_protocol::IdentityOwner {
                 project: self.project(),
                 package: package.to_owned(),
-                left_behind: false,
-            }
-            .write(&record)
-            .unwrap();
+            };
+            crate::helper_appcontainer::record_identity(&record, &owner).unwrap();
             std::fs::write(grant_record_path(&self.records(), &name), "{}").unwrap();
             record
         }
@@ -1968,6 +1978,8 @@ mod tests {
         let grants = grant_record_path(&releases.records(), &name);
         let recorded_by_the_run = releases.folder.path().join("recorded-by-the-run.json");
         std::fs::copy(&record, &recorded_by_the_run).unwrap();
+        // Named from the script's own folder, as a literal `%` in a
+        // temporary path would expand in a path written into the script.
         std::fs::write(
             releases.folder.path().join("then-a-run.cmd"),
             format!(
@@ -1978,11 +1990,9 @@ mod tests {
                  @shift\r\n\
                  @goto next\r\n\
                  :run\r\n\
-                 @if not exist \"{record}\" copy /y \"{recorded}\" \"{record}\" >nul\r\n\
-                 @echo {{}}> \"{grants}\"\r\n",
-                record = record.display(),
-                recorded = recorded_by_the_run.display(),
-                grants = grants.display(),
+                 @if not exist \"%~dp0records\\{name}.identity.json\" \
+                 copy /y \"%~dp0recorded-by-the-run.json\" \"%~dp0records\\{name}.identity.json\" >nul\r\n\
+                 @echo {{}}> \"%~dp0records\\{name}.grants.json\"\r\n",
             ),
         )
         .unwrap();
@@ -1995,6 +2005,55 @@ mod tests {
             record.exists(),
             "what the run was granted is found by the identity's record"
         );
+    }
+
+    #[test]
+    fn a_run_names_its_identity_record_and_owner_to_its_helper() {
+        let project = tempfile::tempdir().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let sandbox = AppContainerSandbox {
+            spec: SandboxSpec {
+                project_dir: project.path().to_path_buf(),
+                ..make_spec()
+            },
+            mode: SandboxMode::Enforce,
+            posture: BackendPosture::Default,
+            helper_path: PathBuf::from(r"C:\lpm\lpm-sandbox-helper.exe"),
+        };
+        let name = appcontainer_name_for(project.path(), "pkg");
+        let script = SandboxedCommand::new("cmd.exe");
+        let parsed = |command: &Command| {
+            crate::helper_protocol::parse_argv(command.get_args().map(OsString::from))
+                .expect("the helper takes the argv lpm gives it")
+        };
+
+        let (recorded, started) = sandbox
+            .helper_command(&script, Some(records.path().to_path_buf()))
+            .unwrap();
+        let (unrecorded, untracked) = sandbox.helper_command(&script, None).unwrap();
+
+        let recorded = parsed(&recorded);
+        assert_eq!(
+            recorded.identity_record,
+            Some(identity_record_path(records.path(), &name))
+        );
+        assert_eq!(
+            recorded.identity_owner,
+            Some(crate::helper_protocol::IdentityOwner {
+                project: project.path().to_path_buf(),
+                package: "pkg".to_owned(),
+            })
+        );
+        assert_eq!(
+            recorded.grant_record,
+            Some(grant_record_path(records.path(), &name))
+        );
+        assert!(started.is_some(), "a recorded run is kept track of");
+        let unrecorded = parsed(&unrecorded);
+        assert_eq!(unrecorded.identity_record, None);
+        assert_eq!(unrecorded.identity_owner, None);
+        assert_eq!(unrecorded.grant_record, None);
+        assert!(untracked.is_none());
     }
 
     /// An earlier release of lpm kept the record of an identity it released

@@ -209,8 +209,8 @@ impl Drop for TempProject {
         let Some(helper) = locate_test_sandbox_helper() else {
             return;
         };
-        // An identity is recorded before its helper starts, and its grants
-        // once the helper has made its profile, so either file names one.
+        // A run's helper records its identity once it holds it, and its
+        // grants once it has made its profile, so either file names one.
         let names: std::collections::BTreeSet<String> = entries
             .flatten()
             .filter_map(|entry| {

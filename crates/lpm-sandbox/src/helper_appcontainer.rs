@@ -117,6 +117,8 @@ mod identity;
 mod processes;
 pub mod setup;
 
+#[cfg(test)]
+pub(crate) use identity::record_identity;
 pub(crate) use identity::{IDENTITY_RECORD_VERSION, IdentityRecord};
 
 /// `SE_GROUP_ENABLED` from winnt.h. The Attributes field of every
@@ -239,13 +241,15 @@ pub enum AppContainerError {
         #[source]
         source: std::io::Error,
     },
-    /// Removing the record of which project and package a released
-    /// identity belonged to failed.
-    #[error("failed to remove the record of this package's sandbox identity {path}: {source}")]
+    /// Writing the record of which project and package the identity
+    /// belongs to, before a run, or removing it after a release, failed.
+    #[error(
+        "failed to write or remove the record of this package's sandbox identity {path}: {source}"
+    )]
     IdentityRecord {
         /// The record.
         path: PathBuf,
-        /// Filesystem error returned while removing it.
+        /// Filesystem error returned while writing or removing it.
         #[source]
         source: std::io::Error,
     },
@@ -705,7 +709,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // lock a release of the identity takes to remove the record, so the
     // record outlasts whatever this run sets.
     if let (Some(record), Some(owner)) = (&args.identity_record, &args.identity_owner) {
-        identity::record_identity(record, owner);
+        identity::record_identity(record, owner)?;
     }
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
