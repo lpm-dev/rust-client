@@ -409,6 +409,21 @@ const publisherScripts = {
   ].join("\n"),
 };
 
+// Whether a command line runs `git tag` or `git push`: options before the subcommand are skipped,
+// and -C and -c take a value. Tokens are read one at a time, so the scan stays linear.
+function runsGitTagOrPush(text) {
+  for (const match of text.matchAll(/\bgit\b/g)) {
+    const rest = text.slice(match.index + 3).split("\n", 1)[0];
+    const tokens = rest.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+    let index = 0;
+    while (index < tokens.length && tokens[index].startsWith("-")) {
+      index += tokens[index] === "-C" || tokens[index] === "-c" ? 2 : 1;
+    }
+    if (tokens[index] === "tag" || tokens[index] === "push") return true;
+  }
+  return false;
+}
+
 // Whether a workflow step or script could create a git tag, directly or by publishing a release.
 // It errs toward flagging: a flagged command must be shown not to create a v* tag before it is allowed.
 function createsTag(text, { workflow = true } = {}) {
@@ -419,7 +434,6 @@ function createsTag(text, { workflow = true } = {}) {
     /"draft"\s*:(?!\s*true\b)/,
     /--draft=(?!true\b)/,
     /\bdraft\s*:\s*false\b/,
-    /\bgit(?:\s+-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|\s+--?[\w-]+(?:=\S+)?)*\s+(?:tag|push)\b/,
     /["']git["']\s*,\s*\[?\s*["'](?:tag|push)["']/,
     /\b(?:createRelease|createRef|updateRelease|createTag)\b/,
     /\/git\/refs\b/,
@@ -432,7 +446,7 @@ function createsTag(text, { workflow = true } = {}) {
   ];
   // A workflow's release action takes `draft:` as an input; in a script that is any object property.
   if (workflow) forms.push(/^\s*draft:(?!\s*true\b)/m);
-  return forms.some((form) => form.test(text));
+  return runsGitTagOrPush(text) || forms.some((form) => form.test(text));
 }
 
 test("the tag-creation scan flags each way a workflow could create a tag", () => {
@@ -454,6 +468,7 @@ test("the tag-creation scan flags each way a workflow could create a tag", () =>
     "uses: ad-m/github-push-action@0123456789abcdef0123456789abcdef01234567",
     "        with:\n          draft: false",
     'git -C "a b" push origin v9',
+    "git --no-pager -c user.name=x push origin v9",
     'execFileSync("git", ["push", "origin", "v9"])',
     "subprocess.run(['git', 'tag', 'v9'])",
     "gh api -XPOST repos/x/releases --input body.json",
@@ -467,6 +482,7 @@ test("the tag-creation scan flags each way a workflow could create a tag", () =>
     'gh api --method DELETE "repos/x/releases/1"',
     'gh api "repos/x/git/ref/tags/v9"',
     'git -C "$root" worktree add --quiet --detach "$engine" "$tag"',
+    "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # .github/workflows",
     "uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4",
     "uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0",
     "draft: true",
