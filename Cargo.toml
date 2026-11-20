@@ -53,7 +53,7 @@ exclude = ["vendor/cap-primitives", "vendor/oxc_parser", "vendor/winx", "vendor/
 default-members = ["crates/lpm-cli"]
 
 [workspace.package]
-version = "0.87.0"
+version = "0.88.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
