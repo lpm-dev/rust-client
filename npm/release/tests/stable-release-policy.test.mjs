@@ -51,8 +51,12 @@ test("stable releases require candidate promotion and do not start from a tag", 
   assert.match(promotion, /appeared while the draft was being verified/);
   assert.ok(
     promotion.indexOf("Create draft and upload exact assets") <
-      promotion.indexOf("Verify exact draft and publish stable release"),
-    "release assets must be uploaded to a draft before that draft is published",
+      promotion.indexOf("Verify the exact draft"),
+    "release assets must be uploaded to a draft before that draft is verified",
+  );
+  assert.ok(
+    promotion.indexOf("Verify the exact draft") < promotion.indexOf("Publish the verified stable release"),
+    "a draft must be verified before it is published",
   );
   assert.ok(
     promotion.indexOf("Reverify candidate and promotion asset inventory") <

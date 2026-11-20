@@ -2518,22 +2518,11 @@ jobs:
           make_latest: false
           target_commitish: ${{ env.SOURCE_SHA }}
 
-      - name: Create a token for release tags
-        id: tag-token
-        if: steps.release-state.outputs.publish == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.RELEASE_TAGS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_TAGS_APP_PRIVATE_KEY }}
-          owner: lpm-dev
-          repositories: rust-client
-          permission-contents: write
-
-      - name: Verify exact draft and publish stable release
+      - name: Verify the exact draft
+        id: verify-draft
         if: steps.release-state.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAGS_TOKEN: ${{ steps.tag-token.outputs.token }}
         run: |
           set -euo pipefail
           exact=$(gh api --paginate --slurp \
@@ -2570,8 +2559,42 @@ jobs:
             exit 1
           fi
           release_id=$(jq -er '.id' "$RUNNER_TEMP/draft-release.json")
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Create a token for release tags
+        id: tag-token
+        if: steps.release-state.outputs.publish == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_TAGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_TAGS_APP_PRIVATE_KEY }}
+          owner: lpm-dev
+          repositories: rust-client
+          permission-contents: write
+
+      - name: Publish the verified stable release
+        if: steps.release-state.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAGS_TOKEN: ${{ steps.tag-token.outputs.token }}
+          RELEASE_ID: ${{ steps.verify-draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::The verified draft has no release ID."
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_TAG appeared after the draft was verified; refusing to publish."
+            exit 1
+          fi
+          draft=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '[.draft, .tag_name, .target_commitish] | @tsv')
+          if [ "$draft" != "$(printf 'true\t%s\t%s' "$RELEASE_TAG" "$SOURCE_SHA")" ]; then
+            echo "::error::Draft $RELEASE_ID changed after it was verified; refusing to publish."
+            exit 1
+          fi
           # Publishing the draft creates its tag, and only the release-tags app may create v* tags.
-          GH_TOKEN="$RELEASE_TAGS_TOKEN" gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+          GH_TOKEN="$RELEASE_TAGS_TOKEN" gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             -F draft=false \
             -F prerelease=false \
             -f make_latest=true >/dev/null
