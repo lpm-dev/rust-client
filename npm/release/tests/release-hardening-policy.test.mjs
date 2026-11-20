@@ -344,6 +344,71 @@ test("the Homebrew update reaches the tap only with a per-run app token scoped t
   }
 });
 
+// The `run:` script of a workflow step, without its indentation.
+function runOf(step) {
+  const body = step.split("\n        run: |\n")[1];
+  assert.ok(body !== undefined, `${step.split("\n")[0]} has no run block`);
+  const lines = body.split("\n").map((line) => line.replace(/^ {10}/, ""));
+  while (lines.at(-1)?.trim() === "") lines.pop();
+  return lines.join("\n");
+}
+
+// The only scripts that run with the release-tags token in their environment.
+const publisherScripts = {
+  "finalize-promotion-release": [
+    "set -euo pipefail",
+    "if [[ ! \"$RELEASE_ID\" =~ ^[1-9][0-9]*$ ]]; then",
+    "  echo \"::error::The verified draft has no release ID.\"",
+    "  exit 1",
+    "fi",
+    "# A replaced asset gets a new ID, so this also catches assets swapped after they were verified.",
+    "gh api \"repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}\" > \"$RUNNER_TEMP/draft-before-publish.json\"",
+    "verified='[.draft, .tag_name, .target_commitish, ([.assets[] | [.id, .name, .size, .digest]] | sort)]'",
+    "before=$(jq -ce \"$verified\" \"$RUNNER_TEMP/draft-before-publish.json\")",
+    "expected=$(jq -ce \"$verified\" \"$RUNNER_TEMP/draft-release.json\")",
+    "if [ \"$before\" != \"$expected\" ]; then",
+    "  echo \"::error::Draft $RELEASE_ID changed after it was verified; refusing to publish.\"",
+    "  exit 1",
+    "fi",
+    "if tag_lookup=$(gh api \"repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}\" 2>&1); then",
+    "  echo \"::error::Tag $RELEASE_TAG appeared after the draft was verified; refusing to publish.\"",
+    "  exit 1",
+    "fi",
+    "case \"$tag_lookup\" in",
+    "  *\"(HTTP 404)\"*) ;;",
+    "  *)",
+    "    echo \"::error::Could not confirm that tag $RELEASE_TAG is absent; refusing to publish.\"",
+    "    exit 1",
+    "    ;;",
+    "esac",
+    "# Publishing the draft creates its tag, and only the release-tags app may create v* tags.",
+    "GH_TOKEN=\"$RELEASE_TAGS_TOKEN\" gh api --method PATCH \"repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}\" \\",
+    "  -F draft=false \\",
+    "  -F prerelease=false \\",
+    "  -f make_latest=true >/dev/null",
+  ].join("\n"),
+  "publish-release": [
+    "set -euo pipefail",
+    "release_id=$(gh api --paginate \"repos/${GITHUB_REPOSITORY}/releases?per_page=100\" \\",
+    "  --jq \".[] | select(.tag_name == \\\"${RELEASE_TAG}\\\" and .draft == true) | .id\")",
+    "if [ -z \"$release_id\" ] || [ \"$(printf '%s\\n' \"$release_id\" | wc -l | tr -d ' ')\" != \"1\" ]; then",
+    "  echo \"::error::Expected exactly one draft release for $RELEASE_TAG.\"",
+    "  exit 1",
+    "fi",
+    "# `lpm self-update` binds a main-signed stable release to its version",
+    "# through this target, and the signing-policy gate assumed it.",
+    "draft_target=$(gh api \"repos/${GITHUB_REPOSITORY}/releases/${release_id}\" --jq .target_commitish)",
+    "if [ \"$draft_target\" != \"$GITHUB_SHA\" ]; then",
+    "  echo \"::error::Draft target is $draft_target, expected the signed source commit $GITHUB_SHA.\"",
+    "  exit 1",
+    "fi",
+    "# Publishing the draft creates its tag, and only the release-tags app may create v* tags.",
+    "GH_TOKEN=\"$RELEASE_TAGS_TOKEN\" gh api --method PATCH \"repos/${GITHUB_REPOSITORY}/releases/${release_id}\" \\",
+    "  -F draft=false \\",
+    "  -f make_latest=\"$MAKE_LATEST\" >/dev/null",
+  ].join("\n"),
+};
+
 // Whether a workflow step or script could create a git tag, directly or by publishing a release.
 // It errs toward flagging: a flagged command must be shown not to create a v* tag before it is allowed.
 function createsTag(text, { workflow = true } = {}) {
@@ -354,14 +419,16 @@ function createsTag(text, { workflow = true } = {}) {
     /"draft"\s*:(?!\s*true\b)/,
     /--draft=(?!true\b)/,
     /\bdraft\s*:\s*false\b/,
-    /\bgit(?:\s+-[Cc]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+(?:tag|push)\b/,
+    /\bgit(?:\s+-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|\s+--?[\w-]+(?:=\S+)?)*\s+(?:tag|push)\b/,
+    /["']git["']\s*,\s*\[?\s*["'](?:tag|push)["']/,
     /\b(?:createRelease|createRef|updateRelease|createTag)\b/,
     /\/git\/refs\b/,
     /gh release create\b/,
     /uses:\s*(?!softprops\/action-gh-release@)\S*(?:release|tag|push)\S*@/,
-    // The releases collection itself: creating a release there publishes it unless it is a draft,
-    // and gh switches to POST when it is given fields.
-    /\/releases(?![\w/?-])/,
+    // The releases collection in the API itself, by path or under an interpolated base: creating a
+    // release there publishes it unless it is a draft, and gh switches to POST when given fields.
+    /\brepos\/[^\s"'`]*\/releases(?![\w/?-])/,
+    /\}\/releases(?![\w/?-])/,
   ];
   // A workflow's release action takes `draft:` as an input; in a script that is any object property.
   if (workflow) forms.push(/^\s*draft:(?!\s*true\b)/m);
@@ -386,6 +453,11 @@ test("the tag-creation scan flags each way a workflow could create a tag", () =>
     "uses: mathieudutour/github-tag-action@0123456789abcdef0123456789abcdef01234567",
     "uses: ad-m/github-push-action@0123456789abcdef0123456789abcdef01234567",
     "        with:\n          draft: false",
+    'git -C "a b" push origin v9',
+    'execFileSync("git", ["push", "origin", "v9"])',
+    "subprocess.run(['git', 'tag', 'v9'])",
+    "gh api -XPOST repos/x/releases --input body.json",
+    "await fetch(`${base}/releases`, { method: 'POST' })",
   ]) {
     assert.ok(createsTag(text), text);
   }
@@ -402,13 +474,21 @@ test("the tag-creation scan flags each way a workflow could create a tag", () =>
     `draft=$(printf '%s' "$exact" | jq -r '.[0].draft')`,
     'gh api "repos/x/releases/latest" --jq .tag_name',
     'gh api "repos/x/releases/tags/v9"',
+    'echo "Failed to detect latest version. Check https://github.com/$REPO/releases"',
   ]) {
     assert.ok(!createsTag(text), text);
   }
 });
 
 test("a release tag is created only by publishing a draft with a per-run token from the release-tags app", () => {
-  const relayTrustRelease = /gh release create relay-trust --target "\$GITHUB_SHA"/;
+  // Steps that create a tag, but never a v* tag, each with the reason.
+  const allowed = [
+    {
+      file: ".github/workflows/relay-trust.yml",
+      command: /gh release create relay-trust --target "\$GITHUB_SHA"/,
+      reason: "relay-trust publishes its own relay-trust tag in this repository",
+    },
+  ];
   const publishers = [];
   for (const file of workflowFiles()) {
     const workflow = read(file);
@@ -419,8 +499,9 @@ test("a release tag is created only by publishing a draft with a per-run token f
         if (/uses: softprops\/action-gh-release@/.test(step)) {
           assert.match(step, /\n\s+draft: true\n/, `${file} ${name}: the release action must only create drafts`);
         }
-        // relay-trust publishes its own non-v* tag in this repository only.
-        const scanned = file.endsWith("/relay-trust.yml") && !/--repo\b/.test(step) ? step.replace(relayTrustRelease, "") : step;
+        const scanned = /--repo\b/.test(step)
+          ? step
+          : allowed.filter((entry) => entry.file === file).reduce((text, entry) => text.replace(entry.command, ""), step);
         if (createsTag(scanned)) publishers.push([file, name, step.split("\n")[0]]);
       }
     }
@@ -437,8 +518,13 @@ test("a release tag is created only by publishing a draft with a per-run token f
     fs.readdirSync(path.join(repoRoot, directory), { withFileTypes: true })
       .filter((entry) => entry.isFile() && /\.(?:sh|py|mjs|js)$/.test(entry.name))
       .map((entry) => `${directory}/${entry.name}`);
-  const scripts = [...scriptsIn("scripts"), ...scriptsIn("scripts/ci"), ...scriptsIn("npm/release")];
-  assert.ok(scripts.includes("scripts/relay-trust.py"), "the scan reaches the scripts workflows run");
+  const referenced = workflowFiles().flatMap((file) =>
+    [...read(file).matchAll(/\b((?:scripts|bench|npm)\/[\w./-]+\.(?:sh|py|mjs|js)|install\.sh)\b/g)].map((match) => match[1]));
+  const scripts = [...new Set([...scriptsIn("scripts"), ...scriptsIn("scripts/ci"), ...scriptsIn("npm/release"), ...referenced])]
+    .filter((script) => fs.existsSync(path.join(repoRoot, script)));
+  for (const script of ["scripts/relay-trust.py", "install.sh", "bench/realworld-audit/run-all.sh"]) {
+    assert.ok(scripts.includes(script), `the scan reaches ${script}, which a workflow runs`);
+  }
   for (const script of scripts) {
     assert.ok(!createsTag(read(script), { workflow: false }), `${script} must not create a tag`);
   }
@@ -484,11 +570,9 @@ test("a release tag is created only by publishing a draft with a per-run token f
       /GH_TOKEN="\$RELEASE_TAGS_TOKEN" gh api --method PATCH "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{(?:release_id|RELEASE_ID)\}" \\\n\s+-F draft=false/,
       `${name} publishes the draft with the tag token`,
     );
-    const otherCommand =
-      /(?:^|[;&|(!]|\bif|\bthen|\belse|\bdo)\s*(?:\.\/|\.\s|source\s|env\s|(?:sh|zsh|npm|cargo|make|git|exec|xargs|eval)\b)/m;
-    assert.doesNotMatch(publish, otherCommand, `${name}: nothing but gh and jq runs while the tag token is in the environment`);
-    assert.doesNotMatch(publish, /scripts\/|\b(?:cosign|node|npx|python3?|curl|wget|bash)\b/,
-      `${name}: no repository script, interpreter or download tool runs with the tag token`);
+    // The token is in this step's environment, so its script is pinned whole: any change, such as
+    // a command that could read the token, needs this test to change with it.
+    assert.equal(runOf(publish), publisherScripts[name], `${name}: the publishing script changed`);
     for (const [index, step] of steps.entries()) {
       if (index === publishIndex - 1 || index === publishIndex) continue;
       assert.doesNotMatch(step, /tag-token|RELEASE_TAGS_/, `${step.split("\n")[0]} must not see the tag token`);
@@ -503,25 +587,6 @@ test("a release tag is created only by publishing a draft with a per-run token f
   assert.match(verify, /printf 'release_id=%s\\n' "\$release_id" >> "\$GITHUB_OUTPUT"/);
   const publishStable = stepsOf(stable).find((step) => step.startsWith("name: Publish the verified stable release\n"));
   assert.match(publishStable, /\n\s+RELEASE_ID: \$\{\{ steps\.verify-draft\.outputs\.release_id \}\}\n/);
-  // Right before publishing: the draft, its target and its exact assets are those verified, and no tag exists.
-  const order = [
-    'gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RUNNER_TEMP/draft-before-publish.json"',
-    "[.draft, .tag_name, .target_commitish, ([.assets[] | [.id, .name, .size, .digest]] | sort)]",
-    'before=$(jq -ce "$verified" "$RUNNER_TEMP/draft-before-publish.json")',
-    'expected=$(jq -ce "$verified" "$RUNNER_TEMP/draft-release.json")',
-    'if [ "$before" != "$expected" ]; then',
-    "changed after it was verified; refusing to publish.",
-    'if tag_lookup=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" 2>&1); then',
-    'appeared after the draft was verified; refusing to publish.',
-    '*"(HTTP 404)"*) ;;',
-    "Could not confirm that tag $RELEASE_TAG is absent; refusing to publish.",
-    "-F draft=false",
-  ].map((needle) => {
-    const index = publishStable.indexOf(needle);
-    assert.notEqual(index, -1, `the stable publisher must contain: ${needle}`);
-    return index;
-  });
-  assert.deepEqual(order, [...order].sort((a, b) => a - b), "the stable publisher checks the draft, then the tag, then publishes");
 
   for (const [name, job] of jobsOf(workflow)) {
     if (publishers.some(([, publisher]) => publisher === name)) continue;
