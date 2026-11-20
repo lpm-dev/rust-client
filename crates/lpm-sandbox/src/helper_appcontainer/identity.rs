@@ -233,20 +233,56 @@ impl IdentityRecord {
     }
 }
 
+/// What a run finds at an identity record's path.
+enum FoundRecord {
+    Missing,
+    Current(IdentityRecord),
+    /// Another release of lpm wrote it, in a form that release reads.
+    OfAnotherRelease,
+    /// Nothing can read it, so no cleanup finds the identity by it.
+    Unreadable,
+}
+
+impl FoundRecord {
+    fn at(path: &Path) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Versioned {
+            version: u32,
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::Missing,
+            Err(_) => return Self::Unreadable,
+        };
+        match serde_json::from_slice::<IdentityRecord>(&bytes) {
+            Ok(record) if record.version == IDENTITY_RECORD_VERSION => Self::Current(record),
+            _ => match serde_json::from_slice::<Versioned>(&bytes) {
+                Ok(versioned) if versioned.version != IDENTITY_RECORD_VERSION => {
+                    Self::OfAnotherRelease
+                }
+                _ => Self::Unreadable,
+            },
+        }
+    }
+}
+
 /// Records at `path` that the identity belongs to `owner`'s package in
 /// its project, unless that is recorded already. A record that says the
 /// package left is of an earlier stay: the package is back, and keeps the
-/// identity.
+/// identity. One that can't be read is written again, as the identity's
+/// name already says whose it is. One another release wrote is left to it.
 ///
 /// A run that can't record its identity fails, as nothing could find what
 /// it set. One that can't say its package is back goes on: the record
 /// still names the identity, so the next sweep takes its access, and the
 /// run after that sets it up again.
 pub(crate) fn record_identity(path: &Path, owner: &IdentityOwner) -> Result<(), AppContainerError> {
-    let recorded = path.exists();
-    if recorded && !IdentityRecord::read(path).is_some_and(|record| record.left_behind) {
-        return Ok(());
-    }
+    let left_behind = match FoundRecord::at(path) {
+        FoundRecord::Current(record) if !record.left_behind => return Ok(()),
+        FoundRecord::OfAnotherRelease => return Ok(()),
+        FoundRecord::Current(_) => true,
+        FoundRecord::Missing | FoundRecord::Unreadable => false,
+    };
     let record = IdentityRecord {
         version: IDENTITY_RECORD_VERSION,
         project: owner.project.clone(),
@@ -255,7 +291,7 @@ pub(crate) fn record_identity(path: &Path, owner: &IdentityOwner) -> Result<(), 
     };
     match record.write(path) {
         Ok(()) => Ok(()),
-        Err(error) if recorded => {
+        Err(error) if left_behind => {
             tracing::warn!(
                 target: "lpm_sandbox::helper_appcontainer",
                 "couldn't record that {} is back in {}, so the next `lpm cache clean` removes \
@@ -1057,6 +1093,32 @@ mod tests {
         assert!(
             !back.left_behind,
             "a package that is back keeps its identity"
+        );
+    }
+
+    #[test]
+    fn a_run_rewrites_an_unreadable_identity_record_and_leaves_another_release_s() {
+        let directory = tempfile::tempdir().unwrap();
+        let unreadable = directory.path().join("unreadable.identity.json");
+        let of_another_release = directory.path().join("other.identity.json");
+        std::fs::write(&unreadable, br#"{"version":1,"proj"#).unwrap();
+        let written_elsewhere = serde_json::to_vec(&serde_json::json!({
+            "version": IDENTITY_RECORD_VERSION + 1,
+            "owner": "another release",
+        }))
+        .unwrap();
+        std::fs::write(&of_another_release, &written_elsewhere).unwrap();
+
+        record_identity(&unreadable, &owner()).unwrap();
+        record_identity(&of_another_release, &owner()).unwrap();
+
+        let repaired = IdentityRecord::read(&unreadable).expect("a record lpm reads again");
+        assert_eq!(repaired.project, owner().project);
+        assert_eq!(repaired.package, owner().package);
+        assert!(!repaired.left_behind);
+        assert_eq!(
+            std::fs::read(&of_another_release).unwrap(),
+            written_elsewhere
         );
     }
 

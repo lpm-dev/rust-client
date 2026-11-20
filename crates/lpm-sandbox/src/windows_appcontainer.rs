@@ -600,7 +600,7 @@ impl AppContainerSandbox {
     }
 
     /// The helper invocation that runs `cmd` in the sandbox, apart from
-    /// its stdio, and the run to keep track of. `records` is where the LPM
+    /// its stdio handles, and the run to keep track of. `records` is where the LPM
     /// home keeps identity records; without it the run records nothing.
     fn helper_command(
         &self,
@@ -1976,8 +1976,15 @@ mod tests {
         let record = releases.run_of("waited");
         let name = appcontainer_name_for(&releases.project(), "waited");
         let grants = grant_record_path(&releases.records(), &name);
+        // What the run records once it holds the identity: the same record,
+        // in other bytes, so that it tells the run's record from the one
+        // the release should have removed.
         let recorded_by_the_run = releases.folder.path().join("recorded-by-the-run.json");
-        std::fs::copy(&record, &recorded_by_the_run).unwrap();
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let run_s_record = serde_json::to_vec(&recorded).unwrap();
+        assert_ne!(run_s_record, std::fs::read(&record).unwrap());
+        std::fs::write(&recorded_by_the_run, &run_s_record).unwrap();
         // Named from the script's own folder, as a literal `%` in a
         // temporary path would expand in a path written into the script.
         // `shift /1` keeps `%0`, which a plain `shift` moves on too.
@@ -2002,9 +2009,10 @@ mod tests {
 
         assert!(matches!(released, Ok(true)), "{released:?}");
         assert!(grants.exists(), "the run granted the identity again");
-        assert!(
-            record.exists(),
-            "what the run was granted is found by the identity's record"
+        assert_eq!(
+            std::fs::read(&record).ok(),
+            Some(run_s_record),
+            "what the run was granted is found by the record the run wrote"
         );
     }
 
