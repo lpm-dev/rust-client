@@ -2584,15 +2584,25 @@ jobs:
             echo "::error::The verified draft has no release ID."
             exit 1
           fi
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "::error::Tag $RELEASE_TAG appeared after the draft was verified; refusing to publish."
-            exit 1
-          fi
-          draft=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '[.draft, .tag_name, .target_commitish] | @tsv')
-          if [ "$draft" != "$(printf 'true\t%s\t%s' "$RELEASE_TAG" "$SOURCE_SHA")" ]; then
+          # A replaced asset gets a new ID, so this also catches assets swapped after they were verified.
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RUNNER_TEMP/draft-before-publish.json"
+          verified='[.draft, .tag_name, .target_commitish, ([.assets[] | [.id, .name, .size, .digest]] | sort)]'
+          if [ "$(jq -c "$verified" "$RUNNER_TEMP/draft-before-publish.json")" != \
+            "$(jq -c "$verified" "$RUNNER_TEMP/draft-release.json")" ]; then
             echo "::error::Draft $RELEASE_ID changed after it was verified; refusing to publish."
             exit 1
           fi
+          if tag_lookup=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" 2>&1); then
+            echo "::error::Tag $RELEASE_TAG appeared after the draft was verified; refusing to publish."
+            exit 1
+          fi
+          case "$tag_lookup" in
+            *"(HTTP 404)"*) ;;
+            *)
+              echo "::error::Could not confirm that tag $RELEASE_TAG is absent; refusing to publish."
+              exit 1
+              ;;
+          esac
           # Publishing the draft creates its tag, and only the release-tags app may create v* tags.
           GH_TOKEN="$RELEASE_TAGS_TOKEN" gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             -F draft=false \

@@ -344,27 +344,88 @@ test("the Homebrew update reaches the tap only with a per-run app token scoped t
   }
 });
 
+// Whether a workflow step or script could create a git tag, directly or by publishing a release.
+// It errs toward flagging: a flagged command must be shown not to create a v* tag before it is allowed.
+function createsTag(text) {
+  const forms = [
+    /draft"?\s*[=:]\s*false/,
+    /--draft=false/,
+    /\bgit(?:\s+-[Cc]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+(?:tag|push)\b/,
+    /\b(?:createRelease|createRef|updateRelease|createTag)\b/,
+    /\/git\/refs\b/,
+    /gh release create\b/,
+    /uses:\s*(?!softprops\/action-gh-release@)\S*release\S*@/,
+  ];
+  if (forms.some((form) => form.test(text))) return true;
+  // A release created without `draft: true` is published at once, and so is its tag.
+  return /\b(?:POST)\b/.test(text) && /\/releases["'\s]*(?:\\?\n|$|\s+-)/m.test(text);
+}
+
+test("the tag-creation scan flags each way a workflow could create a tag", () => {
+  for (const text of [
+    'gh api --method POST "repos/x/releases" -f tag_name=v9.9.9',
+    'gh api -X POST repos/x/releases \\\n  -f tag_name=v9',
+    `gh api repos/x/releases --input - <<< '{"tag_name":"v9","draft":false}'`,
+    "gh release edit v9 --draft=false",
+    "git -C . push origin v9.9.9",
+    "git tag v9.9.9",
+    "await github.rest.git.createRef({ ref: 'refs/tags/v9' })",
+    "uses: ncipollo/release-action@0123456789abcdef0123456789abcdef01234567",
+    "gh release create v9 --target main",
+  ]) {
+    assert.ok(createsTag(text), text);
+  }
+  for (const text of [
+    'gh api --method POST \\\n  "repos/x/releases/generate-notes" \\\n  -f tag_name="$RELEASE_TAG"',
+    'gh api "repos/x/releases?per_page=100"',
+    'gh api --method DELETE "repos/x/releases/1"',
+    'gh api "repos/x/git/ref/tags/v9"',
+    'git -C "$root" worktree add --quiet --detach "$engine" "$tag"',
+    "uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4",
+  ]) {
+    assert.ok(!createsTag(text), text);
+  }
+});
+
 test("a release tag is created only by publishing a draft with a per-run token from the release-tags app", () => {
-  // Publishing a draft creates its tag; once a ruleset lets only the app create v* tags, any other
-  // tag-creating call fails at publication instead of here.
-  const tagCreating = /draft[=:]\s*false|--draft=false|\bgit\s+(?:tag|push)\b|\/git\/refs\b|gh release create(?! relay-trust )/;
+  const relayTrustRelease = /gh release create relay-trust --target "\$GITHUB_SHA"/;
   const publishers = [];
   for (const file of workflowFiles()) {
-    for (const [name, job] of jobsOf(read(file))) {
-      for (const step of stepsOf(job)) {
+    const workflow = read(file);
+    for (const [name, job] of jobsOf(workflow)) {
+      const steps = stepsOf(job);
+      if (/\n    steps:\n/.test(job)) assert.ok(steps.length > 0, `${file} ${name}: steps must be readable`);
+      for (const step of steps) {
         if (/uses: softprops\/action-gh-release@/.test(step)) {
           assert.match(step, /\n\s+draft: true\n/, `${file} ${name}: the release action must only create drafts`);
         }
-        if (tagCreating.test(step)) publishers.push([file, name, step.split("\n")[0]]);
+        // relay-trust publishes its own non-v* tag in this repository only.
+        const scanned = file.endsWith("/relay-trust.yml") && !/--repo\b/.test(step) ? step.replace(relayTrustRelease, "") : step;
+        if (createsTag(scanned)) publishers.push([file, name, step.split("\n")[0]]);
       }
     }
   }
-  assert.deepEqual(publishers, [
-    [".github/workflows/release.yml", "finalize-promotion-release", "name: Publish the verified stable release"],
-    [".github/workflows/release.yml", "publish-release", "name: Promote the exact draft release"],
-  ]);
+  assert.deepEqual(
+    publishers,
+    [
+      [".github/workflows/release.yml", "finalize-promotion-release", "name: Publish the verified stable release"],
+      [".github/workflows/release.yml", "publish-release", "name: Promote the exact draft release"],
+    ],
+    "a new step that could create a tag must hold the release-tags token, or be shown not to create a v* tag",
+  );
+  const scripts = fs.readdirSync(path.join(repoRoot, "scripts/ci")).map((name) => `scripts/ci/${name}`)
+    .concat(fs.readdirSync(path.join(repoRoot, "npm/release")).filter((name) => name.endsWith(".mjs")).map((name) => `npm/release/${name}`));
+  for (const script of scripts) {
+    assert.ok(!createsTag(read(script)), `${script} must not create a tag`);
+  }
 
   const workflow = read(".github/workflows/release.yml");
+  assert.doesNotMatch(workflow.slice(0, workflow.indexOf("\njobs:\n")), /RELEASE_TAGS_/, "no workflow-level env may hold the app");
+  assert.equal(
+    workflow.match(/secrets\.RELEASE_TAGS_APP_PRIVATE_KEY/g).length,
+    2,
+    "only the two token steps read the app key",
+  );
   for (const [, name, publishName] of publishers) {
     const job = jobsOf(workflow).find(([jobName]) => jobName === name)[1];
     assert.match(job, /^    environment: release$/m, `${name} reads the app key from the release environment`);
@@ -393,14 +454,16 @@ test("a release tag is created only by publishing a draft with a per-run token f
 
     assert.match(publish, /\n\s+GH_TOKEN: \$\{\{ github\.token \}\}\n/);
     assert.match(publish, /\n\s+RELEASE_TAGS_TOKEN: \$\{\{ steps\.tag-token\.outputs\.token \}\}\n/);
-    assert.equal(publish.match(/RELEASE_TAGS_TOKEN/g).length, 2, `${name} uses the tag token for one command only`);
+    assert.equal(publish.match(/RELEASE_TAGS_/g).length, 2, `${name} uses the tag token for one command only`);
     assert.match(
       publish,
       /GH_TOKEN="\$RELEASE_TAGS_TOKEN" gh api --method PATCH "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{(?:release_id|RELEASE_ID)\}" \\\n\s+-F draft=false/,
       `${name} publishes the draft with the tag token`,
     );
-    assert.doesNotMatch(publish, /scripts\/|cosign|\bnpx?\b|\bnode\b|\bpython3?\b|\bcurl\b/,
-      `${name}: nothing but gh runs while the tag token is in the environment`);
+    const otherCommand =
+      /(?:^|[;&|(!]|\bif|\bthen|\belse|\bdo)\s*(?:\.\/|\.\s|source\s|(?:bash|sh|zsh|node|npm|npx|python3?|curl|wget|cargo|make|git)\b)/m;
+    assert.doesNotMatch(publish, otherCommand, `${name}: nothing but gh and jq runs while the tag token is in the environment`);
+    assert.doesNotMatch(publish, /scripts\/|\bcosign\b/, `${name}: no repository script or cosign runs with the tag token`);
     for (const [index, step] of steps.entries()) {
       if (index === publishIndex - 1 || index === publishIndex) continue;
       assert.doesNotMatch(step, /tag-token|RELEASE_TAGS_/, `${step.split("\n")[0]} must not see the tag token`);
@@ -415,10 +478,23 @@ test("a release tag is created only by publishing a draft with a per-run token f
   assert.match(verify, /printf 'release_id=%s\\n' "\$release_id" >> "\$GITHUB_OUTPUT"/);
   const publishStable = stepsOf(stable).find((step) => step.startsWith("name: Publish the verified stable release\n"));
   assert.match(publishStable, /\n\s+RELEASE_ID: \$\{\{ steps\.verify-draft\.outputs\.release_id \}\}\n/);
-  assert.ok(
-    publishStable.indexOf("appeared after the draft was verified") < publishStable.indexOf("-F draft=false"),
-    "the stable publisher checks again that no tag appeared before it publishes",
-  );
+  // Right before publishing: the draft, its target and its exact assets are those verified, and no tag exists.
+  const order = [
+    'gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RUNNER_TEMP/draft-before-publish.json"',
+    "[.draft, .tag_name, .target_commitish, ([.assets[] | [.id, .name, .size, .digest]] | sort)]",
+    '"$RUNNER_TEMP/draft-release.json"',
+    "changed after it was verified; refusing to publish.",
+    'if tag_lookup=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" 2>&1); then',
+    'appeared after the draft was verified; refusing to publish.',
+    '*"(HTTP 404)"*) ;;',
+    "Could not confirm that tag $RELEASE_TAG is absent; refusing to publish.",
+    "-F draft=false",
+  ].map((needle) => {
+    const index = publishStable.indexOf(needle);
+    assert.notEqual(index, -1, `the stable publisher must contain: ${needle}`);
+    return index;
+  });
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "the stable publisher checks the draft, then the tag, then publishes");
 
   for (const [name, job] of jobsOf(workflow)) {
     if (publishers.some(([, publisher]) => publisher === name)) continue;
