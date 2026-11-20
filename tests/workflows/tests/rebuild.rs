@@ -804,6 +804,32 @@ fn a_script_stopped_at_its_time_limit_leaves_nothing_of_its_run_set() {
             "the stopped run still holds what it set ({held}): {record}"
         );
     }
+    let identities: Vec<serde_json::Value> = std::fs::read_dir(&records)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".identity.json")
+        })
+        .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        identities.len(),
+        1,
+        "the run recorded whose identity it is: {identities:?}"
+    );
+    assert_eq!(identities[0]["package"], name);
+    let recorded_project = identities[0]["project"]
+        .as_str()
+        .map(std::path::Path::new)
+        .and_then(|project| project.canonicalize().ok());
+    assert_eq!(
+        recorded_project,
+        project.path().canonicalize().ok(),
+        "{identities:?}"
+    );
 }
 
 #[test]

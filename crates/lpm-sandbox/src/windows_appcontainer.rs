@@ -1980,6 +1980,7 @@ mod tests {
         std::fs::copy(&record, &recorded_by_the_run).unwrap();
         // Named from the script's own folder, as a literal `%` in a
         // temporary path would expand in a path written into the script.
+        // `shift /1` keeps `%0`, which a plain `shift` moves on too.
         std::fs::write(
             releases.folder.path().join("then-a-run.cmd"),
             format!(
@@ -1987,7 +1988,7 @@ mod tests {
                  @if \"%~1\"==\"\" goto run\r\n\
                  @if \"%~1\"==\"--grant-record\" if exist \"%~2\" del \"%~2\"\r\n\
                  @if \"%~1\"==\"--identity-record\" if exist \"%~2\" del \"%~2\"\r\n\
-                 @shift\r\n\
+                 @shift /1\r\n\
                  @goto next\r\n\
                  :run\r\n\
                  @if not exist \"%~dp0records\\{name}.identity.json\" \

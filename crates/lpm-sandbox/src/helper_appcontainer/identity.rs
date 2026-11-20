@@ -266,7 +266,7 @@ pub(crate) fn record_identity(path: &Path, owner: &IdentityOwner) -> Result<(), 
             );
             Ok(())
         }
-        Err(source) => Err(AppContainerError::IdentityRecord {
+        Err(source) => Err(AppContainerError::RecordIdentity {
             path: path.to_path_buf(),
             source,
         }),
@@ -279,7 +279,7 @@ pub(super) fn forget_identity(path: &Path) -> Result<(), AppContainerError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(AppContainerError::IdentityRecord {
+        Err(source) => Err(AppContainerError::ForgetIdentity {
             path: path.to_path_buf(),
             source,
         }),
@@ -1070,7 +1070,7 @@ mod tests {
         let error = record_identity(&path, &owner()).unwrap_err();
 
         assert!(
-            matches!(&error, AppContainerError::IdentityRecord { path: named, .. } if named == &path),
+            matches!(&error, AppContainerError::RecordIdentity { path: named, .. } if named == &path),
             "{error:?}"
         );
     }

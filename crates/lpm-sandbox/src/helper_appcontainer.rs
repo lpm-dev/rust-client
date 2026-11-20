@@ -242,14 +242,21 @@ pub enum AppContainerError {
         source: std::io::Error,
     },
     /// Writing the record of which project and package the identity
-    /// belongs to, before a run, or removing it after a release, failed.
-    #[error(
-        "failed to write or remove the record of this package's sandbox identity {path}: {source}"
-    )]
-    IdentityRecord {
+    /// belongs to failed before a run set anything.
+    #[error("failed to record this package's sandbox identity in {path}: {source}")]
+    RecordIdentity {
         /// The record.
         path: PathBuf,
-        /// Filesystem error returned while writing or removing it.
+        /// Filesystem error returned while writing it.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Removing the record of a released identity failed.
+    #[error("failed to remove the record of this package's sandbox identity {path}: {source}")]
+    ForgetIdentity {
+        /// The record.
+        path: PathBuf,
+        /// Filesystem error returned while removing it.
         #[source]
         source: std::io::Error,
     },

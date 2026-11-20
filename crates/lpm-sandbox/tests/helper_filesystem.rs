@@ -2199,22 +2199,16 @@ fn helper_denies_read_to_path_outside_any_allow_set() {
 
 /// A junction in `folder` to a folder beside it, or `None` where none can
 /// be made. `mklink /J` makes one without administrator rights, unlike a
-/// symbolic link.
+/// symbolic link. It is given names relative to `folder`, as `cmd`
+/// expands a `%` in a path written on its command line.
 fn junction_in(folder: &std::path::Path) -> Option<std::path::PathBuf> {
-    let real_dir = folder.join("real");
-    let junction = folder.join("junction");
-    fs::create_dir(&real_dir).expect("create real dir");
+    fs::create_dir(folder.join("real")).expect("create real dir");
     let status = std::process::Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            "/J",
-            &junction.to_string_lossy(),
-            &real_dir.to_string_lossy(),
-        ])
+        .args(["/d", "/c", "mklink", "/J", "junction", "real"])
+        .current_dir(folder)
         .status();
     match status {
-        Ok(status) if status.success() => Some(junction),
+        Ok(status) if status.success() => Some(folder.join("junction")),
         Ok(_) => {
             eprintln!("skipping: mklink /J failed (junction creation unsupported here)");
             None
@@ -2250,10 +2244,74 @@ fn a_run_refused_after_it_holds_its_identity_leaves_it_recorded() {
         .expect("spawn helper");
 
     assert!(
-        !out.status.success(),
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("reparse point"),
         "the run should be refused at the junction: {out:?}"
     );
     assert!(record.exists(), "the refused run left no record: {out:?}");
+}
+
+/// A run that can't record its identity sets nothing, as no cleanup could
+/// find what it set.
+#[test]
+fn a_run_that_cannot_record_its_identity_grants_nothing() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let not_a_folder = records.path().join("file");
+    fs::write(&not_a_folder, "").expect("write the file in the record's way");
+    let grants = records.path().join("grants.json");
+    let identity = RunIdentity(vec![
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        format!("LpmFilesystemUnrecorded-{}", std::process::id()),
+        "--grant-record".into(),
+        grants.to_string_lossy().into_owned(),
+    ]);
+    let mut argv = identity.0.clone();
+    argv.extend(
+        [
+            "--identity-record",
+            &not_a_folder.join("identity.json").to_string_lossy(),
+            "--identity-project",
+            &project.path().to_string_lossy(),
+            "--identity-package",
+            RECORDED_PACKAGE,
+            "--writable-dir",
+            &project.path().to_string_lossy(),
+            "--stdio-stdin",
+            "null",
+            "--stdio-stdout",
+            "null",
+            "--stdio-stderr",
+            "piped",
+            "--",
+            r"C:\Windows\System32\cmd.exe",
+            "/d",
+            "/c",
+            "exit 0",
+        ]
+        .map(String::from),
+    );
+    let before = saved_entries(project.path());
+
+    let out = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&argv)
+        .output()
+        .expect("spawn helper");
+
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr)
+                .contains("failed to record this package's sandbox identity"),
+        "the run should fail at its identity record: {out:?}"
+    );
+    assert!(!grants.exists(), "the run recorded grants: {out:?}");
+    assert_eq!(
+        saved_entries(project.path()),
+        before,
+        "the run changed its project's permissions"
+    );
 }
 
 #[test]
