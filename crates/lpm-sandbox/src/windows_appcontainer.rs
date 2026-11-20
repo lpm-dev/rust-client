@@ -2051,6 +2051,47 @@ mod tests {
         assert!(!of_a_gone_project.exists());
     }
 
+    /// The stand-in releases the identity as the helper does, then plays a
+    /// run of the same package that was waiting for the identity: the run
+    /// takes it as soon as the release lets go, and records and grants it
+    /// before the process that asked for the release goes on.
+    #[test]
+    fn a_run_that_takes_the_identity_as_its_release_ends_stays_recorded() {
+        let releases = Releases::new();
+        let record = releases.run_of("waited");
+        let name = appcontainer_name_for(&releases.project(), "waited");
+        let grants = grant_record_path(&releases.records(), &name);
+        let recorded_by_the_run = releases.folder.path().join("recorded-by-the-run.json");
+        std::fs::copy(&record, &recorded_by_the_run).unwrap();
+        std::fs::write(
+            releases.folder.path().join("then-a-run.cmd"),
+            format!(
+                ":next\r\n\
+                 @if \"%~1\"==\"\" goto run\r\n\
+                 @if \"%~1\"==\"--grant-record\" if exist \"%~2\" del \"%~2\"\r\n\
+                 @if \"%~1\"==\"--identity-record\" if exist \"%~2\" del \"%~2\"\r\n\
+                 @shift\r\n\
+                 @goto next\r\n\
+                 :run\r\n\
+                 @if not exist \"{record}\" copy /y \"{recorded}\" \"{record}\" >nul\r\n\
+                 @echo {{}}> \"{grants}\"\r\n",
+                record = record.display(),
+                recorded = recorded_by_the_run.display(),
+                grants = grants.display(),
+            ),
+        )
+        .unwrap();
+
+        let released = releases.uninstall_of("waited", "then-a-run.cmd");
+
+        assert!(matches!(released, Ok(true)), "{released:?}");
+        assert!(grants.exists(), "the run granted the identity again");
+        assert!(
+            record.exists(),
+            "what the run was granted is found by the identity's record"
+        );
+    }
+
     #[test]
     fn an_identity_released_before_its_project_went_is_forgotten_without_being_counted() {
         let releases = Releases::new();
