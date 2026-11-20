@@ -1842,13 +1842,20 @@ mod tests {
             )
         }
 
-        /// How often the helper that works was started for `package`.
+        /// How often the helper that works was started for `package`,
+        /// while the project is there to name its identity.
         fn releases_of(&self, package: &str) -> usize {
-            let name = appcontainer_name_for(&self.project(), package);
+            self.releases_named(&appcontainer_name_for(&self.project(), package))
+        }
+
+        /// How often the helper that works was started for the identity
+        /// `name`. The name of a project that is gone can't be worked out
+        /// again: it is named from the project's canonical path.
+        fn releases_named(&self, name: &str) -> usize {
             std::fs::read_to_string(self.folder.path().join("released.txt"))
                 .unwrap_or_default()
                 .lines()
-                .filter(|started_with| started_with.contains(&name))
+                .filter(|started_with| started_with.contains(name))
                 .count()
         }
     }
@@ -2080,11 +2087,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(of_gone_projects, 0, "it held no access to remove");
         assert_eq!(of_left_packages, 0);
-        assert_eq!(
-            releases.releases_of("released-earlier"),
-            1,
-            "its profile is released"
-        );
+        assert_eq!(releases.releases_named(&name), 1, "its profile is released");
         assert!(!record.exists(), "a gone project's record goes");
     }
 
