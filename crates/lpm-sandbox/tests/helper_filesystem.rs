@@ -298,6 +298,14 @@ fn helper_argv_base() -> OwnIdentityArgv {
             .into_owned(),
     ];
     let mut argv = identity.clone();
+    argv.extend([
+        "--identity-record".to_string(),
+        identity_record_of(&identity).to_string_lossy().into_owned(),
+        "--identity-project".into(),
+        records.path().to_string_lossy().into_owned(),
+        "--identity-package".into(),
+        RECORDED_PACKAGE.into(),
+    ]);
     argv.extend(
         [
             "--stdio-stdin",
@@ -691,12 +699,28 @@ fn names_trustee(path: &std::path::Path, sid: &str) -> bool {
 /// when dropped.
 struct RunIdentity(Vec<String>);
 
-/// The helper run that revokes what `identity` was granted and deletes
-/// its profile.
+/// The package the runs [`helper_argv_base`] starts record their identity
+/// for.
+const RECORDED_PACKAGE: &str = "lpm-filesystem-test";
+
+/// Where the runs of `identity` record it: beside its grant record.
+fn identity_record_of(identity: &[String]) -> std::path::PathBuf {
+    let grants = identity
+        .iter()
+        .skip_while(|argument| *argument != "--grant-record")
+        .nth(1)
+        .expect("the identity names its grant record");
+    std::path::Path::new(grants).with_extension("identity.json")
+}
+
+/// The helper run that revokes what `identity` was granted, deletes its
+/// profile and removes its identity record.
 fn cleanup_of(identity: &[String]) -> std::process::Command {
     let mut cleanup = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
     cleanup
         .args(identity)
+        .arg("--identity-record")
+        .arg(identity_record_of(identity))
         .args(["--revoke-only", "--delete-appcontainer-profile"]);
     cleanup
 }
@@ -1935,6 +1959,84 @@ fn a_run_says_that_it_waits_for_the_process_that_holds_its_identity() {
     );
 }
 
+/// A release of the identity removes its record while it holds the
+/// identity, so the record a run writes must wait for the identity too.
+/// Otherwise a run that recorded it before a release ended would go on
+/// to grant access that nothing names.
+#[test]
+fn a_run_records_its_identity_only_once_it_holds_it() {
+    use std::io::Read as _;
+
+    const WAITING: &[u8] = b"waiting for the process that holds";
+    let project = tempfile::tempdir().expect("project tempdir");
+    let mut argv = helper_argv_base();
+    argv.extend(
+        [
+            "--writable-dir",
+            &project.path().to_string_lossy(),
+            "--",
+            r"C:\Windows\System32\cmd.exe",
+            "/d",
+            "/c",
+            "exit 0",
+        ]
+        .map(String::from),
+    );
+    let record = identity_record_of(&argv);
+    let mut held = HeldIdentity::hold(profile_of(&argv));
+    let mut run = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn helper");
+    let mut stderr = run.stderr.take().expect("the run's stderr");
+    let (says_it_waits, waits) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut printed = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stderr.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                return printed;
+            }
+            printed.extend_from_slice(&buffer[..read]);
+            if printed.windows(WAITING.len()).any(|said| said == WAITING) {
+                let _ = says_it_waits.send(());
+            }
+        }
+    });
+
+    let waited = waits
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .is_ok();
+    let recorded_while_held = record.exists();
+    held.release();
+    let ended = ends_within(&mut run, std::time::Duration::from_secs(120));
+    let _ = run.kill();
+    let status = run.wait().expect("the run's exit status");
+    let printed = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
+
+    assert!(
+        waited,
+        "the run never said that it waits for its identity: {printed}"
+    );
+    assert!(
+        !recorded_while_held,
+        "the run recorded an identity it didn't hold"
+    );
+    assert!(ended && status.success(), "{status:?}: {printed}");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("the run recorded its identity"))
+            .expect("an identity record");
+    assert_eq!(recorded["package"], RECORDED_PACKAGE);
+    assert_eq!(
+        recorded["project"].as_str().map(std::path::PathBuf::from),
+        record.parent().map(std::path::Path::to_path_buf)
+    );
+}
+
 #[test]
 fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its_identity() {
     let records = tempfile::tempdir().expect("record tempdir");
@@ -1950,6 +2052,8 @@ fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its
             .to_string_lossy()
             .into_owned(),
     ]);
+    let record = identity_record_of(&identity.0);
+    fs::write(&record, "{}").expect("record the identity");
     let mut held = HeldIdentity::hold(profile_of(&identity.0));
 
     let refused = output_within_half_a_minute(cleanup_of(&identity.0));
@@ -1959,11 +2063,16 @@ fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its
         String::from_utf8_lossy(&refused.stderr).contains("nothing of it was cleaned up"),
         "{refused:?}"
     );
+    assert!(
+        record.exists(),
+        "a cleanup that didn't hold the identity keeps its record"
+    );
 
     held.release();
     let cleaned_up = output_within_half_a_minute(cleanup_of(&identity.0));
 
     assert!(cleaned_up.status.success(), "{cleaned_up:?}");
+    assert!(!record.exists(), "the identity's record goes with it");
 }
 
 /// The run's helper is started by a `cmd.exe` the test can end, and what
@@ -2088,38 +2197,132 @@ fn helper_denies_read_to_path_outside_any_allow_set() {
     );
 }
 
+/// A junction in `folder` to a folder beside it, or `None` where none can
+/// be made. `mklink /J` makes one without administrator rights, unlike a
+/// symbolic link. It is given names relative to `folder`, as `cmd`
+/// expands a `%` in a path written on its command line.
+fn junction_in(folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    fs::create_dir(folder.join("real")).expect("create real dir");
+    let status = std::process::Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J", "junction", "real"])
+        .current_dir(folder)
+        .status();
+    match status {
+        Ok(status) if status.success() => Some(folder.join("junction")),
+        Ok(_) => {
+            eprintln!("skipping: mklink /J failed (junction creation unsupported here)");
+            None
+        }
+        Err(_) => {
+            eprintln!("skipping: mklink /J not available in this environment");
+            None
+        }
+    }
+}
+
+/// A run records its identity before it sets anything, so one refused
+/// partway still leaves the record its release starts from.
+#[test]
+fn a_run_refused_after_it_holds_its_identity_leaves_it_recorded() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let Some(junction) = junction_in(tmp.path()) else {
+        return;
+    };
+    let mut argv = helper_argv_base();
+    argv.extend([
+        "--writable-dir".into(),
+        junction.to_string_lossy().into_owned(),
+        "--".into(),
+        r"C:\Windows\System32\whoami.exe".into(),
+    ]);
+    let record = identity_record_of(&argv);
+
+    let out = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&argv)
+        .output()
+        .expect("spawn helper");
+
+    assert!(
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("reparse point"),
+        "the run should be refused at the junction: {out:?}"
+    );
+    assert!(record.exists(), "the refused run left no record: {out:?}");
+}
+
+/// A run that can't record its identity sets nothing, as no cleanup could
+/// find what it set.
+#[test]
+fn a_run_that_cannot_record_its_identity_grants_nothing() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let records = tempfile::tempdir().expect("record tempdir");
+    let not_a_folder = records.path().join("file");
+    fs::write(&not_a_folder, "").expect("write the file in the record's way");
+    let grants = records.path().join("grants.json");
+    let identity = RunIdentity(vec![
+        "--protocol-version".to_string(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
+        "--appcontainer-name".into(),
+        format!("LpmFilesystemUnrecorded-{}", std::process::id()),
+        "--grant-record".into(),
+        grants.to_string_lossy().into_owned(),
+    ]);
+    let mut argv = identity.0.clone();
+    argv.extend(
+        [
+            "--identity-record",
+            &not_a_folder.join("identity.json").to_string_lossy(),
+            "--identity-project",
+            &project.path().to_string_lossy(),
+            "--identity-package",
+            RECORDED_PACKAGE,
+            "--writable-dir",
+            &project.path().to_string_lossy(),
+            "--stdio-stdin",
+            "null",
+            "--stdio-stdout",
+            "null",
+            "--stdio-stderr",
+            "piped",
+            "--",
+            r"C:\Windows\System32\cmd.exe",
+            "/d",
+            "/c",
+            "exit 0",
+        ]
+        .map(String::from),
+    );
+    let before = saved_entries(project.path());
+
+    let out = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&argv)
+        .output()
+        .expect("spawn helper");
+
+    assert!(
+        !out.status.success()
+            && String::from_utf8_lossy(&out.stderr)
+                .contains("failed to record this package's sandbox identity"),
+        "the run should fail at its identity record: {out:?}"
+    );
+    assert!(!grants.exists(), "the run recorded grants: {out:?}");
+    assert_eq!(
+        saved_entries(project.path()),
+        before,
+        "the run changed its project's permissions"
+    );
+}
+
 #[test]
 fn helper_refuses_reparse_point_root_with_named_error() {
     // Refuse a reparse-point root as a writable-dir / readable-dir
-    // grant target: granting on it would grant its target.
-    //
-    // Build a junction inside a tmpdir pointing at the parent
-    // tmpdir, then ask the helper to grant on the junction. The
-    // walker must refuse rather than follow.
+    // grant target: granting on it would grant its target. The walker
+    // must refuse rather than follow the junction.
     let tmp = tempfile::tempdir().expect("tempdir");
-    let real_dir = tmp.path().join("real");
-    let junction = tmp.path().join("junction");
-    fs::create_dir(&real_dir).expect("create real dir");
-
-    // `mklink /J <link> <target>` creates an NTFS directory
-    // junction without admin (unlike symlinks).
-    let status = std::process::Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            "/J",
-            &junction.to_string_lossy(),
-            &real_dir.to_string_lossy(),
-        ])
-        .status();
-    let Ok(s) = status else {
-        eprintln!("skipping: mklink /J not available in this environment");
+    let Some(junction) = junction_in(tmp.path()) else {
         return;
     };
-    if !s.success() {
-        eprintln!("skipping: mklink /J failed (junction creation unsupported here)");
-        return;
-    }
 
     let mut argv = helper_argv_base();
     argv.extend([

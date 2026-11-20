@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
-use crate::helper_appcontainer::ScriptJob;
+use crate::helper_appcontainer::{IDENTITY_RECORD_VERSION, IdentityRecord, ScriptJob};
 use crate::helper_protocol::{APPCONTAINER_NAME, PROTOCOL_VERSION, StdioMode};
 use crate::{
     Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec, SandboxStdio,
@@ -93,69 +93,6 @@ fn identity_record_path(records: &Path, name: &str) -> PathBuf {
     records.join(format!("{name}.identity.json"))
 }
 
-/// The project and package an identity belongs to, as the parent records
-/// them for a later cleanup.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct IdentityRecord {
-    version: u32,
-    project: PathBuf,
-    package: String,
-    /// The package left the project and the identity couldn't be released
-    /// then, so the next sweep tries again.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    left_behind: bool,
-}
-
-const IDENTITY_RECORD_VERSION: u32 = 1;
-
-impl IdentityRecord {
-    fn read(path: &Path) -> Option<Self> {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-            .filter(|record| record.version == IDENTITY_RECORD_VERSION)
-    }
-
-    fn write(&self, path: &Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).expect("an identity record serializes");
-        lpm_common::write_file_atomic(path, bytes)
-    }
-}
-
-/// Records which project and package `name` belongs to, unless that is
-/// recorded already. A record that says the package left is of an
-/// earlier stay: the package is back, and keeps the identity.
-fn record_identity(records: &Path, name: &str, project: &Path, package: &str) {
-    let path = identity_record_path(records, name);
-    let recorded = path.exists();
-    if recorded && !IdentityRecord::read(&path).is_some_and(|record| record.left_behind) {
-        return;
-    }
-    let record = IdentityRecord {
-        version: IDENTITY_RECORD_VERSION,
-        project: project.to_path_buf(),
-        package: package.to_owned(),
-        left_behind: false,
-    };
-    let Err(error) = std::fs::create_dir_all(records).and_then(|()| record.write(&path)) else {
-        return;
-    };
-    if recorded {
-        tracing::warn!(
-            "couldn't record that {package} is back in {}, so the next `lpm cache clean` \
-             removes the sandbox access its scripts have there, and the run after that sets \
-             it up again: {error}",
-            project.display()
-        );
-    } else {
-        tracing::warn!(
-            "couldn't record the sandbox identity of {package} in {}, so removing the package \
-             won't remove the access its scripts had: {error}",
-            project.display()
-        );
-    }
-}
-
 pub(crate) fn release_package_identity(
     project_dir: &Path,
     package: &str,
@@ -181,16 +118,7 @@ fn release_package_identity_in(
         return Ok(false);
     }
     helper()
-        .and_then(|helper| {
-            release_identity(
-                records,
-                &helper,
-                &name,
-                project_dir,
-                package,
-                Released::Forgotten,
-            )
-        })
+        .and_then(|helper| release_identity(records, &helper, &name, project_dir, package))
         .map(|()| true)
         .map_err(|error| crate::IdentityLeftBehind {
             error,
@@ -273,23 +201,16 @@ fn release_identities_left_behind_in(
         }
     };
     for (name, record) in left_behind {
-        let (then, count) = if record.project.exists() {
-            (Released::Kept, &mut released.of_removed_packages)
+        let count = if record.project.exists() {
+            &mut released.of_removed_packages
         } else {
-            (Released::Forgotten, &mut released.of_removed_projects)
+            &mut released.of_removed_projects
         };
-        // An identity that was released keeps its identity record while its
-        // project is there, and has no grant record. Once the project is
-        // gone that identity record goes too, with no access left to remove.
+        // An identity recorded by a run that stopped before it granted
+        // anything has no grant record, nor has one whose record an earlier
+        // release of lpm kept after releasing it. Neither has access to count.
         let held_access = grant_record_path(records, &name).exists();
-        match release_identity(
-            records,
-            &helper,
-            &name,
-            &record.project,
-            &record.package,
-            then,
-        ) {
+        match release_identity(records, &helper, &name, &record.project, &record.package) {
             Ok(()) if held_access => *count += 1,
             Ok(()) => {}
             Err(error) => released.failed.push(error),
@@ -298,25 +219,14 @@ fn release_identities_left_behind_in(
     released
 }
 
-/// What becomes of an identity's record once the identity is released.
-enum Released {
-    Forgotten,
-    /// The record stays and stops saying that the package left. In a
-    /// project that is still there the package may be back, and a run of
-    /// it records its identity before its helper holds it; removing the
-    /// record here could remove that run's.
-    Kept,
-}
-
-/// Has the helper revoke what `name` was granted and delete its profile,
-/// then does to its identity record what `then` says.
+/// Has the helper revoke what `name` was granted, delete its profile and
+/// remove its identity record, all while it holds the identity.
 fn release_identity(
     records: &Path,
     helper: &Path,
     name: &str,
     project: &Path,
     package: &str,
-    then: Released,
 ) -> Result<(), SandboxError> {
     let failed = |reason: String| SandboxError::IdentityCleanupFailed {
         project: project.to_path_buf(),
@@ -330,6 +240,8 @@ fn release_identity(
         .arg(name)
         .arg("--grant-record")
         .arg(grant_record_path(records, name))
+        .arg("--identity-record")
+        .arg(identity_record_path(records, name))
         .arg("--revoke-only")
         .arg("--delete-appcontainer-profile")
         .stdin(std::process::Stdio::null())
@@ -341,24 +253,9 @@ fn release_identity(
         "removing the sandbox access {package}'s scripts had in {}",
         project.display()
     );
-    if let Some(reason) = heard_from(output.status, &output.stderr, &removing) {
-        return Err(failed(reason));
-    }
-    let path = identity_record_path(records, name);
-    let recorded = match then {
-        Released::Forgotten => std::fs::remove_file(&path),
-        Released::Kept => IdentityRecord {
-            version: IDENTITY_RECORD_VERSION,
-            project: project.to_path_buf(),
-            package: package.to_owned(),
-            left_behind: false,
-        }
-        .write(&path),
-    };
-    match recorded {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(failed(error.to_string())),
+    match heard_from(output.status, &output.stderr, &removing) {
+        Some(reason) => Err(failed(reason)),
+        None => Ok(()),
     }
 }
 
@@ -701,23 +598,15 @@ impl AppContainerSandbox {
             }),
         }
     }
-}
 
-/// Posture decision. Pure (inputs in, outcome out). Never refuses:
-/// AppContainer delivers strict on every Windows host the helper runs on,
-/// so `allow-degraded` has nothing to fall back to here.
-pub(crate) fn decide_appcontainer_posture(deny_outbound_network: bool) -> BackendPosture {
-    if deny_outbound_network {
-        BackendPosture::Strict
-    } else {
-        BackendPosture::Default
-    }
-}
-
-// ── Sandbox trait impl ───────────────────────────────────────────────
-
-impl Sandbox for AppContainerSandbox {
-    fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+    /// The helper invocation that runs `cmd` in the sandbox, apart from
+    /// its stdio handles, and the run to keep track of. `records` is where the LPM
+    /// home keeps identity records; without it the run records nothing.
+    fn helper_command(
+        &self,
+        cmd: &SandboxedCommand,
+        records: Option<PathBuf>,
+    ) -> Result<(Command, Option<StartedRun>), SandboxError> {
         for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
             crate::config::revalidate_effective_write_dir(path, index)?;
         }
@@ -743,13 +632,14 @@ impl Sandbox for AppContainerSandbox {
             .arg(PROTOCOL_VERSION.to_string());
         let name = appcontainer_name_for(&self.spec.project_dir, &self.spec.package_name);
         helper_cmd.arg("--appcontainer-name").arg(&name);
-        let record = identity_records().map(|records| {
-            record_identity(
-                &records,
-                &name,
-                &self.spec.project_dir,
-                &self.spec.package_name,
-            );
+        let record = records.map(|records| {
+            helper_cmd
+                .arg("--identity-record")
+                .arg(identity_record_path(&records, &name))
+                .arg("--identity-project")
+                .arg(&self.spec.project_dir)
+                .arg("--identity-package")
+                .arg(&self.spec.package_name);
             grant_record_path(&records, &name)
         });
         // A run that records what it sets gets a Job this process holds
@@ -806,7 +696,7 @@ impl Sandbox for AppContainerSandbox {
         // these PATH-derived entries opt into the WARN-and-continue
         // semantics. See "Other (non-MSVC)
         // COM-dependent lifecycle scripts still break" row.
-        for dir in tool_dirs_needing_explicit_grant(&cmd, &self.spec) {
+        for dir in tool_dirs_needing_explicit_grant(cmd, &self.spec) {
             helper_cmd.arg("--readable-dir-best-effort").arg(dir);
         }
         // Narrow-write grants mirror the macOS/Linux writable set.
@@ -913,6 +803,27 @@ impl Sandbox for AppContainerSandbox {
         for a in &cmd.args {
             helper_cmd.arg(a);
         }
+
+        Ok((helper_cmd, started))
+    }
+}
+
+/// Posture decision. Pure (inputs in, outcome out). Never refuses:
+/// AppContainer delivers strict on every Windows host the helper runs on,
+/// so `allow-degraded` has nothing to fall back to here.
+pub(crate) fn decide_appcontainer_posture(deny_outbound_network: bool) -> BackendPosture {
+    if deny_outbound_network {
+        BackendPosture::Strict
+    } else {
+        BackendPosture::Default
+    }
+}
+
+// ── Sandbox trait impl ───────────────────────────────────────────────
+
+impl Sandbox for AppContainerSandbox {
+    fn spawn(&self, cmd: SandboxedCommand) -> Result<Child, SandboxError> {
+        let (mut helper_cmd, started) = self.helper_command(&cmd, identity_records())?;
 
         // The parent connects its own stdio to the helper; the
         // helper inherits + forwards to the lifecycle child. The
@@ -1857,7 +1768,8 @@ mod tests {
     /// A folder for identity records and a project beside it, with two
     /// scripts that stand in for the helper: one that fails as a cleanup
     /// that found the identity held does, and one that succeeds, writes
-    /// down what it was started with and removes the grant record.
+    /// down what it was started with and removes the grant record and the
+    /// identity record.
     struct Releases {
         folder: tempfile::TempDir,
     }
@@ -1877,6 +1789,7 @@ mod tests {
                  :next\r\n\
                  @if \"%~1\"==\"\" exit /b 0\r\n\
                  @if \"%~1\"==\"--grant-record\" if exist \"%~2\" del \"%~2\"\r\n\
+                 @if \"%~1\"==\"--identity-record\" if exist \"%~2\" del \"%~2\"\r\n\
                  @shift\r\n\
                  @goto next\r\n",
             )
@@ -1893,13 +1806,18 @@ mod tests {
         }
 
         /// Records the identity of `package` in the project and what it
-        /// was granted, as a run of its scripts does, and says where the
-        /// identity is recorded.
+        /// was granted, as the helper of a run of its scripts does, and
+        /// says where the identity is recorded.
         fn run_of(&self, package: &str) -> PathBuf {
             let name = appcontainer_name_for(&self.project(), package);
-            record_identity(&self.records(), &name, &self.project(), package);
+            let record = identity_record_path(&self.records(), &name);
+            let owner = crate::helper_protocol::IdentityOwner {
+                project: self.project(),
+                package: package.to_owned(),
+            };
+            crate::helper_appcontainer::record_identity(&record, &owner).unwrap();
             std::fs::write(grant_record_path(&self.records(), &name), "{}").unwrap();
-            identity_record_path(&self.records(), &name)
+            record
         }
 
         fn uninstall_of(
@@ -1924,13 +1842,20 @@ mod tests {
             )
         }
 
-        /// How often the helper that works was started for `package`.
+        /// How often the helper that works was started for `package`,
+        /// while the project is there to name its identity.
         fn releases_of(&self, package: &str) -> usize {
-            let name = appcontainer_name_for(&self.project(), package);
+            self.releases_named(&appcontainer_name_for(&self.project(), package))
+        }
+
+        /// How often the helper that works was started for the identity
+        /// `name`. The name of a project that is gone can't be worked out
+        /// again: it is named from the project's canonical path.
+        fn releases_named(&self, name: &str) -> usize {
             std::fs::read_to_string(self.folder.path().join("released.txt"))
                 .unwrap_or_default()
                 .lines()
-                .filter(|started_with| started_with.contains(&name))
+                .filter(|started_with| started_with.contains(name))
                 .count()
         }
     }
@@ -1965,10 +1890,7 @@ mod tests {
             0,
             "a package still in its project keeps its identity"
         );
-        assert!(
-            left.exists(),
-            "the record of a project that is still there stays for a run that has the package back"
-        );
+        assert!(!left.exists(), "a released identity's record goes with it");
     }
 
     #[test]
@@ -2051,21 +1973,121 @@ mod tests {
         assert!(!of_a_gone_project.exists());
     }
 
+    /// The stand-in releases the identity as the helper does, then plays a
+    /// run of the same package that was waiting for the identity: the run
+    /// takes it as soon as the release lets go, and records and grants it
+    /// before the process that asked for the release goes on.
     #[test]
-    fn an_identity_released_before_its_project_went_is_forgotten_without_being_counted() {
+    fn a_run_that_takes_the_identity_as_its_release_ends_stays_recorded() {
         let releases = Releases::new();
-        let record = releases.run_of("left");
-        let failed = releases.uninstall_of("left", "fails.cmd");
-        let (released, _, _) = releases.sweep();
+        let record = releases.run_of("waited");
+        let name = appcontainer_name_for(&releases.project(), "waited");
+        let grants = grant_record_path(&releases.records(), &name);
+        // What the run records once it holds the identity: the same record,
+        // in other bytes, so that it tells the run's record from the one
+        // the release should have removed.
+        let recorded_by_the_run = releases.folder.path().join("recorded-by-the-run.json");
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let run_s_record = serde_json::to_vec(&recorded).unwrap();
+        assert_ne!(run_s_record, std::fs::read(&record).unwrap());
+        std::fs::write(&recorded_by_the_run, &run_s_record).unwrap();
+        // Named from the script's own folder, as a literal `%` in a
+        // temporary path would expand in a path written into the script.
+        // `shift /1` keeps `%0`, which a plain `shift` moves on too.
+        std::fs::write(
+            releases.folder.path().join("then-a-run.cmd"),
+            format!(
+                ":next\r\n\
+                 @if \"%~1\"==\"\" goto run\r\n\
+                 @if \"%~1\"==\"--grant-record\" if exist \"%~2\" del \"%~2\"\r\n\
+                 @if \"%~1\"==\"--identity-record\" if exist \"%~2\" del \"%~2\"\r\n\
+                 @shift /1\r\n\
+                 @goto next\r\n\
+                 :run\r\n\
+                 @if not exist \"%~dp0records\\{name}.identity.json\" \
+                 copy /y \"%~dp0recorded-by-the-run.json\" \"%~dp0records\\{name}.identity.json\" >nul\r\n\
+                 @echo {{}}> \"%~dp0records\\{name}.grants.json\"\r\n",
+            ),
+        )
+        .unwrap();
+
+        let released = releases.uninstall_of("waited", "then-a-run.cmd");
+
+        assert!(matches!(released, Ok(true)), "{released:?}");
+        assert!(grants.exists(), "the run granted the identity again");
+        assert_eq!(
+            std::fs::read(&record).ok(),
+            Some(run_s_record),
+            "what the run was granted is found by the record the run wrote"
+        );
+    }
+
+    #[test]
+    fn a_run_names_its_identity_record_and_owner_to_its_helper() {
+        let project = tempfile::tempdir().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let sandbox = AppContainerSandbox {
+            spec: SandboxSpec {
+                project_dir: project.path().to_path_buf(),
+                ..make_spec()
+            },
+            mode: SandboxMode::Enforce,
+            posture: BackendPosture::Default,
+            helper_path: PathBuf::from(r"C:\lpm\lpm-sandbox-helper.exe"),
+        };
+        let name = appcontainer_name_for(project.path(), "pkg");
+        let script = SandboxedCommand::new("cmd.exe");
+        let parsed = |command: &Command| {
+            crate::helper_protocol::parse_argv(command.get_args().map(OsString::from))
+                .expect("the helper takes the argv lpm gives it")
+        };
+
+        let (recorded, started) = sandbox
+            .helper_command(&script, Some(records.path().to_path_buf()))
+            .unwrap();
+        let (unrecorded, untracked) = sandbox.helper_command(&script, None).unwrap();
+
+        let recorded = parsed(&recorded);
+        assert_eq!(
+            recorded.identity_record,
+            Some(identity_record_path(records.path(), &name))
+        );
+        assert_eq!(
+            recorded.identity_owner,
+            Some(crate::helper_protocol::IdentityOwner {
+                project: project.path().to_path_buf(),
+                package: "pkg".to_owned(),
+            })
+        );
+        assert_eq!(
+            recorded.grant_record,
+            Some(grant_record_path(records.path(), &name))
+        );
+        assert!(started.is_some(), "a recorded run is kept track of");
+        let unrecorded = parsed(&unrecorded);
+        assert_eq!(unrecorded.identity_record, None);
+        assert_eq!(unrecorded.identity_owner, None);
+        assert_eq!(unrecorded.grant_record, None);
+        assert!(untracked.is_none());
+    }
+
+    /// An earlier release of lpm kept the record of an identity it released
+    /// while the identity's project was there, with no grant record.
+    #[test]
+    fn an_identity_recorded_without_a_grant_record_goes_with_its_project_uncounted() {
+        let releases = Releases::new();
+        let record = releases.run_of("released-earlier");
+        let name = appcontainer_name_for(&releases.project(), "released-earlier");
+        std::fs::remove_file(grant_record_path(&releases.records(), &name)).unwrap();
 
         std::fs::remove_dir(releases.project()).unwrap();
         let (of_left_packages, of_gone_projects, failures) = releases.sweep();
 
-        assert!(failed.is_err(), "{failed:?}");
-        assert_eq!(released, 1, "the retry removed its access");
-        assert_eq!(of_gone_projects, 0, "{failures:?}");
-        assert_eq!(of_left_packages, 0, "{failures:?}");
         assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(of_gone_projects, 0, "it held no access to remove");
+        assert_eq!(of_left_packages, 0);
+        assert_eq!(releases.releases_named(&name), 1, "its profile is released");
         assert!(!record.exists(), "a gone project's record goes");
     }
 
