@@ -343,6 +343,64 @@ test("the Homebrew update reaches the tap only with a per-run app token scoped t
   }
 });
 
+test("a release tag is created only by publishing a draft with a per-run token from the release-tags app", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const publishers = jobsOf(workflow).filter(([, job]) => /-F draft=false/.test(job));
+  assert.deepEqual(
+    publishers.map(([name]) => name),
+    ["finalize-promotion-release", "publish-release"],
+    "publishing a draft creates its tag, so every job that publishes one must hold the tag token",
+  );
+
+  for (const [name, job] of publishers) {
+    assert.match(job, /^    environment: release$/m, `${name} reads the app key from the release environment`);
+    const steps = stepsOf(job);
+    const mintIndex = steps.findIndex((step) => step.startsWith("name: Create a token for release tags"));
+    assert.notEqual(mintIndex, -1, `${name} must mint its own release-tags token`);
+    const mint = steps[mintIndex];
+    assert.match(mint, /\n\s+id: tag-token\n/);
+    assert.match(mint, /uses: actions\/create-github-app-token@[0-9a-f]{40} #/);
+    assert.match(mint, /client-id: \$\{\{ vars\.RELEASE_TAGS_APP_CLIENT_ID \}\}/);
+    assert.match(mint, /private-key: \$\{\{ secrets\.RELEASE_TAGS_APP_PRIVATE_KEY \}\}/);
+    assert.match(mint, /owner: lpm-dev\n\s+repositories: rust-client\n/);
+    assert.match(mint, /permission-contents: write\n/);
+    assert.doesNotMatch(mint, /permission-(?!contents)/, "the token needs no other permission");
+
+    const publishIndex = steps.findIndex((step) => /-F draft=false/.test(step));
+    assert.equal(publishIndex, mintIndex + 1, `${name} mints the token right before the step that publishes`);
+    const publish = steps[publishIndex];
+    assert.equal(
+      mint.match(/\n\s+if: (.+)/)?.[1],
+      publish.match(/\n\s+if: (.+)/)?.[1],
+      `${name} mints the token only when it publishes`,
+    );
+    assert.match(publish, /\n\s+GH_TOKEN: \$\{\{ github\.token \}\}\n/);
+    assert.match(publish, /\n\s+RELEASE_TAGS_TOKEN: \$\{\{ steps\.tag-token\.outputs\.token \}\}\n/);
+    assert.equal(
+      publish.match(/RELEASE_TAGS_TOKEN/g).length,
+      2,
+      `${name} uses the tag token for one command only`,
+    );
+    assert.match(
+      publish,
+      /GH_TOKEN="\$RELEASE_TAGS_TOKEN" gh api --method PATCH "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{release_id\}" \\\n\s+-F draft=false/,
+      `${name} publishes the draft with the tag token`,
+    );
+    for (const [index, step] of steps.entries()) {
+      if (index === mintIndex || index === publishIndex) continue;
+      assert.doesNotMatch(step, /tag-token|RELEASE_TAGS_/, `${step.split("\n")[0]} must not see the tag token`);
+    }
+  }
+
+  for (const [name, job] of jobsOf(workflow)) {
+    if (publishers.some(([publisher]) => publisher === name)) continue;
+    assert.doesNotMatch(job, /RELEASE_TAGS_|tag-token/, `${name} must not use the release-tags app`);
+  }
+  for (const file of workflowFiles().filter((file) => !file.endsWith("/release.yml"))) {
+    assert.doesNotMatch(read(file), /RELEASE_TAGS_/, `${file} must not use the release-tags app`);
+  }
+});
+
 test("every SHA256SUMS.txt attestation passes the shipped self-update policy before anything else runs", () => {
   const workflow = read(".github/workflows/release.yml");
   const attestingJobs = jobsOf(workflow).filter(([, job]) =>
@@ -680,6 +738,8 @@ test("every release job that holds a signing secret or an OIDC token runs in a p
     "sign-windows": "windows-signing",
     release: "release",
     "stage-promotion-release": "release",
+    "finalize-promotion-release": "release",
+    "publish-release": "release",
     "publish-promotion-platform": "release",
     "publish-npm-platform": "release",
     "publish-npm-wrapper": "release",
