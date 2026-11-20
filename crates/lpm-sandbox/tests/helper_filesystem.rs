@@ -298,6 +298,14 @@ fn helper_argv_base() -> OwnIdentityArgv {
             .into_owned(),
     ];
     let mut argv = identity.clone();
+    argv.extend([
+        "--identity-record".to_string(),
+        identity_record_of(&identity).to_string_lossy().into_owned(),
+        "--identity-project".into(),
+        records.path().to_string_lossy().into_owned(),
+        "--identity-package".into(),
+        RECORDED_PACKAGE.into(),
+    ]);
     argv.extend(
         [
             "--stdio-stdin",
@@ -691,12 +699,28 @@ fn names_trustee(path: &std::path::Path, sid: &str) -> bool {
 /// when dropped.
 struct RunIdentity(Vec<String>);
 
-/// The helper run that revokes what `identity` was granted and deletes
-/// its profile.
+/// The package the runs [`helper_argv_base`] starts record their identity
+/// for.
+const RECORDED_PACKAGE: &str = "lpm-filesystem-test";
+
+/// Where the runs of `identity` record it: beside its grant record.
+fn identity_record_of(identity: &[String]) -> std::path::PathBuf {
+    let grants = identity
+        .iter()
+        .skip_while(|argument| *argument != "--grant-record")
+        .nth(1)
+        .expect("the identity names its grant record");
+    std::path::Path::new(grants).with_extension("identity.json")
+}
+
+/// The helper run that revokes what `identity` was granted, deletes its
+/// profile and removes its identity record.
 fn cleanup_of(identity: &[String]) -> std::process::Command {
     let mut cleanup = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"));
     cleanup
         .args(identity)
+        .arg("--identity-record")
+        .arg(identity_record_of(identity))
         .args(["--revoke-only", "--delete-appcontainer-profile"]);
     cleanup
 }
@@ -1935,6 +1959,61 @@ fn a_run_says_that_it_waits_for_the_process_that_holds_its_identity() {
     );
 }
 
+/// A release of the identity removes its record while it holds the
+/// identity, so the record a run writes must wait for the identity too.
+/// Otherwise a run that recorded it before a release ended would go on
+/// to grant access that nothing names.
+#[test]
+fn a_run_records_its_identity_only_once_it_holds_it() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let mut argv = helper_argv_base();
+    argv.extend(
+        [
+            "--writable-dir",
+            &project.path().to_string_lossy(),
+            "--",
+            r"C:\Windows\System32\cmd.exe",
+            "/d",
+            "/c",
+            "exit 0",
+        ]
+        .map(String::from),
+    );
+    let record = identity_record_of(&argv);
+    let mut held = HeldIdentity::hold(profile_of(&argv));
+    let mut run = std::process::Command::new(env!("CARGO_BIN_EXE_lpm-sandbox-helper"))
+        .args(&argv)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn helper");
+
+    let ended_while_held = ends_within(&mut run, std::time::Duration::from_secs(3));
+    let recorded_while_held = record.exists();
+    held.release();
+    let ended = ends_within(&mut run, std::time::Duration::from_secs(120));
+    let _ = run.kill();
+    let output = run.wait_with_output().expect("the run's output");
+
+    assert!(
+        !ended_while_held,
+        "the run didn't wait for the identity: {output:?}"
+    );
+    assert!(
+        !recorded_while_held,
+        "the run recorded an identity it didn't hold"
+    );
+    assert!(ended && output.status.success(), "{output:?}");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("the run recorded its identity"))
+            .expect("an identity record");
+    assert_eq!(recorded["package"], RECORDED_PACKAGE);
+    assert_eq!(
+        recorded["project"].as_str().map(std::path::PathBuf::from),
+        record.parent().map(std::path::Path::to_path_buf)
+    );
+}
+
 #[test]
 fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its_identity() {
     let records = tempfile::tempdir().expect("record tempdir");
@@ -1950,6 +2029,8 @@ fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its
             .to_string_lossy()
             .into_owned(),
     ]);
+    let record = identity_record_of(&identity.0);
+    fs::write(&record, "{}").expect("record the identity");
     let mut held = HeldIdentity::hold(profile_of(&identity.0));
 
     let refused = output_within_half_a_minute(cleanup_of(&identity.0));
@@ -1959,11 +2040,16 @@ fn a_cleanup_fails_rather_than_wait_without_limit_for_the_process_that_holds_its
         String::from_utf8_lossy(&refused.stderr).contains("nothing of it was cleaned up"),
         "{refused:?}"
     );
+    assert!(
+        record.exists(),
+        "a cleanup that didn't hold the identity keeps its record"
+    );
 
     held.release();
     let cleaned_up = output_within_half_a_minute(cleanup_of(&identity.0));
 
     assert!(cleaned_up.status.success(), "{cleaned_up:?}");
+    assert!(!record.exists(), "the identity's record goes with it");
 }
 
 /// The run's helper is started by a `cmd.exe` the test can end, and what

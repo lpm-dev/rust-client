@@ -130,6 +130,18 @@ pub struct HelperArgs {
     /// (`--grant-record`), so a later run revokes the ones its spec no
     /// longer grants, and a cleanup run all of them.
     pub grant_record: Option<PathBuf>,
+    /// Where the parent finds which project and package the identity
+    /// belongs to (`--identity-record`). A run records
+    /// [`identity_owner`](Self::identity_owner) there, unless it is
+    /// recorded, before it creates the profile or grants anything. A
+    /// revoke-only run removes it once the identity is released. Each
+    /// happens while the helper holds the identity, so a run and a cleanup
+    /// of one identity can't leave it holding access no record names.
+    pub identity_record: Option<PathBuf>,
+    /// The project and package a run records the identity for
+    /// (`--identity-project`, `--identity-package`). Present exactly when
+    /// a run has an [`identity_record`](Self::identity_record).
+    pub identity_owner: Option<IdentityOwner>,
     /// Revoke every tree [`grant_record`](Self::grant_record) lists,
     /// delete the profile if asked to, and exit without a program
     /// (`--revoke-only`).
@@ -207,6 +219,15 @@ pub struct HelperArgs {
     pub program_args: Vec<OsString>,
 }
 
+/// The project and package a sandbox identity belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityOwner {
+    /// The project directory, absolute.
+    pub project: PathBuf,
+    /// The package's name.
+    pub package: String,
+}
+
 /// Parse failure shapes. Each variant carries enough context for the
 /// helper's stderr to name the offending field so users (or the
 /// release-installer flow) can self-diagnose without reading the
@@ -263,6 +284,22 @@ pub enum ParseError {
     /// `--take-back-run` leaves the identity for its next run.
     #[error("`--take-back-run` keeps the profile `--delete-appcontainer-profile` would delete")]
     TakeBackDeletesProfile,
+    /// `--take-back-run` leaves the identity for its next run, which the
+    /// identity record must keep naming.
+    #[error("`--take-back-run` keeps the identity whose record `--identity-record` names")]
+    TakeBackWithIdentityRecord,
+    /// A revoke-only run removes the identity record once the identity is
+    /// gone, and a profile that is kept would be left with no record.
+    #[error(
+        "`--revoke-only` removes `--identity-record` only with `--delete-appcontainer-profile`"
+    )]
+    IdentityRecordOutlivedByProfile,
+    /// The project and package are what a run records for its identity.
+    #[error(
+        "`--identity-project` and `--identity-package` are what a run records in \
+         `--identity-record`, so they need a run that has one"
+    )]
+    IdentityOwnerOutsideRecordedRun,
     /// A required flag was absent.
     #[error("required flag `--{0}` was not provided")]
     MissingFlag(String),
@@ -310,6 +347,9 @@ pub enum ParseError {
 /// | `--appcontainer-name` | non-empty string | required, once |
 /// | `--delete-appcontainer-profile` | (flag) | optional |
 /// | `--grant-record` | absolute path | optional, once (required by a cleanup run) |
+/// | `--identity-record` | absolute path | optional, once (not with `--take-back-run`; with `--revoke-only`, needs `--delete-appcontainer-profile`) |
+/// | `--identity-project` | absolute path | once with `--identity-record` on a run, otherwise refused |
+/// | `--identity-package` | package name | once with `--identity-record` on a run, otherwise refused |
 /// | `--revoke-only` | (flag) | optional cleanup run: no stdio flags, `--` or program |
 /// | `--take-back-run` | (flag) | optional cleanup run: no stdio flags, `--` or program |
 /// | `--sweep-record` | absolute path | optional, once |
@@ -338,6 +378,9 @@ where
     let mut appcontainer_name: Option<String> = None;
     let mut delete_appcontainer_profile = false;
     let mut grant_record: Option<PathBuf> = None;
+    let mut identity_record: Option<PathBuf> = None;
+    let mut identity_project: Option<PathBuf> = None;
+    let mut identity_package: Option<String> = None;
     let mut revoke_only = false;
     let mut take_back_run = false;
     let mut job: Option<String> = None;
@@ -405,6 +448,19 @@ where
             }
             "--grant-record" => {
                 grant_record = Some(absolute_value(&mut it, "--grant-record")?);
+            }
+            "--identity-record" => {
+                identity_record = Some(absolute_value(&mut it, "--identity-record")?);
+            }
+            "--identity-project" => {
+                identity_project = Some(absolute_value(&mut it, "--identity-project")?);
+            }
+            "--identity-package" => {
+                let raw = next_value(&mut it, "--identity-package")?;
+                let package = raw
+                    .to_str()
+                    .ok_or_else(|| ParseError::UnknownFlag("--identity-package".to_string()))?;
+                identity_package = Some(package.to_owned());
             }
             "--revoke-only" => {
                 revoke_only = true;
@@ -492,6 +548,24 @@ where
     if job.is_some() && grant_record.is_none() {
         return Err(ParseError::JobWithoutRecord);
     }
+    if identity_record.is_some() {
+        if take_back_run {
+            return Err(ParseError::TakeBackWithIdentityRecord);
+        }
+        if revoke_only && !delete_appcontainer_profile {
+            return Err(ParseError::IdentityRecordOutlivedByProfile);
+        }
+    }
+    let recorded_run = identity_record.is_some() && cleanup.is_none();
+    let identity_owner = match (identity_project, identity_package) {
+        (Some(_), _) | (_, Some(_)) if !recorded_run => {
+            return Err(ParseError::IdentityOwnerOutsideRecordedRun);
+        }
+        (Some(project), Some(package)) => Some(IdentityOwner { project, package }),
+        (None, None) if !recorded_run => None,
+        (None, _) => return Err(ParseError::MissingFlag("identity-project".to_string())),
+        (Some(_), None) => return Err(ParseError::MissingFlag("identity-package".to_string())),
+    };
     let program = match program {
         Some(program) => program,
         None if cleanup.is_some() => OsString::new(),
@@ -523,6 +597,8 @@ where
         appcontainer_name,
         delete_appcontainer_profile,
         grant_record,
+        identity_record,
+        identity_owner,
         revoke_only,
         take_back_run,
         job,
@@ -782,6 +858,106 @@ mod tests {
             parse_argv(argv(&[&identity, &job, &["--revoke-only"]])).unwrap_err(),
             ParseError::JobWithRevokeOnly
         );
+    }
+
+    const IDENTITY: [&str; 6] = [
+        "--protocol-version",
+        "3",
+        "--appcontainer-name",
+        "LpmSandboxLifecycleChild-0123",
+        "--grant-record",
+        "C:/records/LpmSandboxLifecycleChild-0123.grants.json",
+    ];
+    const IDENTITY_RECORD: [&str; 2] = [
+        "--identity-record",
+        "C:/records/LpmSandboxLifecycleChild-0123.identity.json",
+    ];
+    const OWNER: [&str; 4] = [
+        "--identity-project",
+        "C:/work/app",
+        "--identity-package",
+        "@scope/pkg",
+    ];
+    const PROGRAM: [&str; 8] = [
+        "--stdio-stdin",
+        "null",
+        "--stdio-stdout",
+        "null",
+        "--stdio-stderr",
+        "null",
+        "--",
+        "C:/Windows/System32/cmd.exe",
+    ];
+    const RELEASE: [&str; 2] = ["--revoke-only", "--delete-appcontainer-profile"];
+
+    fn concat(parts: &[&[&'static str]]) -> Vec<OsString> {
+        make_argv(&parts.concat())
+    }
+
+    #[test]
+    fn parse_argv_takes_an_identity_record_with_its_owner_for_a_run_and_alone_for_a_release() {
+        let run = parse_argv(concat(&[&IDENTITY, &IDENTITY_RECORD, &OWNER, &PROGRAM]))
+            .expect("a run that records its identity must parse");
+        let released = parse_argv(concat(&[&IDENTITY, &IDENTITY_RECORD, &RELEASE]))
+            .expect("a release that removes the identity's record must parse");
+        let unrecorded = parse_argv(concat(&[&IDENTITY, &PROGRAM])).unwrap();
+
+        let record = Some(PathBuf::from(IDENTITY_RECORD[1]));
+        assert_eq!(run.identity_record, record);
+        assert_eq!(
+            run.identity_owner,
+            Some(IdentityOwner {
+                project: PathBuf::from("C:/work/app"),
+                package: "@scope/pkg".to_string(),
+            })
+        );
+        assert_eq!(released.identity_record, record);
+        assert_eq!(released.identity_owner, None);
+        assert_eq!(unrecorded.identity_record, None);
+        assert_eq!(unrecorded.identity_owner, None);
+    }
+
+    #[test]
+    fn parse_argv_refuses_an_identity_record_a_run_or_release_would_leave_wrong() {
+        let refused = |parts: &[&[&'static str]]| parse_argv(concat(parts)).unwrap_err();
+
+        assert_eq!(
+            refused(&[&IDENTITY, &IDENTITY_RECORD, &PROGRAM]),
+            ParseError::MissingFlag("identity-project".to_string())
+        );
+        assert_eq!(
+            refused(&[&IDENTITY, &IDENTITY_RECORD, &OWNER[..2], &PROGRAM]),
+            ParseError::MissingFlag("identity-package".to_string())
+        );
+        assert_eq!(
+            refused(&[&IDENTITY, &IDENTITY_RECORD, &OWNER[2..], &PROGRAM]),
+            ParseError::MissingFlag("identity-project".to_string())
+        );
+        assert_eq!(
+            refused(&[&IDENTITY, &OWNER, &PROGRAM]),
+            ParseError::IdentityOwnerOutsideRecordedRun
+        );
+        assert_eq!(
+            refused(&[&IDENTITY, &IDENTITY_RECORD, &OWNER, &RELEASE]),
+            ParseError::IdentityOwnerOutsideRecordedRun
+        );
+        assert_eq!(
+            refused(&[&IDENTITY, &IDENTITY_RECORD, &RELEASE[..1]]),
+            ParseError::IdentityRecordOutlivedByProfile
+        );
+        assert_eq!(
+            refused(&[&IDENTITY, &IDENTITY_RECORD, &["--take-back-run"]]),
+            ParseError::TakeBackWithIdentityRecord
+        );
+        for flag in ["--identity-record", "--identity-project"] {
+            assert!(
+                matches!(
+                    refused(&[&IDENTITY, &[flag, "relative/path"], &PROGRAM]),
+                    ParseError::NotAbsolute { .. }
+                ),
+                "{flag}"
+            );
+        }
     }
 
     #[test]

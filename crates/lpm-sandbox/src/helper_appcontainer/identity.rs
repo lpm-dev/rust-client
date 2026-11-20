@@ -15,6 +15,7 @@
 //! run of the identity or its cleanup does.
 
 use super::*;
+use crate::helper_protocol::IdentityOwner;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
@@ -195,6 +196,90 @@ fn is_covered(path: &Path, trees: &[String]) -> bool {
                 .strip_prefix(tree.as_str())
                 .is_some_and(|rest| rest.starts_with('\\'))
     })
+}
+
+/// The project and package an identity belongs to, kept beside its grant
+/// record so that a cleanup finds the identities of packages that left
+/// and of projects that are gone. Only a helper that holds the identity
+/// writes or removes it. lpm itself only marks one left behind when a
+/// release fails, and never removes one, so no run's access outlives its
+/// record.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct IdentityRecord {
+    pub(crate) version: u32,
+    pub(crate) project: PathBuf,
+    pub(crate) package: String,
+    /// The package left the project and the identity couldn't be released
+    /// then, so the next sweep tries again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) left_behind: bool,
+}
+
+pub(crate) const IDENTITY_RECORD_VERSION: u32 = 1;
+
+impl IdentityRecord {
+    pub(crate) fn read(path: &Path) -> Option<Self> {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|record| record.version == IDENTITY_RECORD_VERSION)
+    }
+
+    pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).expect("an identity record serializes");
+        path.parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| lpm_common::write_file_atomic(path, bytes))
+    }
+}
+
+/// Records at `path` that the identity belongs to `owner`'s package in
+/// its project, unless that is recorded already. A record that says the
+/// package left is of an earlier stay: the package is back, and keeps the
+/// identity. A run goes on without a record it couldn't write, and says
+/// what that leaves.
+pub(super) fn record_identity(path: &Path, owner: &IdentityOwner) {
+    let recorded = path.exists();
+    if recorded && !IdentityRecord::read(path).is_some_and(|record| record.left_behind) {
+        return;
+    }
+    let record = IdentityRecord {
+        version: IDENTITY_RECORD_VERSION,
+        project: owner.project.clone(),
+        package: owner.package.clone(),
+        left_behind: false,
+    };
+    let Err(error) = record.write(path) else {
+        return;
+    };
+    let (package, project) = (&owner.package, owner.project.display());
+    if recorded {
+        tracing::warn!(
+            target: "lpm_sandbox::helper_appcontainer",
+            "couldn't record that {package} is back in {project}, so the next `lpm cache clean` \
+             removes the sandbox access its scripts have there, and the run after that sets \
+             it up again: {error}",
+        );
+    } else {
+        tracing::warn!(
+            target: "lpm_sandbox::helper_appcontainer",
+            "couldn't record the sandbox identity of {package} in {project}, so removing the \
+             package won't remove the access its scripts had: {error}",
+        );
+    }
+}
+
+/// Removes the identity's record at `path` once the identity holds no
+/// access and has no profile.
+pub(super) fn forget_identity(path: &Path) -> Result<(), AppContainerError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AppContainerError::IdentityRecord {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 const HELD_NOTICE_AFTER_MS: u32 = 5_000;
@@ -794,21 +879,7 @@ mod tests {
         record_grants(&record, std::slice::from_ref(&tree)).unwrap();
         let profiles = profile_list().expect("the user's AppContainer profile list");
         assert_eq!(lists_profile(&profiles, sid.0), Some(true));
-        let args = crate::helper_protocol::parse_argv(
-            [
-                "--protocol-version",
-                &crate::helper_protocol::PROTOCOL_VERSION.to_string(),
-                "--appcontainer-name",
-                &name,
-                "--grant-record",
-                record.to_str().unwrap(),
-                "--revoke-only",
-                "--delete-appcontainer-profile",
-            ]
-            .into_iter()
-            .map(std::ffi::OsString::from),
-        )
-        .unwrap();
+        let args = revoke_only_args(&name, &record);
 
         assert_eq!(run_revoke_only(&args).unwrap(), 0);
 
@@ -816,6 +887,10 @@ mod tests {
         assert!(!grants(&tree.join("inner").join("file.txt"), sid.0));
         assert!(!record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(false));
+        assert!(
+            !identity_recorded_beside_path(&record).exists(),
+            "the identity's record goes with its profile"
+        );
     }
 
     /// Disables every privilege of this process until it drops, for a check
@@ -906,7 +981,10 @@ mod tests {
         }
     }
 
+    /// The release of the identity `name` whose grants `record` names. Its
+    /// identity record, beside the grant record, is written for it.
     fn revoke_only_args(name: &str, record: &Path) -> HelperArgs {
+        let identity_record = identity_recorded_beside(record);
         crate::helper_protocol::parse_argv(
             [
                 "--protocol-version",
@@ -915,6 +993,8 @@ mod tests {
                 name,
                 "--grant-record",
                 record.to_str().unwrap(),
+                "--identity-record",
+                identity_record.to_str().unwrap(),
                 "--revoke-only",
                 "--delete-appcontainer-profile",
             ]
@@ -922,6 +1002,70 @@ mod tests {
             .map(std::ffi::OsString::from),
         )
         .unwrap()
+    }
+
+    fn owner() -> IdentityOwner {
+        IdentityOwner {
+            project: PathBuf::from(r"C:\work\app"),
+            package: "@scope/pkg".to_owned(),
+        }
+    }
+
+    fn identity_recorded_beside_path(record: &Path) -> PathBuf {
+        record.with_extension("identity.json")
+    }
+
+    /// Records the identity whose grants `record` names beside it, as its
+    /// run would have, and says where.
+    fn identity_recorded_beside(record: &Path) -> PathBuf {
+        let path = identity_recorded_beside_path(record);
+        record_identity(&path, &owner());
+        path
+    }
+
+    #[test]
+    fn a_run_records_its_identity_once_and_again_when_its_package_is_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested").join("identity.json");
+
+        record_identity(&path, &owner());
+        let first = IdentityRecord::read(&path).expect("a record the run wrote");
+        let recorded = std::fs::read(&path).unwrap();
+        let elsewhere = IdentityOwner {
+            project: PathBuf::from(r"C:\elsewhere"),
+            package: "other".to_owned(),
+        };
+        record_identity(&path, &elsewhere);
+        let kept = std::fs::read(&path).unwrap();
+        IdentityRecord {
+            left_behind: true,
+            ..IdentityRecord::read(&path).unwrap()
+        }
+        .write(&path)
+        .unwrap();
+        record_identity(&path, &owner());
+        let back = IdentityRecord::read(&path).unwrap();
+
+        assert_eq!(first.project, owner().project);
+        assert_eq!(first.package, owner().package);
+        assert!(!first.left_behind);
+        assert_eq!(kept, recorded, "a recorded identity is left as it is");
+        assert!(
+            !back.left_behind,
+            "a package that is back keeps its identity"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_identity_removes_its_record_and_one_already_gone_is_forgotten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.json");
+        record_identity(&path, &owner());
+
+        forget_identity(&path).unwrap();
+        forget_identity(&path).unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1036,6 +1180,7 @@ mod tests {
         assert!(!grants(&tree.join("inner").join("file.txt"), sid.0));
         assert!(!record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(false));
+        assert!(!identity_recorded_beside_path(&record).exists());
         std::fs::remove_dir(&locked).unwrap();
     }
 
@@ -1066,6 +1211,7 @@ mod tests {
         assert!(grants(&locked, sid.0));
         assert!(record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        assert!(identity_recorded_beside_path(&record).exists());
         std::fs::remove_dir(&locked).unwrap();
     }
 
@@ -1102,11 +1248,13 @@ mod tests {
         assert!(!grants(&tree, sid.0));
         assert!(record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        assert!(identity_recorded_beside_path(&record).exists());
         std::fs::remove_dir(&locked).unwrap();
     }
 
     /// A record that can't be read may name trees still granted; the
-    /// profile and the record stay until one that can be read is cleaned up.
+    /// profile and both records stay until one that can be read is cleaned
+    /// up.
     #[test]
     fn a_cleanup_run_keeps_the_profile_when_its_record_can_t_be_read() {
         let name = unique_name("LpmIdentityUnreadable");
@@ -1125,6 +1273,7 @@ mod tests {
         );
         assert!(record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        assert!(identity_recorded_beside_path(&record).exists());
     }
 
     /// Part of a tree the cleanup can't list may hold the identity's grant,
@@ -1171,6 +1320,7 @@ mod tests {
         assert!(grants(&hidden.join("inner"), sid.0));
         assert!(record.exists());
         assert_eq!(lists_profile(&profiles, sid.0), Some(true));
+        assert!(identity_recorded_beside_path(&record).exists());
     }
 
     #[test]

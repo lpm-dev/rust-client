@@ -117,6 +117,8 @@ mod identity;
 mod processes;
 pub mod setup;
 
+pub(crate) use identity::{IDENTITY_RECORD_VERSION, IdentityRecord};
+
 /// `SE_GROUP_ENABLED` from winnt.h. The Attributes field of every
 /// `SID_AND_ATTRIBUTES` inside a `SECURITY_CAPABILITIES.Capabilities`
 /// array must carry this bit — otherwise the capability SID is
@@ -234,6 +236,16 @@ pub enum AppContainerError {
         /// The record.
         path: PathBuf,
         /// Filesystem error returned while writing or removing it.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Removing the record of which project and package a released
+    /// identity belonged to failed.
+    #[error("failed to remove the record of this package's sandbox identity {path}: {source}")]
+    IdentityRecord {
+        /// The record.
+        path: PathBuf,
+        /// Filesystem error returned while removing it.
         #[source]
         source: std::io::Error,
     },
@@ -689,6 +701,12 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     //    run of it changes its entries meanwhile. One without a grant
     //    record sets and removes them just the same.
     let _identity = identity::lock(&args.appcontainer_name, &caller)?;
+    // Recorded before the profile exists or holds anything, under the
+    // lock a release of the identity takes to remove the record, so the
+    // record outlasts whatever this run sets.
+    if let (Some(record), Some(owner)) = (&args.identity_record, &args.identity_owner) {
+        identity::record_identity(record, owner);
+    }
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
@@ -1218,7 +1236,9 @@ const HELD_IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(5
 
 /// Revokes every tree the grant record names from the identity, removes
 /// the record and, when asked, deletes the profile: the cleanup an
-/// identity gets once its package leaves the project.
+/// identity gets once its package leaves the project. The identity record
+/// goes last, while the identity is still held, so a run waiting for the
+/// identity records it again for what it then sets.
 pub fn run_revoke_only(args: &HelperArgs) -> Result<i32, AppContainerError> {
     let Some(record) = args.grant_record.as_deref() else {
         return Err(AppContainerError::GrantRecord {
@@ -1247,6 +1267,9 @@ pub fn run_revoke_only(args: &HelperArgs) -> Result<i32, AppContainerError> {
                 hresult,
             });
         }
+    }
+    if let Some(record) = &args.identity_record {
+        identity::forget_identity(record)?;
     }
     Ok(0)
 }
