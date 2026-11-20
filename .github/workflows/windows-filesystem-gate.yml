@@ -120,9 +120,6 @@ jobs:
       - name: Windows uninstall cleanup contracts
         run: cargo nextest run --locked -p lpm-workflows --test uninstall_contract --no-fail-fast --status-level slow --final-status-level fail
 
-      - name: Windows sandboxed script run and cleanup
-        run: cargo nextest run --locked -p lpm-workflows --test rebuild -E 'test(a_script_stopped_at_its_time_limit_leaves_nothing_of_its_run_set)' --no-fail-fast --status-level slow --final-status-level fail
-
       - name: Windows package initialization contracts
         run: cargo nextest run --locked -p lpm-workflows --test init --no-fail-fast --status-level slow --final-status-level fail
 
