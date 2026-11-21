@@ -70,6 +70,7 @@ pub(crate) struct ShallowPackageGuard {
     pub(crate) package_dir_mtime_nanos: i128,
     pub(crate) package_json_size: u64,
     pub(crate) package_json_mtime_nanos: i128,
+    pub(crate) package_dir_entry_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +86,8 @@ pub(crate) struct TreeSnapshot {
     pub(crate) package_json_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_json_mtime_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_dir_entry_count: Option<u64>,
 }
 
 impl TreeSnapshot {
@@ -98,6 +101,7 @@ impl TreeSnapshot {
             package_dir_mtime_nanos: self.package_dir_mtime_nanos?,
             package_json_size: self.package_json_size?,
             package_json_mtime_nanos: self.package_json_mtime_nanos?,
+            package_dir_entry_count: self.package_dir_entry_count,
         })
     }
 }
@@ -120,10 +124,25 @@ pub(crate) fn read_shallow_package_guard(package_dir: &Path) -> Option<ShallowPa
         return None;
     }
     let pkg_json_mtime = pkg_json_meta.modified().ok()?;
+    // NTFS directory mtimes quantize to coarse timer ticks, so a same-tick
+    // add/remove in `package_dir` can keep `dir_mtime` unchanged; count
+    // top-level entries on Windows to detect structural mutations reliably.
+    #[cfg(windows)]
+    let package_dir_entry_count = {
+        let mut count = 0u64;
+        for entry in std::fs::read_dir(package_dir).ok()? {
+            entry.ok()?;
+            count = count.checked_add(1)?;
+        }
+        Some(count)
+    };
+    #[cfg(not(windows))]
+    let package_dir_entry_count = None;
     Some(ShallowPackageGuard {
         package_dir_mtime_nanos: system_time_nanos(dir_mtime),
         package_json_size: pkg_json_meta.len(),
         package_json_mtime_nanos: system_time_nanos(pkg_json_mtime),
+        package_dir_entry_count,
     })
 }
 
@@ -1103,6 +1122,7 @@ fn write_tree_snapshot_fields(
         package_dir_mtime_nanos: shallow_guard.map(|guard| guard.package_dir_mtime_nanos),
         package_json_size: shallow_guard.map(|guard| guard.package_json_size),
         package_json_mtime_nanos: shallow_guard.map(|guard| guard.package_json_mtime_nanos),
+        package_dir_entry_count: shallow_guard.and_then(|guard| guard.package_dir_entry_count),
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
         LpmError::Store(format!(

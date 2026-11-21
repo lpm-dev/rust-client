@@ -6450,7 +6450,10 @@ fn staging_dir_names_are_recognized_only_with_their_random_suffix() {
 fn source_policy_reuses_link_entry_via_shallow_guard_and_skips_fresh_touch() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
-    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    assert_eq!(
+        store.object_integrity_policy(),
+        ObjectIntegrityPolicy::Source
+    );
     let sri = synthetic_sri(b"source_policy_shallow_guard_reuse");
     let object_dir = write_object(
         &store,
@@ -6502,7 +6505,10 @@ fn source_policy_reuses_link_entry_via_shallow_guard_and_skips_fresh_touch() {
 fn source_policy_repairs_link_entry_when_package_json_or_top_level_entry_changes() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
-    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    assert_eq!(
+        store.object_integrity_policy(),
+        ObjectIntegrityPolicy::Source
+    );
     let sri = synthetic_sri(b"source_policy_repairs_shallow_mutation");
     let object_dir = write_object(
         &store,
@@ -6557,7 +6563,10 @@ fn source_policy_repairs_link_entry_when_package_json_or_top_level_entry_changes
 fn source_policy_keeps_full_tree_verification_for_built_link_entries() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
-    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    assert_eq!(
+        store.object_integrity_policy(),
+        ObjectIntegrityPolicy::Source
+    );
     let sri = synthetic_sri(b"source_policy_built_entry_strict");
     let object_dir = write_object(
         &store,
@@ -6597,7 +6606,10 @@ fn source_policy_keeps_full_tree_verification_for_built_link_entries() {
 fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
-    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    assert_eq!(
+        store.object_integrity_policy(),
+        ObjectIntegrityPolicy::Source
+    );
     let sri = synthetic_sri(b"reused_link_entry_touches_after_cooldown");
     let object_dir = write_object(
         &store,
@@ -6619,13 +6631,22 @@ fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
     let first = store.populate_link_entry(request()).unwrap();
     let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
     let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-    filetime::set_file_mtime(&sidecar_path, filetime::FileTime::from_system_time(stale_time))
+    filetime::set_file_mtime(
+        &sidecar_path,
+        filetime::FileTime::from_system_time(stale_time),
+    )
+    .unwrap();
+    let before = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
         .unwrap();
-    let before = std::fs::metadata(&sidecar_path).unwrap().modified().unwrap();
 
     let reused = store.populate_link_entry(request()).unwrap();
     assert!(!reused.freshly_populated);
-    let after = std::fs::metadata(&sidecar_path).unwrap().modified().unwrap();
+    let after = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
     assert!(
         after > before,
         "sidecar older than cooldown must have its mtime refreshed on reuse"

@@ -3697,7 +3697,10 @@ fn link_entry_is_reusable(
     };
     let package_dir = link_entry_package_dir(dir, key);
     let source_shallow_eligible = source_policy_uses_source_integrity(object_dir, policy)
-        && package_dir.join(LINK_BUILD_MARKER).symlink_metadata().is_err();
+        && package_dir
+            .join(LINK_BUILD_MARKER)
+            .symlink_metadata()
+            .is_err();
     if source_shallow_eligible
         && let Some(snapshot) = read_tree_snapshot(dir)
         && snapshot.content_integrity == expected.as_ref()

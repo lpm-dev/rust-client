@@ -3103,7 +3103,9 @@ fn is_simple_http_url(value: &str) -> bool {
     let host = rest.split('/').next().unwrap_or("");
     !host.is_empty()
         && !rest.bytes().any(|byte| {
-            byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(byte, b'@' | b'?' | b'#' | b'\\')
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(byte, b'@' | b'?' | b'#' | b'\\')
         })
         && !host.starts_with('.')
         && !host.starts_with(':')

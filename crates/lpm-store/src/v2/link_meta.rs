@@ -267,21 +267,23 @@ impl LinkMeta {
         link_dir: &Path,
     ) -> Result<(Self, Option<std::time::SystemTime>), LpmError> {
         let path = link_dir.join(LINK_META_FILENAME);
-        let (bytes, metadata) =
-            lpm_common::read_text_file_capped_nofollow_with_metadata(&path, LINK_META_MAX_BYTES)
-                .map_err(|error| {
-                    LpmError::Store(match error {
-                        lpm_common::BoundedReadError::TooLarge { .. } => format!(
-                            "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
-                            path.display(),
-                            LINK_META_MAX_BYTES
-                        ),
-                        _ => format!(
-                            "failed to read virtual-store link sidecar at {}: {error}",
-                            path.display()
-                        ),
-                    })
-                })?;
+        let (bytes, metadata) = lpm_common::read_text_file_capped_nofollow_with_metadata(
+            &path,
+            LINK_META_MAX_BYTES,
+        )
+        .map_err(|error| {
+            LpmError::Store(match error {
+                lpm_common::BoundedReadError::TooLarge { .. } => format!(
+                    "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
+                    path.display(),
+                    LINK_META_MAX_BYTES
+                ),
+                _ => format!(
+                    "failed to read virtual-store link sidecar at {}: {error}",
+                    path.display()
+                ),
+            })
+        })?;
         let parsed: LinkMeta = serde_json::from_str(&bytes).map_err(|e| {
             LpmError::Store(format!(
                 "malformed virtual-store link sidecar at {}: {e}",
