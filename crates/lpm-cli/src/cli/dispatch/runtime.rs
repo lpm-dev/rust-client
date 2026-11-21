@@ -46,9 +46,12 @@ pub(in crate::cli) fn keep_state_ignored_at_exit() {
 }
 
 pub(super) fn run_async_main() -> Result<()> {
-    // Standalone and recursive installs poll large futures on different threads.
-    // Both need this stack budget for debug builds and large workspaces.
+    // Debug builds hold large unoptimized futures; release builds need far less
+    // stack and benefit from lower virtual/resident overhead across worker pools.
+    #[cfg(debug_assertions)]
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
+    #[cfg(not(debug_assertions))]
+    const ASYNC_STACK_BYTES: usize = 8 * 1024 * 1024;
     std::thread::Builder::new()
         .name("lpm-async-main".into())
         .stack_size(ASYNC_STACK_BYTES)

@@ -18,6 +18,14 @@ pub(super) fn package_baseline_dir_indexed(
     find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
 
+#[derive(serde::Deserialize)]
+struct LifecycleScriptsManifest {
+    #[serde(default)]
+    scripts: Option<serde_json::Value>,
+    #[serde(default)]
+    gypfile: Option<serde_json::Value>,
+}
+
 /// The install-time scripts of the package whose manifest is at
 /// `pkg_json_path`, as they run: those it names, and the native build it
 /// gets without naming one (see
@@ -36,15 +44,14 @@ pub(super) fn read_lifecycle_scripts(
             pkg_json_path.display(),
         )));
     }
-    let manifest: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(content)
-        .map_err(|error| {
-            lpm_common::LpmError::Store(format!(
-                "installed manifest {} is malformed: {error}",
-                pkg_json_path.display()
-            ))
-        })?;
+    let manifest: LifecycleScriptsManifest = serde_json::from_slice(content).map_err(|error| {
+        lpm_common::LpmError::Store(format!(
+            "installed manifest {} is malformed: {error}",
+            pkg_json_path.display()
+        ))
+    })?;
     let no_scripts = serde_json::Map::new();
-    let scripts = match manifest.get("scripts") {
+    let scripts = match manifest.scripts.as_ref() {
         Some(scripts) => scripts.as_object().ok_or_else(|| {
             lpm_common::LpmError::Store(format!(
                 "installed manifest {} is malformed: scripts must be an object",
@@ -69,12 +76,21 @@ pub(super) fn read_lifecycle_scripts(
         }
     }
 
+    let gypfile_disabled = manifest
+        .gypfile
+        .as_ref()
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
     if !lifecycle.contains_key("install")
+        && !lifecycle.contains_key("preinstall")
+        && !gypfile_disabled
         && let Some(package_dir) = pkg_json_path.parent()
-        && let Some(implied) =
-            lpm_security::native_build::implied_install_script(package_dir, &manifest)
+        && lpm_security::native_build::has_binding_gyp(package_dir)
     {
-        lifecycle.insert("install".to_string(), implied.to_string());
+        lifecycle.insert(
+            "install".to_string(),
+            lpm_security::native_build::IMPLIED_INSTALL_SCRIPT.to_string(),
+        );
     }
 
     if lifecycle.is_empty() {

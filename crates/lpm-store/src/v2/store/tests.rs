@@ -1271,15 +1271,18 @@ fn populate_is_idempotent_and_touches_last_referenced_at() {
     assert!(first.sidecar.is_some(), "fresh population returns sidecar");
     let first_sidecar = first.sidecar.unwrap();
     let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
+    // Backdate the sidecar past the touch cooldown and advance wall time so
+    // the reuse hit must refresh file mtime on every supported FS granularity.
+    let stale_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    filetime::set_file_mtime(
+        &sidecar_path,
+        filetime::FileTime::from_system_time(stale_mtime),
+    )
+    .unwrap();
     let mtime_before = std::fs::metadata(&sidecar_path)
         .unwrap()
         .modified()
         .unwrap();
-
-    // Sleep enough that the file mtime granularity advances on
-    // every supported FS — APFS resolves to ns, ext4 to ms, but
-    // some test runners hit FAT-style 1-s granularity. 1100 ms
-    // is the conservative floor.
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let second = populate_link_entry_source(&store, req()).unwrap();
@@ -1415,7 +1418,7 @@ fn populate_link_entry_rebuilds_stale_existing_entry() {
     let store = Store::at(dir.path());
 
     let sri = synthetic_sri(b"populate_link_entry_rebuilds_stale_existing_entry");
-    let object_dir = write_object(
+    let object_dir = write_tree_object(
         &store,
         &sri,
         &[
@@ -1432,17 +1435,21 @@ fn populate_link_entry_rebuilds_stale_existing_entry() {
         platform: Arc::new(sample_meta_platform()),
     };
 
-    let first = populate_link_entry_source(&store, request()).unwrap();
+    let first = store
+        .populate_link_entry_inner(request(), None, None, ObjectIntegrityPolicy::Tree)
+        .unwrap();
     let link_index = first.link_dir.join("node_modules/stale-link/index.js");
     std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
 
-    let second = populate_link_entry_source(&store, request()).unwrap();
+    let second = store
+        .populate_link_entry_inner(request(), None, None, ObjectIntegrityPolicy::Tree)
+        .unwrap();
 
     assert!(second.freshly_populated);
     assert_eq!(
         std::fs::read(link_index).unwrap(),
         b"module.exports = {};",
-        "stale link entry must be rebuilt from the verified object"
+        "stale link entry must be rebuilt from the verified object under Tree policy"
     );
 }
 
@@ -1452,7 +1459,7 @@ fn populate_link_entry_with_verified_object_rebuilds_stale_existing_entry() {
     let store = Store::at(dir.path());
 
     let sri = synthetic_sri(b"populate_link_entry_with_verified_object_rebuilds_stale");
-    let object_dir = write_object(
+    let object_dir = write_tree_object(
         &store,
         &sri,
         &[
@@ -1461,7 +1468,7 @@ fn populate_link_entry_with_verified_object_rebuilds_stale_existing_entry() {
         ],
     );
     let verified = store
-        .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+        .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Tree)
         .unwrap()
         .unwrap()
         .object_integrity;
@@ -1474,21 +1481,33 @@ fn populate_link_entry_with_verified_object_rebuilds_stale_existing_entry() {
         platform: Arc::new(sample_meta_platform()),
     };
 
-    let first =
-        populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
+    let first = store
+        .populate_link_entry_inner(
+            request(),
+            Some(&verified),
+            None,
+            ObjectIntegrityPolicy::Tree,
+        )
+        .unwrap();
     let link_index = first
         .link_dir
         .join("node_modules/verified-stale-link/index.js");
     std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
 
-    let second =
-        populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
+    let second = store
+        .populate_link_entry_inner(
+            request(),
+            Some(&verified),
+            None,
+            ObjectIntegrityPolicy::Tree,
+        )
+        .unwrap();
 
     assert!(second.freshly_populated);
     assert_eq!(
         std::fs::read(link_index).unwrap(),
         b"module.exports = {};",
-        "verified-object fast path must still rebuild stale link entries"
+        "verified-object fast path must still rebuild stale link entries under Tree policy"
     );
 }
 
@@ -6425,4 +6444,190 @@ fn staging_dir_names_are_recognized_only_with_their_random_suffix() {
         "tmp.0123456789abcdef"
     )));
     assert!(!crate::v2::is_staging_dir_name(OsStr::new("pkg@1.0.0")));
+}
+
+#[test]
+fn source_policy_reuses_link_entry_via_shallow_guard_and_skips_fresh_touch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    let sri = synthetic_sri(b"source_policy_shallow_guard_reuse");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"shallow-pkg","version":"1.0.0"}"#,
+            ),
+            ("index.js", b"module.exports = 1;\n"),
+        ],
+    );
+    let key = arc_key("shallow-pkg", "1.0.0");
+    let request = || LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri.clone(),
+        object_dir: object_dir.clone(),
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+
+    let first = store.populate_link_entry(request()).unwrap();
+    assert!(first.freshly_populated);
+    let snapshot = read_tree_snapshot(&first.link_dir).expect("tree snapshot");
+    assert!(
+        snapshot.shallow_guard().is_some(),
+        "fresh link snapshot must record shallow guard fields"
+    );
+
+    let reused = store.populate_link_entry(request()).unwrap();
+    assert!(!reused.freshly_populated);
+    assert_eq!(
+        reused.timings.touch_ns, 0,
+        "freshly populated sidecar within cooldown must skip redundant mtime touch"
+    );
+
+    let verified = store
+        .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+        .unwrap()
+        .unwrap()
+        .object_integrity;
+    let verified_reused =
+        populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
+    assert!(!verified_reused.freshly_populated);
+    assert_eq!(verified_reused.timings.touch_ns, 0);
+}
+
+#[test]
+fn source_policy_repairs_link_entry_when_package_json_or_top_level_entry_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    let sri = synthetic_sri(b"source_policy_repairs_shallow_mutation");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"guarded-pkg","version":"1.0.0"}"#,
+            ),
+            ("index.js", b"module.exports = 'ok';\n"),
+        ],
+    );
+    let key = arc_key("guarded-pkg", "1.0.0");
+    let request = || LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri.clone(),
+        object_dir: object_dir.clone(),
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+
+    let first = store.populate_link_entry(request()).unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+
+    // Mutate package.json size -> shallow guard must detect and repair.
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        br#"{"name":"guarded-pkg","version":"1.0.0","tampered":true}"#,
+    )
+    .unwrap();
+    let repaired = store.populate_link_entry(request()).unwrap();
+    assert!(
+        repaired.freshly_populated,
+        "package.json mutation must trigger repair under Source policy"
+    );
+    assert_eq!(
+        std::fs::read(pkg_dir.join("package.json")).unwrap(),
+        br#"{"name":"guarded-pkg","version":"1.0.0"}"#
+    );
+
+    // Delete top-level file (changes package_dir mtime) -> shallow guard must detect and repair.
+    std::fs::remove_file(pkg_dir.join("index.js")).unwrap();
+    let repaired_again = store.populate_link_entry(request()).unwrap();
+    assert!(
+        repaired_again.freshly_populated,
+        "top-level file removal must trigger repair under Source policy"
+    );
+    assert!(pkg_dir.join("index.js").is_file());
+}
+
+#[test]
+fn source_policy_keeps_full_tree_verification_for_built_link_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    let sri = synthetic_sri(b"source_policy_built_entry_strict");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            ("package.json", br#"{"name":"built-pkg","version":"1.0.0"}"#),
+            ("nested/sub/file.js", b"module.exports = 'pristine';\n"),
+        ],
+    );
+    let key = arc_key("built-pkg", "1.0.0");
+    let request = || LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri.clone(),
+        object_dir: object_dir.clone(),
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+
+    let first = store.populate_link_entry(request()).unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    // Mark as lifecycle-built and mutate a nested file; shallow guard must be bypassed.
+    std::fs::write(pkg_dir.join(".lpm-built"), b"built").unwrap();
+    std::fs::write(pkg_dir.join("nested/sub/file.js"), b"tampered").unwrap();
+
+    let repaired = store.populate_link_entry(request()).unwrap();
+    assert!(
+        repaired.freshly_populated,
+        "built link entry must bypass shallow guard and repair nested tampering"
+    );
+    assert_eq!(
+        std::fs::read(pkg_dir.join("nested/sub/file.js")).unwrap(),
+        b"module.exports = 'pristine';\n"
+    );
+}
+
+#[test]
+fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    assert_eq!(store.object_integrity_policy(), ObjectIntegrityPolicy::Source);
+    let sri = synthetic_sri(b"reused_link_entry_touches_after_cooldown");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[(
+            "package.json",
+            br#"{"name":"cooldown-pkg","version":"1.0.0"}"#,
+        )],
+    );
+    let key = arc_key("cooldown-pkg", "1.0.0");
+    let request = || LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri.clone(),
+        object_dir: object_dir.clone(),
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+
+    let first = store.populate_link_entry(request()).unwrap();
+    let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
+    let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    filetime::set_file_mtime(&sidecar_path, filetime::FileTime::from_system_time(stale_time))
+        .unwrap();
+    let before = std::fs::metadata(&sidecar_path).unwrap().modified().unwrap();
+
+    let reused = store.populate_link_entry(request()).unwrap();
+    assert!(!reused.freshly_populated);
+    let after = std::fs::metadata(&sidecar_path).unwrap().modified().unwrap();
+    assert!(
+        after > before,
+        "sidecar older than cooldown must have its mtime refreshed on reuse"
+    );
 }

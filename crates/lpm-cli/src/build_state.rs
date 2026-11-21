@@ -987,7 +987,14 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     };
 
     let walk_start = std::time::Instant::now();
-    let rows: Result<Vec<_>, LpmError> = installed.par_iter().map(per_pkg).collect();
+    // Avoid initializing Rayon's global thread pool for typical installs;
+    // sequential scanning takes < 1 ms and avoids ~8-15 MiB thread-pool RSS.
+    const PARALLEL_BLOCKED_SCAN_THRESHOLD: usize = 512;
+    let rows: Result<Vec<_>, LpmError> = if installed.len() >= PARALLEL_BLOCKED_SCAN_THRESHOLD {
+        installed.par_iter().map(per_pkg).collect()
+    } else {
+        installed.iter().map(per_pkg).collect()
+    };
     let mut blocked: Vec<BlockedPackage> = rows?.into_iter().flatten().collect();
     tracing::debug!(
         "perf.post_install_walk pkgs={} ms={}",

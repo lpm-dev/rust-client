@@ -274,34 +274,77 @@ pub(super) async fn prevalidate_v2_reusable_objects(
         });
     }
 
-    let unique_candidates: HashSet<String> = candidates.into_iter().map(str::to_owned).collect();
-    let candidate_count = unique_candidates.len();
-    let concurrency = v2_cache_check_concurrency(candidate_count);
-    let validation_batch = store_v2.reusable_object_validation_batch();
-    let mut checks = futures::stream::iter(unique_candidates.into_iter().map(|sri| {
-        let store_v2 = Arc::clone(&store_v2);
-        let validation_batch = validation_batch.clone();
-        async move {
-            tokio::task::spawn_blocking(move || {
-                store_v2
-                    .reusable_object_with_timings_in_batch(&sri, &validation_batch)
-                    .map(|(hit, timings)| (sri, hit, timings))
-            })
-            .await
-            .map_err(|error| {
-                LpmError::Registry(format!("virtual-store cache check task panicked: {error}"))
-            })?
+    let unique_candidates: Vec<String> = {
+        let mut seen = HashSet::with_capacity(candidates.len());
+        let mut unique = Vec::with_capacity(candidates.len());
+        for sri in candidates {
+            if seen.insert(sri) {
+                unique.push(sri.to_owned());
+            }
         }
-    }))
-    .buffer_unordered(concurrency);
-
+        unique
+    };
+    let candidate_count = unique_candidates.len();
+    let validation_batch = store_v2.reusable_object_validation_batch();
     let mut hits = HashMap::with_capacity(candidate_count);
     let mut validation_timings = V2ReusableValidationTimings::default();
-    while let Some(result) = checks.next().await {
-        let (sri, hit, timings) = result?;
-        validation_timings.record(timings, hit.is_some());
-        if let Some(hit) = hit {
-            hits.insert(sri, hit);
+
+    // Under Source policy each check is a single stat + tiny sidecar read (~10 µs),
+    // so fanning out up to 16 blocking threads adds thread/arena RSS for no wall gain.
+    let inline_source_check = store_v2.object_integrity_policy()
+        == lpm_store::v2::ObjectIntegrityPolicy::Source
+        && candidate_count <= 256;
+    let concurrency = if inline_source_check {
+        1
+    } else {
+        v2_cache_check_concurrency(candidate_count)
+    };
+
+    if inline_source_check {
+        let store_v2 = Arc::clone(&store_v2);
+        let results = tokio::task::spawn_blocking(move || {
+            let mut batch_results = Vec::with_capacity(unique_candidates.len());
+            for sri in unique_candidates {
+                let (hit, timings) =
+                    store_v2.reusable_object_with_timings_in_batch(&sri, &validation_batch)?;
+                batch_results.push((sri, hit, timings));
+            }
+            Ok::<_, LpmError>(batch_results)
+        })
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("virtual-store cache check task panicked: {error}"))
+        })??;
+        for (sri, hit, timings) in results {
+            validation_timings.record(timings, hit.is_some());
+            if let Some(hit) = hit {
+                hits.insert(sri, hit);
+            }
+        }
+    } else {
+        let mut checks = futures::stream::iter(unique_candidates.into_iter().map(|sri| {
+            let store_v2 = Arc::clone(&store_v2);
+            let validation_batch = validation_batch.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    store_v2
+                        .reusable_object_with_timings_in_batch(&sri, &validation_batch)
+                        .map(|(hit, timings)| (sri, hit, timings))
+                })
+                .await
+                .map_err(|error| {
+                    LpmError::Registry(format!("virtual-store cache check task panicked: {error}"))
+                })?
+            }
+        }))
+        .buffer_unordered(concurrency);
+
+        while let Some(result) = checks.next().await {
+            let (sri, hit, timings) = result?;
+            validation_timings.record(timings, hit.is_some());
+            if let Some(hit) = hit {
+                hits.insert(sri, hit);
+            }
         }
     }
     let hit_count = hits.len();

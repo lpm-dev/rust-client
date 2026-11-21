@@ -3078,7 +3078,10 @@ pub(super) fn locked_registry_source_matches_url(
     }
 }
 
-fn registry_base_urls_match(left: &str, right: &str) -> bool {
+pub(super) fn registry_base_urls_match(left: &str, right: &str) -> bool {
+    if left == right && is_simple_http_url(left) {
+        return true;
+    }
     let (Ok(left), Ok(right)) = (reqwest::Url::parse(left), reqwest::Url::parse(right)) else {
         return false;
     };
@@ -3088,6 +3091,23 @@ fn registry_base_urls_match(left: &str, right: &str) -> bool {
         && left.path().trim_end_matches('/') == right.path().trim_end_matches('/')
         && left.query() == right.query()
         && left.fragment() == right.fragment()
+}
+
+fn is_simple_http_url(value: &str) -> bool {
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    !host.is_empty()
+        && !rest.bytes().any(|byte| {
+            byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(byte, b'@' | b'?' | b'#' | b'\\')
+        })
+        && !host.starts_with('.')
+        && !host.starts_with(':')
+        && !host.ends_with(':')
 }
 
 #[derive(Clone, Copy)]

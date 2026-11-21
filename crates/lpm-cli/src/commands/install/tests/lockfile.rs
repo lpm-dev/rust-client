@@ -2802,3 +2802,48 @@ fn a_package_that_records_no_tarball_url_is_never_reported_as_refreshed() {
 
     assert!(urls_other_than_locked(std::iter::once(&row), &served).is_empty());
 }
+
+#[test]
+fn registry_base_urls_match_fast_path_accepts_equal_origins_and_rejects_malformed_urls() {
+    assert!(registry_base_urls_match(
+        "https://registry.npmjs.org",
+        "https://registry.npmjs.org"
+    ));
+    assert!(registry_base_urls_match(
+        "https://registry.npmjs.org/",
+        "https://registry.npmjs.org"
+    ));
+    assert!(registry_base_urls_match(
+        "http://127.0.0.1:4873/npm",
+        "http://127.0.0.1:4873/npm"
+    ));
+    assert!(!registry_base_urls_match(
+        "https://registry.npmjs.org",
+        "https://registry.example.test"
+    ));
+    assert!(!registry_base_urls_match("not a url", "not a url"));
+    assert!(!registry_base_urls_match("https://", "https://"));
+}
+
+#[test]
+fn platform_filter_prunes_unreachable_transitive_optional_before_engine_overlap() {
+    let registry_source = "registry+https://registry.npmjs.org";
+    let mut root = filter_fixture_package("app-dep", registry_source, Some("app-dep"), false);
+    root.dependencies
+        .push(("wrong-os-opt".to_string(), "1.0.0".to_string()));
+    let mut wrong_os = filter_fixture_package("wrong-os-opt", registry_source, None, true);
+    wrong_os.platform = Some(lpm_resolver::PlatformMeta {
+        os: vec!["__lpm_no_such_os__".to_string()],
+        cpu: Vec::new(),
+        libc: Vec::new(),
+    });
+    wrong_os
+        .dependencies
+        .push(("dead-runtime".to_string(), "1.0.0".to_string()));
+    let dead_runtime = filter_fixture_package("dead-runtime", registry_source, None, false);
+
+    let mut packages = vec![root, wrong_os, dead_runtime];
+    assert_eq!(filter_platform_packages(&mut packages).unwrap(), 1);
+    let remaining: Vec<&str> = packages.iter().map(|pkg| pkg.name.as_str()).collect();
+    assert_eq!(remaining, vec!["app-dep"]);
+}

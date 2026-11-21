@@ -65,6 +65,13 @@ pub(crate) fn object_integrity_policy_from_env() -> ObjectIntegrityPolicy {
     ObjectIntegrityPolicy::from_env_value(std::env::var(ENV_V2_OBJECT_INTEGRITY).ok().as_deref())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShallowPackageGuard {
+    pub(crate) package_dir_mtime_nanos: i128,
+    pub(crate) package_json_size: u64,
+    pub(crate) package_json_mtime_nanos: i128,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TreeSnapshot {
     pub(crate) schema: u32,
@@ -72,6 +79,12 @@ pub(crate) struct TreeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) layout_content_integrity: Option<String>,
     pub(crate) metadata_integrity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_dir_mtime_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_json_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_json_mtime_nanos: Option<i128>,
 }
 
 impl TreeSnapshot {
@@ -79,6 +92,39 @@ impl TreeSnapshot {
         TreeContentSchema::from_snapshot_schema(self.schema)
             .unwrap_or(TreeContentSchema::SequentialV1)
     }
+
+    pub(crate) fn shallow_guard(&self) -> Option<ShallowPackageGuard> {
+        Some(ShallowPackageGuard {
+            package_dir_mtime_nanos: self.package_dir_mtime_nanos?,
+            package_json_size: self.package_json_size?,
+            package_json_mtime_nanos: self.package_json_mtime_nanos?,
+        })
+    }
+}
+
+fn system_time_nanos(time: std::time::SystemTime) -> i128 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    }
+}
+
+pub(crate) fn read_shallow_package_guard(package_dir: &Path) -> Option<ShallowPackageGuard> {
+    let dir_meta = std::fs::symlink_metadata(package_dir).ok()?;
+    if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
+        return None;
+    }
+    let dir_mtime = dir_meta.modified().ok()?;
+    let pkg_json_meta = std::fs::symlink_metadata(package_dir.join("package.json")).ok()?;
+    if !pkg_json_meta.is_file() || pkg_json_meta.file_type().is_symlink() {
+        return None;
+    }
+    let pkg_json_mtime = pkg_json_meta.modified().ok()?;
+    Some(ShallowPackageGuard {
+        package_dir_mtime_nanos: system_time_nanos(dir_mtime),
+        package_json_size: pkg_json_meta.len(),
+        package_json_mtime_nanos: system_time_nanos(pkg_json_mtime),
+    })
 }
 
 /// Object digest validated according to the active integrity policy.
@@ -931,6 +977,52 @@ pub(crate) fn write_tree_snapshot_best_effort(dir: &Path, integrities: &TreeInte
     }
 }
 
+pub(crate) fn write_link_tree_snapshot_best_effort(
+    dir: &Path,
+    package_dir: &Path,
+    integrities: &TreeIntegrities,
+) {
+    let shallow_guard = read_shallow_package_guard(package_dir);
+    if let Err(error) = write_tree_snapshot_fields(
+        dir,
+        integrities.content_schema,
+        &integrities.content,
+        None,
+        &integrities.metadata,
+        shallow_guard,
+        false,
+    ) {
+        tracing::debug!(
+            target = %dir.display(),
+            "virtual store: failed to refresh link tree snapshot: {error}"
+        );
+    }
+}
+
+pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
+    dir: &Path,
+    package_dir: &Path,
+    snapshot: &TreeSnapshot,
+) {
+    let Some(shallow_guard) = read_shallow_package_guard(package_dir) else {
+        return;
+    };
+    if let Err(error) = write_tree_snapshot_fields(
+        dir,
+        snapshot.content_schema(),
+        &snapshot.content_integrity,
+        snapshot.layout_content_integrity.as_deref(),
+        &snapshot.metadata_integrity,
+        Some(shallow_guard),
+        false,
+    ) {
+        tracing::debug!(
+            target = %dir.display(),
+            "virtual store: failed to stamp shallow guard on link tree snapshot: {error}"
+        );
+    }
+}
+
 pub(crate) fn write_tree_snapshot(
     dir: &Path,
     integrities: &TreeIntegrities,
@@ -941,6 +1033,24 @@ pub(crate) fn write_tree_snapshot(
         &integrities.content,
         None,
         &integrities.metadata,
+        None,
+        false,
+    )
+}
+
+pub(crate) fn write_link_tree_snapshot_unpublished(
+    dir: &Path,
+    package_dir: &Path,
+    integrities: &TreeIntegrities,
+) -> Result<(), LpmError> {
+    write_tree_snapshot_fields(
+        dir,
+        integrities.content_schema,
+        &integrities.content,
+        None,
+        &integrities.metadata,
+        read_shallow_package_guard(package_dir),
+        true,
     )
 }
 
@@ -955,6 +1065,24 @@ pub(crate) fn write_tree_snapshot_with_layout_content(
         source_content_integrity,
         Some(&layout_integrities.content),
         &layout_integrities.metadata,
+        None,
+        false,
+    )
+}
+
+pub(crate) fn write_tree_snapshot_with_layout_content_unpublished(
+    dir: &Path,
+    source_content_integrity: &str,
+    layout_integrities: &TreeIntegrities,
+) -> Result<(), LpmError> {
+    write_tree_snapshot_fields(
+        dir,
+        layout_integrities.content_schema,
+        source_content_integrity,
+        Some(&layout_integrities.content),
+        &layout_integrities.metadata,
+        None,
+        true,
     )
 }
 
@@ -964,12 +1092,17 @@ fn write_tree_snapshot_fields(
     content_integrity: &str,
     layout_content_integrity: Option<&str>,
     metadata_integrity: &str,
+    shallow_guard: Option<ShallowPackageGuard>,
+    unpublished: bool,
 ) -> Result<(), LpmError> {
     let snapshot = TreeSnapshot {
         schema: content_schema.snapshot_schema(),
         content_integrity: content_integrity.to_owned(),
         layout_content_integrity: layout_content_integrity.map(str::to_owned),
         metadata_integrity: metadata_integrity.to_owned(),
+        package_dir_mtime_nanos: shallow_guard.map(|guard| guard.package_dir_mtime_nanos),
+        package_json_size: shallow_guard.map(|guard| guard.package_json_size),
+        package_json_mtime_nanos: shallow_guard.map(|guard| guard.package_json_mtime_nanos),
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
         LpmError::Store(format!(
@@ -977,12 +1110,33 @@ fn write_tree_snapshot_fields(
         ))
     })?;
     let final_path = dir.join(TREE_SNAPSHOT_FILENAME);
-    write_file_atomic(&final_path, bytes).map_err(|error| {
-        LpmError::Store(format!(
-            "failed to atomically install virtual-store tree snapshot at {}: {error}",
-            final_path.display()
-        ))
-    })
+    if unpublished {
+        use std::io::Write as _;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&final_path)
+            .map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to write virtual-store tree snapshot at {}: {error}",
+                    final_path.display()
+                ))
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to write virtual-store tree snapshot at {}: {error}",
+                final_path.display()
+            ))
+        })
+    } else {
+        write_file_atomic(&final_path, bytes).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to atomically install virtual-store tree snapshot at {}: {error}",
+                final_path.display()
+            ))
+        })
+    }
 }
 
 pub(crate) fn read_object_integrity(dir: &Path) -> Result<String, LpmError> {

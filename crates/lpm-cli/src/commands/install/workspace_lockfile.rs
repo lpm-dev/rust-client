@@ -264,17 +264,31 @@ impl WorkspaceLockfileCoordinator {
                 .filter(|importer| !existing_projection_metadata.contains_key(*importer))
                 .collect::<Vec<_>>()
         };
-        let projections = missing
-            .into_par_iter()
-            .map(|importer| {
-                #[cfg(test)]
-                self.projection_materializations
-                    .fetch_add(1, Ordering::Relaxed);
-                existing
-                    .project_importer_metadata(importer)
-                    .map(|lockfile| (importer.to_string(), Arc::new(lockfile)))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let projections = if missing.len() >= 16 {
+            missing
+                .into_par_iter()
+                .map(|importer| {
+                    #[cfg(test)]
+                    self.projection_materializations
+                        .fetch_add(1, Ordering::Relaxed);
+                    existing
+                        .project_importer_metadata(importer)
+                        .map(|lockfile| (importer.to_string(), Arc::new(lockfile)))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            missing
+                .into_iter()
+                .map(|importer| {
+                    #[cfg(test)]
+                    self.projection_materializations
+                        .fetch_add(1, Ordering::Relaxed);
+                    existing
+                        .project_importer_metadata(importer)
+                        .map(|lockfile| (importer.to_string(), Arc::new(lockfile)))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         self.existing_projection_metadata
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1211,7 +1225,14 @@ pub(super) fn active_lockfile_snapshot(project_dir: &Path) -> ActiveLockfileSnap
         )
     });
     let content = project
-        .and_then(|project| project.lockfile.to_toml())
+        .and_then(|project| {
+            if project.workspace_root.is_none() && !project.content.contains("[workspace-packages")
+            {
+                Ok(project.content)
+            } else {
+                project.lockfile.to_toml()
+            }
+        })
         .unwrap_or_default();
     ActiveLockfileSnapshot {
         path,

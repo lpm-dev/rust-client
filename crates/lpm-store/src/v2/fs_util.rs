@@ -111,6 +111,48 @@ pub(crate) fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn ensured_store_tiers() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENSURED: LazyLock<Mutex<HashSet<PathBuf>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    &ENSURED
+}
+
+/// [`ensure_store_tier_dir_locked`] memoized once per process so hot per-package
+/// callers avoid repeating `lstat` and macOS `acl_get_link_np` on the same tier
+/// directory. Kept distinct from [`harden_store_tier_once`] so baseline-lookup
+/// hardening still runs independently when reading an existing tier. Callers
+/// that subsequently observe `NotFound` call [`invalidate_hardened_store_tier`]
+/// and retry.
+pub(crate) fn ensure_store_tier_dir_locked_once(path: &Path) -> std::io::Result<()> {
+    use std::sync::PoisonError;
+
+    if ensured_store_tiers()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(path)
+    {
+        return Ok(());
+    }
+    ensure_store_tier_dir_locked(path)?;
+    ensured_store_tiers()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    Ok(())
+}
+
+pub(crate) fn invalidate_hardened_store_tier(path: &Path) {
+    use std::sync::PoisonError;
+
+    ensured_store_tiers()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(path);
+}
+
 /// [`ensure_store_tier_dir_locked`] for an existing tier a reuse reads,
 /// which an earlier release may have left open to others, once per process:
 /// later reuses from the same tier check nothing. A missing tier is left

@@ -3343,8 +3343,8 @@ async fn warm_installs_parse_the_lockfile_and_index_the_store_once() {
         "a warm install must read lpm.lock from several phases: {warm:#}"
     );
     assert_eq!(
-        warm["tail"]["baseline_index_build_count"], 1,
-        "a warm install indexed the installed tree more than once: {warm:#}"
+        warm["tail"]["baseline_index_build_count"], 0,
+        "an unpatched warm install should build its baseline index in memory without walking disk: {warm:#}"
     );
 }
 
