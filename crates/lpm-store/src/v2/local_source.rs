@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::SecurityAnalysisPolicy;
 use lpm_common::LpmError;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use sha2::{Digest, Sha256};
 
 use super::fs_util::{create_fs_symlink, ensure_store_tier_dir_locked, tmp_sibling};
@@ -68,15 +68,107 @@ pub(crate) fn compute_local_source_fingerprint(
     ))))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn compute_local_source_fingerprint(
+    source_root: &Path,
+) -> Result<Option<LocalSourceFingerprint>, LpmError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-local-source-win-v1\0");
+    hash_local_source_metadata_windows(source_root, &mut hasher, 0)?;
+    Ok(Some(LocalSourceFingerprint(format!(
+        "sha256-{}",
+        hex::encode(hasher.finalize())
+    ))))
+}
+
+#[cfg(not(any(unix, windows)))]
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "matches the Unix implementation, which walks the source"
+    reason = "matches the Unix/Windows implementation, which walks the source"
 )]
 pub(crate) fn compute_local_source_fingerprint(
     _source_root: &Path,
 ) -> Result<Option<LocalSourceFingerprint>, LpmError> {
     Ok(None)
+}
+
+#[cfg(windows)]
+fn hash_local_source_metadata_windows(
+    source_dir: &Path,
+    hasher: &mut Sha256,
+    depth: usize,
+) -> Result<(), LpmError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
+        return Err(LpmError::Store(format!(
+            "virtual-store local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            source_dir.display()
+        )));
+    }
+
+    let entries =
+        read_snapshot_entries(source_dir, |_, name| is_excluded_local_source_entry(name))?;
+    let mut source_path = source_dir.to_path_buf();
+    for entry in entries {
+        let name: Vec<u8> = entry
+            .name
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(&name);
+        source_path.push(&entry.name);
+        let file_type = entry.metadata.file_type();
+        if lpm_common::is_symlink_or_junction(&entry.metadata) {
+            hasher.update(*b"l");
+            hash_windows_file_metadata(hasher, &entry.metadata);
+            let resolved = source_path
+                .canonicalize()
+                .unwrap_or_else(|_| source_path.clone());
+            match std::fs::metadata(&resolved) {
+                Ok(metadata) if metadata.is_file() => {
+                    hasher.update(*b"f");
+                    hash_windows_file_metadata(hasher, &metadata);
+                }
+                _ => {
+                    hasher.update(*b"l");
+                    let target: Vec<u8> = resolved
+                        .as_os_str()
+                        .encode_wide()
+                        .flat_map(u16::to_le_bytes)
+                        .collect();
+                    hasher.update(
+                        u64::try_from(target.len())
+                            .unwrap_or(u64::MAX)
+                            .to_le_bytes(),
+                    );
+                    hasher.update(&target);
+                }
+            }
+        } else if file_type.is_dir() {
+            hasher.update(*b"d");
+            hash_local_source_metadata_windows(&source_path, hasher, depth + 1)?;
+        } else if file_type.is_file() {
+            hasher.update(*b"f");
+            hash_windows_file_metadata(hasher, &entry.metadata);
+        } else {
+            hasher.update(*b"o");
+            hash_windows_file_metadata(hasher, &entry.metadata);
+        }
+        source_path.pop();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hash_windows_file_metadata(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
+    use std::os::windows::fs::MetadataExt;
+
+    hasher.update(metadata.file_size().to_le_bytes());
+    hasher.update(metadata.file_attributes().to_le_bytes());
+    hasher.update(metadata.creation_time().to_le_bytes());
+    hasher.update(metadata.last_write_time().to_le_bytes());
 }
 
 #[cfg(unix)]

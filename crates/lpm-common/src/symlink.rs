@@ -236,14 +236,26 @@ fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::Result<()> {
-    let link = with_backslashes(link);
-    let abs_target = absolute_windows_link_target(&with_backslashes(target), &link)?;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Try symlink_dir first — works without admin on Windows setups
-    // running with Developer Mode or with the SeCreateSymbolicLink
-    // privilege granted via group policy.
-    if std::os::windows::fs::symlink_dir(&abs_target, &link).is_ok() {
-        return Ok(());
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    static SYMLINK_DIR_PRIVILEGE_MISSING: AtomicBool = AtomicBool::new(false);
+
+    let link = with_backslashes(link);
+    let target = with_backslashes(target);
+    let abs_target = absolute_windows_link_target(&target, &link)?;
+
+    if !SYMLINK_DIR_PRIVILEGE_MISSING.load(Ordering::Relaxed) {
+        // Try symlink_dir first — works without admin on Windows setups
+        // running with Developer Mode or with the SeCreateSymbolicLink
+        // privilege granted via group policy.
+        match std::os::windows::fs::symlink_dir(&abs_target, &link) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                SYMLINK_DIR_PRIVILEGE_MISSING.store(true, Ordering::Relaxed);
+            }
+            Err(_) => {}
+        }
     }
     create_junction(&abs_target, &link)
 }
@@ -253,9 +265,17 @@ fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::
 /// prefix, where it would be part of a name, and no Windows file name may
 /// hold one, so the backslash means the same in every form.
 #[cfg(windows)]
-fn with_backslashes(path: &Path) -> PathBuf {
+fn with_backslashes(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
+    if !path
+        .as_os_str()
+        .encode_wide()
+        .any(|unit| unit == u16::from(b'/'))
+    {
+        return Cow::Borrowed(path);
+    }
     let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
@@ -267,7 +287,7 @@ fn with_backslashes(path: &Path) -> PathBuf {
             }
         })
         .collect();
-    PathBuf::from(std::ffi::OsString::from_wide(&wide))
+    Cow::Owned(PathBuf::from(std::ffi::OsString::from_wide(&wide)))
 }
 
 /// Creates `link` as an NTFS junction to the absolute `target`. A junction
