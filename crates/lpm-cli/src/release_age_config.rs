@@ -292,24 +292,44 @@ impl ReleaseAgeResolver {
         json_output: bool,
     ) -> Result<ReleaseAgeConfig, LpmError> {
         let global = crate::commands::config::GlobalConfig::load_checked()?;
+        Self::resolve_config_with_context(
+            &global,
+            None,
+            project_dir,
+            cli_override,
+            cli_exclude,
+            json_output,
+        )
+    }
+
+    pub(crate) fn resolve_config_with_context(
+        global: &crate::commands::config::GlobalConfig,
+        package: Option<&lpm_workspace::PackageJson>,
+        project_dir: &Path,
+        cli_override: Option<u64>,
+        cli_exclude: &[String],
+        json_output: bool,
+    ) -> Result<ReleaseAgeConfig, LpmError> {
         let effective_authorized = crate::security_approval::load_effective_authorized_posture()?;
         let authorized_floor = effective_authorized.posture.minimum_release_age_secs();
         let authorized_policy = effective_authorized.posture.release_age_policy();
-        let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
-        let floor = crate::security_floor::current_release_age_floor_secs(&global);
-        let policy_floor = crate::security_floor::current_release_age_policy_floor(&global);
+        let force_security_floor = crate::security_floor::force_security_floor_enabled(global);
+        let floor = crate::security_floor::current_release_age_floor_secs(global);
+        let policy_floor = crate::security_floor::current_release_age_policy_floor(global);
         let mut minimum_release_age_exclude =
             validate_release_age_excludes("--min-release-age-exclude", cli_exclude)?;
 
-        let package_config =
-            read_package_json_release_age_config(&project_dir.join("package.json"))?
-                .unwrap_or_default();
+        let package_config = match package {
+            Some(pkg) => package_release_age_config_from_package(pkg)?,
+            None => read_package_json_release_age_config(&project_dir.join("package.json"))?,
+        }
+        .unwrap_or_default();
         extend_unique_excludes(
             &mut minimum_release_age_exclude,
             package_config.minimum_release_age_exclude,
         );
         let global_release_age_config = match global_config_path() {
-            Some(path) => match read_global_release_age_config_from_file(&path) {
+            Some(path) => match parse_global_release_age_config_from_table(&path, global.table()) {
                 Ok(mut config) => {
                     ensure_global_release_age_excludes_authorized(
                         &effective_authorized,
@@ -566,13 +586,10 @@ fn global_config_path() -> Option<PathBuf> {
         .map(|root| root.root().join("config.toml"))
 }
 
-fn read_package_json_release_age_config(
-    pkg_json_path: &Path,
+fn package_release_age_config_from_package(
+    pkg: &lpm_workspace::PackageJson,
 ) -> Result<Option<PackageReleaseAgeConfig>, LpmError> {
-    let Ok(pkg) = lpm_workspace::read_package_json(pkg_json_path) else {
-        return Ok(None);
-    };
-    let Some(lpm) = pkg.lpm else {
+    let Some(lpm) = pkg.lpm.as_ref() else {
         return Ok(None);
     };
     Ok(Some(PackageReleaseAgeConfig {
@@ -587,6 +604,15 @@ fn read_package_json_release_age_config(
             .map(|raw| ReleaseAgePolicy::parse("package.json lpm.minimumReleaseAgePolicy", raw))
             .transpose()?,
     }))
+}
+
+fn read_package_json_release_age_config(
+    pkg_json_path: &Path,
+) -> Result<Option<PackageReleaseAgeConfig>, LpmError> {
+    let Ok(pkg) = lpm_workspace::read_package_json(pkg_json_path) else {
+        return Ok(None);
+    };
+    package_release_age_config_from_package(&pkg)
 }
 
 /// Read `minimum-release-age-secs` from a `~/.lpm/config.toml` at `path`.
@@ -605,6 +631,7 @@ fn read_global_min_age_from_file(path: &Path) -> Result<Option<u64>, LpmError> {
     Ok(read_global_release_age_config_from_file(path)?.minimum_release_age_secs)
 }
 
+#[cfg(test)]
 fn read_global_release_age_config_from_file(
     path: &Path,
 ) -> Result<GlobalReleaseAgeConfig, LpmError> {
@@ -627,6 +654,13 @@ fn read_global_release_age_config_from_file(
             )));
         }
     };
+    parse_global_release_age_config_from_table(path, &table)
+}
+
+fn parse_global_release_age_config_from_table(
+    path: &Path,
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<GlobalReleaseAgeConfig, LpmError> {
     let minimum_release_age_secs = match table.get(GLOBAL_KEY) {
         Some(value) => Some(parse_global_min_age_value(path, value)?),
         None => None,

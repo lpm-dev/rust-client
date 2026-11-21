@@ -7,13 +7,58 @@ pub(super) fn write_post_install_hash(
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
+    write_post_install_hash_with_proof(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        security_analysis_policy,
+        dependency_engine_policy,
+        None,
+    );
+}
+
+pub(super) struct PostInstallSyncNoopProofContext<'a> {
+    pub(super) package: &'a lpm_workspace::PackageJson,
+    pub(super) lockfile: &'a lpm_lockfile::Lockfile,
+    pub(super) routes: &'a lpm_registry::RouteTable,
+    pub(super) auto_install_peers: bool,
+}
+
+pub(super) fn write_post_install_hash_with_proof(
+    project_dir: &Path,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
+    dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
+    proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
+) {
     let lock = workspace_lockfile::active_lockfile_snapshot(project_dir);
     let dependency_engine_key = dependency_engine_policy.freshness_key(&lock.content);
     let node_runtime_fingerprint = match dependency_engine_key.as_str() {
         "none" | "legacy" => None,
         _ => dependency_engine_policy.resolved_node_runtime_fingerprint(),
     };
-    if let Err(e) = write_post_install_hash_with_context(
+    let sync_noop_proof = proof_context.and_then(|ctx| {
+        if lock.path != project_dir.join(lpm_lockfile::LOCKFILE_NAME)
+            || crate::install_state::has_pnpm_workspace_yaml(project_dir)
+            || lpm_workspace::find_workspace_root(project_dir)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return None;
+        }
+        Some(super::sync_noop::compute_sync_noop_proof(
+            project_dir,
+            &lock.path,
+            ctx.package,
+            ctx.lockfile,
+            &lock.content,
+            ctx.routes,
+            ctx.auto_install_peers,
+        ))
+    });
+    if let Err(e) = write_post_install_hash_with_context_and_proof(
         project_dir,
         linker_mode,
         object_integrity_policy,
@@ -21,6 +66,7 @@ pub(super) fn write_post_install_hash(
         &dependency_engine_key,
         node_runtime_fingerprint,
         &lock,
+        sync_noop_proof.as_ref(),
     ) {
         tracing::warn!(
             "failed to write `.lpm/install-hash` after install ({e}) — \
@@ -38,11 +84,36 @@ pub(super) fn write_post_install_hash_with_context(
     node_runtime_fingerprint: Option<&str>,
     lock: &workspace_lockfile::ActiveLockfileSnapshot,
 ) -> std::io::Result<()> {
+    write_post_install_hash_with_context_and_proof(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        security_analysis_policy,
+        dependency_engine_key,
+        node_runtime_fingerprint,
+        lock,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_post_install_hash_with_context_and_proof(
+    project_dir: &Path,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
+    dependency_engine_key: &str,
+    node_runtime_fingerprint: Option<&str>,
+    lock: &workspace_lockfile::ActiveLockfileSnapshot,
+    sync_noop_proof: Option<&crate::install_state::SyncNoopLockfileProofInput>,
+) -> std::io::Result<()> {
     let pkg = lpm_common::read_text_file_capped(
         &project_dir.join("package.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .unwrap_or_default();
+    let sync_noop_proof = sync_noop_proof
+        .filter(|_| !crate::install_state::package_json_needs_slow_freshness(&pkg));
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v10(
@@ -68,6 +139,7 @@ pub(super) fn write_post_install_hash_with_context(
             lockfile_path: &lock.path,
             node_runtime_fingerprint,
             security_analysis_policy,
+            sync_noop_proof,
         },
     )
 }

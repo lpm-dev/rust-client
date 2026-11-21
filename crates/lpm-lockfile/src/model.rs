@@ -1346,6 +1346,15 @@ impl Lockfile {
         Ok(self.project_importer_metadata_from_snapshot(&ImporterSnapshot::default()))
     }
 
+    pub(crate) fn into_root_importer(self) -> Result<Self, LockfileError> {
+        if self.metadata.lockfile_version < LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
+            || self.workspace_packages.is_empty() && self.importers.keys().all(|key| key == ".")
+        {
+            return Ok(self);
+        }
+        self.project_root_importer()
+    }
+
     fn project_validated_importer(&self, importer: &str) -> Result<Self, LockfileError> {
         self.project_importer_impl(importer, false)
     }

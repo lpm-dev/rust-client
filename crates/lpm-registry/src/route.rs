@@ -214,6 +214,55 @@ impl RouteTable {
         Self::new(mode, npmrc)
     }
 
+    /// Deterministic 16-hex-char fingerprint covering every routing decision
+    /// that can change which upstream registry URL a package resolves to.
+    pub fn routing_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"lpm-route-fp-v1\0");
+        hasher.update(match self.mode {
+            RouteMode::Direct => b"direct\0" as &[u8],
+            RouteMode::Proxy => b"proxy\0" as &[u8],
+        });
+        if let Some(target) = self.npmrc.default_registry.as_ref() {
+            hasher.update(b"default:");
+            hasher.update(target.base_url.as_bytes());
+        }
+        hasher.update(b"\0");
+        let mut scopes: Vec<(&str, &str)> = self
+            .npmrc
+            .scope_registries
+            .iter()
+            .map(|(scope, target)| (scope.as_str(), target.base_url.as_ref()))
+            .collect();
+        scopes.sort_unstable_by_key(|(scope, _)| *scope);
+        for (scope, url) in scopes {
+            hasher.update(b"scope:");
+            hasher.update(scope.as_bytes());
+            hasher.update(b"=");
+            hasher.update(url.as_bytes());
+            hasher.update(b"\0");
+        }
+        let mut overrides: Vec<(&str, RouteMode)> = self
+            .package_route_overrides
+            .iter()
+            .map(|(name, mode)| (name.as_str(), *mode))
+            .collect();
+        overrides.sort_unstable_by_key(|(name, _)| *name);
+        for (name, mode) in overrides {
+            hasher.update(b"override:");
+            hasher.update(name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(match mode {
+                RouteMode::Direct => b"direct\0" as &[u8],
+                RouteMode::Proxy => b"proxy\0" as &[u8],
+            });
+        }
+        let digest = hasher.finalize();
+        hex::encode(&digest[..8])
+    }
+
     /// Pick the upstream for a specific package name.
     ///
     /// Resolution order:
@@ -1407,5 +1456,32 @@ mod tests {
             }
             other => panic!("expected authenticated npm-compatible route, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn routing_fingerprint_changes_on_registry_or_mode_change_and_is_order_independent() {
+        let base = make_table("", RouteMode::Direct);
+        let proxy = make_table("", RouteMode::Proxy);
+        let custom_default = make_table("registry=https://npm.internal/\n", RouteMode::Direct);
+        let scopes_a = make_table(
+            "@a:registry=https://a.internal/\n@b:registry=https://b.internal/\n",
+            RouteMode::Direct,
+        );
+        let scopes_b = make_table(
+            "@b:registry=https://b.internal/\n@a:registry=https://a.internal/\n",
+            RouteMode::Direct,
+        );
+
+        assert_eq!(base.routing_fingerprint().len(), 16);
+        assert_ne!(base.routing_fingerprint(), proxy.routing_fingerprint());
+        assert_ne!(
+            base.routing_fingerprint(),
+            custom_default.routing_fingerprint()
+        );
+        assert_ne!(base.routing_fingerprint(), scopes_a.routing_fingerprint());
+        assert_eq!(
+            scopes_a.routing_fingerprint(),
+            scopes_b.routing_fingerprint()
+        );
     }
 }
