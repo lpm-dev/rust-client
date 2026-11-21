@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-pub(super) const MAX_ENTRY_BYTES: usize = 256 * 1024;
+pub(super) const MAX_ENTRY_BYTES: usize = 512 * 1024;
 pub(super) const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MAX_PENDING_ENTRIES: usize = 64;
 const MAX_WRITER_POOLS: usize = 4;
@@ -104,6 +104,13 @@ impl WriterSetup {
                 hooks: TestHooks::default(),
             }
         }
+    }
+
+    pub(super) fn with_minimum_files(mut self, min_files: usize) -> Self {
+        if let Self::AfterFiles { minimum, .. } = &mut self {
+            *minimum = min_files;
+        }
+        self
     }
 
     pub(super) fn with_failure_signal(mut self, signal: Arc<FailureSignal>) -> Self {

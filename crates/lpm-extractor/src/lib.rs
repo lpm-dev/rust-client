@@ -2201,6 +2201,8 @@ impl CaseFoldHashBucket {
 struct CaseFoldPathIndex {
     hash_builder: RandomState,
     buckets: HashMap<u64, CaseFoldHashBucket>,
+    scratch: String,
+    existing_scratch: String,
 }
 
 impl CaseFoldPathIndex {
@@ -2208,68 +2210,47 @@ impl CaseFoldPathIndex {
         Self {
             hash_builder: RandomState::new(),
             buckets: HashMap::with_capacity(64),
+            scratch: String::with_capacity(128),
+            existing_scratch: String::with_capacity(128),
         }
     }
 
     fn classify<E: ExtractionRecord>(
-        &self,
+        &mut self,
         relative_path: &Path,
         records: &[E],
         pending: Option<&writers::PendingEntries>,
     ) -> Result<ArchivePathMatch, LpmError> {
-        let folded_path = case_fold_path_key(relative_path);
-        let folded_hash = self.hash_builder.hash_one(folded_path.as_bytes());
-        self.classify_with_hash_and_pending(
+        case_fold_path_key_into(relative_path, &mut self.scratch);
+        let folded_hash = self.hash_builder.hash_one(self.scratch.as_bytes());
+        classify_with_hash_and_pending(
+            &self.buckets,
             relative_path,
             records,
-            &folded_path,
+            &self.scratch,
             folded_hash,
             pending,
+            &mut self.existing_scratch,
         )
     }
 
     #[cfg(test)]
     fn classify_with_hash<E: ExtractionRecord>(
-        &self,
+        &mut self,
         relative_path: &Path,
         records: &[E],
         folded_path: &str,
         folded_hash: u64,
     ) -> Result<ArchivePathMatch, LpmError> {
-        self.classify_with_hash_and_pending(relative_path, records, folded_path, folded_hash, None)
-    }
-
-    fn classify_with_hash_and_pending<E: ExtractionRecord>(
-        &self,
-        relative_path: &Path,
-        records: &[E],
-        folded_path: &str,
-        folded_hash: u64,
-        pending: Option<&writers::PendingEntries>,
-    ) -> Result<ArchivePathMatch, LpmError> {
-        let Some(bucket) = self.buckets.get(&folded_hash) else {
-            return Ok(ArchivePathMatch::New { folded_hash });
-        };
-
-        for &record_index in bucket.indices() {
-            let existing_path = records
-                .get(record_index)
-                .map(ExtractionRecord::relative_path)
-                .or_else(|| pending?.path(record_index.checked_sub(records.len())?))
-                .ok_or_else(|| LpmError::Registry("invalid archive path ledger index".into()))?;
-            if existing_path == relative_path {
-                return Ok(ArchivePathMatch::ExactDuplicate { record_index });
-            }
-            if case_fold_path_key(existing_path) == folded_path {
-                return Err(LpmError::Registry(format!(
-                    "case-fold path collision in tarball: {} conflicts with {}",
-                    relative_path.display(),
-                    existing_path.display()
-                )));
-            }
-        }
-
-        Ok(ArchivePathMatch::New { folded_hash })
+        classify_with_hash_and_pending(
+            &self.buckets,
+            relative_path,
+            records,
+            folded_path,
+            folded_hash,
+            None,
+            &mut self.existing_scratch,
+        )
     }
 
     fn record_new(&mut self, folded_hash: u64, record_index: usize) {
@@ -2284,8 +2265,43 @@ impl CaseFoldPathIndex {
     }
 }
 
-fn case_fold_path_key(path: &Path) -> String {
-    let mut key = String::new();
+fn classify_with_hash_and_pending<E: ExtractionRecord>(
+    buckets: &HashMap<u64, CaseFoldHashBucket>,
+    relative_path: &Path,
+    records: &[E],
+    folded_path: &str,
+    folded_hash: u64,
+    pending: Option<&writers::PendingEntries>,
+    existing_scratch: &mut String,
+) -> Result<ArchivePathMatch, LpmError> {
+    let Some(bucket) = buckets.get(&folded_hash) else {
+        return Ok(ArchivePathMatch::New { folded_hash });
+    };
+
+    for &record_index in bucket.indices() {
+        let existing_path = records
+            .get(record_index)
+            .map(ExtractionRecord::relative_path)
+            .or_else(|| pending?.path(record_index.checked_sub(records.len())?))
+            .ok_or_else(|| LpmError::Registry("invalid archive path ledger index".into()))?;
+        if existing_path == relative_path {
+            return Ok(ArchivePathMatch::ExactDuplicate { record_index });
+        }
+        case_fold_path_key_into(existing_path, existing_scratch);
+        if existing_scratch == folded_path {
+            return Err(LpmError::Registry(format!(
+                "case-fold path collision in tarball: {} conflicts with {}",
+                relative_path.display(),
+                existing_path.display()
+            )));
+        }
+    }
+
+    Ok(ArchivePathMatch::New { folded_hash })
+}
+
+fn case_fold_path_key_into(path: &Path, key: &mut String) {
+    key.clear();
     for component in path.components() {
         let Component::Normal(name) = component else {
             continue;
@@ -2293,9 +2309,8 @@ fn case_fold_path_key(path: &Path) -> String {
         if !key.is_empty() {
             key.push('/');
         }
-        append_case_fold_component_key(&mut key, name);
+        append_case_fold_component_key(key, name);
     }
-    key
 }
 
 fn append_case_fold_component_key(key: &mut String, component: &OsStr) {
