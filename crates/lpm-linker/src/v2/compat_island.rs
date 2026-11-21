@@ -433,6 +433,29 @@ fn ensure_store_compat_island(
 }
 
 #[cfg(target_os = "macos")]
+fn compat_system_time_nanos(time: std::time::SystemTime) -> i128 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn compat_package_shallow_guard(package_dir: &Path) -> Option<(String, u64, String)> {
+    let dir_meta = std::fs::symlink_metadata(package_dir).ok()?;
+    if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
+        return None;
+    }
+    let dir_mtime = compat_system_time_nanos(dir_meta.modified().ok()?).to_string();
+    let pkg_json_meta = std::fs::symlink_metadata(package_dir.join("package.json")).ok()?;
+    if !pkg_json_meta.is_file() || pkg_json_meta.file_type().is_symlink() {
+        return None;
+    }
+    let pkg_json_mtime = compat_system_time_nanos(pkg_json_meta.modified().ok()?).to_string();
+    Some((dir_mtime, pkg_json_meta.len(), pkg_json_mtime))
+}
+
+#[cfg(target_os = "macos")]
 fn store_compat_island_complete(
     store_island: &Path,
     entries: &[CompatibilityEntry<'_>],
@@ -467,16 +490,48 @@ fn store_compat_island_complete(
     if recorded_entries.len() != entries.len() {
         return false;
     }
+    let recorded_guards = manifest
+        .get("shallow_guards")
+        .and_then(serde_json::Value::as_object);
+    let source_policy =
+        store.object_integrity_policy() == lpm_store::v2::ObjectIntegrityPolicy::Source;
     entries.iter().all(|entry| {
         let entry_dir = compatibility_entry_dir(store_island, &entry.key);
         let expected = recorded_entries
             .get(entry.key.dir_name())
             .and_then(serde_json::Value::as_str);
         expected.is_some_and(|expected| {
-            compatibility_entry_reusable(&entry_dir, entry)
-                && store
-                    .compat_island_entry_metadata_integrity(&entry_dir)
-                    .is_ok_and(|actual| actual == expected)
+            if !compatibility_entry_reusable(&entry_dir, entry) {
+                return false;
+            }
+            if source_policy
+                && let Some(guard_val) =
+                    recorded_guards.and_then(|guards| guards.get(entry.key.dir_name()))
+            {
+                let package_dir = compatibility_package_dir(store_island, &entry.key);
+                let has_build_marker = package_dir.join(".lpm-built").symlink_metadata().is_ok();
+                if !has_build_marker
+                    && let Some((dir_mtime, pkg_size, pkg_mtime)) =
+                        compat_package_shallow_guard(&package_dir)
+                    && guard_val
+                        .get("dir_mtime_nanos")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(dir_mtime.as_str())
+                    && guard_val
+                        .get("pkg_json_size")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(pkg_size)
+                    && guard_val
+                        .get("pkg_json_mtime_nanos")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(pkg_mtime.as_str())
+                {
+                    return true;
+                }
+            }
+            store
+                .compat_island_entry_metadata_integrity(&entry_dir)
+                .is_ok_and(|actual| actual == expected)
         })
     })
 }
@@ -488,6 +543,7 @@ fn write_store_compat_island_completion(
     store: &Store,
 ) -> Result<(), LpmError> {
     let mut recorded_entries = serde_json::Map::new();
+    let mut shallow_guards = serde_json::Map::new();
     for entry in entries {
         let entry_dir = compatibility_entry_dir(store_island, &entry.key);
         let integrity = store.compat_island_entry_metadata_integrity(&entry_dir)?;
@@ -495,10 +551,22 @@ fn write_store_compat_island_completion(
             entry.key.dir_name().to_string(),
             serde_json::Value::String(integrity),
         );
+        let package_dir = compatibility_package_dir(store_island, &entry.key);
+        if let Some((dir_mtime, pkg_size, pkg_mtime)) = compat_package_shallow_guard(&package_dir) {
+            shallow_guards.insert(
+                entry.key.dir_name().to_string(),
+                serde_json::json!({
+                    "dir_mtime_nanos": dir_mtime,
+                    "pkg_json_size": pkg_size,
+                    "pkg_json_mtime_nanos": pkg_mtime,
+                }),
+            );
+        }
     }
     let manifest = serde_json::json!({
         "schema": COMPAT_ISLAND_COMPLETE_SCHEMA,
         "entries": recorded_entries,
+        "shallow_guards": shallow_guards,
     });
     let content = serde_json::to_vec(&manifest).map_err(|error| {
         LpmError::Store(format!(

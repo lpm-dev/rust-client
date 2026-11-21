@@ -172,12 +172,53 @@ impl LinkMeta {
     /// touch only widens prune's view of cold entries by one install
     /// cycle.
     pub fn touch_on_disk(sidecar_path: &Path) -> Result<(), LpmError> {
-        filetime::set_file_mtime(sidecar_path, filetime::FileTime::now()).map_err(|e| {
-            LpmError::Store(format!(
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+
+            let c_path = CString::new(sidecar_path.as_os_str().as_bytes()).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to update virtual-store link sidecar mtime at {}: {e}",
+                    sidecar_path.display()
+                ))
+            })?;
+            let times = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                },
+            ];
+            let rc = unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    c_path.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            Err(LpmError::Store(format!(
                 "failed to update virtual-store link sidecar mtime at {}: {e}",
                 sidecar_path.display()
-            ))
-        })
+            )))
+        }
+        #[cfg(not(unix))]
+        {
+            filetime::set_file_mtime(sidecar_path, filetime::FileTime::now()).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to update virtual-store link sidecar mtime at {}: {e}",
+                    sidecar_path.display()
+                ))
+            })
+        }
     }
 
     /// The touch-time signal prune actually consults.
@@ -218,21 +259,29 @@ impl LinkMeta {
     /// same-user writer can't force the prune/doctor/store diagnostic
     /// walk to allocate megabytes before bailing.
     pub fn read_from(link_dir: &Path) -> Result<Self, LpmError> {
+        Self::read_from_with_mtime(link_dir).map(|(meta, _)| meta)
+    }
+
+    /// Read a sidecar and return the file's mtime from the same descriptor.
+    pub(crate) fn read_from_with_mtime(
+        link_dir: &Path,
+    ) -> Result<(Self, Option<std::time::SystemTime>), LpmError> {
         let path = link_dir.join(LINK_META_FILENAME);
-        let bytes = lpm_common::read_text_file_capped_nofollow(&path, LINK_META_MAX_BYTES)
-            .map_err(|error| {
-                LpmError::Store(match error {
-                    lpm_common::BoundedReadError::TooLarge { .. } => format!(
-                        "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
-                        path.display(),
-                        LINK_META_MAX_BYTES
-                    ),
-                    _ => format!(
-                        "failed to read virtual-store link sidecar at {}: {error}",
-                        path.display()
-                    ),
-                })
-            })?;
+        let (bytes, metadata) =
+            lpm_common::read_text_file_capped_nofollow_with_metadata(&path, LINK_META_MAX_BYTES)
+                .map_err(|error| {
+                    LpmError::Store(match error {
+                        lpm_common::BoundedReadError::TooLarge { .. } => format!(
+                            "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
+                            path.display(),
+                            LINK_META_MAX_BYTES
+                        ),
+                        _ => format!(
+                            "failed to read virtual-store link sidecar at {}: {error}",
+                            path.display()
+                        ),
+                    })
+                })?;
         let parsed: LinkMeta = serde_json::from_str(&bytes).map_err(|e| {
             LpmError::Store(format!(
                 "malformed virtual-store link sidecar at {}: {e}",
@@ -270,7 +319,7 @@ impl LinkMeta {
                 path.display()
             )));
         }
-        Ok(parsed)
+        Ok((parsed, metadata.modified().ok()))
     }
 
     /// Serialize and atomically write to `<link_dir>/.lpm-link-meta.json`.

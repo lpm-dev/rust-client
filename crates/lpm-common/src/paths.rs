@@ -774,9 +774,6 @@ pub struct SingleFileExclusiveLockHandle {
 }
 
 fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -785,7 +782,16 @@ fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
 
         options.mode(0o600);
     }
-    options.open(lock_path)
+    match options.open(lock_path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            options.open(lock_path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Opens the lock file at `lock_path`, created owner-only, without following

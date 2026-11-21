@@ -1771,9 +1771,23 @@ async fn run_with_options_under_store_lock(
     //
     // Apply is unconditional even on the lockfile fast path: see the
     // module-level comment in `patch_engine.rs` for why.
-    let baseline_index = store_version
-        .uses_virtual_store()
-        .then(|| lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root));
+    let needs_patch_baseline_index = !current_patches.is_empty();
+    let baseline_index = store_version.uses_virtual_store().then(|| {
+        if needs_patch_baseline_index {
+            lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root)
+        } else {
+            lpm_store::V2BaselineIndex::from_materialized_coords(
+                link_result.materialized.iter().map(|entry| {
+                    (
+                        entry.name.clone(),
+                        entry.version.clone(),
+                        entry.destination.clone(),
+                        String::new(),
+                    )
+                }),
+            )
+        }
+    });
     let mut omitted_patch_targets =
         registered_patch_targets(&current_patches, packages_for_lockfile.iter())?;
     retain_omitted_patch_targets(&mut omitted_patch_targets, packages.iter());
