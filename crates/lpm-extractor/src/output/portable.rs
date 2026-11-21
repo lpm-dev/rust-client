@@ -154,9 +154,7 @@ impl OutputTree {
     /// Resolve `path` in the prepared parent without touching the filesystem,
     /// so another thread can create the file.
     pub(crate) fn new_file(&self, path: &Path) -> Result<NewFile, LpmError> {
-        let directory = self
-            .current_parent()
-            .map_or(&self.root, |p| &p.directory);
+        let directory = self.current_parent().map_or(&self.root, |p| &p.directory);
         let name = path.file_name().ok_or_else(|| changed_directory(path))?;
         Ok(NewFile {
             directory: Arc::clone(directory),

@@ -2216,14 +2216,23 @@ impl BlobStatFingerprint {
 
 #[cfg(windows)]
 impl BlobStatFingerprint {
-    fn from_validated_blob_path(path: &Path, key: &BlobKey) -> Result<Self, LpmError> {
-        use std::os::windows::fs::MetadataExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
-            GetFileInformationByHandleEx,
-        };
+    fn from_path(path: &Path) -> Result<Self, LpmError> {
+        let file = open_regular_file_nofollow(path).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to open v3 CAS file for Windows identity at {}: {error}",
+                path.display()
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect v3 CAS file identity at {}: {error}",
+                path.display()
+            ))
+        })?;
+        Self::from_open_file(path, &file, &metadata)
+    }
 
+    fn from_validated_blob_path(path: &Path, key: &BlobKey) -> Result<Self, LpmError> {
         let file = open_regular_file_nofollow(path).map_err(|error| {
             LpmError::Store(format!(
                 "failed to open v3 CAS blob for Windows identity at {}: {error}",
@@ -2245,6 +2254,21 @@ impl BlobStatFingerprint {
                 path.display()
             )));
         }
+        Self::from_open_file(path, &file, &metadata)
+    }
+
+    fn from_open_file(
+        path: &Path,
+        file: &fs::File,
+        metadata: &fs::Metadata,
+    ) -> Result<Self, LpmError> {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx,
+        };
+
         let handle = file.as_raw_handle();
         let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: `handle` comes from the live `File` above and

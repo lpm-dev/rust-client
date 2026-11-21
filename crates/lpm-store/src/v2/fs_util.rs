@@ -638,12 +638,7 @@ pub(crate) mod linux_copy {
         copy_through_buffer(source, destination, len)
     }
 
-    fn reflink(
-        source: &File,
-        destination: &File,
-        device: u64,
-        pair: u64,
-    ) -> std::io::Result<bool> {
+    fn reflink(source: &File, destination: &File, device: u64, pair: u64) -> std::io::Result<bool> {
         #[cfg(test)]
         REFLINK_CANDIDATES.with(|candidates| candidates.set(candidates.get() + 1));
         if NO_REFLINK_DEVICE.load(Ordering::Relaxed) == device {

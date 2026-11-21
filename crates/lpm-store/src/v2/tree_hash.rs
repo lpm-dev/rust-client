@@ -473,8 +473,7 @@ fn statx_or_fstatat_entry(
         kind,
         mode: st.st_mode & 0o7777,
         len: st.st_size as u64,
-        modified_time_nanos: i128::from(st.st_mtime) * 1_000_000_000
-            + i128::from(st.st_mtime_nsec),
+        modified_time_nanos: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
         change_time_nanos: i128::from(st.st_ctime) * 1_000_000_000 + i128::from(st.st_ctime_nsec),
     })
 }
