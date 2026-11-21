@@ -1525,6 +1525,7 @@ async fn run_with_options_under_store_lock(
                 route_table: &route_table,
                 packages: &packages,
                 offline,
+                force,
                 json_output,
             };
             if monitor_only {

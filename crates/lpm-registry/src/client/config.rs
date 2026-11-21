@@ -354,17 +354,7 @@ impl RegistryClient {
         )
     }
 
-    /// The default-TLS client set, built when a request first needs it.
-    pub(super) fn build_default_cached_client() -> CachedClient {
-        // reqwest honours HTTPS_PROXY / HTTP_PROXY / ALL_PROXY by
-        // default. A compromised CI runner or shell rc that exports
-        // these can silently route every registry request — including
-        // the bearer-bearing publish/auth flows — through an
-        // attacker proxy. We don't disable the env-proxy support
-        // (legitimate corporate proxies depend on it) but we DO log
-        // a one-shot warn so operators can spot unexpected proxy
-        // contamination. It fires when the clients are built, so only
-        // commands that send registry requests show it.
+    pub(super) fn warn_env_proxy_if_set() {
         for var in [
             "HTTPS_PROXY",
             "https_proxy",
@@ -384,14 +374,27 @@ impl RegistryClient {
                 break;
             }
         }
-        Self::build_http_client_set_with_tls_and_identity(
+    }
+
+    pub(super) fn build_default_pool_client(pool: super::http::ClientPool) -> reqwest::Client {
+        let (read_timeout, redirect) = match pool {
+            super::http::ClientPool::General => (Some(READ_TIMEOUT), HttpRedirectMode::Automatic),
+            super::http::ClientPool::PolicyMetadata
+            | super::http::ClientPool::ManualRedirect(_) => {
+                (Some(READ_TIMEOUT), HttpRedirectMode::Manual)
+            }
+            super::http::ClientPool::Transfer => (None, HttpRedirectMode::Manual),
+        };
+        Self::build_http_client_with_prepared_tls_identity_and_transport(
             CONNECT_TIMEOUT,
-            READ_TIMEOUT,
+            read_timeout,
             &TlsOverrides::default(),
+            &TrustedRoots::Bundled,
             None,
+            HttpTransportMode::Default,
+            redirect,
         )
         .expect("default TLS config never fails to build")
-        .cached(None)
     }
 
     /// Create a new registry client with default settings.
@@ -443,6 +446,11 @@ impl RegistryClient {
     /// Get the current base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Configured metadata cache directory, if on-disk caching is enabled.
+    pub fn cache_dir(&self) -> Option<&std::path::Path> {
+        self.cache_dir.as_deref()
     }
 
     /// Return whether this client can attach or recover a bearer for `posture`.
