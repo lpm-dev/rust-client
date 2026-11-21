@@ -262,7 +262,10 @@ pub fn link_packages_v2_with_compatibility_bin_names(
     // the parallelism gain.
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     const PARALLEL_THRESHOLD: usize = 32;
+    #[cfg(not(target_os = "macos"))]
+    const PARALLEL_THRESHOLD: usize = 8;
 
     let linked_count_atomic = AtomicUsize::new(0);
     let materialized_results: Vec<Result<MaterializedPackage, LpmError>> =

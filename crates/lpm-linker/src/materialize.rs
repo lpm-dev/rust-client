@@ -172,7 +172,7 @@ fn materialize_dir_recursive(
             )));
         } else if file_type.is_file() {
             if !allow_hardlinks {
-                std::fs::copy(&src_path, &dst_path)?;
+                copy_regular_file(&src_path, &dst_path)?;
             } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
                 // Hardlink refusals fall into a few classes: cross-volume
                 // mounts, permissions, and Windows junctions inside the CAS
@@ -184,12 +184,24 @@ fn materialize_dir_recursive(
                     error = %e,
                     "link_dir_recursive: hardlink failed, falling back to copy",
                 );
-                std::fs::copy(&src_path, &dst_path)?;
+                copy_regular_file(&src_path, &dst_path)?;
             }
         }
     }
 
     Ok(())
+}
+
+fn copy_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    #[cfg(target_os = "linux")]
+    {
+        lpm_store::v2::linux_copy_file(src, dst)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::copy(src, dst)?;
+        Ok(())
+    }
 }
 
 /// Try to use macOS `clonefile()` syscall for instant copy-on-write.

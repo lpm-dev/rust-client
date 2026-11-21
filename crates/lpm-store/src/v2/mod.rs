@@ -55,6 +55,8 @@ pub use build_cache::{
     BuildSandboxFingerprint, BuildScriptFingerprint,
 };
 pub use fs_util::is_staging_dir_name;
+#[cfg(target_os = "linux")]
+pub use fs_util::linux_copy::copy_file as linux_copy_file;
 pub use graph_key::{DepEdge, GraphKey, GraphKeyInputs, LinkerModeTag, PeerEntry};
 pub use link_meta::{
     LINK_META_FILENAME, LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaDep, LinkMetaPlatform,
