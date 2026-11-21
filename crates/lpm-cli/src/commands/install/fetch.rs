@@ -93,7 +93,7 @@ pub(super) fn default_bounded_fetch_extract_permits() -> usize {
     #[cfg(not(target_os = "macos"))]
     {
         std::thread::available_parallelism().map_or(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS, |n| {
-            n.get().clamp(4, 12)
+            n.get().clamp(4, 8)
         })
     }
 }
@@ -3135,10 +3135,20 @@ mod tests {
     #[test]
     fn explicit_v2_streaming_extract_weight_is_bounded() {
         let large = std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES);
+        let max_permits = default_bounded_fetch_extract_permits();
+        let max_permits_str = max_permits.to_string();
+        let over_max_str = (max_permits + 1).to_string();
         assert_eq!(configured_v2_streaming_extract_weight(Some("1"), large), 1);
         assert_eq!(configured_v2_streaming_extract_weight(Some("3"), large), 3);
+        assert_eq!(
+            configured_v2_streaming_extract_weight(Some(&max_permits_str), large),
+            max_permits
+        );
         assert_eq!(configured_v2_streaming_extract_weight(Some("0"), large), 3);
-        assert_eq!(configured_v2_streaming_extract_weight(Some("5"), large), 3);
+        assert_eq!(
+            configured_v2_streaming_extract_weight(Some(&over_max_str), large),
+            3
+        );
     }
 
     #[tokio::test]

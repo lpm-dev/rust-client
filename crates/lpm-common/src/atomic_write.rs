@@ -294,7 +294,10 @@ fn copy_into_new_file(
         }
         let mut source = directory.open(temporary_name)?;
         simulated::copy(&mut source, &mut created)?;
-        created.sync_all()
+        if options.sync_file {
+            created.sync_all()?;
+        }
+        Ok(())
     })();
     if let Err(error) = copied {
         if is_current_entry(directory, destination, &created).unwrap_or(false) {

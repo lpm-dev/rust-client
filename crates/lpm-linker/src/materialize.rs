@@ -195,7 +195,8 @@ fn materialize_dir_recursive(
 fn copy_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
     #[cfg(target_os = "linux")]
     {
-        lpm_store::v2::linux_copy_file(src, dst)
+        lpm_store::v2::linux_copy_file_io(src, dst)?;
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {

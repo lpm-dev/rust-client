@@ -5695,7 +5695,7 @@ fn unchanged_local_source_populate_reuses_recorded_source_fingerprint() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn local_source_refresh_detects_content_changes_after_mtime_is_restored() {
     let dir = tempfile::tempdir().unwrap();
@@ -5727,7 +5727,43 @@ fn local_source_refresh_detects_content_changes_after_mtime_is_restored() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[test]
+fn local_source_refresh_detects_same_size_edit_after_mtime_is_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let source = dir.path().join("workspace-pkg");
+    write_local_source_fixture(&source);
+    let source_file = source.join("src/module-0.js");
+    let original_bytes = std::fs::read(&source_file).unwrap();
+    let mut replacement = original_bytes.clone();
+    assert!(!replacement.is_empty());
+    replacement[0] = if replacement[0] == b'/' { b' ' } else { b'/' };
+    assert_eq!(replacement.len(), original_bytes.len());
+    let original_mtime = std::fs::metadata(&source_file).unwrap().modified().unwrap();
+    let sri = synthetic_sri(b"local_source_refresh_detects_same_size_edit_after_mtime_is_restored");
+    let object_dir = store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    std::fs::write(&source_file, &replacement).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&source_file)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+    store
+        .populate_object_from_local_source(&source, &sri)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(object_dir.join("src/module-0.js")).unwrap(),
+        replacement,
+    );
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn local_source_reuse_repairs_a_tampered_stored_snapshot() {
     let dir = tempfile::tempdir().unwrap();

@@ -558,10 +558,12 @@ pub(crate) mod linux_copy {
 
     /// The last device that refused a reflink, or `u64::MAX`.
     static NO_REFLINK_DEVICE: AtomicU64 = AtomicU64::new(u64::MAX);
-    /// The last `(src_dev, dst_dev)` pair that returned `EXDEV`, or `u64::MAX`.
-    static EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
-    /// The last device that refused `copy_file_range`, or `u64::MAX`.
-    static NO_COPY_FILE_RANGE_DEVICE: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The last `(src_dev, dst_dev)` pair where `FICLONE` returned `EXDEV`, or `u64::MAX`.
+    static REFLINK_EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The last `(src_dev, dst_dev)` pair where `copy_file_range` returned `EXDEV`, or `u64::MAX`.
+    static COPY_FILE_RANGE_EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The last `(src_dev, dst_dev)` pair that refused `copy_file_range`, or `u64::MAX`.
+    static NO_COPY_FILE_RANGE_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
 
     #[inline]
     fn device_pair_tag(src_dev: u64, dst_dev: u64) -> u64 {
@@ -576,23 +578,28 @@ pub(crate) mod linux_copy {
     }
 
     pub fn copy_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
-        let failed = |action: &str, error: std::io::Error| {
+        copy_file_io(src, dst).map_err(|(action, error)| {
             LpmError::Store(format!(
                 "failed to {action} virtual-store source file {} → {}: {error}",
                 src.display(),
                 dst.display()
             ))
-        };
+        })
+    }
+
+    pub fn copy_file_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
+        copy_file_io(src, dst).map_err(|(_, error)| error)
+    }
+
+    fn copy_file_io(src: &Path, dst: &Path) -> Result<(), (&'static str, std::io::Error)> {
         let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(src)
-            .map_err(|error| failed("open", error))?;
-        let source_metadata = source
-            .metadata()
-            .map_err(|error| failed("inspect", error))?;
+            .map_err(|error| ("open", error))?;
+        let source_metadata = source.metadata().map_err(|error| ("inspect", error))?;
         if !source_metadata.is_file() {
-            return Err(failed(
+            return Err((
                 "copy",
                 std::io::Error::other("the source is not a regular file"),
             ));
@@ -603,18 +610,13 @@ pub(crate) mod linux_copy {
             .create_new(true)
             .mode(0o600)
             .open(dst)
-            .map_err(|error| failed("create", error))?;
-        let copied = fill(&mut source, &mut destination, &source_metadata).and_then(|()| {
-            if mode == 0o600 {
-                Ok(())
-            } else {
-                destination.set_permissions(std::fs::Permissions::from_mode(mode))
-            }
-        });
+            .map_err(|error| ("create", error))?;
+        let copied = fill(&mut source, &mut destination, &source_metadata)
+            .and_then(|()| destination.set_permissions(std::fs::Permissions::from_mode(mode)));
         copied.map_err(|error| {
             drop(destination);
             let _ = std::fs::remove_file(dst);
-            failed("copy", error)
+            ("copy", error)
         })
     }
 
@@ -626,11 +628,18 @@ pub(crate) mod linux_copy {
         let len = source_metadata.len();
         if len >= MIN_REFLINK_BYTES {
             let src_dev = source_metadata.dev();
-            let dst_dev = destination.metadata()?.dev();
-            let pair = device_pair_tag(src_dev, dst_dev);
-            if EXDEV_PAIR.load(Ordering::Relaxed) != pair
-                && (reflink(source, destination, src_dev, pair)?
-                    || copy_file_range(source, destination, len, src_dev, pair)?)
+            let mut cached_pair: Option<u64> = None;
+            let mut pair_for = || -> std::io::Result<u64> {
+                if let Some(pair) = cached_pair {
+                    return Ok(pair);
+                }
+                let dst_dev = destination.metadata()?.dev();
+                let pair = device_pair_tag(src_dev, dst_dev);
+                cached_pair = Some(pair);
+                Ok(pair)
+            };
+            if reflink(source, destination, src_dev, &mut pair_for)?
+                || copy_file_range(source, destination, len, &mut pair_for)?
             {
                 return Ok(());
             }
@@ -638,10 +647,19 @@ pub(crate) mod linux_copy {
         copy_through_buffer(source, destination, len)
     }
 
-    fn reflink(source: &File, destination: &File, device: u64, pair: u64) -> std::io::Result<bool> {
+    fn reflink(
+        source: &File,
+        destination: &File,
+        device: u64,
+        pair_for: &mut impl FnMut() -> std::io::Result<u64>,
+    ) -> std::io::Result<bool> {
         #[cfg(test)]
         REFLINK_CANDIDATES.with(|candidates| candidates.set(candidates.get() + 1));
         if NO_REFLINK_DEVICE.load(Ordering::Relaxed) == device {
+            return Ok(false);
+        }
+        let exdev_cached = REFLINK_EXDEV_PAIR.load(Ordering::Relaxed);
+        if exdev_cached != u64::MAX && exdev_cached == pair_for()? {
             return Ok(false);
         }
         const FICLONE: libc::Ioctl = 0x4004_9409;
@@ -656,8 +674,11 @@ pub(crate) mod linux_copy {
                 NO_REFLINK_DEVICE.store(device, Ordering::Relaxed);
                 Ok(false)
             }
+            Some(libc::EPERM) => Ok(false),
             Some(libc::EXDEV) => {
-                EXDEV_PAIR.store(pair, Ordering::Relaxed);
+                if let Ok(pair) = pair_for() {
+                    REFLINK_EXDEV_PAIR.store(pair, Ordering::Relaxed);
+                }
                 Ok(false)
             }
             _ => Err(error),
@@ -668,10 +689,14 @@ pub(crate) mod linux_copy {
         source: &File,
         destination: &File,
         len: u64,
-        device: u64,
-        pair: u64,
+        pair_for: &mut impl FnMut() -> std::io::Result<u64>,
     ) -> std::io::Result<bool> {
-        if NO_COPY_FILE_RANGE_DEVICE.load(Ordering::Relaxed) == device {
+        let exdev_cached = COPY_FILE_RANGE_EXDEV_PAIR.load(Ordering::Relaxed);
+        let unsupported_cached = NO_COPY_FILE_RANGE_PAIR.load(Ordering::Relaxed);
+        if (exdev_cached != u64::MAX || unsupported_cached != u64::MAX) && {
+            let pair = pair_for()?;
+            pair == exdev_cached || pair == unsupported_cached
+        } {
             return Ok(false);
         }
         let mut saw_exdev = false;
@@ -701,9 +726,11 @@ pub(crate) mod linux_copy {
         })?;
         if !copied {
             if saw_exdev {
-                EXDEV_PAIR.store(pair, Ordering::Relaxed);
-            } else if saw_unsupported {
-                NO_COPY_FILE_RANGE_DEVICE.store(device, Ordering::Relaxed);
+                if let Ok(pair) = pair_for() {
+                    COPY_FILE_RANGE_EXDEV_PAIR.store(pair, Ordering::Relaxed);
+                }
+            } else if saw_unsupported && let Ok(pair) = pair_for() {
+                NO_COPY_FILE_RANGE_PAIR.store(pair, Ordering::Relaxed);
             }
         }
         Ok(copied)
@@ -763,8 +790,6 @@ pub(crate) mod linux_copy {
         }
         BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
-            // On regular files smaller than the buffer, a single `read(len + 1)`
-            // returning `len` bytes proves EOF in one syscall instead of two.
             if let Ok(len_usize) = usize::try_from(len)
                 && len_usize < COPY_BUFFER_BYTES
             {
@@ -779,10 +804,6 @@ pub(crate) mod linux_copy {
                     copied += read;
                     if copied > len_usize {
                         return Err(source_changed());
-                    }
-                    if copied == len_usize && read == len_usize {
-                        // A single short read into a `len + 1` slice already hit EOF.
-                        break;
                     }
                 }
                 if copied != len_usize {
@@ -893,12 +914,33 @@ fn remove_materialized_object_sidecars(dst: &Path) -> Result<(), LpmError> {
         c".lpm-object-integrity",
         c".lpm-tree-snapshot.json",
     ];
-    debug_assert_eq!(SIDECARS[2].to_str(), Ok(OBJECT_INTEGRITY_FILENAME));
-    debug_assert_eq!(SIDECARS[3].to_str(), Ok(TREE_SNAPSHOT_FILENAME));
+    const _: () = {
+        const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        assert!(bytes_eq(
+            SIDECARS[2].to_bytes(),
+            OBJECT_INTEGRITY_FILENAME.as_bytes()
+        ));
+        assert!(bytes_eq(
+            SIDECARS[3].to_bytes(),
+            TREE_SNAPSHOT_FILENAME.as_bytes()
+        ));
+    };
 
     let dir = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(::libc::O_DIRECTORY | ::libc::O_CLOEXEC)
+        .custom_flags(::libc::O_DIRECTORY | ::libc::O_NOFOLLOW | ::libc::O_CLOEXEC)
         .open(dst)
         .map_err(|e| {
             LpmError::Store(format!(

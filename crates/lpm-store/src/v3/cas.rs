@@ -2217,15 +2217,9 @@ impl BlobStatFingerprint {
 #[cfg(windows)]
 impl BlobStatFingerprint {
     fn from_path(path: &Path) -> Result<Self, LpmError> {
-        let file = open_regular_file_nofollow(path).map_err(|error| {
+        let (file, metadata) = open_regular_file_nofollow(path).map_err(|error| {
             LpmError::Store(format!(
                 "failed to open v3 CAS file for Windows identity at {}: {error}",
-                path.display()
-            ))
-        })?;
-        let metadata = file.metadata().map_err(|error| {
-            LpmError::Store(format!(
-                "failed to inspect v3 CAS file identity at {}: {error}",
                 path.display()
             ))
         })?;
@@ -2233,15 +2227,9 @@ impl BlobStatFingerprint {
     }
 
     fn from_validated_blob_path(path: &Path, key: &BlobKey) -> Result<Self, LpmError> {
-        let file = open_regular_file_nofollow(path).map_err(|error| {
+        let (file, metadata) = open_regular_file_nofollow(path).map_err(|error| {
             LpmError::Store(format!(
                 "failed to open v3 CAS blob for Windows identity at {}: {error}",
-                path.display()
-            ))
-        })?;
-        let metadata = file.metadata().map_err(|error| {
-            LpmError::Store(format!(
-                "failed to inspect v3 CAS blob identity at {}: {error}",
                 path.display()
             ))
         })?;
@@ -2379,8 +2367,7 @@ fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, LpmError> {
 }
 
 fn read_capped_io(path: &Path, cap: u64) -> Result<Vec<u8>, std::io::Error> {
-    let file = open_regular_file_nofollow(path)?;
-    let metadata = file.metadata()?;
+    let (file, metadata) = open_regular_file_nofollow(path)?;
     if metadata.len() > cap {
         return Err(std::io::Error::other(format!(
             "CAS metadata is {} bytes; cap is {cap}",
@@ -2403,7 +2390,7 @@ fn read_capped_io(path: &Path, cap: u64) -> Result<Vec<u8>, std::io::Error> {
     Ok(bytes)
 }
 
-fn open_regular_file_nofollow(path: &Path) -> io::Result<File> {
+fn open_regular_file_nofollow(path: &Path) -> io::Result<(File, fs::Metadata)> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2430,7 +2417,7 @@ fn open_regular_file_nofollow(path: &Path) -> io::Result<File> {
             return Err(io::Error::other("CAS entry is a reparse point"));
         }
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 fn publish_bytes_no_replace(path: &Path, bytes: &[u8], cap: u64) -> Result<(), LpmError> {
@@ -2523,12 +2510,13 @@ fn replace_with_hardlink(source: &Path, destination: &Path) -> Result<(), LpmErr
 }
 
 fn hash_file(path: &Path, buffer: &mut [u8]) -> Result<String, LpmError> {
-    let mut reader = BufReader::new(open_regular_file_nofollow(path).map_err(|error| {
+    let (file, _) = open_regular_file_nofollow(path).map_err(|error| {
         LpmError::Store(format!(
             "failed to open v3 CAS source file {}: {error}",
             path.display()
         ))
-    })?);
+    })?;
+    let mut reader = BufReader::new(file);
     let mut hasher = blake3::Hasher::new();
     loop {
         let read = reader.read(buffer).map_err(|error| {

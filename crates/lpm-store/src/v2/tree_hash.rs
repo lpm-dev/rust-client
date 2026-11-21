@@ -3,9 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use lpm_common::LpmError;
-#[cfg(any(not(target_os = "linux"), test))]
-use lpm_common::is_symlink_or_junction;
+use lpm_common::{LpmError, is_symlink_or_junction};
 use lpm_extractor::ExtractedFileDigest;
 use sha2::{Digest, Sha256};
 
@@ -295,21 +293,6 @@ fn hash_object_tree_dir(
 }
 
 fn read_object_tree_entries(root: &Path, dir: &Path) -> Result<Vec<ObjectTreeEntry>, LpmError> {
-    #[cfg(target_os = "linux")]
-    {
-        read_object_tree_entries_linux(root, dir)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        read_object_tree_entries_portable(root, dir)
-    }
-}
-
-#[cfg(any(not(target_os = "linux"), test))]
-fn read_object_tree_entries_portable(
-    root: &Path,
-    dir: &Path,
-) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     let mut entries = Vec::new();
     // Unix DirEntry values keep the directory handle alive; store owned names
     // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
@@ -339,143 +322,6 @@ fn read_object_tree_entries_portable(
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(entries)
-}
-
-#[cfg(target_os = "linux")]
-fn read_object_tree_entries_linux(
-    root: &Path,
-    dir: &Path,
-) -> Result<Vec<ObjectTreeEntry>, LpmError> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir_file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(dir)
-        .map_err(|e| {
-            LpmError::Store(format!(
-                "failed to read virtual-store object tree at {}: {e}",
-                dir.display()
-            ))
-        })?;
-    let dirfd = dir_file.as_raw_fd();
-
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| {
-        LpmError::Store(format!(
-            "failed to read virtual-store object tree at {}: {e}",
-            dir.display()
-        ))
-    })? {
-        let entry = entry.map_err(|e| {
-            LpmError::Store(format!(
-                "failed to enumerate virtual-store object tree entry: {e}"
-            ))
-        })?;
-        let file_name = entry.file_name();
-        if is_object_metadata_sidecar_name(root, dir, &file_name) {
-            continue;
-        }
-        let c_name = CString::new(file_name.as_bytes()).map_err(|_| {
-            LpmError::Store(format!(
-                "virtual-store object tree entry name contains NUL under {}",
-                dir.display()
-            ))
-        })?;
-        let parsed = statx_or_fstatat_entry(dirfd, dir, file_name, &c_name)?;
-        entries.push(parsed);
-    }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(entries)
-}
-
-#[cfg(target_os = "linux")]
-fn statx_or_fstatat_entry(
-    dirfd: libc::c_int,
-    dir: &Path,
-    name: OsString,
-    c_name: &std::ffi::CStr,
-) -> Result<ObjectTreeEntry, LpmError> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static STATX_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-
-    if !STATX_UNSUPPORTED.load(Ordering::Relaxed) {
-        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-        let mask = libc::STATX_TYPE
-            | libc::STATX_MODE
-            | libc::STATX_SIZE
-            | libc::STATX_MTIME
-            | libc::STATX_CTIME;
-        // SAFETY: `dirfd` is a valid directory fd, `c_name` is NUL-terminated,
-        // and `stx` is valid writable storage of `libc::statx`.
-        let rc = unsafe {
-            libc::statx(
-                dirfd,
-                c_name.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC,
-                mask,
-                &mut stx,
-            )
-        };
-        if rc == 0 {
-            let kind = match u32::from(stx.stx_mode) & libc::S_IFMT {
-                libc::S_IFLNK => ObjectTreeEntryKind::Symlink,
-                libc::S_IFDIR => ObjectTreeEntryKind::Directory,
-                libc::S_IFREG => ObjectTreeEntryKind::File,
-                _ => ObjectTreeEntryKind::Unsupported,
-            };
-            let modified_time_nanos = i128::from(stx.stx_mtime.tv_sec) * 1_000_000_000
-                + i128::from(stx.stx_mtime.tv_nsec);
-            let change_time_nanos = i128::from(stx.stx_ctime.tv_sec) * 1_000_000_000
-                + i128::from(stx.stx_ctime.tv_nsec);
-            return Ok(ObjectTreeEntry {
-                name,
-                kind,
-                mode: u32::from(stx.stx_mode) & 0o7777,
-                len: stx.stx_size,
-                modified_time_nanos,
-                change_time_nanos,
-            });
-        }
-        let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
-            STATX_UNSUPPORTED.store(true, Ordering::Relaxed);
-        } else {
-            return Err(LpmError::Store(format!(
-                "failed to stat virtual-store object tree entry {}: {error}",
-                dir.join(&name).display()
-            )));
-        }
-    }
-
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `dirfd` is a valid directory fd, `c_name` is NUL-terminated, and
-    // `st` is valid writable storage of `libc::stat`.
-    if unsafe { libc::fstatat(dirfd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(LpmError::Store(format!(
-            "failed to stat virtual-store object tree entry {}: {error}",
-            dir.join(&name).display()
-        )));
-    }
-    let kind = match st.st_mode & libc::S_IFMT {
-        libc::S_IFLNK => ObjectTreeEntryKind::Symlink,
-        libc::S_IFDIR => ObjectTreeEntryKind::Directory,
-        libc::S_IFREG => ObjectTreeEntryKind::File,
-        _ => ObjectTreeEntryKind::Unsupported,
-    };
-    Ok(ObjectTreeEntry {
-        name,
-        kind,
-        mode: st.st_mode & 0o7777,
-        len: st.st_size as u64,
-        modified_time_nanos: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
-        change_time_nanos: i128::from(st.st_ctime) * 1_000_000_000 + i128::from(st.st_ctime_nsec),
-    })
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -878,7 +724,6 @@ struct ObjectTreeEntry {
     change_time_nanos: i128,
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
 impl ObjectTreeEntry {
     fn from_metadata(name: OsString, metadata: &std::fs::Metadata) -> Self {
         let kind = if is_symlink_or_junction(metadata) {
@@ -1653,31 +1498,5 @@ mod tests {
         let mut encoded = Vec::new();
         push_os_str_bytes(&mut encoded, &entry.name);
         assert_eq!(encoded, b"file-\xff");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_statx_entries_match_portable_metadata_entries() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("index.js"), b"module.exports = 1;\n").unwrap();
-        let bin = root.path().join("cli.sh");
-        std::fs::write(&bin, b"#!/bin/sh\necho hi\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::create_dir(root.path().join("nested")).unwrap();
-        std::os::unix::fs::symlink("index.js", root.path().join("alias.js")).unwrap();
-
-        let linux = read_object_tree_entries_linux(root.path(), root.path()).unwrap();
-        let portable = read_object_tree_entries_portable(root.path(), root.path()).unwrap();
-        assert_eq!(linux.len(), portable.len());
-        for (l, p) in linux.iter().zip(portable.iter()) {
-            assert_eq!(l.name, p.name);
-            assert_eq!(l.kind, p.kind);
-            assert_eq!(l.mode, p.mode);
-            assert_eq!(l.len, p.len);
-            assert_eq!(l.modified_time_nanos, p.modified_time_nanos);
-            assert_eq!(l.change_time_nanos, p.change_time_nanos);
-        }
     }
 }
