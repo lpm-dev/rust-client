@@ -1365,6 +1365,7 @@ pub(super) async fn run_offline_install_phase(
         route_table,
         packages: &locked,
         offline: true,
+        force: false,
         json_output,
     })
     .await?;

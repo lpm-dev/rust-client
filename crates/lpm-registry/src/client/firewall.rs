@@ -11,6 +11,16 @@ pub struct NpmFirewallBatchPackage {
     pub published_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NpmFirewallCacheDirective {
+    #[default]
+    Unspecified,
+    Store {
+        max_age_secs: u64,
+    },
+    NoStore,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NpmFirewallBatchResponse {
@@ -22,6 +32,8 @@ pub struct NpmFirewallBatchResponse {
     pub decisions: Vec<NpmFirewallDecision>,
     #[serde(skip)]
     pub client_timing: Option<NpmFirewallClientTiming>,
+    #[serde(skip)]
+    pub cache_directive: NpmFirewallCacheDirective,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -220,6 +232,17 @@ impl Default for NpmFirewallPolicyProfile {
 }
 
 impl RegistryClient {
+    /// Non-reversible fingerprint of the auth principal (bearer + mTLS client
+    /// cert) used for firewall requests against `self.base_url`.
+    pub fn firewall_auth_identity_fingerprint(
+        &self,
+        posture: AuthPosture,
+    ) -> Result<String, LpmError> {
+        let bearer = self.current_bearer(posture)?;
+        let identity_fp = self.http.identity_fp_for_url(&self.base_url);
+        Ok(bearer_principal_fingerprint(bearer.as_deref(), identity_fp))
+    }
+
     pub async fn npm_firewall_batch_verdicts(
         &self,
         packages: &[NpmFirewallBatchPackage],
@@ -282,10 +305,18 @@ impl RegistryClient {
             })
             .await?;
         let request_ms = elapsed_millis(request_started);
+        let cache_directive = match Self::metadata_cache_directive(response.headers()) {
+            MetadataCacheDirective::Unspecified => NpmFirewallCacheDirective::Unspecified,
+            MetadataCacheDirective::Store { fresh_for } => NpmFirewallCacheDirective::Store {
+                max_age_secs: fresh_for.as_secs(),
+            },
+            MetadataCacheDirective::NoStore => NpmFirewallCacheDirective::NoStore,
+        };
         let (mut parsed, body_timings) = parse_capped_api_json_with_timing::<
             NpmFirewallBatchResponse,
         >(response, "npm firewall batch verdict response")
         .await?;
+        parsed.cache_directive = cache_directive;
         parsed.client_timing = Some(NpmFirewallClientTiming {
             request_ms,
             body_read_ms: body_timings.body_read_ms,

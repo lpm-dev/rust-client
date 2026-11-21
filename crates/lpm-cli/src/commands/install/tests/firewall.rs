@@ -3,7 +3,7 @@ use crate::commands::install::firewall::{
     DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode,
     NpmFirewallPreflightStats, npm_firewall_chunk_size, npm_firewall_package,
     npm_firewall_package_from_selected_event, request_npm_firewall_preflight,
-    spawn_chunked_npm_firewall_preflight,
+    request_npm_firewall_preflight_with_force, spawn_chunked_npm_firewall_preflight,
 };
 use crate::npm_firewall_config::NpmFirewallMode;
 
@@ -921,4 +921,393 @@ fn npm_firewall_package_from_selected_event_skips_incompatible_platform_package(
         )
         .is_none()
     );
+}
+
+#[tokio::test]
+async fn monitor_verdict_cache_reuses_clean_allows_and_keeps_enforce_live() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=300")
+                .set_body_json(serde_json::json!({
+                    "requestId": "req-allow",
+                    "policyMode": "product_default",
+                    "summary": {
+                        "total": 1,
+                        "allow": 1,
+                        "warn": 0,
+                        "block": 0,
+                        "unknown": 0,
+                        "matched": 0
+                    },
+                    "decisions": []
+                })),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let cache = tempfile::tempdir().unwrap();
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("monitor-cache-token")
+            .with_cache_dir(Some(cache.path().to_path_buf())),
+    );
+    let pkgs = vec![lpm_registry::client::NpmFirewallBatchPackage {
+        name: "left-pad".to_string(),
+        version: "1.3.0".to_string(),
+        integrity: None,
+        published_at: None,
+    }];
+    let profile = lpm_registry::client::NpmFirewallPolicyProfile::default();
+
+    // 1. Cold monitor call hits server and caches clean allow.
+    let first = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        profile,
+        Arc::clone(&client),
+        pkgs.clone(),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.stats.checked_count, 1);
+    assert_eq!(first.stats.allow_count, 1);
+    assert_eq!(first.stats.cache_hit_count, 0);
+
+    // 2. Warm monitor call serves from cache with zero HTTP calls.
+    let second = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        profile,
+        Arc::clone(&client),
+        pkgs.clone(),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.stats.checked_count, 1);
+    assert_eq!(second.stats.allow_count, 1);
+    assert_eq!(second.stats.cache_hit_count, 1);
+    assert!(!second.stats.rpc_failed);
+    assert_eq!(second.stats.to_json()["cache_hit_count"], 1);
+
+    // 3. --force bypasses monitor cache.
+    let forced = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        profile,
+        Arc::clone(&client),
+        pkgs.clone(),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(forced.stats.cache_hit_count, 0);
+
+    // 4. Enforce mode always calls live even when monitor cache is warm.
+    let enforced = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Enforce,
+        NpmFirewallLookupMode::PackageOnly,
+        profile,
+        Arc::clone(&client),
+        pkgs,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(enforced.stats.cache_hit_count, 0);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn monitor_verdict_cache_never_caches_warns_unknowns_or_no_store() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "no-store")
+                .set_body_json(serde_json::json!({
+                    "requestId": "req-nostore",
+                    "policyMode": "product_default",
+                    "summary": {
+                        "total": 1,
+                        "allow": 1,
+                        "warn": 0,
+                        "block": 0,
+                        "unknown": 0,
+                        "matched": 0
+                    },
+                    "decisions": []
+                })),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let cache = tempfile::tempdir().unwrap();
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("monitor-nostore-token")
+            .with_cache_dir(Some(cache.path().to_path_buf())),
+    );
+    let pkgs = vec![lpm_registry::client::NpmFirewallBatchPackage {
+        name: "left-pad".to_string(),
+        version: "1.3.0".to_string(),
+        integrity: None,
+        published_at: None,
+    }];
+    let profile = lpm_registry::client::NpmFirewallPolicyProfile::default();
+
+    for _ in 0..2 {
+        let res = request_npm_firewall_preflight_with_force(
+            NpmFirewallMode::Monitor,
+            NpmFirewallLookupMode::PackageOnly,
+            profile,
+            Arc::clone(&client),
+            pkgs.clone(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.stats.cache_hit_count, 0);
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn monitor_verdict_cache_isolates_auth_identity_and_policy_profile() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "req-iso",
+            "policyMode": "product_default",
+            "summary": {
+                "total": 1,
+                "allow": 1,
+                "warn": 0,
+                "block": 0,
+                "unknown": 0,
+                "matched": 0
+            },
+            "decisions": []
+        })))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let cache = tempfile::tempdir().unwrap();
+    let client_a = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("token-user-a")
+            .with_cache_dir(Some(cache.path().to_path_buf())),
+    );
+    let client_b = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("token-user-b")
+            .with_cache_dir(Some(cache.path().to_path_buf())),
+    );
+    let pkgs = vec![lpm_registry::client::NpmFirewallBatchPackage {
+        name: "left-pad".to_string(),
+        version: "1.3.0".to_string(),
+        integrity: None,
+        published_at: None,
+    }];
+    let default_profile = lpm_registry::client::NpmFirewallPolicyProfile::default();
+    let mut stricter_profile = default_profile;
+    stricter_profile.lpm_ai_suspicious = lpm_registry::client::NpmFirewallPolicyAction::Block;
+
+    // 1. User A populates cache.
+    let res1 = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        default_profile,
+        Arc::clone(&client_a),
+        pkgs.clone(),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res1.stats.cache_hit_count, 0);
+
+    // 2. User B must miss cache.
+    let res2 = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        default_profile,
+        client_b,
+        pkgs.clone(),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res2.stats.cache_hit_count, 0);
+
+    // 3. User A with stricter policy profile must miss cache.
+    let res3 = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        stricter_profile,
+        client_a,
+        pkgs,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res3.stats.cache_hit_count, 0);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn monitor_verdict_cache_caches_unflagged_allows_and_rechecks_warned_packages() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let pkgs = body["packages"].as_array().unwrap();
+            if pkgs.len() == 2 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "requestId": "req-mixed-1",
+                    "policyMode": "product_default",
+                    "summary": {
+                        "total": 2,
+                        "allow": 1,
+                        "warn": 1,
+                        "block": 0,
+                        "unknown": 1,
+                        "matched": 1
+                    },
+                    "decisions": [{
+                        "decisionId": "dec-warn",
+                        "name": "flagged-pkg",
+                        "version": "1.0.0",
+                        "action": "warn",
+                        "verdict": "suspicious",
+                        "reason": "test warning",
+                        "matchSource": "package",
+                        "policyMode": "product_default",
+                        "enqueueScan": false
+                    }]
+                }))
+            } else {
+                assert_eq!(pkgs.len(), 1);
+                assert_eq!(pkgs[0]["name"], "flagged-pkg");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "requestId": "req-mixed-2",
+                    "policyMode": "product_default",
+                    "summary": {
+                        "total": 1,
+                        "allow": 0,
+                        "warn": 1,
+                        "block": 0,
+                        "unknown": 0,
+                        "matched": 1
+                    },
+                    "decisions": [{
+                        "decisionId": "dec-warn-2",
+                        "name": "flagged-pkg",
+                        "version": "1.0.0",
+                        "action": "warn",
+                        "verdict": "suspicious",
+                        "reason": "test warning",
+                        "matchSource": "package",
+                        "policyMode": "product_default",
+                        "enqueueScan": false
+                    }]
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let cache = tempfile::tempdir().unwrap();
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("monitor-mixed-token")
+            .with_cache_dir(Some(cache.path().to_path_buf())),
+    );
+    let pkgs = vec![
+        lpm_registry::client::NpmFirewallBatchPackage {
+            name: "clean-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: None,
+            published_at: None,
+        },
+        lpm_registry::client::NpmFirewallBatchPackage {
+            name: "flagged-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: None,
+            published_at: None,
+        },
+    ];
+    let profile = lpm_registry::client::NpmFirewallPolicyProfile::default();
+
+    let first = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        profile,
+        Arc::clone(&client),
+        pkgs.clone(),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.stats.checked_count, 2);
+    assert_eq!(first.stats.allow_count, 1);
+    assert_eq!(first.stats.warn_count, 1);
+    assert_eq!(first.stats.unknown_count, 1);
+    assert_eq!(first.stats.cache_hit_count, 0);
+
+    // Second run serves clean-pkg from cache (preserving unknown_count) and only queries flagged-pkg live.
+    let second = request_npm_firewall_preflight_with_force(
+        NpmFirewallMode::Monitor,
+        NpmFirewallLookupMode::PackageOnly,
+        profile,
+        client,
+        pkgs,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.stats.checked_count, 2);
+    assert_eq!(second.stats.allow_count, 1);
+    assert_eq!(second.stats.warn_count, 1);
+    assert_eq!(second.stats.unknown_count, 1);
+    assert_eq!(second.stats.cache_hit_count, 1);
+    assert_eq!(second.decisions.len(), 1);
+    server.verify().await;
 }
