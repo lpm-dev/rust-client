@@ -3065,6 +3065,44 @@ mod tests {
     }
 
     #[test]
+    fn dist_unpacked_size_deserializes_from_messagepack_and_ignores_invalid_values() {
+        let populated = DistInfo {
+            tarball: Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string()),
+            shasum: None,
+            integrity: Some("sha512-test".to_string()),
+            unpacked_size: std::num::NonZeroU64::new(4096),
+            signatures: None,
+            attestations: None,
+        };
+        let encoded = rmp_serde::to_vec_named(&populated).unwrap();
+        let decoded: DistInfo = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.unpacked_size, std::num::NonZeroU64::new(4096));
+
+        let empty = DistInfo {
+            unpacked_size: None,
+            ..populated
+        };
+        let encoded_empty = rmp_serde::to_vec_named(&empty).unwrap();
+        let decoded_empty: DistInfo = rmp_serde::from_slice(&encoded_empty).unwrap();
+        assert_eq!(decoded_empty.unpacked_size, None);
+
+        let invalid_cases = [
+            serde_json::json!({"unpackedSize": 0}),
+            serde_json::json!({"unpackedSize": -5}),
+            serde_json::json!({"unpackedSize": 12.5}),
+            serde_json::json!({"unpackedSize": "4096"}),
+            serde_json::json!({"unpackedSize": true}),
+            serde_json::json!({"unpackedSize": [1, 2]}),
+            serde_json::json!({"unpackedSize": {"nested": 1}}),
+        ];
+        for value in invalid_cases {
+            let bytes = rmp_serde::to_vec_named(&value).unwrap();
+            let parsed: DistInfo = rmp_serde::from_slice(&bytes).expect("messagepack decode");
+            assert_eq!(parsed.unpacked_size, None, "{value}");
+        }
+    }
+
+    #[test]
     fn resolve_version_spec_exact_version() {
         let m = metadata_for_resolver_tests();
         assert_eq!(m.resolve_version_spec("1.2.3").unwrap(), "1.2.3");

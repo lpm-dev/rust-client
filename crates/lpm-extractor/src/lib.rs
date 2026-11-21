@@ -535,7 +535,7 @@ const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
 /// Largest decoded size [`file_fits_buffered_extraction`] admits. Several
 /// archives extract at once, and each buffered one holds its whole decoded
 /// tar until its last entry is written, so larger downloads go to the
-/// pipelined decoder, which keeps at most 768 KiB queued.
+/// pipelined decoder, which keeps at most 1 MiB of decode buffers.
 const MAX_ROUTED_BUFFERED_DECODE_SIZE: usize = 8 * 1024 * 1024;
 
 /// Whether a file-backed archive is small enough, both compressed and as
@@ -1184,7 +1184,7 @@ pub fn extract_tarball_from_reader_streaming_digests(
     )
 }
 
-/// Decode gzip ahead of file extraction using at most 768 KiB of queued buffers.
+/// Decode gzip ahead of file extraction using at most 1 MiB of decode buffers.
 ///
 /// The reader moves to a scoped worker. On extraction failure or unwinding,
 /// `cancel_input` must unblock any pending read before that worker can join.

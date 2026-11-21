@@ -39,16 +39,13 @@ struct Parent {
     identity: Identity,
 }
 
-const MAX_CACHED_PARENTS: usize = 8;
-
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
     root: Arc<File>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
-    parent_cache: Vec<Parent>,
-    active_parent: bool,
+    parent: Option<Parent>,
 }
 
 impl OutputTree {
@@ -61,22 +58,8 @@ impl OutputTree {
             root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
-            parent_cache: Vec::with_capacity(MAX_CACHED_PARENTS),
-            active_parent: false,
+            parent: None,
         })
-    }
-
-    #[inline]
-    fn current_parent(&self) -> Option<&Parent> {
-        self.active_parent.then(|| &self.parent_cache[0])
-    }
-
-    fn cache_parent(&mut self, parent: Parent) {
-        if self.parent_cache.len() == MAX_CACHED_PARENTS {
-            self.parent_cache.pop();
-        }
-        self.parent_cache.insert(0, parent);
-        self.active_parent = true;
     }
 
     pub(crate) fn prepare_parent(
@@ -86,21 +69,17 @@ impl OutputTree {
     ) -> Result<(), LpmError> {
         let parent = path.parent().unwrap_or(Path::new(""));
         if parent.as_os_str().is_empty() {
-            self.active_parent = false;
+            self.parent = None;
             return Ok(());
         }
-        if let Some(index) = self
-            .parent_cache
-            .iter()
-            .position(|cached| cached.path == parent)
+        if self
+            .parent
+            .as_ref()
+            .is_some_and(|cached| cached.path == parent)
         {
-            if index > 0 {
-                self.parent_cache[..=index].rotate_right(1);
-            }
-            self.active_parent = true;
             return Ok(());
         }
-        self.active_parent = false;
+        self.parent = None;
         if let Some(record) = self.directories.get(parent)
             && let Some((directory, name)) = open_known_parent(&self.root, parent)?
         {
@@ -108,7 +87,7 @@ impl OutputTree {
             if identity != record.identity {
                 return Err(changed_directory(parent));
             }
-            self.cache_parent(Parent {
+            self.parent = Some(Parent {
                 path: parent.to_path_buf(),
                 name,
                 file: Arc::new(directory),
@@ -154,7 +133,7 @@ impl OutputTree {
             current = Some(next);
         }
         if let Some(file) = current {
-            self.cache_parent(Parent {
+            self.parent = Some(Parent {
                 path: prefix,
                 name: c_path(parent)?,
                 file: Arc::new(file),
@@ -181,7 +160,8 @@ impl OutputTree {
     /// so another thread can create the file.
     pub(crate) fn new_file(&self, path: &Path) -> Result<NewFile, LpmError> {
         let directory = self
-            .current_parent()
+            .parent
+            .as_ref()
             .map_or(&self.root, |parent| &parent.file);
         let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
         Ok(NewFile {
@@ -205,7 +185,7 @@ impl OutputTree {
 
     pub(crate) fn validate_parent_for_inspection(&self) -> Result<(), LpmError> {
         self.validate_root()?;
-        if let Some(parent) = self.current_parent() {
+        if let Some(parent) = &self.parent {
             let metadata = stat_at(self.root.as_raw_fd(), &parent.name)?;
             // Identity checking also rejects an intermediate symlink redirected to another tree.
             if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
@@ -238,8 +218,7 @@ impl OutputTree {
     }
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
-        self.active_parent = false;
-        self.parent_cache.clear();
+        self.parent = None;
         self.validate_root()?;
         for (path, record) in &self.directories {
             if let Some((directory, _)) = open_known_parent(&self.root, path)? {
@@ -255,7 +234,8 @@ impl OutputTree {
 
     pub(crate) fn accepted_file_identity(&self, path: &Path) -> Result<Identity, LpmError> {
         let directory = self
-            .current_parent()
+            .parent
+            .as_ref()
             .map_or(&self.root, |parent| &parent.file);
         let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
         let name = CString::new(leaf.as_bytes()).map_err(invalid_path)?;
@@ -267,8 +247,7 @@ impl OutputTree {
     }
 
     pub(crate) fn cleanup<E: ExtractionRecord>(&mut self, files: &[E], identities: &[Identity]) {
-        self.active_parent = false;
-        self.parent_cache.clear();
+        self.parent = None;
         if files.len() != identities.len() {
             return;
         }

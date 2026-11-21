@@ -21,7 +21,7 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
 pub(super) const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 const METADATA_CACHE_FRESHNESS_LINE_CAP: u64 = 20;
-pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 24 * 1024 * 1024;
+pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 32 * 1024 * 1024;
 // MessagePack reserves 0xc1, so older readers treat JSON fallback entries as misses.
 pub(super) const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 
@@ -1681,6 +1681,27 @@ mod pending_write_budget_tests {
 
         drop(retained);
         assert_eq!(budget.available_permits(), MAX_PENDING_METADATA_CACHE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_persists_packument_larger_than_eight_mib() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().to_path_buf()));
+        let key = "large-packument-over-8mib";
+        let payload = "x".repeat(12 * 1024 * 1024);
+
+        client.write_metadata_cache(key, &payload, Some("\"v-large\""));
+        client.flush_pending_cache_writes().await;
+
+        let (cached, etag) = client
+            .read_metadata_cache_as::<String>(key)
+            .expect("12 MiB packument must persist within the pending cache byte budget");
+        assert_eq!(cached.len(), payload.len());
+        assert_eq!(etag.as_deref(), Some("\"v-large\""));
+        assert_eq!(
+            client.pending_cache_write_bytes.available_permits(),
+            MAX_PENDING_METADATA_CACHE_BYTES
+        );
     }
 }
 

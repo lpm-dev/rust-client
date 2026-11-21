@@ -162,7 +162,7 @@ pub(super) fn extract(
             crate::writers::WriterSetup::Disabled,
             |signal| {
                 crate::writers::WriterSetup::configured()
-                    .with_minimum_files(0)
+                    .with_minimum_files(4)
                     .with_failure_signal(signal)
             },
         );

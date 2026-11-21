@@ -14,11 +14,37 @@ pub(super) const MAX_VERSION_METADATA_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 // Bound simultaneous multi-MB packument deserializations to keep cold-install peak RSS in check.
 const LARGE_METADATA_PARSE_THRESHOLD: usize = 512 * 1024;
-const LARGE_METADATA_PARSE_CONCURRENCY: usize = 2;
 
-fn large_metadata_parse_limiter() -> &'static tokio::sync::Semaphore {
-    static LIMITER: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(LARGE_METADATA_PARSE_CONCURRENCY))
+fn large_metadata_parse_limiter() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIMITER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        let permits =
+            std::thread::available_parallelism().map_or(2, |cpus| (cpus.get() / 4).clamp(2, 4));
+        Arc::new(tokio::sync::Semaphore::new(permits))
+    })
+}
+
+async fn run_blocking_metadata_parse<T, F>(
+    limiter: &Arc<tokio::sync::Semaphore>,
+    buf_len: usize,
+    parse: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let large_parse_permit = if buf_len >= LARGE_METADATA_PARSE_THRESHOLD {
+        Arc::clone(limiter).acquire_owned().await.ok()
+    } else {
+        None
+    };
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit alive inside the blocking worker so cancelling the outer future
+        // cannot release RSS headroom while deserialization is still running.
+        let _large_parse_permit = large_parse_permit;
+        parse()
+    })
+    .await
 }
 
 /// Hard cap for non-metadata API responses (whoami, token check,
@@ -64,10 +90,13 @@ pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned + Send 
         return parse_metadata_buffer(&buf, context);
     }
 
+    let buf_len = buf.len();
     let context_owned = context.to_string();
-    tokio::task::spawn_blocking(move || parse_metadata_buffer(&buf, &context_owned))
-        .await
-        .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?
+    run_blocking_metadata_parse(large_metadata_parse_limiter(), buf_len, move || {
+        parse_metadata_buffer(&buf, &context_owned)
+    })
+    .await
+    .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -185,17 +214,13 @@ where
         return (parsed, timings);
     }
 
-    let _large_parse_permit = if buf.len() >= LARGE_METADATA_PARSE_THRESHOLD {
-        large_metadata_parse_limiter().acquire().await.ok()
-    } else {
-        None
-    };
+    let buf_len = buf.len();
     let context_owned = context.to_string();
     let span =
         tracing::trace_span!(target: "lpm_install_timeline", "metadata_parse", blocking = true);
     tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
     let worker_span = span.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = run_blocking_metadata_parse(large_metadata_parse_limiter(), buf_len, move || {
         let _entered = worker_span.enter();
         tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let parse_start = std::time::Instant::now();
@@ -337,4 +362,46 @@ pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> 
 
 pub(super) fn elapsed_millis(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_large_metadata_parse_retains_permit_until_worker_finishes() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let limiter_for_task = Arc::clone(&limiter);
+        let task = tokio::spawn(async move {
+            run_blocking_metadata_parse(
+                &limiter_for_task,
+                LARGE_METADATA_PARSE_THRESHOLD,
+                move || {
+                    let _ = started_tx.send(());
+                    let _ = resume_rx.recv();
+                    42usize
+                },
+            )
+            .await
+        });
+
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            limiter.available_permits(),
+            0,
+            "permit must stay held while blocking metadata parse is still executing"
+        );
+
+        resume_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), limiter.acquire())
+            .await
+            .expect("permit must be released once blocking parse finishes")
+            .unwrap();
+        drop(permit);
+        assert_eq!(limiter.available_permits(), 1);
+    }
 }
