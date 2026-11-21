@@ -1,8 +1,8 @@
 use miette::Result;
 
 mod runtime;
-pub(crate) use runtime::{keep_state_ignored_at_exit, keep_state_ignored_at_exit_from};
 use runtime::run_async_main;
+pub(crate) use runtime::{keep_state_ignored_at_exit, keep_state_ignored_at_exit_from};
 
 use crate::{
     auth, auth_storage_notice, color_policy, commands, engine_check, install_state,

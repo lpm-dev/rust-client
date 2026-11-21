@@ -1902,9 +1902,7 @@ pub fn relay_url_is_loopback(url: &str) -> bool {
 
 fn bundled_root_cert_store() -> rustls::RootCertStore {
     let mut root_store = rustls::RootCertStore::empty();
-    root_store.add_parsable_certificates(
-        webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned(),
-    );
+    root_store.add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
     root_store
 }
 

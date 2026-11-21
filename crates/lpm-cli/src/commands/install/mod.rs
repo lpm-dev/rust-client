@@ -2342,14 +2342,14 @@ async fn run_with_options_under_store_lock(
             && direct_versions_out.is_none()
             && policy_project_dir == project_dir
         {
-            active_lockfile_for_proof.as_deref().map(|lockfile| {
-                PostInstallSyncNoopProofContext {
+            active_lockfile_for_proof
+                .as_deref()
+                .map(|lockfile| PostInstallSyncNoopProofContext {
                     package: &pkg,
                     lockfile,
                     routes: &route_table,
                     auto_install_peers,
-                }
-            })
+                })
         } else {
             None
         };

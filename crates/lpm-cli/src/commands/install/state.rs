@@ -112,8 +112,8 @@ fn write_post_install_hash_with_context_and_proof(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .unwrap_or_default();
-    let sync_noop_proof = sync_noop_proof
-        .filter(|_| !crate::install_state::package_json_needs_slow_freshness(&pkg));
+    let sync_noop_proof =
+        sync_noop_proof.filter(|_| !crate::install_state::package_json_needs_slow_freshness(&pkg));
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v10(

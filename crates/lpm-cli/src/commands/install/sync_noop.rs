@@ -217,7 +217,9 @@ pub(crate) fn is_up_to_date(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::debug!("failed to refresh the cached Node runtime fingerprint: {error}");
+                    tracing::debug!(
+                        "failed to refresh the cached Node runtime fingerprint: {error}"
+                    );
                 }
             }
         }

@@ -297,8 +297,9 @@ impl DependencyEnginePolicy {
     }
 
     pub(crate) fn freshness_key(&self, lockfile_content: &str) -> String {
-        let version_ok = !lockfile_version(lockfile_content)
-            .is_some_and(|version| version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES);
+        let version_ok = !lockfile_version(lockfile_content).is_some_and(|version| {
+            version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
+        });
         let has_node_engines = version_ok && lockfile_has_dependency_node_engines(lockfile_content);
         self.freshness_key_from_flags(version_ok, has_node_engines)
     }
