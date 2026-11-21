@@ -33,13 +33,16 @@ struct Parent {
     identity: Identity,
 }
 
+const PARENT_CACHE_CAPACITY: usize = 8;
+
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
     root: Arc<Dir>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
-    parent: Option<Parent>,
+    parents: Vec<Parent>,
+    active_parent: Option<usize>,
 }
 
 impl OutputTree {
@@ -52,8 +55,13 @@ impl OutputTree {
             root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
-            parent: None,
+            parents: Vec::with_capacity(PARENT_CACHE_CAPACITY),
+            active_parent: None,
         })
+    }
+
+    fn current_parent(&self) -> Option<&Parent> {
+        self.active_parent.and_then(|idx| self.parents.get(idx))
     }
 
     pub(crate) fn prepare_parent(
@@ -63,17 +71,18 @@ impl OutputTree {
     ) -> Result<(), LpmError> {
         let parent = path.parent().unwrap_or(Path::new(""));
         if parent.as_os_str().is_empty() {
-            self.parent = None;
+            self.active_parent = None;
             return Ok(());
         }
-        if self
-            .parent
-            .as_ref()
-            .is_some_and(|cached| cached.path == parent)
-        {
+        if let Some(idx) = self.parents.iter().position(|cached| cached.path == parent) {
+            if idx != 0 {
+                let entry = self.parents.remove(idx);
+                self.parents.insert(0, entry);
+            }
+            self.active_parent = Some(0);
             return Ok(());
         }
-        self.parent = None;
+        self.active_parent = None;
 
         let mut current = None::<Dir>;
         let mut prefix = PathBuf::with_capacity(parent.as_os_str().len());
@@ -113,11 +122,18 @@ impl OutputTree {
             current = Some(next);
         }
         if let Some(directory) = current {
-            self.parent = Some(Parent {
-                path: prefix,
-                directory: Arc::new(directory),
-                identity,
-            });
+            if self.parents.len() == PARENT_CACHE_CAPACITY {
+                self.parents.pop();
+            }
+            self.parents.insert(
+                0,
+                Parent {
+                    path: prefix,
+                    directory: Arc::new(directory),
+                    identity,
+                },
+            );
+            self.active_parent = Some(0);
         }
         Ok(())
     }
@@ -138,7 +154,9 @@ impl OutputTree {
     /// Resolve `path` in the prepared parent without touching the filesystem,
     /// so another thread can create the file.
     pub(crate) fn new_file(&self, path: &Path) -> Result<NewFile, LpmError> {
-        let directory = self.parent.as_ref().map_or(&self.root, |p| &p.directory);
+        let directory = self
+            .current_parent()
+            .map_or(&self.root, |p| &p.directory);
         let name = path.file_name().ok_or_else(|| changed_directory(path))?;
         Ok(NewFile {
             directory: Arc::clone(directory),
@@ -161,7 +179,7 @@ impl OutputTree {
 
     pub(crate) fn validate_parent_for_inspection(&self) -> Result<(), LpmError> {
         self.validate_root()?;
-        if let Some(parent) = &self.parent {
+        if let Some(parent) = self.current_parent() {
             let current = self
                 .open_recorded_directory(&parent.path)?
                 .ok_or_else(|| changed_directory(&parent.path))?;
@@ -194,7 +212,8 @@ impl OutputTree {
     }
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
-        self.parent = None;
+        self.active_parent = None;
+        self.parents.clear();
         self.validate_root()?;
         for path in self.directories.keys() {
             self.open_recorded_directory(path)?;
@@ -204,8 +223,7 @@ impl OutputTree {
 
     pub(crate) fn accepted_file_identity(&self, path: &Path) -> Result<Identity, LpmError> {
         let directory = self
-            .parent
-            .as_ref()
+            .current_parent()
             .map_or(&self.root, |parent| &parent.directory);
         let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
         let metadata = directory.symlink_metadata(leaf)?;
@@ -216,7 +234,8 @@ impl OutputTree {
     }
 
     pub(crate) fn cleanup<E: ExtractionRecord>(&mut self, files: &[E], identities: &[Identity]) {
-        self.parent = None;
+        self.active_parent = None;
+        self.parents.clear();
         if files.len() != identities.len() {
             return;
         }

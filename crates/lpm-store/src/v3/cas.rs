@@ -655,26 +655,29 @@ impl FileCas {
 
     fn read_blob_stat(&self, key: &BlobKey) -> Result<BlobStatFingerprint, LpmError> {
         let path = self.blob_path(key)?;
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            LpmError::Store(format!(
-                "failed to inspect v3 CAS blob {}: {error}",
-                path.display()
-            ))
-        })?;
-        if !metadata.file_type().is_file()
-            || metadata.len() != key.size
-            || normalized_mode(&metadata) != key.mode
-        {
-            return Err(LpmError::Store(format!(
-                "v3 CAS blob metadata mismatch at {}",
-                path.display()
-            )));
-        }
         #[cfg(windows)]
-        let fingerprint = BlobStatFingerprint::from_path(&path)?;
+        {
+            BlobStatFingerprint::from_validated_blob_path(&path, key)
+        }
         #[cfg(not(windows))]
-        let fingerprint = BlobStatFingerprint::from_metadata(&metadata);
-        Ok(fingerprint)
+        {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to inspect v3 CAS blob {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file()
+                || metadata.len() != key.size
+                || normalized_mode(&metadata) != key.mode
+            {
+                return Err(LpmError::Store(format!(
+                    "v3 CAS blob metadata mismatch at {}",
+                    path.display()
+                )));
+            }
+            Ok(BlobStatFingerprint::from_metadata(&metadata))
+        }
     }
 
     fn write_source_validation(&self, validation: &SourceValidationRecord) -> Result<(), LpmError> {
@@ -2213,7 +2216,7 @@ impl BlobStatFingerprint {
 
 #[cfg(windows)]
 impl BlobStatFingerprint {
-    fn from_path(path: &Path) -> Result<Self, LpmError> {
+    fn from_validated_blob_path(path: &Path, key: &BlobKey) -> Result<Self, LpmError> {
         use std::os::windows::fs::MetadataExt;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -2233,6 +2236,15 @@ impl BlobStatFingerprint {
                 path.display()
             ))
         })?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != key.size
+            || normalized_mode(&metadata) != key.mode
+        {
+            return Err(LpmError::Store(format!(
+                "v3 CAS blob metadata mismatch at {}",
+                path.display()
+            )));
+        }
         let handle = file.as_raw_handle();
         let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: `handle` comes from the live `File` above and

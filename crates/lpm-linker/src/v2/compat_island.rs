@@ -260,23 +260,87 @@ fn build_compat_island_at(
     key_map: &KeyMap,
     refresh_package_copies: bool,
 ) -> Result<CompatibilityLinks, LpmError> {
-    let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
-    for entry in entries {
-        let package_dir = ensure_compatibility_package_copy(
-            compatibility_root,
-            entry,
-            store,
-            refresh_package_copies,
-        )?;
-        compatibility_links.insert(&entry.key, package_dir);
+    #[cfg(target_os = "macos")]
+    {
+        let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
+        for entry in entries {
+            let package_dir = ensure_compatibility_package_copy(
+                compatibility_root,
+                entry,
+                store,
+                refresh_package_copies,
+            )?;
+            compatibility_links.insert(&entry.key, package_dir);
+        }
+        for entry in entries {
+            sync_compatibility_entry_links(
+                compatibility_root,
+                entry,
+                key_map,
+                &compatibility_links,
+            )?;
+        }
+        for entry in entries {
+            write_compatibility_marker(compatibility_root, entry)?;
+        }
+        Ok(compatibility_links)
     }
-    for entry in entries {
-        sync_compatibility_entry_links(compatibility_root, entry, key_map, &compatibility_links)?;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        use rayon::prelude::*;
+
+        const PARALLEL_COMPAT_THRESHOLD: usize = 4;
+        let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
+        if entries.len() >= PARALLEL_COMPAT_THRESHOLD {
+            let copied: Vec<(&GraphKey, PathBuf)> = entries
+                .par_iter()
+                .map(|entry| {
+                    let package_dir = ensure_compatibility_package_copy(
+                        compatibility_root,
+                        entry,
+                        store,
+                        refresh_package_copies,
+                    )?;
+                    Ok((entry.key.as_ref(), package_dir))
+                })
+                .collect::<Result<Vec<_>, LpmError>>()?;
+            for (key, package_dir) in copied {
+                compatibility_links.insert(key, package_dir);
+            }
+            entries.par_iter().try_for_each(|entry| {
+                sync_compatibility_entry_links(
+                    compatibility_root,
+                    entry,
+                    key_map,
+                    &compatibility_links,
+                )?;
+                write_compatibility_marker(compatibility_root, entry)
+            })?;
+        } else {
+            for entry in entries {
+                let package_dir = ensure_compatibility_package_copy(
+                    compatibility_root,
+                    entry,
+                    store,
+                    refresh_package_copies,
+                )?;
+                compatibility_links.insert(&entry.key, package_dir);
+            }
+            for entry in entries {
+                sync_compatibility_entry_links(
+                    compatibility_root,
+                    entry,
+                    key_map,
+                    &compatibility_links,
+                )?;
+            }
+            for entry in entries {
+                write_compatibility_marker(compatibility_root, entry)?;
+            }
+        }
+        Ok(compatibility_links)
     }
-    for entry in entries {
-        write_compatibility_marker(compatibility_root, entry)?;
-    }
-    Ok(compatibility_links)
 }
 
 /// Non-macOS path: build (and incrementally reconcile) the island directly in
@@ -1349,14 +1413,16 @@ fn create_compatibility_sibling_link(
 }
 
 /// Relative symlink target for an in-island sibling edge, computed from the
-/// link's parent directory. Both paths live under the same compatibility
-/// root, so the result is an island-internal relative path (e.g.
-/// `../../<dep-key>/node_modules/<dep>`) that survives a whole-island
-/// `clonefile` to any destination.
+/// link's parent directory. Both paths are built under the same compatibility
+/// root with no intermediate symlinks, so lexical `diff_paths` computes the
+/// island-internal relative path directly without `canonicalize()` syscalls.
 fn relative_compat_sibling_target(link_path: &Path, target_package_dir: &Path) -> PathBuf {
     let Some(link_parent) = link_path.parent() else {
         return target_package_dir.to_path_buf();
     };
+    if let Some(relative) = pathdiff::diff_paths(target_package_dir, link_parent) {
+        return relative;
+    }
     let link_parent_canonical = link_parent
         .canonicalize()
         .unwrap_or_else(|_| link_parent.to_path_buf());
