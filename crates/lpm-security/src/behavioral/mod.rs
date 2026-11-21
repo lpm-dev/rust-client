@@ -2311,7 +2311,6 @@ pub fn read_cached_analysis_from_open_dir(
     package_dir: &cap_std::fs::Dir,
 ) -> Option<PackageAnalysis> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
-    use std::io::Read as _;
 
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
@@ -2320,14 +2319,9 @@ pub fn read_cached_analysis_from_open_dir(
     if !metadata.is_file() || metadata.len() > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
         return None;
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    let mut limited = file
-        .into_std()
-        .take(lpm_common::STATE_FILE_SIZE_CAP_BYTES.saturating_add(1));
-    limited.read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
-        return None;
-    }
+    let bytes =
+        lpm_common::read_stream_capped(file.into_std(), lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     let analysis: PackageAnalysis = serde_json::from_slice(&bytes).ok()?;
     if analysis.version != SCHEMA_VERSION {
         tracing::debug!(

@@ -190,7 +190,7 @@ fn runtime_worker_threads(
         return None;
     }
     let project_dir = project_dir?;
-    let content = lpm_common::read_text_file_capped(
+    let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
         &project_dir.join("package.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
