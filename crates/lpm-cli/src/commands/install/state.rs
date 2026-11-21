@@ -359,8 +359,8 @@ pub(super) async fn run_install_freshness_phase(
                 if input.omit_policy.optional {
                     filter_optional_packages(&mut packages, input.root_optional_dependency_names);
                 }
-                filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
                 filter_platform_packages(&mut packages)?;
+                filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
                 let skills_ready = input.no_skills
                     || selected_package_skills(&packages)?
                         .iter()

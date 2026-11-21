@@ -44,7 +44,6 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const LOCKFILE_NODE_ENGINE_NEEDLE: &str = "node-engine = ";
 const DEFAULT_NODE_SELECTOR_HINT: &str = "22";
 const NEUTRAL_NODE_SELECTOR_HINT: &str = "<matching-version>";
 
@@ -339,7 +338,11 @@ impl DependencyEnginePolicy {
 }
 
 pub(crate) fn lockfile_has_dependency_node_engines(content: &str) -> bool {
-    content.contains(LOCKFILE_NODE_ENGINE_NEEDLE)
+    content.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("node-engine")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
 }
 
 fn lockfile_version(content: &str) -> Option<u32> {
@@ -1213,5 +1216,18 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(reusing.constrained_freshness_key(), "1:20.11.0");
+    }
+
+    #[test]
+    fn lockfile_node_engine_detection_handles_compact_toml_spacing() {
+        assert!(lockfile_has_dependency_node_engines(
+            "[[package]]\nname = \"a\"\nnode-engine = \">=20\"\n"
+        ));
+        assert!(lockfile_has_dependency_node_engines(
+            "[[package]]\nname=\"a\"\nnode-engine=\">=20\"\n"
+        ));
+        assert!(!lockfile_has_dependency_node_engines(
+            "# node-engine = \">=20\"\n[[package]]\nname = \"a\"\n"
+        ));
     }
 }

@@ -2823,6 +2823,14 @@ fn registry_base_urls_match_fast_path_accepts_equal_origins_and_rejects_malforme
     ));
     assert!(!registry_base_urls_match("not a url", "not a url"));
     assert!(!registry_base_urls_match("https://", "https://"));
+    assert!(!registry_base_urls_match(
+        "https://host:65536",
+        "https://host:65536"
+    ));
+    assert!(!registry_base_urls_match(
+        "https://host:abc",
+        "https://host:abc"
+    ));
 }
 
 #[test]

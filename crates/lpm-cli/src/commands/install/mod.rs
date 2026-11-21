@@ -1771,21 +1771,78 @@ async fn run_with_options_under_store_lock(
     //
     // Apply is unconditional even on the lockfile fast path: see the
     // module-level comment in `patch_engine.rs` for why.
-    let needs_patch_baseline_index = !current_patches.is_empty();
+    let has_duplicate_materialized_coords = {
+        let mut seen: HashMap<(&str, &str), &Path> =
+            HashMap::with_capacity(link_result.materialized.len());
+        link_result.materialized.iter().any(|entry| {
+            seen.insert(
+                (entry.name.as_str(), entry.version.as_str()),
+                entry.destination.as_path(),
+            )
+            .is_some_and(|prev| prev != entry.destination.as_path())
+        })
+    };
+    let needs_full_baseline_index =
+        !current_patches.is_empty() || has_duplicate_materialized_coords;
     let baseline_index = store_version.uses_virtual_store().then(|| {
-        if needs_patch_baseline_index {
+        if needs_full_baseline_index {
             lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root)
         } else {
-            lpm_store::V2BaselineIndex::from_materialized_coords(
-                link_result.materialized.iter().map(|entry| {
-                    (
-                        entry.name.clone(),
-                        entry.version.clone(),
-                        entry.destination.clone(),
-                        String::new(),
-                    )
-                }),
-            )
+            let pkg_by_instance: HashMap<&lpm_common::PackageInstanceId, &InstallPackage> =
+                packages
+                    .iter()
+                    .filter_map(|pkg| pkg.instance_id.as_ref().map(|id| (id, pkg)))
+                    .collect();
+            let mut pkg_by_coords: HashMap<(&str, &str), &InstallPackage> =
+                HashMap::with_capacity(packages.len());
+            for pkg in &packages {
+                let key = (pkg.name.as_str(), pkg.version.as_str());
+                pkg_by_coords
+                    .entry(key)
+                    .and_modify(|existing| {
+                        if pkg.is_direct && !existing.is_direct {
+                            *existing = pkg;
+                        }
+                    })
+                    .or_insert(pkg);
+            }
+            let mut ordered: Vec<(bool, String, String, PathBuf, PathBuf, String)> =
+                Vec::with_capacity(link_result.materialized.len());
+            for entry in &link_result.materialized {
+                let matched_pkg = entry
+                    .instance_id
+                    .as_ref()
+                    .and_then(|id| pkg_by_instance.get(id).copied())
+                    .or_else(|| {
+                        pkg_by_coords
+                            .get(&(entry.name.as_str(), entry.version.as_str()))
+                            .copied()
+                    });
+                let is_direct = matched_pkg.is_some_and(|pkg| pkg.is_direct);
+                let integrity = matched_pkg
+                    .and_then(|pkg| pkg.integrity.clone())
+                    .unwrap_or_default();
+                let pristine_dir = store_v2_handle
+                    .as_deref()
+                    .filter(|_| !integrity.is_empty())
+                    .and_then(|store_v2| store_v2.paths().object_dir(&integrity).ok())
+                    .filter(|dir| dir.is_dir())
+                    .unwrap_or_else(|| entry.destination.clone());
+                ordered.push((
+                    is_direct,
+                    entry.name.clone(),
+                    entry.version.clone(),
+                    entry.destination.clone(),
+                    pristine_dir,
+                    integrity,
+                ));
+            }
+            ordered.sort_by_key(|(is_direct, ..)| !*is_direct);
+            lpm_store::V2BaselineIndex::from_materialized_coords(ordered.into_iter().map(
+                |(_, name, version, package_dir, pristine_dir, integrity)| {
+                    (name, version, package_dir, pristine_dir, integrity)
+                },
+            ))
         }
     });
     let mut omitted_patch_targets =

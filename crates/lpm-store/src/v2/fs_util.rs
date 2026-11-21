@@ -111,36 +111,76 @@ pub(crate) fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn ensured_store_tiers() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
-    use std::collections::HashSet;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoreTierDirIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn read_verified_tier_identity(path: &Path) -> Option<StoreTierDirIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() || is_symlink_or_junction(&metadata) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
+        Some(StoreTierDirIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(StoreTierDirIdentity {})
+    }
+}
+
+fn ensured_store_tiers()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, StoreTierDirIdentity>> {
+    use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
-    static ENSURED: LazyLock<Mutex<HashSet<PathBuf>>> =
-        LazyLock::new(|| Mutex::new(HashSet::new()));
+    static ENSURED: LazyLock<Mutex<HashMap<PathBuf, StoreTierDirIdentity>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     &ENSURED
 }
 
-/// [`ensure_store_tier_dir_locked`] memoized once per process so hot per-package
-/// callers avoid repeating `lstat` and macOS `acl_get_link_np` on the same tier
-/// directory. Kept distinct from [`harden_store_tier_once`] so baseline-lookup
-/// hardening still runs independently when reading an existing tier. Callers
-/// that subsequently observe `NotFound` call [`invalidate_hardened_store_tier`]
-/// and retry.
+/// [`ensure_store_tier_dir_locked`] memoized per directory identity so hot
+/// per-package callers avoid repeating macOS `acl_get_link_np` and
+/// `set_permissions` on the same unchanged tier directory. Every hit still
+/// verifies via a single `lstat` that the path remains a real owner-only
+/// directory with the same `(dev, ino)`, falling back to full hardening if
+/// the directory was removed, widened, or replaced.
 pub(crate) fn ensure_store_tier_dir_locked_once(path: &Path) -> std::io::Result<()> {
     use std::sync::PoisonError;
 
-    if ensured_store_tiers()
+    let cached_identity = ensured_store_tiers()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .contains(path)
-    {
-        return Ok(());
+        .get(path)
+        .copied();
+    if let Some(expected) = cached_identity {
+        if read_verified_tier_identity(path) == Some(expected) {
+            return Ok(());
+        }
+        ensured_store_tiers()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path);
     }
     ensure_store_tier_dir_locked(path)?;
-    ensured_store_tiers()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(path.to_path_buf());
+    if let Some(identity) = read_verified_tier_identity(path) {
+        ensured_store_tiers()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), identity);
+    }
     Ok(())
 }
 
@@ -154,31 +194,40 @@ pub(crate) fn invalidate_hardened_store_tier(path: &Path) {
 }
 
 /// [`ensure_store_tier_dir_locked`] for an existing tier a reuse reads,
-/// which an earlier release may have left open to others, once per process:
-/// later reuses from the same tier check nothing. A missing tier is left
-/// for the writer that creates it.
+/// memoized by verified directory identity so unchanged tiers skip repeated
+/// ACL/chmod work while deleted or replaced tiers are re-checked. A missing
+/// tier is left for the writer that creates it.
 pub(crate) fn harden_store_tier_once(path: &Path) -> std::io::Result<()> {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex, PoisonError};
 
-    static HARDENED: LazyLock<Mutex<HashSet<PathBuf>>> =
-        LazyLock::new(|| Mutex::new(HashSet::new()));
-    if HARDENED
+    static HARDENED: LazyLock<Mutex<HashMap<PathBuf, StoreTierDirIdentity>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let cached_identity = HARDENED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .contains(path)
-    {
-        return Ok(());
+        .get(path)
+        .copied();
+    if let Some(expected) = cached_identity {
+        if read_verified_tier_identity(path) == Some(expected) {
+            return Ok(());
+        }
+        HARDENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path);
     }
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         _ => {}
     }
     ensure_store_tier_dir_locked(path)?;
-    HARDENED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(path.to_path_buf());
+    if let Some(identity) = read_verified_tier_identity(path) {
+        HARDENED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), identity);
+    }
     Ok(())
 }
 

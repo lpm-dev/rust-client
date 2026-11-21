@@ -193,6 +193,8 @@ impl LinkMeta {
                     tv_nsec: libc::UTIME_NOW,
                 },
             ];
+            // SAFETY: `c_path` is a valid NUL-terminated string and `times` is a
+            // valid two-element timespec array for the duration of the syscall.
             let rc = unsafe {
                 libc::utimensat(
                     libc::AT_FDCWD,

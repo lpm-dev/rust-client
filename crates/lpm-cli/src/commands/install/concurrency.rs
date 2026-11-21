@@ -289,40 +289,57 @@ pub(super) async fn prevalidate_v2_reusable_objects(
     let mut hits = HashMap::with_capacity(candidate_count);
     let mut validation_timings = V2ReusableValidationTimings::default();
 
-    // Under Source policy each check is a single stat + tiny sidecar read (~10 µs),
+    // Under V2 Source policy each warm check is a single stat + tiny sidecar read (~10 µs),
     // so fanning out up to 16 blocking threads adds thread/arena RSS for no wall gain.
+    // V3 file-CAS stores validate blob files, and cold legacy migrations/backfills take
+    // longer, so we keep V3 parallel and spill to parallel if any inline check is slow.
     let inline_source_check = store_v2.object_integrity_policy()
         == lpm_store::v2::ObjectIntegrityPolicy::Source
+        && store_v2.supports_streamed_object_ingest()
         && candidate_count <= 256;
-    let concurrency = if inline_source_check {
+    let mut concurrency = if inline_source_check {
         1
     } else {
         v2_cache_check_concurrency(candidate_count)
     };
 
-    if inline_source_check {
+    let mut remaining_candidates = if inline_source_check {
+        const INLINE_SLOW_CHECK_THRESHOLD_MS: u128 = 10;
         let store_v2 = Arc::clone(&store_v2);
-        let results = tokio::task::spawn_blocking(move || {
+        let validation_batch = validation_batch.clone();
+        let (batch_results, overflow) = tokio::task::spawn_blocking(move || {
             let mut batch_results = Vec::with_capacity(unique_candidates.len());
-            for sri in unique_candidates {
+            let mut iter = unique_candidates.into_iter();
+            while let Some(sri) = iter.next() {
                 let (hit, timings) =
                     store_v2.reusable_object_with_timings_in_batch(&sri, &validation_batch)?;
+                let slow = timings.total_ms >= INLINE_SLOW_CHECK_THRESHOLD_MS;
                 batch_results.push((sri, hit, timings));
+                if slow {
+                    let overflow: Vec<String> = iter.collect();
+                    return Ok::<_, LpmError>((batch_results, overflow));
+                }
             }
-            Ok::<_, LpmError>(batch_results)
+            Ok::<_, LpmError>((batch_results, Vec::new()))
         })
         .await
         .map_err(|error| {
             LpmError::Registry(format!("virtual-store cache check task panicked: {error}"))
         })??;
-        for (sri, hit, timings) in results {
+        for (sri, hit, timings) in batch_results {
             validation_timings.record(timings, hit.is_some());
             if let Some(hit) = hit {
                 hits.insert(sri, hit);
             }
         }
+        overflow
     } else {
-        let mut checks = futures::stream::iter(unique_candidates.into_iter().map(|sri| {
+        unique_candidates
+    };
+
+    if !remaining_candidates.is_empty() {
+        concurrency = v2_cache_check_concurrency(remaining_candidates.len());
+        let mut checks = futures::stream::iter(remaining_candidates.drain(..).map(|sri| {
             let store_v2 = Arc::clone(&store_v2);
             let validation_batch = validation_batch.clone();
             async move {

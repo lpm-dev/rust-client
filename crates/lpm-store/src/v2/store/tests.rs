@@ -1283,7 +1283,6 @@ fn populate_is_idempotent_and_touches_last_referenced_at() {
         .unwrap()
         .modified()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let second = populate_link_entry_source(&store, req()).unwrap();
     assert!(!second.freshly_populated);
@@ -6587,9 +6586,16 @@ fn source_policy_keeps_full_tree_verification_for_built_link_entries() {
 
     let first = store.populate_link_entry(request()).unwrap();
     let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
-    // Mark as lifecycle-built and mutate a nested file; shallow guard must be bypassed.
+    let original_dir_mtime = std::fs::metadata(&pkg_dir).unwrap().modified().unwrap();
+    // Mark as lifecycle-built, mutate a nested file, and restore package_dir mtime
+    // so only the `.lpm-built` bypass forces full tree verification.
     std::fs::write(pkg_dir.join(".lpm-built"), b"built").unwrap();
     std::fs::write(pkg_dir.join("nested/sub/file.js"), b"tampered").unwrap();
+    filetime::set_file_mtime(
+        &pkg_dir,
+        filetime::FileTime::from_system_time(original_dir_mtime),
+    )
+    .unwrap();
 
     let repaired = store.populate_link_entry(request()).unwrap();
     assert!(
@@ -6630,7 +6636,7 @@ fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
 
     let first = store.populate_link_entry(request()).unwrap();
     let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
-    let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(900);
     filetime::set_file_mtime(
         &sidecar_path,
         filetime::FileTime::from_system_time(stale_time),
@@ -6650,5 +6656,85 @@ fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
     assert!(
         after > before,
         "sidecar older than cooldown must have its mtime refreshed on reuse"
+    );
+
+    // Future-dated sidecar (clock skew) must also be repaired back to now.
+    let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    filetime::set_file_mtime(
+        &sidecar_path,
+        filetime::FileTime::from_system_time(future_time),
+    )
+    .unwrap();
+    let reused_after_skew = store.populate_link_entry(request()).unwrap();
+    assert!(!reused_after_skew.freshly_populated);
+    let repaired_mtime = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        repaired_mtime < future_time,
+        "future-dated sidecar mtime must be refreshed on reuse"
+    );
+}
+
+#[test]
+fn source_policy_shallow_guard_falls_back_when_snapshot_is_racily_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"source_policy_racily_clean_nested_tamper");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[
+            ("package.json", br#"{"name":"racy-pkg","version":"1.0.0"}"#),
+            ("nested/file.js", b"module.exports = 'pristine';\n"),
+        ],
+    );
+    let key = arc_key("racy-pkg", "1.0.0");
+    let request = || LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri.clone(),
+        object_dir: object_dir.clone(),
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+
+    let first = store.populate_link_entry(request()).unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    // Immediately after creation, snapshot_captured_at_nanos is within 2s of mtimes
+    // (racily clean), so a nested file mutation must still be caught by metadata check.
+    std::fs::write(
+        pkg_dir.join("nested/file.js"),
+        b"module.exports = 'tampered';\n",
+    )
+    .unwrap();
+    let second = store.populate_link_entry(request()).unwrap();
+    assert!(
+        second.freshly_populated,
+        "racily-clean shallow guard must fall back to metadata verification and repair nested edits"
+    );
+    assert_eq!(
+        std::fs::read(pkg_dir.join("nested/file.js")).unwrap(),
+        b"module.exports = 'pristine';\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_store_tier_dir_locked_once_detects_symlink_replacement_after_caching() {
+    let dir = tempfile::tempdir().unwrap();
+    let tier = dir.path().join("tier");
+    let decoy = dir.path().join("decoy");
+    std::fs::create_dir(&decoy).unwrap();
+
+    crate::v2::fs_util::ensure_store_tier_dir_locked_once(&tier).unwrap();
+    std::fs::remove_dir(&tier).unwrap();
+    std::os::unix::fs::symlink(&decoy, &tier).unwrap();
+
+    let err = crate::v2::fs_util::ensure_store_tier_dir_locked_once(&tier)
+        .expect_err("cached tier path replaced by symlink must be rejected");
+    assert!(
+        err.to_string().contains("non-directory store tier"),
+        "unexpected error: {err}"
     );
 }

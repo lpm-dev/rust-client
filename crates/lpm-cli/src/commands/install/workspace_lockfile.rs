@@ -1225,14 +1225,7 @@ pub(super) fn active_lockfile_snapshot(project_dir: &Path) -> ActiveLockfileSnap
         )
     });
     let content = project
-        .and_then(|project| {
-            if project.workspace_root.is_none() && !project.content.contains("[workspace-packages")
-            {
-                Ok(project.content)
-            } else {
-                project.lockfile.to_toml()
-            }
-        })
+        .and_then(|project| project.lockfile.to_toml())
         .unwrap_or_default();
     ActiveLockfileSnapshot {
         path,

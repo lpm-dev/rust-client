@@ -115,16 +115,18 @@ impl V2BaselineIndex {
 
     /// Build a coordinate-keyed index directly from already-materialized v2/v3
     /// package directories without walking `node_modules` or re-reading link
-    /// sidecars on disk. Callers that need patch-baseline `pristine_dir` or
-    /// graph-digest traversal must still use [`Self::for_project`].
+    /// sidecars on disk. Callers must pass direct roots before transitives,
+    /// supply the store object `pristine_dir` and integrity when known, and
+    /// fall back to [`Self::for_project`] when patches are active or multiple
+    /// distinct materialized instances share `(name, version)`.
     pub fn from_materialized_coords(
-        entries: impl IntoIterator<Item = (String, String, PathBuf, String)>,
+        entries: impl IntoIterator<Item = (String, String, PathBuf, PathBuf, String)>,
     ) -> Self {
         let mut index = Self::default();
-        for (name, version, package_dir, integrity) in entries {
+        for (name, version, package_dir, pristine_dir, integrity) in entries {
             let baseline = Arc::new(InstalledPackageBaseline {
-                pristine_dir: package_dir.clone(),
                 package_dir,
+                pristine_dir,
                 integrity: integrity.clone(),
                 layout: PackageBaselineLayout::V2,
             });

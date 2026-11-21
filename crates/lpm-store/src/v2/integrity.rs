@@ -65,12 +65,43 @@ pub(crate) fn object_integrity_policy_from_env() -> ObjectIntegrityPolicy {
     ObjectIntegrityPolicy::from_env_value(std::env::var(ENV_V2_OBJECT_INTEGRITY).ok().as_deref())
 }
 
+// Git-style racily-clean safety window: if package mtimes were within 2 seconds
+// of snapshot capture, fall back to full metadata hashing to catch same-tick edits.
+pub(crate) const SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS: i128 = 2_000_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShallowPackageGuard {
     pub(crate) package_dir_mtime_nanos: i128,
+    pub(crate) package_dir_ctime_nanos: Option<i128>,
     pub(crate) package_json_size: u64,
     pub(crate) package_json_mtime_nanos: i128,
+    pub(crate) package_json_ctime_nanos: Option<i128>,
     pub(crate) package_dir_entry_count: Option<u64>,
+    pub(crate) captured_at_nanos: Option<i128>,
+}
+
+impl ShallowPackageGuard {
+    /// Returns true iff `self` (the current filesystem observation) matches
+    /// `recorded` AND `recorded` was captured safely after both mtimes (outside
+    /// the racily-clean window).
+    pub(crate) fn matches_non_racy(&self, recorded: &ShallowPackageGuard) -> bool {
+        if self.package_dir_mtime_nanos != recorded.package_dir_mtime_nanos
+            || self.package_dir_ctime_nanos != recorded.package_dir_ctime_nanos
+            || self.package_json_size != recorded.package_json_size
+            || self.package_json_mtime_nanos != recorded.package_json_mtime_nanos
+            || self.package_json_ctime_nanos != recorded.package_json_ctime_nanos
+            || self.package_dir_entry_count != recorded.package_dir_entry_count
+        {
+            return false;
+        }
+        let Some(captured_at) = recorded.captured_at_nanos else {
+            return false;
+        };
+        captured_at.saturating_sub(recorded.package_dir_mtime_nanos)
+            >= SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+            && captured_at.saturating_sub(recorded.package_json_mtime_nanos)
+                >= SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,11 +114,17 @@ pub(crate) struct TreeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_dir_mtime_nanos: Option<i128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_dir_ctime_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_json_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_json_mtime_nanos: Option<i128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_json_ctime_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_dir_entry_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_captured_at_nanos: Option<i128>,
 }
 
 impl TreeSnapshot {
@@ -99,9 +136,12 @@ impl TreeSnapshot {
     pub(crate) fn shallow_guard(&self) -> Option<ShallowPackageGuard> {
         Some(ShallowPackageGuard {
             package_dir_mtime_nanos: self.package_dir_mtime_nanos?,
+            package_dir_ctime_nanos: self.package_dir_ctime_nanos,
             package_json_size: self.package_json_size?,
             package_json_mtime_nanos: self.package_json_mtime_nanos?,
+            package_json_ctime_nanos: self.package_json_ctime_nanos,
             package_dir_entry_count: self.package_dir_entry_count,
+            captured_at_nanos: self.snapshot_captured_at_nanos,
         })
     }
 }
@@ -111,6 +151,18 @@ fn system_time_nanos(time: std::time::SystemTime) -> i128 {
         Ok(duration) => duration.as_nanos() as i128,
         Err(error) => -(error.duration().as_nanos() as i128),
     }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn metadata_ctime_nanos(metadata: &std::fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+    Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn metadata_ctime_nanos(_metadata: &std::fs::Metadata) -> Option<i128> {
+    None
 }
 
 pub(crate) fn read_shallow_package_guard(package_dir: &Path) -> Option<ShallowPackageGuard> {
@@ -140,9 +192,12 @@ pub(crate) fn read_shallow_package_guard(package_dir: &Path) -> Option<ShallowPa
     let package_dir_entry_count = None;
     Some(ShallowPackageGuard {
         package_dir_mtime_nanos: system_time_nanos(dir_mtime),
+        package_dir_ctime_nanos: metadata_ctime_nanos(&dir_meta),
         package_json_size: pkg_json_meta.len(),
         package_json_mtime_nanos: system_time_nanos(pkg_json_mtime),
+        package_json_ctime_nanos: metadata_ctime_nanos(&pkg_json_meta),
         package_dir_entry_count,
+        captured_at_nanos: Some(system_time_nanos(std::time::SystemTime::now())),
     })
 }
 
@@ -1120,9 +1175,12 @@ fn write_tree_snapshot_fields(
         layout_content_integrity: layout_content_integrity.map(str::to_owned),
         metadata_integrity: metadata_integrity.to_owned(),
         package_dir_mtime_nanos: shallow_guard.map(|guard| guard.package_dir_mtime_nanos),
+        package_dir_ctime_nanos: shallow_guard.and_then(|guard| guard.package_dir_ctime_nanos),
         package_json_size: shallow_guard.map(|guard| guard.package_json_size),
         package_json_mtime_nanos: shallow_guard.map(|guard| guard.package_json_mtime_nanos),
+        package_json_ctime_nanos: shallow_guard.and_then(|guard| guard.package_json_ctime_nanos),
         package_dir_entry_count: shallow_guard.and_then(|guard| guard.package_dir_entry_count),
+        snapshot_captured_at_nanos: shallow_guard.and_then(|guard| guard.captured_at_nanos),
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
         LpmError::Store(format!(

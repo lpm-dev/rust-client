@@ -381,7 +381,7 @@ fn ensure_store_compat_island(
     key_map: &KeyMap,
     force_refresh: bool,
 ) -> Result<(), LpmError> {
-    if store_compat_island_complete(store_island, entries, store) && !force_refresh {
+    if store_compat_island_complete(store_island, entries, store, key_map) && !force_refresh {
         // Reuse: refresh the sentinel's mtime so `lpm cache prune
         // --max-age` treats an actively-used island as live (the clone
         // that follows only reads the island, so without this an island
@@ -418,7 +418,7 @@ fn ensure_store_compat_island(
         Ok(()) => Ok(()),
         // Lost a concurrent-build race: another install published a complete
         // island at this key first. Discard ours and reuse theirs.
-        Err(_) if store_compat_island_complete(store_island, entries, store) => {
+        Err(_) if store_compat_island_complete(store_island, entries, store, key_map) => {
             let _ = std::fs::remove_dir_all(&tmp);
             Ok(())
         }
@@ -433,6 +433,9 @@ fn ensure_store_compat_island(
 }
 
 #[cfg(target_os = "macos")]
+const COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS: i128 = 2_000_000_000;
+
+#[cfg(target_os = "macos")]
 fn compat_system_time_nanos(time: std::time::SystemTime) -> i128 {
     match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_nanos() as i128,
@@ -441,18 +444,123 @@ fn compat_system_time_nanos(time: std::time::SystemTime) -> i128 {
 }
 
 #[cfg(target_os = "macos")]
-fn compat_package_shallow_guard(package_dir: &Path) -> Option<(String, u64, String)> {
+struct CompatPackageShallowGuard {
+    dir_mtime_nanos: i128,
+    dir_ctime_nanos: i128,
+    pkg_json_size: u64,
+    pkg_json_mtime_nanos: i128,
+    pkg_json_ctime_nanos: i128,
+}
+
+#[cfg(target_os = "macos")]
+fn compat_package_shallow_guard(package_dir: &Path) -> Option<CompatPackageShallowGuard> {
+    use std::os::unix::fs::MetadataExt;
+
     let dir_meta = std::fs::symlink_metadata(package_dir).ok()?;
     if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
         return None;
     }
-    let dir_mtime = compat_system_time_nanos(dir_meta.modified().ok()?).to_string();
+    let dir_mtime_nanos = compat_system_time_nanos(dir_meta.modified().ok()?);
+    let dir_ctime_nanos =
+        i128::from(dir_meta.ctime()) * 1_000_000_000 + i128::from(dir_meta.ctime_nsec());
     let pkg_json_meta = std::fs::symlink_metadata(package_dir.join("package.json")).ok()?;
     if !pkg_json_meta.is_file() || pkg_json_meta.file_type().is_symlink() {
         return None;
     }
-    let pkg_json_mtime = compat_system_time_nanos(pkg_json_meta.modified().ok()?).to_string();
-    Some((dir_mtime, pkg_json_meta.len(), pkg_json_mtime))
+    let pkg_json_mtime_nanos = compat_system_time_nanos(pkg_json_meta.modified().ok()?);
+    let pkg_json_ctime_nanos =
+        i128::from(pkg_json_meta.ctime()) * 1_000_000_000 + i128::from(pkg_json_meta.ctime_nsec());
+    Some(CompatPackageShallowGuard {
+        dir_mtime_nanos,
+        dir_ctime_nanos,
+        pkg_json_size: pkg_json_meta.len(),
+        pkg_json_mtime_nanos,
+        pkg_json_ctime_nanos,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn compat_entry_sibling_links_match(
+    store_island: &Path,
+    entry: &CompatibilityEntry<'_>,
+    key_map: &KeyMap,
+) -> bool {
+    let Ok(mut expected_links) = compatibility_dependency_links(entry.target, key_map) else {
+        return false;
+    };
+    let own_local = entry.key.name();
+    expected_links.retain(|(local, _)| local != own_local);
+    let node_modules = compatibility_node_modules_dir(store_island, &entry.key);
+    let own_package_dir = compatibility_package_dir(store_island, &entry.key);
+
+    let mut expected_slots: HashSet<String> = HashSet::with_capacity(expected_links.len() + 1);
+    expected_slots.insert(own_local.to_string());
+    for (local, _) in &expected_links {
+        expected_slots.insert(local.clone());
+    }
+
+    // Verify no unexpected sibling entries were injected into entry/node_modules.
+    let Ok(read_dir) = std::fs::read_dir(&node_modules) else {
+        return false;
+    };
+    let mut actual_count = 0usize;
+    for item in read_dir {
+        let Ok(item) = item else {
+            return false;
+        };
+        let path = item.path();
+        let name = item.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = path.symlink_metadata() else {
+            return false;
+        };
+        if name.starts_with('@') && meta.is_dir() && !is_symlink_or_junction(&meta) {
+            let Ok(scope_entries) = std::fs::read_dir(&path) else {
+                return false;
+            };
+            let mut scope_count = 0usize;
+            for scoped in scope_entries {
+                let Ok(scoped) = scoped else {
+                    return false;
+                };
+                let full_name = format!("{name}/{}", scoped.file_name().to_string_lossy());
+                if !expected_slots.contains(&full_name) {
+                    return false;
+                }
+                scope_count += 1;
+            }
+            if scope_count == 0 {
+                return false;
+            }
+            actual_count += scope_count;
+        } else {
+            if !expected_slots.contains(&name) {
+                return false;
+            }
+            actual_count += 1;
+        }
+    }
+    if actual_count != expected_slots.len() {
+        return false;
+    }
+
+    for (local, dep_key) in expected_links {
+        let target_package_dir = compatibility_package_dir(store_island, &dep_key);
+        if target_package_dir == own_package_dir {
+            continue;
+        }
+        let link_path = node_modules.join(&local);
+        let Ok(meta) = link_path.symlink_metadata() else {
+            return false;
+        };
+        if !meta.file_type().is_symlink() {
+            return false;
+        }
+        let expected_rel = relative_compat_sibling_target(&link_path, &target_package_dir);
+        if std::fs::read_link(&link_path).ok().as_deref() != Some(expected_rel.as_path()) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -460,6 +568,7 @@ fn store_compat_island_complete(
     store_island: &Path,
     entries: &[CompatibilityEntry<'_>],
     store: &Store,
+    key_map: &KeyMap,
 ) -> bool {
     let sentinel = store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME);
     let Ok(metadata) = sentinel.symlink_metadata() else {
@@ -493,8 +602,10 @@ fn store_compat_island_complete(
     let recorded_guards = manifest
         .get("shallow_guards")
         .and_then(serde_json::Value::as_object);
-    let source_policy =
-        store.object_integrity_policy() == lpm_store::v2::ObjectIntegrityPolicy::Source;
+    let captured_at_nanos = manifest
+        .get("captured_at_nanos")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<i128>().ok());
     entries.iter().all(|entry| {
         let entry_dir = compatibility_entry_dir(store_island, &entry.key);
         let expected = recorded_entries
@@ -504,27 +615,40 @@ fn store_compat_island_complete(
             if !compatibility_entry_reusable(&entry_dir, entry) {
                 return false;
             }
-            if source_policy
+            if store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri)
+                && let Some(captured_at) = captured_at_nanos
                 && let Some(guard_val) =
                     recorded_guards.and_then(|guards| guards.get(entry.key.dir_name()))
             {
                 let package_dir = compatibility_package_dir(store_island, &entry.key);
                 let has_build_marker = package_dir.join(".lpm-built").symlink_metadata().is_ok();
                 if !has_build_marker
-                    && let Some((dir_mtime, pkg_size, pkg_mtime)) =
-                        compat_package_shallow_guard(&package_dir)
+                    && let Some(current) = compat_package_shallow_guard(&package_dir)
+                    && captured_at.saturating_sub(current.dir_mtime_nanos)
+                        >= COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+                    && captured_at.saturating_sub(current.pkg_json_mtime_nanos)
+                        >= COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
                     && guard_val
                         .get("dir_mtime_nanos")
                         .and_then(serde_json::Value::as_str)
-                        == Some(dir_mtime.as_str())
+                        == Some(current.dir_mtime_nanos.to_string().as_str())
+                    && guard_val
+                        .get("dir_ctime_nanos")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(current.dir_ctime_nanos.to_string().as_str())
                     && guard_val
                         .get("pkg_json_size")
                         .and_then(serde_json::Value::as_u64)
-                        == Some(pkg_size)
+                        == Some(current.pkg_json_size)
                     && guard_val
                         .get("pkg_json_mtime_nanos")
                         .and_then(serde_json::Value::as_str)
-                        == Some(pkg_mtime.as_str())
+                        == Some(current.pkg_json_mtime_nanos.to_string().as_str())
+                    && guard_val
+                        .get("pkg_json_ctime_nanos")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(current.pkg_json_ctime_nanos.to_string().as_str())
+                    && compat_entry_sibling_links_match(store_island, entry, key_map)
                 {
                     return true;
                 }
@@ -551,20 +675,26 @@ fn write_store_compat_island_completion(
             entry.key.dir_name().to_string(),
             serde_json::Value::String(integrity),
         );
-        let package_dir = compatibility_package_dir(store_island, &entry.key);
-        if let Some((dir_mtime, pkg_size, pkg_mtime)) = compat_package_shallow_guard(&package_dir) {
-            shallow_guards.insert(
-                entry.key.dir_name().to_string(),
-                serde_json::json!({
-                    "dir_mtime_nanos": dir_mtime,
-                    "pkg_json_size": pkg_size,
-                    "pkg_json_mtime_nanos": pkg_mtime,
-                }),
-            );
+        if store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri) {
+            let package_dir = compatibility_package_dir(store_island, &entry.key);
+            if let Some(guard) = compat_package_shallow_guard(&package_dir) {
+                shallow_guards.insert(
+                    entry.key.dir_name().to_string(),
+                    serde_json::json!({
+                        "dir_mtime_nanos": guard.dir_mtime_nanos.to_string(),
+                        "dir_ctime_nanos": guard.dir_ctime_nanos.to_string(),
+                        "pkg_json_size": guard.pkg_json_size,
+                        "pkg_json_mtime_nanos": guard.pkg_json_mtime_nanos.to_string(),
+                        "pkg_json_ctime_nanos": guard.pkg_json_ctime_nanos.to_string(),
+                    }),
+                );
+            }
         }
     }
+    let captured_at_nanos = compat_system_time_nanos(std::time::SystemTime::now()).to_string();
     let manifest = serde_json::json!({
         "schema": COMPAT_ISLAND_COMPLETE_SCHEMA,
+        "captured_at_nanos": captured_at_nanos,
         "entries": recorded_entries,
         "shallow_guards": shallow_guards,
     });

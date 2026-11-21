@@ -1285,8 +1285,8 @@ pub(super) async fn run_offline_install_phase(
             &ambient_peer_installs,
         );
     }
-    filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     let _platform_skipped = filter_platform_packages(&mut locked)?;
+    filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     if !json_output {
         output::info_line(crate::install_ui::terminal_line!(
             "Offline: using lockfile ({} packages)",
@@ -3100,16 +3100,37 @@ fn is_simple_http_url(value: &str) -> bool {
     let Some(rest) = rest else {
         return false;
     };
-    let host = rest.split('/').next().unwrap_or("");
-    !host.is_empty()
-        && !rest.bytes().any(|byte| {
-            byte.is_ascii_whitespace()
-                || byte.is_ascii_control()
-                || matches!(byte, b'@' | b'?' | b'#' | b'\\')
-        })
-        && !host.starts_with('.')
-        && !host.starts_with(':')
-        && !host.ends_with(':')
+    if rest.bytes().any(|byte| {
+        !byte.is_ascii()
+            || byte.is_ascii_whitespace()
+            || byte.is_ascii_control()
+            || matches!(byte, b'@' | b'?' | b'#' | b'\\' | b'[' | b']')
+    }) {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return false;
+    }
+    match port {
+        Some(port) => {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        }
+        None => true,
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -34,10 +34,9 @@ use super::integrity::{
     object_integrity_policy_from_env, read_object_integrity, read_shallow_package_guard,
     read_tree_snapshot, refresh_link_snapshot_shallow_guard_best_effort,
     remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
-    tree_snapshot_matches, write_link_tree_snapshot_best_effort,
-    write_link_tree_snapshot_unpublished, write_object_integrity_for_policy,
-    write_object_integrity_for_policy_with_tree, write_tree_snapshot,
-    write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
+    write_link_tree_snapshot_best_effort, write_link_tree_snapshot_unpublished,
+    write_object_integrity_for_policy, write_object_integrity_for_policy_with_tree,
+    write_tree_snapshot, write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
     write_tree_snapshot_with_layout_content_unpublished,
 };
 use super::local_source::{
@@ -765,6 +764,18 @@ impl Store {
 
     pub fn object_integrity_policy(&self) -> ObjectIntegrityPolicy {
         self.object_integrity_policy
+    }
+
+    /// Whether the active integrity policy permits the shallow package guard
+    /// for the given object SRI (always false under `Tree` policy or for local
+    /// `file:`/`link:` snapshots).
+    pub fn source_policy_allows_shallow_guard_for_sri(&self, source_sri: &str) -> bool {
+        if self.object_integrity_policy != ObjectIntegrityPolicy::Source {
+            return false;
+        }
+        self.paths.object_dir(source_sri).is_ok_and(|dir| {
+            source_policy_uses_source_integrity(&dir, self.object_integrity_policy)
+        })
     }
 
     /// Return the policy used for extraction and cache-hit backfills.
@@ -3655,7 +3666,7 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     path.is_file()
 }
 
-const LINK_TOUCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+const LINK_TOUCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
 const LINK_BUILD_MARKER: &str = ".lpm-built";
 
 fn should_touch_sidecar(mtime: Option<std::time::SystemTime>) -> bool {
@@ -3664,7 +3675,8 @@ fn should_touch_sidecar(mtime: Option<std::time::SystemTime>) -> bool {
     };
     match std::time::SystemTime::now().duration_since(mtime) {
         Ok(elapsed) => elapsed >= LINK_TOUCH_COOLDOWN,
-        Err(_) => false,
+        // Always refresh future-dated mtimes (clock skew) so prune LRU recovers.
+        Err(_) => true,
     }
 }
 
@@ -3701,32 +3713,31 @@ fn link_entry_is_reusable(
             .join(LINK_BUILD_MARKER)
             .symlink_metadata()
             .is_err();
-    if source_shallow_eligible
-        && let Some(snapshot) = read_tree_snapshot(dir)
+    let existing_snapshot = read_tree_snapshot(dir);
+    if let Some(snapshot) = existing_snapshot.as_ref()
         && snapshot.content_integrity == expected.as_ref()
-        && snapshot.layout_content_integrity.is_none()
     {
-        if let Some(recorded_guard) = snapshot.shallow_guard()
-            && read_shallow_package_guard(&package_dir) == Some(recorded_guard)
+        if source_shallow_eligible
+            && snapshot.layout_content_integrity.is_none()
+            && let Some(recorded_guard) = snapshot.shallow_guard()
+            && let Some(current_guard) = read_shallow_package_guard(&package_dir)
+            && current_guard.matches_non_racy(&recorded_guard)
         {
             return Ok(Some(sidecar_mtime));
         }
-        if snapshot.shallow_guard().is_none()
-            && compute_tree_metadata_integrity(&package_dir)? == snapshot.metadata_integrity
-        {
-            refresh_link_snapshot_shallow_guard_best_effort(dir, &package_dir, &snapshot);
+        if compute_tree_metadata_integrity(&package_dir)? == snapshot.metadata_integrity {
+            if source_shallow_eligible && snapshot.layout_content_integrity.is_none() {
+                refresh_link_snapshot_shallow_guard_best_effort(dir, &package_dir, snapshot);
+            }
             return Ok(Some(sidecar_mtime));
         }
-    }
-    if tree_snapshot_matches(dir, &package_dir, expected.as_ref())? {
-        return Ok(Some(sidecar_mtime));
     }
     let actual = compute_object_tree_integrities(&package_dir)?;
     if actual.content == expected.as_ref() {
         write_link_tree_snapshot_best_effort(dir, &package_dir, &actual);
         return Ok(Some(sidecar_mtime));
     }
-    if read_tree_snapshot(dir).is_some_and(|snapshot| {
+    if existing_snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.content_integrity == expected.as_ref()
             && snapshot.layout_content_integrity.as_deref() == Some(actual.content.as_str())
     }) {
