@@ -55,15 +55,26 @@ impl From<ColorChoice> for ResolvedChoice {
 /// pre-`Cli::parse` — the pre-scan is the only way to honor `--color`
 /// before clap runs.
 pub fn init(cli: Option<ColorChoice>) {
+    let enabled = apply_core_policy(cli);
+    if !enabled {
+        cliclack::set_theme(NoColorTheme);
+    }
+}
+
+/// Initialize color policy for pre-clap fast paths (`--version`, sync
+/// up-to-date installs) that never invoke interactive `cliclack` prompts.
+pub fn init_fast(cli: Option<ColorChoice>) {
+    let _ = apply_core_policy(cli);
+}
+
+fn apply_core_policy(cli: Option<ColorChoice>) -> bool {
     let force = env_force_color();
     let no_color = env_no_color();
     let is_tty = std::io::stdout().is_terminal();
     let enabled = color::resolve(cli.map(Into::into), force, no_color, is_tty);
     color::set_enabled(enabled);
     owo_colors::set_override(enabled);
-    if !enabled {
-        cliclack::set_theme(NoColorTheme);
-    }
+    enabled
 }
 
 /// Argv pre-scan for `--color=<value>` or `--color <value>`.

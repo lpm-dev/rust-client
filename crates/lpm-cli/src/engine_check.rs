@@ -297,12 +297,21 @@ impl DependencyEnginePolicy {
     }
 
     pub(crate) fn freshness_key(&self, lockfile_content: &str) -> String {
-        if lockfile_version(lockfile_content)
-            .is_some_and(|version| version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES)
-        {
+        let version_ok = !lockfile_version(lockfile_content)
+            .is_some_and(|version| version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES);
+        let has_node_engines = version_ok && lockfile_has_dependency_node_engines(lockfile_content);
+        self.freshness_key_from_flags(version_ok, has_node_engines)
+    }
+
+    pub(crate) fn freshness_key_from_flags(
+        &self,
+        lockfile_version_ok: bool,
+        has_dependency_node_engines: bool,
+    ) -> String {
+        if !lockfile_version_ok {
             return "legacy".to_string();
         }
-        if !lockfile_has_dependency_node_engines(lockfile_content) {
+        if !has_dependency_node_engines {
             return "none".to_string();
         }
         self.constrained_freshness_key()
@@ -389,6 +398,31 @@ pub(crate) fn prepare_dependency_policy_reusing(
         DependencyEnginePolicy::new(root_dir, script_path.into(), engine_strict, json_output)
             .with_node_versions(node_versions);
     enforce_root_with_policy(&root_pkg, &policy)?;
+    Ok(policy)
+}
+
+/// Prepare the policy for a standalone (non-workspace) root whose `PackageJson`
+/// and `GlobalConfig` are already loaded, avoiding duplicate ancestor walks and
+/// config reads on the sync up-to-date fast lane.
+pub(crate) fn prepare_dependency_policy_for_standalone_root(
+    root_dir: &Path,
+    root_pkg: &PackageJson,
+    global: &crate::commands::config::GlobalConfig,
+    cli_no_engine_strict: bool,
+    json_output: bool,
+    node_versions: NodeVersionReuse,
+) -> Result<DependencyEnginePolicy, LpmError> {
+    let engine_strict =
+        engine_strict_config::resolve_for_root_with_global(cli_no_engine_strict, root_pkg, global);
+    let script_path = lpm_runner::bin_path::build_path_with_bins(root_dir)?;
+    let policy = DependencyEnginePolicy::new(
+        root_dir.to_path_buf(),
+        script_path.into(),
+        engine_strict,
+        json_output,
+    )
+    .with_node_versions(node_versions);
+    enforce_root_with_policy(root_pkg, &policy)?;
     Ok(policy)
 }
 
