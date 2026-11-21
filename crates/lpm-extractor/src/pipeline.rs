@@ -158,13 +158,14 @@ pub(super) fn extract(
     cancel_input: impl FnOnce(),
 ) -> Result<Vec<ExtractedFileDigest>, LpmError> {
     with_decoder(reader, limits, cancel_input, |decoded| {
-        let writer_setup = decoded
-            .writer_failure_signal()
-            .map_or(crate::writers::WriterSetup::Disabled, |signal| {
+        let writer_setup = decoded.writer_failure_signal().map_or(
+            crate::writers::WriterSetup::Disabled,
+            |signal| {
                 crate::writers::WriterSetup::configured()
                     .with_minimum_files(0)
                     .with_failure_signal(signal)
-            });
+            },
+        );
         extract_tar_archive_with_writers(
             decoded,
             target_dir,

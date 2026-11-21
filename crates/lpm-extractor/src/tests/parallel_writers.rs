@@ -276,7 +276,8 @@ fn large_entries_stream_between_bounded_small_file_batches() {
 
 #[test]
 fn blocked_writers_observe_entry_and_owned_byte_limits_before_admission_continues() {
-    let max_entries_at_max_size = crate::writers::MAX_PENDING_BYTES / crate::writers::MAX_ENTRY_BYTES;
+    let max_entries_at_max_size =
+        crate::writers::MAX_PENDING_BYTES / crate::writers::MAX_ENTRY_BYTES;
     for (size, count, expected_entries, expected_bytes) in [
         (
             1,

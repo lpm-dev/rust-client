@@ -455,7 +455,9 @@ where
         }
 
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-            Ok(u64::try_from(value).ok().and_then(std::num::NonZeroU64::new))
+            Ok(u64::try_from(value)
+                .ok()
+                .and_then(std::num::NonZeroU64::new))
         }
 
         fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {

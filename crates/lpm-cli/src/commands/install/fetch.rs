@@ -357,9 +357,8 @@ async fn await_v2_streaming_extract_task<T>(
     if held_permits.is_empty() && (missing_supplemental == 0 || semaphore.is_none()) {
         return (task.await, false, 0, 0);
     }
-    let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(
-        lease_started_at + lease,
-    ));
+    let deadline =
+        tokio::time::sleep_until(tokio::time::Instant::from_std(lease_started_at + lease));
     tokio::pin!(deadline);
     let mut upgraded_count = 0usize;
 
