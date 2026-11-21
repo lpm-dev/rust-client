@@ -3,7 +3,7 @@ use tracing::Instrument as _;
 
 const ENV_FETCH_OVERLAP: &str = "LPM_FETCH_OVERLAP";
 const ENV_FETCH_OVERLAP_MIN_SELECTED: &str = "LPM_FETCH_OVERLAP_MIN_SELECTED";
-const DEFAULT_FETCH_OVERLAP_MIN_SELECTED: usize = 64;
+const DEFAULT_FETCH_OVERLAP_MIN_SELECTED: usize = 16;
 const FETCH_OVERLAP_QUEUE_MULTIPLIER: usize = 4;
 
 fn fetch_overlap_queue_capacity(download_concurrency: usize) -> usize {
@@ -362,6 +362,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
     install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     streaming_fetch: bool,
+    streaming_lane: Option<Arc<super::fetch::V2StreamingLane>>,
     min_selected: usize,
 ) -> FetchOverlapJoin {
     let task = async move {
@@ -389,12 +390,28 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                         stats.record_buffered_event();
                         if stats.selected_count as usize >= min_selected {
                             dispatching = true;
+                            if streaming_lane.is_some()
+                                && let Some((largest_idx, _)) = buffered
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(index, entry)| {
+                                        let size = entry.event.unpacked_size?.get();
+                                        (size >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES
+                                            && !entry.event.optional)
+                                            .then_some((index, size))
+                                    })
+                                    .max_by_key(|&(_, size)| size)
+                            {
+                                let largest = buffered.remove(largest_idx);
+                                buffered.insert(0, largest);
+                            }
                             for buffered_event in buffered.drain(..) {
                                 stats.record_buffered_dispatch(
                                     buffered_event.selected_at.elapsed().as_millis(),
                                 );
                                 dispatch_selected_event(
                                     buffered_event.event,
+                                    streaming_lane.as_ref(),
                                     &route_table,
                                     &client,
                                     &store,
@@ -417,6 +434,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                     }
                     dispatch_selected_event(
                         event,
+                        streaming_lane.as_ref(),
                         &route_table,
                         &client,
                         &store,
@@ -716,6 +734,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_selected_event(
     event: lpm_resolver::SelectedPackageEvent,
+    streaming_lane: Option<&Arc<super::fetch::V2StreamingLane>>,
     route_table: &RouteTable,
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -743,9 +762,16 @@ fn dispatch_selected_event(
         stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
         return;
     }
+    let package_streaming_lane = streaming_lane
+        .filter(|_| {
+            package
+                .unpacked_size
+                .is_some_and(|size| size.get() >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES)
+        })
+        .cloned();
     dispatch_install_package(
         package,
-        None,
+        package_streaming_lane,
         route_table,
         client,
         store,
@@ -1340,7 +1366,7 @@ mod tests {
 
     #[test]
     fn fetch_overlap_min_selected_default_skips_tiny_graphs() {
-        assert_eq!(DEFAULT_FETCH_OVERLAP_MIN_SELECTED, 64);
+        assert_eq!(DEFAULT_FETCH_OVERLAP_MIN_SELECTED, 16);
     }
 
     #[test]

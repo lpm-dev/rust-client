@@ -268,6 +268,8 @@ struct V2StreamingExtractAdmission {
     supplemental_permit: Option<LeasedExtractPermit>,
     requested_weight: usize,
     acquired_weight: usize,
+    missing_supplemental: usize,
+    lease_started_at: std::time::Instant,
     wait_ms: u128,
 }
 
@@ -287,6 +289,8 @@ async fn acquire_v2_streaming_extract_admission(
             supplemental_permit: None,
             requested_weight,
             acquired_weight: 0,
+            missing_supplemental: 0,
+            lease_started_at: wait_start,
             wait_ms: 0,
         });
     };
@@ -297,6 +301,7 @@ async fn acquire_v2_streaming_extract_admission(
         .await
         .map_err(|_| LpmError::Registry("fetch extract limiter closed unexpectedly".into()))?;
     let wait_ms = wait_start.elapsed().as_millis();
+    let lease_started_at = std::time::Instant::now();
     let supplemental_requested = requested_weight.min(limiter.permits).saturating_sub(1);
     let supplemental_permit = if supplemental_requested == 0 {
         None
@@ -315,17 +320,21 @@ async fn acquire_v2_streaming_extract_admission(
             });
         permit.map(|permit| LeasedExtractPermit {
             permit,
-            acquired_at: std::time::Instant::now(),
+            acquired_at: lease_started_at,
         })
     };
-    let acquired_weight = 1 + supplemental_permit
+    let initial_supplemental = supplemental_permit
         .as_ref()
         .map_or(0, |supplemental| supplemental.permit.num_permits());
+    let acquired_weight = 1 + initial_supplemental;
+    let missing_supplemental = supplemental_requested.saturating_sub(initial_supplemental);
     Ok(V2StreamingExtractAdmission {
         base_permit: Some(base_permit),
         supplemental_permit,
         requested_weight,
         acquired_weight,
+        missing_supplemental,
+        lease_started_at,
         wait_ms,
     })
 }
@@ -333,25 +342,71 @@ async fn acquire_v2_streaming_extract_admission(
 async fn await_v2_streaming_extract_task<T>(
     mut task: tokio::task::JoinHandle<T>,
     supplemental_permit: Option<LeasedExtractPermit>,
+    limiter: FetchExtractLimiter,
+    mut missing_supplemental: usize,
+    lease_started_at: std::time::Instant,
     lease: std::time::Duration,
-) -> (Result<T, tokio::task::JoinError>, bool, u128) {
-    let Some(supplemental_permit) = supplemental_permit else {
-        return (task.await, false, 0);
-    };
+) -> (Result<T, tokio::task::JoinError>, bool, u128, usize) {
+    let mut held_permits: Vec<tokio::sync::OwnedSemaphorePermit> =
+        Vec::with_capacity(missing_supplemental.saturating_add(1));
+    let mut hold_started_at = supplemental_permit.as_ref().map(|p| p.acquired_at);
+    if let Some(initial) = supplemental_permit {
+        held_permits.push(initial.permit);
+    }
+    let semaphore = limiter.map(|limiter| Arc::clone(&limiter.semaphore));
+    if held_permits.is_empty() && (missing_supplemental == 0 || semaphore.is_none()) {
+        return (task.await, false, 0, 0);
+    }
     let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(
-        supplemental_permit.acquired_at + lease,
+        lease_started_at + lease,
     ));
     tokio::pin!(deadline);
+    let mut upgraded_count = 0usize;
+
+    if let Some(semaphore) = semaphore {
+        while missing_supplemental > 0 {
+            let acquire = Arc::clone(&semaphore).acquire_owned();
+            tokio::pin!(acquire);
+            tokio::select! {
+                result = &mut task => {
+                    let hold_ms = hold_started_at.map_or(0, |started| started.elapsed().as_millis());
+                    drop(held_permits);
+                    return (result, false, hold_ms, upgraded_count);
+                }
+                () = &mut deadline => {
+                    let hold_ms = hold_started_at.map_or(0, |started| started.elapsed().as_millis());
+                    drop(held_permits);
+                    return (task.await, true, hold_ms, upgraded_count);
+                }
+                acquired = &mut acquire => {
+                    match acquired {
+                        Ok(extra) => {
+                            hold_started_at.get_or_insert_with(std::time::Instant::now);
+                            held_permits.push(extra);
+                            missing_supplemental -= 1;
+                            upgraded_count += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    if held_permits.is_empty() {
+        return (task.await, false, 0, upgraded_count);
+    }
+
     tokio::select! {
         result = &mut task => {
-            let hold_ms = supplemental_permit.acquired_at.elapsed().as_millis();
-            drop(supplemental_permit);
-            (result, false, hold_ms)
+            let hold_ms = hold_started_at.map_or(0, |started| started.elapsed().as_millis());
+            drop(held_permits);
+            (result, false, hold_ms, upgraded_count)
         }
         () = &mut deadline => {
-            let hold_ms = supplemental_permit.acquired_at.elapsed().as_millis();
-            drop(supplemental_permit);
-            (task.await, true, hold_ms)
+            let hold_ms = hold_started_at.map_or(0, |started| started.elapsed().as_millis());
+            drop(held_permits);
+            (task.await, true, hold_ms, upgraded_count)
         }
     }
 }
@@ -3142,13 +3197,16 @@ mod tests {
         let leased = tokio::spawn(await_v2_streaming_extract_task(
             task,
             admission.supplemental_permit,
+            limiter.clone(),
+            admission.missing_supplemental,
+            admission.lease_started_at,
             std::time::Duration::from_millis(20),
         ));
 
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         assert_eq!(semaphore.available_permits(), 3);
         release_task.notify_one();
-        let (_, expired, hold_ms) = leased.await.unwrap();
+        let (_, expired, hold_ms, _) = leased.await.unwrap();
         assert!(expired);
         assert!(hold_ms >= 20);
         drop(base_permit);
@@ -3168,9 +3226,12 @@ mod tests {
         let base_permit = admission.base_permit;
         let task = tokio::spawn(async { 7 });
 
-        let (result, expired, _) = await_v2_streaming_extract_task(
+        let (result, expired, _, _) = await_v2_streaming_extract_task(
             task,
             admission.supplemental_permit,
+            limiter.clone(),
+            admission.missing_supplemental,
+            admission.lease_started_at,
             std::time::Duration::from_secs(2),
         )
         .await;
@@ -3195,9 +3256,12 @@ mod tests {
         let base_permit = admission.base_permit;
         let task = tokio::spawn(async { panic!("streaming task panic fixture") });
 
-        let (result, expired, _) = await_v2_streaming_extract_task(
+        let (result, expired, _, _) = await_v2_streaming_extract_task(
             task,
             admission.supplemental_permit,
+            limiter.clone(),
+            admission.missing_supplemental,
+            admission.lease_started_at,
             std::time::Duration::from_secs(2),
         )
         .await;
@@ -3228,16 +3292,76 @@ mod tests {
         let leased = tokio::spawn(await_v2_streaming_extract_task(
             task,
             admission.supplemental_permit,
+            limiter.clone(),
+            admission.missing_supplemental,
+            admission.lease_started_at,
             lease,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(semaphore.available_permits(), 3);
         release_task.notify_one();
-        let (_, expired, hold_ms) = leased.await.unwrap();
+        let (_, expired, hold_ms, _) = leased.await.unwrap();
 
         assert!(expired);
         assert!(hold_ms >= 40);
         drop(admission.base_permit);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn v2_streaming_extract_upgrades_supplemental_permits_as_peers_finish() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let peer_one = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let peer_two = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let peer_three = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&semaphore),
+            4,
+        ));
+
+        let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+            .await
+            .unwrap();
+        assert_eq!(admission.acquired_weight, 1);
+        assert_eq!(admission.missing_supplemental, 2);
+        assert_eq!(semaphore.available_permits(), 0);
+
+        let finish_task = Arc::new(tokio::sync::Notify::new());
+        let finish_task_worker = Arc::clone(&finish_task);
+        let base_permit = admission.base_permit;
+        let task = tokio::spawn(async move {
+            let _base = base_permit;
+            finish_task_worker.notified().await;
+            42usize
+        });
+
+        let semaphore_observer = Arc::clone(&semaphore);
+        let release_peers = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(peer_one);
+            drop(peer_two);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let available_during_upgrade = semaphore_observer.available_permits();
+            finish_task.notify_one();
+            drop(peer_three);
+            available_during_upgrade
+        });
+
+        let (result, lease_expired, _, upgraded) = await_v2_streaming_extract_task(
+            task,
+            admission.supplemental_permit,
+            limiter.clone(),
+            admission.missing_supplemental,
+            admission.lease_started_at,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let available_during_upgrade = release_peers.await.unwrap();
+
+        assert_eq!(result.unwrap(), 42);
+        assert!(!lease_expired);
+        assert_eq!(upgraded, 2);
+        assert_eq!(available_during_upgrade, 0);
         assert_eq!(semaphore.available_permits(), 4);
     }
 
@@ -5109,6 +5233,8 @@ async fn extract_v2_registry_response(
         mut supplemental_permit,
         requested_weight,
         acquired_weight,
+        missing_supplemental,
+        lease_started_at,
         wait_ms: extract_permit_wait_ms,
     } = admission;
 
@@ -5144,13 +5270,17 @@ async fn extract_v2_registry_response(
         let retained_key_guard = if result.is_err() { key_guard } else { None };
         (result, retained_key_guard)
     });
-    let (joined, supplemental_lease_expired, supplemental_hold_ms) =
+    let (joined, supplemental_lease_expired, supplemental_hold_ms, upgraded_supplemental) =
         await_v2_streaming_extract_task(
             joined,
             supplemental_permit.take(),
+            fetch_extract_limiter.clone(),
+            missing_supplemental,
+            lease_started_at,
             V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE,
         )
         .await;
+    let final_acquired_weight = acquired_weight.saturating_add(upgraded_supplemental);
     tracing::event!(name: "await_resume", target: "lpm_install_timeline", tracing::Level::TRACE, success = joined.is_ok());
     let joined = joined.map_err(|error| {
         fatal(LpmError::Registry(format!(
@@ -5181,7 +5311,7 @@ async fn extract_v2_registry_response(
     .with_streaming_pipeline(download_headers_ms, stream_body_wall_ms, pipeline_wall_ms)
     .with_streaming_admission(
         u64::try_from(requested_weight).unwrap_or(u64::MAX),
-        u64::try_from(acquired_weight).unwrap_or(u64::MAX),
+        u64::try_from(final_acquired_weight).unwrap_or(u64::MAX),
         unpacked_size,
         supplemental_hold_ms,
         supplemental_lease_expired,

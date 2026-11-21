@@ -356,6 +356,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 install_accounting,
                                 dependency_engine_policy.clone(),
                                 streaming_fetch,
+                                streaming_fetch.then(|| v2_streaming_lane.clone()),
                                 1,
                             ));
                             npm_firewall_preflight_join =
@@ -412,6 +413,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 install_accounting,
                                 dependency_engine_policy.clone(),
                                 streaming_fetch,
+                                streaming_fetch.then(|| v2_streaming_lane.clone()),
                                 fetch_overlap_min_selected(),
                             ));
                             Some(tx)
