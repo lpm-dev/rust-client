@@ -256,7 +256,7 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 # Synthetic X.509 certificates with URI SANs, so unit tests exercise the SAN
 # extractor against deterministic inputs, and issuers built from those
 # certificates. Same version as lpm-cert uses.
-rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }
 
 [lints]
 workspace = true

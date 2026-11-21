@@ -142,12 +142,15 @@ pub(super) fn prepare_install_setup_context(
         input.json_output,
     )?;
 
-    let release_age_config = crate::release_age_config::ReleaseAgeResolver::resolve_config(
-        input.policy_project_dir,
-        input.min_release_age_override,
-        input.min_release_age_exclude,
-        input.json_output,
-    )?;
+    let release_age_config =
+        crate::release_age_config::ReleaseAgeResolver::resolve_config_with_context(
+            &global_config,
+            (input.policy_project_dir == input.project_dir).then_some(&pkg),
+            input.policy_project_dir,
+            input.min_release_age_override,
+            input.min_release_age_exclude,
+            input.json_output,
+        )?;
     let effective_min_age_secs = release_age_config.minimum_release_age_secs;
     if input.allow_new && effective_min_age_secs > 0 {
         crate::security_approval::approve_project_runtime_override(

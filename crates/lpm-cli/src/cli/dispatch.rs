@@ -1,7 +1,7 @@
 use miette::Result;
 
 mod runtime;
-pub(in crate::cli) use runtime::keep_state_ignored_at_exit;
+pub(crate) use runtime::{keep_state_ignored_at_exit, keep_state_ignored_at_exit_from};
 use runtime::run_async_main;
 
 use crate::{
@@ -55,7 +55,7 @@ pub(crate) fn run() -> Result<()> {
     // `clap` will validate the value later under its `value_enum`
     // contract; an unknown value here just falls back to env + TTY
     // detection until clap surfaces the typo.
-    color_policy::init(color_policy::peek_color_choice_from_argv(
+    color_policy::init_fast(color_policy::peek_color_choice_from_argv(
         std::env::args_os(),
     ));
 
@@ -65,9 +65,9 @@ pub(crate) fn run() -> Result<()> {
     }
 
     // ── sync fast lane ──────────────────────────────────
-    // If this is a bare `lpm install` (or `lpm i`) with no disqualifying
-    // flags and the project is already up to date, exit immediately
-    // without starting tokio, clap, tracing, or auth.
+    // If this is a bare `lpm install` (or `lpm i` / `lpm ci`) with no
+    // disqualifying flags and the project is already up to date, exit
+    // immediately without starting tokio, clap, tracing, or auth.
     //
     // package.json is read at most ONCE on the fast lane —
     // shared between the workspace-root check and the install-state
@@ -82,7 +82,6 @@ pub(crate) fn run() -> Result<()> {
         let Ok(cwd) = std::env::current_dir() else {
             return run_async_main();
         };
-        runtime::keep_state_ignored_at_exit_from(&cwd);
         // Start timing BEFORE any disk work, matching install.rs which
         // captures `start` at function entry before `check_install_state`.
         let start = std::time::Instant::now();
@@ -128,7 +127,6 @@ pub(crate) fn run() -> Result<()> {
                     } else {
                         output::success(&format!("up to date ({elapsed_ms}ms)"));
                     }
-                    keep_state_ignored_at_exit();
                     std::process::exit(0);
                 }
                 Ok(false) => {}

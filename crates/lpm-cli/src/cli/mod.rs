@@ -8,5 +8,5 @@ mod install_timeline;
 pub(crate) use args::{
     BundleFormat, BundlePlatform, CheckEngine, Cli, Commands, InitPackageTargetCli,
 };
-pub(crate) use dispatch::run;
+pub(crate) use dispatch::{keep_state_ignored_at_exit, keep_state_ignored_at_exit_from, run};
 pub(crate) use format::print_json_clap_error;

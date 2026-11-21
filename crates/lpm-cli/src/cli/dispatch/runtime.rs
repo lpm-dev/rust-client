@@ -8,7 +8,7 @@ static STARTED_IN: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mut
 
 /// Has the command keep its state ignored as it ends, on whichever path it
 /// exits.
-pub(in crate::cli) fn keep_state_ignored_at_exit_from(started_in: &std::path::Path) {
+pub(crate) fn keep_state_ignored_at_exit_from(started_in: &std::path::Path) {
     if let Ok(mut slot) = STARTED_IN.lock() {
         *slot = Some(started_in.to_path_buf());
     }
@@ -36,7 +36,7 @@ fn writes_nothing(command: Option<&Commands>) -> bool {
 
 /// Keeps the project's `.lpm` and the LPM home out of git as the command
 /// ends, once.
-pub(in crate::cli) fn keep_state_ignored_at_exit() {
+pub(crate) fn keep_state_ignored_at_exit() {
     let Some(cwd) = STARTED_IN.lock().ok().and_then(|mut slot| slot.take()) else {
         return;
     };
@@ -46,6 +46,7 @@ pub(in crate::cli) fn keep_state_ignored_at_exit() {
 }
 
 pub(super) fn run_async_main() -> Result<()> {
+    crate::open_file_limit::raise();
     // Standalone and recursive installs poll large futures on different threads.
     // Both need this stack budget for debug builds and large workspaces.
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;

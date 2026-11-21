@@ -15,7 +15,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 lpm-cert = { workspace = true }
 lpm-common = { workspace = true }
 pem = "4"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -36,7 +36,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-rcgen = { version = "0.14", features = ["pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 reqwest = { workspace = true }
 tempfile = "3"
 
