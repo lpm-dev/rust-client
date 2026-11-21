@@ -1173,23 +1173,34 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
 
     let client = NpmFirewallPreflightClient::new(client);
     let started = Instant::now();
+    let effective_client = match client.for_mode(mode).await {
+        Ok(resolved) => resolved,
+        Err(error) if matches!(mode, NpmFirewallMode::Monitor) => {
+            stats.batch_ms = started.elapsed().as_millis();
+            stats.rpc_failed = true;
+            return Ok(NpmFirewallPreflightResult {
+                stats,
+                decisions: Vec::new(),
+                report_error: Some(npm_firewall_preflight_report_error(error)),
+            });
+        }
+        Err(error) => {
+            return Err(npm_firewall_preflight_enforce_error(error));
+        }
+    };
     let use_cache = monitor_verdict_cache_enabled(mode, force, offline);
     let now_secs = if use_cache { current_unix_secs() } else { 0 };
     let mut cache_state: Option<(PathBuf, HashMap<String, MonitorVerdictCacheEntry>)> = None;
     let packages_to_check: Vec<NpmFirewallBatchPackage> = if use_cache {
-        let effective_client = client.for_mode(mode).await.ok();
         let cache_path = effective_client
-            .as_deref()
-            .filter(|resolved| {
-                resolved
-                    .has_bearer_for_posture(mode.auth_posture())
-                    .unwrap_or(false)
-            })
-            .and_then(|resolved| {
-                monitor_verdict_cache_path(resolved, mode, lookup_mode, policy_profile)
+            .has_bearer_for_posture(mode.auth_posture())
+            .unwrap_or(false)
+            .then(|| {
+                monitor_verdict_cache_path(&effective_client, mode, lookup_mode, policy_profile)
                     .ok()
                     .flatten()
-            });
+            })
+            .flatten();
         if let Some(path) = cache_path {
             let entries = read_monitor_verdict_cache(&path, now_secs);
             let mut uncached = Vec::new();
@@ -1197,7 +1208,10 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
             let mut unknown_hits = 0u64;
             for package in verdict_packages {
                 let key = monitor_verdict_entry_key(&package, lookup_mode);
-                if let Some(entry) = entries.get(&key).filter(|entry| entry.expires_at > now_secs) {
+                if let Some(entry) = entries
+                    .get(&key)
+                    .filter(|entry| entry.expires_at > now_secs)
+                {
                     hits = hits.saturating_add(1);
                     if entry.unknown {
                         unknown_hits = unknown_hits.saturating_add(1);
@@ -1227,8 +1241,12 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
         });
     }
 
-    let response = match client
-        .batch_verdicts(mode, policy_profile, &packages_to_check)
+    let response = match effective_client
+        .npm_firewall_batch_verdicts_with_posture_and_policy(
+            &packages_to_check,
+            mode.auth_posture(),
+            Some(policy_profile),
+        )
         .await
     {
         Ok(response) => response,

@@ -579,9 +579,8 @@ impl LazyDefaultClient {
                 .clone(),
             super::http::ClientPool::ManualRedirect(lane) => {
                 let lanes = self.request_lanes.get_or_init(|| {
-                    let count = super::http::request_lane_count(
-                        std::env::var("LPM_HTTP").ok().as_deref(),
-                    );
+                    let count =
+                        super::http::request_lane_count(std::env::var("LPM_HTTP").ok().as_deref());
                     (0..count)
                         .map(|_| std::sync::OnceLock::new())
                         .collect::<Vec<_>>()
