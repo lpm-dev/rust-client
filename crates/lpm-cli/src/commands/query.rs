@@ -1185,8 +1185,10 @@ fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, L
     if let Some(gypfile) = parsed.gypfile {
         minimal.insert("gypfile".to_owned(), gypfile);
     }
-    Ok(lpm_security::native_build::leaves_install_to_binding_gyp(&minimal)
-        && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?)
+    Ok(
+        lpm_security::native_build::leaves_install_to_binding_gyp(&minimal)
+            && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?,
+    )
 }
 
 fn has_regular_file(package_dir: &cap_std::fs::Dir, name: &str) -> Result<bool, LpmError> {

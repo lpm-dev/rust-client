@@ -633,10 +633,8 @@ pub async fn run_workspace(
                 &mut dag_state,
                 |idx, (completed_identities, completed_states)| {
                     let member_name = ws_graph.members[idx].name.clone();
-                    let member_task_plan = member_task_plans[idx]
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| {
+                    let member_task_plan =
+                        member_task_plans[idx].as_ref().cloned().ok_or_else(|| {
                             LpmError::Script(format!(
                                 "internal task plan missing for workspace member '{member_name}'"
                             ))
@@ -646,10 +644,8 @@ pub async fn run_workspace(
                         &ws_graph,
                         completed_identities,
                     );
-                    let initially_failed_tasks = blocked_workspace_tasks(
-                        member_task_plan.as_ref(),
-                        completed_states,
-                    );
+                    let initially_failed_tasks =
+                        blocked_workspace_tasks(member_task_plan.as_ref(), completed_states);
                     let member_dir = ws_graph.members[idx].path.clone();
                     let args_owned = extra_args.to_vec();
                     let mode_owned = env_mode.map(str::to_owned);
@@ -950,9 +946,9 @@ impl RunnableWorkspaceDag {
         let mut first_error: Option<LpmError> = None;
 
         std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel::<(usize, std::thread::Result<Result<T, LpmError>>)>();
-            let mut handles: HashMap<usize, std::thread::ScopedJoinHandle<'_, ()>> =
-                HashMap::new();
+            let (tx, rx) =
+                std::sync::mpsc::channel::<(usize, std::thread::Result<Result<T, LpmError>>)>();
+            let mut handles: HashMap<usize, std::thread::ScopedJoinHandle<'_, ()>> = HashMap::new();
 
             loop {
                 while !stopped

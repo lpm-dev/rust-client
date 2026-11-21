@@ -555,11 +555,7 @@ fn run_verify(
 
     let stage_one_outcomes: Vec<EntryStageOneOutcome> = if packages.len() >= 4 {
         use rayon::prelude::*;
-        packages
-            .par_iter()
-            .enumerate()
-            .map(check_entry)
-            .collect()
+        packages.par_iter().enumerate().map(check_entry).collect()
     } else {
         packages.iter().enumerate().map(check_entry).collect()
     };

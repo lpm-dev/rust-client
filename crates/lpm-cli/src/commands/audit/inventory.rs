@@ -559,8 +559,10 @@ fn load_behavioral_analyses_with_index(
 
     let project_cache_ref = project_cache.as_ref();
     let shared_by_fingerprint = dashmap::DashMap::new();
-    let store_fingerprint_by_path: dashmap::DashMap<PathBuf, Arc<std::sync::OnceLock<Option<String>>>> =
-        dashmap::DashMap::new();
+    let store_fingerprint_by_path: dashmap::DashMap<
+        PathBuf,
+        Arc<std::sync::OnceLock<Option<String>>>,
+    > = dashmap::DashMap::new();
     let store_analysis_by_path: dashmap::DashMap<PathBuf, Arc<StoreAnalysisCell>> =
         dashmap::DashMap::new();
     let loaded: Vec<PackageScan> = scannable

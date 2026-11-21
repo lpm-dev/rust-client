@@ -118,7 +118,9 @@ pub(crate) fn read_installed_manifest_metadata(
         let installed_paths = installed_package_paths(project_dir, lockfile, &indexes, &roots)?;
         let manifest_cache = ManifestReadCache::new();
 
-        let resolve_one = |package: &LockedPackage, platform_skipped: bool| -> Result<PackageManifestOutcome, LpmError> {
+        let resolve_one = |package: &LockedPackage,
+                           platform_skipped: bool|
+         -> Result<PackageManifestOutcome, LpmError> {
             let package_key = package_metadata_key(package);
             if let Some(path) = installed_paths.get(&package_key) {
                 if let Some(baseline) = baseline_index.lookup_by_package_dir(path)
@@ -173,7 +175,11 @@ pub(crate) fn read_installed_manifest_metadata(
                 return Err(missing_installed_manifest(package, None));
             }
             let project_manifest = node_modules_package_json(project_dir, &package.name);
-            match read_matching_manifest_metadata_cached(&project_manifest, package, &manifest_cache)? {
+            match read_matching_manifest_metadata_cached(
+                &project_manifest,
+                package,
+                &manifest_cache,
+            )? {
                 ManifestProbe::Match(metadata) => {
                     return Ok(PackageManifestOutcome::Metadata(package_key, metadata));
                 }
@@ -337,7 +343,9 @@ fn read_parsed_manifest_entry(path: &Path) -> Result<Option<ParsedManifestEntry>
         Ok((content, _)) => content,
         Err(BoundedReadError::NotFound { .. }) => return Ok(None),
         Err(error) => {
-            return Err(format!("failed to read installed package manifest: {error}"));
+            return Err(format!(
+                "failed to read installed package manifest: {error}"
+            ));
         }
     };
     let trimmed = lpm_common::strip_utf8_bom_str(&content).trim_start();
@@ -360,7 +368,11 @@ fn read_parsed_manifest_entry(path: &Path) -> Result<Option<ParsedManifestEntry>
             path.display()
         )
     })?;
-    let name = fields.name.as_ref().and_then(Value::as_str).map(str::to_owned);
+    let name = fields
+        .name
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let version = fields
         .version
         .as_ref()

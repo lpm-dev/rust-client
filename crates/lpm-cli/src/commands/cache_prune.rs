@@ -1315,10 +1315,12 @@ fn compute_prune(
             + build_artifacts_orphaned.len();
         if total_orphan_dirs >= 4 {
             use rayon::prelude::*;
-            bytes_freed_or_eligible = [&link_entries_orphaned,
+            bytes_freed_or_eligible = [
+                &link_entries_orphaned,
                 &object_entries_orphaned,
                 &compat_islands_orphaned,
-                &build_artifacts_orphaned]
+                &build_artifacts_orphaned,
+            ]
             .into_iter()
             .flat_map(|dirs| dirs.iter())
             .collect::<Vec<_>>()

@@ -905,16 +905,15 @@ fn collect_input_files(
                     return Ok(());
                 }
                 if seen.insert(relative.clone()) {
-                    let resolved_relative =
-                        resolved
-                            .strip_prefix(&canonical_project)
-                            .map_err(|_| {
-                                LpmError::Task(format!(
-                                    "task cache input resolves outside project: {}",
-                                    entry.display()
-                                ))
-                            })?
-                            .to_path_buf();
+                    let resolved_relative = resolved
+                        .strip_prefix(&canonical_project)
+                        .map_err(|_| {
+                            LpmError::Task(format!(
+                                "task cache input resolves outside project: {}",
+                                entry.display()
+                            ))
+                        })?
+                        .to_path_buf();
                     candidates.push(InputCandidate {
                         relative,
                         entry,
@@ -966,10 +965,12 @@ fn collect_input_files(
                 |(project_res, directories), candidate| {
                     let project = match project_res {
                         Ok(dir) => dir,
-                        Err(error) => return Err(LpmError::Io(std::io::Error::new(
-                            error.kind(),
-                            error.to_string(),
-                        ))),
+                        Err(error) => {
+                            return Err(LpmError::Io(std::io::Error::new(
+                                error.kind(),
+                                error.to_string(),
+                            )));
+                        }
                     };
                     hash_candidate(project, directories, candidate)
                 },
@@ -2500,8 +2501,11 @@ mod tests {
         let src = project.path().join("src");
         fs::create_dir_all(&src).unwrap();
         for idx in (0..12).rev() {
-            fs::write(src.join(format!("file_{idx:02}.ts")), format!("export const v = {idx};\n"))
-                .unwrap();
+            fs::write(
+                src.join(format!("file_{idx:02}.ts")),
+                format!("export const v = {idx};\n"),
+            )
+            .unwrap();
         }
         let globs = vec!["src/**".to_string()];
         let first = super::collect_input_files(project.path(), &globs).unwrap();

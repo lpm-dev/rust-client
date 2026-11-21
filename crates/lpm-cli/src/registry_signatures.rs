@@ -926,10 +926,16 @@ mod tests {
 
         assert_eq!(report.packages.len(), 3);
         assert_eq!(report.packages[0].name, "dup-pkg");
-        assert_eq!(report.packages[0].status, RegistrySignatureStatus::NotVerified);
+        assert_eq!(
+            report.packages[0].status,
+            RegistrySignatureStatus::NotVerified
+        );
         assert_eq!(report.packages[1].name, "@lpm.dev/owner.pkg");
         assert_eq!(report.packages[1].status, RegistrySignatureStatus::Skipped);
         assert_eq!(report.packages[2].name, "dup-pkg");
-        assert_eq!(report.packages[2].status, RegistrySignatureStatus::NotVerified);
+        assert_eq!(
+            report.packages[2].status,
+            RegistrySignatureStatus::NotVerified
+        );
     }
 }
