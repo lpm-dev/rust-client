@@ -567,7 +567,136 @@ fn run_verify(
         safe_version: String,
         security_cache_dir: std::path::PathBuf,
     }
+    enum SecurityVerifyOutcome {
+        Matched,
+        DirectoryChanged(String),
+        Mismatch {
+            missing_cache: bool,
+            fix_result: Option<Result<(), String>>,
+        },
+    }
+
     let mut security_jobs = Vec::new();
+    for outcome in &stage_one_outcomes {
+        if !outcome.passed || !deep {
+            continue;
+        }
+        let entry = &packages[outcome.entry_index];
+        // Virtual-store links strip `.lpm-security.json`; installs read the
+        // analysis from the shared object directory, so verify checks it there.
+        let security_cache_dir = outcome
+            .security_cache_object_dir
+            .as_deref()
+            .unwrap_or(&entry.dir);
+        if outcome.security_cache_object_dir.is_some()
+            && !security_checked_objects.insert(security_cache_dir.to_path_buf())
+        {
+            continue;
+        }
+        security_jobs.push(SecurityVerifyJob {
+            entry_index: outcome.entry_index,
+            safe_name: outcome.safe_name.clone(),
+            safe_version: outcome.safe_version.clone(),
+            security_cache_dir: security_cache_dir.to_path_buf(),
+        });
+    }
+
+    let mut security_outcomes_by_entry: std::collections::HashMap<usize, SecurityVerifyOutcome> =
+        std::collections::HashMap::with_capacity(security_jobs.len());
+    if deep && !security_jobs.is_empty() {
+        let run_security_job = |job: SecurityVerifyJob| -> (usize, SecurityVerifyOutcome) {
+            let source_path = &packages[job.entry_index].dir;
+            let source_dir =
+                match maintenance::open_verified_directory_chain(&store_root, source_path) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return (
+                            job.entry_index,
+                            SecurityVerifyOutcome::DirectoryChanged(format!(
+                                "{}@{} — {error}",
+                                job.safe_name, job.safe_version
+                            )),
+                        );
+                    }
+                };
+            let cache_dir = if job.security_cache_dir == *source_path {
+                match source_dir.try_clone() {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return (
+                            job.entry_index,
+                            SecurityVerifyOutcome::DirectoryChanged(format!(
+                                "{}@{} — cannot retain security cache directory: {}",
+                                job.safe_name,
+                                job.safe_version,
+                                sanitize_for_terminal(&error.to_string())
+                            )),
+                        );
+                    }
+                }
+            } else {
+                match maintenance::open_verified_directory_chain(
+                    &store_root,
+                    &job.security_cache_dir,
+                ) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return (
+                            job.entry_index,
+                            SecurityVerifyOutcome::DirectoryChanged(format!(
+                                "{}@{} — {error}",
+                                job.safe_name, job.safe_version
+                            )),
+                        );
+                    }
+                }
+            };
+
+            let cached = lpm_security::behavioral::read_cached_analysis_from_open_dir(&cache_dir);
+            let fresh = lpm_security::behavioral::analyze_package_from_open_dir(
+                &source_dir,
+                lpm_security::behavioral::PackageDirectory::Published,
+            );
+
+            // Compare and (when --fix is active) repair through the pinned
+            // directory handle immediately so both analyses drop before the
+            // worker returns.
+            let outcome = match cached {
+                Some(ref cached_analysis) if security_analysis_matches(cached_analysis, &fresh) => {
+                    SecurityVerifyOutcome::Matched
+                }
+                cached_opt => {
+                    let missing_cache = cached_opt.is_none();
+                    let fix_result = if fix {
+                        Some(write_security_cache_for_verify_in_dir(
+                            &cache_dir,
+                            &fresh,
+                            &job.safe_name,
+                            &job.safe_version,
+                        ))
+                    } else {
+                        None
+                    };
+                    SecurityVerifyOutcome::Mismatch {
+                        missing_cache,
+                        fix_result,
+                    }
+                }
+            };
+            (job.entry_index, outcome)
+        };
+
+        let results: Vec<_> = if security_jobs.len() >= 4 {
+            use rayon::prelude::*;
+            security_jobs
+                .into_par_iter()
+                .map(run_security_job)
+                .collect()
+        } else {
+            security_jobs.into_iter().map(run_security_job).collect()
+        };
+        security_outcomes_by_entry.extend(results);
+    }
 
     for mut outcome in stage_one_outcomes {
         if outcome.referenced_object_failed {
@@ -580,98 +709,31 @@ fn run_verify(
         if !outcome.passed {
             continue;
         }
-        if deep {
+        if let Some(sec_outcome) = security_outcomes_by_entry.remove(&outcome.entry_index) {
             let entry = &packages[outcome.entry_index];
-            let security_cache_dir = outcome
-                .security_cache_object_dir
-                .as_deref()
-                .unwrap_or(&entry.dir);
-            if outcome.security_cache_object_dir.is_some()
-                && !security_checked_objects.insert(security_cache_dir.to_path_buf())
-            {
-                verified += 1;
-                continue;
-            }
-            security_jobs.push(SecurityVerifyJob {
-                entry_index: outcome.entry_index,
-                safe_name: outcome.safe_name,
-                safe_version: outcome.safe_version,
-                security_cache_dir: security_cache_dir.to_path_buf(),
-            });
-        } else {
-            verified += 1;
-        }
-    }
-
-    if deep && !security_jobs.is_empty() {
-        let run_security_job = |job: SecurityVerifyJob| {
-            let dir = &packages[job.entry_index].dir;
-            let cached = lpm_security::behavioral::read_cached_analysis(&job.security_cache_dir);
-            let fresh = lpm_security::behavioral::analyze_package(dir);
-            (job, cached, fresh)
-        };
-        let security_results: Vec<_> = if security_jobs.len() >= 4 {
-            use rayon::prelude::*;
-            security_jobs
-                .into_par_iter()
-                .map(run_security_job)
-                .collect()
-        } else {
-            security_jobs.into_iter().map(run_security_job).collect()
-        };
-
-        for (job, cached, fresh) in security_results {
-            let entry = &packages[job.entry_index];
             let name = &entry.name;
             let version = &entry.version;
-            let safe_name = &job.safe_name;
-            let safe_version = &job.safe_version;
-            let security_cache_dir = job.security_cache_dir.as_path();
-
-            match cached {
-                Some(ref cached_analysis) => {
-                    if !security_analysis_matches(cached_analysis, &fresh) {
-                        security_mismatches += 1;
-                        if fix {
-                            let fixed = match write_security_cache_for_verify(
-                                security_cache_dir,
-                                &fresh,
-                                safe_name,
-                                safe_version,
-                            ) {
-                                Ok(()) => {
-                                    security_reanalyzed += 1;
-                                    true
-                                }
-                                Err(issue) => {
-                                    security_fix_failures += 1;
-                                    tracing::warn!("{issue}");
-                                    corrupted.push(issue);
-                                    false
-                                }
-                            };
-                            if !json_output {
-                                let status = if fixed { "fixed" } else { "fix failed" };
-                                install_ui::warn_untrusted(&format!(
-                                    "{safe_name}@{safe_version} — security analysis mismatch ({status})"
-                                ));
-                            }
-                        } else if !json_output {
-                            install_ui::warn_untrusted(&format!(
-                                "{name}@{version} — security analysis mismatch (use --fix to refresh)"
-                            ));
-                        }
-                    }
+            let safe_name = &outcome.safe_name;
+            let safe_version = &outcome.safe_version;
+            match sec_outcome {
+                SecurityVerifyOutcome::Matched => {
+                    verified += 1;
                 }
-                None => {
+                SecurityVerifyOutcome::DirectoryChanged(issue) => {
+                    corrupted.push(issue);
+                }
+                SecurityVerifyOutcome::Mismatch {
+                    missing_cache,
+                    fix_result,
+                } => {
                     security_mismatches += 1;
-                    if fix {
-                        let fixed = match write_security_cache_for_verify(
-                            security_cache_dir,
-                            &fresh,
-                            safe_name,
-                            safe_version,
-                        ) {
+                    let label = if missing_cache {
+                        "missing security cache"
+                    } else {
+                        "security analysis mismatch"
+                    };
+                    if let Some(fix_result) = fix_result {
+                        let fixed = match fix_result {
                             Ok(()) => {
                                 security_reanalyzed += 1;
                                 true
@@ -686,16 +748,21 @@ fn run_verify(
                         if !json_output {
                             let status = if fixed { "fixed" } else { "fix failed" };
                             install_ui::warn_untrusted(&format!(
-                                "{safe_name}@{safe_version} — missing security cache ({status})"
+                                "{safe_name}@{safe_version} — {label} ({status})"
                             ));
                         }
                     } else if !json_output {
-                        install_ui::warn_untrusted(&format!(
-                            "{name}@{version} — missing security cache (use --fix to generate)"
-                        ));
+                        let hint = if missing_cache {
+                            "use --fix to generate"
+                        } else {
+                            "use --fix to refresh"
+                        };
+                        install_ui::warn_untrusted(&format!("{name}@{version} — {label} ({hint})"));
                     }
+                    verified += 1;
                 }
             }
+        } else {
             verified += 1;
         }
     }
@@ -1096,13 +1163,13 @@ fn security_analysis_matches(
         && cached.manifest == fresh.manifest
 }
 
-fn write_security_cache_for_verify(
-    dir: &std::path::Path,
+fn write_security_cache_for_verify_in_dir(
+    dir: &cap_std::fs::Dir,
     fresh: &lpm_security::behavioral::PackageAnalysis,
     safe_name: &str,
     safe_version: &str,
 ) -> Result<(), String> {
-    lpm_security::behavioral::write_cached_analysis_atomic(dir, fresh).map_err(|e| {
+    lpm_security::behavioral::write_cached_analysis_atomic_in_dir(dir, fresh).map_err(|e| {
         format!(
             "{safe_name}@{safe_version} — failed to write .lpm-security.json: {}",
             sanitize_for_terminal(&e.to_string())

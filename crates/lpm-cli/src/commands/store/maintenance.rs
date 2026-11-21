@@ -39,6 +39,41 @@ pub(super) fn verify_directory_chain(root: &Path, path: &Path) -> Result<(), Lpm
     Ok(())
 }
 
+pub(super) fn open_verified_directory_chain(
+    root: &Path,
+    path: &Path,
+) -> Result<cap_std::fs::Dir, LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| LpmError::Store("package path is outside the store".into()))?;
+    ensure_directory(root)?;
+    let mut current_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+        .map_err(|error| {
+            LpmError::Store(format!(
+                "cannot open store directory {}: {}",
+                lpm_common::sanitize_for_terminal(&root.display().to_string()),
+                lpm_common::sanitize_for_terminal(&error.to_string())
+            ))
+        })?;
+    let mut current_path = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(LpmError::Store("invalid store path component".into()));
+        };
+        current_path.push(name);
+        current_dir = current_dir.open_dir_nofollow(name).map_err(|error| {
+            LpmError::Store(format!(
+                "store path is not a real directory: {} ({})",
+                lpm_common::sanitize_for_terminal(&current_path.display().to_string()),
+                lpm_common::sanitize_for_terminal(&error.to_string())
+            ))
+        })?;
+    }
+    Ok(current_dir)
+}
+
 pub(super) fn verify_roots(root: &Path) -> Result<(), LpmError> {
     for relative in [
         "v1",

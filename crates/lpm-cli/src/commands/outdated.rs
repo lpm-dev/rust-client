@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const OUTDATED_JSON_SCHEMA_VERSION: u32 = 2;
-const OUTDATED_METADATA_CONCURRENCY: usize = 16;
+const OUTDATED_METADATA_CONCURRENCY: usize = 4;
 const MAX_LOOKUP_FAILURE_DETAIL_BYTES: usize = 2 * 1024;
 
 struct ManifestDependencyEntry {

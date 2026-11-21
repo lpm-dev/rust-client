@@ -65,23 +65,39 @@ pub(crate) fn read_json_file(path: &Path) -> Result<Value, LpmError> {
 }
 
 pub(crate) fn extract_manifest_metadata(value: &Value) -> ManifestMetadata {
-    let description = value
-        .get("description")
+    extract_manifest_metadata_fields(
+        value.get("description"),
+        value.get("homepage"),
+        value.get("repository"),
+        value.get("author"),
+        value.get("license"),
+        value.get("licenses"),
+    )
+}
+
+fn extract_manifest_metadata_fields(
+    description: Option<&Value>,
+    homepage: Option<&Value>,
+    repository: Option<&Value>,
+    author: Option<&Value>,
+    license: Option<&Value>,
+    licenses_field: Option<&Value>,
+) -> ManifestMetadata {
+    let description = description
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let homepage = value
-        .get("homepage")
+    let homepage = homepage
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let repository = value.get("repository").and_then(extract_urlish);
-    let author = value.get("author").and_then(extract_author);
+    let repository = repository.and_then(extract_urlish);
+    let author = author.and_then(extract_author);
     let mut licenses = Vec::new();
-    if let Some(license) = value.get("license") {
+    if let Some(license) = license {
         collect_licenses(license, &mut licenses);
     }
-    if let Some(license) = value.get("licenses") {
+    if let Some(license) = licenses_field {
         collect_licenses(license, &mut licenses);
     }
     licenses.sort();
@@ -212,25 +228,40 @@ pub(crate) fn read_installed_manifest_metadata(
             Err(missing_installed_manifest(package, None))
         };
 
-        let outcomes: Vec<Result<PackageManifestOutcome, LpmError>> = if packages.len() >= 4 {
+        let outcomes: Vec<Option<Result<PackageManifestOutcome, LpmError>>> = if packages.len() >= 4
+        {
             use rayon::prelude::*;
+            let failed = std::sync::atomic::AtomicBool::new(false);
             packages
                 .par_iter()
                 .zip(platform_skip_flags.par_iter())
-                .map(|(package, &platform_skipped)| resolve_one(package, platform_skipped))
+                .map(|(package, &platform_skipped)| {
+                    if failed.load(std::sync::atomic::Ordering::Acquire) {
+                        return None;
+                    }
+                    let outcome = resolve_one(package, platform_skipped);
+                    if outcome.is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Some(outcome)
+                })
                 .collect()
         } else {
             packages
                 .iter()
                 .zip(&platform_skip_flags)
-                .map(|(package, &platform_skipped)| resolve_one(package, platform_skipped))
+                .map(|(package, &platform_skipped)| Some(resolve_one(package, platform_skipped)))
                 .collect()
         };
 
         let mut metadata_by_package = BTreeMap::new();
         let mut platform_skipped_packages = BTreeSet::new();
-        for outcome in outcomes {
-            match outcome? {
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let outcome = match outcome {
+                Some(outcome) => outcome?,
+                None => resolve_one(&packages[index], platform_skip_flags[index])?,
+            };
+            match outcome {
                 PackageManifestOutcome::Metadata(key, metadata) => {
                     metadata_by_package.insert(key, metadata);
                 }
@@ -258,24 +289,109 @@ struct ParsedManifestEntry {
     metadata: ManifestMetadata,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Default)]
 struct RawManifestFields {
-    #[serde(default)]
     name: Option<Value>,
-    #[serde(default)]
     version: Option<Value>,
-    #[serde(default)]
     description: Option<Value>,
-    #[serde(default)]
     homepage: Option<Value>,
-    #[serde(default)]
     repository: Option<Value>,
-    #[serde(default)]
     author: Option<Value>,
-    #[serde(default)]
     license: Option<Value>,
-    #[serde(default)]
     licenses: Option<Value>,
+}
+
+impl RawManifestFields {
+    fn into_parsed_entry(self) -> ParsedManifestEntry {
+        let name = self
+            .name
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let version = self
+            .version
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let metadata = extract_manifest_metadata_fields(
+            self.description.as_ref(),
+            self.homepage.as_ref(),
+            self.repository.as_ref(),
+            self.author.as_ref(),
+            self.license.as_ref(),
+            self.licenses.as_ref(),
+        );
+        ParsedManifestEntry {
+            name,
+            version,
+            metadata,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawManifestFields {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RawManifestFields;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(RawManifestFields::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(RawManifestFields::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(RawManifestFields::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(RawManifestFields::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(RawManifestFields::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RawManifestFields::default())
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(RawManifestFields::default())
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut fields = RawManifestFields::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "name" => fields.name = Some(map.next_value()?),
+                        "version" => fields.version = Some(map.next_value()?),
+                        "description" => fields.description = Some(map.next_value()?),
+                        "homepage" => fields.homepage = Some(map.next_value()?),
+                        "repository" => fields.repository = Some(map.next_value()?),
+                        "author" => fields.author = Some(map.next_value()?),
+                        "license" => fields.license = Some(map.next_value()?),
+                        "licenses" => fields.licenses = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(fields)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 enum ManifestProbe {
@@ -287,8 +403,54 @@ enum ManifestProbe {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ManifestFileCacheKey {
+    path: PathBuf,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    len: u64,
+    mtime_nanos: Option<i128>,
+    #[cfg(unix)]
+    ctime_nanos: i128,
+}
+
+fn manifest_file_cache_key(path: &Path) -> Option<ManifestFileCacheKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let ctime_nanos = i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec());
+        Some(ManifestFileCacheKey {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime_nanos,
+            ctime_nanos,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(ManifestFileCacheKey {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            mtime_nanos,
+        })
+    }
+}
+
 type ManifestReadCell = std::sync::OnceLock<Result<Option<ParsedManifestEntry>, String>>;
-type ManifestReadCache = dashmap::DashMap<PathBuf, std::sync::Arc<ManifestReadCell>>;
+type ManifestReadCache = dashmap::DashMap<ManifestFileCacheKey, std::sync::Arc<ManifestReadCell>>;
 
 fn read_required_manifest_metadata_cached(
     path: &Path,
@@ -312,11 +474,20 @@ fn read_matching_manifest_metadata_cached(
     package: &LockedPackage,
     cache: &ManifestReadCache,
 ) -> Result<ManifestProbe, LpmError> {
-    let slot = cache
-        .entry(path.to_path_buf())
-        .or_insert_with(|| std::sync::Arc::new(std::sync::OnceLock::new()))
-        .clone();
-    let parsed = slot.get_or_init(|| read_parsed_manifest_entry(path));
+    let parsed_storage;
+    let parsed = if let Some(key) = manifest_file_cache_key(path) {
+        let slot = cache
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::OnceLock::new()))
+            .clone();
+        parsed_storage = slot
+            .get_or_init(|| read_parsed_manifest_entry(path))
+            .clone();
+        &parsed_storage
+    } else {
+        parsed_storage = read_parsed_manifest_entry(path);
+        &parsed_storage
+    };
     match parsed {
         Ok(None) => Ok(ManifestProbe::Missing),
         Ok(Some(entry)) => {
@@ -348,70 +519,14 @@ fn read_parsed_manifest_entry(path: &Path) -> Result<Option<ParsedManifestEntry>
             ));
         }
     };
-    let trimmed = lpm_common::strip_utf8_bom_str(&content).trim_start();
-    if !trimmed.starts_with('{') {
-        let _: serde::de::IgnoredAny = serde_json::from_str(trimmed).map_err(|error| {
+    let fields: RawManifestFields = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|error| {
             format!(
                 "failed to parse installed package manifest {}: {error}",
                 path.display()
             )
         })?;
-        return Ok(Some(ParsedManifestEntry {
-            name: None,
-            version: None,
-            metadata: ManifestMetadata::default(),
-        }));
-    }
-    let fields: RawManifestFields = serde_json::from_str(trimmed).map_err(|error| {
-        format!(
-            "failed to parse installed package manifest {}: {error}",
-            path.display()
-        )
-    })?;
-    let name = fields
-        .name
-        .as_ref()
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let version = fields
-        .version
-        .as_ref()
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let description = fields
-        .description
-        .as_ref()
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let homepage = fields
-        .homepage
-        .as_ref()
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let repository = fields.repository.as_ref().and_then(extract_urlish);
-    let author = fields.author.as_ref().and_then(extract_author);
-    let mut licenses = Vec::new();
-    if let Some(license) = fields.license.as_ref() {
-        collect_licenses(license, &mut licenses);
-    }
-    if let Some(license) = fields.licenses.as_ref() {
-        collect_licenses(license, &mut licenses);
-    }
-    licenses.sort();
-    licenses.dedup();
-    Ok(Some(ParsedManifestEntry {
-        name,
-        version,
-        metadata: ManifestMetadata {
-            description,
-            licenses,
-            homepage,
-            repository,
-            author,
-        },
-    }))
+    Ok(Some(fields.into_parsed_entry()))
 }
 
 pub(crate) fn package_metadata_key(package: &LockedPackage) -> String {
@@ -848,5 +963,34 @@ mod tests {
         let skipped = platform_skipped_test_flags(vec![platform_package, runtime]);
 
         assert_eq!(skipped, [true, false]);
+    }
+
+    #[test]
+    fn read_parsed_manifest_entry_accepts_duplicate_keys_last_wins_and_rejects_nbsp() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{"name":"dup","version":"1.0.0","license":"MIT","license":"ISC"}"#,
+        )
+        .unwrap();
+        let entry = read_parsed_manifest_entry(&manifest)
+            .unwrap()
+            .expect("manifest entry present");
+        assert_eq!(entry.name.as_deref(), Some("dup"));
+        assert_eq!(entry.metadata.licenses, vec!["ISC"]);
+
+        std::fs::write(
+            &manifest,
+            "\u{00A0}{\"name\":\"dup\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        assert!(read_parsed_manifest_entry(&manifest).is_err());
+
+        std::fs::write(&manifest, "[]").unwrap();
+        let non_object = read_parsed_manifest_entry(&manifest)
+            .unwrap()
+            .expect("valid non-object JSON");
+        assert!(non_object.name.is_none());
     }
 }

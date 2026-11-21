@@ -1104,14 +1104,27 @@ fn populate_package_disk_state(
     };
 
     if count >= 4 {
-        let results: Vec<Result<(bool, bool), LpmError>> = inventory
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let results: Vec<Option<Result<(bool, bool), LpmError>>> = inventory
             .discovery
             .packages
             .par_iter()
-            .map(inspect_one)
+            .map(|package| {
+                if failed.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                let result = inspect_one(package);
+                if result.is_err() {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Some(result)
+            })
             .collect();
         for (index, result) in results.into_iter().enumerate() {
-            let (pkg_has_scripts, pkg_is_built) = result?;
+            let (pkg_has_scripts, pkg_is_built) = match result {
+                Some(outcome) => outcome?,
+                None => inspect_one(&inventory.discovery.packages[index])?,
+            };
             if load_scripts {
                 has_scripts[index] = pkg_has_scripts;
             }
@@ -1133,12 +1146,44 @@ fn populate_package_disk_state(
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
 struct LifecycleScriptManifest {
-    #[serde(default)]
     scripts: Option<serde_json::Value>,
-    #[serde(default)]
     gypfile: Option<serde_json::Value>,
+}
+
+impl<'de> serde::Deserialize<'de> for LifecycleScriptManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = LifecycleScriptManifest;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut scripts = None;
+                let mut gypfile = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "scripts" => scripts = Some(map.next_value()?),
+                        "gypfile" => gypfile = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(LifecycleScriptManifest { scripts, gypfile })
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, LpmError> {
@@ -1158,36 +1203,32 @@ fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, L
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         metadata.len(),
     )?;
-    let trimmed = lpm_common::strip_utf8_bom_str(&content).trim_start();
-    if !trimmed.starts_with('{') {
-        return Err(LpmError::Script(
-            "invalid package.json: expected a JSON object".into(),
-        ));
-    }
-    let parsed: LifecycleScriptManifest = serde_json::from_str(trimmed)
-        .map_err(|error| LpmError::Script(format!("invalid package.json: {error}")))?;
-    let names_one = parsed
+    let parsed: LifecycleScriptManifest =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+            .map_err(|error| LpmError::Script(format!("invalid package.json: {error}")))?;
+    let scripts = parsed
         .scripts
         .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|scripts| {
-            LIFECYCLE_SCRIPTS
-                .iter()
-                .any(|phase| scripts.contains_key(*phase))
-        });
+        .and_then(serde_json::Value::as_object);
+    let names_one = scripts.is_some_and(|scripts| {
+        LIFECYCLE_SCRIPTS
+            .iter()
+            .any(|phase| scripts.contains_key(*phase))
+    });
     if names_one {
         return Ok(true);
     }
-    let mut minimal = serde_json::Map::with_capacity(2);
-    if let Some(scripts) = parsed.scripts {
-        minimal.insert("scripts".to_owned(), scripts);
-    }
-    if let Some(gypfile) = parsed.gypfile {
-        minimal.insert("gypfile".to_owned(), gypfile);
-    }
+    let install = scripts
+        .and_then(|s| s.get("install"))
+        .and_then(serde_json::Value::as_str);
+    let preinstall = scripts
+        .and_then(|s| s.get("preinstall"))
+        .and_then(serde_json::Value::as_str);
+    let gypfile = parsed.gypfile.as_ref().and_then(serde_json::Value::as_bool);
     Ok(
-        lpm_security::native_build::leaves_install_to_binding_gyp(&minimal)
-            && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?,
+        lpm_security::native_build::scripts_leave_install_to_binding_gyp(
+            install, preinstall, gypfile,
+        ) && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?,
     )
 }
 
@@ -1503,6 +1544,29 @@ mod tests {
 
         std::fs::write(dir.path().join("package.json"), "[]").unwrap();
         assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+
+        std::fs::write(dir.path().join("package.json"), "\u{00A0}{}").unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_uses_last_wins_on_duplicate_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_dir =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"echo 1"},"scripts":{"postinstall":"echo hi"}}"#,
+        )
+        .unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).unwrap());
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"postinstall":"echo hi"},"scripts":{"test":"echo 1"}}"#,
+        )
+        .unwrap();
+        assert!(!check_has_lifecycle_scripts(&package_dir).unwrap());
     }
 
     #[test]

@@ -566,9 +566,13 @@ pub async fn run_workspace(
 
     let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
 
-    let runnable_dag = RunnableWorkspaceDag::from_graph(&ws_graph, &runnable_members);
     if total > 0 {
-        if workspace_concurrency <= 1 || runnable_dag.is_linear_chain() {
+        let runnable_dag = (workspace_concurrency > 1)
+            .then(|| RunnableWorkspaceDag::from_graph(&ws_graph, &runnable_members));
+        if runnable_dag
+            .as_ref()
+            .is_none_or(RunnableWorkspaceDag::is_linear_chain)
+        {
             for idx in levels
                 .iter()
                 .flatten()
@@ -624,14 +628,19 @@ pub async fn run_workspace(
                 }
             }
         } else {
-            let member_stream = stream || (workspace_concurrency > 1 && !json_output);
+            let runnable_dag = runnable_dag.expect("DAG constructed for workspace_concurrency > 1");
             let mut dag_state = (&mut completed_task_identities, &mut completed_task_states);
             runnable_dag.execute_parallel(
                 workspace_concurrency,
                 continue_on_error,
                 &ws_graph.members,
                 &mut dag_state,
-                |idx, (completed_identities, completed_states)| {
+                |idx, isolated, (completed_identities, completed_states)| {
+                    // Concurrent members need prefixed, piped output so their
+                    // logs do not interleave; an isolated member (nothing else
+                    // running or ready) keeps inherited stdio unless --stream
+                    // was requested.
+                    let member_stream = stream || (!isolated && !json_output);
                     let member_name = ws_graph.members[idx].name.clone();
                     let member_task_plan =
                         member_task_plans[idx].as_ref().cloned().ok_or_else(|| {
@@ -852,11 +861,12 @@ fn run_workspace_package(
     }
 }
 
-/// Effective dependency DAG restricted to runnable workspace members.
+/// Effective dependency DAG across workspace members.
 ///
-/// Preserves transitive ordering across non-runnable intermediate members so a
-/// runnable member starts as soon as its own runnable ancestors finish instead
-/// of waiting at a global topological-level barrier.
+/// Stores the original O(V + E) graph and propagates readiness immediately
+/// through non-runnable intermediate members so a runnable member starts as
+/// soon as its own runnable ancestors finish without expanding transitive
+/// bridges into quadratic edge lists.
 struct RunnableWorkspaceDag {
     runnable: Vec<bool>,
     remaining_deps: Vec<usize>,
@@ -872,27 +882,20 @@ impl RunnableWorkspaceDag {
         let count = edges.len();
         let mut remaining_deps = vec![0usize; count];
         let mut dependents = vec![Vec::new(); count];
-        for member_idx in 0..count {
-            if !runnable[member_idx] {
-                continue;
+        let mut seen_epoch = vec![0u32; count];
+        let mut epoch = 0u32;
+        for (member_idx, deps) in edges.iter().enumerate() {
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                seen_epoch.fill(0);
+                epoch = 1;
             }
-            let mut visited = vec![false; count];
-            let mut stack = edges[member_idx].clone();
-            let mut direct_runnable_deps = Vec::new();
-            while let Some(dep_idx) = stack.pop() {
-                if visited[dep_idx] {
-                    continue;
+            for &dep_idx in deps {
+                if dep_idx < count && seen_epoch[dep_idx] != epoch {
+                    seen_epoch[dep_idx] = epoch;
+                    remaining_deps[member_idx] += 1;
+                    dependents[dep_idx].push(member_idx);
                 }
-                visited[dep_idx] = true;
-                if runnable[dep_idx] {
-                    direct_runnable_deps.push(dep_idx);
-                } else {
-                    stack.extend(edges[dep_idx].iter().copied());
-                }
-            }
-            remaining_deps[member_idx] = direct_runnable_deps.len();
-            for dep_idx in direct_runnable_deps {
-                dependents[dep_idx].push(member_idx);
             }
         }
         Self {
@@ -902,21 +905,53 @@ impl RunnableWorkspaceDag {
         }
     }
 
+    fn release_node(
+        &self,
+        idx: usize,
+        remaining: &mut [usize],
+        ready_runnable: &mut std::collections::BTreeSet<usize>,
+    ) {
+        let mut zero_work_queue = vec![idx];
+        while let Some(completed_idx) = zero_work_queue.pop() {
+            for &dep_idx in &self.dependents[completed_idx] {
+                remaining[dep_idx] -= 1;
+                if remaining[dep_idx] == 0 {
+                    if self.runnable[dep_idx] {
+                        ready_runnable.insert(dep_idx);
+                    } else {
+                        zero_work_queue.push(dep_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    fn initial_ready(&self, remaining: &mut [usize]) -> std::collections::BTreeSet<usize> {
+        let mut ready_runnable = std::collections::BTreeSet::new();
+        let mut zero_work_roots = Vec::new();
+        for (idx, &is_runnable) in self.runnable.iter().enumerate() {
+            if remaining[idx] == 0 {
+                if is_runnable {
+                    ready_runnable.insert(idx);
+                } else {
+                    zero_work_roots.push(idx);
+                }
+            }
+        }
+        for root in zero_work_roots {
+            self.release_node(root, remaining, &mut ready_runnable);
+        }
+        ready_runnable
+    }
+
     fn is_linear_chain(&self) -> bool {
         let mut remaining = self.remaining_deps.clone();
-        let mut ready: Vec<usize> = (0..self.runnable.len())
-            .filter(|&idx| self.runnable[idx] && remaining[idx] == 0)
-            .collect();
-        while let Some(idx) = ready.pop() {
+        let mut ready = self.initial_ready(&mut remaining);
+        while let Some(idx) = ready.pop_first() {
             if !ready.is_empty() {
                 return false;
             }
-            for &dep_idx in &self.dependents[idx] {
-                remaining[dep_idx] -= 1;
-                if remaining[dep_idx] == 0 {
-                    ready.push(dep_idx);
-                }
-            }
+            self.release_node(idx, &mut remaining, &mut ready);
         }
         true
     }
@@ -933,15 +968,15 @@ impl RunnableWorkspaceDag {
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, LpmError> + Send + 'static,
-        Prep: FnMut(usize, &S) -> Result<F, LpmError>,
+        Prep: FnMut(usize, bool, &S) -> Result<F, LpmError>,
         Done: FnMut(usize, T, &mut S) -> bool,
     {
         let concurrency = workspace_concurrency.max(1);
         let mut remaining = self.remaining_deps.clone();
-        let mut ready: std::collections::BTreeSet<usize> = (0..self.runnable.len())
-            .filter(|&idx| self.runnable[idx] && remaining[idx] == 0)
-            .collect();
-        let mut stopped = false;
+        let mut ready = self.initial_ready(&mut remaining);
+        // Hard errors (env denial, worker error, panic) stop unstarted members
+        // even under --no-bail while waiting for already-started members to finish.
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let mut failed = false;
         let mut first_error: Option<LpmError> = None;
 
@@ -951,22 +986,27 @@ impl RunnableWorkspaceDag {
             let mut handles: HashMap<usize, std::thread::ScopedJoinHandle<'_, ()>> = HashMap::new();
 
             loop {
-                while !stopped
+                while !stop_requested.load(Ordering::Acquire)
                     && (continue_on_error || !failed)
                     && handles.len() < concurrency
                     && let Some(idx) = ready.pop_first()
                 {
-                    let job = match prepare(idx, state) {
+                    let isolated = handles.is_empty() && ready.is_empty();
+                    let job = match prepare(idx, isolated, state) {
                         Ok(job) => job,
                         Err(error) => {
-                            stopped = true;
+                            stop_requested.store(true, Ordering::Release);
                             first_error.get_or_insert(error);
                             break;
                         }
                     };
                     let tx = tx.clone();
+                    let worker_stop = Arc::clone(&stop_requested);
                     let handle = scope.spawn(move || {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        if !matches!(&result, Ok(Ok(_))) {
+                            worker_stop.store(true, Ordering::Release);
+                        }
                         let _ = tx.send((idx, result));
                     });
                     handles.insert(idx, handle);
@@ -976,40 +1016,46 @@ impl RunnableWorkspaceDag {
                     break;
                 }
 
-                let Ok((idx, worker_result)) = rx.recv() else {
+                let Ok(first_completion) = rx.recv() else {
                     break;
                 };
-                if let Some(handle) = handles.remove(&idx) {
-                    let _ = handle.join();
+                // Drain every already-queued completion before refilling slots
+                // so a queued hard error stops pending dependents even when a
+                // success message was queued just ahead of it.
+                let mut completions = vec![first_completion];
+                while let Ok(next) = rx.try_recv() {
+                    completions.push(next);
                 }
 
-                match worker_result {
-                    Ok(Ok(value)) => {
-                        let succeeded = on_complete(idx, value, state);
-                        if !succeeded {
-                            failed = true;
-                        }
-                        if !stopped && (continue_on_error || !failed) {
-                            for &dep_idx in &self.dependents[idx] {
-                                remaining[dep_idx] -= 1;
-                                if remaining[dep_idx] == 0 {
-                                    ready.insert(dep_idx);
-                                }
+                for (idx, worker_result) in completions {
+                    if let Some(handle) = handles.remove(&idx) {
+                        let _ = handle.join();
+                    }
+                    match worker_result {
+                        Ok(Ok(value)) => {
+                            let succeeded = on_complete(idx, value, state);
+                            if !succeeded {
+                                failed = true;
+                            }
+                            if !stop_requested.load(Ordering::Acquire)
+                                && (continue_on_error || !failed)
+                            {
+                                self.release_node(idx, &mut remaining, &mut ready);
                             }
                         }
-                    }
-                    Ok(Err(error)) => {
-                        stopped = true;
-                        first_error.get_or_insert(error);
-                    }
-                    Err(_) => {
-                        stopped = true;
-                        first_error.get_or_insert_with(|| {
-                            LpmError::Task(format!(
-                                "workspace task thread panicked for '{}'",
-                                members[idx].name
-                            ))
-                        });
+                        Ok(Err(error)) => {
+                            stop_requested.store(true, Ordering::Release);
+                            first_error.get_or_insert(error);
+                        }
+                        Err(_) => {
+                            stop_requested.store(true, Ordering::Release);
+                            first_error.get_or_insert_with(|| {
+                                LpmError::Task(format!(
+                                    "workspace task thread panicked for '{}'",
+                                    members[idx].name
+                                ))
+                            });
+                        }
                     }
                 }
             }
@@ -1039,14 +1085,14 @@ mod tests {
     #[test]
     fn dag_scheduler_starts_dependent_before_unrelated_slow_peer_finishes() {
         // Graph: 0 (fast-lib), 1 (slow-lib), 2 (app -> depends on 0 only).
-        // With a level barrier, 2 would wait for 1; with the DAG scheduler, 2
-        // runs and completes while 1 is still blocked.
         let edges = vec![vec![], vec![], vec![0]];
         let runnable = vec![true, true, true];
         let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
         assert!(!dag.is_linear_chain());
 
         let members = test_members(&["fast-lib", "slow-lib", "app"]);
+        let (slow_started_tx, slow_started_rx) = std::sync::mpsc::channel();
+        let slow_started_rx = Arc::new(std::sync::Mutex::new(slow_started_rx));
         let (app_done_tx, app_done_rx) = std::sync::mpsc::channel();
         let app_done_rx = Arc::new(std::sync::Mutex::new(app_done_rx));
         let finished = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1058,7 +1104,10 @@ mod tests {
             false,
             &members,
             &mut (),
-            |idx, ()| {
+            |idx, isolated, ()| {
+                assert!(!isolated || idx == 2);
+                let slow_started_tx = slow_started_tx.clone();
+                let slow_started_rx = Arc::clone(&slow_started_rx);
                 let app_done_tx = app_done_tx.clone();
                 let app_done_rx = Arc::clone(&app_done_rx);
                 let finished = Arc::clone(&finished);
@@ -1068,11 +1117,18 @@ mod tests {
                     let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
                     if idx == 1 {
+                        slow_started_tx.send(()).unwrap();
                         app_done_rx
                             .lock()
                             .unwrap()
                             .recv_timeout(std::time::Duration::from_secs(10))
                             .expect("app must complete while slow-lib is still running");
+                    } else if idx == 0 {
+                        slow_started_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .expect("slow-lib must start concurrently with fast-lib");
                     }
                     finished.lock().unwrap().push(idx);
                     running.fetch_sub(1, Ordering::SeqCst);
@@ -1097,9 +1153,112 @@ mod tests {
         let runnable = vec![true, false, true];
         let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
         assert!(dag.is_linear_chain());
-        assert_eq!(dag.remaining_deps[0], 0);
-        assert_eq!(dag.remaining_deps[2], 1);
-        assert_eq!(dag.dependents[0], vec![2]);
+        let members = test_members(&["lib", "skip", "app"]);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        dag.execute_parallel(
+            2,
+            false,
+            &members,
+            &mut (),
+            |idx, isolated, ()| {
+                assert!(isolated, "linear chain member {idx} must be isolated");
+                let order = Arc::clone(&order);
+                Ok(move || {
+                    order.lock().unwrap().push(idx);
+                    Ok(idx)
+                })
+            },
+            |_idx, _val, ()| true,
+        )
+        .unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![0, 2]);
+    }
+
+    #[test]
+    fn dag_scheduler_keeps_linear_edge_storage_for_shared_non_runnable_bridge() {
+        // 100 producers -> 1 non-runnable bridge -> 100 consumers (200 edges, not 10,000).
+        let producers = 100usize;
+        let bridge = producers;
+        let consumers = 100usize;
+        let total = producers + 1 + consumers;
+        let mut edges = vec![Vec::new(); total];
+        edges[bridge] = (0..producers).collect();
+        for edge in &mut edges[(bridge + 1)..total] {
+            *edge = vec![bridge];
+        }
+        let mut runnable = vec![true; total];
+        runnable[bridge] = false;
+
+        let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
+        let stored_edges: usize = dag.dependents.iter().map(Vec::len).sum();
+        assert_eq!(stored_edges, producers + consumers);
+    }
+
+    #[test]
+    fn dag_scheduler_marks_fan_in_final_member_as_isolated() {
+        // 0 (a), 1 (b), 2 (app depends on 0 and 1).
+        let edges = vec![vec![], vec![], vec![0, 1]];
+        let runnable = vec![true, true, true];
+        let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
+        let members = test_members(&["a", "b", "app"]);
+        let isolated_seen = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        dag.execute_parallel(
+            2,
+            false,
+            &members,
+            &mut (),
+            |idx, isolated, ()| {
+                isolated_seen.lock().unwrap().insert(idx, isolated);
+                Ok(move || Ok(idx))
+            },
+            |_idx, _val, ()| true,
+        )
+        .unwrap();
+
+        let map = isolated_seen.lock().unwrap();
+        assert_eq!(map.get(&0), Some(&false));
+        assert_eq!(map.get(&2), Some(&true));
+    }
+
+    #[test]
+    fn dag_scheduler_stops_pending_dependents_on_queued_hard_error_even_with_no_bail() {
+        // 0 (succeeds), 1 (hard Err), 2 (depends on 0).
+        let edges = vec![vec![], vec![], vec![0]];
+        let runnable = vec![true, true, true];
+        let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
+        let members = test_members(&["ok", "fatal", "dep"]);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let err = dag
+            .execute_parallel(
+                2,
+                true, // --no-bail
+                &members,
+                &mut (),
+                |idx, _isolated, ()| {
+                    started.lock().unwrap().push(idx);
+                    let barrier = Arc::clone(&barrier);
+                    Ok(move || {
+                        if idx == 0 {
+                            barrier.wait();
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Ok(idx)
+                        } else if idx == 1 {
+                            barrier.wait();
+                            Err(LpmError::Task("fatal env error".into()))
+                        } else {
+                            Ok(idx)
+                        }
+                    })
+                },
+                |_idx, _val, ()| true,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("fatal env error"));
+        assert!(!started.lock().unwrap().contains(&2));
     }
 
     #[test]
@@ -1115,7 +1274,7 @@ mod tests {
             false,
             &members,
             &mut (),
-            |idx, ()| {
+            |idx, _isolated, ()| {
                 let started = Arc::clone(&started);
                 Ok(move || {
                     started.lock().unwrap().push(idx);

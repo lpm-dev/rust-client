@@ -110,9 +110,10 @@ pub(super) fn keep_project_state_ignored(project_dir: &std::path::Path) {
     }
 }
 
-/// Commands that run one script or read local state, and do any parallel
-/// work on rayon, the blocking pool or their own threads. A runtime worker
-/// per CPU only adds thread start-up and scheduler contention to them.
+/// Commands that run one script, inspect local state, or run bounded
+/// registry/analysis work on rayon or the blocking pool without spawning
+/// workspace-wide async installs. A runtime worker per CPU only adds thread
+/// start-up and scheduler contention to them.
 fn runs_on_two_workers(command: Option<&Commands>) -> bool {
     match command {
         Some(Commands::Run(args)) => {
@@ -125,15 +126,12 @@ fn runs_on_two_workers(command: Option<&Commands>) -> bool {
                 && !args.affected
                 && !args.watch
         }
+        Some(Commands::RunFile(args)) => !args.watch,
+        Some(Commands::Migrate(args)) => args.no_install || args.dry_run,
         Some(
             Commands::Exec(_)
-            | Commands::RunFile(_)
             | Commands::Env(_)
-            | Commands::Tidy(_)
             | Commands::Pack(_)
-            | Commands::Uninstall(_)
-            | Commands::Upgrade(_)
-            | Commands::Migrate(_)
             | Commands::Why(_)
             | Commands::Graph(_)
             | Commands::Query(_)
@@ -166,7 +164,7 @@ fn runtime_worker_threads(
     if runs_on_two_workers(command) {
         return Some(available_parallelism.clamp(1, 2));
     }
-    let install = match command {
+    let single_project_install_like = match command {
         Some(Commands::Install(args)) => {
             !args.global
                 && args.packages.is_empty()
@@ -179,10 +177,16 @@ fn runtime_worker_threads(
                 && args.changed_files_ignore_pattern.is_empty()
                 && args.test_pattern.is_empty()
         }
-        Some(Commands::Ci(_)) => true,
+        Some(
+            Commands::Ci(_)
+            | Commands::Migrate(_)
+            | Commands::Upgrade(_)
+            | Commands::Tidy(_)
+            | Commands::Uninstall(_),
+        ) => true,
         _ => false,
     };
-    if !install {
+    if !single_project_install_like {
         return None;
     }
     let project_dir = project_dir?;
@@ -289,6 +293,7 @@ mod tests {
         for args in [
             vec!["lpm", "run", "test"],
             vec!["lpm", "run", "test", "--", "--watch"],
+            vec!["lpm", "__run-file", "scripts/seed.ts"],
             vec!["lpm", "exec", "tsc"],
             vec!["lpm", "why", "react"],
             vec!["lpm", "graph"],
@@ -296,11 +301,8 @@ mod tests {
             vec!["lpm", "outdated"],
             vec!["lpm", "info", "react"],
             vec!["lpm", "doctor"],
-            vec!["lpm", "tidy"],
             vec!["lpm", "pack"],
-            vec!["lpm", "uninstall", "react"],
-            vec!["lpm", "upgrade"],
-            vec!["lpm", "migrate"],
+            vec!["lpm", "migrate", "--no-install"],
             vec!["lpm", "env", "ls"],
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();
@@ -340,6 +342,7 @@ mod tests {
             vec!["lpm", "run", "test", "--filter", "app"],
             vec!["lpm", "run", "test", "--affected"],
             vec!["lpm", "run", "test", "--watch"],
+            vec!["lpm", "__run-file", "scripts/seed.ts", "--watch"],
             vec!["lpm", "serve"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
@@ -361,12 +364,21 @@ mod tests {
         let member = project.path().join("packages/app");
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
-        for command in ["install", "ci"] {
-            let cli = Cli::try_parse_from(["lpm", command]).unwrap();
+        for args in [
+            vec!["lpm", "install"],
+            vec!["lpm", "ci"],
+            vec!["lpm", "migrate"],
+            vec!["lpm", "upgrade"],
+            vec!["lpm", "tidy"],
+            vec!["lpm", "uninstall", "react"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
             for path in [project.path(), member.as_path()] {
                 assert_eq!(
                     runtime_worker_threads(cli.command.as_ref(), false, 18, Some(path)),
                     None,
+                    "{args:?} at {}",
+                    path.display()
                 );
             }
         }

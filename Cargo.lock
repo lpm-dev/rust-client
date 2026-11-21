@@ -4360,7 +4360,6 @@ dependencies = [
  "lpm-extractor",
  "lpm-workspace",
  "notify",
- "rayon",
  "rustix",
  "same-file",
  "serde",

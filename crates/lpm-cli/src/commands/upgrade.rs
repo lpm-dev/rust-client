@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-const METADATA_PLANNING_CONCURRENCY: usize = 16;
+const METADATA_PLANNING_CONCURRENCY: usize = 4;
 const MAX_METADATA_FAILURE_DETAIL_BYTES: usize = 2 * 1024;
 const MAX_METADATA_FAILURE_NAMES: usize = 8;
 const MAX_METADATA_FAILURES_MESSAGE_BYTES: usize = 16 * 1024;

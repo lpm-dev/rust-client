@@ -7,7 +7,7 @@
 //! - Environment variables
 //! - Node.js version
 
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::Dir;
 use lpm_common::LpmError;
 use sha2::{Digest, Sha256};
@@ -850,15 +850,7 @@ fn collect_input_files(
     project_dir: &Path,
     globs: &[String],
 ) -> Result<Vec<(PathBuf, String)>, LpmError> {
-    struct InputCandidate {
-        relative: PathBuf,
-        entry: PathBuf,
-        resolved_relative: PathBuf,
-        metadata: std::fs::Metadata,
-        unlinked: bool,
-    }
-
-    let mut candidates = Vec::new();
+    let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let canonical_project = project_dir.canonicalize().map_err(|error| {
         LpmError::Task(format!(
@@ -866,7 +858,9 @@ fn collect_input_files(
             project_dir.display()
         ))
     })?;
+    let project = Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority())?;
     let mut links = ComponentLinks::default();
+    let mut directories = InputDirectories::default();
 
     for pattern in globs {
         if !crate::cache::validate_glob_pattern(pattern) {
@@ -880,6 +874,8 @@ fn collect_input_files(
         for pat in &patterns {
             for_each_cache_glob_match(&canonical_project, pat, |relative| {
                 let entry = canonical_project.join(&relative);
+                // A path below the canonical root with no linked component
+                // is its own canonical form, and its lstat is its stat.
                 let unlinked_metadata = links.unlinked_metadata(&canonical_project, &relative)?;
                 let unlinked = unlinked_metadata.is_some();
                 let (resolved, metadata) = match unlinked_metadata {
@@ -905,87 +901,36 @@ fn collect_input_files(
                     return Ok(());
                 }
                 if seen.insert(relative.clone()) {
-                    let resolved_relative = resolved
-                        .strip_prefix(&canonical_project)
-                        .map_err(|_| {
+                    let resolved_relative =
+                        resolved.strip_prefix(&canonical_project).map_err(|_| {
                             LpmError::Task(format!(
                                 "task cache input resolves outside project: {}",
                                 entry.display()
                             ))
-                        })?
-                        .to_path_buf();
-                    candidates.push(InputCandidate {
-                        relative,
-                        entry,
-                        resolved_relative,
-                        metadata,
-                        unlinked,
-                    });
+                        })?;
+                    let mut file = directories.open_file(&project, resolved_relative)?;
+                    let content_hash = file_content_hash(&mut file).map_err(|error| {
+                        LpmError::Task(format!(
+                            "failed to hash task cache input {}: {error}",
+                            entry.display()
+                        ))
+                    })?;
+                    let identity_hash = if unlinked {
+                        hash_unlinked_input_identity(&metadata, &content_hash)
+                    } else {
+                        hash_input_path_identity(
+                            &canonical_project,
+                            &relative,
+                            &metadata,
+                            &content_hash,
+                        )?
+                    };
+                    files.push((relative, identity_hash));
                 }
                 Ok(())
             })?;
         }
     }
-
-    let hash_candidate = |project: &Dir,
-                          directories: &mut InputDirectories,
-                          candidate: InputCandidate|
-     -> Result<(PathBuf, String), LpmError> {
-        let mut file = directories.open_file(project, &candidate.resolved_relative)?;
-        let content_hash = file_content_hash(&mut file).map_err(|error| {
-            LpmError::Task(format!(
-                "failed to hash task cache input {}: {error}",
-                candidate.entry.display()
-            ))
-        })?;
-        let identity_hash = if candidate.unlinked {
-            hash_unlinked_input_identity(&candidate.metadata, &content_hash)
-        } else {
-            hash_input_path_identity(
-                &canonical_project,
-                &candidate.relative,
-                &candidate.metadata,
-                &content_hash,
-            )?
-        };
-        Ok((candidate.relative, identity_hash))
-    };
-
-    let mut files: Vec<(PathBuf, String)> = if candidates.len() >= 8 {
-        use rayon::prelude::*;
-        let results: Vec<Result<(PathBuf, String), LpmError>> = candidates
-            .into_par_iter()
-            .map_init(
-                || {
-                    (
-                        Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority()),
-                        InputDirectories::default(),
-                    )
-                },
-                |(project_res, directories), candidate| {
-                    let project = match project_res {
-                        Ok(dir) => dir,
-                        Err(error) => {
-                            return Err(LpmError::Io(std::io::Error::new(
-                                error.kind(),
-                                error.to_string(),
-                            )));
-                        }
-                    };
-                    hash_candidate(project, directories, candidate)
-                },
-            )
-            .collect();
-        results.into_iter().collect::<Result<Vec<_>, _>>()?
-    } else {
-        let project = Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority())?;
-        let mut directories = InputDirectories::default();
-        let mut out = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            out.push(hash_candidate(&project, &mut directories, candidate)?);
-        }
-        out
-    };
 
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
@@ -1095,7 +1040,7 @@ impl InputDirectories {
             .as_ref()
             .expect("input parent directory was opened");
         let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
         let file = parent.open_with(name, &options).map_err(|error| {
             LpmError::Task(format!(
                 "failed to open task cache input {} without following links: {error}",

@@ -2306,6 +2306,39 @@ pub fn read_cached_analysis(package_dir: &Path) -> Option<PackageAnalysis> {
     Some(analysis)
 }
 
+/// Read a cached `.lpm-security.json` file from a retained directory capability.
+pub fn read_cached_analysis_from_open_dir(
+    package_dir: &cap_std::fs::Dir,
+) -> Option<PackageAnalysis> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+    use std::io::Read as _;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file = package_dir.open_with(".lpm-security.json", &options).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut limited = file
+        .into_std()
+        .take(lpm_common::STATE_FILE_SIZE_CAP_BYTES.saturating_add(1));
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
+        return None;
+    }
+    let analysis: PackageAnalysis = serde_json::from_slice(&bytes).ok()?;
+    if analysis.version != SCHEMA_VERSION {
+        tracing::debug!(
+            "cached analysis version {} != current {SCHEMA_VERSION}, needs re-analysis",
+            analysis.version
+        );
+        return None;
+    }
+    Some(analysis)
+}
+
 /// Write analysis results to `.lpm-security.json` in a package directory.
 pub fn write_cached_analysis(
     package_dir: &Path,
@@ -2325,6 +2358,21 @@ pub fn write_cached_analysis_atomic(
     let path = package_dir.join(".lpm-security.json");
     let json = serde_json::to_string_pretty(analysis).map_err(std::io::Error::other)?;
     lpm_common::write_file_atomic(&path, json)
+}
+
+/// Atomically replace `.lpm-security.json` through a retained directory capability.
+pub fn write_cached_analysis_atomic_in_dir(
+    package_dir: &cap_std::fs::Dir,
+    analysis: &PackageAnalysis,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let json = serde_json::to_string_pretty(analysis).map_err(std::io::Error::other)?;
+    lpm_common::write_file_atomic_in_dir_with(
+        package_dir,
+        std::ffi::OsStr::new(".lpm-security.json"),
+        |file| file.write_all(json.as_bytes()),
+    )
 }
 
 /// Backfill a missing, malformed, or outdated analysis cache.

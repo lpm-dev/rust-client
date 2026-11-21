@@ -262,19 +262,26 @@ pub(crate) async fn verify_packages_with_timings(
         std::collections::HashMap::with_capacity(inputs.len());
     let mut unique_inputs = Vec::with_capacity(inputs.len());
     let mut index_map = Vec::with_capacity(inputs.len());
+    let mut unique_counts = Vec::with_capacity(inputs.len());
     for input in inputs {
         let key = SignatureDedupKey::from_input(&input);
         let unique_idx = match seen.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let idx = *entry.get();
+                unique_counts[idx] += 1;
+                idx
+            }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let idx = unique_inputs.len();
                 entry.insert(idx);
                 unique_inputs.push(input);
+                unique_counts.push(1usize);
                 idx
             }
         };
         index_map.push(unique_idx);
     }
+    drop(seen);
 
     let unique_results: Vec<RegistrySignaturePackageResult> =
         futures::stream::iter(unique_inputs.into_iter().map(|input| {
@@ -299,10 +306,24 @@ pub(crate) async fn verify_packages_with_timings(
     let packages = if unique_results.len() == index_map.len() {
         unique_results
     } else {
-        index_map
-            .into_iter()
-            .map(|idx| unique_results[idx].clone())
-            .collect()
+        let mut slots: Vec<Option<RegistrySignaturePackageResult>> =
+            unique_results.into_iter().map(Some).collect();
+        let mut packages = Vec::with_capacity(index_map.len());
+        for idx in index_map {
+            unique_counts[idx] -= 1;
+            let row = if unique_counts[idx] == 0 {
+                slots[idx]
+                    .take()
+                    .expect("unique signature result present for last consumer")
+            } else {
+                slots[idx]
+                    .as_ref()
+                    .expect("unique signature result present for shared consumer")
+                    .clone()
+            };
+            packages.push(row);
+        }
+        packages
     };
 
     if let Some(timings) = &timings {
@@ -385,12 +406,14 @@ async fn verify_one_package(
         return not_verified(input, reason);
     }
 
-    let crypto_start = std::time::Instant::now();
     let name = input.name;
     let version = input.version;
+    let fallback_name = name.clone();
+    let fallback_version = version.clone();
     let signatures = input.signatures;
     let published_at = input.published_at;
     let verify_result = tokio::task::spawn_blocking(move || {
+        let crypto_start = std::time::Instant::now();
         let verification = lpm_registry::verify_registry_signatures(
             &name,
             &version,
@@ -399,43 +422,46 @@ async fn verify_one_package(
             &keys,
             published_at.as_deref(),
         );
-        (name, version, verification)
+        let crypto_elapsed = crypto_start.elapsed();
+        (name, version, verification, crypto_elapsed)
     })
     .await;
-    if let Some(timings) = timings {
-        timings.record_crypto(crypto_start.elapsed());
-    }
     match verify_result {
-        Ok((name, version, Ok(RegistrySignatureVerification::Verified { count }))) => {
-            RegistrySignaturePackageResult {
-                name,
-                version,
-                status: RegistrySignatureStatus::Verified,
-                reason: None,
-                signatures_verified: count,
+        Ok((name, version, outcome, crypto_elapsed)) => {
+            if let Some(timings) = timings {
+                timings.record_crypto(crypto_elapsed);
+            }
+            match outcome {
+                Ok(RegistrySignatureVerification::Verified { count }) => {
+                    RegistrySignaturePackageResult {
+                        name,
+                        version,
+                        status: RegistrySignatureStatus::Verified,
+                        reason: None,
+                        signatures_verified: count,
+                    }
+                }
+                Ok(RegistrySignatureVerification::NoSignatures) => RegistrySignaturePackageResult {
+                    name,
+                    version,
+                    status: RegistrySignatureStatus::NotVerified,
+                    reason: Some(RegistrySignatureReason::MissingSignatures),
+                    signatures_verified: 0,
+                },
+                Err(error) => RegistrySignaturePackageResult {
+                    name,
+                    version,
+                    status: RegistrySignatureStatus::NotVerified,
+                    reason: Some(RegistrySignatureReason::VerificationFailed(
+                        error.to_string(),
+                    )),
+                    signatures_verified: 0,
+                },
             }
         }
-        Ok((name, version, Ok(RegistrySignatureVerification::NoSignatures))) => {
-            RegistrySignaturePackageResult {
-                name,
-                version,
-                status: RegistrySignatureStatus::NotVerified,
-                reason: Some(RegistrySignatureReason::MissingSignatures),
-                signatures_verified: 0,
-            }
-        }
-        Ok((name, version, Err(error))) => RegistrySignaturePackageResult {
-            name,
-            version,
-            status: RegistrySignatureStatus::NotVerified,
-            reason: Some(RegistrySignatureReason::VerificationFailed(
-                error.to_string(),
-            )),
-            signatures_verified: 0,
-        },
         Err(join_error) => RegistrySignaturePackageResult {
-            name: String::new(),
-            version: String::new(),
+            name: fallback_name,
+            version: fallback_version,
             status: RegistrySignatureStatus::NotVerified,
             reason: Some(RegistrySignatureReason::VerificationFailed(
                 join_error.to_string(),

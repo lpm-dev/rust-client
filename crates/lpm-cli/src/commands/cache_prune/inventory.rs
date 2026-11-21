@@ -92,8 +92,6 @@ pub(super) fn walk_link_entries(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(super::prune_inspection_error(&root, error)),
     };
-    let mut canonical_targets: std::collections::HashMap<PathBuf, PathBuf> =
-        std::collections::HashMap::new();
     for entry in entries {
         let entry = entry.map_err(|error| super::prune_inspection_error(&root, error))?;
         if lpm_store::v2::is_staging_dir_name(&entry.file_name()) {
@@ -162,17 +160,8 @@ pub(super) fn walk_link_entries(
             let actual = std::fs::canonicalize(&link)
                 .map_err(|error| super::prune_inspection_error(&link, error))?;
             let expected_path = store.paths().link_package_dir(&target);
-            let expected = match canonical_targets.get(&expected_path) {
-                Some(cached) => cached.as_path(),
-                None => {
-                    let canonical = std::fs::canonicalize(&expected_path)
-                        .map_err(|error| super::prune_inspection_error(&expected_path, error))?;
-                    canonical_targets
-                        .entry(expected_path)
-                        .or_insert(canonical)
-                        .as_path()
-                }
-            };
+            let expected = std::fs::canonicalize(&expected_path)
+                .map_err(|error| super::prune_inspection_error(&expected_path, error))?;
             if actual != expected {
                 return Err(LpmError::Store(format!(
                     "cache prune: dependency metadata disagrees with installed link at {}",

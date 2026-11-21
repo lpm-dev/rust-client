@@ -28,7 +28,7 @@ use std::time::Instant;
 const CYCLONEDX_SPEC_VERSION: &str = "1.7";
 const SPDX_SPEC_VERSION: &str = "SPDX-2.3";
 const SBOM_SCHEMA_VERSION: u32 = 1;
-const REGISTRY_ENRICHMENT_CONCURRENCY: usize = 16;
+const REGISTRY_ENRICHMENT_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SbomFormat {

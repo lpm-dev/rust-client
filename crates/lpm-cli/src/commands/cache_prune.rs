@@ -1508,19 +1508,25 @@ fn parse_duration(s: &str) -> Result<Age, LpmError> {
     })
 }
 
-fn dir_size(dir: &Path) -> std::io::Result<u64> {
+fn dir_size(root: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_file() {
-            let meta = entry.metadata()?;
-            total = total.saturating_add(meta.len());
-        } else if file_type.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path())?);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // Drain each ReadDir into the stack before descending so deep trees
+        // never hold more than one directory descriptor per worker.
+        let entries = std::fs::read_dir(&dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if lpm_common::is_symlink_or_junction(&meta) {
+                continue;
+            }
+            if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            } else if meta.is_dir() {
+                stack.push(path);
+            }
         }
     }
     Ok(total)
