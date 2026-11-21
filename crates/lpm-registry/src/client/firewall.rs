@@ -232,15 +232,53 @@ impl Default for NpmFirewallPolicyProfile {
 }
 
 impl RegistryClient {
-    /// Non-reversible fingerprint of the auth principal (bearer + mTLS client
-    /// cert) used for firewall requests against `self.base_url`.
-    pub fn firewall_auth_identity_fingerprint(
+    /// Non-reversible fingerprint of the established auth principal (live
+    /// bearer + mTLS client cert) and effective TLS trust posture for
+    /// `self.base_url`.
+    ///
+    /// Returns `Ok(None)` when no live bearer is currently established (for
+    /// example, a refresh-only session that has not yet exchanged its refresh
+    /// token), so callers never bucket distinct accounts under an anonymous key.
+    pub fn firewall_cache_identity_fingerprint(
         &self,
         posture: AuthPosture,
-    ) -> Result<String, LpmError> {
-        let bearer = self.current_bearer(posture)?;
+    ) -> Result<Option<String>, LpmError> {
+        use sha2::{Digest as _, Sha256};
+
+        let Some(bearer) = self.current_bearer(posture)? else {
+            return Ok(None);
+        };
         let identity_fp = self.http.identity_fp_for_url(&self.base_url);
-        Ok(bearer_principal_fingerprint(bearer.as_deref(), identity_fp))
+        let principal = bearer_principal_fingerprint(Some(&bearer), identity_fp);
+
+        let tls = &self.http.tls_overrides;
+        let origin = crate::npmrc::OriginKey::from_request_url(&self.base_url);
+        let origin_tls = origin.as_ref().and_then(|key| {
+            tls.per_origin.get(key).or_else(|| {
+                tls.per_origin.get(&crate::npmrc::OriginKey {
+                    host_lower: key.host_lower.clone(),
+                    port: None,
+                })
+            })
+        });
+        let strict_ssl = tls.strict_ssl.as_ref().is_none_or(|setting| setting.value);
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"lpm-firewall-cache-principal-v2\0");
+        hasher.update(principal.as_bytes());
+        hasher.update(b"\0strict=");
+        hasher.update(if strict_ssl { b"1" } else { b"0" });
+        for root in &tls.extra_roots {
+            hasher.update(b"\0groot=");
+            hasher.update(root.pem_bytes.as_slice());
+        }
+        if let Some(entry) = origin_tls {
+            for cafile in &entry.cafiles {
+                hasher.update(b"\0ocafile=");
+                hasher.update(cafile.path.as_os_str().as_encoded_bytes());
+            }
+        }
+        Ok(Some(hex::encode(&hasher.finalize()[..16])))
     }
 
     pub async fn npm_firewall_batch_verdicts(
@@ -291,7 +329,7 @@ impl RegistryClient {
                 async move {
                     let mut req = self
                         .http
-                        .for_url(&url)
+                        .for_manual_redirect_url(&url)
                         .await?
                         .post(&url)
                         .header("Accept", "application/json")
@@ -305,11 +343,30 @@ impl RegistryClient {
             })
             .await?;
         let request_ms = elapsed_millis(request_started);
+        let age_secs = response
+            .headers()
+            .get(reqwest::header::AGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         let cache_directive = match Self::metadata_cache_directive(response.headers()) {
-            MetadataCacheDirective::Unspecified => NpmFirewallCacheDirective::Unspecified,
-            MetadataCacheDirective::Store { fresh_for } => NpmFirewallCacheDirective::Store {
-                max_age_secs: fresh_for.as_secs(),
-            },
+            MetadataCacheDirective::Unspecified => {
+                if age_secs > 0 {
+                    NpmFirewallCacheDirective::Store { max_age_secs: 0 }
+                } else {
+                    NpmFirewallCacheDirective::Unspecified
+                }
+            }
+            MetadataCacheDirective::Store { fresh_for } => {
+                let remaining = fresh_for.as_secs().saturating_sub(age_secs);
+                if remaining == 0 {
+                    NpmFirewallCacheDirective::NoStore
+                } else {
+                    NpmFirewallCacheDirective::Store {
+                        max_age_secs: remaining,
+                    }
+                }
+            }
             MetadataCacheDirective::NoStore => NpmFirewallCacheDirective::NoStore,
         };
         let (mut parsed, body_timings) = parse_capped_api_json_with_timing::<
