@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ClientPool {
+pub(super) enum ClientPool {
     General,
     PolicyMetadata,
     ManualRedirect(usize),
@@ -172,28 +172,16 @@ impl HttpClients {
         })
     }
 
-    /// Look up a cached client for `url` without lazy-building.
-    /// Returns the eager-built per-origin entry if one exists, else
-    /// the default. Sync, infallible — suitable for hot paths.
-    fn cached_for_url_no_build(&self, url: &str) -> &CachedClient {
-        let Some(origin) = OriginKey::from_request_url(url) else {
-            return self.default.get();
-        };
-        self.cached_for_origin_no_build(&origin)
-    }
-
-    fn cached_for_origin_no_build(&self, origin: &OriginKey) -> &CachedClient {
-        if let Some(c) = self.eager.get(origin) {
-            return c;
-        }
-        self.default.get()
-    }
-
     /// Public-API variant returning the underlying `reqwest::Client`.
     /// Kept for callers that don't care about the cached fingerprint
     /// (the retry executors, request-builder helpers, tests).
     pub fn for_url_no_build(&self, url: &str) -> &reqwest::Client {
-        &self.cached_for_url_no_build(url).client
+        if let Some(origin) = OriginKey::from_request_url(url)
+            && let Some(cached) = self.eager.get(&origin)
+        {
+            return &cached.client;
+        }
+        self.default.general()
     }
 
     /// Identity fingerprint for the client that would handle a request
@@ -377,13 +365,9 @@ impl HttpClients {
 
     async fn for_url_pool(&self, url: &str, pool: ClientPool) -> Result<reqwest::Client, LpmError> {
         let Some(origin) = OriginKey::from_request_url(url) else {
-            return Ok(self.select_pool_client(self.default.get(), pool));
+            return Ok(self.default.select(pool));
         };
         self.for_origin_pool(&origin, pool).await
-    }
-
-    fn select_pool_client(&self, cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
-        select_pool(cached, pool)
     }
 
     async fn for_origin_pool(
@@ -396,7 +380,7 @@ impl HttpClients {
             return Ok(select(c));
         }
         let Some(per_origin_tls) = self.tls_overrides.per_origin.get(origin) else {
-            return Ok(select(self.default.get()));
+            return Ok(self.default.select(pool));
         };
         let preloaded_cert_pem = match self.lazy_identity_material(origin) {
             Some(Ok(material)) => Some(Arc::clone(&material.cert_pem)),
@@ -468,7 +452,7 @@ impl lpm_auth::RefreshClientSource for HttpClients {
     }
 }
 
-fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
+pub(super) fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
     match pool {
         ClientPool::General => cached.client.clone(),
         ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),

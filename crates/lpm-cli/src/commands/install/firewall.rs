@@ -1,14 +1,18 @@
 use super::*;
 use lpm_registry::client::{
     AuthPosture, NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse,
-    NpmFirewallClientTiming, NpmFirewallDecision, NpmFirewallDiagnostics,
-    NpmFirewallFlaggedPackageIndexDiagnostics, NpmFirewallPolicyProfile,
+    NpmFirewallCacheDirective, NpmFirewallClientTiming, NpmFirewallDecision,
+    NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics, NpmFirewallPolicyProfile,
 };
 
 pub(super) use crate::npm_firewall_config::NpmFirewallMode;
 
 const ENV_EXPERIMENT_NPM_FIREWALL_LOOKUP: &str = "LPM_EXPERIMENT_NPM_FIREWALL_LOOKUP";
 const ENV_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE: &str = "LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE";
+const ENV_NPM_FIREWALL_CACHE: &str = "LPM_NPM_FIREWALL_CACHE";
+const DEFAULT_MONITOR_VERDICT_CACHE_TTL_SECS: u64 = 300;
+const MAX_MONITOR_VERDICT_CACHE_ENTRIES: usize = 10_000;
+const MAX_MONITOR_VERDICT_CACHE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(super) const DEFAULT_NPM_FIREWALL_CHUNK_SIZE: usize = 64;
 const NPM_FIREWALL_OFFLINE_HINT: &str = "npm firewall verdict preflight requires network access; set [firewall].mode = \"off\" or run online";
 
@@ -212,6 +216,7 @@ pub(super) struct NpmFirewallPreflightStats {
     pub(super) block_count: u64,
     pub(super) unknown_count: u64,
     pub(super) matched_count: u64,
+    pub(super) cache_hit_count: u64,
     pub(super) rpc_failed: bool,
     pub(super) offline_skipped: bool,
     pub(super) worker_diagnostics: Option<NpmFirewallDiagnostics>,
@@ -284,6 +289,9 @@ impl NpmFirewallPreflightStats {
             "rpc_failed": self.rpc_failed,
             "offline_skipped": self.offline_skipped,
         });
+        if self.mode.is_enabled() || self.cache_hit_count > 0 {
+            json["cache_hit_count"] = serde_json::json!(self.cache_hit_count);
+        }
         if let Some(diagnostics) = &self.worker_diagnostics {
             json["worker"] = serde_json::to_value(diagnostics).unwrap_or(serde_json::Value::Null);
         }
@@ -864,6 +872,247 @@ async fn release_firewall_events(
     }
 }
 
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct MonitorVerdictCacheEntry {
+    expires_at: u64,
+    #[serde(default)]
+    unknown: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MonitorVerdictCacheFile {
+    version: u8,
+    entries: HashMap<String, MonitorVerdictCacheEntry>,
+}
+
+const MONITOR_VERDICT_CACHE_VERSION: u8 = 2;
+
+fn monitor_verdict_cache_enabled_with_env(
+    mode: NpmFirewallMode,
+    force: bool,
+    offline: bool,
+    env_value: Option<&str>,
+) -> bool {
+    if !matches!(mode, NpmFirewallMode::Monitor) || force || offline {
+        return false;
+    }
+    !env_value.is_some_and(|raw| {
+        let trimmed = raw.trim();
+        trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("0")
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed.eq_ignore_ascii_case("no")
+    })
+}
+
+fn monitor_verdict_cache_enabled(mode: NpmFirewallMode, force: bool, offline: bool) -> bool {
+    let env_value = std::env::var(ENV_NPM_FIREWALL_CACHE).ok();
+    monitor_verdict_cache_enabled_with_env(mode, force, offline, env_value.as_deref())
+}
+
+fn monitor_verdict_cache_dir(client: &RegistryClient) -> Option<PathBuf> {
+    let cache_dir = client.cache_dir()?;
+    if cache_dir.file_name() == Some(std::ffi::OsStr::new("metadata")) {
+        Some(cache_dir.with_file_name("firewall-verdicts"))
+    } else {
+        Some(cache_dir.join("firewall-verdicts"))
+    }
+}
+
+fn monitor_verdict_cache_path(
+    client: &RegistryClient,
+    mode: NpmFirewallMode,
+    lookup_mode: NpmFirewallLookupMode,
+    policy_profile: NpmFirewallPolicyProfile,
+) -> Result<Option<PathBuf>, LpmError> {
+    use sha2::Digest as _;
+
+    let Some(dir) = monitor_verdict_cache_dir(client) else {
+        return Ok(None);
+    };
+    let auth_fp = client.firewall_auth_identity_fingerprint(mode.auth_posture())?;
+    let policy_bytes = serde_json::to_vec(&policy_profile).unwrap_or_default();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"lpm-firewall-verdict-cache-v1\0");
+    hasher.update(client.base_url().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(lookup_mode.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(auth_fp.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&policy_bytes);
+    let digest = hasher.finalize();
+    let mut filename = String::with_capacity(37);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut filename, "{byte:02x}");
+    }
+    filename.push_str(".json");
+    Ok(Some(dir.join(filename)))
+}
+
+fn monitor_verdict_entry_key(
+    pkg: &NpmFirewallBatchPackage,
+    lookup_mode: NpmFirewallLookupMode,
+) -> String {
+    match lookup_mode {
+        NpmFirewallLookupMode::PackageOnly => {
+            let mut key = String::with_capacity(pkg.name.len() + 1 + pkg.version.len());
+            key.push_str(&pkg.name);
+            key.push('\0');
+            key.push_str(&pkg.version);
+            key
+        }
+        NpmFirewallLookupMode::PackageAndIntegrity => {
+            let integrity = pkg.integrity.as_deref().unwrap_or("");
+            let mut key =
+                String::with_capacity(pkg.name.len() + 2 + pkg.version.len() + integrity.len());
+            key.push_str(&pkg.name);
+            key.push('\0');
+            key.push_str(&pkg.version);
+            key.push('\0');
+            key.push_str(integrity);
+            key
+        }
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn read_monitor_verdict_cache(
+    path: &Path,
+    now_secs: u64,
+) -> HashMap<String, MonitorVerdictCacheEntry> {
+    let Ok(raw) =
+        lpm_common::read_text_file_capped_nofollow(path, MAX_MONITOR_VERDICT_CACHE_FILE_BYTES)
+    else {
+        return HashMap::new();
+    };
+    let Ok(mut parsed) = serde_json::from_str::<MonitorVerdictCacheFile>(&raw) else {
+        return HashMap::new();
+    };
+    if parsed.version != MONITOR_VERDICT_CACHE_VERSION {
+        return HashMap::new();
+    }
+    parsed
+        .entries
+        .retain(|_, entry| entry.expires_at > now_secs);
+    parsed.entries
+}
+
+fn effective_monitor_verdict_ttl_secs(directive: NpmFirewallCacheDirective) -> Option<u64> {
+    match directive {
+        NpmFirewallCacheDirective::NoStore => None,
+        NpmFirewallCacheDirective::Store { max_age_secs: 0 } => None,
+        NpmFirewallCacheDirective::Store { max_age_secs } => {
+            Some(max_age_secs.min(DEFAULT_MONITOR_VERDICT_CACHE_TTL_SECS))
+        }
+        NpmFirewallCacheDirective::Unspecified => Some(DEFAULT_MONITOR_VERDICT_CACHE_TTL_SECS),
+    }
+}
+
+fn write_monitor_verdict_cache(
+    path: &Path,
+    mut entries: HashMap<String, MonitorVerdictCacheEntry>,
+    now_secs: u64,
+) {
+    entries.retain(|_, entry| entry.expires_at > now_secs);
+    if entries.len() > MAX_MONITOR_VERDICT_CACHE_ENTRIES {
+        let mut by_expiry: Vec<(u64, String, MonitorVerdictCacheEntry)> = entries
+            .into_iter()
+            .map(|(key, entry)| (entry.expires_at, key, entry))
+            .collect();
+        by_expiry.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+        by_expiry.truncate(MAX_MONITOR_VERDICT_CACHE_ENTRIES);
+        entries = by_expiry
+            .into_iter()
+            .map(|(_, key, entry)| (key, entry))
+            .collect();
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        tracing::debug!(%error, "failed to create firewall verdict cache directory");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let payload = MonitorVerdictCacheFile {
+        version: MONITOR_VERDICT_CACHE_VERSION,
+        entries,
+    };
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    let options = lpm_common::atomic_write::AtomicWriteOptions::new().owner_only();
+    if let Err(error) =
+        lpm_common::atomic_write::write_file_atomic_with_options(path, &bytes, options)
+    {
+        tracing::debug!(%error, "failed to persist firewall monitor verdict cache");
+    }
+}
+
+fn cache_clean_allow_verdicts(
+    path: &Path,
+    mut existing_entries: HashMap<String, MonitorVerdictCacheEntry>,
+    uncached: &[NpmFirewallBatchPackage],
+    response: &NpmFirewallBatchResponse,
+    lookup_mode: NpmFirewallLookupMode,
+    now_secs: u64,
+) {
+    let Some(ttl_secs) = effective_monitor_verdict_ttl_secs(response.cache_directive) else {
+        return;
+    };
+    if response.summary.allow == 0
+        || response.summary.total != uncached.len() as u64
+        || response
+            .summary
+            .allow
+            .saturating_add(response.summary.warn)
+            .saturating_add(response.summary.block)
+            != response.summary.total
+    {
+        return;
+    }
+    let non_allow: HashSet<(&str, &str)> = response
+        .decisions
+        .iter()
+        .filter(|decision| decision.action != NpmFirewallAction::Allow)
+        .map(|decision| (decision.name.as_str(), decision.version.as_str()))
+        .collect();
+    // Fail closed if the server reported warns/blocks without enumerating them.
+    if (response.summary.warn > 0 || response.summary.block > 0) && non_allow.is_empty() {
+        return;
+    }
+    let all_allows_unmatched = response.summary.unknown >= response.summary.allow;
+    let expires_at = now_secs.saturating_add(ttl_secs);
+    let mut added = 0usize;
+    for package in uncached {
+        if non_allow.contains(&(package.name.as_str(), package.version.as_str())) {
+            continue;
+        }
+        existing_entries.insert(
+            monitor_verdict_entry_key(package, lookup_mode),
+            MonitorVerdictCacheEntry {
+                expires_at,
+                unknown: all_allows_unmatched,
+            },
+        );
+        added += 1;
+    }
+    if added > 0 {
+        write_monitor_verdict_cache(path, existing_entries, now_secs);
+    }
+}
+
 pub(super) async fn request_npm_firewall_preflight(
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
@@ -871,6 +1120,27 @@ pub(super) async fn request_npm_firewall_preflight(
     client: Arc<RegistryClient>,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
     offline: bool,
+) -> Result<NpmFirewallPreflightResult, LpmError> {
+    request_npm_firewall_preflight_with_force(
+        mode,
+        lookup_mode,
+        policy_profile,
+        client,
+        verdict_packages,
+        offline,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn request_npm_firewall_preflight_with_force(
+    mode: NpmFirewallMode,
+    lookup_mode: NpmFirewallLookupMode,
+    policy_profile: NpmFirewallPolicyProfile,
+    client: Arc<RegistryClient>,
+    verdict_packages: Vec<NpmFirewallBatchPackage>,
+    offline: bool,
+    force: bool,
 ) -> Result<NpmFirewallPreflightResult, LpmError> {
     let mut stats = NpmFirewallPreflightStats::for_mode(mode, lookup_mode);
     if !mode.is_enabled() {
@@ -903,8 +1173,62 @@ pub(super) async fn request_npm_firewall_preflight(
 
     let client = NpmFirewallPreflightClient::new(client);
     let started = Instant::now();
+    let use_cache = monitor_verdict_cache_enabled(mode, force, offline);
+    let now_secs = if use_cache { current_unix_secs() } else { 0 };
+    let mut cache_state: Option<(PathBuf, HashMap<String, MonitorVerdictCacheEntry>)> = None;
+    let packages_to_check: Vec<NpmFirewallBatchPackage> = if use_cache {
+        let effective_client = client.for_mode(mode).await.ok();
+        let cache_path = effective_client
+            .as_deref()
+            .filter(|resolved| {
+                resolved
+                    .has_bearer_for_posture(mode.auth_posture())
+                    .unwrap_or(false)
+            })
+            .and_then(|resolved| {
+                monitor_verdict_cache_path(resolved, mode, lookup_mode, policy_profile)
+                    .ok()
+                    .flatten()
+            });
+        if let Some(path) = cache_path {
+            let entries = read_monitor_verdict_cache(&path, now_secs);
+            let mut uncached = Vec::new();
+            let mut hits = 0u64;
+            let mut unknown_hits = 0u64;
+            for package in verdict_packages {
+                let key = monitor_verdict_entry_key(&package, lookup_mode);
+                if let Some(entry) = entries.get(&key).filter(|entry| entry.expires_at > now_secs) {
+                    hits = hits.saturating_add(1);
+                    if entry.unknown {
+                        unknown_hits = unknown_hits.saturating_add(1);
+                    }
+                } else {
+                    uncached.push(package);
+                }
+            }
+            stats.cache_hit_count = hits;
+            stats.allow_count = stats.allow_count.saturating_add(hits);
+            stats.unknown_count = stats.unknown_count.saturating_add(unknown_hits);
+            cache_state = Some((path, entries));
+            uncached
+        } else {
+            verdict_packages
+        }
+    } else {
+        verdict_packages
+    };
+
+    if packages_to_check.is_empty() {
+        stats.batch_ms = started.elapsed().as_millis();
+        return Ok(NpmFirewallPreflightResult {
+            stats,
+            decisions: Vec::new(),
+            report_error: None,
+        });
+    }
+
     let response = match client
-        .batch_verdicts(mode, policy_profile, &verdict_packages)
+        .batch_verdicts(mode, policy_profile, &packages_to_check)
         .await
     {
         Ok(response) => response,
@@ -923,12 +1247,23 @@ pub(super) async fn request_npm_firewall_preflight(
     };
     stats.batch_ms = started.elapsed().as_millis();
     stats.record_response(&response, stats.batch_ms);
+    if let Some((path, entries)) = cache_state {
+        cache_clean_allow_verdicts(
+            &path,
+            entries,
+            &packages_to_check,
+            &response,
+            lookup_mode,
+            now_secs,
+        );
+    }
     tracing::debug!(
         target = "lpm::firewall",
         package_count = response.summary.total,
         matched = response.summary.matched,
         warn = response.summary.warn,
         block = response.summary.block,
+        cache_hits = stats.cache_hit_count,
         elapsed_ms = stats.batch_ms,
         request_id = %response.request_id,
         policy_mode = %response.policy_mode,
@@ -972,19 +1307,21 @@ pub(super) fn spawn_npm_firewall_preflight(
         route_table,
         packages,
         offline,
+        force,
         json_output: _,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
     let client = Arc::clone(client);
     NpmFirewallPreflightJoin {
-        handle: Some(tokio::spawn(request_npm_firewall_preflight(
+        handle: Some(tokio::spawn(request_npm_firewall_preflight_with_force(
             mode,
             lookup_mode,
             policy_profile,
             client,
             verdict_packages,
             offline,
+            force,
         ))),
     }
 }
@@ -1065,17 +1402,19 @@ pub(super) async fn run_npm_firewall_preflight(
         route_table,
         packages,
         offline,
+        force,
         json_output,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
-    let result = request_npm_firewall_preflight(
+    let result = request_npm_firewall_preflight_with_force(
         mode,
         lookup_mode,
         policy_profile,
         Arc::clone(client),
         verdict_packages,
         offline,
+        force,
     )
     .await?;
     finish_npm_firewall_preflight(result, json_output)
@@ -1089,6 +1428,7 @@ pub(super) struct NpmFirewallPreflightRequest<'a> {
     pub(super) route_table: &'a RouteTable,
     pub(super) packages: &'a [InstallPackage],
     pub(super) offline: bool,
+    pub(super) force: bool,
     pub(super) json_output: bool,
 }
 

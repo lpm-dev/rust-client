@@ -285,7 +285,7 @@ fn http_clients_eager_hit_overrides_default() {
         "eager origin must dispatch to its registered client"
     );
     assert!(
-        std::ptr::eq(other, &client.http.default.get().client),
+        std::ptr::eq(other, client.http.default.general()),
         "non-eager origin must dispatch to default"
     );
 }
@@ -561,7 +561,7 @@ fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
         .for_url_no_build("https://host.internal:8443/bar");
     let stored = &client.http.eager.get(&key_no_port).unwrap().client;
     assert!(std::ptr::eq(picked_443, stored));
-    assert!(std::ptr::eq(picked_8443, &client.http.default.get().client));
+    assert!(std::ptr::eq(picked_8443, client.http.default.general()));
 }
 
 #[tokio::test]
