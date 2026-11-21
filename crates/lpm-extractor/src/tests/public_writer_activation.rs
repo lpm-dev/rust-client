@@ -164,8 +164,7 @@ fn public_digest_routes_preserve_contents_with_supported_writer_activation() {
             assert_eq!(
                 activations.load(Ordering::Relaxed),
                 usize::from(
-                    route != "streaming"
-                        && file_count > 256
+                    (route == "pipelined-file" || (route != "streaming" && file_count > 256))
                         && std::env::var("LPM_INTERNAL_EXTRACT_WRITERS").as_deref() != Ok("0")
                         && crate::writers::writer_pool_capacity() > 0
                 ),

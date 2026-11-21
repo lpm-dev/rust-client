@@ -12,6 +12,14 @@ const _: () = assert!(MAX_METADATA_BYTES <= 64 * 1024 * 1024);
 pub(super) const MAX_VERSION_METADATA_BYTES: usize = 4 * 1024 * 1024;
 // Keep small responses inline; large packuments can monopolize an async worker.
 pub(super) const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
+// Bound simultaneous multi-MB packument deserializations to keep cold-install peak RSS in check.
+const LARGE_METADATA_PARSE_THRESHOLD: usize = 512 * 1024;
+const LARGE_METADATA_PARSE_CONCURRENCY: usize = 2;
+
+fn large_metadata_parse_limiter() -> &'static tokio::sync::Semaphore {
+    static LIMITER: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(LARGE_METADATA_PARSE_CONCURRENCY))
+}
 
 /// Hard cap for non-metadata API responses (whoami, token check,
 /// quality/skills, tunnel domain ops, publish ack, error bodies).
@@ -177,6 +185,11 @@ where
         return (parsed, timings);
     }
 
+    let _large_parse_permit = if buf.len() >= LARGE_METADATA_PARSE_THRESHOLD {
+        large_metadata_parse_limiter().acquire().await.ok()
+    } else {
+        None
+    };
     let context_owned = context.to_string();
     let span =
         tracing::trace_span!(target: "lpm_install_timeline", "metadata_parse", blocking = true);
