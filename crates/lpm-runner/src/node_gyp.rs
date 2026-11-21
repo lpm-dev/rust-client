@@ -82,17 +82,21 @@ impl NpmNodeGyp {
         // Node can't start a script named with the prefix a resolved path
         // carries on Windows.
         let script = lpm_common::symlink::windows_plain_path(&script);
+        #[derive(serde::Deserialize)]
+        struct NodeGypManifest {
+            version: Option<String>,
+        }
+
         let manifest = lpm_common::read_file_capped(
             &package.join("package.json"),
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         )
         .ok()?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+        let manifest: NodeGypManifest = serde_json::from_slice(&manifest).ok()?;
         // The version goes into a command file as a comment, so it keeps
         // only what a version is written with.
         let version: String = manifest
-            .get("version")?
-            .as_str()?
+            .version?
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
             .take(64)

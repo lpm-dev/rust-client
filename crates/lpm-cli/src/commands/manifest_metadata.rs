@@ -116,9 +116,9 @@ pub(crate) fn read_installed_manifest_metadata(
             lockfile,
         );
         let installed_paths = installed_package_paths(project_dir, lockfile, &indexes, &roots)?;
-        let mut metadata_by_package = BTreeMap::new();
-        let mut platform_skipped_packages = BTreeSet::new();
-        for (package, &platform_skipped) in packages.iter().zip(&platform_skip_flags) {
+        let manifest_cache = ManifestReadCache::new();
+
+        let resolve_one = |package: &LockedPackage, platform_skipped: bool| -> Result<PackageManifestOutcome, LpmError> {
             let package_key = package_metadata_key(package);
             if let Some(path) = installed_paths.get(&package_key) {
                 if let Some(baseline) = baseline_index.lookup_by_package_dir(path)
@@ -133,10 +133,9 @@ pub(crate) fn read_installed_manifest_metadata(
                     )));
                 }
                 let manifest = path.join("package.json");
-                match read_matching_manifest_metadata(&manifest, package)? {
+                match read_matching_manifest_metadata_cached(&manifest, package, &manifest_cache)? {
                     ManifestProbe::Match(metadata) => {
-                        metadata_by_package.insert(package_key, metadata);
-                        continue;
+                        return Ok(PackageManifestOutcome::Metadata(package_key, metadata));
                     }
                     ManifestProbe::Missing | ManifestProbe::DifferentPackage { .. } => {
                         if store_version.uses_virtual_store() {
@@ -159,23 +158,24 @@ pub(crate) fn read_installed_manifest_metadata(
                 });
             if let Some(baseline) = virtual_baseline {
                 let manifest_path = baseline.package_dir.join("package.json");
-                let metadata = read_required_manifest_metadata(&manifest_path, package)?;
-                metadata_by_package.insert(package_key, metadata);
-                continue;
+                let metadata = read_required_manifest_metadata_cached(
+                    &manifest_path,
+                    package,
+                    &manifest_cache,
+                )?;
+                return Ok(PackageManifestOutcome::Metadata(package_key, metadata));
             }
 
             if package.instance_id.is_some() && store_version.uses_virtual_store() {
                 if platform_skipped {
-                    platform_skipped_packages.insert(package_key);
-                    continue;
+                    return Ok(PackageManifestOutcome::PlatformSkipped(package_key));
                 }
                 return Err(missing_installed_manifest(package, None));
             }
             let project_manifest = node_modules_package_json(project_dir, &package.name);
-            match read_matching_manifest_metadata(&project_manifest, package)? {
+            match read_matching_manifest_metadata_cached(&project_manifest, package, &manifest_cache)? {
                 ManifestProbe::Match(metadata) => {
-                    metadata_by_package.insert(package_key, metadata);
-                    continue;
+                    return Ok(PackageManifestOutcome::Metadata(package_key, metadata));
                 }
                 ManifestProbe::Missing | ManifestProbe::DifferentPackage { .. } => {}
             }
@@ -191,23 +191,85 @@ pub(crate) fn read_installed_manifest_metadata(
                     )
             {
                 let manifest_path = baseline.package_dir.join("package.json");
-                let metadata = read_required_manifest_metadata(&manifest_path, package)?;
-                metadata_by_package.insert(package_key, metadata);
-                continue;
+                let metadata = read_required_manifest_metadata_cached(
+                    &manifest_path,
+                    package,
+                    &manifest_cache,
+                )?;
+                return Ok(PackageManifestOutcome::Metadata(package_key, metadata));
             }
 
             if platform_skipped {
-                platform_skipped_packages.insert(package_key);
-                continue;
+                return Ok(PackageManifestOutcome::PlatformSkipped(package_key));
             }
 
-            return Err(missing_installed_manifest(package, None));
+            Err(missing_installed_manifest(package, None))
+        };
+
+        let outcomes: Vec<Result<PackageManifestOutcome, LpmError>> = if packages.len() >= 4 {
+            use rayon::prelude::*;
+            packages
+                .par_iter()
+                .zip(platform_skip_flags.par_iter())
+                .map(|(package, &platform_skipped)| resolve_one(package, platform_skipped))
+                .collect()
+        } else {
+            packages
+                .iter()
+                .zip(&platform_skip_flags)
+                .map(|(package, &platform_skipped)| resolve_one(package, platform_skipped))
+                .collect()
+        };
+
+        let mut metadata_by_package = BTreeMap::new();
+        let mut platform_skipped_packages = BTreeSet::new();
+        for outcome in outcomes {
+            match outcome? {
+                PackageManifestOutcome::Metadata(key, metadata) => {
+                    metadata_by_package.insert(key, metadata);
+                }
+                PackageManifestOutcome::PlatformSkipped(key) => {
+                    platform_skipped_packages.insert(key);
+                }
+            }
         }
         Ok(InstalledManifestInventory {
             metadata_by_package,
             platform_skipped_packages,
         })
     })
+}
+
+enum PackageManifestOutcome {
+    Metadata(String, ManifestMetadata),
+    PlatformSkipped(String),
+}
+
+#[derive(Clone)]
+struct ParsedManifestEntry {
+    name: Option<String>,
+    version: Option<String>,
+    metadata: ManifestMetadata,
+}
+
+#[derive(serde::Deserialize)]
+struct RawManifestFields {
+    #[serde(default)]
+    name: Option<Value>,
+    #[serde(default)]
+    version: Option<Value>,
+    #[serde(default)]
+    description: Option<Value>,
+    #[serde(default)]
+    homepage: Option<Value>,
+    #[serde(default)]
+    repository: Option<Value>,
+    #[serde(default)]
+    author: Option<Value>,
+    #[serde(default)]
+    license: Option<Value>,
+    #[serde(default)]
+    licenses: Option<Value>,
 }
 
 enum ManifestProbe {
@@ -219,11 +281,15 @@ enum ManifestProbe {
     },
 }
 
-fn read_required_manifest_metadata(
+type ManifestReadCell = std::sync::OnceLock<Result<Option<ParsedManifestEntry>, String>>;
+type ManifestReadCache = dashmap::DashMap<PathBuf, std::sync::Arc<ManifestReadCell>>;
+
+fn read_required_manifest_metadata_cached(
     path: &Path,
     package: &LockedPackage,
+    cache: &ManifestReadCache,
 ) -> Result<ManifestMetadata, LpmError> {
-    match read_matching_manifest_metadata(path, package)? {
+    match read_matching_manifest_metadata_cached(path, package, cache)? {
         ManifestProbe::Match(metadata) => Ok(metadata),
         ManifestProbe::Missing => Err(missing_installed_manifest(package, Some(path))),
         ManifestProbe::DifferentPackage { name, version } => Err(mismatched_installed_manifest(
@@ -235,45 +301,105 @@ fn read_required_manifest_metadata(
     }
 }
 
-fn read_matching_manifest_metadata(
+fn read_matching_manifest_metadata_cached(
     path: &Path,
     package: &LockedPackage,
+    cache: &ManifestReadCache,
 ) -> Result<ManifestProbe, LpmError> {
+    let slot = cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::OnceLock::new()))
+        .clone();
+    let parsed = slot.get_or_init(|| read_parsed_manifest_entry(path));
+    match parsed {
+        Ok(None) => Ok(ManifestProbe::Missing),
+        Ok(Some(entry)) => {
+            if entry.name.as_deref() == Some(package.name.as_str())
+                && entry.version.as_deref() == Some(package.version.as_str())
+            {
+                Ok(ManifestProbe::Match(entry.metadata.clone()))
+            } else {
+                Ok(ManifestProbe::DifferentPackage {
+                    name: entry.name.clone(),
+                    version: entry.version.clone(),
+                })
+            }
+        }
+        Err(message) => Err(LpmError::Store(message.clone())),
+    }
+}
+
+fn read_parsed_manifest_entry(path: &Path) -> Result<Option<ParsedManifestEntry>, String> {
     let content = match lpm_common::read_text_regular_file_capped_with_metadata(
         path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) {
         Ok((content, _)) => content,
-        Err(BoundedReadError::NotFound { .. }) => return Ok(ManifestProbe::Missing),
+        Err(BoundedReadError::NotFound { .. }) => return Ok(None),
         Err(error) => {
-            return Err(LpmError::Store(format!(
-                "failed to read installed package manifest: {error}"
-            )));
+            return Err(format!("failed to read installed package manifest: {error}"));
         }
     };
-    let value: Value =
-        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
-            LpmError::Store(format!(
+    let trimmed = lpm_common::strip_utf8_bom_str(&content).trim_start();
+    if !trimmed.starts_with('{') {
+        let _: serde::de::IgnoredAny = serde_json::from_str(trimmed).map_err(|error| {
+            format!(
                 "failed to parse installed package manifest {}: {error}",
                 path.display()
-            ))
+            )
         })?;
-    if manifest_matches_package(&value, package) {
-        Ok(ManifestProbe::Match(extract_manifest_metadata(&value)))
-    } else {
-        Ok(ManifestProbe::DifferentPackage {
-            name: value.get("name").and_then(Value::as_str).map(str::to_owned),
-            version: value
-                .get("version")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
+        return Ok(Some(ParsedManifestEntry {
+            name: None,
+            version: None,
+            metadata: ManifestMetadata::default(),
+        }));
     }
-}
-
-fn manifest_matches_package(value: &Value, package: &LockedPackage) -> bool {
-    value.get("name").and_then(Value::as_str) == Some(package.name.as_str())
-        && value.get("version").and_then(Value::as_str) == Some(package.version.as_str())
+    let fields: RawManifestFields = serde_json::from_str(trimmed).map_err(|error| {
+        format!(
+            "failed to parse installed package manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    let name = fields.name.as_ref().and_then(Value::as_str).map(str::to_owned);
+    let version = fields
+        .version
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let description = fields
+        .description
+        .as_ref()
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let homepage = fields
+        .homepage
+        .as_ref()
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let repository = fields.repository.as_ref().and_then(extract_urlish);
+    let author = fields.author.as_ref().and_then(extract_author);
+    let mut licenses = Vec::new();
+    if let Some(license) = fields.license.as_ref() {
+        collect_licenses(license, &mut licenses);
+    }
+    if let Some(license) = fields.licenses.as_ref() {
+        collect_licenses(license, &mut licenses);
+    }
+    licenses.sort();
+    licenses.dedup();
+    Ok(Some(ParsedManifestEntry {
+        name,
+        version,
+        metadata: ManifestMetadata {
+            description,
+            licenses,
+            homepage,
+            repository,
+            author,
+        },
+    }))
 }
 
 pub(crate) fn package_metadata_key(package: &LockedPackage) -> String {

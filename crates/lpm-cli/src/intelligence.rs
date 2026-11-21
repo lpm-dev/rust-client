@@ -504,6 +504,10 @@ fn scan_file(
     drop(parsed);
     state.parser_allocator.reset();
 
+    if found.is_empty() {
+        return Ok(());
+    }
+
     let line_index = LineIndex::new(&content);
     for (offset, specifier, type_reference) in found {
         record_source_import(

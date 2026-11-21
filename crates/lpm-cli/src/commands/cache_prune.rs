@@ -1309,21 +1309,32 @@ fn compute_prune(
 
     let mut bytes_freed_or_eligible = 0u64;
     if build_full_plan && !flags.apply {
-        for dir in &link_entries_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-        }
-        for dir in &object_entries_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-        }
-        for dir in &compat_islands_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-        }
-        for dir in &build_artifacts_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+        let total_orphan_dirs = link_entries_orphaned.len()
+            + object_entries_orphaned.len()
+            + compat_islands_orphaned.len()
+            + build_artifacts_orphaned.len();
+        if total_orphan_dirs >= 4 {
+            use rayon::prelude::*;
+            bytes_freed_or_eligible = [&link_entries_orphaned,
+                &object_entries_orphaned,
+                &compat_islands_orphaned,
+                &build_artifacts_orphaned]
+            .into_iter()
+            .flat_map(|dirs| dirs.iter())
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|dir| dir_size(dir).unwrap_or(0))
+            .reduce(|| 0u64, u64::saturating_add);
+        } else {
+            for dir in link_entries_orphaned
+                .iter()
+                .chain(&object_entries_orphaned)
+                .chain(&compat_islands_orphaned)
+                .chain(&build_artifacts_orphaned)
+            {
+                bytes_freed_or_eligible =
+                    bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+            }
         }
     }
 
@@ -1499,10 +1510,14 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let meta = std::fs::symlink_metadata(entry.path())?;
-        if meta.is_file() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_file() {
+            let meta = entry.metadata()?;
             total = total.saturating_add(meta.len());
-        } else if meta.is_dir() {
+        } else if file_type.is_dir() {
             total = total.saturating_add(dir_size(&entry.path())?);
         }
     }

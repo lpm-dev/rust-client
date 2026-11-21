@@ -405,7 +405,7 @@ fn capture_filesystem_validation(
             root.display()
         ))
     })?;
-    let fingerprint = compute_validation_fingerprint(&root, &fixed_names, &globs)?;
+    let fingerprint = compute_validation_fingerprint_canonical(&root, &fixed_names, &globs)?;
     Ok(FilesystemValidation {
         root,
         fixed_names,
@@ -425,9 +425,17 @@ fn compute_validation_fingerprint(
             root.display()
         ))
     })?;
+    compute_validation_fingerprint_canonical(&canonical_root, fixed_names, globs)
+}
+
+fn compute_validation_fingerprint_canonical(
+    canonical_root: &Path,
+    fixed_names: &[String],
+    globs: &[String],
+) -> Result<[u8; 32], LpmError> {
     let mut hasher = Sha256::new();
     hash_record(&mut hasher, 0, &[b"task-filesystem-validation-v1"]);
-    hash_validation_path(&mut hasher, b"root", &canonical_root, true)?;
+    hash_validation_path(&mut hasher, b"root", canonical_root, true)?;
 
     for name in fixed_names {
         let path = canonical_root.join(name);
@@ -455,7 +463,7 @@ fn compute_validation_fingerprint(
             )));
         }
         for expanded in expand_glob(pattern) {
-            for_each_cache_glob_match(&canonical_root, &expanded, |relative| {
+            for_each_cache_glob_match(canonical_root, &expanded, |relative| {
                 entries.insert(relative);
                 Ok(())
             })?;
@@ -499,7 +507,7 @@ fn compute_validation_fingerprint(
         } else {
             path.clone()
         };
-        let resolved_relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+        let resolved_relative = resolved.strip_prefix(canonical_root).map_err(|_| {
             LpmError::Task(format!(
                 "task cache validation path resolves outside project: {}",
                 path.display()
@@ -842,7 +850,15 @@ fn collect_input_files(
     project_dir: &Path,
     globs: &[String],
 ) -> Result<Vec<(PathBuf, String)>, LpmError> {
-    let mut files = Vec::new();
+    struct InputCandidate {
+        relative: PathBuf,
+        entry: PathBuf,
+        resolved_relative: PathBuf,
+        metadata: std::fs::Metadata,
+        unlinked: bool,
+    }
+
+    let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let canonical_project = project_dir.canonicalize().map_err(|error| {
         LpmError::Task(format!(
@@ -850,9 +866,7 @@ fn collect_input_files(
             project_dir.display()
         ))
     })?;
-    let project = Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority())?;
     let mut links = ComponentLinks::default();
-    let mut directories = InputDirectories::default();
 
     for pattern in globs {
         if !crate::cache::validate_glob_pattern(pattern) {
@@ -861,14 +875,11 @@ fn collect_input_files(
             )));
         }
 
-        // "src/**" → also match "src/**/*" for files at any depth
         let patterns = expand_glob(pattern);
 
         for pat in &patterns {
             for_each_cache_glob_match(&canonical_project, pat, |relative| {
                 let entry = canonical_project.join(&relative);
-                // A path below the canonical root with no linked component
-                // is its own canonical form, and its lstat is its stat.
                 let unlinked_metadata = links.unlinked_metadata(&canonical_project, &relative)?;
                 let unlinked = unlinked_metadata.is_some();
                 let (resolved, metadata) = match unlinked_metadata {
@@ -895,37 +906,86 @@ fn collect_input_files(
                 }
                 if seen.insert(relative.clone()) {
                     let resolved_relative =
-                        resolved.strip_prefix(&canonical_project).map_err(|_| {
-                            LpmError::Task(format!(
-                                "task cache input resolves outside project: {}",
-                                entry.display()
-                            ))
-                        })?;
-                    let mut file = directories.open_file(&project, resolved_relative)?;
-                    let content_hash = file_content_hash(&mut file).map_err(|error| {
-                        LpmError::Task(format!(
-                            "failed to hash task cache input {}: {error}",
-                            entry.display()
-                        ))
-                    })?;
-                    let identity_hash = if unlinked {
-                        hash_unlinked_input_identity(&metadata, &content_hash)
-                    } else {
-                        hash_input_path_identity(
-                            &canonical_project,
-                            &relative,
-                            &metadata,
-                            &content_hash,
-                        )?
-                    };
-                    files.push((relative, identity_hash));
+                        resolved
+                            .strip_prefix(&canonical_project)
+                            .map_err(|_| {
+                                LpmError::Task(format!(
+                                    "task cache input resolves outside project: {}",
+                                    entry.display()
+                                ))
+                            })?
+                            .to_path_buf();
+                    candidates.push(InputCandidate {
+                        relative,
+                        entry,
+                        resolved_relative,
+                        metadata,
+                        unlinked,
+                    });
                 }
                 Ok(())
             })?;
         }
     }
 
-    // Sort for deterministic ordering
+    let hash_candidate = |project: &Dir,
+                          directories: &mut InputDirectories,
+                          candidate: InputCandidate|
+     -> Result<(PathBuf, String), LpmError> {
+        let mut file = directories.open_file(project, &candidate.resolved_relative)?;
+        let content_hash = file_content_hash(&mut file).map_err(|error| {
+            LpmError::Task(format!(
+                "failed to hash task cache input {}: {error}",
+                candidate.entry.display()
+            ))
+        })?;
+        let identity_hash = if candidate.unlinked {
+            hash_unlinked_input_identity(&candidate.metadata, &content_hash)
+        } else {
+            hash_input_path_identity(
+                &canonical_project,
+                &candidate.relative,
+                &candidate.metadata,
+                &content_hash,
+            )?
+        };
+        Ok((candidate.relative, identity_hash))
+    };
+
+    let mut files: Vec<(PathBuf, String)> = if candidates.len() >= 8 {
+        use rayon::prelude::*;
+        let results: Vec<Result<(PathBuf, String), LpmError>> = candidates
+            .into_par_iter()
+            .map_init(
+                || {
+                    (
+                        Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority()),
+                        InputDirectories::default(),
+                    )
+                },
+                |(project_res, directories), candidate| {
+                    let project = match project_res {
+                        Ok(dir) => dir,
+                        Err(error) => return Err(LpmError::Io(std::io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        ))),
+                    };
+                    hash_candidate(project, directories, candidate)
+                },
+            )
+            .collect();
+        results.into_iter().collect::<Result<Vec<_>, _>>()?
+    } else {
+        let project = Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority())?;
+        let mut directories = InputDirectories::default();
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            out.push(hash_candidate(&project, &mut directories, candidate)?);
+        }
+        out
+    };
+
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
 }
@@ -2432,5 +2492,25 @@ mod tests {
         let link = project.path().join("dangling");
         std::os::unix::fs::symlink(project.path().join("does-not-exist"), &link).unwrap();
         assert!(!target_stays_in_project(&link, project.path()));
+    }
+
+    #[test]
+    fn collect_input_files_parallel_path_returns_sorted_deterministic_hashes() {
+        let project = tempfile::tempdir().unwrap();
+        let src = project.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for idx in (0..12).rev() {
+            fs::write(src.join(format!("file_{idx:02}.ts")), format!("export const v = {idx};\n"))
+                .unwrap();
+        }
+        let globs = vec!["src/**".to_string()];
+        let first = super::collect_input_files(project.path(), &globs).unwrap();
+        let second = super::collect_input_files(project.path(), &globs).unwrap();
+        assert_eq!(first.len(), 12);
+        assert_eq!(first, second);
+        let paths: Vec<_> = first.iter().map(|(path, _)| path.clone()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
     }
 }

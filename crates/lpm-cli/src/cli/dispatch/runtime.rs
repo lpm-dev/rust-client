@@ -127,6 +127,13 @@ fn runs_on_two_workers(command: Option<&Commands>) -> bool {
         }
         Some(
             Commands::Exec(_)
+            | Commands::RunFile(_)
+            | Commands::Env(_)
+            | Commands::Tidy(_)
+            | Commands::Pack(_)
+            | Commands::Uninstall(_)
+            | Commands::Upgrade(_)
+            | Commands::Migrate(_)
             | Commands::Why(_)
             | Commands::Graph(_)
             | Commands::Query(_)
@@ -289,6 +296,12 @@ mod tests {
             vec!["lpm", "outdated"],
             vec!["lpm", "info", "react"],
             vec!["lpm", "doctor"],
+            vec!["lpm", "tidy"],
+            vec!["lpm", "pack"],
+            vec!["lpm", "uninstall", "react"],
+            vec!["lpm", "upgrade"],
+            vec!["lpm", "migrate"],
+            vec!["lpm", "env", "ls"],
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();
             for available in [1, 2, 18] {

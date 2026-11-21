@@ -566,129 +566,100 @@ pub async fn run_workspace(
 
     let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
 
-    // Run workspace levels sequentially (respects inter-package deps),
-    // packages within each level in parallel.
-    for level in &levels {
-        let scheduled_level_targets: Vec<usize> = level
-            .iter()
-            .filter(|i| runnable_members[**i])
-            .copied()
-            .collect();
-
-        if scheduled_level_targets.is_empty() {
-            continue;
-        }
-
-        if !continue_on_error && failed_flag.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let level_targets = scheduled_level_targets;
-
-        // Single package in level → no thread overhead
-        if level_targets.len() == 1 {
-            let idx = level_targets[0];
-            let member_task_plan = member_task_plans[idx].as_ref().ok_or_else(|| {
-                LpmError::Script(format!(
-                    "internal task plan missing for workspace member '{}'",
-                    ws_graph.members[idx].name
-                ))
-            })?;
-            let workspace_dependency_identities = resolve_workspace_dependency_identities(
-                member_task_plan,
-                &ws_graph,
-                &completed_task_identities,
-            );
-            let initially_failed_tasks =
-                blocked_workspace_tasks(member_task_plan, &completed_task_states);
-            let report = env_access.run(|| {
-                run_workspace_package(
-                    &ws_graph.members[idx].path,
-                    workspace_contract.as_ref(),
-                    &ws_graph.members[idx].name,
-                    extra_args,
-                    env_mode,
-                    no_cache,
-                    parallel,
-                    continue_on_error,
-                    stream,
-                    json_output,
-                    member_runtime_hints[idx].as_ref(),
+    let runnable_dag = RunnableWorkspaceDag::from_graph(&ws_graph, &runnable_members);
+    if total > 0 {
+        if workspace_concurrency <= 1 || runnable_dag.is_linear_chain() {
+            for idx in levels
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|idx| runnable_members[*idx])
+            {
+                if !continue_on_error && failed_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let member_task_plan = member_task_plans[idx].as_ref().ok_or_else(|| {
+                    LpmError::Script(format!(
+                        "internal task plan missing for workspace member '{}'",
+                        ws_graph.members[idx].name
+                    ))
+                })?;
+                let workspace_dependency_identities = resolve_workspace_dependency_identities(
                     member_task_plan,
-                    &workspace_dependency_identities,
-                    &initially_failed_tasks,
-                    session.clone(),
-                )
-            })?;
-            if !no_cache {
-                completed_task_identities[idx] = Some(required_cache_identities(
-                    &report,
-                    &required_task_identities[idx],
-                ));
-            }
-            completed_task_states[idx] = Some(report.task_states());
-            if report.is_successful() {
-                succeeded.fetch_add(1, Ordering::Relaxed);
-            } else {
-                failed_flag.store(true, Ordering::Relaxed);
+                    &ws_graph,
+                    &completed_task_identities,
+                );
+                let initially_failed_tasks =
+                    blocked_workspace_tasks(member_task_plan, &completed_task_states);
+                let report = env_access.run(|| {
+                    run_workspace_package(
+                        &ws_graph.members[idx].path,
+                        workspace_contract.as_ref(),
+                        &ws_graph.members[idx].name,
+                        extra_args,
+                        env_mode,
+                        no_cache,
+                        parallel,
+                        continue_on_error,
+                        stream,
+                        json_output,
+                        member_runtime_hints[idx].as_ref(),
+                        member_task_plan,
+                        &workspace_dependency_identities,
+                        &initially_failed_tasks,
+                        session.clone(),
+                    )
+                })?;
+                if !no_cache {
+                    completed_task_identities[idx] = Some(required_cache_identities(
+                        &report,
+                        &required_task_identities[idx],
+                    ));
+                }
+                completed_task_states[idx] = Some(report.task_states());
+                if report.is_successful() {
+                    succeeded.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    failed_flag.store(true, Ordering::Relaxed);
+                }
             }
         } else {
-            // Multiple packages in this level run in parallel, at most
-            // `workspace_concurrency` at once. Members take slots in workspace
-            // order as slots free up, so a slow member never holds idle slots
-            // the way a batch waiting for its slowest member would.
-            let slots = MemberSlots::new(workspace_concurrency);
-            // Members running at once would mix their raw output on the
-            // terminal, so their lines carry `member:task` prefixes instead.
             let member_stream = stream || (workspace_concurrency > 1 && !json_output);
-            // An error, such as a denied environment, stops members that
-            // haven't started, even with `--no-bail`.
-            let stopped = AtomicBool::new(false);
-            {
-                std::thread::scope(|scope| -> Result<(), LpmError> {
-                    let slots = &slots;
-                    let failed_flag = &failed_flag;
-                    let stopped = &stopped;
-                    let handles: Vec<_> = level_targets
-                    .iter()
-                    .enumerate()
-                    .map(|(turn, &idx)| -> Result<_, LpmError> {
-                        let member_dir = ws_graph.members[idx].path.clone();
-                        let member_name = ws_graph.members[idx].name.clone();
-                        let args_owned: Vec<String> = extra_args.to_vec();
-                        let mode_owned = env_mode.map(|s| s.to_string());
-                        let workspace_contract = workspace_contract.clone();
-                        let session = session.clone();
-                        let member_runtime_hint = Arc::clone(&member_runtime_hints[idx]);
-                        let required_task_identities = required_task_identities[idx].clone();
-                        let member_task_plan = member_task_plans[idx]
-                            .as_ref()
-                            .cloned()
-                            .ok_or_else(|| {
-                                LpmError::Script(format!(
-                                    "internal task plan missing for workspace member '{member_name}'"
-                                ))
-                            })?;
-                        let workspace_dependency_identities =
-                            resolve_workspace_dependency_identities(
-                                member_task_plan.as_ref(),
-                                &ws_graph,
-                                &completed_task_identities,
-                            );
-                        let initially_failed_tasks = blocked_workspace_tasks(
-                            member_task_plan.as_ref(),
-                            &completed_task_states,
-                        );
-
-                        let worker_env_access = env_access.clone();
-                        Ok((idx, scope.spawn(move || -> Result<_, LpmError> {
-                            let _slot = slots.acquire(turn);
-                            if stopped.load(Ordering::Acquire)
-                                || (!continue_on_error && failed_flag.load(Ordering::Relaxed))
-                            {
-                                return Ok(None);
-                            }
-                            let outcome = worker_env_access.run(|| {
+            let mut dag_state = (&mut completed_task_identities, &mut completed_task_states);
+            runnable_dag.execute_parallel(
+                workspace_concurrency,
+                continue_on_error,
+                &ws_graph.members,
+                &mut dag_state,
+                |idx, (completed_identities, completed_states)| {
+                    let member_name = ws_graph.members[idx].name.clone();
+                    let member_task_plan = member_task_plans[idx]
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| {
+                            LpmError::Script(format!(
+                                "internal task plan missing for workspace member '{member_name}'"
+                            ))
+                        })?;
+                    let workspace_dependency_identities = resolve_workspace_dependency_identities(
+                        member_task_plan.as_ref(),
+                        &ws_graph,
+                        completed_identities,
+                    );
+                    let initially_failed_tasks = blocked_workspace_tasks(
+                        member_task_plan.as_ref(),
+                        completed_states,
+                    );
+                    let member_dir = ws_graph.members[idx].path.clone();
+                    let args_owned = extra_args.to_vec();
+                    let mode_owned = env_mode.map(str::to_owned);
+                    let workspace_contract = workspace_contract.clone();
+                    let session = session.clone();
+                    let member_runtime_hint = Arc::clone(&member_runtime_hints[idx]);
+                    let required_task_identities = required_task_identities[idx].clone();
+                    let worker_env_access = env_access.clone();
+                    Ok(move || {
+                        worker_env_access.run(|| {
                             let report = run_workspace_package(
                                 &member_dir,
                                 workspace_contract.as_ref(),
@@ -714,41 +685,22 @@ pub async fn run_workspace(
                             } else {
                                 None
                             };
-                            Ok(Some((report, identities)))
-                            });
-                            if outcome.is_err() {
-                                stopped.store(true, Ordering::Release);
-                            }
-                            outcome
-                        })))
+                            Ok((report, identities))
+                        })
                     })
-                    .collect::<Result<_, _>>()?;
-
-                    for (idx, handle) in handles {
-                        match handle.join() {
-                            Ok(Ok(None)) => {}
-                            Ok(Ok(Some((report, identities)))) => {
-                                completed_task_identities[idx] = identities;
-                                completed_task_states[idx] = Some(report.task_states());
-                                if report.is_successful() {
-                                    succeeded.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    failed_flag.store(true, Ordering::Relaxed);
-                                }
-                            }
-                            Ok(Err(error)) => return Err(error),
-                            Err(_) => {
-                                return Err(LpmError::Task(format!(
-                                    "workspace task thread panicked for '{}'",
-                                    ws_graph.members[idx].name
-                                )));
-                            }
-                        }
+                },
+                |idx, (report, identities), (completed_identities, completed_states)| {
+                    completed_identities[idx] = identities;
+                    completed_states[idx] = Some(report.task_states());
+                    if report.is_successful() {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                        true
+                    } else {
+                        failed_flag.store(true, Ordering::Relaxed);
+                        false
                     }
-
-                    Ok(())
-                })?;
-            }
+                },
+            )?;
         }
     }
 
@@ -904,58 +856,173 @@ fn run_workspace_package(
     }
 }
 
-/// The slots of workspace members that may run at once, handed out in
-/// workspace order: a member's turn comes only after every earlier member
-/// has started.
-struct MemberSlots {
-    state: std::sync::Mutex<SlotState>,
-    changed: std::sync::Condvar,
+/// Effective dependency DAG restricted to runnable workspace members.
+///
+/// Preserves transitive ordering across non-runnable intermediate members so a
+/// runnable member starts as soon as its own runnable ancestors finish instead
+/// of waiting at a global topological-level barrier.
+struct RunnableWorkspaceDag {
+    runnable: Vec<bool>,
+    remaining_deps: Vec<usize>,
+    dependents: Vec<Vec<usize>>,
 }
 
-struct SlotState {
-    free: usize,
-    next_turn: usize,
-}
+impl RunnableWorkspaceDag {
+    fn from_graph(ws_graph: &lpm_task::graph::WorkspaceGraph, runnable: &[bool]) -> Self {
+        Self::from_edges(&ws_graph.edges, runnable)
+    }
 
-impl MemberSlots {
-    fn new(count: usize) -> Self {
+    fn from_edges(edges: &[Vec<usize>], runnable: &[bool]) -> Self {
+        let count = edges.len();
+        let mut remaining_deps = vec![0usize; count];
+        let mut dependents = vec![Vec::new(); count];
+        for member_idx in 0..count {
+            if !runnable[member_idx] {
+                continue;
+            }
+            let mut visited = vec![false; count];
+            let mut stack = edges[member_idx].clone();
+            let mut direct_runnable_deps = Vec::new();
+            while let Some(dep_idx) = stack.pop() {
+                if visited[dep_idx] {
+                    continue;
+                }
+                visited[dep_idx] = true;
+                if runnable[dep_idx] {
+                    direct_runnable_deps.push(dep_idx);
+                } else {
+                    stack.extend(edges[dep_idx].iter().copied());
+                }
+            }
+            remaining_deps[member_idx] = direct_runnable_deps.len();
+            for dep_idx in direct_runnable_deps {
+                dependents[dep_idx].push(member_idx);
+            }
+        }
         Self {
-            state: std::sync::Mutex::new(SlotState {
-                free: count.max(1),
-                next_turn: 0,
-            }),
-            changed: std::sync::Condvar::new(),
+            runnable: runnable.to_vec(),
+            remaining_deps,
+            dependents,
         }
     }
 
-    fn acquire(&self, turn: usize) -> MemberSlot<'_> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.free == 0 || state.next_turn != turn {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn is_linear_chain(&self) -> bool {
+        let mut remaining = self.remaining_deps.clone();
+        let mut ready: Vec<usize> = (0..self.runnable.len())
+            .filter(|&idx| self.runnable[idx] && remaining[idx] == 0)
+            .collect();
+        while let Some(idx) = ready.pop() {
+            if !ready.is_empty() {
+                return false;
+            }
+            for &dep_idx in &self.dependents[idx] {
+                remaining[dep_idx] -= 1;
+                if remaining[dep_idx] == 0 {
+                    ready.push(dep_idx);
+                }
+            }
         }
-        state.free -= 1;
-        state.next_turn += 1;
-        self.changed.notify_all();
-        MemberSlot(self)
+        true
     }
-}
 
-struct MemberSlot<'a>(&'a MemberSlots);
+    fn execute_parallel<S, T, F, Prep, Done>(
+        &self,
+        workspace_concurrency: usize,
+        continue_on_error: bool,
+        members: &[lpm_task::graph::GraphNode],
+        state: &mut S,
+        mut prepare: Prep,
+        mut on_complete: Done,
+    ) -> Result<(), LpmError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, LpmError> + Send + 'static,
+        Prep: FnMut(usize, &S) -> Result<F, LpmError>,
+        Done: FnMut(usize, T, &mut S) -> bool,
+    {
+        let concurrency = workspace_concurrency.max(1);
+        let mut remaining = self.remaining_deps.clone();
+        let mut ready: std::collections::BTreeSet<usize> = (0..self.runnable.len())
+            .filter(|&idx| self.runnable[idx] && remaining[idx] == 0)
+            .collect();
+        let mut stopped = false;
+        let mut failed = false;
+        let mut first_error: Option<LpmError> = None;
 
-impl Drop for MemberSlot<'_> {
-    fn drop(&mut self) {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .free += 1;
-        self.0.changed.notify_all();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, std::thread::Result<Result<T, LpmError>>)>();
+            let mut handles: HashMap<usize, std::thread::ScopedJoinHandle<'_, ()>> =
+                HashMap::new();
+
+            loop {
+                while !stopped
+                    && (continue_on_error || !failed)
+                    && handles.len() < concurrency
+                    && let Some(idx) = ready.pop_first()
+                {
+                    let job = match prepare(idx, state) {
+                        Ok(job) => job,
+                        Err(error) => {
+                            stopped = true;
+                            first_error.get_or_insert(error);
+                            break;
+                        }
+                    };
+                    let tx = tx.clone();
+                    let handle = scope.spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        let _ = tx.send((idx, result));
+                    });
+                    handles.insert(idx, handle);
+                }
+
+                if handles.is_empty() {
+                    break;
+                }
+
+                let Ok((idx, worker_result)) = rx.recv() else {
+                    break;
+                };
+                if let Some(handle) = handles.remove(&idx) {
+                    let _ = handle.join();
+                }
+
+                match worker_result {
+                    Ok(Ok(value)) => {
+                        let succeeded = on_complete(idx, value, state);
+                        if !succeeded {
+                            failed = true;
+                        }
+                        if !stopped && (continue_on_error || !failed) {
+                            for &dep_idx in &self.dependents[idx] {
+                                remaining[dep_idx] -= 1;
+                                if remaining[dep_idx] == 0 {
+                                    ready.insert(dep_idx);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        stopped = true;
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        stopped = true;
+                        first_error.get_or_insert_with(|| {
+                            LpmError::Task(format!(
+                                "workspace task thread panicked for '{}'",
+                                members[idx].name
+                            ))
+                        });
+                    }
+                }
+            }
+        });
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -963,70 +1030,105 @@ impl Drop for MemberSlot<'_> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn member_slots_keep_running_members_while_a_slow_one_holds_its_slot() {
-        let slots = MemberSlots::new(2);
-        let running = AtomicUsize::new(0);
-        let peak = AtomicUsize::new(0);
-        let finished = std::sync::Mutex::new(Vec::new());
-        let (quick_done, quick_finished) = std::sync::mpsc::channel();
-        // The quick members ask for a slot only once the slow one counts as
-        // running, or all three could pass through before it does.
-        let slow_is_running = std::sync::Barrier::new(4);
-
-        std::thread::scope(|scope| {
-            let (slots, running, peak, finished) = (&slots, &running, &peak, &finished);
-            let slow_is_running = &slow_is_running;
-            let enter = move || {
-                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-            };
-            scope.spawn(move || {
-                let _slot = slots.acquire(0);
-                enter();
-                slow_is_running.wait();
-                // It holds its slot until every quick member has run through
-                // the other one, so no timing decides the order.
-                for _ in 0..3 {
-                    quick_finished
-                        .recv_timeout(std::time::Duration::from_secs(30))
-                        .expect("a quick member runs while the slow one holds its slot");
-                }
-                finished.lock().unwrap().push("slow");
-                running.fetch_sub(1, Ordering::SeqCst);
-            });
-            for (turn, name) in ["a", "b", "c"].into_iter().enumerate() {
-                let quick_done = quick_done.clone();
-                scope.spawn(move || {
-                    slow_is_running.wait();
-                    let _slot = slots.acquire(turn + 1);
-                    enter();
-                    finished.lock().unwrap().push(name);
-                    running.fetch_sub(1, Ordering::SeqCst);
-                    quick_done.send(()).unwrap();
-                });
-            }
-        });
-
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(*finished.lock().unwrap(), ["a", "b", "c", "slow"]);
+    fn test_members(names: &[&str]) -> Vec<lpm_task::graph::GraphNode> {
+        names
+            .iter()
+            .map(|name| lpm_task::graph::GraphNode {
+                name: (*name).to_string(),
+                path: std::path::PathBuf::from(name),
+            })
+            .collect()
     }
 
     #[test]
-    fn member_slots_start_members_in_workspace_order() {
-        let slots = MemberSlots::new(1);
-        let started = std::sync::Mutex::new(Vec::new());
-        let member = |turn: usize| {
-            let _slot = slots.acquire(turn);
-            started.lock().unwrap().push(turn);
-        };
-        let member = &member;
+    fn dag_scheduler_starts_dependent_before_unrelated_slow_peer_finishes() {
+        // Graph: 0 (fast-lib), 1 (slow-lib), 2 (app -> depends on 0 only).
+        // With a level barrier, 2 would wait for 1; with the DAG scheduler, 2
+        // runs and completes while 1 is still blocked.
+        let edges = vec![vec![], vec![], vec![0]];
+        let runnable = vec![true, true, true];
+        let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
+        assert!(!dag.is_linear_chain());
 
-        std::thread::scope(|scope| {
-            for turn in [3, 1, 2, 0] {
-                scope.spawn(move || member(turn));
-            }
-        });
+        let members = test_members(&["fast-lib", "slow-lib", "app"]);
+        let (app_done_tx, app_done_rx) = std::sync::mpsc::channel();
+        let app_done_rx = Arc::new(std::sync::Mutex::new(app_done_rx));
+        let finished = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicUsize::new(0));
+
+        dag.execute_parallel(
+            2,
+            false,
+            &members,
+            &mut (),
+            |idx, ()| {
+                let app_done_tx = app_done_tx.clone();
+                let app_done_rx = Arc::clone(&app_done_rx);
+                let finished = Arc::clone(&finished);
+                let peak = Arc::clone(&peak);
+                let running = Arc::clone(&running);
+                Ok(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    if idx == 1 {
+                        app_done_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .expect("app must complete while slow-lib is still running");
+                    }
+                    finished.lock().unwrap().push(idx);
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    if idx == 2 {
+                        app_done_tx.send(()).unwrap();
+                    }
+                    Ok(idx)
+                })
+            },
+            |_idx, _val, ()| true,
+        )
+        .unwrap();
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(*finished.lock().unwrap(), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn dag_scheduler_preserves_transitive_order_through_non_runnable_member() {
+        // Graph: 0 (runnable) <- 1 (non-runnable) <- 2 (runnable)
+        let edges = vec![vec![], vec![0], vec![1]];
+        let runnable = vec![true, false, true];
+        let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
+        assert!(dag.is_linear_chain());
+        assert_eq!(dag.remaining_deps[0], 0);
+        assert_eq!(dag.remaining_deps[2], 1);
+        assert_eq!(dag.dependents[0], vec![2]);
+    }
+
+    #[test]
+    fn dag_scheduler_starts_ready_members_in_workspace_order_with_concurrency_one() {
+        let edges = vec![vec![], vec![], vec![], vec![]];
+        let runnable = vec![true, true, true, true];
+        let dag = RunnableWorkspaceDag::from_edges(&edges, &runnable);
+        let members = test_members(&["a", "b", "c", "d"]);
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        dag.execute_parallel(
+            1,
+            false,
+            &members,
+            &mut (),
+            |idx, ()| {
+                let started = Arc::clone(&started);
+                Ok(move || {
+                    started.lock().unwrap().push(idx);
+                    Ok(idx)
+                })
+            },
+            |_idx, _val, ()| true,
+        )
+        .unwrap();
 
         assert_eq!(*started.lock().unwrap(), vec![0, 1, 2, 3]);
     }
