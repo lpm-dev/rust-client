@@ -75,63 +75,83 @@ pub(crate) fn run() -> Result<()> {
     // first, which skips both the lpm.lock read and the SHA-256 pass
     // when the manifest/lockfile mtimes are unchanged.
     if let Some(fast_lane) = install_state::argv_qualifies_for_fast_lane() {
-        if let Err(error) = privilege::ensure_user_invocation_allowed() {
-            exit_with_lpm_error(&error, fast_lane.json);
-        }
+        let timeline_enabled =
+            std::env::var_os("LPM_INSTALL_TIMELINE_DIR").is_some_and(|value| !value.is_empty());
+        let provenance_env_set =
+            std::env::var_os("LPM_PROVENANCE_ENFORCE").is_some_and(|value| !value.is_empty());
+        if !timeline_enabled && !provenance_env_set {
+            if let Err(error) = privilege::ensure_user_invocation_allowed() {
+                exit_with_lpm_error(&error, fast_lane.json);
+            }
+            if let Ok(root) = lpm_common::LpmRoot::from_env()
+                && let Err(exposed) = lpm_common::project_state::guard_lpm_home(root.root())
+            {
+                let message = format!(
+                    "{exposed}, so git could commit the login state, env secrets and packages saved there; {}",
+                    exposed.remedy()
+                );
+                exit_with_lpm_error(&lpm_common::LpmError::LpmHome(message), fast_lane.json);
+            }
 
-        let Ok(cwd) = std::env::current_dir() else {
-            return run_async_main();
-        };
-        // Start timing BEFORE any disk work, matching install.rs which
-        // captures `start` at function entry before `check_install_state`.
-        let start = std::time::Instant::now();
+            let Ok(cwd) = std::env::current_dir() else {
+                return run_async_main();
+            };
+            // Start timing BEFORE any disk work, matching install.rs which
+            // captures `start` at function entry before `check_install_state`.
+            let start = std::time::Instant::now();
 
-        let pkg_content_opt = lpm_common::read_text_file_capped(
-            &cwd.join("package.json"),
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        )
-        .ok();
-        let workspace_root_install = pkg_content_opt
-            .as_deref()
-            .is_some_and(install_state::is_workspace_root_content)
-            || install_state::has_pnpm_workspace_yaml(&cwd);
+            let pkg_content_opt = lpm_common::read_text_file_capped(
+                &cwd.join("package.json"),
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            )
+            .ok();
+            let workspace_root_install = pkg_content_opt
+                .as_deref()
+                .is_some_and(install_state::is_workspace_root_content)
+                || install_state::has_pnpm_workspace_yaml(&cwd);
 
-        if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
-            match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, fast_lane) {
-                Ok(true) => {
-                    let elapsed_ms = start.elapsed().as_millis();
-                    if fast_lane.json {
-                        let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
-                        let timing_requested =
-                            crate::json_contract::install_timing_requested(fast_lane.timing);
-                        // Hand-formatted to match `serde_json::to_string_pretty`
-                        // output for the `install.rs` up-to-date object —
-                        // avoids constructing a `serde_json::Value` on the
-                        // hot path.
-                        if timing_requested {
-                            println!(
-                                "{{\n  \"schema_version\": {schema_version},\n  \
-                                     \"success\": true,\n  \"up_to_date\": true,\n  \
-                                     \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
-                                     \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
-                                     \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
-                                     }}\n}}"
-                            );
-                        } else {
-                            println!(
-                                "{{\n  \"schema_version\": {schema_version},\n  \
-                                     \"success\": true,\n  \"up_to_date\": true,\n  \
-                                     \"duration_ms\": {elapsed_ms}\n}}"
-                            );
+            if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
+                match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, fast_lane) {
+                    Ok(true) => {
+                        if !cwd.join(".lpm").join(".gitignore").exists() {
+                            keep_state_ignored_at_exit_from(&cwd);
+                            keep_state_ignored_at_exit();
                         }
-                    } else {
-                        output::success(&format!("up to date ({elapsed_ms}ms)"));
+                        let elapsed_ms = start.elapsed().as_millis();
+                        if fast_lane.json {
+                            let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
+                            let timing_requested =
+                                crate::json_contract::install_timing_requested(fast_lane.timing);
+                            // Hand-formatted to match `serde_json::to_string_pretty`
+                            // output for the `install.rs` up-to-date object —
+                            // avoids constructing a `serde_json::Value` on the
+                            // hot path.
+                            if timing_requested {
+                                println!(
+                                    "{{\n  \"schema_version\": {schema_version},\n  \
+                                         \"success\": true,\n  \"up_to_date\": true,\n  \
+                                         \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
+                                         \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
+                                         \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
+                                         }}\n}}"
+                                );
+                            } else {
+                                println!(
+                                    "{{\n  \"schema_version\": {schema_version},\n  \
+                                         \"success\": true,\n  \"up_to_date\": true,\n  \
+                                         \"duration_ms\": {elapsed_ms}\n}}"
+                                );
+                            }
+                        } else {
+                            output::success(&format!("up to date ({elapsed_ms}ms)"));
+                        }
+                        std::process::exit(0);
                     }
-                    std::process::exit(0);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    exit_with_lpm_error(&error, fast_lane.json);
+                    Ok(false) => {}
+                    Err(error) => {
+                        keep_state_ignored_at_exit_from(&cwd);
+                        exit_with_lpm_error(&error, fast_lane.json);
+                    }
                 }
             }
         }

@@ -236,25 +236,13 @@ strip = true
 [profile.release.package.axum]
 opt-level = "z"
 
-[profile.release.package.clap_builder]
-opt-level = "z"
-
 [profile.release.package.clap_complete]
 opt-level = "z"
 
 [profile.release.package.cliclack]
 opt-level = "z"
 
-[profile.release.package.icu_normalizer]
-opt-level = "z"
-
-[profile.release.package.icu_properties]
-opt-level = "z"
-
 [profile.release.package.jsonschema]
-opt-level = "z"
-
-[profile.release.package.libsqlite3-sys]
 opt-level = "z"
 
 [profile.release.package.lpm-dashboard]
@@ -269,31 +257,13 @@ opt-level = "z"
 [profile.release.package.miette]
 opt-level = "z"
 
-[profile.release.package.oxc_codegen]
-opt-level = "z"
-
-[profile.release.package.oxc_parser]
-opt-level = "z"
-
-[profile.release.package.oxc_semantic]
-opt-level = "z"
-
-[profile.release.package.oxc_transformer]
-opt-level = "z"
-
 [profile.release.package.ratatui]
 opt-level = "z"
 
 [profile.release.package.rmcp]
 opt-level = "z"
 
-[profile.release.package.rusqlite]
-opt-level = "z"
-
 [profile.release.package.schemars]
-opt-level = "z"
-
-[profile.release.package.serde_yaml]
 opt-level = "z"
 
 [profile.release.package.toml_edit]

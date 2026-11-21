@@ -183,7 +183,7 @@ pub fn make_client_leaf(ca: &TestCa) -> ClientLeaf {
 
 // ---- TLS server ------------------------------------------------------
 
-/// rustls 0.23 needs a CryptoProvider installed. Picks `ring`
+/// rustls 0.23 needs a CryptoProvider installed. Picks `aws-lc-rs`
 /// (matches the dev-dep feature). Idempotent — safe across tests.
 pub fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

@@ -191,7 +191,6 @@ pub(super) struct OnlineLockfileWritePhaseInput<'a> {
 pub(super) struct OnlineLockfileWritePhaseResult {
     pub(super) write_ms: u128,
     pub(super) write_count: u64,
-    pub(super) active_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
 }
 
 impl OnlineLockfileWritePhaseResult {
@@ -213,19 +212,14 @@ pub(super) fn run_online_lockfile_write_phase(
             input.lockfile_path,
             "write",
         )?);
-        result.active_lockfile = Some(Arc::new(lockfile));
         return Ok(result);
     }
 
-    if input.frozen_lockfile_active {
-        result.active_lockfile = input.fast_path_lockfile;
-        return Ok(result);
-    }
-
-    if let Some(lockfile) = input.fast_path_lockfile {
+    if !input.frozen_lockfile_active
+        && let Some(lockfile) = input.fast_path_lockfile
+    {
         let refreshed_urls =
             refreshed_tarball_urls(&lockfile, input.lockfile_path, input.fresh_urls)?;
-        let before = Arc::clone(&lockfile);
         if let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
             lockfile,
             input.lockfile_path,
@@ -240,8 +234,6 @@ pub(super) fn run_online_lockfile_write_phase(
             input.json_output,
         )? {
             result.record_write(write_ms);
-        } else {
-            result.active_lockfile = Some(before);
         }
     }
 

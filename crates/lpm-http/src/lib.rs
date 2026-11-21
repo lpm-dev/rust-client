@@ -2103,4 +2103,13 @@ mod permanent_tls_failure_tests {
 
         assert!(!is_permanent_tls_failure(&error), "{}", error_chain(&error));
     }
+
+    #[test]
+    fn default_tls_provider_prefers_post_quantum_key_exchange() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        assert_eq!(
+            provider.kx_groups[0].name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
+    }
 }

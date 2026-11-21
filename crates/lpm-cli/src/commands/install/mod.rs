@@ -2115,7 +2115,6 @@ async fn run_with_options_under_store_lock(
     })?;
     let wf_tail_lockfile_write_ms = lockfile_write_result.write_ms;
     let wf_tail_lockfile_write_count = lockfile_write_result.write_count;
-    let active_lockfile_for_proof = lockfile_write_result.active_lockfile;
 
     let OnlineAutoBuildPhaseResult {
         blocked_capture,
@@ -2342,14 +2341,10 @@ async fn run_with_options_under_store_lock(
             && direct_versions_out.is_none()
             && policy_project_dir == project_dir
         {
-            active_lockfile_for_proof
-                .as_deref()
-                .map(|lockfile| PostInstallSyncNoopProofContext {
-                    package: &pkg,
-                    lockfile,
-                    routes: &route_table,
-                    auto_install_peers,
-                })
+            Some(PostInstallSyncNoopProofContext {
+                routes: &route_table,
+                auto_install_peers,
+            })
         } else {
             None
         };

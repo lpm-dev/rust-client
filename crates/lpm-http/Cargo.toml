@@ -12,7 +12,7 @@ base64 = { workspace = true }
 bytes = "1"
 futures = { workspace = true }
 reqwest = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum", "std"] }
 tokio = { workspace = true }
 webpki-root-certs = { workspace = true }
 
