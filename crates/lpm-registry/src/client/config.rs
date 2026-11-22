@@ -199,10 +199,12 @@ impl RegistryClient {
                 adaptive_h2_window,
             )
         };
-        let lane_count = request_lane_count(std::env::var("LPM_HTTP").ok().as_deref());
+        let lpm_http = std::env::var("LPM_HTTP").ok();
+        let lane_count = request_lane_count(lpm_http.as_deref());
+        let policy_lane_count = super::http::policy_metadata_lane_count(lpm_http.as_deref());
         Ok(HttpClientSet {
             client: build(Some(read_timeout), HttpRedirectMode::Automatic, false)?,
-            policy_metadata_lanes: (0..lane_count)
+            policy_metadata_lanes: (0..policy_lane_count)
                 .map(|_| build(Some(read_timeout), HttpRedirectMode::Manual, true))
                 .collect::<Result<_, _>>()?,
             request_lanes: (0..lane_count)
@@ -293,7 +295,7 @@ impl RegistryClient {
         identity: Option<reqwest::Identity>,
         transport: HttpTransportMode,
         redirect: HttpRedirectMode,
-        adaptive_h2_window: bool,
+        large_h2_window: bool,
     ) -> Result<reqwest::Client, LpmError> {
         let mut b = roots
             .client_builder()
@@ -316,8 +318,13 @@ impl RegistryClient {
                 .pool_idle_timeout(Duration::from_secs(120))
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
-        } else if adaptive_h2_window {
-            b = b.http2_adaptive_window(true);
+        } else if large_h2_window {
+            // Hyper's adaptive_window(true) resets initial windows to 64 KiB,
+            // stalling large full packuments across extra RTTs; wide static
+            // windows let multi-MiB packuments stream at full rate immediately.
+            b = b
+                .http2_initial_stream_window_size(2 * 1024 * 1024)
+                .http2_initial_connection_window_size(8 * 1024 * 1024);
         }
         b = Self::apply_tls_settings(b, tls, identity);
         b.build().map_err(|e| {

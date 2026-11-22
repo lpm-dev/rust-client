@@ -17,12 +17,18 @@ pub(super) enum ClientPool {
 const REQUEST_LANES: usize = 8;
 
 /// HTTP/1.1 pools already open a connection per concurrent request.
+pub(super) const POLICY_METADATA_LANES: usize = 4;
+
 pub(super) fn request_lane_count(lpm_http: Option<&str>) -> usize {
     if lpm_http == Some("h1-pool") {
         1
     } else {
         REQUEST_LANES
     }
+}
+
+pub(super) fn policy_metadata_lane_count(lpm_http: Option<&str>) -> usize {
+    request_lane_count(lpm_http).min(POLICY_METADATA_LANES)
 }
 
 /// The clients built for one TLS configuration.
