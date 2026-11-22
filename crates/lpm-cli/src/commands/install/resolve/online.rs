@@ -324,6 +324,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else {
                             speculation_deps
                         },
+                        resolver_policy.clone(),
                         dependency_engine_policy.clone(),
                         streaming_fetch.then(|| v2_streaming_lane.clone()),
                         spec_tracker.clone(),
@@ -544,6 +545,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else {
                             speculation_deps
                         },
+                        resolver_policy.clone(),
                         dependency_engine_policy.clone(),
                         streaming_fetch.then(|| v2_streaming_lane.clone()),
                         spec_tracker.clone(),

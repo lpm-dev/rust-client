@@ -286,6 +286,56 @@ fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
 }
 
 #[test]
+fn speculative_version_picker_skips_versions_blocked_by_min_release_age() {
+    let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "fixture",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "2.0.0" },
+        "time": {
+            "modified": "2025-01-03T00:00:00.000Z",
+            "1.0.0": "2024-12-01T00:00:00.000Z",
+            "2.0.0": "2025-01-03T00:00:00.000Z"
+        },
+        "versions": {
+            "1.0.0": {
+                "name": "fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://registry.example/fixture-1.0.0.tgz",
+                    "integrity": "sha512-one"
+                }
+            },
+            "2.0.0": {
+                "name": "fixture",
+                "version": "2.0.0",
+                "dist": {
+                    "tarball": "https://registry.example/fixture-2.0.0.tgz",
+                    "integrity": "sha512-two"
+                }
+            }
+        }
+    })));
+    let policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes_at_unix(
+        86_400,
+        Default::default(),
+        std::iter::empty(),
+        1_735_862_400,
+    );
+
+    let picked = super::super::fetch::pick_speculative_version_with_policy(
+        "fixture", &slim, "*", &policy,
+    );
+    assert_eq!(
+        picked,
+        Some((
+            "1.0.0".to_string(),
+            "https://registry.example/fixture-1.0.0.tgz".to_string(),
+            Some("sha512-one".to_string()),
+        ))
+    );
+}
+
+#[test]
 fn speculative_dependency_enqueue_rewrites_aliases_and_includes_optional_deps() {
     let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
         "name": "fixture",
@@ -372,6 +422,7 @@ async fn count_dispatched_speculative_frames(
         Some(Arc::new(Semaphore::new(0))),
         Arc::new(FetchCoordinator::default()),
         dependencies,
+        lpm_resolver::ResolverPolicy::default(),
         Arc::new(
             crate::engine_check::prepare_dependency_policy(store_root.path(), true, true).unwrap(),
         ),

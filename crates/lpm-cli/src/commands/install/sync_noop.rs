@@ -5,7 +5,7 @@ use lpm_common::LpmError;
 pub(crate) fn is_up_to_date(
     project_dir: &Path,
     package_json: &str,
-    mode: crate::install_state::FastLaneMode,
+    mode: &crate::install_state::FastLaneMode,
 ) -> Result<bool, LpmError> {
     let json_output = mode.json;
     let package_json = lpm_common::strip_utf8_bom_str(package_json);
@@ -175,14 +175,45 @@ pub(crate) fn is_up_to_date(
         &package,
         json_output,
     )?;
-    crate::release_age_config::ReleaseAgeResolver::resolve_config_with_context(
+    let cli_min_age = match mode.min_release_age.as_deref() {
+        Some(raw) => match crate::release_age_config::parse_duration(raw) {
+            Ok(secs) => Some(secs),
+            // Let clap and the full CLI dispatch render invalid duration errors.
+            Err(_) => return Ok(false),
+        },
+        None => None,
+    };
+    let cli_excludes = if mode.min_release_age_exclude.is_empty() {
+        Vec::new()
+    } else {
+        match crate::release_age_config::validate_release_age_excludes(
+            "--min-release-age-exclude",
+            &mode.min_release_age_exclude,
+        ) {
+            Ok(excludes) => excludes,
+            Err(_) => return Ok(false),
+        }
+    };
+    let resolved_age = crate::release_age_config::ReleaseAgeResolver::resolve_config_with_context(
         &global,
         Some(&package),
         project_dir,
-        None,
-        &[],
+        cli_min_age,
+        &cli_excludes,
         json_output,
     )?;
+    let current_release_age_key = crate::install_state::release_age_freshness_key(
+        resolved_age.minimum_release_age_secs,
+        resolved_age.minimum_release_age_policy,
+        &resolved_age.minimum_release_age_exclude,
+        false,
+    );
+    if current_release_age_key.is_some()
+        && crate::install_state::parse_release_age_policy_line(&cached_state)
+            != current_release_age_key.as_deref()
+    {
+        return Ok(false);
+    }
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
     let skills_ready = mode.no_skills
         || ((!crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
@@ -528,6 +559,7 @@ mod tests {
                 node_runtime_fingerprint: None,
                 security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
                 sync_noop_proof: Some(&proof),
+                release_age_policy_key: None,
             },
         )
         .unwrap();
@@ -537,8 +569,10 @@ mod tests {
             timing: false,
             frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
             no_skills: true,
+            min_release_age: None,
+            min_release_age_exclude: Vec::new(),
         };
-        assert!(super::is_up_to_date(project, pkg_json, mode).unwrap());
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
 
         // Same-size edit with restored mtime must invalidate the content-bound proof.
         let pkg_mtime = std::fs::metadata(project.join("package.json"))
@@ -554,7 +588,7 @@ mod tests {
             .unwrap()
             .set_modified(pkg_mtime)
             .unwrap();
-        assert!(!super::is_up_to_date(project, edited_pkg, mode).unwrap());
+        assert!(!super::is_up_to_date(project, edited_pkg, &mode).unwrap());
         // Restore original package.json and mtime.
         std::fs::write(project.join("package.json"), pkg_json).unwrap();
         std::fs::File::options()
@@ -563,7 +597,7 @@ mod tests {
             .unwrap()
             .set_modified(pkg_mtime)
             .unwrap();
-        assert!(super::is_up_to_date(project, pkg_json, mode).unwrap());
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
 
         // Changing `.npmrc` changes the route fingerprint, invalidating the proof.
         std::fs::write(
@@ -571,10 +605,10 @@ mod tests {
             "registry=https://custom.registry.example/\n",
         )
         .unwrap();
-        assert!(!super::is_up_to_date(project, pkg_json, mode).unwrap());
+        assert!(!super::is_up_to_date(project, pkg_json, &mode).unwrap());
 
         std::fs::remove_file(project.join(".npmrc")).unwrap();
-        assert!(super::is_up_to_date(project, pkg_json, mode).unwrap());
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
 
         // A patched project must never mark frozen_ok in the sync proof.
         let patched_pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"},"lpm":{"patchedDependencies":{"react@1.0.0":{"path":"patches/react@1.0.0.patch","originalIntegrity":"sha512-test"}}}}"#;
@@ -604,6 +638,6 @@ mod tests {
             },
         );
         modified_lockfile.write_to_file(&lock_path).unwrap();
-        assert!(!super::is_up_to_date(project, pkg_json, mode).unwrap());
+        assert!(!super::is_up_to_date(project, pkg_json, &mode).unwrap());
     }
 }

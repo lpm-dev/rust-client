@@ -727,6 +727,12 @@ async fn run_with_options_under_store_lock(
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_audit_after_install_ms = 0u128;
 
+    let release_age_policy_key = crate::install_state::release_age_freshness_key(
+        effective_min_age_secs,
+        release_age_policy,
+        &minimum_release_age_exclude,
+        allow_new,
+    );
     let InstallFreshnessResult {
         setup_install_state_ms: wf_setup_install_state_ms,
         cleanup_catalogs_in_pipeline,
@@ -754,6 +760,7 @@ async fn run_with_options_under_store_lock(
         object_integrity_policy,
         security_analysis_policy,
         dependency_engine_policy: dependency_engine_policy.as_ref(),
+        release_age_policy_key: release_age_policy_key.as_deref(),
         store_version,
         compatibility_bin_names,
         requested_add_count,
@@ -2354,6 +2361,7 @@ async fn run_with_options_under_store_lock(
             object_integrity_policy,
             security_analysis_policy,
             dependency_engine_policy.as_ref(),
+            release_age_policy_key.as_deref(),
             proof_context,
         );
     }

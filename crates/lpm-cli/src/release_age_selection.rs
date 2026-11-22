@@ -251,27 +251,35 @@ pub(crate) async fn hydrate_release_times_if_needed(
         return Ok(());
     }
 
+    let expected_modified = metadata.modified.as_deref();
     let release_times = match source {
         ReleaseTimeMetadataSource::NpmDirect => {
             client
-                .get_npm_release_times_routed_full(
+                .get_npm_release_times_routed_full_for_modified(
                     &metadata.name,
                     lpm_registry::UpstreamRoute::NpmDirect,
+                    expected_modified,
                 )
                 .await?
         }
         ReleaseTimeMetadataSource::Routed(route) => {
             client
-                .get_npm_release_times_routed_full(&metadata.name, route.clone())
+                .get_npm_release_times_routed_full_for_modified(
+                    &metadata.name,
+                    route.clone(),
+                    expected_modified,
+                )
                 .await?
         }
-        ReleaseTimeMetadataSource::WorkerOnly => {
+        ReleaseTimeMetadataSource::WorkerOnly => std::sync::Arc::new(
             client
                 .get_npm_release_times_proxy_only(&metadata.name)
-                .await?
-        }
+                .await?,
+        ),
     };
-    metadata.time.extend(release_times.time);
+    metadata
+        .time
+        .extend(release_times.time.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     if let Some(version) = metadata
         .versions
