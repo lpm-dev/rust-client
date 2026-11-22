@@ -340,11 +340,6 @@ pub(crate) struct BehavioralAnalyses {
     pub(crate) not_installed: Vec<bool>,
 }
 
-enum PackageScan {
-    Analyzed(LoadedAnalysis),
-    NotInstalled(usize),
-}
-
 struct LoadedAnalysis {
     scan_index: usize,
     package_index: usize,
@@ -363,17 +358,18 @@ impl PackageInventory {
     /// Callers that need to take the store lock around the
     /// store-touching part of inventory load should call this first to
     /// learn `discovery.manager`, then conditionally lock and call
-    /// [`PackageInventory::from_discovery_with_lpm_root`].
+    /// [`PackageInventory::from_discovery_with_options`].
     pub fn discover(
         project_dir: &Path,
     ) -> Result<discovery::DiscoveryResult, lpm_common::LpmError> {
         discovery::discover_packages_retaining_parsed_lpm_lockfile(project_dir)
     }
 
-    pub(crate) fn from_discovery_with_lpm_root(
+    pub(crate) fn from_discovery_with_options(
         discovery: discovery::DiscoveryResult,
         store_version: lpm_store::StoreVersion,
         lpm_root: Option<&lpm_common::LpmRoot>,
+        load_behavioral_analysis: bool,
     ) -> Self {
         let baseline_index = lpm_root.map(|root| {
             build_project_v2_baseline_index(
@@ -388,7 +384,11 @@ impl PackageInventory {
             analyses,
             source_paths,
             not_installed,
-        } = load_behavioral_analyses_with_index(&discovery, lpm_root, baseline_index.as_ref());
+        } = if load_behavioral_analysis {
+            load_behavioral_analyses_with_index(&discovery, lpm_root, baseline_index.as_ref())
+        } else {
+            resolve_package_sources_with_index(&discovery, lpm_root, baseline_index.as_ref())
+        };
         Self {
             discovery,
             analyses,
@@ -441,12 +441,8 @@ pub(crate) fn load_behavioral_analyses(
     load_behavioral_analyses_with_index(discovery, lpm_root.as_ref(), baseline_index.as_ref())
 }
 
-fn load_behavioral_analyses_with_index(
-    discovery: &DiscoveryResult,
-    lpm_root: Option<&lpm_common::LpmRoot>,
-    baseline_index: Option<&ProjectV2BaselineIndex>,
-) -> BehavioralAnalyses {
-    let scannable: Vec<(usize, &DiscoveredPackage)> = discovery
+fn scannable_packages(discovery: &DiscoveryResult) -> Vec<(usize, &DiscoveredPackage)> {
+    discovery
         .packages
         .iter()
         .enumerate()
@@ -456,7 +452,98 @@ fn load_behavioral_analyses_with_index(
                 ScanMode::FullLocal | ScanMode::RegistryAndStore
             )
         })
+        .collect()
+}
+
+fn resolve_package_sources_with_index(
+    discovery: &DiscoveryResult,
+    lpm_root: Option<&lpm_common::LpmRoot>,
+    baseline_index: Option<&ProjectV2BaselineIndex>,
+) -> BehavioralAnalyses {
+    enum SourceProbe {
+        Present {
+            package_index: usize,
+            source_path: PathBuf,
+        },
+        NotInstalled(usize),
+    }
+
+    let scannable = scannable_packages(discovery);
+    let project_root = open_project_root(&discovery.project_root).ok();
+    let probed: Vec<SourceProbe> = scannable
+        .par_iter()
+        .filter_map(|(package_index, package)| {
+            match open_package_source(project_root.as_ref(), package, lpm_root, baseline_index) {
+                Ok(source) => Some(SourceProbe::Present {
+                    package_index: *package_index,
+                    source_path: source.path,
+                }),
+                Err(error)
+                    if package.platform_skipped
+                        && project_root.is_some()
+                        && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    Some(SourceProbe::NotInstalled(*package_index))
+                }
+                Err(_) => None,
+            }
+        })
         .collect();
+
+    let analyses = vec![None; discovery.packages.len()];
+    let mut source_paths = vec![None; discovery.packages.len()];
+    let mut not_installed: Vec<bool> = discovery
+        .packages
+        .iter()
+        .map(|package| package.scan_mode == ScanMode::NotInstalled)
+        .collect();
+    for probe in probed {
+        match probe {
+            SourceProbe::Present {
+                package_index,
+                source_path,
+            } => {
+                if source_path != Path::new(&discovery.packages[package_index].path) {
+                    source_paths[package_index] = Some(source_path);
+                }
+            }
+            SourceProbe::NotInstalled(package_index) => {
+                not_installed[package_index] = true;
+            }
+        }
+    }
+
+    BehavioralAnalyses {
+        analyses,
+        source_paths,
+        not_installed,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum StoreGroupKey {
+    Identified(PathBuf, crate::directory_transaction::DirectoryIdentity),
+    Unique(usize),
+}
+
+fn load_behavioral_analyses_with_index(
+    discovery: &DiscoveryResult,
+    lpm_root: Option<&lpm_common::LpmRoot>,
+    baseline_index: Option<&ProjectV2BaselineIndex>,
+) -> BehavioralAnalyses {
+    struct OpenedRow {
+        scan_index: usize,
+        package_index: usize,
+        source: OpenedPackageSource,
+        dir_identity: Option<crate::directory_transaction::DirectoryIdentity>,
+    }
+
+    enum OpenStep {
+        Opened(OpenedRow),
+        NotInstalled(usize),
+    }
+
+    let scannable = scannable_packages(discovery);
     let manager = discovery.manager.to_string();
     let mut analysis_keys: Vec<String> = scannable
         .iter()
@@ -475,96 +562,185 @@ fn load_behavioral_analyses_with_index(
             .iter()
             .map(|package| Path::new(&package.path)),
     );
-    let project_cache_ref = project_cache.as_ref();
-    let shared_by_fingerprint = dashmap::DashMap::new();
-    let loaded: Vec<PackageScan> = scannable
+
+    let opened_steps: Vec<OpenStep> = scannable
         .par_iter()
         .enumerate()
         .filter_map(|(scan_index, (package_index, package))| {
-            let package_source =
-                match open_package_source(project_root.as_ref(), package, lpm_root, baseline_index)
-                {
-                    Ok(source) => source,
-                    Err(error)
-                        if package.platform_skipped
-                            && project_root.is_some()
-                            && error.kind() == io::ErrorKind::NotFound =>
-                    {
-                        return Some(PackageScan::NotInstalled(*package_index));
-                    }
-                    Err(_) => return None,
-                };
-            let package_directory = &package_source.directory;
-            let contents = match package_source.origin {
-                SourceOrigin::Store => PackageDirectory::Published,
-                SourceOrigin::Project => PackageDirectory::Installed(
-                    nested
-                        .get(Path::new(&package.path))
-                        .map_or(&[], Vec::as_slice),
-                ),
-                SourceOrigin::LocalDirectory => PackageDirectory::LocalSource,
-            };
-            let key = &analysis_keys[scan_index];
-            if let Some(cache) = project_cache_ref
-                && cache.has_candidate(key, package)
-            {
-                let fingerprint =
-                    lpm_security::behavioral::package_input_fingerprint_from_open_dir(
-                        package_directory,
-                        contents,
-                    )
-                    .ok();
-                if let Some(cached) = fingerprint
-                    .as_deref()
-                    .and_then(|fingerprint| cache.get(key, package, fingerprint))
-                {
-                    return Some(PackageScan::Analyzed(LoadedAnalysis {
+            match open_package_source(project_root.as_ref(), package, lpm_root, baseline_index) {
+                Ok(source) => {
+                    let dir_identity = if source.origin == SourceOrigin::Store {
+                        crate::directory_transaction::directory_identity(&source.directory).ok()
+                    } else {
+                        None
+                    };
+                    Some(OpenStep::Opened(OpenedRow {
                         scan_index,
                         package_index: *package_index,
-                        analysis: cached,
-                        cache_fingerprint: None,
-                        source_path: package_source.path,
-                    }));
+                        source,
+                        dir_identity,
+                    }))
                 }
+                Err(error)
+                    if package.platform_skipped
+                        && project_root.is_some()
+                        && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    Some(OpenStep::NotInstalled(*package_index))
+                }
+                Err(_) => None,
             }
-
-            let (analysis, cache_fingerprint) =
-                lpm_security::behavioral::analyze_package_from_open_dir_with_fingerprint(
-                    package_directory,
-                    contents,
-                );
-            let mut analysis = Arc::new(analysis);
-            if let Some(fingerprint) = cache_fingerprint.as_ref() {
-                analysis = match shared_by_fingerprint.entry(fingerprint.clone()) {
-                    Entry::Occupied(entry) => Arc::clone(entry.get()),
-                    Entry::Vacant(entry) => Arc::clone(&entry.insert(analysis)),
-                };
-            }
-            Some(PackageScan::Analyzed(LoadedAnalysis {
-                scan_index,
-                package_index: *package_index,
-                analysis,
-                cache_fingerprint,
-                source_path: package_source.path,
-            }))
         })
         .collect();
 
-    let mut analyses = vec![None; discovery.packages.len()];
-    let mut source_paths = vec![None; discovery.packages.len()];
     let mut not_installed: Vec<bool> = discovery
         .packages
         .iter()
         .map(|package| package.scan_mode == ScanMode::NotInstalled)
         .collect();
-    for scan in loaded {
-        let loaded = match scan {
-            PackageScan::Analyzed(loaded) => loaded,
-            PackageScan::NotInstalled(package_index) => {
+
+    // Group store rows by (path, filesystem identity) before entering Rayon so
+    // each physical directory is fingerprinted and analyzed once without ever
+    // blocking a Rayon worker on a OnceLock across nested Rayon work.
+    struct WorkGroup {
+        representative_dir: cap_std::fs::Dir,
+        origin: SourceOrigin,
+        members: Vec<(usize, usize, PathBuf)>,
+    }
+
+    let mut store_group_indices: HashMap<StoreGroupKey, usize> = HashMap::new();
+    let mut groups: Vec<WorkGroup> = Vec::with_capacity(opened_steps.len());
+
+    for step in opened_steps {
+        match step {
+            OpenStep::NotInstalled(package_index) => {
                 not_installed[package_index] = true;
-                continue;
             }
-        };
+            OpenStep::Opened(row) => {
+                if row.source.origin == SourceOrigin::Store {
+                    let group_key = match row.dir_identity {
+                        Some(identity) => {
+                            StoreGroupKey::Identified(row.source.path.clone(), identity)
+                        }
+                        None => StoreGroupKey::Unique(row.scan_index),
+                    };
+                    if let Some(&group_idx) = store_group_indices.get(&group_key) {
+                        groups[group_idx].members.push((
+                            row.scan_index,
+                            row.package_index,
+                            row.source.path,
+                        ));
+                    } else {
+                        let group_idx = groups.len();
+                        store_group_indices.insert(group_key, group_idx);
+                        groups.push(WorkGroup {
+                            representative_dir: row.source.directory,
+                            origin: SourceOrigin::Store,
+                            members: vec![(row.scan_index, row.package_index, row.source.path)],
+                        });
+                    }
+                } else {
+                    groups.push(WorkGroup {
+                        representative_dir: row.source.directory,
+                        origin: row.source.origin,
+                        members: vec![(row.scan_index, row.package_index, row.source.path)],
+                    });
+                }
+            }
+        }
+    }
+
+    let project_cache_ref = project_cache.as_ref();
+    let shared_by_fingerprint = dashmap::DashMap::new();
+
+    let loaded: Vec<LoadedAnalysis> = groups
+        .into_par_iter()
+        .flat_map_iter(|group| {
+            let mut results = Vec::with_capacity(group.members.len());
+            let mut cache_misses = Vec::new();
+            let contents = match group.origin {
+                SourceOrigin::Store => PackageDirectory::Published,
+                SourceOrigin::Project => {
+                    let first_pkg = &discovery.packages[group.members[0].1];
+                    PackageDirectory::Installed(
+                        nested
+                            .get(Path::new(&first_pkg.path))
+                            .map_or(&[], Vec::as_slice),
+                    )
+                }
+                SourceOrigin::LocalDirectory => PackageDirectory::LocalSource,
+            };
+
+            if let Some(cache) = project_cache_ref {
+                let any_candidate = group.members.iter().any(|(scan_index, package_index, _)| {
+                    cache.has_candidate(
+                        &analysis_keys[*scan_index],
+                        &discovery.packages[*package_index],
+                    )
+                });
+                let fingerprint = if any_candidate {
+                    lpm_security::behavioral::package_input_fingerprint_from_open_dir(
+                        &group.representative_dir,
+                        contents,
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+                for member in group.members {
+                    let (scan_index, package_index, source_path) = member;
+                    let key = &analysis_keys[scan_index];
+                    let package = &discovery.packages[package_index];
+                    if let Some(cached) = fingerprint
+                        .as_deref()
+                        .and_then(|fp| cache.get(key, package, fp))
+                    {
+                        results.push(LoadedAnalysis {
+                            scan_index,
+                            package_index,
+                            analysis: cached,
+                            cache_fingerprint: None,
+                            source_path,
+                        });
+                    } else {
+                        cache_misses.push((scan_index, package_index, source_path));
+                    }
+                }
+            } else {
+                cache_misses = group.members;
+            }
+
+            if !cache_misses.is_empty() {
+                let (analysis, cache_fingerprint) =
+                    lpm_security::behavioral::analyze_package_from_open_dir_with_fingerprint(
+                        &group.representative_dir,
+                        contents,
+                    );
+                let mut analysis = Arc::new(analysis);
+                if let Some(fingerprint) = cache_fingerprint.as_ref() {
+                    analysis = match shared_by_fingerprint.entry(fingerprint.clone()) {
+                        Entry::Occupied(entry) => Arc::clone(entry.get()),
+                        Entry::Vacant(entry) => Arc::clone(&entry.insert(analysis)),
+                    };
+                }
+                for (scan_index, package_index, source_path) in cache_misses {
+                    results.push(LoadedAnalysis {
+                        scan_index,
+                        package_index,
+                        analysis: Arc::clone(&analysis),
+                        cache_fingerprint: cache_fingerprint.clone(),
+                        source_path,
+                    });
+                }
+            }
+
+            results
+        })
+        .collect();
+
+    let mut analyses = vec![None; discovery.packages.len()];
+    let mut source_paths = vec![None; discovery.packages.len()];
+    for loaded in loaded {
         let package = &discovery.packages[loaded.package_index];
         let key = std::mem::take(&mut analysis_keys[loaded.scan_index]);
         if let Some(fingerprint) = loaded.cache_fingerprint.as_ref() {
@@ -1000,5 +1176,143 @@ mod tests {
         assert!(runner.source.child_process);
         assert!(!local.source.eval);
         assert_eq!(local.meta.files_scanned, 1);
+    }
+
+    #[test]
+    fn from_discovery_without_behavioral_analysis_skips_ast_scan_and_preserves_not_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let project_root = root.path().join("project");
+        let pkg_dir = project_root.join("node_modules/present-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"present-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "eval('x')\n").unwrap();
+
+        let present = DiscoveredPackage {
+            name: "present-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            path: "node_modules/present-pkg".to_string(),
+            scan_mode: ScanMode::FullLocal,
+            ..discovered_package(None, None)
+        };
+        let skipped = DiscoveredPackage {
+            name: "darwin-only".to_string(),
+            version: "1.0.0".to_string(),
+            path: "node_modules/darwin-only".to_string(),
+            scan_mode: ScanMode::FullLocal,
+            platform_skipped: true,
+            ..discovered_package(None, None)
+        };
+        let discovery = DiscoveryResult {
+            manager: super::super::discovery::ManagerKind::Npm,
+            lockfile_path: None,
+            project_root,
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages: vec![present, skipped],
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        };
+
+        let mut inv = PackageInventory::from_discovery_with_options(
+            discovery,
+            lpm_store::StoreVersion::V2,
+            None,
+            false,
+        );
+        assert_eq!(inv.analyses.len(), 2);
+        assert!(inv.analyses.iter().all(Option::is_none));
+        assert_eq!(inv.not_installed, vec![false, true]);
+        inv.retain_installed();
+        assert_eq!(inv.discovery.packages.len(), 1);
+        assert_eq!(inv.discovery.packages[0].name, "present-pkg");
+    }
+
+    #[test]
+    fn shared_store_directory_with_nested_rayon_files_completes_without_deadlock() {
+        let root = tempfile::tempdir().unwrap();
+        let lpm_home = root.path().join("lpm-home");
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.clone().into_os_string())]);
+        let lpm_root = lpm_common::LpmRoot::from_dir(lpm_home);
+        let project_root = root.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let store_pkg = lpm_root.store_v1().join("shared-lib@1.0.0");
+        std::fs::create_dir_all(&store_pkg).unwrap();
+        let integrity = "sha512-shared-lib-test";
+        std::fs::write(store_pkg.join(".integrity"), integrity).unwrap();
+        std::fs::write(
+            store_pkg.join("package.json"),
+            r#"{"name":"shared-lib","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        // >= 20 source files triggers nested Rayon inside lpm-security.
+        for idx in 0..24 {
+            let body = if idx == 0 {
+                "eval('1 + 1');\n"
+            } else {
+                "export const ok = 1;\n"
+            };
+            std::fs::write(store_pkg.join(format!("mod_{idx:02}.js")), body).unwrap();
+        }
+
+        let packages: Vec<DiscoveredPackage> = (0..4)
+            .map(|idx| DiscoveredPackage {
+                name: "shared-lib".to_string(),
+                version: "1.0.0".to_string(),
+                path: format!("node_modules/p{idx}/node_modules/shared-lib"),
+                scan_mode: ScanMode::RegistryAndStore,
+                ..discovered_package(Some(integrity), None)
+            })
+            .collect();
+        let discovery = DiscoveryResult {
+            manager: super::super::discovery::ManagerKind::Lpm,
+            lockfile_path: None,
+            project_root: project_root.clone(),
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages,
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        };
+        let baseline_index = build_project_v2_baseline_index(
+            &project_root,
+            &lpm_root,
+            lpm_store::StoreVersion::V1,
+            None,
+            None,
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let result = pool.install(|| {
+                load_behavioral_analyses_with_index(
+                    &discovery,
+                    Some(&lpm_root),
+                    Some(&baseline_index),
+                )
+            });
+            let _ = tx.send(result);
+        });
+
+        let loaded = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("behavioral scan on shared store path must not deadlock");
+        assert_eq!(loaded.analyses.len(), 4);
+        let first = loaded.analyses[0].as_ref().unwrap();
+        assert!(first.source.eval);
+        for other in &loaded.analyses[1..] {
+            assert!(Arc::ptr_eq(first, other.as_ref().unwrap()));
+        }
     }
 }

@@ -7,7 +7,7 @@
 //! - Environment variables
 //! - Node.js version
 
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::fs::Dir;
 use lpm_common::LpmError;
 use sha2::{Digest, Sha256};
@@ -405,7 +405,7 @@ fn capture_filesystem_validation(
             root.display()
         ))
     })?;
-    let fingerprint = compute_validation_fingerprint(&root, &fixed_names, &globs)?;
+    let fingerprint = compute_validation_fingerprint_canonical(&root, &fixed_names, &globs)?;
     Ok(FilesystemValidation {
         root,
         fixed_names,
@@ -425,9 +425,17 @@ fn compute_validation_fingerprint(
             root.display()
         ))
     })?;
+    compute_validation_fingerprint_canonical(&canonical_root, fixed_names, globs)
+}
+
+fn compute_validation_fingerprint_canonical(
+    canonical_root: &Path,
+    fixed_names: &[String],
+    globs: &[String],
+) -> Result<[u8; 32], LpmError> {
     let mut hasher = Sha256::new();
     hash_record(&mut hasher, 0, &[b"task-filesystem-validation-v1"]);
-    hash_validation_path(&mut hasher, b"root", &canonical_root, true)?;
+    hash_validation_path(&mut hasher, b"root", canonical_root, true)?;
 
     for name in fixed_names {
         let path = canonical_root.join(name);
@@ -455,7 +463,7 @@ fn compute_validation_fingerprint(
             )));
         }
         for expanded in expand_glob(pattern) {
-            for_each_cache_glob_match(&canonical_root, &expanded, |relative| {
+            for_each_cache_glob_match(canonical_root, &expanded, |relative| {
                 entries.insert(relative);
                 Ok(())
             })?;
@@ -499,7 +507,7 @@ fn compute_validation_fingerprint(
         } else {
             path.clone()
         };
-        let resolved_relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+        let resolved_relative = resolved.strip_prefix(canonical_root).map_err(|_| {
             LpmError::Task(format!(
                 "task cache validation path resolves outside project: {}",
                 path.display()
@@ -861,7 +869,6 @@ fn collect_input_files(
             )));
         }
 
-        // "src/**" → also match "src/**/*" for files at any depth
         let patterns = expand_glob(pattern);
 
         for pat in &patterns {
@@ -925,7 +932,6 @@ fn collect_input_files(
         }
     }
 
-    // Sort for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
 }
@@ -1034,7 +1040,7 @@ impl InputDirectories {
             .as_ref()
             .expect("input parent directory was opened");
         let mut options = cap_std::fs::OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
         let file = parent.open_with(name, &options).map_err(|error| {
             LpmError::Task(format!(
                 "failed to open task cache input {} without following links: {error}",
@@ -2432,5 +2438,28 @@ mod tests {
         let link = project.path().join("dangling");
         std::os::unix::fs::symlink(project.path().join("does-not-exist"), &link).unwrap();
         assert!(!target_stays_in_project(&link, project.path()));
+    }
+
+    #[test]
+    fn collect_input_files_parallel_path_returns_sorted_deterministic_hashes() {
+        let project = tempfile::tempdir().unwrap();
+        let src = project.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for idx in (0..12).rev() {
+            fs::write(
+                src.join(format!("file_{idx:02}.ts")),
+                format!("export const v = {idx};\n"),
+            )
+            .unwrap();
+        }
+        let globs = vec!["src/**".to_string()];
+        let first = super::collect_input_files(project.path(), &globs).unwrap();
+        let second = super::collect_input_files(project.path(), &globs).unwrap();
+        assert_eq!(first.len(), 12);
+        assert_eq!(first, second);
+        let paths: Vec<_> = first.iter().map(|(path, _)| path.clone()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
     }
 }

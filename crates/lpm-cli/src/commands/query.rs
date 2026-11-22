@@ -213,10 +213,11 @@ pub async fn run(
         let lock_path = lpm_root_outer.store_lock();
         let lpm_root_inner = lpm_root_outer;
         lpm_common::with_shared_lock(lock_path, || {
-            let mut inv = PackageInventory::from_discovery_with_lpm_root(
+            let mut inv = PackageInventory::from_discovery_with_options(
                 pre_discovery,
                 store_version,
                 Some(&lpm_root_inner),
+                requirements.analysis,
             );
             inv.retain_installed();
             if requirements.needs_disk_state() {
@@ -233,8 +234,12 @@ pub async fn run(
             Ok(inv)
         })?
     } else {
-        let mut inv =
-            PackageInventory::from_discovery_with_lpm_root(pre_discovery, store_version, None);
+        let mut inv = PackageInventory::from_discovery_with_options(
+            pre_discovery,
+            store_version,
+            None,
+            requirements.analysis,
+        );
         inv.retain_installed();
         if requirements.needs_disk_state() {
             populate_package_disk_state(
@@ -1053,18 +1058,21 @@ fn populate_package_disk_state(
     has_scripts: &mut Vec<bool>,
     is_built: &mut Vec<bool>,
 ) -> Result<(), LpmError> {
+    use rayon::prelude::*;
+
     has_scripts.clear();
     is_built.clear();
+    let count = inventory.discovery.packages.len();
     if load_scripts {
-        has_scripts.resize(inventory.discovery.packages.len(), false);
+        has_scripts.resize(count, false);
     }
     if load_built {
-        is_built.resize(inventory.discovery.packages.len(), false);
+        is_built.resize(count, false);
     }
     let project_root =
         crate::commands::audit::inventory::open_project_root(&inventory.discovery.project_root)
             .ok();
-    for (index, package) in inventory.discovery.packages.iter().enumerate() {
+    let inspect_one = |package: &crate::commands::audit::discovery::DiscoveredPackage| -> Result<(bool, bool), LpmError> {
         let directory = crate::commands::audit::inventory::open_package_source_directory(
             project_root.as_ref(),
             package,
@@ -1077,19 +1085,105 @@ fn populate_package_disk_state(
                 package.name, package.version
             ))
         })?;
-        if load_scripts {
-            has_scripts[index] = check_has_lifecycle_scripts(&directory).map_err(|error| {
+        let pkg_has_scripts = if load_scripts {
+            check_has_lifecycle_scripts(&directory).map_err(|error| {
                 LpmError::Script(format!(
                     "cannot read scripts for {}@{}: {error}",
                     package.name, package.version
                 ))
-            })?;
+            })?
+        } else {
+            false
+        };
+        let pkg_is_built = if load_built {
+            has_regular_build_marker(&directory)?
+        } else {
+            false
+        };
+        Ok((pkg_has_scripts, pkg_is_built))
+    };
+
+    if count >= 4 {
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let results: Vec<Option<Result<(bool, bool), LpmError>>> = inventory
+            .discovery
+            .packages
+            .par_iter()
+            .map(|package| {
+                if failed.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                let result = inspect_one(package);
+                if result.is_err() {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Some(result)
+            })
+            .collect();
+        for (index, result) in results.into_iter().enumerate() {
+            let (pkg_has_scripts, pkg_is_built) = match result {
+                Some(outcome) => outcome?,
+                None => inspect_one(&inventory.discovery.packages[index])?,
+            };
+            if load_scripts {
+                has_scripts[index] = pkg_has_scripts;
+            }
+            if load_built {
+                is_built[index] = pkg_is_built;
+            }
         }
-        if load_built {
-            is_built[index] = has_regular_build_marker(&directory)?;
+    } else {
+        for (index, package) in inventory.discovery.packages.iter().enumerate() {
+            let (pkg_has_scripts, pkg_is_built) = inspect_one(package)?;
+            if load_scripts {
+                has_scripts[index] = pkg_has_scripts;
+            }
+            if load_built {
+                is_built[index] = pkg_is_built;
+            }
         }
     }
     Ok(())
+}
+
+struct LifecycleScriptManifest {
+    scripts: Option<serde_json::Value>,
+    gypfile: Option<serde_json::Value>,
+}
+
+impl<'de> serde::Deserialize<'de> for LifecycleScriptManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = LifecycleScriptManifest;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut scripts = None;
+                let mut gypfile = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "scripts" => scripts = Some(map.next_value()?),
+                        "gypfile" => gypfile = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(LifecycleScriptManifest { scripts, gypfile })
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, LpmError> {
@@ -1109,20 +1203,33 @@ fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, L
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         metadata.len(),
     )?;
-    let parsed: serde_json::Map<String, serde_json::Value> =
+    let parsed: LifecycleScriptManifest =
         serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
             .map_err(|error| LpmError::Script(format!("invalid package.json: {error}")))?;
-    let names_one = parsed
-        .get("scripts")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|scripts| {
-            LIFECYCLE_SCRIPTS
-                .iter()
-                .any(|phase| scripts.contains_key(*phase))
-        });
-    Ok(names_one
-        || lpm_security::native_build::leaves_install_to_binding_gyp(&parsed)
-            && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?)
+    let scripts = parsed
+        .scripts
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let names_one = scripts.is_some_and(|scripts| {
+        LIFECYCLE_SCRIPTS
+            .iter()
+            .any(|phase| scripts.contains_key(*phase))
+    });
+    if names_one {
+        return Ok(true);
+    }
+    let install = scripts
+        .and_then(|s| s.get("install"))
+        .and_then(serde_json::Value::as_str);
+    let preinstall = scripts
+        .and_then(|s| s.get("preinstall"))
+        .and_then(serde_json::Value::as_str);
+    let gypfile = parsed.gypfile.as_ref().and_then(serde_json::Value::as_bool);
+    Ok(
+        lpm_security::native_build::scripts_leave_install_to_binding_gyp(
+            install, preinstall, gypfile,
+        ) && has_regular_file(package_dir, lpm_security::native_build::BINDING_GYP)?,
+    )
 }
 
 fn has_regular_file(package_dir: &cap_std::fs::Dir, name: &str) -> Result<bool, LpmError> {
@@ -1425,6 +1532,41 @@ mod tests {
         let package_dir =
             cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
         assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_rejects_malformed_or_non_object_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_dir =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+
+        std::fs::write(dir.path().join("package.json"), "[]").unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+
+        std::fs::write(dir.path().join("package.json"), "\u{00A0}{}").unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).is_err());
+    }
+
+    #[test]
+    fn check_lifecycle_scripts_uses_last_wins_on_duplicate_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_dir =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"echo 1"},"scripts":{"postinstall":"echo hi"}}"#,
+        )
+        .unwrap();
+        assert!(check_has_lifecycle_scripts(&package_dir).unwrap());
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"postinstall":"echo hi"},"scripts":{"test":"echo 1"}}"#,
+        )
+        .unwrap();
+        assert!(!check_has_lifecycle_scripts(&package_dir).unwrap());
     }
 
     #[test]

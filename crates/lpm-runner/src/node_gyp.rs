@@ -82,17 +82,52 @@ impl NpmNodeGyp {
         // Node can't start a script named with the prefix a resolved path
         // carries on Windows.
         let script = lpm_common::symlink::windows_plain_path(&script);
+        struct NodeGypManifest {
+            version: Option<String>,
+        }
+        impl<'de> serde::Deserialize<'de> for NodeGypManifest {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = NodeGypManifest;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("a package.json object")
+                    }
+
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: serde::de::MapAccess<'de>,
+                    {
+                        let mut version = None;
+                        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                            if key == "version" {
+                                let value: serde_json::Value = map.next_value()?;
+                                version = value.as_str().map(str::to_owned);
+                            } else {
+                                let _: serde::de::IgnoredAny = map.next_value()?;
+                            }
+                        }
+                        Ok(NodeGypManifest { version })
+                    }
+                }
+                deserializer.deserialize_map(Visitor)
+            }
+        }
+
         let manifest = lpm_common::read_file_capped(
             &package.join("package.json"),
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         )
         .ok()?;
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+        let manifest: NodeGypManifest = serde_json::from_slice(&manifest).ok()?;
         // The version goes into a command file as a comment, so it keeps
         // only what a version is written with.
         let version: String = manifest
-            .get("version")?
-            .as_str()?
+            .version?
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
             .take(64)
@@ -564,5 +599,29 @@ pub(crate) mod tests {
 
         assert!(!OFFERED_TO_SCRIPTS.load(Ordering::Relaxed));
         assert_eq!(command_directory(&[bin]), None);
+    }
+
+    #[test]
+    fn node_gyp_manifest_rejects_array_and_accepts_duplicate_version_last_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let modules = root.path().join("node_modules");
+        let bin_dir = modules.join("node-gyp").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("node-gyp.js"), "// stub").unwrap();
+
+        std::fs::write(
+            modules.join("node-gyp").join("package.json"),
+            r#"["9.0.0"]"#,
+        )
+        .unwrap();
+        assert!(NpmNodeGyp::in_modules(modules.clone()).is_none());
+
+        std::fs::write(
+            modules.join("node-gyp").join("package.json"),
+            r#"{"version":"8.0.0","version":"10.1.0"}"#,
+        )
+        .unwrap();
+        let resolved = NpmNodeGyp::in_modules(modules).expect("duplicate version should parse");
+        assert_eq!(resolved.version, "10.1.0");
     }
 }

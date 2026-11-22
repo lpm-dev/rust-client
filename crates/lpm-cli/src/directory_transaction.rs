@@ -4,21 +4,21 @@ use cap_std::fs::Dir;
 use std::ffi::{OsStr, OsString};
 
 #[cfg(unix)]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryIdentity {
     volume: u32,
     file_index: u64,
 }
 
 #[cfg(not(any(unix, windows)))]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryIdentity;
 
 #[cfg(unix)]

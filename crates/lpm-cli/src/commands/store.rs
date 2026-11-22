@@ -304,9 +304,20 @@ fn run_verify(
     let mut referenced_objects_ok = true;
     let v2_paths = lpm_store::v2::StoreV2Paths::from_lpm_root(lpm_root);
     let v3_paths = lpm_store::v2::StoreV2Paths::from_lpm_root_v3(lpm_root);
-    let mut security_checked_objects = HashSet::new();
+    let store_root = lpm_root.store_root();
 
-    for (entry_index, entry) in packages.iter().enumerate() {
+    struct EntryStageOneOutcome {
+        entry_index: usize,
+        safe_name: String,
+        safe_version: String,
+        referenced_object_failed: bool,
+        compared_lockfile: bool,
+        corrupted: Vec<String>,
+        passed: bool,
+        security_cache_object_dir: Option<std::path::PathBuf>,
+    }
+
+    let check_entry = |(entry_index, entry): (usize, &StoreVerifyEntry)| -> EntryStageOneOutcome {
         let StoreVerifyEntry {
             name,
             version,
@@ -316,24 +327,28 @@ fn run_verify(
             store_version,
             tree_digest,
         } = entry;
-        // L59: every state-derived field that may carry sidecar / dir
-        // / package.json control bytes goes through sanitize_for_terminal
-        // before format!. Without this a tampered sidecar can ride
-        // ESC/BEL/OSC sequences into the human emitter.
         let safe_name = sanitize_for_terminal(name);
         let safe_version = sanitize_for_terminal(version);
+        let mut outcome = EntryStageOneOutcome {
+            entry_index,
+            safe_name,
+            safe_version,
+            referenced_object_failed: false,
+            compared_lockfile: false,
+            corrupted: Vec::new(),
+            passed: false,
+            security_cache_object_dir: None,
+        };
 
-        // Virtual-store links strip `.lpm-security.json`; installs read the
-        // analysis from the shared object directory, so verify checks it there.
-        let mut security_cache_object_dir = None;
         if let Some(object_path) = object_path {
             let safe_object_path = sanitize_for_terminal(object_path);
             let Some(source_sri) = inline_integrity.as_deref() else {
-                referenced_objects_ok = false;
-                corrupted.push(format!(
-                    "{safe_name}@{safe_version} — virtual-store link missing source integrity for {safe_object_path}"
+                outcome.referenced_object_failed = true;
+                outcome.corrupted.push(format!(
+                    "{}@{} — virtual-store link missing source integrity for {safe_object_path}",
+                    outcome.safe_name, outcome.safe_version
                 ));
-                continue;
+                return outcome;
             };
             let paths = if *store_version == Some(lpm_store::StoreVersion::V3) {
                 &v3_paths
@@ -343,59 +358,70 @@ fn run_verify(
             let expected_object_path = match paths.relative_object_path(source_sri) {
                 Ok(path) => path,
                 Err(e) => {
-                    referenced_objects_ok = false;
-                    corrupted.push(format!(
-                        "{safe_name}@{safe_version} — invalid referenced object hash: {}",
+                    outcome.referenced_object_failed = true;
+                    outcome.corrupted.push(format!(
+                        "{}@{} — invalid referenced object hash: {}",
+                        outcome.safe_name,
+                        outcome.safe_version,
                         sanitize_for_terminal(&e.to_string())
                     ));
-                    continue;
+                    return outcome;
                 }
             };
             if *object_path != expected_object_path {
-                referenced_objects_ok = false;
-                corrupted.push(format!(
-                    "{safe_name}@{safe_version} — object path mismatch: sidecar '{}' != hash '{}'",
+                outcome.referenced_object_failed = true;
+                outcome.corrupted.push(format!(
+                    "{}@{} — object path mismatch: sidecar '{}' != hash '{}'",
+                    outcome.safe_name,
+                    outcome.safe_version,
                     safe_object_path,
                     sanitize_for_terminal(&expected_object_path)
                 ));
-                continue;
+                return outcome;
             }
             if !virtual_object_paths.contains(&(
                 store_version.unwrap_or(lpm_store::StoreVersion::V2),
                 object_path.clone(),
             )) {
-                referenced_objects_ok = false;
-                corrupted.push(format!(
-                    "{safe_name}@{safe_version} — referenced object missing: {safe_object_path}"
+                outcome.referenced_object_failed = true;
+                outcome.corrupted.push(format!(
+                    "{}@{} — referenced object missing: {safe_object_path}",
+                    outcome.safe_name, outcome.safe_version
                 ));
-                continue;
+                return outcome;
             }
             let expected_tree_digest = if *store_version == Some(lpm_store::StoreVersion::V3) {
                 match v3_store.file_cas_tree_digest(source_sri) {
                     Ok(digest) => digest,
                     Err(error) => {
-                        corrupted.push(format!(
-                            "{safe_name}@{safe_version} — invalid CAS source record: {}",
+                        outcome.corrupted.push(format!(
+                            "{}@{} — invalid CAS source record: {}",
+                            outcome.safe_name,
+                            outcome.safe_version,
                             sanitize_for_terminal(&error.to_string())
                         ));
-                        continue;
+                        return outcome;
                     }
                 }
             } else {
                 None
             };
             if tree_digest.as_deref() != expected_tree_digest.as_deref() {
-                corrupted.push(format!(
-                    "{safe_name}@{safe_version} — CAS tree reference mismatch"
+                outcome.corrupted.push(format!(
+                    "{}@{} — CAS tree reference mismatch",
+                    outcome.safe_name, outcome.safe_version
                 ));
-                continue;
+                return outcome;
             }
-            security_cache_object_dir = paths.object_dir(source_sri).ok();
+            outcome.security_cache_object_dir = paths.object_dir(source_sri).ok();
         }
 
-        if let Err(error) = maintenance::verify_directory_chain(&lpm_root.store_root(), dir) {
-            corrupted.push(format!("{safe_name}@{safe_version} — {error}"));
-            continue;
+        if let Err(error) = maintenance::verify_directory_chain(&store_root, dir) {
+            outcome.corrupted.push(format!(
+                "{}@{} — {error}",
+                outcome.safe_name, outcome.safe_version
+            ));
+            return outcome;
         }
         let pkg_json_path = dir.join("package.json");
         match std::fs::symlink_metadata(&pkg_json_path) {
@@ -404,69 +430,76 @@ fn run_verify(
                     && !lpm_common::is_symlink_or_junction(&metadata)
                     && metadata.len() > 0 => {}
             Ok(_) => {
-                corrupted.push(format!(
-                    "{safe_name}@{safe_version} — package.json must be a nonempty regular file"
+                outcome.corrupted.push(format!(
+                    "{}@{} — package.json must be a nonempty regular file",
+                    outcome.safe_name, outcome.safe_version
                 ));
-                continue;
+                return outcome;
             }
             Err(error) => {
-                corrupted.push(format!(
-                    "{safe_name}@{safe_version} — missing or unreadable package.json: {}",
+                outcome.corrupted.push(format!(
+                    "{}@{} — missing or unreadable package.json: {}",
+                    outcome.safe_name,
+                    outcome.safe_version,
                     sanitize_for_terminal(&error.to_string())
                 ));
-                continue;
+                return outcome;
             }
         }
 
-        // Deep mode: parse package.json, validate name/version fields,
-        // and verify integrity hash against lockfile.
         if deep {
             match lpm_common::read_text_file_capped_nofollow(
                 &pkg_json_path,
                 lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
             ) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(pkg) => {
-                            if !pkg.is_object() {
-                                corrupted.push(format!("{safe_name}@{safe_version} — package.json must contain an object"));
-                                continue;
-                            }
-                            let mut invalid_identity = false;
-                            for (field, expected) in [("name", name), ("version", version)] {
-                                if let Some(value) = pkg.get(field)
-                                    && value.as_str() != Some(expected.as_str())
-                                {
-                                    corrupted.push(format!(
-                                        "{safe_name}@{safe_version} — package.json {field} mismatch: expected '{}'", sanitize_for_terminal(expected)
-                                    ));
-                                    invalid_identity = true;
-                                }
-                            }
-                            if invalid_identity {
-                                continue;
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(pkg) => {
+                        if !pkg.is_object() {
+                            outcome.corrupted.push(format!(
+                                "{}@{} — package.json must contain an object",
+                                outcome.safe_name, outcome.safe_version
+                            ));
+                            return outcome;
+                        }
+                        let mut invalid_identity = false;
+                        for (field, expected) in [("name", name), ("version", version)] {
+                            if let Some(value) = pkg.get(field)
+                                && value.as_str() != Some(expected.as_str())
+                            {
+                                outcome.corrupted.push(format!(
+                                    "{}@{} — package.json {field} mismatch: expected '{}'",
+                                    outcome.safe_name,
+                                    outcome.safe_version,
+                                    sanitize_for_terminal(expected)
+                                ));
+                                invalid_identity = true;
                             }
                         }
-                        Err(e) => {
-                            corrupted.push(format!(
-                                "{safe_name}@{safe_version} — invalid package.json: {}",
-                                sanitize_for_terminal(&e.to_string())
-                            ));
-                            continue;
+                        if invalid_identity {
+                            return outcome;
                         }
                     }
-                }
+                    Err(e) => {
+                        outcome.corrupted.push(format!(
+                            "{}@{} — invalid package.json: {}",
+                            outcome.safe_name,
+                            outcome.safe_version,
+                            sanitize_for_terminal(&e.to_string())
+                        ));
+                        return outcome;
+                    }
+                },
                 Err(e) => {
-                    corrupted.push(format!(
-                        "{safe_name}@{safe_version} — unreadable package.json: {}",
+                    outcome.corrupted.push(format!(
+                        "{}@{} — unreadable package.json: {}",
+                        outcome.safe_name,
+                        outcome.safe_version,
                         sanitize_for_terminal(&e.to_string())
                     ));
-                    continue;
+                    return outcome;
                 }
             }
 
-            // Compare only after project links independently bind this entry to
-            // a locked artifact. Global name/version coordinates are not provenance.
             if let Some(expected_integrity) = lockfile_verification.expected.get(&entry_index) {
                 let stored = match inline_integrity.as_deref() {
                     Some(integrity) => Ok(Some(std::borrow::Cow::Borrowed(integrity))),
@@ -485,15 +518,17 @@ fn run_verify(
                     Ok(Some(stored)) => {
                         let matches = stored == *expected_integrity;
                         if !matches {
-                            corrupted.push(format!(
-                                "{safe_name}@{safe_version} — integrity mismatch: stored '{}...' != lockfile '{}...'",
+                            outcome.corrupted.push(format!(
+                                "{}@{} — integrity mismatch: stored '{}...' != lockfile '{}...'",
+                                outcome.safe_name,
+                                outcome.safe_version,
                                 truncate_chars_safe(&sanitize_for_terminal(&stored), 20),
                                 truncate_chars_safe(&sanitize_for_terminal(expected_integrity), 20),
                             ));
                         }
-                        lockfile_verification.record_comparison(entry_index);
+                        outcome.compared_lockfile = true;
                         if !matches {
-                            continue;
+                            return outcome;
                         }
                     }
                     Ok(None) => {
@@ -502,71 +537,203 @@ fn run_verify(
                         );
                     }
                     Err(error) => {
-                        corrupted.push(format!(
-                            "{safe_name}@{safe_version} — unreadable integrity marker: {}",
+                        outcome.corrupted.push(format!(
+                            "{}@{} — unreadable integrity marker: {}",
+                            outcome.safe_name,
+                            outcome.safe_version,
                             sanitize_for_terminal(&error.to_string()),
                         ));
-                        continue;
+                        return outcome;
                     }
                 }
             }
+        }
 
-            // Security cross-check: re-run behavioral analysis and compare with cached.
-            // Read-only by default — only writes when --fix is passed.
-            let security_cache_dir = security_cache_object_dir.as_deref().unwrap_or(dir);
-            if security_cache_object_dir.is_some()
-                && !security_checked_objects.insert(security_cache_dir.to_path_buf())
-            {
-                verified += 1;
-                continue;
-            }
-            let cached = lpm_security::behavioral::read_cached_analysis(security_cache_dir);
-            let fresh = lpm_security::behavioral::analyze_package(dir);
+        outcome.passed = true;
+        outcome
+    };
 
-            match cached {
-                Some(ref cached_analysis) => {
-                    if !security_analysis_matches(cached_analysis, &fresh) {
-                        security_mismatches += 1;
-                        if fix {
-                            let fixed = match write_security_cache_for_verify(
-                                security_cache_dir,
-                                &fresh,
-                                &safe_name,
-                                &safe_version,
-                            ) {
-                                Ok(()) => {
-                                    security_reanalyzed += 1;
-                                    true
-                                }
-                                Err(issue) => {
-                                    security_fix_failures += 1;
-                                    tracing::warn!("{issue}");
-                                    corrupted.push(issue);
-                                    false
-                                }
-                            };
-                            if !json_output {
-                                let status = if fixed { "fixed" } else { "fix failed" };
-                                install_ui::warn_untrusted(&format!(
-                                    "{safe_name}@{safe_version} — security analysis mismatch ({status})"
-                                ));
-                            }
-                        } else if !json_output {
-                            install_ui::warn_untrusted(&format!(
-                                "{name}@{version} — security analysis mismatch (use --fix to refresh)"
-                            ));
-                        }
+    let stage_one_outcomes: Vec<EntryStageOneOutcome> = if packages.len() >= 4 {
+        use rayon::prelude::*;
+        packages.par_iter().enumerate().map(check_entry).collect()
+    } else {
+        packages.iter().enumerate().map(check_entry).collect()
+    };
+
+    let mut security_checked_objects = HashSet::new();
+    struct SecurityVerifyJob {
+        entry_index: usize,
+        safe_name: String,
+        safe_version: String,
+        security_cache_dir: std::path::PathBuf,
+    }
+    enum SecurityVerifyOutcome {
+        Matched,
+        DirectoryChanged(String),
+        Mismatch {
+            missing_cache: bool,
+            fix_result: Option<Result<(), String>>,
+        },
+    }
+
+    let mut security_jobs = Vec::new();
+    for outcome in &stage_one_outcomes {
+        if !outcome.passed || !deep {
+            continue;
+        }
+        let entry = &packages[outcome.entry_index];
+        // Virtual-store links strip `.lpm-security.json`; installs read the
+        // analysis from the shared object directory, so verify checks it there.
+        let security_cache_dir = outcome
+            .security_cache_object_dir
+            .as_deref()
+            .unwrap_or(&entry.dir);
+        if outcome.security_cache_object_dir.is_some()
+            && !security_checked_objects.insert(security_cache_dir.to_path_buf())
+        {
+            continue;
+        }
+        security_jobs.push(SecurityVerifyJob {
+            entry_index: outcome.entry_index,
+            safe_name: outcome.safe_name.clone(),
+            safe_version: outcome.safe_version.clone(),
+            security_cache_dir: security_cache_dir.to_path_buf(),
+        });
+    }
+
+    let mut security_outcomes_by_entry: std::collections::HashMap<usize, SecurityVerifyOutcome> =
+        std::collections::HashMap::with_capacity(security_jobs.len());
+    if deep && !security_jobs.is_empty() {
+        let run_security_job = |job: SecurityVerifyJob| -> (usize, SecurityVerifyOutcome) {
+            let source_path = &packages[job.entry_index].dir;
+            let source_dir =
+                match maintenance::open_verified_directory_chain(&store_root, source_path) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return (
+                            job.entry_index,
+                            SecurityVerifyOutcome::DirectoryChanged(format!(
+                                "{}@{} — {error}",
+                                job.safe_name, job.safe_version
+                            )),
+                        );
+                    }
+                };
+            let cache_dir = if job.security_cache_dir == *source_path {
+                match source_dir.try_clone() {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return (
+                            job.entry_index,
+                            SecurityVerifyOutcome::DirectoryChanged(format!(
+                                "{}@{} — cannot retain security cache directory: {}",
+                                job.safe_name,
+                                job.safe_version,
+                                sanitize_for_terminal(&error.to_string())
+                            )),
+                        );
                     }
                 }
-                None => {
-                    security_mismatches += 1;
-                    if fix {
-                        let fixed = match write_security_cache_for_verify(
-                            security_cache_dir,
+            } else {
+                match maintenance::open_verified_directory_chain(
+                    &store_root,
+                    &job.security_cache_dir,
+                ) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        return (
+                            job.entry_index,
+                            SecurityVerifyOutcome::DirectoryChanged(format!(
+                                "{}@{} — {error}",
+                                job.safe_name, job.safe_version
+                            )),
+                        );
+                    }
+                }
+            };
+
+            let cached = lpm_security::behavioral::read_cached_analysis_from_open_dir(&cache_dir);
+            let fresh = lpm_security::behavioral::analyze_package_from_open_dir(
+                &source_dir,
+                lpm_security::behavioral::PackageDirectory::Published,
+            );
+
+            // Compare and (when --fix is active) repair through the pinned
+            // directory handle immediately so both analyses drop before the
+            // worker returns.
+            let outcome = match cached {
+                Some(ref cached_analysis) if security_analysis_matches(cached_analysis, &fresh) => {
+                    SecurityVerifyOutcome::Matched
+                }
+                cached_opt => {
+                    let missing_cache = cached_opt.is_none();
+                    let fix_result = if fix {
+                        Some(write_security_cache_for_verify_in_dir(
+                            &cache_dir,
                             &fresh,
-                            &safe_name,
-                            &safe_version,
-                        ) {
+                            &job.safe_name,
+                            &job.safe_version,
+                        ))
+                    } else {
+                        None
+                    };
+                    SecurityVerifyOutcome::Mismatch {
+                        missing_cache,
+                        fix_result,
+                    }
+                }
+            };
+            (job.entry_index, outcome)
+        };
+
+        let results: Vec<_> = if security_jobs.len() >= 4 {
+            use rayon::prelude::*;
+            security_jobs
+                .into_par_iter()
+                .map(run_security_job)
+                .collect()
+        } else {
+            security_jobs.into_iter().map(run_security_job).collect()
+        };
+        security_outcomes_by_entry.extend(results);
+    }
+
+    for mut outcome in stage_one_outcomes {
+        if outcome.referenced_object_failed {
+            referenced_objects_ok = false;
+        }
+        if outcome.compared_lockfile {
+            lockfile_verification.record_comparison(outcome.entry_index);
+        }
+        corrupted.append(&mut outcome.corrupted);
+        if !outcome.passed {
+            continue;
+        }
+        if let Some(sec_outcome) = security_outcomes_by_entry.remove(&outcome.entry_index) {
+            let entry = &packages[outcome.entry_index];
+            let name = &entry.name;
+            let version = &entry.version;
+            let safe_name = &outcome.safe_name;
+            let safe_version = &outcome.safe_version;
+            match sec_outcome {
+                SecurityVerifyOutcome::Matched => {
+                    verified += 1;
+                }
+                SecurityVerifyOutcome::DirectoryChanged(issue) => {
+                    corrupted.push(issue);
+                }
+                SecurityVerifyOutcome::Mismatch {
+                    missing_cache,
+                    fix_result,
+                } => {
+                    security_mismatches += 1;
+                    let label = if missing_cache {
+                        "missing security cache"
+                    } else {
+                        "security analysis mismatch"
+                    };
+                    if let Some(fix_result) = fix_result {
+                        let fixed = match fix_result {
                             Ok(()) => {
                                 security_reanalyzed += 1;
                                 true
@@ -581,19 +748,23 @@ fn run_verify(
                         if !json_output {
                             let status = if fixed { "fixed" } else { "fix failed" };
                             install_ui::warn_untrusted(&format!(
-                                "{safe_name}@{safe_version} — missing security cache ({status})"
+                                "{safe_name}@{safe_version} — {label} ({status})"
                             ));
                         }
                     } else if !json_output {
-                        install_ui::warn_untrusted(&format!(
-                            "{name}@{version} — missing security cache (use --fix to generate)"
-                        ));
+                        let hint = if missing_cache {
+                            "use --fix to generate"
+                        } else {
+                            "use --fix to refresh"
+                        };
+                        install_ui::warn_untrusted(&format!("{name}@{version} — {label} ({hint})"));
                     }
+                    verified += 1;
                 }
             }
+        } else {
+            verified += 1;
         }
-
-        verified += 1;
     }
 
     if !json_output {
@@ -992,13 +1163,13 @@ fn security_analysis_matches(
         && cached.manifest == fresh.manifest
 }
 
-fn write_security_cache_for_verify(
-    dir: &std::path::Path,
+fn write_security_cache_for_verify_in_dir(
+    dir: &cap_std::fs::Dir,
     fresh: &lpm_security::behavioral::PackageAnalysis,
     safe_name: &str,
     safe_version: &str,
 ) -> Result<(), String> {
-    lpm_security::behavioral::write_cached_analysis_atomic(dir, fresh).map_err(|e| {
+    lpm_security::behavioral::write_cached_analysis_atomic_in_dir(dir, fresh).map_err(|e| {
         format!(
             "{safe_name}@{safe_version} — failed to write .lpm-security.json: {}",
             sanitize_for_terminal(&e.to_string())

@@ -219,6 +219,35 @@ pub async fn verify_packages(
     verify_packages_with_timings(client, route_table, inputs, allow_metadata_hydration, None).await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SignatureDedupKey {
+    name: String,
+    version: String,
+    source: Option<String>,
+    resolved_url: Option<String>,
+    integrity: Option<String>,
+    published_at: Option<String>,
+    signatures: Vec<(Option<String>, Option<String>)>,
+}
+
+impl SignatureDedupKey {
+    fn from_input(input: &RegistrySignatureInput) -> Self {
+        Self {
+            name: input.name.clone(),
+            version: input.version.clone(),
+            source: input.source.clone(),
+            resolved_url: input.resolved_url.clone(),
+            integrity: input.integrity.clone(),
+            published_at: input.published_at.clone(),
+            signatures: input
+                .signatures
+                .iter()
+                .map(|sig| (sig.keyid.clone(), sig.sig.clone()))
+                .collect(),
+        }
+    }
+}
+
 pub(crate) async fn verify_packages_with_timings(
     client: Arc<RegistryClient>,
     route_table: RouteTable,
@@ -227,24 +256,75 @@ pub(crate) async fn verify_packages_with_timings(
     timings: Option<Arc<RegistrySignatureTimings>>,
 ) -> RegistrySignatureReport {
     let total_start = std::time::Instant::now();
-    let packages = futures::stream::iter(inputs.into_iter().map(|input| {
-        let client = Arc::clone(&client);
-        let route_table = route_table.clone();
-        let timings = timings.clone();
-        async move {
-            verify_one_package(
-                client,
-                route_table,
-                input,
-                allow_metadata_hydration,
-                timings.as_deref(),
-            )
-            .await
+    let route_table = Arc::new(route_table);
+
+    let mut seen: std::collections::HashMap<SignatureDedupKey, usize> =
+        std::collections::HashMap::with_capacity(inputs.len());
+    let mut unique_inputs = Vec::with_capacity(inputs.len());
+    let mut index_map = Vec::with_capacity(inputs.len());
+    let mut unique_counts = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let key = SignatureDedupKey::from_input(&input);
+        let unique_idx = match seen.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let idx = *entry.get();
+                unique_counts[idx] += 1;
+                idx
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let idx = unique_inputs.len();
+                entry.insert(idx);
+                unique_inputs.push(input);
+                unique_counts.push(1usize);
+                idx
+            }
+        };
+        index_map.push(unique_idx);
+    }
+    drop(seen);
+
+    let unique_results: Vec<RegistrySignaturePackageResult> =
+        futures::stream::iter(unique_inputs.into_iter().map(|input| {
+            let client = Arc::clone(&client);
+            let route_table = Arc::clone(&route_table);
+            let timings = timings.clone();
+            async move {
+                verify_one_package(
+                    client,
+                    route_table,
+                    input,
+                    allow_metadata_hydration,
+                    timings.as_deref(),
+                )
+                .await
+            }
+        }))
+        .buffered(VERIFY_CONCURRENCY)
+        .collect()
+        .await;
+
+    let packages = if unique_results.len() == index_map.len() {
+        unique_results
+    } else {
+        let mut slots: Vec<Option<RegistrySignaturePackageResult>> =
+            unique_results.into_iter().map(Some).collect();
+        let mut packages = Vec::with_capacity(index_map.len());
+        for idx in index_map {
+            unique_counts[idx] -= 1;
+            let row = if unique_counts[idx] == 0 {
+                slots[idx]
+                    .take()
+                    .expect("unique signature result present for last consumer")
+            } else {
+                slots[idx]
+                    .as_ref()
+                    .expect("unique signature result present for shared consumer")
+                    .clone()
+            };
+            packages.push(row);
         }
-    }))
-    .buffered(VERIFY_CONCURRENCY)
-    .collect()
-    .await;
+        packages
+    };
 
     if let Some(timings) = &timings {
         timings.record_total_wall(total_start.elapsed());
@@ -269,7 +349,7 @@ fn package_result_to_json(package: &RegistrySignaturePackageResult) -> serde_jso
 
 async fn verify_one_package(
     client: Arc<RegistryClient>,
-    route_table: RouteTable,
+    route_table: Arc<RouteTable>,
     mut input: RegistrySignatureInput,
     allow_metadata_hydration: bool,
     timings: Option<&RegistrySignatureTimings>,
@@ -326,33 +406,68 @@ async fn verify_one_package(
         return not_verified(input, reason);
     }
 
-    let crypto_start = std::time::Instant::now();
-    let verification = lpm_registry::verify_registry_signatures(
-        &input.name,
-        &input.version,
-        &integrity,
-        &input.signatures,
-        &keys,
-        input.published_at.as_deref(),
-    );
-    if let Some(timings) = timings {
-        timings.record_crypto(crypto_start.elapsed());
-    }
-    match verification {
-        Ok(RegistrySignatureVerification::Verified { count }) => RegistrySignaturePackageResult {
-            name: input.name,
-            version: input.version,
-            status: RegistrySignatureStatus::Verified,
-            reason: None,
-            signatures_verified: count,
-        },
-        Ok(RegistrySignatureVerification::NoSignatures) => {
-            not_verified(input, RegistrySignatureReason::MissingSignatures)
+    let name = input.name;
+    let version = input.version;
+    let fallback_name = name.clone();
+    let fallback_version = version.clone();
+    let signatures = input.signatures;
+    let published_at = input.published_at;
+    let verify_result = tokio::task::spawn_blocking(move || {
+        let crypto_start = std::time::Instant::now();
+        let verification = lpm_registry::verify_registry_signatures(
+            &name,
+            &version,
+            &integrity,
+            &signatures,
+            &keys,
+            published_at.as_deref(),
+        );
+        let crypto_elapsed = crypto_start.elapsed();
+        (name, version, verification, crypto_elapsed)
+    })
+    .await;
+    match verify_result {
+        Ok((name, version, outcome, crypto_elapsed)) => {
+            if let Some(timings) = timings {
+                timings.record_crypto(crypto_elapsed);
+            }
+            match outcome {
+                Ok(RegistrySignatureVerification::Verified { count }) => {
+                    RegistrySignaturePackageResult {
+                        name,
+                        version,
+                        status: RegistrySignatureStatus::Verified,
+                        reason: None,
+                        signatures_verified: count,
+                    }
+                }
+                Ok(RegistrySignatureVerification::NoSignatures) => RegistrySignaturePackageResult {
+                    name,
+                    version,
+                    status: RegistrySignatureStatus::NotVerified,
+                    reason: Some(RegistrySignatureReason::MissingSignatures),
+                    signatures_verified: 0,
+                },
+                Err(error) => RegistrySignaturePackageResult {
+                    name,
+                    version,
+                    status: RegistrySignatureStatus::NotVerified,
+                    reason: Some(RegistrySignatureReason::VerificationFailed(
+                        error.to_string(),
+                    )),
+                    signatures_verified: 0,
+                },
+            }
         }
-        Err(error) => not_verified(
-            input,
-            RegistrySignatureReason::VerificationFailed(error.to_string()),
-        ),
+        Err(join_error) => RegistrySignaturePackageResult {
+            name: fallback_name,
+            version: fallback_version,
+            status: RegistrySignatureStatus::NotVerified,
+            reason: Some(RegistrySignatureReason::VerificationFailed(
+                join_error.to_string(),
+            )),
+            signatures_verified: 0,
+        },
     }
 }
 
@@ -759,7 +874,7 @@ mod tests {
     async fn foreign_lpm_scoped_package_is_not_skipped_by_name_alone() {
         let result = verify_one_package(
             Arc::new(RegistryClient::new()),
-            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            Arc::new(RouteTable::from_mode_only(lpm_registry::RouteMode::Direct)),
             RegistrySignatureInput {
                 name: "@lpm.dev/dependency-confusion".to_string(),
                 version: "1.0.0".to_string(),
@@ -785,7 +900,7 @@ mod tests {
     async fn lpm_scoped_package_from_configured_lpm_registry_is_skipped() {
         let result = verify_one_package(
             Arc::new(RegistryClient::new()),
-            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            Arc::new(RouteTable::from_mode_only(lpm_registry::RouteMode::Direct)),
             RegistrySignatureInput {
                 name: "@lpm.dev/owner.package".to_string(),
                 version: "1.0.0".to_string(),
@@ -805,5 +920,48 @@ mod tests {
             result.reason,
             Some(RegistrySignatureReason::LpmRegistryPackage)
         ));
+    }
+
+    #[tokio::test]
+    async fn verify_packages_deduplicates_identical_inputs_and_preserves_order() {
+        let dup = RegistrySignatureInput {
+            name: "dup-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            resolved_url: None,
+            integrity: Some("sha512-test".to_string()),
+            signatures: Vec::new(),
+            published_at: None,
+        };
+        let skipped_lpm = RegistrySignatureInput {
+            name: "@lpm.dev/owner.pkg".to_string(),
+            version: "2.0.0".to_string(),
+            source: Some("registry+https://lpm.dev".to_string()),
+            resolved_url: None,
+            integrity: None,
+            signatures: Vec::new(),
+            published_at: None,
+        };
+        let report = verify_packages(
+            Arc::new(RegistryClient::new()),
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            vec![dup.clone(), skipped_lpm, dup],
+            false,
+        )
+        .await;
+
+        assert_eq!(report.packages.len(), 3);
+        assert_eq!(report.packages[0].name, "dup-pkg");
+        assert_eq!(
+            report.packages[0].status,
+            RegistrySignatureStatus::NotVerified
+        );
+        assert_eq!(report.packages[1].name, "@lpm.dev/owner.pkg");
+        assert_eq!(report.packages[1].status, RegistrySignatureStatus::Skipped);
+        assert_eq!(report.packages[2].name, "dup-pkg");
+        assert_eq!(
+            report.packages[2].status,
+            RegistrySignatureStatus::NotVerified
+        );
     }
 }

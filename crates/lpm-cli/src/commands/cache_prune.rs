@@ -1309,21 +1309,34 @@ fn compute_prune(
 
     let mut bytes_freed_or_eligible = 0u64;
     if build_full_plan && !flags.apply {
-        for dir in &link_entries_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-        }
-        for dir in &object_entries_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-        }
-        for dir in &compat_islands_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-        }
-        for dir in &build_artifacts_orphaned {
-            bytes_freed_or_eligible =
-                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+        let total_orphan_dirs = link_entries_orphaned.len()
+            + object_entries_orphaned.len()
+            + compat_islands_orphaned.len()
+            + build_artifacts_orphaned.len();
+        if total_orphan_dirs >= 4 {
+            use rayon::prelude::*;
+            bytes_freed_or_eligible = [
+                &link_entries_orphaned,
+                &object_entries_orphaned,
+                &compat_islands_orphaned,
+                &build_artifacts_orphaned,
+            ]
+            .into_iter()
+            .flat_map(|dirs| dirs.iter())
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|dir| dir_size(dir).unwrap_or(0))
+            .reduce(|| 0u64, u64::saturating_add);
+        } else {
+            for dir in link_entries_orphaned
+                .iter()
+                .chain(&object_entries_orphaned)
+                .chain(&compat_islands_orphaned)
+                .chain(&build_artifacts_orphaned)
+            {
+                bytes_freed_or_eligible =
+                    bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+            }
         }
     }
 
@@ -1495,15 +1508,25 @@ fn parse_duration(s: &str) -> Result<Age, LpmError> {
     })
 }
 
-fn dir_size(dir: &Path) -> std::io::Result<u64> {
+fn dir_size(root: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let meta = std::fs::symlink_metadata(entry.path())?;
-        if meta.is_file() {
-            total = total.saturating_add(meta.len());
-        } else if meta.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path())?);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // Drain each ReadDir into the stack before descending so deep trees
+        // never hold more than one directory descriptor per worker.
+        let entries = std::fs::read_dir(&dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if lpm_common::is_symlink_or_junction(&meta) {
+                continue;
+            }
+            if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            } else if meta.is_dir() {
+                stack.push(path);
+            }
         }
     }
     Ok(total)
