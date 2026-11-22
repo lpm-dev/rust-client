@@ -47,11 +47,11 @@ mod url_gate;
 pub use self::auth::AuthPosture;
 pub use self::body::parse_capped_api_json;
 pub use self::firewall::{
-    NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse, NpmFirewallClientTiming,
-    NpmFirewallDecision, NpmFirewallDecisionAuthority, NpmFirewallDecisionDisplay,
-    NpmFirewallDecisionPolicy, NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics,
-    NpmFirewallLookupDuration, NpmFirewallMatchSources, NpmFirewallPolicyAction,
-    NpmFirewallPolicyProfile, NpmFirewallSummary,
+    NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse,
+    NpmFirewallCacheDirective, NpmFirewallClientTiming, NpmFirewallDecision,
+    NpmFirewallDecisionAuthority, NpmFirewallDecisionDisplay, NpmFirewallDecisionPolicy,
+    NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics, NpmFirewallLookupDuration,
+    NpmFirewallMatchSources, NpmFirewallPolicyAction, NpmFirewallPolicyProfile, NpmFirewallSummary,
 };
 pub use self::install_accounting::{
     MANAGED_INSTALL_ACCOUNTING_HEADER, MANAGED_INSTALL_ACCOUNTING_VERSION,

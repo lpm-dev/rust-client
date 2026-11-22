@@ -537,36 +537,149 @@ pub(super) struct CachedClient {
 }
 
 /// The client set for origins without TLS configuration of their own. A
-/// registry client without TLS overrides builds it on first use, so a command
-/// that never reaches a registry, such as `lpm run`, doesn't parse the bundled
-/// root certificates for each of its clients.
-pub(super) struct DefaultClient(std::sync::OnceLock<CachedClient>);
+/// registry client without TLS overrides builds only the exact client pool
+/// each request uses, so short or single-RPC commands do not construct all
+/// eleven HTTP clients up front.
+pub(super) struct LazyDefaultClient {
+    proxy_warning: std::sync::Once,
+    client: std::sync::OnceLock<reqwest::Client>,
+    policy_metadata_client: std::sync::OnceLock<reqwest::Client>,
+    request_lanes: std::sync::OnceLock<Arc<[std::sync::OnceLock<reqwest::Client>]>>,
+    transfer_client: std::sync::OnceLock<reqwest::Client>,
+}
+
+impl LazyDefaultClient {
+    fn new() -> Self {
+        Self {
+            proxy_warning: std::sync::Once::new(),
+            client: std::sync::OnceLock::new(),
+            policy_metadata_client: std::sync::OnceLock::new(),
+            request_lanes: std::sync::OnceLock::new(),
+            transfer_client: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn build(&self, pool: super::http::ClientPool) -> reqwest::Client {
+        self.proxy_warning
+            .call_once(RegistryClient::warn_env_proxy_if_set);
+        RegistryClient::build_default_pool_client(pool)
+    }
+
+    fn general(&self) -> &reqwest::Client {
+        self.client
+            .get_or_init(|| self.build(super::http::ClientPool::General))
+    }
+
+    fn select(&self, pool: super::http::ClientPool) -> reqwest::Client {
+        match pool {
+            super::http::ClientPool::General => self.general().clone(),
+            super::http::ClientPool::PolicyMetadata => self
+                .policy_metadata_client
+                .get_or_init(|| self.build(super::http::ClientPool::PolicyMetadata))
+                .clone(),
+            super::http::ClientPool::ManualRedirect(lane) => {
+                let lanes = self.request_lanes.get_or_init(|| {
+                    let count =
+                        super::http::request_lane_count(std::env::var("LPM_HTTP").ok().as_deref());
+                    (0..count)
+                        .map(|_| std::sync::OnceLock::new())
+                        .collect::<Vec<_>>()
+                        .into()
+                });
+                lanes[lane % lanes.len()]
+                    .get_or_init(|| self.build(super::http::ClientPool::ManualRedirect(lane)))
+                    .clone()
+            }
+            super::http::ClientPool::Transfer => self
+                .transfer_client
+                .get_or_init(|| self.build(super::http::ClientPool::Transfer))
+                .clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_built(&self) -> bool {
+        self.client.get().is_some()
+            || self.policy_metadata_client.get().is_some()
+            || self.transfer_client.get().is_some()
+            || self
+                .request_lanes
+                .get()
+                .is_some_and(|lanes| lanes.iter().any(|slot| slot.get().is_some()))
+    }
+}
+
+pub(super) enum DefaultClient {
+    Built(Box<CachedClient>),
+    Lazy(Box<LazyDefaultClient>),
+}
 
 impl DefaultClient {
     pub(super) fn built(client: CachedClient) -> Self {
-        Self(std::sync::OnceLock::from(client))
+        Self::Built(Box::new(client))
     }
 
     pub(super) fn on_first_use() -> Self {
-        Self(std::sync::OnceLock::new())
+        Self::Lazy(Box::new(LazyDefaultClient::new()))
     }
 
-    pub(super) fn get(&self) -> &CachedClient {
-        self.0
-            .get_or_init(RegistryClient::build_default_cached_client)
+    pub(super) fn general(&self) -> &reqwest::Client {
+        match self {
+            Self::Built(client) => &client.client,
+            Self::Lazy(lazy) => lazy.general(),
+        }
+    }
+
+    pub(super) fn select(&self, pool: super::http::ClientPool) -> reqwest::Client {
+        match self {
+            Self::Built(client) => super::http::select_pool(client, pool),
+            Self::Lazy(lazy) => lazy.select(pool),
+        }
     }
 
     /// The identity fingerprint, without building a client set that would
     /// carry none.
     pub(super) fn identity_fp(&self) -> Option<&str> {
-        self.0
-            .get()
-            .and_then(|client| client.identity_fp.as_deref())
+        match self {
+            Self::Built(client) => client.identity_fp.as_deref(),
+            Self::Lazy(_) => None,
+        }
     }
 
     #[cfg(test)]
     pub(super) fn is_built(&self) -> bool {
-        self.0.get().is_some()
+        match self {
+            Self::Built(_) => true,
+            Self::Lazy(lazy) => lazy.is_built(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lazy_default_client_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_default_client_builds_only_the_requested_pool() {
+        let default = DefaultClient::on_first_use();
+        assert!(!default.is_built());
+
+        let _ = default.select(super::super::http::ClientPool::General);
+        assert!(default.is_built());
+        let DefaultClient::Lazy(lazy) = &default else {
+            panic!("expected lazy default client");
+        };
+        assert!(lazy.client.get().is_some());
+        assert!(lazy.policy_metadata_client.get().is_none());
+        assert!(lazy.request_lanes.get().is_none());
+        assert!(lazy.transfer_client.get().is_none());
+
+        let _ = default.select(super::super::http::ClientPool::ManualRedirect(0));
+        let lanes = lazy.request_lanes.get().expect("request lanes initialized");
+        let built_lanes = lanes.iter().filter(|slot| slot.get().is_some()).count();
+        assert_eq!(built_lanes, 1);
+        assert!(lazy.policy_metadata_client.get().is_none());
+        assert!(lazy.transfer_client.get().is_none());
     }
 }
 
