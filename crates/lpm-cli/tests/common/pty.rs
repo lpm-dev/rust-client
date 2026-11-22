@@ -43,6 +43,38 @@ fn unread_input(file: &File) -> usize {
     usize::try_from(waiting).unwrap_or_default()
 }
 
+/// How [`run_in_pty_with`] runs `lpm`.
+pub struct PtyOptions {
+    /// The pause between the writes of one response.
+    pub pause: Duration,
+    /// Capture lpm's standard output rather than give it the terminal.
+    pub capture_stdout: bool,
+    /// Leave the terminal's descriptor non-blocking, as an earlier program
+    /// can.
+    pub nonblocking_stdin: bool,
+    /// `TERM` for lpm; `None` leaves it unset.
+    pub term: Option<&'static str>,
+}
+
+impl Default for PtyOptions {
+    fn default() -> Self {
+        Self {
+            pause: Duration::ZERO,
+            capture_stdout: false,
+            nonblocking_stdin: false,
+            term: Some("xterm-256color"),
+        }
+    }
+}
+
+/// Each step's response as one write.
+fn whole<'a>(steps: &[(&'a [u8], &'a [u8])]) -> Vec<(&'a [u8], Vec<&'a [u8]>)> {
+    steps
+        .iter()
+        .map(|(prompt, response)| (*prompt, vec![*response]))
+        .collect()
+}
+
 /// Run `lpm` with `args` in a PTY as `cwd`'s command, isolated as
 /// [`crate::common::lpm_command`] isolates it. Each step is a prompt to wait
 /// for and the bytes to send once it shows with echo off, in order; the
@@ -53,11 +85,7 @@ pub fn run_in_pty(
     args: &[&str],
     steps: &[(&[u8], &[u8])],
 ) -> PtySession {
-    let chunked: Vec<(&[u8], Vec<&[u8]>)> = steps
-        .iter()
-        .map(|(prompt, response)| (*prompt, vec![*response]))
-        .collect();
-    run_in_pty_chunked(cwd, lpm_home, args, &chunked, Duration::ZERO)
+    run_in_pty_with(cwd, lpm_home, args, &whole(steps), &PtyOptions::default()).0
 }
 
 /// [`run_in_pty`], sending each response as several writes with `pause`
@@ -69,7 +97,11 @@ pub fn run_in_pty_chunked(
     steps: &[(&[u8], Vec<&[u8]>)],
     pause: Duration,
 ) -> PtySession {
-    run(cwd, lpm_home, args, steps, pause, false).0
+    let options = PtyOptions {
+        pause,
+        ..PtyOptions::default()
+    };
+    run_in_pty_with(cwd, lpm_home, args, steps, &options).0
 }
 
 /// [`run_in_pty`] with lpm's standard output captured rather than the
@@ -80,12 +112,45 @@ pub fn run_in_pty_with_stdout_captured(
     args: &[&str],
     steps: &[(&[u8], &[u8])],
 ) -> (PtySession, String) {
-    let chunked: Vec<(&[u8], Vec<&[u8]>)> = steps
-        .iter()
-        .map(|(prompt, response)| (*prompt, vec![*response]))
-        .collect();
-    let (session, stdout) = run(cwd, lpm_home, args, &chunked, Duration::ZERO, true);
+    let options = PtyOptions {
+        capture_stdout: true,
+        ..PtyOptions::default()
+    };
+    let (session, stdout) = run_in_pty_with(cwd, lpm_home, args, &whole(steps), &options);
     (session, stdout.unwrap_or_default())
+}
+
+/// [`run_in_pty`], calling `before_answer` with each step's index once its
+/// prompt shows and before it's answered, such as to change what the
+/// command is asking about.
+pub fn run_in_pty_answering(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], &[u8])],
+    before_answer: &mut dyn FnMut(usize),
+) -> PtySession {
+    run(
+        cwd,
+        lpm_home,
+        args,
+        &whole(steps),
+        &PtyOptions::default(),
+        before_answer,
+    )
+    .0
+}
+
+/// [`run_in_pty`] with `options`, returning what lpm wrote to its standard
+/// output when it was captured.
+pub fn run_in_pty_with(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], Vec<&[u8]>)],
+    options: &PtyOptions,
+) -> (PtySession, Option<String>) {
+    run(cwd, lpm_home, args, steps, options, &mut |_| {})
 }
 
 fn run(
@@ -93,8 +158,8 @@ fn run(
     lpm_home: &Path,
     args: &[&str],
     steps: &[(&[u8], Vec<&[u8]>)],
-    pause: Duration,
-    capture_stdout: bool,
+    options: &PtyOptions,
+    before_answer: &mut dyn FnMut(usize),
 ) -> (PtySession, Option<String>) {
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -128,10 +193,27 @@ fn run(
     // a session leader's exit revokes its terminal on macOS, which would
     // discard the input lpm left unread instead of keeping it for whatever
     // reads the terminal next, as a shell's foreground job does.
+    if options.nonblocking_stdin {
+        // SAFETY: `slave` owns a valid descriptor, and these calls only update
+        // the flags of the open file description lpm's streams share.
+        unsafe {
+            let flags = libc::fcntl(slave.as_raw_fd(), libc::F_GETFL);
+            assert!(flags >= 0, "read PTY slave flags");
+            assert_eq!(
+                libc::fcntl(slave.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                0,
+                "set PTY slave nonblocking mode"
+            );
+        }
+    }
     let mut command = super::lpm_command(cwd, lpm_home, None, args);
+    match options.term {
+        Some(term) => command.env("TERM", term),
+        None => command.env_remove("TERM"),
+    };
     command
         .stdin(Stdio::from(slave.try_clone().expect("clone PTY stdin")))
-        .stdout(if capture_stdout {
+        .stdout(if options.capture_stdout {
             Stdio::piped()
         } else {
             Stdio::from(slave.try_clone().expect("clone PTY stdout"))
@@ -166,9 +248,10 @@ fn run(
                 .position(|window| window == *prompt)
             && terminal_echo_is_disabled(&master)
         {
+            before_answer(answered);
             for (index, chunk) in response.iter().enumerate() {
                 if index > 0 {
-                    std::thread::sleep(pause);
+                    std::thread::sleep(options.pause);
                 }
                 let mut rest: &[u8] = chunk;
                 while !rest.is_empty() {

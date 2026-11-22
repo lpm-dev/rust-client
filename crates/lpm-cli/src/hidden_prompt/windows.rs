@@ -1,20 +1,76 @@
 //! The console on Windows: keys read as the characters they type, which
 //! covers AltGr, Alt codes and an input method, without echo, line editing,
-//! Ctrl+C's signal or escape sequences.
+//! Ctrl+C's signal or escape sequences. Without processed input the console
+//! doesn't paste on Ctrl+V, so the prompt pastes the clipboard itself, as one
+//! paste.
 
 use std::io;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, FlushConsoleInputBuffer, GetConsoleMode, GetStdHandle,
-    INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE, SetConsoleMode,
+    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_WINDOW_INPUT, FlushConsoleInputBuffer, GetConsoleMode,
+    GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE,
+    SetConsoleMode,
 };
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use zeroize::Zeroizing;
 
-use super::decode::{Utf16, typed_unit};
+use super::decode::{Utf16, paste_units, typed_unit};
+
+/// The character Ctrl+V types.
+const CTRL_V: u16 = 0x16;
+
+/// Whether standard input is a console, the one terminal whose echo the
+/// prompt can turn off.
+pub(super) fn can_hide_input() -> bool {
+    // SAFETY: the call takes a constant and returns a handle the process
+    // owns, or none.
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut mode: CONSOLE_MODE = 0;
+    // SAFETY: the call writes one mode, and fails on a handle that isn't a
+    // console's.
+    !input.is_null()
+        && input != INVALID_HANDLE_VALUE
+        && unsafe { GetConsoleMode(input, &mut mode) } != 0
+}
+
+/// The clipboard's text, or `None` when it holds none.
+fn clipboard_text() -> Option<Zeroizing<Vec<u16>>> {
+    // SAFETY: opening the clipboard for this thread, with no window.
+    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+        return None;
+    }
+    // SAFETY: the clipboard is open; the handle stays the clipboard's.
+    let data = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT)) };
+    let text = if data.is_null() {
+        None
+    } else {
+        // SAFETY: `data` is the clipboard's memory object, locked while read.
+        let units = unsafe { GlobalLock(data) }.cast::<u16>();
+        if units.is_null() {
+            None
+        } else {
+            // SAFETY: the object holds `GlobalSize` bytes; its text ends at a
+            // NUL within them.
+            let available = unsafe { GlobalSize(data) } / 2;
+            let held = unsafe { std::slice::from_raw_parts(units, available) };
+            let length = held.iter().position(|&unit| unit == 0).unwrap_or(available);
+            let mut copied = Zeroizing::new(Vec::with_capacity(length));
+            copied.extend_from_slice(&held[..length]);
+            // SAFETY: unlocking what was locked above.
+            unsafe { GlobalUnlock(data) };
+            Some(copied)
+        }
+    };
+    // SAFETY: closing the clipboard opened above.
+    unsafe { CloseClipboard() };
+    text
+}
 use super::{Event, Keyboard, Output};
 
 /// The console's input mode for as long as it lives.
@@ -42,7 +98,9 @@ impl Terminal {
             & !(ENABLE_LINE_INPUT
                 | ENABLE_ECHO_INPUT
                 | ENABLE_PROCESSED_INPUT
-                | ENABLE_VIRTUAL_TERMINAL_INPUT);
+                | ENABLE_VIRTUAL_TERMINAL_INPUT
+                | ENABLE_MOUSE_INPUT
+                | ENABLE_WINDOW_INPUT);
         // SAFETY: `input` is the console input handle.
         if unsafe { SetConsoleMode(input, mode) } == 0 {
             return Err(io::Error::last_os_error());
@@ -72,8 +130,20 @@ impl Terminal {
         if succeeded == 0 {
             return Err(io::Error::last_os_error());
         }
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the console closed",
+            ));
+        }
         for &unit in &units[..read as usize] {
-            self.utf16.feed(unit, each);
+            if unit == CTRL_V {
+                if let Some(text) = clipboard_text() {
+                    paste_units(&text, each);
+                }
+            } else {
+                self.utf16.feed(unit, each);
+            }
         }
         Ok(())
     }
@@ -116,7 +186,7 @@ impl Terminal {
                 let key = unsafe { record.Event.KeyEvent };
                 // SAFETY: the console fills the character as UTF-16.
                 let unit = unsafe { key.uChar.UnicodeChar };
-                if let Some(unit) = typed_unit(key.bKeyDown != 0, unit) {
+                if let Some(unit) = typed_unit(key.bKeyDown != 0, key.wVirtualKeyCode, unit) {
                     self.utf16.feed(unit, each);
                 }
             }

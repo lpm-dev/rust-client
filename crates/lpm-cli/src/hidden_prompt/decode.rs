@@ -29,6 +29,16 @@ enum State {
     },
     /// `ESC O` and the one byte that ends it.
     SingleShift,
+    /// The three bytes of an X10 mouse report, `ESC [ M` and its button and
+    /// position, left to skip.
+    MouseReport {
+        remaining: u8,
+    },
+    /// A string a terminal sends, such as an `ESC ]` reply, which ends with
+    /// BEL or `ESC \\`; `escape` once an `ESC` of that end was read.
+    TerminalString {
+        escape: bool,
+    },
     /// In a bracketed paste, with `matched` bytes of its end marker read.
     Paste {
         matched: u8,
@@ -48,6 +58,9 @@ impl Bytes {
                     };
                 }
                 b'O' => self.state = State::SingleShift,
+                b']' | b'P' | b'_' | b'^' | b'X' => {
+                    self.state = State::TerminalString { escape: false };
+                }
                 // An escape that starts no sequence edits nothing, and what
                 // follows it is read on its own.
                 _ => {
@@ -71,6 +84,8 @@ impl Bytes {
                 0x40..=0x7e => {
                     self.state = if byte == b'~' && length == 3 && parameters == *b"200" {
                         State::Paste { matched: 0 }
+                    } else if byte == b'M' && length == 0 {
+                        State::MouseReport { remaining: 3 }
                     } else {
                         State::Ground
                     };
@@ -88,7 +103,40 @@ impl Bytes {
                     self.ground(byte, each);
                 }
             }
+            State::MouseReport { remaining } => {
+                self.state = match remaining {
+                    0 | 1 => State::Ground,
+                    _ => State::MouseReport {
+                        remaining: remaining - 1,
+                    },
+                };
+            }
+            State::TerminalString { escape } => {
+                self.state = match (escape, byte) {
+                    (_, 0x07) | (true, b'\\') => State::Ground,
+                    (_, 0x1b) => State::TerminalString { escape: true },
+                    _ => State::TerminalString { escape: false },
+                };
+            }
             State::Paste { matched } => self.paste(byte, matched, each),
+        }
+    }
+
+    /// Whether a paste has begun and not ended.
+    pub(super) fn pasting(&self) -> bool {
+        matches!(self.state, State::Paste { .. })
+    }
+
+    /// End a paste whose end marker never came: what began like the marker
+    /// was pasted text.
+    pub(super) fn end_paste(&mut self, each: &mut dyn FnMut(Event)) {
+        if let State::Paste { matched } = self.state {
+            for &held in &PASTE_END[..usize::from(matched)] {
+                self.pasted(held, each);
+            }
+            self.state = State::Ground;
+            self.after_carriage_return = false;
+            each(Event::PasteEnded);
         }
     }
 
@@ -182,11 +230,39 @@ impl Utf16 {
     }
 }
 
-/// The character a console key record types: only a key press types one,
-/// and the release of a key, Enter's included, types nothing.
+/// The character a console key record types: a key press types one, and so
+/// does the release of Alt that ends an Alt code, which is how the classic
+/// console delivers a pasted character its keyboard layout lacks. Any other
+/// release, Enter's included, types nothing.
 #[cfg(any(windows, test))]
-pub(super) fn typed_unit(key_down: bool, unit: u16) -> Option<u16> {
-    (key_down && unit != 0).then_some(unit)
+pub(super) fn typed_unit(key_down: bool, virtual_key: u16, unit: u16) -> Option<u16> {
+    const VK_MENU: u16 = 0x12;
+    (unit != 0 && (key_down || virtual_key == VK_MENU)).then_some(unit)
+}
+
+/// Text pasted from the clipboard, as UTF-16, the way a terminal's paste
+/// arrives: pasted bytes with each `\r\n` or `\r` a `\n`, then its end.
+#[cfg(any(windows, test))]
+pub(super) fn paste_units(units: &[u16], each: &mut dyn FnMut(Event)) {
+    let mut encoded = [0_u8; 4];
+    let mut characters = char::decode_utf16(units.iter().copied())
+        .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .peekable();
+    while let Some(character) = characters.next() {
+        let character = if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            '\n'
+        } else {
+            character
+        };
+        for &byte in character.encode_utf8(&mut encoded).as_bytes() {
+            each(Event::Pasted(byte));
+        }
+    }
+    zeroize::Zeroize::zeroize(&mut encoded);
+    each(Event::PasteEnded);
 }
 
 #[cfg(any(windows, test))]
@@ -362,14 +438,74 @@ mod tests {
     }
 
     #[test]
-    fn only_a_key_press_types_a_character_never_its_release() {
-        assert_eq!(typed_unit(true, u16::from(b'a')), Some(u16::from(b'a')));
-        assert_eq!(typed_unit(false, u16::from(b'a')), None);
-        assert_eq!(typed_unit(false, 0x0d), None, "the release of Enter");
+    fn a_key_press_types_a_character_and_only_alt_s_release_does() {
+        const VK_A: u16 = 0x41;
+        const VK_RETURN: u16 = 0x0d;
+        const VK_MENU: u16 = 0x12;
         assert_eq!(
-            typed_unit(true, 0),
+            typed_unit(true, VK_A, u16::from(b'a')),
+            Some(u16::from(b'a'))
+        );
+        assert_eq!(typed_unit(false, VK_A, u16::from(b'a')), None);
+        assert_eq!(
+            typed_unit(false, VK_RETURN, 0x0d),
+            None,
+            "the release of Enter"
+        );
+        assert_eq!(
+            typed_unit(true, 0x10, 0),
             None,
             "a key that types nothing, such as Shift"
         );
+        assert_eq!(
+            typed_unit(false, VK_MENU, 0x20ac),
+            Some(0x20ac),
+            "an Alt code, as a pasted character the layout lacks arrives"
+        );
+        assert_eq!(
+            typed_unit(false, VK_MENU, 0),
+            None,
+            "a plain release of Alt"
+        );
+    }
+
+    #[test]
+    fn a_clipboard_paste_is_pasted_text_with_its_line_breaks_made_line_feeds() {
+        let units: Vec<u16> = "one\r\ntwo\rthree\n🔑".encode_utf16().collect();
+        let mut shown = Shown::default();
+        paste_units(&units, &mut |event| shown.take(event));
+        assert_eq!(shown.finish(), "<paste>one\ntwo\nthree\n🔑<PasteEnded>");
+    }
+
+    #[test]
+    fn mouse_reports_and_terminal_strings_add_nothing() {
+        assert_eq!(decoded(&[b"a\x1b[M #!b"]), "ab", "an X10 mouse report");
+        assert_eq!(
+            decoded(&[b"a\x1b]11;rgb:0/0/0\x07b"]),
+            "ab",
+            "an OSC reply ended by BEL"
+        );
+        assert_eq!(
+            decoded(&[b"a\x1bP1$r0m\x1b\\b"]),
+            "ab",
+            "a DCS reply ended by ST"
+        );
+        assert_eq!(decoded(&[b"a\x1b_x\x1b\\", b"b"]), "ab");
+    }
+
+    #[test]
+    fn a_paste_ended_without_its_marker_keeps_what_began_like_one() {
+        let mut bytes = Bytes::default();
+        let mut shown = Shown::default();
+        for &byte in b"\x1b[200~ab\x1b[20" {
+            bytes.feed(byte, &mut |event| shown.take(event));
+        }
+        assert!(bytes.pasting());
+        bytes.end_paste(&mut |event| shown.take(event));
+        assert!(!bytes.pasting());
+        for &byte in b"c" {
+            bytes.feed(byte, &mut |event| shown.take(event));
+        }
+        assert_eq!(shown.finish(), "<paste>ab\x1b[20<PasteEnded>c");
     }
 }

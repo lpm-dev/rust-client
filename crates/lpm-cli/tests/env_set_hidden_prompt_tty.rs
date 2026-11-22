@@ -14,7 +14,8 @@ mod common;
 mod tty {
     use crate::common;
     use crate::common::pty::{
-        PtySession, run_in_pty, run_in_pty_chunked, run_in_pty_with_stdout_captured,
+        PtyOptions, PtySession, run_in_pty, run_in_pty_chunked, run_in_pty_with,
+        run_in_pty_with_stdout_captured,
     };
     use std::time::Duration;
 
@@ -183,7 +184,7 @@ mod tty {
         assert!(
             session
                 .transcript
-                .contains("the value pasted for TOKEN has more than one line"),
+                .contains("more input arrived right after the value for TOKEN"),
             "{}",
             session.transcript
         );
@@ -312,7 +313,7 @@ mod tty {
         assert!(
             session
                 .transcript
-                .contains("the value pasted for TOKEN has more than one line"),
+                .contains("more input arrived right after the value for TOKEN"),
             "{}",
             session.transcript
         );
@@ -484,5 +485,119 @@ mod tty {
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
             Some("fixture-captured")
         );
+    }
+
+    #[test]
+    fn ctrl_c_cancels_once_a_paste_that_never_ends_goes_quiet() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b[200~fixture-part", b"\x03"],
+            )],
+            Duration::from_millis(2500),
+        );
+        assert_eq!(session.status.code(), Some(130), "{}", session.transcript);
+        assert!(session.echo_restored);
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn a_terminal_left_non_blocking_still_answers_the_prompt() {
+        let (project, lpm_home) = project();
+        let options = PtyOptions {
+            nonblocking_stdin: true,
+            ..PtyOptions::default()
+        };
+        let (session, _) = run_in_pty_with(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-typed\r"],
+            )],
+            &options,
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-typed")
+        );
+    }
+
+    #[test]
+    fn a_dumb_terminal_or_none_gets_no_paste_marking_sequences() {
+        for term in [Some("dumb"), None] {
+            let (project, lpm_home) = project();
+            let options = PtyOptions {
+                term,
+                ..PtyOptions::default()
+            };
+            let (session, _) = run_in_pty_with(
+                project.path(),
+                lpm_home.path(),
+                &["env", "set", "TOKEN"],
+                &[(
+                    b"Value for TOKEN (default, hidden): ",
+                    vec![b"fixture-plain\r"],
+                )],
+                &options,
+            );
+            assert!(session.status.success(), "{term:?}: {}", session.transcript);
+            assert!(
+                !session.raw.windows(3).any(|window| window == b"\x1b[?"),
+                "{term:?}: {:?}",
+                String::from_utf8_lossy(&session.raw)
+            );
+            assert_eq!(
+                stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+                Some("fixture-plain")
+            );
+        }
+    }
+
+    #[test]
+    fn an_arrow_key_whose_bytes_arrive_apart_adds_nothing() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b", b"[Afixture-key\r"],
+            )],
+            Duration::from_millis(120),
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-key")
+        );
+    }
+
+    #[test]
+    fn a_typed_nul_is_refused_like_one_from_any_other_source() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                b"fixture\x00value\r",
+            )],
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("contains a NUL character"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
     }
 }

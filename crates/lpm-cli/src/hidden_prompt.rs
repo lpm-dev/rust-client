@@ -52,10 +52,18 @@ pub(crate) enum PromptError {
     Terminal(io::Error),
 }
 
+/// Whether this terminal can hide what's typed: on Windows only a console
+/// can, and a pty such as Git Bash's mintty, which `IsTerminal` also calls a
+/// terminal, can't.
+pub(crate) fn can_hide_input() -> bool {
+    platform::can_hide_input()
+}
+
 /// Ask for one value of at most `limit` bytes on the terminal, showing
-/// `prompt` and nothing of what's typed. The caller checks that stdin and
-/// stdout are a terminal first. The prompt goes to stderr, or to stdout when
-/// stderr is redirected, so the person always sees what they're asked.
+/// `prompt` and nothing of what's typed. The caller checks that stdin is a
+/// terminal that [`can_hide_input`], and that stderr or stdout is one too.
+/// The prompt goes to stderr, or to stdout when stderr is redirected, so the
+/// person always sees what they're asked.
 pub(crate) fn read_hidden(prompt: &str, limit: usize) -> Result<Zeroizing<String>, PromptError> {
     let output = Output::for_prompt();
     let result = {
@@ -107,6 +115,14 @@ trait Keyboard {
     /// of text it holds to `each`, in order. False when nothing arrived in
     /// time.
     fn read(&mut self, wait: Option<Duration>, each: &mut dyn FnMut(Event)) -> io::Result<bool>;
+
+    /// Whether a paste the terminal marked has begun and not ended.
+    fn pasting(&self) -> bool {
+        false
+    }
+
+    /// End a paste whose end never came, passing its end to `each`.
+    fn end_paste(&mut self, _each: &mut dyn FnMut(Event)) {}
 }
 
 /// One key, or one byte of text, read from the terminal.
@@ -114,16 +130,9 @@ trait Keyboard {
 enum Event {
     /// A byte of typed text, part of a UTF-8 character.
     Typed(u8),
-    /// A byte of text the terminal marked as pasted, its line breaks `\n`.
-    #[cfg_attr(
-        not(any(unix, test)),
-        expect(dead_code, reason = "only a Unix terminal marks pastes")
-    )]
+    /// A byte of pasted text, its line breaks `\n`: one a Unix terminal
+    /// marked as pasted, or the Windows clipboard's.
     Pasted(u8),
-    #[cfg_attr(
-        not(any(unix, test)),
-        expect(dead_code, reason = "only a Unix terminal marks pastes")
-    )]
     PasteEnded,
     Enter,
     Backspace,
@@ -164,9 +173,11 @@ impl fmt::Debug for Event {
     }
 }
 
-/// What a typed control character does.
+/// What a typed control character does. A NUL is kept, so the value is
+/// refused as one from any other source is.
 fn control(byte: u8) -> Event {
     match byte {
+        0x00 => Event::Typed(0),
         b'\r' | b'\n' => Event::Enter,
         b'\t' => Event::Typed(b'\t'),
         0x08 | 0x7f => Event::Backspace,
@@ -297,9 +308,20 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
         if let Some(ending) = reading.ended {
             break ending;
         }
-        keyboard
-            .read(None, &mut |event| reading.take(event))
-            .map_err(PromptError::Terminal)?;
+        // Inside a paste every key is pasted text, Ctrl+C's included, so a
+        // paste whose end never comes ends once the terminal goes quiet.
+        if keyboard.pasting() {
+            let arrived = keyboard
+                .read(Some(LEFTOVERS_LIMIT), &mut |event| reading.take(event))
+                .map_err(PromptError::Terminal)?;
+            if !arrived {
+                keyboard.end_paste(&mut |event| reading.take(event));
+            }
+        } else {
+            keyboard
+                .read(None, &mut |event| reading.take(event))
+                .map_err(PromptError::Terminal)?;
+        }
     };
     // A failure ends the wait too: the line has ended, and a terminal that
     // can't be read passes nothing on either.
@@ -437,10 +459,11 @@ mod tests {
     }
 
     /// A keyboard that hands out one batch of events each read, then
-    /// nothing.
+    /// nothing, and is inside a paste while `pasting`.
     struct Script {
         batches: VecDeque<Vec<Event>>,
         waits: Vec<Option<Duration>>,
+        pasting: bool,
     }
 
     impl Script {
@@ -448,6 +471,7 @@ mod tests {
             Self {
                 batches: batches.into_iter().collect(),
                 waits: Vec::new(),
+                pasting: false,
             }
         }
     }
@@ -459,6 +483,13 @@ mod tests {
             each: &mut dyn FnMut(Event),
         ) -> io::Result<bool> {
             self.waits.push(wait);
+            if self.pasting
+                && wait == Some(LEFTOVERS_LIMIT)
+                && self.batches.front().is_none_or(Vec::is_empty)
+            {
+                self.batches.pop_front();
+                return Ok(false);
+            }
             match self.batches.pop_front() {
                 Some(batch) => {
                     batch.into_iter().for_each(each);
@@ -468,6 +499,35 @@ mod tests {
                 None => panic!("the prompt waited for a key the script doesn't hold"),
             }
         }
+
+        fn pasting(&self) -> bool {
+            self.pasting
+        }
+
+        fn end_paste(&mut self, each: &mut dyn FnMut(Event)) {
+            self.pasting = false;
+            each(Event::PasteEnded);
+        }
+    }
+
+    #[test]
+    fn a_paste_that_never_ends_ends_once_quiet_so_ctrl_c_cancels_again() {
+        let mut script = Script::new([
+            vec![Event::Pasted(b'x')],
+            Vec::new(),
+            vec![Event::Interrupt],
+        ]);
+        script.pasting = true;
+        assert_eq!(outcome(&mut script), Err("Cancelled".to_owned()));
+        assert_eq!(
+            script.waits[..2],
+            [Some(LEFTOVERS_LIMIT), Some(LEFTOVERS_LIMIT)]
+        );
+    }
+
+    #[test]
+    fn a_typed_nul_is_kept_for_the_value_to_be_refused() {
+        assert_eq!(control(0), Event::Typed(0));
     }
 
     fn outcome(script: &mut Script) -> Result<String, String> {

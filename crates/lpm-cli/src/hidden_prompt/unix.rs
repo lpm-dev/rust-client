@@ -13,8 +13,20 @@ const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
 const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
 
 /// How long an escape waits for the rest of a sequence before it's taken to
-/// be the Escape key.
-const ESCAPE_KEY_WAIT: Duration = Duration::from_millis(50);
+/// be the Escape key, as long as readline's: a sequence can arrive in pieces
+/// over a slow connection.
+const ESCAPE_KEY_WAIT: Duration = Duration::from_millis(500);
+
+/// Any Unix terminal can hide what's typed.
+pub(super) fn can_hide_input() -> bool {
+    true
+}
+
+/// Whether the terminal takes escape sequences, such as the one that turns
+/// on bracketed paste: not without `TERM`, or with `TERM=dumb`.
+fn takes_escape_sequences() -> bool {
+    std::env::var_os("TERM").is_some_and(|term| !term.is_empty() && term != "dumb")
+}
 
 /// Raw mode and bracketed paste for as long as it lives.
 pub(super) struct Terminal {
@@ -49,7 +61,8 @@ impl Terminal {
             paste_marked: false,
             bytes: Bytes::default(),
         };
-        terminal.paste_marked = output.write(BRACKETED_PASTE_ON).is_ok();
+        terminal.paste_marked =
+            takes_escape_sequences() && output.write(BRACKETED_PASTE_ON).is_ok();
         Ok(terminal)
     }
 }
@@ -57,7 +70,7 @@ impl Terminal {
 impl Keyboard for Terminal {
     fn read(&mut self, wait: Option<Duration>, each: &mut dyn FnMut(Event)) -> io::Result<bool> {
         if let Some(wait) = wait
-            && !input_within(wait)?
+            && !input_within(Some(wait))?
         {
             return Ok(false);
         }
@@ -70,8 +83,13 @@ impl Keyboard for Terminal {
                 break read;
             }
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            match error.kind() {
+                io::ErrorKind::Interrupted => {}
+                // An earlier program can leave the terminal non-blocking.
+                io::ErrorKind::WouldBlock => {
+                    input_within(None)?;
+                }
+                _ => return Err(error),
             }
         };
         if read == 0 {
@@ -85,15 +103,26 @@ impl Keyboard for Terminal {
         }
         // A terminal sends the rest of a sequence with the escape that
         // starts it; one nothing follows soon was the Escape key.
-        if self.bytes.after_escape() && !input_within(ESCAPE_KEY_WAIT)? {
+        if self.bytes.after_escape() && !input_within(Some(ESCAPE_KEY_WAIT))? {
             self.bytes.escape_key();
         }
         Ok(true)
     }
+
+    fn pasting(&self) -> bool {
+        self.bytes.pasting()
+    }
+
+    fn end_paste(&mut self, each: &mut dyn FnMut(Event)) {
+        self.bytes.end_paste(each);
+    }
 }
 
-fn input_within(wait: Duration) -> io::Result<bool> {
-    let timeout = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+/// Whether input arrives within `wait`, or at all when `None`.
+fn input_within(wait: Option<Duration>) -> io::Result<bool> {
+    let timeout = wait.map_or(-1, |wait| {
+        libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX)
+    });
     let mut descriptor = libc::pollfd {
         fd: libc::STDIN_FILENO,
         events: libc::POLLIN,

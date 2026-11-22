@@ -385,7 +385,7 @@ fn read_piped_env_file() -> Result<zeroize::Zeroizing<String>, LpmError> {
         ));
     }
     let limit = usize::try_from(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).unwrap_or(usize::MAX);
-    lpm_common::secret_read::read_secret_text(stdin.lock(), limit).map_err(|error| {
+    lpm_common::secret_read::read_secret_stdin(limit).map_err(|error| {
         LpmError::Env(match error {
             SecretReadError::TooLarge => format!(
                 "the .env file piped to `lpm env import -` is larger than {} MiB",
@@ -393,6 +393,9 @@ fn read_piped_env_file() -> Result<zeroize::Zeroizing<String>, LpmError> {
             ),
             SecretReadError::NotText => {
                 "the .env file piped to `lpm env import -` isn't UTF-8 text".into()
+            }
+            SecretReadError::NotFileOrPipe => {
+                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a device".into()
             }
             other => format!("failed to read standard input: {other}"),
         })

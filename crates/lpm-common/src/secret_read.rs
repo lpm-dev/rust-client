@@ -101,6 +101,14 @@ fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretR
             SecretReadError::Io(error)
         }
     })?;
+    // Windows gives no metadata for a pipe or a device, so its kind decides
+    // first.
+    #[cfg(windows)]
+    match windows_kind(&file) {
+        WindowsKind::Disk => {}
+        WindowsKind::Pipe => return Ok((file, 0)),
+        WindowsKind::Other => return Err(SecretReadError::NotFileOrPipe),
+    }
     let metadata = file.metadata().map_err(SecretReadError::Io)?;
     if metadata.is_dir() {
         return Err(SecretReadError::Directory);
@@ -127,18 +135,70 @@ fn is_pipe(_file: &File, metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_fifo()
 }
 
-#[cfg(windows)]
-fn is_pipe(file: &File, _metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
-
-    // SAFETY: the handle is the open file's, valid while `file` lives.
-    unsafe { GetFileType(file.as_raw_handle()) == FILE_TYPE_PIPE }
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn is_pipe(_file: &File, _metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(windows)]
+enum WindowsKind {
+    Disk,
+    Pipe,
+    Other,
+}
+
+#[cfg(windows)]
+fn windows_kind(file: &File) -> WindowsKind {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+
+    // SAFETY: the handle is the open file's, valid while `file` lives.
+    match unsafe { GetFileType(file.as_raw_handle()) } {
+        FILE_TYPE_DISK => WindowsKind::Disk,
+        FILE_TYPE_PIPE => WindowsKind::Pipe,
+        _ => WindowsKind::Other,
+    }
+}
+
+/// Standard input, at most `limit` bytes, as UTF-8 text. It's read from its
+/// descriptor, not through std's buffered stdin, whose buffer is never
+/// wiped. A device, such as `/dev/zero`, is refused; the caller refuses a
+/// terminal, with its own advice, first.
+pub fn read_secret_stdin(limit: usize) -> Result<Zeroizing<String>, SecretReadError> {
+    let stdin = io::stdin();
+    #[cfg(unix)]
+    // SAFETY: standard input stays open for the process, and ManuallyDrop
+    // never closes it.
+    let file = std::mem::ManuallyDrop::new(unsafe {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        File::from_raw_fd(stdin.as_raw_fd())
+    });
+    #[cfg(windows)]
+    // SAFETY: standard input stays open for the process, and ManuallyDrop
+    // never closes it.
+    let file = std::mem::ManuallyDrop::new(unsafe {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        File::from_raw_handle(stdin.as_raw_handle())
+    });
+    #[cfg(windows)]
+    if matches!(windows_kind(&file), WindowsKind::Other) {
+        return Err(SecretReadError::NotFileOrPipe);
+    }
+    let mut size = 0;
+    if let Ok(metadata) = file.metadata() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt as _;
+            let kind = metadata.file_type();
+            if kind.is_char_device() || kind.is_block_device() {
+                return Err(SecretReadError::NotFileOrPipe);
+            }
+        }
+        if metadata.is_file() {
+            size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        }
+    }
+    into_text(read_wiped(&*file, limit, size)?)
 }
 
 /// Reads from the pipe wait for what its writer sends, until it closes,
@@ -328,6 +388,15 @@ mod tests {
     fn a_device_is_refused() {
         assert!(matches!(
             read_secret_text_file(Path::new("/dev/null"), 100),
+            Err(SecretReadError::NotFileOrPipe)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_device_is_refused_as_not_a_file_or_a_pipe() {
+        assert!(matches!(
+            read_secret_text_file(Path::new("NUL"), 100),
             Err(SecretReadError::NotFileOrPipe)
         ));
     }

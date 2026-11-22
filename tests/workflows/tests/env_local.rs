@@ -1292,6 +1292,32 @@ fn env_import_reads_a_pipe_and_refuses_a_directory_or_a_device() {
     assert_eq!(revealed(&project, "A").as_deref(), Some("fixture-a"));
 }
 
+#[cfg(unix)]
+#[test]
+fn stdin_that_is_a_device_is_refused_rather_than_read() {
+    let project = TempProject::empty(r#"{"name":"stdin-device","version":"1.0.0"}"#);
+    for (args, said) in [
+        (
+            &["env", "set", "TOKEN", "--stdin"][..],
+            "standard input is a device; nothing was read for TOKEN",
+        ),
+        (
+            &["env", "import", "-"][..],
+            "but standard input is a device",
+        ),
+    ] {
+        let output = support::lpm_spawnable(&project)
+            .args(args)
+            .stdin(std::fs::File::open("/dev/zero").expect("open /dev/zero"))
+            .output()
+            .expect("failed to run lpm");
+        assert!(!output.status.success(), "{args:?}");
+        let text = failure_text(&output);
+        assert!(text.contains(said), "{args:?}: {text}");
+    }
+    assert_eq!(revealed(&project, "TOKEN"), None);
+}
+
 #[test]
 fn env_set_warns_about_hidden_characters_in_values_from_stdin_and_files() {
     let project = TempProject::empty(r#"{"name":"env-set-hidden-input","version":"1.0.0"}"#);

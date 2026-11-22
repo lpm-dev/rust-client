@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal as _};
 
-use lpm_common::secret_read::{SecretReadError, read_secret_text, read_secret_text_file};
+use lpm_common::secret_read::{SecretReadError, read_secret_stdin, read_secret_text_file};
 use zeroize::Zeroizing;
 
 use super::prelude::*;
@@ -61,6 +61,9 @@ pub(super) trait Sources {
     /// and so is stderr, where the prompt shows, or stdout, where it shows
     /// when stderr is redirected.
     fn can_prompt(&self) -> bool;
+    /// Whether the terminal can hide what's typed; on Windows only a console
+    /// can, not a pty such as Git Bash's mintty.
+    fn can_hide_input(&self) -> bool;
     fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError>;
     fn read_file(&mut self, path: &str, limit: usize)
     -> Result<Zeroizing<String>, SecretReadError>;
@@ -80,8 +83,12 @@ impl Sources for ProcessSources {
         io::stdin().is_terminal() && (io::stderr().is_terminal() || io::stdout().is_terminal())
     }
 
+    fn can_hide_input(&self) -> bool {
+        crate::hidden_prompt::can_hide_input()
+    }
+
     fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError> {
-        read_secret_text(io::stdin().lock(), limit)
+        read_secret_stdin(limit)
     }
 
     fn read_file(
@@ -271,9 +278,13 @@ fn check_how_bare_keys_get_values(
             [] => Err(LpmError::Env(format!(
                 "--stdin reads one value: name its key without =, such as `{command} API_KEY --stdin`"
             ))),
-            [_] if sources.stdin_is_terminal() => Err(LpmError::Env(format!(
-                "--stdin reads a value piped to lpm, but standard input is this terminal. To type the value hidden, leave out --stdin: `{command} {}`",
-                bare[0]
+            [key] if sources.stdin_is_terminal() && sources.can_hide_input() => {
+                Err(LpmError::Env(format!(
+                    "--stdin reads a value piped to lpm, but standard input is this terminal. To type the value hidden, leave out --stdin: `{command} {key}`"
+                )))
+            }
+            [key] if sources.stdin_is_terminal() => Err(LpmError::Env(format!(
+                "--stdin reads a value piped to lpm, but standard input is this terminal, which can't hide what's typed. Pipe the value in, or read it from a file with `{command} --from-file {key}=PATH`"
             ))),
             [_] => Ok(()),
             keys => Err(LpmError::Env(format!(
@@ -284,11 +295,13 @@ fn check_how_bare_keys_get_values(
         };
     }
     match bare.first() {
-        Some(key) if request.json_output || !sources.can_prompt() => {
+        Some(key) if request.json_output || !sources.can_prompt() || !sources.can_hide_input() => {
             let reason = if request.json_output {
                 "LPM doesn't ask for values with --json"
-            } else {
+            } else if !sources.can_prompt() {
                 "LPM asks for a value, hidden, only in an interactive terminal"
+            } else {
+                "This terminal can't hide what's typed, as Git Bash's mintty can't"
             };
             Err(LpmError::Env(format!(
                 "{key} has no value. {reason}. Pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
@@ -311,7 +324,7 @@ fn prompted(
                 LpmError::ExitCode(crate::prompt::PROMPT_CANCELLED_EXIT_CODE)
             }
             PromptError::SeveralLines => LpmError::Env(format!(
-                "the value pasted for {key} has more than one line, and this terminal can't paste them as one. Nothing was stored. Pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
+                "more input arrived right after the value for {key}: the rest of a paste this terminal can't mark as one, or keys typed too soon. Nothing was stored. Enter it again; for a value of several lines, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
             )),
             PromptError::TooLarge => LpmError::Env(format!(
                 "the value entered for {key} is larger than {} KiB, the most one value can hold. Nothing was stored",
@@ -375,6 +388,9 @@ fn stdin_error(key: &str, error: &SecretReadError) -> LpmError {
             MAX_VALUE_BYTES / 1024
         ),
         SecretReadError::NotText => format!("the value piped in for {key} isn't UTF-8 text"),
+        SecretReadError::NotFileOrPipe => format!(
+            "--stdin reads a value piped to lpm or redirected from a file, but standard input is a device; nothing was read for {key}"
+        ),
         other => format!("failed to read the value for {key} from standard input: {other}"),
     })
 }
@@ -401,6 +417,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         terminal: bool,
+        /// The terminal can't hide what's typed, as a mintty pty can't.
+        cant_hide: bool,
         stdin: Option<Vec<u8>>,
         files: HashMap<String, Result<String, &'static str>>,
         typed: VecDeque<Result<&'static str, PromptError>>,
@@ -415,6 +433,10 @@ mod tests {
 
         fn can_prompt(&self) -> bool {
             self.terminal
+        }
+
+        fn can_hide_input(&self) -> bool {
+            !self.cant_hide
         }
 
         fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError> {
@@ -844,7 +866,10 @@ mod tests {
             ))
         ));
         let pasted = run(&["A"], false, &[], false, &mut fake).unwrap_err();
-        assert!(pasted.contains("more than one line"), "{pasted}");
+        assert!(
+            pasted.contains("more input arrived right after the value for A"),
+            "{pasted}"
+        );
         assert!(pasted.contains("Nothing was stored"), "{pasted}");
         let large = run(&["A"], false, &[], false, &mut fake).unwrap_err();
         assert_eq!(
@@ -854,5 +879,22 @@ mod tests {
         let not_text = run(&["A"], false, &[], false, &mut fake).unwrap_err();
         assert!(not_text.contains("isn't UTF-8 text"), "{not_text}");
         assert!(not_text.contains("`lpm env set A --stdin`"), "{not_text}");
+    }
+
+    #[test]
+    fn a_terminal_that_cant_hide_input_gets_the_ways_that_work() {
+        let mut fake = Fake {
+            terminal: true,
+            cant_hide: true,
+            ..Fake::default()
+        };
+        let bare = run(&["TOKEN"], false, &[], false, &mut fake).unwrap_err();
+        assert!(bare.contains("can't hide what's typed"), "{bare}");
+        assert!(bare.contains("`lpm env set TOKEN --stdin`"), "{bare}");
+        let piped = run(&["TOKEN"], true, &[], false, &mut fake).unwrap_err();
+        assert!(!piped.contains("leave out --stdin"), "{piped}");
+        assert!(piped.contains("--from-file TOKEN=PATH"), "{piped}");
+        assert!(fake.asked.is_empty());
+        assert_eq!(fake.stdin_reads, 0);
     }
 }
