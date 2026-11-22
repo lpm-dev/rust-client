@@ -122,17 +122,23 @@ enum Entry<'a> {
     Bare(&'a str),
 }
 
-/// A request whose arguments were checked before any value is read.
-pub(super) struct Checked {
+/// A request whose arguments were checked before any value is read, which
+/// [`collect`] reads the values of.
+pub(super) struct Checked<'a> {
+    entries: Vec<Entry<'a>>,
+    files: Vec<(&'a str, &'a str)>,
     /// Some value comes from the prompt, standard input or a file, rather
     /// than the arguments alone.
     pub(super) reads_input: bool,
 }
 
-/// Refuse what `request`'s arguments are refused for, as [`collect`] would,
-/// before any value is read or asked for: a malformed key, a key named
-/// twice, or a value with nowhere to come from.
-pub(super) fn check(request: &Request<'_>, sources: &impl Sources) -> Result<Checked, LpmError> {
+/// Refuse what `request`'s arguments are refused for, before any value is
+/// read or asked for: a malformed key, a key named twice, or a value with
+/// nowhere to come from.
+pub(super) fn check<'a>(
+    request: &Request<'a>,
+    sources: &impl Sources,
+) -> Result<Checked<'a>, LpmError> {
     let entries = request
         .entries
         .iter()
@@ -154,6 +160,8 @@ pub(super) fn check(request: &Request<'_>, sources: &impl Sources) -> Result<Che
     check_how_bare_keys_get_values(request, &bare, sources)?;
     Ok(Checked {
         reads_input: !bare.is_empty() || !files.is_empty(),
+        entries,
+        files,
     })
 }
 
@@ -186,31 +194,18 @@ impl Total<'_, '_> {
 }
 
 /// Every key's value, in the order the arguments name them, then the
-/// `--from-file` keys. Nothing is read or asked until every argument is
-/// valid, and nothing is asked until every file and standard input are read.
+/// `--from-file` keys, for the arguments [`check`] accepted. Nothing is
+/// asked until every file and standard input are read.
 pub(super) fn collect(
     request: &Request<'_>,
+    checked: Checked<'_>,
     sources: &mut impl Sources,
 ) -> Result<Vec<Assignment>, LpmError> {
-    let entries = request
-        .entries
-        .iter()
-        .map(|entry| parse_entry(entry))
-        .collect::<Result<Vec<_>, _>>()?;
-    let files = request
-        .from_files
-        .iter()
-        .map(|file| parse_from_file(file))
-        .collect::<Result<Vec<_>, _>>()?;
-    let bare: Vec<&str> = entries
-        .iter()
-        .filter_map(|entry| match entry {
-            Entry::Bare(key) => Some(*key),
-            Entry::Given(..) => None,
-        })
-        .collect();
-    refuse_repeated_keys(&entries, &files, cfg!(windows))?;
-    check_how_bare_keys_get_values(request, &bare, sources)?;
+    let Checked { entries, files, .. } = checked;
+    let first_bare = entries.iter().find_map(|entry| match entry {
+        Entry::Bare(key) => Some(*key),
+        Entry::Given(..) => None,
+    });
 
     let mut total = Total { bytes: 0, request };
     let mut from_files = Vec::with_capacity(files.len());
@@ -227,7 +222,7 @@ pub(super) fn collect(
 
     let mut piped = None;
     if request.stdin
-        && let Some(key) = bare.first()
+        && let Some(key) = first_bare
     {
         let text = sources
             .read_stdin(MAX_VALUE_BYTES)
@@ -323,13 +318,21 @@ fn refuse_repeated_keys(
             return Err(repeated(earlier, key));
         }
     }
-    match sourced
+    // In the order the arguments name them, so the same key is named
+    // every time.
+    let read = entries
         .iter()
-        .find_map(|(folded, key)| given.get(folded).map(|earlier| (*earlier, *key)))
-    {
-        Some((earlier, key)) => Err(repeated(earlier, key)),
-        None => Ok(()),
+        .filter_map(|entry| match entry {
+            Entry::Bare(key) => Some(*key),
+            Entry::Given(..) => None,
+        })
+        .chain(files.iter().map(|(key, _)| *key));
+    for key in read {
+        if let Some(earlier) = given.get(&fold(key)) {
+            return Err(repeated(earlier, key));
+        }
     }
+    Ok(())
 }
 
 fn repeated(earlier: &str, key: &str) -> LpmError {
@@ -374,7 +377,7 @@ fn check_how_bare_keys_get_values(
             } else if !sources.can_prompt() {
                 "LPM asks for a value, hidden, only in an interactive terminal"
             } else {
-                "This terminal can't hide what's typed, as Git Bash's mintty and Emacs's shell can't"
+                "This terminal can't hide what's typed, as Git Bash's mintty and Emacs buffers other than its terminals can't"
             };
             Err(LpmError::Env(format!(
                 "{key} has no value. {reason}. Pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
@@ -460,6 +463,10 @@ fn finish(
     Ok(value)
 }
 
+/// The null device as this system names it, a device people redirect
+/// standard input from.
+pub(super) const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 fn stdin_error(key: &str, error: &SecretReadError) -> LpmError {
     LpmError::Env(match error {
         SecretReadError::TooLarge => format!(
@@ -468,7 +475,7 @@ fn stdin_error(key: &str, error: &SecretReadError) -> LpmError {
         ),
         SecretReadError::NotText => format!("the value piped in for {key} isn't UTF-8 text"),
         SecretReadError::NotFileOrPipe => format!(
-            "--stdin reads a value piped to lpm or redirected from a file, but standard input is a device, such as a terminal or /dev/null; nothing was read for {key}"
+            "--stdin reads a value piped to lpm or redirected from a file, but standard input is a device, such as a terminal or {NULL_DEVICE}; nothing was read for {key}"
         ),
         SecretReadError::Directory => format!(
             "--stdin reads a value piped to lpm or redirected from a file, but standard input is a directory; nothing was read for {key}"
@@ -569,31 +576,30 @@ mod tests {
     ) -> Result<Vec<(String, String)>, String> {
         let entries = strings(entries);
         let from_files = strings(from_files);
-        collect(
-            &Request {
-                entries: &entries,
-                stdin,
-                from_files: &from_files,
-                json_output,
-                command: "lpm env set",
-                asking: Asking {
-                    what: "Value",
-                    environment: "default",
-                },
-                total_limit: usize::MAX,
+        let request = Request {
+            entries: &entries,
+            stdin,
+            from_files: &from_files,
+            json_output,
+            command: "lpm env set",
+            asking: Asking {
+                what: "Value",
+                environment: "default",
             },
-            fake,
-        )
-        .map(|assignments| {
-            assignments
-                .into_iter()
-                .map(|assignment| (assignment.key, assignment.value.to_string()))
-                .collect()
-        })
-        .map_err(|error| match error {
-            LpmError::Env(message) => message,
-            other => format!("{other:?}"),
-        })
+            total_limit: usize::MAX,
+        };
+        check(&request, fake)
+            .and_then(|checked| collect(&request, checked, fake))
+            .map(|assignments| {
+                assignments
+                    .into_iter()
+                    .map(|assignment| (assignment.key, assignment.value.to_string()))
+                    .collect()
+            })
+            .map_err(|error| match error {
+                LpmError::Env(message) => message,
+                other => format!("{other:?}"),
+            })
     }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -623,7 +629,8 @@ mod tests {
             total_limit: 100,
         };
 
-        let Err(LpmError::Env(refused)) = collect(&request, &mut fake) else {
+        let checked = check(&request, &fake).expect("valid arguments");
+        let Err(LpmError::Env(refused)) = collect(&request, checked, &mut fake) else {
             panic!("too much in all");
         };
 
@@ -632,6 +639,35 @@ mod tests {
             "the values given total more than 100 bytes, the most `lpm env set` stores at once; nothing was stored"
         );
         assert_eq!(fake.file_reads, 2, "the third file is never read");
+    }
+
+    #[test]
+    fn a_key_both_given_and_read_is_named_in_the_order_of_the_arguments() {
+        for _ in 0..32 {
+            let refused = run(
+                &["A=1", "B=2"],
+                false,
+                &["A=./a", "B=./b"],
+                false,
+                &mut Fake::default(),
+            )
+            .expect_err("each key both given and read");
+            assert!(refused.contains("A"), "{refused}");
+            assert!(!refused.contains("B"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_device_on_standard_input_is_named_as_this_system_names_its_null_device() {
+        let LpmError::Env(message) = stdin_error("TOKEN", &SecretReadError::NotFileOrPipe) else {
+            panic!("an env error");
+        };
+        let null = if cfg!(windows) {
+            "or NUL;"
+        } else {
+            "or /dev/null;"
+        };
+        assert!(message.contains(null), "{message}");
     }
 
     #[test]
@@ -962,21 +998,21 @@ mod tests {
             ]),
             ..Fake::default()
         };
-        let cancelled = collect(
-            &Request {
-                entries: &strings(&["A"]),
-                stdin: false,
-                from_files: &[],
-                json_output: false,
-                command: "lpm env set",
-                asking: Asking {
-                    what: "Value",
-                    environment: "default",
-                },
-                total_limit: usize::MAX,
+        let entries = strings(&["A"]);
+        let request = Request {
+            entries: &entries,
+            stdin: false,
+            from_files: &[],
+            json_output: false,
+            command: "lpm env set",
+            asking: Asking {
+                what: "Value",
+                environment: "default",
             },
-            &mut fake,
-        );
+            total_limit: usize::MAX,
+        };
+        let cancelled =
+            check(&request, &fake).and_then(|checked| collect(&request, checked, &mut fake));
         assert!(matches!(
             cancelled,
             Err(LpmError::ExitCode(

@@ -27,21 +27,22 @@ fn escape_budget(wait: Option<Duration>, elapsed: Duration) -> Duration {
 }
 
 /// Whether the terminal can hide what's typed: a Unix terminal can, but
-/// not inside Emacs's shell (comint), which shows what's typed in its own
-/// buffer, whatever the terminal's echo.
+/// most Emacs buffers show what's typed themselves, whatever the terminal's
+/// echo.
 pub(super) fn can_hide_input() -> bool {
     hides_typed_input(std::env::var_os("INSIDE_EMACS").as_deref())
 }
 
-/// [`can_hide_input`] for the `INSIDE_EMACS` an Emacs front end sets, such
-/// as `29.4,comint` for `M-x shell`; vterm and other terminal emulators
-/// inside Emacs hide what's typed as any terminal does.
+/// [`can_hide_input`] for the `INSIDE_EMACS` an Emacs front end sets. Only
+/// its terminal emulators hide what's typed as any terminal does: term and
+/// ansi-term (`30.1,term:0.96`), vterm and eat. A shell buffer (`comint`),
+/// eshell, a compile buffer or any other front end shows it.
 fn hides_typed_input(inside_emacs: Option<&std::ffi::OsStr>) -> bool {
-    !inside_emacs.is_some_and(|front_end| {
+    inside_emacs.is_none_or(|front_end| {
         front_end
             .to_string_lossy()
             .split(',')
-            .any(|part| part == "comint")
+            .any(|part| part == "vterm" || part == "eat" || part.starts_with("term:"))
     })
 }
 
@@ -203,9 +204,17 @@ mod tests {
     fn emacs_s_shell_buffer_shows_what_s_typed_and_its_terminals_hide_it() {
         use std::ffi::OsStr;
         assert!(hides_typed_input(None));
-        assert!(!hides_typed_input(Some(OsStr::new("29.4,comint"))));
-        assert!(hides_typed_input(Some(OsStr::new("vterm"))));
-        assert!(hides_typed_input(Some(OsStr::new("29.4,eat"))));
+        for buffer in [
+            "29.4,comint",
+            "30.1,eshell",
+            "30.1,compile",
+            "30.1,tramp:2.7",
+        ] {
+            assert!(!hides_typed_input(Some(OsStr::new(buffer))), "{buffer}");
+        }
+        for terminal in ["vterm", "29.4,eat", "30.1,term:0.96"] {
+            assert!(hides_typed_input(Some(OsStr::new(terminal))), "{terminal}");
+        }
     }
 
     #[test]

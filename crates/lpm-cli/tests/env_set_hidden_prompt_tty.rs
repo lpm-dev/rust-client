@@ -626,6 +626,28 @@ mod tty {
     }
 
     #[test]
+    fn typing_after_a_terminal_string_that_never_ends_stores_nothing() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b]0;fixture-title", b"fixture-key\r"],
+            )],
+            Duration::from_millis(1000),
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("nothing was stored"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
     fn a_terminal_left_non_blocking_still_answers_the_prompt() {
         let (project, lpm_home) = project();
         let options = PtyOptions {
@@ -730,6 +752,28 @@ mod tty {
             &[(
                 b"Value for TOKEN (default, hidden): ",
                 vec![b"fixture-", b"\x1bPkey", b"\r"],
+            )],
+            Duration::from_millis(120),
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("nothing was stored"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn text_typed_after_alt_bracket_stores_nothing_rather_than_part_of_the_value() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-", b"\x1b[", b"12345\r"],
             )],
             Duration::from_millis(120),
         );

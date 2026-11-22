@@ -199,13 +199,13 @@ pub fn read_secret_stdin(limit: usize) -> Result<Zeroizing<String>, SecretReadEr
     }
     let mut size = 0;
     if let Ok(metadata) = file.metadata() {
+        if metadata.is_dir() {
+            return Err(SecretReadError::Directory);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileTypeExt as _;
             let kind = metadata.file_type();
-            if kind.is_dir() {
-                return Err(SecretReadError::Directory);
-            }
             if kind.is_char_device() || kind.is_block_device() {
                 return Err(SecretReadError::NotFileOrPipe);
             }
@@ -333,14 +333,18 @@ mod tests {
     /// Standard input an earlier program left non-blocking is still read
     /// whole: the read waits for what its writer sends. The test runs itself
     /// again as the reader, with the non-blocking end of a pipe for its
-    /// standard input and a writer that sends a moment later.
+    /// standard input. The writer sends nothing until the reader is about to
+    /// read, then the value in two pieces a moment apart, so a read finds
+    /// the pipe empty before each.
     #[cfg(unix)]
     #[test]
     fn standard_input_left_non_blocking_waits_for_its_writer() {
-        use std::io::Write as _;
+        use std::io::{BufRead as _, Read as _, Write as _};
         use std::os::fd::FromRawFd as _;
         const READER: &str = "LPM_SECRET_READ_NON_BLOCKING_READER";
         if std::env::var_os(READER).is_some() {
+            println!("ready");
+            std::io::stdout().flush().expect("flush");
             match read_secret_stdin(64) {
                 Ok(text) => println!("read: {}", text.as_str()),
                 Err(error) => println!("failed: {error}"),
@@ -366,7 +370,7 @@ mod tests {
                 0
             );
         }
-        let reader = std::process::Command::new(std::env::current_exe().expect("this test"))
+        let mut reader = std::process::Command::new(std::env::current_exe().expect("this test"))
             .args([
                 "--exact",
                 "secret_read::tests::standard_input_left_non_blocking_waits_for_its_writer",
@@ -377,13 +381,26 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("run the reader");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut stdout = std::io::BufReader::new(reader.stdout.take().expect("piped"));
+        let mut shown = String::new();
+        while !shown.contains("ready") {
+            assert_ne!(
+                stdout.read_line(&mut shown).expect("the reader's output"),
+                0,
+                "the reader ended first: {shown}"
+            );
+        }
         // A reader that gave up already has closed its end.
-        let _ = write_end.write_all(b"fixture-late");
+        for piece in [&b"fixture-"[..], b"late"] {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = write_end.write_all(piece);
+        }
         drop(write_end);
-        let output = reader.wait_with_output().expect("the reader ends");
-        let shown = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{shown}");
+        stdout
+            .read_to_string(&mut shown)
+            .expect("the reader's output");
+        let status = reader.wait().expect("the reader ends");
+        assert!(status.success(), "{shown}");
         assert!(shown.contains("read: fixture-late"), "{shown}");
     }
 

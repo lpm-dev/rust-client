@@ -1389,9 +1389,21 @@ fn stdin_that_is_a_directory_is_refused_by_name() {
             "but standard input is a directory",
         ),
     ] {
+        // Windows opens a folder only with backup semantics.
+        #[cfg(windows)]
+        let folder = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(project.path())
+        };
+        #[cfg(not(windows))]
+        let folder = std::fs::File::open(project.path());
         let output = support::lpm_spawnable(&project)
             .args(args)
-            .stdin(std::fs::File::open(project.path()).expect("open the project folder"))
+            .stdin(folder.expect("open the project folder"))
             .output()
             .expect("failed to run lpm");
         assert!(!output.status.success(), "{args:?}");

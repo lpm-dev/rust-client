@@ -27,13 +27,14 @@ pub(super) fn env_set(
     // A value that's typed, piped or read waits on the person, so what
     // refuses the write whatever it holds is found first, and the write
     // goes to the project that was checked.
-    let checked = super::value_input::check(&request, &super::value_input::ProcessSources)?
+    let arguments = super::value_input::check(&request, &super::value_input::ProcessSources)?;
+    let checked = arguments
         .reads_input
         .then(|| lpm_vault::check_values_writable(project_dir))
         .transpose()
         .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let assignments =
-        super::value_input::collect(&request, &mut super::value_input::ProcessSources)?;
+        super::value_input::collect(&request, arguments, &mut super::value_input::ProcessSources)?;
     let pairs: Vec<(&str, &str)> = assignments
         .iter()
         .map(|assignment| (assignment.key.as_str(), assignment.value.as_str()))
@@ -418,9 +419,10 @@ fn read_piped_env_file() -> Result<zeroize::Zeroizing<String>, LpmError> {
             SecretReadError::NotText => {
                 "the .env file piped to `lpm env import -` isn't UTF-8 text".into()
             }
-            SecretReadError::NotFileOrPipe => {
-                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a device, such as a terminal or /dev/null".into()
-            }
+            SecretReadError::NotFileOrPipe => format!(
+                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a device, such as a terminal or {}",
+                super::value_input::NULL_DEVICE
+            ),
             SecretReadError::Directory => {
                 "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a directory".into()
             }

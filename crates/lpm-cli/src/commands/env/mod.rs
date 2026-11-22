@@ -396,18 +396,38 @@ mod tests {
     /// (`secret_read::read_secret_stdin`) and never through std's reader.
     #[test]
     fn secret_input_never_reads_through_std_s_buffered_stdin() {
+        let production =
+            |source: &'static str| source.split("#[cfg(test)]").next().unwrap_or(source);
+        // Here std's stdin only says whether it's a terminal.
         for (name, source) in [
             ("value_input.rs", include_str!("value_input.rs")),
             ("local.rs", include_str!("local.rs")),
+            ("hidden_prompt.rs", include_str!("../../hidden_prompt.rs")),
+            (
+                "hidden_prompt/unix.rs",
+                include_str!("../../hidden_prompt/unix.rs"),
+            ),
+            (
+                "hidden_prompt/windows.rs",
+                include_str!("../../hidden_prompt/windows.rs"),
+            ),
         ] {
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            for read in [".lock()", "read_line(", "read_to_string(", "read_to_end("] {
-                assert!(
-                    !production.contains(read),
-                    "{name} reads through std's buffered stdin: {read}"
-                );
-            }
+            let source = production(source);
+            assert_eq!(
+                source.matches("stdin()").count(),
+                source.matches("stdin().is_terminal()").count(),
+                "{name} uses std's stdin for more than whether it's a terminal"
+            );
         }
+        // The reader takes its descriptor and reads that alone.
+        let secret_read = production(include_str!("../../../../lpm-common/src/secret_read.rs"));
+        assert_eq!(secret_read.matches("stdin()").count(), 1);
+        assert_eq!(
+            secret_read.matches("stdin.").count(),
+            secret_read.matches("stdin.as_raw_fd()").count()
+                + secret_read.matches("stdin.as_raw_handle()").count(),
+            "secret_read.rs reads std's stdin rather than its descriptor"
+        );
     }
 
     #[test]

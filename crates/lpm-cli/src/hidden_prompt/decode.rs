@@ -28,13 +28,19 @@ enum State {
     ControlSequence {
         parameters: [u8; 3],
         length: u8,
+        crossed: bool,
+        /// A parameter came after a read ended inside the sequence.
+        taken: bool,
     },
     /// `ESC O` and the one byte that ends it.
-    SingleShift,
+    SingleShift {
+        crossed: bool,
+    },
     /// The three bytes of an X10 mouse report, `ESC [ M` and its button and
     /// position, left to skip.
     MouseReport {
         remaining: u8,
+        crossed: bool,
     },
     /// A string a terminal sends, such as an `ESC ]` reply, which ends with
     /// BEL or `ESC \\`; `escape` once an `ESC` of that end was read. A
@@ -69,9 +75,11 @@ impl Bytes {
                     self.state = State::ControlSequence {
                         parameters: [0; 3],
                         length: 0,
+                        crossed: false,
+                        taken: false,
                     };
                 }
-                b'O' => self.state = State::SingleShift,
+                b'O' => self.state = State::SingleShift { crossed: false },
                 b']' | b'P' | b'_' | b'^' | b'X' => {
                     self.state = State::TerminalString {
                         escape: false,
@@ -90,6 +98,8 @@ impl Bytes {
             State::ControlSequence {
                 mut parameters,
                 length,
+                crossed,
+                taken,
             } => match byte {
                 0x20..=0x3f => {
                     if let Some(slot) = parameters.get_mut(usize::from(length)) {
@@ -98,13 +108,21 @@ impl Bytes {
                     self.state = State::ControlSequence {
                         parameters,
                         length: length.saturating_add(1),
+                        crossed,
+                        taken: taken || crossed,
                     };
                 }
                 0x40..=0x7e => {
-                    self.state = if byte == b'~' && length == 3 && parameters == *b"200" {
+                    let paste = byte == b'~' && length == 3 && parameters == *b"200";
+                    // A paste's start is the terminal's, wherever a read ends.
+                    self.took_after_read(crossed && !paste, each);
+                    self.state = if paste {
                         State::Paste { matched: 0 }
                     } else if byte == b'M' && length == 0 {
-                        State::MouseReport { remaining: 3 }
+                        State::MouseReport {
+                            remaining: 3,
+                            crossed: false,
+                        }
                     } else {
                         State::Ground
                     };
@@ -112,21 +130,27 @@ impl Bytes {
                 // A byte no sequence holds ends it unfinished, and is read
                 // on its own.
                 _ => {
+                    self.took_after_read(taken, each);
                     self.state = State::Ground;
                     self.ground(byte, each);
                 }
             },
-            State::SingleShift => {
+            State::SingleShift { crossed } => {
                 self.state = State::Ground;
-                if !(0x40..=0x7e).contains(&byte) {
+                if (0x40..=0x7e).contains(&byte) {
+                    self.took_after_read(crossed, each);
+                } else {
                     self.ground(byte, each);
                 }
             }
-            State::MouseReport { remaining } => {
+            State::MouseReport { remaining, crossed } => {
+                // The report took a byte after a read ended inside it.
+                self.took_after_read(crossed, each);
                 self.state = match remaining {
                     0 | 1 => State::Ground,
                     _ => State::MouseReport {
                         remaining: remaining - 1,
+                        crossed: false,
                     },
                 };
             }
@@ -200,18 +224,34 @@ impl Bytes {
     /// The read being fed ended. A terminal string that holds nothing yet
     /// began with a key: Escape and the key in one read are a Meta chord,
     /// which edits nothing, and a key typed after the Escape key is text.
+    /// A terminal sends a key's sequence whole, so what a sequence takes
+    /// from a later read may have been typed, such as digits after Alt+[.
     pub(super) fn end_of_read(&mut self, each: &mut dyn FnMut(Event)) {
-        if let State::TerminalString {
-            escape: false,
-            held: false,
-            introducer,
-            chord,
-        } = self.state
-        {
-            self.state = State::Ground;
-            if !chord {
-                each(Event::Typed(introducer));
+        match &mut self.state {
+            State::TerminalString {
+                escape: false,
+                held: false,
+                introducer,
+                chord,
+            } => {
+                let (introducer, chord) = (*introducer, *chord);
+                self.state = State::Ground;
+                if !chord {
+                    each(Event::Typed(introducer));
+                }
             }
+            State::ControlSequence { crossed, .. }
+            | State::SingleShift { crossed }
+            | State::MouseReport { crossed, .. } => *crossed = true,
+            _ => {}
+        }
+    }
+
+    /// A sequence took a byte; one from a read after its start may have
+    /// been typed, and is lost.
+    fn took_after_read(&self, crossed: bool, each: &mut dyn FnMut(Event)) {
+        if crossed {
+            each(Event::Lost);
         }
     }
 
@@ -503,6 +543,30 @@ mod tests {
     }
 
     #[test]
+    fn a_sequence_that_runs_into_a_later_read_may_have_taken_typed_text() {
+        assert_eq!(
+            decoded(&[b"a", b"\x1b[", b"12345\r"]),
+            "a<Lost><Enter>",
+            "Alt+[, then digits"
+        );
+        assert_eq!(
+            decoded(&[b"a", b"\x1bO", b"bc\r"]),
+            "a<Lost>c<Enter>",
+            "Alt+Shift+O, then letters"
+        );
+        assert_eq!(
+            decoded(&[b"a", b"\x1b[", b"\x03"]),
+            "a<Interrupt>",
+            "a key no sequence holds takes nothing"
+        );
+        assert_eq!(
+            decoded(&[b"\x1b", b"[Ab"]),
+            "b",
+            "a slow escape whose sequence arrives whole adds nothing"
+        );
+    }
+
+    #[test]
     fn a_string_introducer_that_ends_its_read_is_a_key() {
         assert_eq!(decoded(&[b"a", b"\x1bP", b"b"]), "ab", "Alt+P adds nothing");
         assert_eq!(
@@ -675,11 +739,13 @@ mod tests {
             }
             assert!(bytes.unfinished());
             bytes.end_unfinished(&mut |event| events.push(event));
+            assert!(!bytes.unfinished(), "quiet ends it");
+            bytes.feed(b'z', &mut |event| events.push(event));
             bytes.feed(0x03, &mut |event| events.push(event));
             assert_eq!(
                 events,
-                [Event::Lost, Event::Interrupt],
-                "what it held may have been typed, and Ctrl+C cancels again"
+                [Event::Lost, Event::Typed(b'z'), Event::Interrupt],
+                "what it held may have been typed; a key after it is a key again"
             );
         }
     }
