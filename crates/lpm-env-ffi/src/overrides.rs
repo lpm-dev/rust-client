@@ -150,12 +150,28 @@ pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize)
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times a plan has read a set's value: for its text, and for
+    /// what the engine refuses in it.
+    pub(super) static VALUE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn scanned_value() {
+    VALUE_SCANS.with(|scans| scans.set(scans.get() + 1));
+}
+
+#[cfg(not(test))]
+fn scanned_value() {}
+
 /// One edit, its fields checked against what its action takes, a set's
 /// value the text of the blob it names.
 enum EditRequest<'b> {
     Set {
         environment: String,
         key: String,
+        blob: usize,
         value: &'b str,
     },
     Unset {
@@ -236,10 +252,35 @@ enum Action {
     EnvironmentsChanged,
 }
 
+/// The text of each blob a set names, read once however many sets name it.
+struct BlobTexts<'a, 'b> {
+    blobs: &'a [&'b [u8]],
+    texts: Vec<Option<Option<&'b str>>>,
+}
+
+impl<'a, 'b> BlobTexts<'a, 'b> {
+    fn new(blobs: &'a [&'b [u8]]) -> Self {
+        Self {
+            blobs,
+            texts: vec![None; blobs.len()],
+        }
+    }
+
+    /// The text of the blob numbered `index`; `None` when there's no such
+    /// blob or it isn't UTF-8.
+    fn text(&mut self, index: usize) -> Option<&'b str> {
+        let bytes = blob(self.blobs, index)?;
+        *self.texts[index - 1].get_or_insert_with(|| {
+            scanned_value();
+            std::str::from_utf8(bytes).ok()
+        })
+    }
+}
+
 impl DecodedEdit {
     /// The edit its action makes, with exactly the fields that action takes;
-    /// a set's value names one of `blobs`, which holds text.
-    fn edit<'b>(self, blobs: &[&'b [u8]]) -> Option<EditRequest<'b>> {
+    /// a set's value names a blob that holds text.
+    fn edit<'b>(self, texts: &mut BlobTexts<'_, 'b>) -> Option<EditRequest<'b>> {
         let Self {
             action,
             environment,
@@ -264,7 +305,8 @@ impl DecodedEdit {
                 ) => EditRequest::Set {
                     environment,
                     key,
-                    value: std::str::from_utf8(blob(blobs, value)?).ok()?,
+                    blob: value,
+                    value: texts.text(value)?,
                 },
                 (Action::Unset, Some(environment), Some(key), None, None, None, None, None) => {
                     EditRequest::Unset { environment, key }
@@ -452,10 +494,16 @@ enum EditsFailure {
 }
 
 /// The edits a request names, in order, each checked as the engine checks
-/// it before its value is copied once out of its blob. A project without
-/// values takes no value at all: any set is refused, whatever it holds.
-fn edits(requests: Vec<EditRequest<'_>>, has_values: bool) -> Result<Vec<Edit>, EditsFailure> {
+/// it before its value is copied once out of its blob, one of `blob_count`.
+/// A project without values takes no value at all: any set is refused,
+/// whatever it holds.
+fn edits(
+    requests: Vec<EditRequest<'_>>,
+    blob_count: usize,
+    has_values: bool,
+) -> Result<Vec<Edit>, EditsFailure> {
     let refused = |index| move |reason| EditsFailure::Refused(PlanError::Edit { index, reason });
+    let mut checked_blobs = vec![false; blob_count];
     let mut copied = 0_usize;
     let mut edits = Vec::with_capacity(requests.len());
     for (index, request) in requests.into_iter().enumerate() {
@@ -463,9 +511,20 @@ fn edits(requests: Vec<EditRequest<'_>>, has_values: bool) -> Result<Vec<Edit>, 
             EditRequest::Set {
                 environment,
                 key,
+                blob,
                 value,
             } => {
-                check_set(&environment, &key, value).map_err(refused(index))?;
+                // A value the engine already found nothing to refuse in
+                // isn't read again: only this set's names are checked.
+                let checked = &mut checked_blobs[blob - 1];
+                let to_check = if *checked {
+                    ""
+                } else {
+                    scanned_value();
+                    value
+                };
+                check_set(&environment, &key, to_check).map_err(refused(index))?;
+                *checked = true;
                 if has_values {
                     if value.len() > MAX_RECORD_BYTES {
                         return Err(EditsFailure::ValueTooLarge { index, key });
@@ -707,11 +766,12 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             if !is_safe_vault_id(vault_id) {
                 return failure(2, DOMAIN.invalid_input);
             }
+            let mut texts = BlobTexts::new(blobs);
             let Some(requested) = request
                 .edits
                 .0
                 .into_iter()
-                .map(|edit| edit.edit(blobs))
+                .map(|edit| edit.edit(&mut texts))
                 .collect::<Option<Vec<_>>>()
             else {
                 return failure(2, DOMAIN.invalid_input);
@@ -726,7 +786,7 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             if let Err(error) = check_writable(&gate) {
                 return refusal(&error);
             }
-            let edits = match edits(requested, request.has_values) {
+            let edits = match edits(requested, blobs.len(), request.has_values) {
                 Ok(edits) => edits,
                 Err(EditsFailure::Refused(error)) => return refusal(&error),
                 Err(EditsFailure::ValueTooLarge { index, key }) => {

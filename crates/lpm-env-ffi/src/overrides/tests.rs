@@ -1008,3 +1008,25 @@ fn a_too_large_refusal_never_repeats_an_invalid_key_and_names_the_limit_it_met()
         "{refused}"
     );
 }
+
+#[test]
+fn a_value_many_sets_name_is_read_once_for_its_text_and_once_for_what_it_holds() {
+    let value = vec![b'x'; 1024];
+    let edits: Vec<Value> = (0..MAX_EDITS)
+        .map(|index| json!({"action": "set", "environment": "dev", "key": format!("K{index}"), "value": 1}))
+        .collect();
+    for has_values in [false, true] {
+        super::VALUE_SCANS.with(|scans| scans.set(0));
+        let (status, _, _) = call(
+            lpm_env_overrides_plan,
+            &json!({"vaultId": VAULT, "hasValues": has_values, "edits": edits}),
+            &[&value],
+        );
+        assert_eq!(status, 5, "with hasValues {has_values}");
+        assert_eq!(
+            super::VALUE_SCANS.with(std::cell::Cell::get),
+            2,
+            "with hasValues {has_values}, every set names the one value"
+        );
+    }
+}
