@@ -939,7 +939,9 @@ fn set_override(key: &str, value: &str) -> crate::companion::overrides::change::
 fn change_overrides(
     edits: &[crate::companion::overrides::change::Edit],
 ) -> Result<crate::companion::overrides::change::ChangePlan, String> {
-    with_vault_transaction(|directory| change_overrides_unlocked(directory, VAULT, edits))
+    with_vault_transaction(|directory| {
+        change_overrides_unlocked(directory, VAULT, edits, crate::overrides::Expect::Nothing)
+    })
 }
 
 fn read_overrides() -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
@@ -1023,8 +1025,13 @@ fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_sa
             crate::storage_transaction::FAIL_DIRECTORY_SYNC_OF
                 .with(|failing| failing.set(Some("env file journal")));
 
-            change_overrides_unlocked(directory, VAULT, &[set_override("API_URL", "mine")])
-                .expect_err("the journal's folder didn't sync");
+            change_overrides_unlocked(
+                directory,
+                VAULT,
+                &[set_override("API_URL", "mine")],
+                crate::overrides::Expect::Nothing,
+            )
+            .expect_err("the journal's folder didn't sync");
 
             assert!(journal_path(home, VAULT).exists());
             assert!(

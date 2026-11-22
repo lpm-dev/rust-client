@@ -288,6 +288,21 @@ impl ChildEnv {
         &self.applied_names
     }
 
+    /// The personal overrides that still decide one of `names`, as they're
+    /// spelled, in order.
+    pub fn overrides_of<'n>(&self, names: impl IntoIterator<Item = &'n str>) -> Vec<&str> {
+        if self.origins.is_empty() {
+            return Vec::new();
+        }
+        let mut decided: Vec<&str> = names
+            .into_iter()
+            .filter_map(|name| self.origins.decides(name))
+            .collect();
+        decided.sort_unstable();
+        decided.dedup();
+        decided
+    }
+
     /// Layer 5: one of LPM's runtime values.
     pub fn insert_runtime(&mut self, key: String, value: String) {
         self.origins.release(&key);
@@ -561,7 +576,26 @@ static ANNOUNCED_OVERRIDES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new()
 /// process, however many tasks, cache checks and services of one command
 /// load it, and log the names at debug level.
 pub fn announce_personal_overrides(child: &ChildEnv, environment: &str) {
-    let Some(notice) = personal_override_notice(child.override_count(), environment) else {
+    announce_override_count(child.override_count(), environment, || {
+        child.override_names().to_vec()
+    });
+}
+
+/// [`announce_personal_overrides`] for output that shows only `shown` of
+/// `child`'s names: the notice counts the overrides that decide one of them.
+pub fn announce_personal_overrides_of<'n>(
+    child: &ChildEnv,
+    environment: &str,
+    shown: impl IntoIterator<Item = &'n str>,
+) {
+    let names = child.overrides_of(shown);
+    announce_override_count(names.len(), environment, || {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    });
+}
+
+fn announce_override_count(count: usize, environment: &str, names: impl FnOnce() -> Vec<String>) {
+    let Some(notice) = personal_override_notice(count, environment) else {
         return;
     };
     let first = ANNOUNCED_OVERRIDES
@@ -570,7 +604,7 @@ pub fn announce_personal_overrides(child: &ChildEnv, environment: &str) {
         .insert(notice.clone());
     if first {
         eprintln!("lpm: {notice}");
-        log_personal_override_names(|| child.override_names().to_vec());
+        log_personal_override_names(names);
     }
 }
 

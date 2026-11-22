@@ -607,6 +607,17 @@ pub fn check_writable(gate: &ProjectGate) -> Result<(), PlanError> {
     gate.authorize(Operation::Write).map_err(PlanError::Refused)
 }
 
+/// Refuse a set of `key` in `environment` to `value` whatever the overrides:
+/// an invalid environment or key, a name LPM never passes to a process, or a
+/// NUL in the value, in that order, as [`check_edit`] does for a set.
+pub fn check_set(environment: &str, key: &str, value: &str) -> Result<(), EditError> {
+    check_settable(environment, key)?;
+    if value.contains('\0') {
+        return Err(EditError::NulValue(key.to_owned()));
+    }
+    Ok(())
+}
+
 /// Refuse what `edit` is refused for whatever overrides a project has: an
 /// invalid environment or name, a name LPM never passes to a process, a NUL
 /// in a value, or environments changed together that name one twice.
@@ -621,20 +632,22 @@ pub fn check_edit(edit: &Edit) -> Result<(), EditError> {
 /// What `edits` do to a project that has no overrides, such as one without
 /// values beside which none can live: their effects when none of them gives
 /// a key an override, so a removal of nothing succeeds and says so; `None`
-/// when one does.
+/// when one does, even if a later one takes it away.
 pub fn effects_without_overrides(edits: &[Edit]) -> Result<Option<Vec<Effect>>, PlanError> {
     let mut none = Overrides {
         case_insensitive: cfg!(windows),
         ..Overrides::default()
     };
     let mut effects = Vec::with_capacity(edits.len());
+    let mut gives_override = false;
     for (index, edit) in edits.iter().enumerate() {
         effects.push(
             none.apply(edit)
                 .map_err(|reason| PlanError::Edit { index, reason })?,
         );
+        gives_override |= !none.is_empty();
     }
-    Ok(none.is_empty().then_some(effects))
+    Ok((!gives_override).then_some(effects))
 }
 
 /// Plan `edits` to a project without values, after the gate checks
@@ -735,10 +748,7 @@ impl Overrides {
                 key,
                 value,
             } => {
-                check_settable(environment, key)?;
-                if value.contains('\0') {
-                    return Err(EditError::NulValue(key.clone()));
-                }
+                check_set(environment, key, value)?;
                 Ok(self.decide(environment, key, Some(Decision::Set(value.clone()))))
             }
             Edit::Unset { environment, key } => {

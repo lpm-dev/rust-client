@@ -37,7 +37,13 @@ fn remove(key: &str) -> Edit {
 fn change(storage: &mut MemoryProjectStorage, edits: &[Edit]) -> Result<(), String> {
     let _scope = crate::companion::LockScope::enter();
     recover_project_transaction(storage)?;
-    crate::keychain::overrides::change_with_storage(storage, VAULT, edits).map(|_| ())
+    crate::keychain::overrides::change_with_storage(
+        storage,
+        VAULT,
+        edits,
+        crate::overrides::Expect::Nothing,
+    )
+    .map(|_| ())
 }
 
 fn read_all(
@@ -364,6 +370,62 @@ fn a_change_probes_the_values_once_for_its_read_and_its_journal() {
     );
 }
 
+#[test]
+fn a_reviewed_removal_reads_the_record_once_and_is_refused_once_it_changed() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "mine"), set("LOG", "debug")]).expect("set");
+    let reviewed = read_all(&mut storage).expect("review");
+    let removals = [("default".to_owned(), "API_URL".to_owned())];
+    let reviewed_removal = |storage: &mut MemoryProjectStorage| {
+        let _scope = crate::companion::LockScope::enter();
+        crate::keychain::overrides::change_with_storage(
+            storage,
+            VAULT,
+            &[remove("API_URL")],
+            crate::overrides::Expect::Reviewed {
+                overrides: &reviewed,
+                removals: &removals,
+            },
+        )
+        .map(drop)
+    };
+
+    change(&mut storage, &[set("API_URL", "yours")]).expect("another command changes it");
+    storage.reads.clear();
+    let refused = reviewed_removal(&mut storage).expect_err("API_URL changed");
+    assert!(refused.contains("changed while it asked"), "{refused}");
+    assert_eq!(
+        read_all(&mut storage).expect("read")["default"].set["API_URL"],
+        "yours"
+    );
+
+    let cost = |storage: &mut MemoryProjectStorage| {
+        (
+            storage.reads.get(&overrides_account()).copied(),
+            storage
+                .probes
+                .iter()
+                .filter(|account| *account == VAULT)
+                .count(),
+        )
+    };
+    change(&mut storage, &[set("API_URL", "mine"), remove("LOG")]).expect("as reviewed");
+    storage.reads.clear();
+    storage.probes.clear();
+    change(&mut storage, &[remove("API_URL")]).expect("a plain removal");
+    let plain = cost(&mut storage);
+    change(&mut storage, &[set("API_URL", "mine")]).expect("as reviewed again");
+    storage.reads.clear();
+    storage.probes.clear();
+    reviewed_removal(&mut storage).expect("what it removes is as reviewed");
+    assert_eq!(
+        cost(&mut storage),
+        plain,
+        "the review is checked against the record the plan reads"
+    );
+    assert!(read_all(&mut storage).expect("read").is_empty());
+}
+
 /// A rollback's write that renames `default` to `prod`, its overrides
 /// following.
 fn rename_default_to_prod(storage: &mut MemoryProjectStorage) -> Result<(), String> {
@@ -518,6 +580,7 @@ fn removing_overrides_from_a_project_without_values_changes_nothing_and_says_so(
         &mut storage,
         VAULT,
         &[remove("API_URL"), Edit::ClearAll],
+        crate::overrides::Expect::Nothing,
     )
     .expect("nothing to remove");
     assert!(plan.mutations.is_empty());

@@ -157,6 +157,14 @@ mod tty {
             &["env", "override", "set", "API_URL=mine"],
         );
         assert!(status.success(), "{stderr}");
+        let vault_id = lpm_vault::vault_id::read_vault_id(project.path()).expect("a vault ID");
+        lpm_vault::acceptance::store_file_companion_records(
+            lpm_home.path(),
+            &vault_id,
+            None,
+            Some("unreadable"),
+        )
+        .expect("damage the overrides record");
 
         let (refused, written) = run_in_pty_with_stderr_captured(
             project.path(),
@@ -166,13 +174,20 @@ mod tty {
         );
 
         assert!(!refused.status.success(), "{}", refused.transcript);
-        assert!(written.contains("Confirmation required"), "{written}");
+        assert!(
+            written.contains("Confirmation required"),
+            "a read would have met the damaged record first: {written}"
+        );
         assert!(written.contains("--yes"), "{written}");
-        assert_eq!(
-            overrides(project.path(), lpm_home.path())
-                .as_array()
-                .map(Vec::len),
-            Some(1)
+        let (status, _, listed) = common::run_lpm(
+            project.path(),
+            lpm_home.path(),
+            None,
+            &["env", "override", "list"],
+        );
+        assert!(
+            !status.success() && listed.contains("damaged"),
+            "the record clear never read is damaged: {listed}"
         );
     }
 

@@ -1703,7 +1703,12 @@ fn write_all_environments_following_with_storage(
 ) -> Result<(), String> {
     validate_vault_id(vault_id)?;
     let mut listed = ListedStorage::new(storage);
-    let mut following = overrides::plan_listed(&mut listed, vault_id, edits)?;
+    let mut following = overrides::plan_listed(
+        &mut listed,
+        vault_id,
+        edits,
+        crate::overrides::Expect::Nothing,
+    )?;
     let mutations: Vec<ProjectStorageMutation> = std::mem::take(&mut following.mutations)
         .into_iter()
         .map(companion_gate::storage_mutation)

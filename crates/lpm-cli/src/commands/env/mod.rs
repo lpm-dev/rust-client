@@ -414,6 +414,10 @@ mod tests {
         for (name, source) in [
             ("value_input.rs", include_str!("value_input.rs")),
             ("local.rs", include_str!("local.rs")),
+            (
+                "personal_overrides.rs",
+                include_str!("personal_overrides.rs"),
+            ),
             ("hidden_prompt.rs", include_str!("../../hidden_prompt.rs")),
             (
                 "hidden_prompt/unix.rs",

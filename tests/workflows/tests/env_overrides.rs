@@ -7,7 +7,7 @@
 
 mod support;
 
-use lpm_runner::dotenv::personal_overrides_here;
+use lpm_runner::dotenv::{personal_override_notice, personal_overrides_here};
 use support::{TempProject, lpm};
 
 const OVERRIDES_MARKER: &str = r#"{"schemaVersion":1,"vaultId":"VAULT_ID","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
@@ -268,6 +268,76 @@ fn print_applies_overrides_but_ci_emission_excludes_them() {
             stderr(&ci)
         );
     }
+}
+
+#[test]
+fn a_filtered_print_counts_only_the_overrides_of_the_names_it_prints() {
+    let (project, _) = project_with_team_value("{}");
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "NEXT_PUBLIC_APP=team",
+            "NEXT_PUBLIC_GONE=team",
+        ])
+        .assert()
+        .success();
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"envSchema": {"vars": {
+            "API_URL": {},
+            "NEXT_PUBLIC_APP": {"client": true},
+            "NEXT_PUBLIC_GONE": {"client": true},
+        }}}),
+    );
+    lpm(&project)
+        .args(["env", "override", "set", "API_URL=mine", "EXTRA=mine"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["env", "override", "unset", "NEXT_PUBLIC_GONE"])
+        .assert()
+        .success();
+
+    let notice = |args: &[&str]| {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        stderr(&output)
+    };
+    for (args, count) in [
+        (&["env", "print"][..], 3),
+        (&["env", "print", "--schema-only"], 2),
+        (&["env", "print", "--client-only"], 1),
+    ] {
+        let shown = notice(args);
+        let expected = personal_override_notice(count, "default").expect("a notice");
+        assert!(
+            shown.contains(&format!("lpm: {expected}")),
+            "{args:?} prints the names of {count} overrides: {shown}"
+        );
+    }
+
+    let log = notice(&["--verbose", "env", "print", "--client-only"]);
+    let named = log
+        .lines()
+        .find(|line| line.contains("personal overrides apply to:"))
+        .unwrap_or_else(|| panic!("--verbose names the overrides: {log}"));
+    assert!(
+        named
+            .trim_end()
+            .ends_with("personal overrides apply to: NEXT_PUBLIC_GONE"),
+        "the client output shows only NEXT_PUBLIC_GONE's change: {named}"
+    );
+
+    lpm(&project)
+        .args(["env", "override", "remove", "NEXT_PUBLIC_GONE"])
+        .assert()
+        .success();
+    let shown = notice(&["env", "print", "--client-only"]);
+    assert!(
+        !shown.contains("personal override"),
+        "no override changes a client value: {shown}"
+    );
 }
 
 #[test]

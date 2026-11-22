@@ -1236,6 +1236,18 @@ fn a_project_without_values_removes_nothing_and_refuses_the_rest() {
             .code(),
         "no_values"
     );
+    for edits in [
+        vec![set("development", "A", "1"), remove("development", "A")],
+        vec![unset("development", "A"), Edit::ClearAll],
+    ] {
+        assert_eq!(
+            plan_without_values(&ProjectGate::Plain, &edits)
+                .unwrap_err()
+                .code(),
+            "no_values",
+            "a batch that gives a key an override anywhere needs values"
+        );
+    }
 }
 
 #[test]

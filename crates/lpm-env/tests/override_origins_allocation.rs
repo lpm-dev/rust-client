@@ -1,7 +1,7 @@
 //! What tracking the personal overrides' origins allocates. Its own test
 //! binary, since the probe replaces the global allocator.
 
-use lpm_env::{PersonalOverrideLayer, PersonalOverrideOrigins};
+use lpm_env::{PersonalOverrideLayer, PersonalOverrideOrigins, ValidationError};
 use std::cell::Cell;
 use std::collections::HashMap;
 
@@ -10,11 +10,13 @@ struct ProbeAllocator;
 thread_local! {
     static PROBE_ENABLED: Cell<bool> = const { Cell::new(false) };
     static MAX_ALLOCATION: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn record_allocation(size: usize) {
     if PROBE_ENABLED.try_with(Cell::get).unwrap_or(false) {
         MAX_ALLOCATION.with(|value| value.set(value.get().max(size)));
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
     }
 }
 
@@ -41,13 +43,19 @@ unsafe impl std::alloc::GlobalAlloc for ProbeAllocator {
     }
 }
 
-/// The largest single allocation `work` makes on this thread.
-fn largest_allocation<T>(work: impl FnOnce() -> T) -> (T, usize) {
+/// What `work` allocates on this thread: its largest single allocation and
+/// how many it makes.
+fn allocations<T>(work: impl FnOnce() -> T) -> (T, usize, usize) {
     MAX_ALLOCATION.with(|value| value.set(0));
+    ALLOCATIONS.with(|count| count.set(0));
     PROBE_ENABLED.with(|enabled| enabled.set(true));
     let result = work();
     PROBE_ENABLED.with(|enabled| enabled.set(false));
-    (result, MAX_ALLOCATION.with(Cell::get))
+    (
+        result,
+        MAX_ALLOCATION.with(Cell::get),
+        ALLOCATIONS.with(Cell::get),
+    )
 }
 
 #[test]
@@ -61,12 +69,42 @@ fn the_origins_keep_no_copy_of_an_override_s_value() {
         unset: &unset,
     };
 
-    let (origins, largest) =
-        largest_allocation(|| PersonalOverrideOrigins::changing(&vars, layer, false));
+    let (origins, largest, _) =
+        allocations(|| PersonalOverrideOrigins::changing(&vars, layer, false));
 
     assert_eq!(origins.names(), ["TOKEN"]);
     assert!(
         largest < LARGE,
         "a {largest}-byte allocation copied the override's value"
     );
+}
+
+#[test]
+fn attributing_no_errors_allocates_nothing() {
+    let set = HashMap::from([("TOKEN".to_owned(), "mine".to_owned())]);
+    let unset = vec!["GONE".to_owned()];
+    let before = HashMap::from([
+        ("TOKEN".to_owned(), "team".to_owned()),
+        ("GONE".to_owned(), "team".to_owned()),
+        ("OTHER".to_owned(), "team".to_owned()),
+    ]);
+    let after = HashMap::from([
+        ("TOKEN".to_owned(), "mine".to_owned()),
+        ("OTHER".to_owned(), "team".to_owned()),
+    ]);
+    let layer = PersonalOverrideLayer {
+        set: &set,
+        unset: &unset,
+    };
+    let no_errors: [ValidationError; 0] = [];
+    for case_insensitive in [false, true] {
+        let origins = PersonalOverrideOrigins::changing(&before, layer, case_insensitive);
+        let (caused, _, count) =
+            allocations(|| origins.attribute(&no_errors, &after, layer, |_, _| false));
+        assert!(caused.is_empty());
+        assert_eq!(
+            count, 0,
+            "with case_insensitive {case_insensitive}, attributing no errors allocated"
+        );
+    }
 }

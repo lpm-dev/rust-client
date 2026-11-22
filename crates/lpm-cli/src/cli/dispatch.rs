@@ -229,18 +229,11 @@ fn init_tracing_once(command: &Commands, verbose: bool) {
         } else {
             "lpm=warn"
         };
-        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
         use tracing_subscriber::util::SubscriberInitExt as _;
 
         let env_filter =
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
-        let diagnostic_filter = tracing_subscriber::filter::filter_fn(|metadata| {
-            metadata.target() == super::install_timeline::TARGET
-        });
-        let timeline = super::install_timeline::start(command)
-            .map(|layer| layer.with_filter(diagnostic_filter));
-
-        let _ = log_subscriber(env_filter).with(timeline).try_init();
+        let _ = log_subscriber(env_filter, super::install_timeline::start(command)).try_init();
     });
 }
 
@@ -3799,15 +3792,23 @@ fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSe
 }
 
 /// The subscriber that logs lpm's own events: on stderr and, with
-/// `--features tracy`, in the Tracy GUI.
+/// `--features tracy`, in the Tracy GUI; and the install timeline's events,
+/// when it records them, in `timeline`.
 fn log_subscriber(
     filter: tracing_subscriber::EnvFilter,
+    timeline: Option<super::install_timeline::TimelineLayer>,
 ) -> impl tracing::Subscriber
 + for<'span> tracing_subscriber::registry::LookupSpan<'span>
 + Send
 + Sync
 + 'static {
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+
+    let timeline = timeline.map(|layer| {
+        layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == super::install_timeline::TARGET
+        }))
+    });
 
     #[cfg(feature = "tracy")]
     let registry = tracing_subscriber::registry().with(lpm_events(
@@ -3816,14 +3817,16 @@ fn log_subscriber(
     ));
     #[cfg(not(feature = "tracy"))]
     let registry = tracing_subscriber::registry();
-    registry.with(lpm_events(
-        tracing_subscriber::fmt::layer()
-            .with_writer(crate::live_region::TracingEvent::default)
-            .with_target(false)
-            .fmt_fields(crate::terminal_output::SanitizedTracingFields::default())
-            .without_time(),
-        filter,
-    ))
+    registry
+        .with(lpm_events(
+            tracing_subscriber::fmt::layer()
+                .with_writer(crate::live_region::TracingEvent::default)
+                .with_target(false)
+                .fmt_fields(crate::terminal_output::SanitizedTracingFields::default())
+                .without_time(),
+            filter,
+        ))
+        .with(timeline)
 }
 
 /// `layer` with lpm's own events at the level `filter` allows, never the
@@ -3857,7 +3860,8 @@ mod log_layer_tests {
             ("lpm=warn", LevelFilter::WARN),
             ("lpm=debug,reqwest=debug", LevelFilter::DEBUG),
         ] {
-            let subscriber = super::log_subscriber(tracing_subscriber::EnvFilter::new(filter));
+            let subscriber =
+                super::log_subscriber(tracing_subscriber::EnvFilter::new(filter), None);
             assert_eq!(subscriber.max_level_hint(), Some(level), "{filter}");
         }
     }

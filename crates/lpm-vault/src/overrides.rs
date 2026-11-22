@@ -102,9 +102,48 @@ pub fn remove_reviewed(
             key: key.clone(),
         })
         .collect();
-    in_overrides_lock(|directory| {
-        let current = read_all_unlocked(directory, vault_id)?;
-        let (before, now) = (Decisions::of(&reviewed.overrides), Decisions::of(&current));
+    let expect = Expect::Reviewed {
+        overrides: &reviewed.overrides,
+        removals,
+    };
+    in_overrides_lock(|directory| change_unlocked(directory, vault_id, &edits, expect)).map(
+        |plan| Change {
+            effects: plan.effects,
+            activated: plan.activated,
+            over_admission_target: plan.over_admission_target,
+        },
+    )
+}
+
+/// What a change requires of the overrides it plans from, checked against
+/// them in its lock, from the record its plan reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Expect<'e> {
+    Nothing,
+    /// Every override `removals` names still decides what it did when a
+    /// review read `overrides`.
+    Reviewed {
+        overrides: &'e BTreeMap<String, PersonalOverrides>,
+        removals: &'e [(String, String)],
+    },
+}
+
+impl Expect<'_> {
+    /// Check against the overrides `current` gives, read only when there's
+    /// something to check.
+    pub(crate) fn check(
+        self,
+        current: impl FnOnce() -> Result<BTreeMap<String, PersonalOverrides>, String>,
+    ) -> Result<(), String> {
+        let Self::Reviewed {
+            overrides,
+            removals,
+        } = self
+        else {
+            return Ok(());
+        };
+        let current = current()?;
+        let (before, now) = (Decisions::of(overrides), Decisions::of(&current));
         if removals
             .iter()
             .any(|(environment, key)| before.get(environment, key) != now.get(environment, key))
@@ -114,15 +153,8 @@ pub fn remove_reviewed(
                     .to_owned(),
             );
         }
-        drop((before, now));
-        drop(current);
-        change_unlocked(directory, vault_id, &edits)
-    })
-    .map(|plan| Change {
-        effects: plan.effects,
-        activated: plan.activated,
-        over_admission_target: plan.over_admission_target,
-    })
+        Ok(())
+    }
 }
 
 /// What every environment's overrides decide, each environment's unset
@@ -164,11 +196,13 @@ pub fn change_checked(
         project_dir,
         "while its values were asked for; nothing was stored",
     )?;
-    in_overrides_lock(|directory| change_unlocked(directory, vault_id, edits)).map(|plan| Change {
-        effects: plan.effects,
-        activated: plan.activated,
-        over_admission_target: plan.over_admission_target,
-    })
+    in_overrides_lock(|directory| change_unlocked(directory, vault_id, edits, Expect::Nothing)).map(
+        |plan| Change {
+            effects: plan.effects,
+            activated: plan.activated,
+            over_admission_target: plan.over_admission_target,
+        },
+    )
 }
 
 /// Apply `edits` to the personal overrides of the env project at
@@ -186,11 +220,12 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
             None => Err(NO_PROJECT.to_owned()),
         };
     };
-    in_overrides_lock(|directory| change_unlocked(directory, &vault_id, edits)).map(|plan| Change {
-        effects: plan.effects,
-        activated: plan.activated,
-        over_admission_target: plan.over_admission_target,
-    })
+    in_overrides_lock(|directory| change_unlocked(directory, &vault_id, edits, Expect::Nothing))
+        .map(|plan| Change {
+            effects: plan.effects,
+            activated: plan.activated,
+            over_admission_target: plan.over_admission_target,
+        })
 }
 
 /// Refuse what a set or unset of `keys` in `environment` is refused for
@@ -223,16 +258,21 @@ pub fn check_before_values(
     Ok(Project { vault_id })
 }
 
-/// Plan `edits`, listing the store's companion records with `inventory`
-/// only when the batch creates or deletes the record, and only what that
-/// needs.
+/// Plan `edits` once the overrides `record` holds are as `expect` says,
+/// listing the store's companion records with `inventory` only when the
+/// batch creates or deletes the record, and only what that needs.
 pub(crate) fn plan(
     vault_id: &str,
     gate: &ProjectGate,
     record: Option<&[u8]>,
     edits: &[Edit],
+    expect: Expect<'_>,
     inventory: impl FnOnce(InventoryNeed) -> Result<Inventory, String>,
 ) -> Result<ChangePlan, String> {
+    expect.check(|| {
+        crate::companion::overrides::evaluate_all(gate, vault_id, record)
+            .map_err(crate::companion::damaged)
+    })?;
     match plan_change(vault_id, gate, record, edits, None) {
         Err(PlanError::NeedsInventory { need, .. }) => {
             let inventory = inventory(need)?;
@@ -243,13 +283,16 @@ pub(crate) fn plan(
     .map_err(|error| error.to_string())
 }
 
-/// `edits` to a project without values, as the engine plans them: those
-/// that give no key an override remove nothing and say so; any other is
-/// refused, with the ways to get values.
+/// `edits` to a project without values, and so without overrides, once
+/// that's as `expect` says, as the engine plans them: those that give no key
+/// an override remove nothing and say so; any other is refused, with the
+/// ways to get values.
 pub(crate) fn plan_without_values(
     gate: &ProjectGate,
     edits: &[Edit],
+    expect: Expect<'_>,
 ) -> Result<ChangePlan, String> {
+    expect.check(|| Ok(BTreeMap::new()))?;
     crate::companion::overrides::change::plan_without_values(gate, edits).map_err(|error| {
         match error {
             PlanError::NoValues => format!(
@@ -318,18 +361,21 @@ fn change_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
     edits: &[Edit],
+    expect: Expect<'_>,
 ) -> Result<ChangePlan, String> {
     if crate::force_file_vault_backend() {
-        return crate::fallback::companion::change_overrides_unlocked(directory, vault_id, edits);
+        return crate::fallback::companion::change_overrides_unlocked(
+            directory, vault_id, edits, expect,
+        );
     }
     #[cfg(target_os = "macos")]
     {
         let _ = directory;
-        crate::keychain::overrides::change_unlocked(vault_id, edits)
+        crate::keychain::overrides::change_unlocked(vault_id, edits, expect)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        crate::fallback::companion::change_overrides_unlocked(directory, vault_id, edits)
+        crate::fallback::companion::change_overrides_unlocked(directory, vault_id, edits, expect)
     }
 }
 
@@ -350,6 +396,61 @@ mod tests {
             }],
         )
         .expect("an override");
+    }
+
+    #[test]
+    fn a_reviewed_removal_reads_the_overrides_once_in_its_lock() {
+        use crate::fallback::companion::OVERRIDES_RECORD_READS;
+
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            store_value_and_override(&dir);
+            let reviewed = review_all(&dir).expect("review").expect("a project");
+            OVERRIDES_RECORD_READS.with(|reads| reads.set(0));
+
+            remove_reviewed(&dir, &reviewed, &[("default".to_owned(), "A".to_owned())])
+                .expect("removed");
+
+            assert_eq!(OVERRIDES_RECORD_READS.with(std::cell::Cell::get), 1);
+            assert!(read_all(&dir).expect("read").is_empty());
+        });
+    }
+
+    #[test]
+    fn a_reviewed_removal_is_refused_once_what_it_removes_changed() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            store_value_and_override(&dir);
+            let reviewed = review_all(&dir).expect("review").expect("a project");
+            change(
+                &dir,
+                &[
+                    Edit::Unset {
+                        environment: "default".to_owned(),
+                        key: "A".to_owned(),
+                    },
+                    Edit::Set {
+                        environment: "default".to_owned(),
+                        key: "B".to_owned(),
+                        value: zeroize::Zeroizing::new("added".to_owned()),
+                    },
+                ],
+            )
+            .expect("another command changes A");
+
+            let refused =
+                remove_reviewed(&dir, &reviewed, &[("default".to_owned(), "A".to_owned())])
+                    .expect_err("A changed since the review");
+
+            assert!(refused.contains("changed while it asked"), "{refused}");
+            let now = read_all(&dir).expect("read");
+            assert_eq!(now["default"].unset, ["A"]);
+            assert_eq!(now["default"].set["B"], "added");
+        });
     }
 
     #[test]

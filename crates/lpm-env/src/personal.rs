@@ -209,6 +209,17 @@ impl PersonalOverrideOrigins {
         self.decided.is_empty()
     }
 
+    /// The spelling of the override that still decides `name`, compared as
+    /// the host compares names.
+    pub fn decides(&self, name: &str) -> Option<&str> {
+        if self.decided.is_empty() {
+            return None;
+        }
+        self.decided
+            .get(&self.key(name))
+            .map(|decided| decided.spelling.as_str())
+    }
+
     /// The names of the overrides that change the environment, as they're
     /// spelled, in order.
     pub fn names(&self) -> Vec<&str> {
@@ -245,8 +256,9 @@ impl PersonalOverrideOrigins {
     /// so it's the overrides' when the group kept its rule with each member
     /// as it would have been without them and breaks it now. Any other error
     /// is an override's when the override still gives the value the schema
-    /// judged, or its `unset` left the value missing. Names are looked up
-    /// once each, without case where the host ignores it.
+    /// judged, or its `unset` left missing or empty a value that held one
+    /// before it. Names are looked up once each, without case where the host
+    /// ignores it.
     ///
     /// `vars` is the environment the schema judged, with everything its
     /// evaluation added, such as inherited values and defaults. For a member
@@ -261,6 +273,9 @@ impl PersonalOverrideOrigins {
         overrides: PersonalOverrideLayer<'_>,
         filled: impl Fn(&str, Option<&str>) -> bool,
     ) -> Vec<bool> {
+        if errors.is_empty() {
+            return Vec::new();
+        }
         if self.decided.is_empty() {
             return vec![false; errors.len()];
         }
@@ -287,13 +302,14 @@ impl PersonalOverrideOrigins {
         // What a member an override decides held before it stands whatever
         // the evaluation then made of it, such as a default that fills it
         // after an unset; a later layer that wrote it took it back.
+        let held_before = |name: &str, decided: &Decided| match decided.before {
+            Before::Present => true,
+            Before::Empty => filled(name, Some("")),
+            Before::Absent => filled(name, None),
+        };
         let present_before = |name: &str| match self.decided.get(&self.key(name)) {
-            Some(decided) => match decided.before {
-                Before::Present => true,
-                Before::Empty => filled(name, Some("")),
-                Before::Absent => filled(name, None),
-            },
-            None => value_of(name).is_some_and(|value| !value.is_empty()),
+            Some(decided) => held_before(name, decided),
+            None => present_now(name),
         };
         let broken: HashSet<&str> = groups
             .iter()
@@ -311,38 +327,32 @@ impl PersonalOverrideOrigins {
                 ValidationErrorKind::GroupViolation { group, .. } => {
                     broken.contains(group.as_str())
                 }
-                _ => self.caused(error, value_of(&error.key), overrides),
+                _ => self
+                    .decided
+                    .get(&self.key(&error.key))
+                    .is_some_and(|decided| {
+                        let value = value_of(&error.key);
+                        match decided.decision {
+                            Decision::Set => decided.still_gives(value, overrides),
+                            Decision::Unset => {
+                                matches!(
+                                    error.kind,
+                                    ValidationErrorKind::Missing | ValidationErrorKind::Empty
+                                ) && value.is_none_or(str::is_empty)
+                                    && held_before(&error.key, decided)
+                            }
+                        }
+                    }),
             })
             .collect()
-    }
-
-    /// Whether an override caused `error` on a name that now holds `value`.
-    fn caused(
-        &self,
-        error: &ValidationError,
-        value: Option<&str>,
-        overrides: PersonalOverrideLayer<'_>,
-    ) -> bool {
-        let Some(decided) = self.decided.get(&self.key(&error.key)) else {
-            return false;
-        };
-        match decided.decision {
-            Decision::Set => decided.still_decides(value, overrides),
-            Decision::Unset => error.kind == ValidationErrorKind::Missing && value.is_none(),
-        }
     }
 }
 
 impl Decided {
-    /// Whether the override still gives the name its final `value`, rather
+    /// Whether a set override still gives the name its final `value`, rather
     /// than a later layer or a schema default.
-    fn still_decides(&self, value: Option<&str>, overrides: PersonalOverrideLayer<'_>) -> bool {
-        match self.decision {
-            Decision::Set => {
-                value.is_some() && value == overrides.set.get(&self.spelling).map(String::as_str)
-            }
-            Decision::Unset => value.is_none(),
-        }
+    fn still_gives(&self, value: Option<&str>, overrides: PersonalOverrideLayer<'_>) -> bool {
+        value.is_some() && value == overrides.set.get(&self.spelling).map(String::as_str)
     }
 }
 
@@ -429,6 +439,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_that_lets_an_empty_value_through_is_blamed_for_its_presence_error() {
+        let unset = names(&["PORT"]);
+        let origins = PersonalOverrideOrigins::changing(
+            &map(&[("PORT", "8080")]),
+            layer(&HashMap::new(), &unset),
+            false,
+        );
+        assert_eq!(
+            origins.attribute(
+                &[
+                    error("PORT", ValidationErrorKind::Missing),
+                    error("PORT", ValidationErrorKind::Empty),
+                ],
+                &map(&[("PORT", "")]),
+                layer(&HashMap::new(), &unset),
+                unfilled,
+            ),
+            [true, true],
+            "the unset removed a value that passed, and an inherited empty one showed through"
+        );
+    }
+
+    #[test]
+    fn an_unset_of_an_empty_value_is_blamed_only_where_the_empty_value_would_have_passed() {
+        let unset = names(&["PORT"]);
+        let origins = PersonalOverrideOrigins::changing(
+            &map(&[("PORT", "")]),
+            layer(&HashMap::new(), &unset),
+            false,
+        );
+        let missing = [error("PORT", ValidationErrorKind::Missing)];
+        let attribute = |filled: fn(&str, Option<&str>) -> bool| {
+            origins.attribute(
+                &missing,
+                &HashMap::new(),
+                layer(&HashMap::new(), &unset),
+                filled,
+            )
+        };
+        assert_eq!(
+            attribute(unfilled),
+            [false],
+            "the empty value was missing to the schema before the unset too"
+        );
+        assert_eq!(
+            attribute(|_, _| true),
+            [true],
+            "a default would have filled the empty value the unset removed"
+        );
+    }
+
+    #[test]
     fn an_override_is_found_under_the_declared_spelling_where_the_host_ignores_case() {
         let set = map(&[("api_url", "not a url")]);
         let invalid = [error(
@@ -442,6 +504,22 @@ mod tests {
         };
         assert_eq!(attribute(true), [true]);
         assert_eq!(attribute(false), [false]);
+    }
+
+    #[test]
+    fn the_override_deciding_a_name_is_found_as_the_host_compares_names() {
+        let set = map(&[("api_url", "mine")]);
+        let decides = |case_insensitive| {
+            PersonalOverrideOrigins::changing(
+                &map(&[("API_URL", "team")]),
+                layer(&set, &[]),
+                case_insensitive,
+            )
+            .decides("API_URL")
+            .map(str::to_owned)
+        };
+        assert_eq!(decides(true).as_deref(), Some("api_url"));
+        assert_eq!(decides(false), None);
     }
 
     #[test]

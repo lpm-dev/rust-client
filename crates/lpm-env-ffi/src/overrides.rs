@@ -16,7 +16,7 @@ use lpm_env_companion::lifecycle::{Mutation, needs_resume};
 use lpm_env_companion::marker::{MAX_RECORD_BYTES, Marker};
 use lpm_env_companion::overrides::change::{
     ChangePlan, Edit, EditError, Effect, EnvironmentMove, Inventory, InventoryNeed, PlanError,
-    check_edit, check_writable, plan_change, plan_without_values,
+    check_edit, check_set, check_writable, plan_change, plan_without_values,
 };
 use lpm_env_companion::overrides::evaluate_all;
 use serde::{Deserialize, Serialize};
@@ -150,12 +150,13 @@ pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize)
     }
 }
 
-/// One edit, its fields checked against what its action takes.
-enum EditRequest {
+/// One edit, its fields checked against what its action takes, a set's
+/// value the text of the blob it names.
+enum EditRequest<'b> {
     Set {
         environment: String,
         key: String,
-        value: usize,
+        value: &'b str,
     },
     Unset {
         environment: String,
@@ -236,8 +237,9 @@ enum Action {
 }
 
 impl DecodedEdit {
-    /// The edit its action makes, with exactly the fields that action takes.
-    fn edit(self) -> Option<EditRequest> {
+    /// The edit its action makes, with exactly the fields that action takes;
+    /// a set's value names one of `blobs`, which holds text.
+    fn edit<'b>(self, blobs: &[&'b [u8]]) -> Option<EditRequest<'b>> {
         let Self {
             action,
             environment,
@@ -262,7 +264,7 @@ impl DecodedEdit {
                 ) => EditRequest::Set {
                     environment,
                     key,
-                    value,
+                    value: std::str::from_utf8(blob(blobs, value)?).ok()?,
                 },
                 (Action::Unset, Some(environment), Some(key), None, None, None, None, None) => {
                     EditRequest::Unset { environment, key }
@@ -437,107 +439,79 @@ where
     }
 }
 
-/// Why the edits of a request can't be read.
+/// Why the edits of a request are refused.
 enum EditsFailure {
-    InvalidInput,
     /// An edit the engine refuses whatever the overrides: checked before its
     /// value is copied, so a refusal never names a value or an invalid key.
     Refused(PlanError),
     /// A value larger than one record holds, refused before it's copied.
-    ValueTooLarge {
-        index: usize,
-        key: String,
-    },
+    ValueTooLarge { index: usize, key: String },
     /// The values set so far past what one input carries, refused before
     /// more is copied.
-    ValuesTooLarge {
-        index: usize,
-    },
+    ValuesTooLarge { index: usize },
 }
 
-/// The edits a request names, in order, each checked before its value is
-/// copied once out of its blob. A project without values takes no value at
-/// all: any set is refused, whatever it holds.
-fn edits(
-    requests: Vec<EditRequest>,
-    blobs: &[&[u8]],
-    has_values: bool,
-) -> Result<Vec<Edit>, EditsFailure> {
+/// The edits a request names, in order, each checked as the engine checks
+/// it before its value is copied once out of its blob. A project without
+/// values takes no value at all: any set is refused, whatever it holds.
+fn edits(requests: Vec<EditRequest<'_>>, has_values: bool) -> Result<Vec<Edit>, EditsFailure> {
+    let refused = |index| move |reason| EditsFailure::Refused(PlanError::Edit { index, reason });
     let mut copied = 0_usize;
     let mut edits = Vec::with_capacity(requests.len());
     for (index, request) in requests.into_iter().enumerate() {
-        let (edit, value) = match request {
+        let edit = match request {
             EditRequest::Set {
                 environment,
                 key,
                 value,
-            } => (
+            } => {
+                check_set(&environment, &key, value).map_err(refused(index))?;
+                if has_values {
+                    if value.len() > MAX_RECORD_BYTES {
+                        return Err(EditsFailure::ValueTooLarge { index, key });
+                    }
+                    copied = copied.saturating_add(value.len());
+                    if copied > MAX_BATCH_VALUE_BYTES {
+                        return Err(EditsFailure::ValuesTooLarge { index });
+                    }
+                }
+                let value = if has_values {
+                    value.to_owned()
+                } else {
+                    String::new()
+                };
                 Edit::Set {
                     environment,
                     key,
-                    value: Zeroizing::new(String::new()),
-                },
-                Some(blob(blobs, value).ok_or(EditsFailure::InvalidInput)?),
-            ),
-            EditRequest::Unset { environment, key } => (Edit::Unset { environment, key }, None),
-            EditRequest::Remove { environment, key } => (Edit::Remove { environment, key }, None),
-            EditRequest::ClearEnvironment { environment } => {
-                (Edit::ClearEnvironment { environment }, None)
+                    value: Zeroizing::new(value),
+                }
             }
-            EditRequest::ClearAll => (Edit::ClearAll, None),
-            EditRequest::EnvironmentRenamed { from, to } => {
-                (Edit::EnvironmentRenamed { from, to }, None)
-            }
+            EditRequest::Unset { environment, key } => Edit::Unset { environment, key },
+            EditRequest::Remove { environment, key } => Edit::Remove { environment, key },
+            EditRequest::ClearEnvironment { environment } => Edit::ClearEnvironment { environment },
+            EditRequest::ClearAll => Edit::ClearAll,
+            EditRequest::EnvironmentRenamed { from, to } => Edit::EnvironmentRenamed { from, to },
             EditRequest::EnvironmentRemoved { environment } => {
-                (Edit::EnvironmentRemoved { environment }, None)
+                Edit::EnvironmentRemoved { environment }
             }
             EditRequest::EnvironmentDuplicated { from, to } => {
-                (Edit::EnvironmentDuplicated { from, to }, None)
+                Edit::EnvironmentDuplicated { from, to }
             }
             EditRequest::EnvironmentCreated { environment } => {
-                (Edit::EnvironmentCreated { environment }, None)
+                Edit::EnvironmentCreated { environment }
             }
-            EditRequest::EnvironmentsChanged { renamed, removed } => (
-                Edit::EnvironmentsChanged {
-                    renamed: renamed
-                        .0
-                        .into_iter()
-                        .map(|rename| (rename.from, rename.to))
-                        .collect(),
-                    removed: removed.0,
-                },
-                None,
-            ),
+            EditRequest::EnvironmentsChanged { renamed, removed } => Edit::EnvironmentsChanged {
+                renamed: renamed
+                    .0
+                    .into_iter()
+                    .map(|rename| (rename.from, rename.to))
+                    .collect(),
+                removed: removed.0,
+            },
         };
-        check_edit(&edit)
-            .map_err(|reason| EditsFailure::Refused(PlanError::Edit { index, reason }))?;
-        let edit = match (edit, value) {
-            (
-                Edit::Set {
-                    environment, key, ..
-                },
-                Some(bytes),
-            ) if has_values => {
-                if bytes.len() > MAX_RECORD_BYTES {
-                    return Err(EditsFailure::ValueTooLarge { index, key });
-                }
-                copied = copied.saturating_add(bytes.len());
-                if copied > MAX_BATCH_VALUE_BYTES {
-                    return Err(EditsFailure::ValuesTooLarge { index });
-                }
-                let text = std::str::from_utf8(bytes).map_err(|_| EditsFailure::InvalidInput)?;
-                let edit = Edit::Set {
-                    environment,
-                    key,
-                    value: Zeroizing::new(text.to_owned()),
-                };
-                // What the value holds, such as a NUL, before the next edit.
-                check_edit(&edit)
-                    .map_err(|reason| EditsFailure::Refused(PlanError::Edit { index, reason }))?;
-                edit
-            }
-            (edit, _) => edit,
-        };
+        if !matches!(edit, Edit::Set { .. }) {
+            check_edit(&edit).map_err(refused(index))?;
+        }
         edits.push(edit);
     }
     Ok(edits)
@@ -737,7 +711,7 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
                 .edits
                 .0
                 .into_iter()
-                .map(DecodedEdit::edit)
+                .map(|edit| edit.edit(blobs))
                 .collect::<Option<Vec<_>>>()
             else {
                 return failure(2, DOMAIN.invalid_input);
@@ -752,9 +726,8 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             if let Err(error) = check_writable(&gate) {
                 return refusal(&error);
             }
-            let edits = match edits(requested, blobs, request.has_values) {
+            let edits = match edits(requested, request.has_values) {
                 Ok(edits) => edits,
-                Err(EditsFailure::InvalidInput) => return failure(2, DOMAIN.invalid_input),
                 Err(EditsFailure::Refused(error)) => return refusal(&error),
                 Err(EditsFailure::ValueTooLarge { index, key }) => {
                     let mut details = serde_json::Map::new();

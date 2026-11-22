@@ -246,6 +246,40 @@ fn a_plan_refuses_for_the_marker_first_then_for_each_edit_in_order() {
 }
 
 #[test]
+fn a_plan_refuses_malformed_value_blobs_as_input_before_the_marker() {
+    let damaged_marker: &[u8] = b"not a marker";
+    let not_text: &[u8] = &[0xff, 0xfe];
+    for (value, blobs) in [
+        (99, vec![damaged_marker]),
+        (2, vec![damaged_marker, not_text]),
+    ] {
+        let (status, refused, _) = call(
+            lpm_env_overrides_plan,
+            &json!({"vaultId": VAULT, "hasValues": true, "marker": 1, "edits": [
+                {"action": "set", "environment": "dev", "key": "A", "value": value},
+            ]}),
+            &blobs,
+        );
+        assert_eq!(status, 2, "value blob {value}: {refused}");
+    }
+}
+
+#[test]
+fn a_plan_without_values_refuses_a_nul_as_a_plan_with_them_does() {
+    let with_nul: &[u8] = b"fixture\0value";
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": false, "edits": [
+            {"action": "set", "environment": "dev", "key": "A", "value": 1},
+        ]}),
+        &[with_nul],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.nul_value");
+    assert_eq!(refused["edit"], 0);
+}
+
+#[test]
 fn a_plan_says_whether_the_project_has_values() {
     let (status, response, _) = call(
         lpm_env_overrides_plan,
@@ -919,6 +953,27 @@ fn a_project_without_values_plans_removals_and_refuses_the_rest() {
     );
     assert_eq!(status, 5, "{refused}");
     assert_eq!(refused["code"], "overrides.no_values");
+    for edits in [
+        json!([
+            {"action": "set", "environment": "dev", "key": "A", "value": 1},
+            {"action": "remove", "environment": "dev", "key": "A"},
+        ]),
+        json!([
+            {"action": "unset", "environment": "dev", "key": "A"},
+            {"action": "clearAll"},
+        ]),
+    ] {
+        let (status, refused, _) = call(
+            lpm_env_overrides_plan,
+            &json!({"vaultId": VAULT, "hasValues": false, "edits": edits}),
+            &[b"fixture"],
+        );
+        assert_eq!(status, 5, "{edits}: {refused}");
+        assert_eq!(
+            refused["code"], "overrides.no_values",
+            "{edits}: a later edit never takes back an override without values"
+        );
+    }
 }
 
 #[test]

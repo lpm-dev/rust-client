@@ -12,6 +12,7 @@ use crate::companion::lifecycle::LifecycleStore as _;
 use crate::companion::overrides::change::{ChangePlan, Edit, Inventory, InventoryNeed};
 use crate::companion::overrides::{self, OVERRIDES_KIND};
 use crate::macos_keychain::ClaimedAccess;
+use crate::overrides::Expect;
 
 use super::companion_gate::{
     KeychainCompanion, authorize, contradictory_record, read_overrides_record,
@@ -68,7 +69,7 @@ pub(super) fn check_with_storage(
     // Whether values exist is all it needs, which their attributes say;
     // the change verifies their approval when it reads.
     match listed.claimed_access(vault_id)? {
-        None => crate::overrides::plan_without_values(&gate, edits).map(drop),
+        None => crate::overrides::plan_without_values(&gate, edits, Expect::Nothing).map(drop),
         Some(ClaimedAccess::Contradictory) => Err(crate::companion::damaged(
             crate::companion::gate::Damage::Access(
                 super::companion_gate::CONTRADICTORY_VALUES.to_owned(),
@@ -81,8 +82,12 @@ pub(super) fn check_with_storage(
     }
 }
 
-pub(crate) fn change_unlocked(vault_id: &str, edits: &[Edit]) -> Result<ChangePlan, String> {
-    change_with_storage(&mut super::KeychainProjectStorage, vault_id, edits)
+pub(crate) fn change_unlocked(
+    vault_id: &str,
+    edits: &[Edit],
+    expect: Expect<'_>,
+) -> Result<ChangePlan, String> {
+    change_with_storage(&mut super::KeychainProjectStorage, vault_id, edits, expect)
 }
 
 /// Plan and commit `edits` through one listing of the service: the gate,
@@ -91,10 +96,11 @@ pub(super) fn change_with_storage(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     edits: &[Edit],
+    expect: Expect<'_>,
 ) -> Result<ChangePlan, String> {
     super::validate_vault_id(vault_id)?;
     let mut listed = ListedStorage::new(storage);
-    let mut plan = plan_listed(&mut listed, vault_id, edits)?;
+    let mut plan = plan_listed(&mut listed, vault_id, edits, expect)?;
     let mutations = std::mem::take(&mut plan.mutations);
     if !mutations.is_empty() {
         if let Err(error) = KeychainCompanion(&mut listed).commit(mutations) {
@@ -139,10 +145,11 @@ pub(super) fn plan_listed<S: ProjectStorage>(
     listed: &mut ListedStorage<'_, S>,
     vault_id: &str,
     edits: &[Edit],
+    expect: Expect<'_>,
 ) -> Result<ChangePlan, String> {
     let (gate, protected_values) = match writable(listed, vault_id)? {
         Writable::WithoutValues(gate) => {
-            return crate::overrides::plan_without_values(&gate, edits);
+            return crate::overrides::plan_without_values(&gate, edits, expect);
         }
         Writable::WithValues {
             gate,
@@ -155,6 +162,7 @@ pub(super) fn plan_listed<S: ProjectStorage>(
         &gate,
         record.as_ref().map(|bytes| bytes.as_slice()),
         edits,
+        expect,
         |need| {
             let names = listed.account_names()?;
             let names = names.iter().map(String::as_str);

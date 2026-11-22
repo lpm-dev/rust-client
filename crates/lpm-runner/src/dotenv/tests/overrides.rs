@@ -123,7 +123,7 @@ fn validation_failures_name_an_override_only_while_it_is_the_final_origin() {
 
 /// The validation failure of `vars` under `overrides` against `schema`,
 /// with `inherited` in this process's environment while it's evaluated.
-fn group_failure(
+fn failure(
     schema: &str,
     inherited: (&str, &str),
     vars: &[(&str, &str)],
@@ -149,7 +149,7 @@ fn group_failure(
 #[test]
 fn a_group_an_override_broke_counts_the_member_the_shell_gives() {
     const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_UNSET_PAIR";
-    let message = group_failure(
+    let message = failure(
         &format!(
             r#"{{"vars":{{"{SHELL}":{{}},"B":{{}}}},"groups":{{"pair":{{"mode":"allOrNone","vars":["{SHELL}","B"]}}}}}}"#
         ),
@@ -166,9 +166,26 @@ fn a_group_an_override_broke_counts_the_member_the_shell_gives() {
 }
 
 #[test]
+fn a_required_name_an_unset_leaves_to_an_empty_shell_value_is_blamed_on_it() {
+    const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_UNSET_EMPTY";
+    for empty in ["missing", "allow", "reject"] {
+        let message = failure(
+            &format!(r#"{{"vars":{{"{SHELL}":{{"required":true,"empty":"{empty}"}}}}}}"#),
+            (SHELL, ""),
+            &[(SHELL, "team")],
+            overrides(&[], &[SHELL]),
+        );
+        assert!(
+            message.contains(&format!("(from a personal override on {THIS_MACHINE})")),
+            "with empty {empty}, the team's value passed before the unset: {message}"
+        );
+    }
+}
+
+#[test]
 fn an_override_of_a_name_the_shell_gives_leaves_its_group_as_it_was() {
     const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_SET_ONE";
-    let message = group_failure(
+    let message = failure(
         &format!(
             r#"{{"vars":{{"{SHELL}":{{}},"B":{{}}}},"groups":{{"one":{{"mode":"exactlyOne","vars":["{SHELL}","B"]}}}}}}"#
         ),

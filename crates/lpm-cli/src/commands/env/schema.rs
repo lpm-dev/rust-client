@@ -214,9 +214,22 @@ fn format_print_env(
             .canonical
         },
     );
-    lpm_runner::dotenv::announce_personal_overrides(&composed, &environment);
-    let mut env_vars = composed.into_vars();
     let schema = config.and_then(|c| c.env_schema.as_ref());
+    let filter = schema.filter(|_| schema_only || client_only);
+    let shown = |rule: &lpm_env::EnvVarRule| !client_only || rule.client;
+    match filter {
+        Some(schema) => lpm_runner::dotenv::announce_personal_overrides_of(
+            &composed,
+            &environment,
+            schema
+                .vars
+                .iter()
+                .filter(|(_, rule)| shown(rule))
+                .map(|(key, _)| key.as_str()),
+        ),
+        None => lpm_runner::dotenv::announce_personal_overrides(&composed, &environment),
+    }
+    let mut env_vars = composed.into_vars();
 
     // Collect secret keys for masking
     let secret_keys: std::collections::HashSet<String> = schema
@@ -229,16 +242,8 @@ fn format_print_env(
         })
         .unwrap_or_default();
 
-    // Filter to schema-only if requested
-    if (schema_only || client_only)
-        && let Some(schema) = schema
-    {
-        env_vars.retain(|key, _| {
-            schema
-                .vars
-                .get(key)
-                .is_some_and(|rule| !client_only || rule.client)
-        });
+    if let Some(schema) = filter {
+        env_vars.retain(|key, _| schema.vars.get(key).is_some_and(shown));
     }
 
     Ok(lpm_env::format_env(&env_vars, format, &secret_keys))

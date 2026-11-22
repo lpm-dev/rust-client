@@ -1027,12 +1027,20 @@ fn authorize_with(
 /// A record's bytes, wiped when dropped; `None` when it's absent.
 pub(crate) type RecordBytes = Option<zeroize::Zeroizing<Vec<u8>>>;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OVERRIDES_RECORD_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The personal overrides record. One that fails to decrypt is damage,
 /// which says how to repair it.
 fn read_overrides_record(
     companion: &mut FileCompanion<'_>,
     vault_id: &str,
 ) -> Result<RecordBytes, String> {
+    #[cfg(test)]
+    OVERRIDES_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
     let account = CompanionAccount::Record {
         kind: OVERRIDES_KIND.to_owned(),
         vault_id: vault_id.to_owned(),
@@ -1065,22 +1073,70 @@ fn read_overrides_record_unlocked(
     Ok(Some((gate, record)))
 }
 
-/// The selected environment's personal overrides.
-pub(crate) fn read_overrides_unlocked(
+/// What a run reads in the caller's lock, after the Apply gate: the values
+/// file's name and content, and the personal overrides record only when
+/// there are values, which overrides need.
+pub(crate) struct RunRead {
+    pub(crate) values: Option<(String, Vec<u8>)>,
+    /// The folder the values file is in, which names it in an error.
+    pub(crate) vaults: VaultStorageDirectory,
+    gate: ProjectGate,
+    record: RecordBytes,
+}
+
+pub(crate) fn read_for_run_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-    environment: &str,
-) -> Result<PersonalOverrides, String> {
-    let Some((gate, record)) = read_overrides_record_unlocked(directory, vault_id)? else {
-        return Ok(PersonalOverrides::default());
+) -> Result<RunRead, String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::ReadApplyingOverrides)?;
+    let values = super::read_vault_content(&companion.vaults, vault_id)?;
+    let record = match values {
+        Some(_) => read_overrides_record(&mut companion, vault_id)?,
+        None => None,
     };
-    crate::companion::overrides::evaluate(
-        &gate,
-        vault_id,
-        environment,
-        record.as_ref().map(|bytes| bytes.as_slice()),
-    )
-    .map_err(damaged)
+    Ok(RunRead {
+        values,
+        vaults: companion.vaults,
+        gate,
+        record,
+    })
+}
+
+impl RunRead {
+    /// `environment`'s personal overrides.
+    pub(crate) fn overrides(
+        &self,
+        vault_id: &str,
+        environment: &str,
+    ) -> Result<PersonalOverrides, String> {
+        if self.values.is_none() {
+            return Ok(PersonalOverrides::default());
+        }
+        crate::companion::overrides::evaluate(
+            &self.gate,
+            vault_id,
+            environment,
+            self.record.as_ref().map(|bytes| bytes.as_slice()),
+        )
+        .map_err(damaged)
+    }
+
+    /// Every environment's personal overrides.
+    pub(crate) fn all_overrides(
+        &self,
+        vault_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
+        if self.values.is_none() {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        crate::companion::overrides::evaluate_all(
+            &self.gate,
+            vault_id,
+            self.record.as_ref().map(|bytes| bytes.as_slice()),
+        )
+        .map_err(damaged)
+    }
 }
 
 /// Every environment's personal overrides, read in the caller's lock after
@@ -1114,18 +1170,20 @@ pub(crate) fn check_overrides_unlocked(
     if companion.has_values(vault_id)? {
         return Ok(());
     }
-    crate::overrides::plan_without_values(&gate, edits).map(drop)
+    crate::overrides::plan_without_values(&gate, edits, crate::overrides::Expect::Nothing).map(drop)
 }
 
-/// Plan `edits` against `vault_id`'s overrides and commit them in one
-/// journaled transaction, in the caller's lock after the write gate.
+/// Plan `edits` against `vault_id`'s overrides, once they're as `expect`
+/// says, and commit them in one journaled transaction, in the caller's lock
+/// after the write gate.
 pub(crate) fn change_overrides_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
     edits: &[crate::companion::overrides::change::Edit],
+    expect: crate::overrides::Expect<'_>,
 ) -> Result<crate::companion::overrides::change::ChangePlan, String> {
     let mut companion = FileCompanion::open(directory)?;
-    let mut plan = plan_with(&mut companion, vault_id, edits)?;
+    let mut plan = plan_with(&mut companion, vault_id, edits, expect)?;
     commit_plan(&mut companion, vault_id, &mut plan)?;
     Ok(plan)
 }
@@ -1144,7 +1202,12 @@ pub(crate) fn write_values_following_unlocked(
     edits: &[crate::companion::overrides::change::Edit],
 ) -> Result<(), String> {
     let mut companion = FileCompanion::open(directory)?;
-    let mut plan = plan_with(&mut companion, vault_id, edits)?;
+    let mut plan = plan_with(
+        &mut companion,
+        vault_id,
+        edits,
+        crate::overrides::Expect::Nothing,
+    )?;
     if plan.mutations.is_empty() {
         drop(companion);
         return super::write_all_environments_unlocked(
@@ -1184,10 +1247,11 @@ fn plan_with(
     companion: &mut FileCompanion,
     vault_id: &str,
     edits: &[crate::companion::overrides::change::Edit],
+    expect: crate::overrides::Expect<'_>,
 ) -> Result<crate::companion::overrides::change::ChangePlan, String> {
     let gate = authorize_with(companion, vault_id, Operation::Write)?;
     if !companion.has_values(vault_id)? {
-        return crate::overrides::plan_without_values(&gate, edits);
+        return crate::overrides::plan_without_values(&gate, edits, expect);
     }
     let record = read_overrides_record(companion, vault_id)?;
     crate::overrides::plan(
@@ -1195,6 +1259,7 @@ fn plan_with(
         &gate,
         record.as_ref().map(|bytes| bytes.as_slice()),
         edits,
+        expect,
         |need| {
             // Only creating the record counts every project's records.
             Ok(crate::companion::overrides::change::Inventory {
