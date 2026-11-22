@@ -45,6 +45,7 @@ pub mod provenance;
 pub mod registry_http;
 pub mod resources;
 pub mod script_directory;
+pub mod secret_read;
 pub mod stored_env;
 pub mod symlink;
 pub mod terminal;

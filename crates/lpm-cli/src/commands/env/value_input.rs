@@ -10,9 +10,10 @@
 //! is almost always a mistake, and `KEY=` stores an empty value on purpose
 //! without exposing anything.
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal as _};
 
-use lpm_common::BoundedReadError;
+use lpm_common::secret_read::{SecretReadError, read_secret_text, read_secret_text_file};
 use zeroize::Zeroizing;
 
 use super::prelude::*;
@@ -20,7 +21,7 @@ use crate::hidden_prompt::PromptError;
 
 /// The most one value may hold: what one macOS Keychain item stores, which
 /// holds every value of a project.
-pub(super) const MAX_VALUE_BYTES: u64 = 100 * 1024;
+pub(super) const MAX_VALUE_BYTES: usize = 100 * 1024;
 
 const KEY_RULE: &str = "env keys must match [A-Za-z_][A-Za-z0-9_]*";
 
@@ -35,6 +36,22 @@ pub(super) struct Request<'a> {
     pub json_output: bool,
     /// The command, for the hints an error gives, such as `lpm env set`.
     pub command: &'static str,
+    /// What the prompt asks for.
+    pub asking: Asking<'a>,
+}
+
+/// What a prompt asks for, such as a value for `default`: `Value for
+/// API_KEY (default, hidden): `.
+#[derive(Clone, Copy)]
+pub(super) struct Asking<'a> {
+    pub what: &'static str,
+    pub environment: &'a str,
+}
+
+impl Asking<'_> {
+    fn label(self, key: &str) -> String {
+        format!("{} for {key} ({}, hidden): ", self.what, self.environment)
+    }
 }
 
 /// Where values that aren't arguments come from.
@@ -43,9 +60,11 @@ pub(super) trait Sources {
     /// Whether a person is at a terminal to answer a prompt: stdin and
     /// stdout are both one.
     fn can_prompt(&self) -> bool;
-    fn read_stdin(&mut self, limit: u64) -> io::Result<Vec<u8>>;
-    fn read_file(&mut self, path: &str, limit: u64) -> Result<String, BoundedReadError>;
-    fn prompt(&mut self, key: &str) -> Result<Zeroizing<String>, PromptError>;
+    fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError>;
+    fn read_file(&mut self, path: &str, limit: usize)
+    -> Result<Zeroizing<String>, SecretReadError>;
+    /// Ask for one value, showing `label`.
+    fn prompt(&mut self, label: &str) -> Result<Zeroizing<String>, PromptError>;
 }
 
 /// The process's own standard input, files and terminal.
@@ -60,22 +79,24 @@ impl Sources for ProcessSources {
         io::stdin().is_terminal() && io::stdout().is_terminal()
     }
 
-    fn read_stdin(&mut self, limit: u64) -> io::Result<Vec<u8>> {
-        lpm_common::read_stream_capped(io::stdin().lock(), limit)
+    fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError> {
+        read_secret_text(io::stdin().lock(), limit)
     }
 
-    fn read_file(&mut self, path: &str, limit: u64) -> Result<String, BoundedReadError> {
-        let absolute = std::path::absolute(path).map_err(|source| BoundedReadError::Io {
-            path: path.into(),
-            source,
-        })?;
-        lpm_common::read_text_regular_file_capped_with_metadata(&absolute, limit)
-            .map(|(text, _)| text)
+    fn read_file(
+        &mut self,
+        path: &str,
+        limit: usize,
+    ) -> Result<Zeroizing<String>, SecretReadError> {
+        read_secret_text_file(
+            &std::path::absolute(path).map_err(SecretReadError::Io)?,
+            limit,
+        )
     }
 
-    fn prompt(&mut self, key: &str) -> Result<Zeroizing<String>, PromptError> {
+    fn prompt(&mut self, label: &str) -> Result<Zeroizing<String>, PromptError> {
         crate::install_ui::settle_spinner();
-        crate::hidden_prompt::read_hidden(&format!("Value for {key} (hidden): "))
+        crate::hidden_prompt::read_hidden(label, MAX_VALUE_BYTES)
     }
 }
 
@@ -114,7 +135,7 @@ pub(super) fn collect(
             Entry::Given(..) => None,
         })
         .collect();
-    refuse_repeated_keys(&entries, &files)?;
+    refuse_repeated_keys(&entries, &files, cfg!(windows))?;
     check_how_bare_keys_get_values(request, &bare, sources)?;
 
     let mut from_files = Vec::with_capacity(files.len());
@@ -124,7 +145,7 @@ pub(super) fn collect(
             .map_err(|error| file_error(path, &error))?;
         from_files.push(Assignment {
             key: (*key).to_owned(),
-            value: finish(key, Zeroizing::new(text), path, request.command)?,
+            value: finish(key, text, Origin::File(path), request.command)?,
         });
     }
 
@@ -132,24 +153,10 @@ pub(super) fn collect(
     if request.stdin
         && let Some(key) = bare.first()
     {
-        let bytes = Zeroizing::new(sources.read_stdin(MAX_VALUE_BYTES).map_err(|error| {
-            if error.kind() == io::ErrorKind::InvalidData {
-                LpmError::Env(format!(
-                    "the value piped in for {key} is larger than {} KiB, the most one value can hold",
-                    MAX_VALUE_BYTES / 1024
-                ))
-            } else {
-                LpmError::Env(format!("failed to read the value for {key} from standard input: {error}"))
-            }
-        })?);
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| LpmError::Env(format!("the value piped in for {key} isn't UTF-8 text")))?;
-        piped = Some(finish(
-            key,
-            Zeroizing::new(text.to_owned()),
-            "standard input",
-            request.command,
-        )?);
+        let text = sources
+            .read_stdin(MAX_VALUE_BYTES)
+            .map_err(|error| stdin_error(key, &error))?;
+        piped = Some(finish(key, text, Origin::Stdin, request.command)?);
     }
 
     let mut assignments = Vec::with_capacity(entries.len() + from_files.len());
@@ -158,7 +165,7 @@ pub(super) fn collect(
             Entry::Given(key, value) => (key, Zeroizing::new(value.to_owned())),
             Entry::Bare(key) => match piped.take() {
                 Some(value) => (key, value),
-                None => (key, prompted(key, sources, request.command)?),
+                None => (key, prompted(key, sources, request)?),
             },
         };
         assignments.push(Assignment {
@@ -198,35 +205,58 @@ fn parse_from_file(entry: &str) -> Result<(&str, &str), LpmError> {
 
 /// A key whose value comes from standard input, the prompt or a file can't
 /// also be given elsewhere: which value wins would be a guess. Repeating
-/// `KEY=VALUE` keeps its meaning, the last one.
-fn refuse_repeated_keys(entries: &[Entry<'_>], files: &[(&str, &str)]) -> Result<(), LpmError> {
-    let mut given = std::collections::HashSet::with_capacity(entries.len() + files.len());
-    let mut sourced = std::collections::HashSet::with_capacity(entries.len() + files.len());
+/// `KEY=VALUE` keeps its meaning, the last one. Where keys differing only in
+/// case name one variable, as on Windows (`fold_case`), so do these.
+fn refuse_repeated_keys(
+    entries: &[Entry<'_>],
+    files: &[(&str, &str)],
+    fold_case: bool,
+) -> Result<(), LpmError> {
+    let fold = |key: &str| {
+        if fold_case {
+            key.to_ascii_uppercase()
+        } else {
+            key.to_owned()
+        }
+    };
+    let mut given: HashMap<String, &str> = HashMap::with_capacity(entries.len());
+    let mut sourced: HashMap<String, &str> = HashMap::with_capacity(entries.len() + files.len());
     for entry in entries {
         match entry {
             Entry::Given(key, _) => {
-                given.insert(*key);
+                if let Some(earlier) = given.insert(fold(key), key)
+                    && earlier != *key
+                {
+                    return Err(repeated(earlier, key));
+                }
             }
             Entry::Bare(key) => {
-                if !sourced.insert(*key) {
-                    return Err(repeated(key));
+                if let Some(earlier) = sourced.insert(fold(key), key) {
+                    return Err(repeated(earlier, key));
                 }
             }
         }
     }
     for (key, _) in files {
-        if !sourced.insert(*key) {
-            return Err(repeated(key));
+        if let Some(earlier) = sourced.insert(fold(key), key) {
+            return Err(repeated(earlier, key));
         }
     }
-    match sourced.iter().find(|key| given.contains(*key)) {
-        Some(key) => Err(repeated(key)),
+    match sourced
+        .iter()
+        .find_map(|(folded, key)| given.get(folded).map(|earlier| (*earlier, *key)))
+    {
+        Some((earlier, key)) => Err(repeated(earlier, key)),
         None => Ok(()),
     }
 }
 
-fn repeated(key: &str) -> LpmError {
-    LpmError::Env(format!("{key} is given more than once"))
+fn repeated(earlier: &str, key: &str) -> LpmError {
+    LpmError::Env(if earlier == key {
+        format!("{key} is given more than once")
+    } else {
+        format!("{earlier} and {key} name the same variable on this system, so give only one")
+    })
 }
 
 fn check_how_bare_keys_get_values(
@@ -270,57 +300,95 @@ fn check_how_bare_keys_get_values(
 fn prompted(
     key: &str,
     sources: &mut impl Sources,
-    command: &str,
+    request: &Request<'_>,
 ) -> Result<Zeroizing<String>, LpmError> {
-    let typed = sources.prompt(key).map_err(|error| match error {
-        PromptError::Cancelled => LpmError::ExitCode(crate::prompt::PROMPT_CANCELLED_EXIT_CODE),
-        PromptError::SeveralLines => LpmError::Env(format!(
-            "the value pasted for {key} has more than one line, and this terminal can't paste them as one. Nothing was stored. Pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
-        )),
-        PromptError::Terminal(error) => LpmError::Env(format!(
-            "failed to read the value for {key} from the terminal: {error}"
-        )),
-    })?;
-    finish(key, typed, "the prompt", command)
+    let command = request.command;
+    let typed = sources
+        .prompt(&request.asking.label(key))
+        .map_err(|error| match error {
+            PromptError::Cancelled => {
+                LpmError::ExitCode(crate::prompt::PROMPT_CANCELLED_EXIT_CODE)
+            }
+            PromptError::SeveralLines => LpmError::Env(format!(
+                "the value pasted for {key} has more than one line, and this terminal can't paste them as one. Nothing was stored. Pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
+            )),
+            PromptError::TooLarge => LpmError::Env(format!(
+                "the value entered for {key} is larger than {} KiB, the most one value can hold. Nothing was stored",
+                MAX_VALUE_BYTES / 1024
+            )),
+            PromptError::NotText => LpmError::Env(format!(
+                "the value entered for {key} isn't UTF-8 text, so this terminal may use another encoding. Nothing was stored. Pipe it in with `{command} {key} --stdin`"
+            )),
+            PromptError::Terminal(error) => LpmError::Env(format!(
+                "failed to read the value for {key} from the terminal: {error}"
+            )),
+        })?;
+    finish(key, typed, Origin::Prompt, command)
+}
+
+/// Where a value came from, to say so without showing it.
+#[derive(Clone, Copy)]
+enum Origin<'a> {
+    Stdin,
+    File(&'a str),
+    Prompt,
 }
 
 /// Apply the rules every value from standard input, a file or the prompt
-/// follows. `from` names where it came from, never what it holds.
+/// follows.
 fn finish(
     key: &str,
     mut value: Zeroizing<String>,
-    from: &str,
+    origin: Origin<'_>,
     command: &str,
 ) -> Result<Zeroizing<String>, LpmError> {
     let kept = lpm_env::strip_single_line_end(&value).len();
     value.truncate(kept);
     if value.is_empty() {
+        let what = match origin {
+            Origin::Stdin => format!("the value piped in for {key} is empty"),
+            Origin::File(path) => format!("--from-file: {path} holds an empty value for {key}"),
+            Origin::Prompt => format!("no value was entered for {key}"),
+        };
         return Err(LpmError::Env(format!(
-            "{from} gave {key} an empty value, so nothing was stored. To store an empty value on purpose, run `{command} {key}=`"
+            "{what}, so nothing was stored. To store an empty value on purpose, run `{command} {key}=`"
         )));
     }
     if value.contains('\0') {
+        let what = match origin {
+            Origin::Stdin => format!("the value piped in for {key}"),
+            Origin::File(path) => format!("--from-file: {path}"),
+            Origin::Prompt => format!("the value entered for {key}"),
+        };
         return Err(LpmError::Env(format!(
-            "the value {from} gave {key} contains a NUL character, which no process environment can hold"
+            "{what} contains a NUL character, which no process environment can hold"
         )));
     }
     Ok(value)
 }
 
-fn file_error(path: &str, error: &BoundedReadError) -> LpmError {
+fn stdin_error(key: &str, error: &SecretReadError) -> LpmError {
     LpmError::Env(match error {
-        BoundedReadError::NotFound { .. } => format!("--from-file: {path} doesn't exist"),
-        BoundedReadError::TooLarge { .. } => format!(
+        SecretReadError::TooLarge => format!(
+            "the value piped in for {key} is larger than {} KiB, the most one value can hold",
+            MAX_VALUE_BYTES / 1024
+        ),
+        SecretReadError::NotText => format!("the value piped in for {key} isn't UTF-8 text"),
+        other => format!("failed to read the value for {key} from standard input: {other}"),
+    })
+}
+
+fn file_error(path: &str, error: &SecretReadError) -> LpmError {
+    LpmError::Env(match error {
+        SecretReadError::NotFound => format!("--from-file: {path} doesn't exist"),
+        SecretReadError::Directory => format!("--from-file: {path} is a directory"),
+        SecretReadError::NotFileOrPipe => format!("--from-file: {path} isn't a file or a pipe"),
+        SecretReadError::TooLarge => format!(
             "--from-file: {path} is larger than {} KiB, the most one value can hold",
             MAX_VALUE_BYTES / 1024
         ),
-        BoundedReadError::InvalidUtf8 { .. } => format!("--from-file: {path} isn't UTF-8 text"),
-        BoundedReadError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidData => {
-            format!("--from-file: {path} isn't a regular file")
-        }
-        BoundedReadError::Io { source, .. } => {
-            format!("--from-file: failed to read {path}: {source}")
-        }
+        SecretReadError::NotText => format!("--from-file: {path} isn't UTF-8 text"),
+        SecretReadError::Io(error) => format!("--from-file: failed to read {path}: {error}"),
     })
 }
 
@@ -348,32 +416,32 @@ mod tests {
             self.terminal
         }
 
-        fn read_stdin(&mut self, limit: u64) -> io::Result<Vec<u8>> {
+        fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError> {
             self.stdin_reads += 1;
             let bytes = self.stdin.clone().unwrap_or_default();
-            if bytes.len() as u64 > limit {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "too large"));
+            if bytes.len() > limit {
+                return Err(SecretReadError::TooLarge);
             }
-            Ok(bytes)
+            String::from_utf8(bytes)
+                .map(Zeroizing::new)
+                .map_err(|_| SecretReadError::NotText)
         }
 
-        fn read_file(&mut self, path: &str, limit: u64) -> Result<String, BoundedReadError> {
+        fn read_file(
+            &mut self,
+            path: &str,
+            limit: usize,
+        ) -> Result<Zeroizing<String>, SecretReadError> {
             match self.files.get(path) {
-                None => Err(BoundedReadError::NotFound { path: path.into() }),
-                Some(Ok(text)) if text.len() as u64 > limit => Err(BoundedReadError::TooLarge {
-                    path: path.into(),
-                    limit,
-                }),
-                Some(Ok(text)) => Ok(text.clone()),
-                Some(Err(_)) => Err(BoundedReadError::Io {
-                    path: path.into(),
-                    source: io::Error::new(io::ErrorKind::InvalidData, "not a regular file"),
-                }),
+                None => Err(SecretReadError::NotFound),
+                Some(Ok(text)) if text.len() > limit => Err(SecretReadError::TooLarge),
+                Some(Ok(text)) => Ok(Zeroizing::new(text.clone())),
+                Some(Err(_)) => Err(SecretReadError::NotFileOrPipe),
             }
         }
 
-        fn prompt(&mut self, key: &str) -> Result<Zeroizing<String>, PromptError> {
-            self.asked.push(key.to_owned());
+        fn prompt(&mut self, label: &str) -> Result<Zeroizing<String>, PromptError> {
+            self.asked.push(label.to_owned());
             self.typed
                 .pop_front()
                 .expect("a prompt the test expected")
@@ -401,6 +469,10 @@ mod tests {
                 from_files: &from_files,
                 json_output,
                 command: "lpm env set",
+                asking: Asking {
+                    what: "Value",
+                    environment: "default",
+                },
             },
             fake,
         )
@@ -534,7 +606,13 @@ mod tests {
                 ("D", "CERT")
             ]))
         );
-        assert_eq!(fake.asked, ["A", "C"]);
+        assert_eq!(
+            fake.asked,
+            [
+                "Value for A (default, hidden): ",
+                "Value for C (default, hidden): "
+            ]
+        );
     }
 
     #[test]
@@ -550,11 +628,26 @@ mod tests {
 
     #[test]
     fn empty_values_from_every_source_are_refused_with_the_way_to_store_one() {
-        for (stdin, files, typed) in [
-            (Some(b"".to_vec()), vec![], None),
-            (Some(b"\n".to_vec()), vec![], None),
-            (None, vec!["A=empty.txt"], None),
-            (None, vec![], Some("")),
+        for (stdin, files, typed, said) in [
+            (
+                Some(b"".to_vec()),
+                vec![],
+                None,
+                "the value piped in for A is empty",
+            ),
+            (
+                Some(b"\n".to_vec()),
+                vec![],
+                None,
+                "the value piped in for A is empty",
+            ),
+            (
+                None,
+                vec!["A=empty.txt"],
+                None,
+                "--from-file: empty.txt holds an empty value for A",
+            ),
+            (None, vec![], Some(""), "no value was entered for A"),
         ] {
             let piped = stdin.is_some();
             let mut fake = Fake {
@@ -566,10 +659,11 @@ mod tests {
             };
             let entries: &[&str] = if files.is_empty() { &["A"] } else { &[] };
             let error = run(entries, piped, &files, false, &mut fake).unwrap_err();
-            assert!(
-                error.contains("gave A an empty value, so nothing was stored")
-                    && error.contains("`lpm env set A=`"),
-                "{error}"
+            assert_eq!(
+                error,
+                format!(
+                    "{said}, so nothing was stored. To store an empty value on purpose, run `lpm env set A=`"
+                )
             );
         }
     }
@@ -578,22 +672,35 @@ mod tests {
     fn nul_characters_are_refused_and_never_shown() {
         let mut fake = Fake {
             stdin: Some(b"sec\0ret".to_vec()),
+            terminal: false,
+            files: HashMap::from([("nul.txt".to_owned(), Ok("sec\0ret".to_owned()))]),
             ..Fake::default()
         };
         let error = run(&["A"], true, &[], false, &mut fake).unwrap_err();
-        assert!(error.contains("contains a NUL character"), "{error}");
-        assert!(!error.contains("sec"), "{error}");
+        assert_eq!(
+            error,
+            "the value piped in for A contains a NUL character, which no process environment can hold"
+        );
+        let error = run(&[], false, &["A=nul.txt"], false, &mut fake).unwrap_err();
+        assert_eq!(
+            error,
+            "--from-file: nul.txt contains a NUL character, which no process environment can hold"
+        );
+        fake.terminal = true;
+        fake.typed = VecDeque::from([Ok("sec\0ret")]);
+        let error = run(&["A"], false, &[], false, &mut fake).unwrap_err();
+        assert!(
+            error.starts_with("the value entered for A contains a NUL"),
+            "{error}"
+        );
     }
 
     #[test]
     fn oversized_and_non_utf8_input_is_refused() {
         let mut fake = Fake {
-            stdin: Some(vec![b'x'; MAX_VALUE_BYTES as usize + 1]),
+            stdin: Some(vec![b'x'; MAX_VALUE_BYTES + 1]),
             files: HashMap::from([
-                (
-                    "big.txt".to_owned(),
-                    Ok("x".repeat(MAX_VALUE_BYTES as usize + 1)),
-                ),
+                ("big.txt".to_owned(), Ok("x".repeat(MAX_VALUE_BYTES + 1))),
                 ("fifo".to_owned(), Err("special")),
             ]),
             ..Fake::default()
@@ -606,7 +713,7 @@ mod tests {
             "--from-file: big.txt is larger than 100 KiB, the most one value can hold"
         );
         let special = run(&[], false, &["A=fifo"], false, &mut fake).unwrap_err();
-        assert_eq!(special, "--from-file: fifo isn't a regular file");
+        assert_eq!(special, "--from-file: fifo isn't a file or a pipe");
         fake.stdin = Some(vec![0xff, 0xfe]);
         let binary = run(&["A"], true, &[], false, &mut fake).unwrap_err();
         assert!(binary.contains("isn't UTF-8 text"), "{binary}");
@@ -614,7 +721,7 @@ mod tests {
 
     #[test]
     fn exactly_the_largest_value_is_accepted() {
-        let largest = "x".repeat(MAX_VALUE_BYTES as usize);
+        let largest = "x".repeat(MAX_VALUE_BYTES);
         let mut fake = Fake {
             stdin: Some(largest.clone().into_bytes()),
             ..Fake::default()
@@ -670,10 +777,49 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_prompt_exits_with_the_interrupt_status_and_a_multiline_paste_is_refused() {
+    fn keys_differing_only_in_case_are_one_key_where_the_system_says_so() {
+        let bare = [Entry::Bare("TOKEN"), Entry::Bare("token")];
+        assert!(refuse_repeated_keys(&bare, &[], false).is_ok());
+        let error = refuse_repeated_keys(&bare, &[], true).unwrap_err();
+        assert!(
+            matches!(&error, LpmError::Env(message) if message == "TOKEN and token name the same variable on this system, so give only one"),
+            "{error:?}"
+        );
+        for (entries, files) in [
+            (
+                &[Entry::Given("TOKEN", "1"), Entry::Bare("Token")][..],
+                &[][..],
+            ),
+            (&[Entry::Given("TOKEN", "1")][..], &[("token", "v")][..]),
+            (
+                &[Entry::Given("TOKEN", "1"), Entry::Given("token", "2")][..],
+                &[][..],
+            ),
+        ] {
+            assert!(refuse_repeated_keys(entries, files, false).is_ok());
+            assert!(refuse_repeated_keys(entries, files, true).is_err());
+        }
+        assert!(
+            refuse_repeated_keys(
+                &[Entry::Given("TOKEN", "1"), Entry::Given("TOKEN", "2")],
+                &[],
+                true
+            )
+            .is_ok(),
+            "the same spelling twice is still the last one wins"
+        );
+    }
+
+    #[test]
+    fn every_way_a_prompt_fails_stores_nothing_and_says_why() {
         let mut fake = Fake {
             terminal: true,
-            typed: VecDeque::from([Err(PromptError::Cancelled), Err(PromptError::SeveralLines)]),
+            typed: VecDeque::from([
+                Err(PromptError::Cancelled),
+                Err(PromptError::SeveralLines),
+                Err(PromptError::TooLarge),
+                Err(PromptError::NotText),
+            ]),
             ..Fake::default()
         };
         let cancelled = collect(
@@ -683,6 +829,10 @@ mod tests {
                 from_files: &[],
                 json_output: false,
                 command: "lpm env set",
+                asking: Asking {
+                    what: "Value",
+                    environment: "default",
+                },
             },
             &mut fake,
         );
@@ -695,5 +845,13 @@ mod tests {
         let pasted = run(&["A"], false, &[], false, &mut fake).unwrap_err();
         assert!(pasted.contains("more than one line"), "{pasted}");
         assert!(pasted.contains("Nothing was stored"), "{pasted}");
+        let large = run(&["A"], false, &[], false, &mut fake).unwrap_err();
+        assert_eq!(
+            large,
+            "the value entered for A is larger than 100 KiB, the most one value can hold. Nothing was stored"
+        );
+        let not_text = run(&["A"], false, &[], false, &mut fake).unwrap_err();
+        assert!(not_text.contains("isn't UTF-8 text"), "{not_text}");
+        assert!(not_text.contains("`lpm env set A --stdin`"), "{not_text}");
     }
 }

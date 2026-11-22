@@ -5,14 +5,16 @@
 //! terminal. These tests use a real PTY to cover what only a terminal shows:
 //! that nothing typed is echoed, that a paste of several lines arrives as one
 //! value, that Ctrl+C restores the terminal, and that lines a terminal sends
-//! after Enter are refused instead of left for the shell.
+//! after Enter, or after Ctrl+C, are refused or discarded instead of left for
+//! the shell.
 
 mod common;
 
 #[cfg(unix)]
 mod tty {
     use crate::common;
-    use crate::common::pty::{PtySession, run_in_pty};
+    use crate::common::pty::{PtySession, run_in_pty, run_in_pty_chunked};
+    use std::time::Duration;
 
     use tempfile::TempDir;
 
@@ -70,7 +72,7 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "set", "API_KEY"],
-            &[(b"Value for API_KEY (hidden): ", b"fixture-typed\r")],
+            &[(b"Value for API_KEY (default, hidden): ", b"fixture-typed\r")],
         );
         assert!(session.status.success(), "{}", session.transcript);
         assert!(
@@ -101,8 +103,8 @@ mod tty {
             lpm_home.path(),
             &["env", "set", "FIRST", "PLAIN=fixture-plain", "SECOND"],
             &[
-                (b"Value for FIRST (hidden): ", b"fixture-first\r"),
-                (b"Value for SECOND (hidden): ", b"fixture-second\r"),
+                (b"Value for FIRST (default, hidden): ", b"fixture-first\r"),
+                (b"Value for SECOND (default, hidden): ", b"fixture-second\r"),
             ],
         );
         assert!(session.status.success(), "{}", session.transcript);
@@ -128,7 +130,7 @@ mod tty {
             lpm_home.path(),
             &["env", "set", "TLS_KEY"],
             &[(
-                b"Value for TLS_KEY (hidden): ",
+                b"Value for TLS_KEY (default, hidden): ",
                 b"\x1b[200~-----BEGIN KEY-----\rZml4dHVyZQ==\r-----END KEY-----\r\x1b[201~\r",
             )],
         );
@@ -152,7 +154,7 @@ mod tty {
             lpm_home.path(),
             &["env", "set", "TOKEN"],
             &[(
-                b"Value for TOKEN (hidden): ",
+                b"Value for TOKEN (default, hidden): ",
                 b"\x1b[200~fixture-line\r\x1b[201~\r",
             )],
         );
@@ -170,7 +172,10 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "set", "TOKEN"],
-            &[(b"Value for TOKEN (hidden): ", b"fixture-one\rfixture-two\r")],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                b"fixture-one\rfixture-two\r",
+            )],
         );
         assert!(!session.status.success(), "{}", session.transcript);
         assert!(
@@ -186,6 +191,7 @@ mod tty {
             session.transcript
         );
         assert!(session.echo_restored);
+        assert_eq!(session.left_unread, 0, "nothing is left for the shell");
         assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
     }
 
@@ -196,7 +202,10 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "set", "TOKEN"],
-            &[(b"Value for TOKEN (hidden): ", b"fixture-partial\x03")],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                b"fixture-partial\x03",
+            )],
         );
         assert_eq!(session.status.code(), Some(130), "{}", session.transcript);
         assert!(
@@ -218,13 +227,13 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "set", "TOKEN"],
-            &[(b"Value for TOKEN (hidden): ", b"\r")],
+            &[(b"Value for TOKEN (default, hidden): ", b"\r")],
         );
         assert!(!session.status.success(), "{}", session.transcript);
         assert!(
             session
                 .transcript
-                .contains("the prompt gave TOKEN an empty value, so nothing was stored"),
+                .contains("no value was entered for TOKEN, so nothing was stored"),
             "{}",
             session.transcript
         );
@@ -255,6 +264,196 @@ mod tty {
             session
                 .transcript
                 .contains("doesn't ask for values with --json"),
+            "{}",
+            session.transcript
+        );
+    }
+
+    #[test]
+    fn input_is_hidden_before_the_prompt_asks_for_it() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", b"fixture-order\r")],
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        let position = |needle: &[u8]| {
+            session
+                .raw
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("written")
+        };
+        assert!(
+            position(BRACKETED_PASTE_ON) < position(b"Value for TOKEN"),
+            "the terminal is set up before the prompt shows:\n{}",
+            session.transcript
+        );
+    }
+
+    #[test]
+    fn a_paste_split_across_writes_is_refused_and_nothing_reaches_the_shell() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-one\r", b"fixture-two\r"],
+            )],
+            Duration::from_millis(10),
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session
+                .transcript
+                .contains("the value pasted for TOKEN has more than one line"),
+            "{}",
+            session.transcript
+        );
+        assert!(
+            !session.transcript.contains("fixture-"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(session.left_unread, 0, "nothing is left for the shell");
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn what_follows_ctrl_c_is_discarded_rather_than_left_for_the_shell() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-partial\x03", b"fixture-rest\r"],
+            )],
+            Duration::from_millis(10),
+        );
+        assert_eq!(session.status.code(), Some(130), "{}", session.transcript);
+        assert!(
+            !session.transcript.contains("fixture-"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(session.left_unread, 0, "nothing is left for the shell");
+    }
+
+    #[test]
+    fn a_line_feed_submits_and_ctrl_h_erases_like_backspace() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                b"fixture-abX\x08c\n",
+            )],
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-abc")
+        );
+    }
+
+    #[test]
+    fn ctrl_w_erases_the_last_word_typed() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                b"fixture-kept typo \x17\r",
+            )],
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-kept ")
+        );
+    }
+
+    #[test]
+    fn a_typed_tab_is_part_of_the_value() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", b"fixture\tvalue\r")],
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture\tvalue")
+        );
+    }
+
+    #[test]
+    fn a_paste_larger_than_one_value_can_hold_is_refused_whole() {
+        let (project, lpm_home) = project();
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.extend(std::iter::repeat_n(b'x', 100 * 1024 + 1));
+        paste.extend_from_slice(b"\x1b[201~\r");
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", &paste)],
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session
+                .transcript
+                .contains("the value entered for TOKEN is larger than 100 KiB"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(session.left_unread, 0, "nothing is left for the shell");
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn the_prompt_names_the_environment_the_value_is_for() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "--env", "staging", "TOKEN"],
+            &[(b"Value for TOKEN (staging, hidden): ", b"fixture-staged\r")],
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("stored TOKEN (staging)"),
+            "{}",
+            session.transcript
+        );
+    }
+
+    #[test]
+    fn import_from_standard_input_refuses_a_terminal_instead_of_reading_it() {
+        let (project, lpm_home) = project();
+        let session = prompted(
+            project.path(),
+            lpm_home.path(),
+            &["env", "import", "-"],
+            &[],
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session
+                .transcript
+                .contains("standard input is this terminal"),
             "{}",
             session.transcript
         );

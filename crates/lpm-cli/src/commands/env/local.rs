@@ -15,6 +15,10 @@ pub(super) fn env_set(
             from_files: &values.from_files,
             json_output,
             command: "lpm env set",
+            asking: super::value_input::Asking {
+                what: "Value",
+                environment: env_label,
+            },
         },
         &mut super::value_input::ProcessSources,
     )?;
@@ -370,7 +374,8 @@ pub(super) fn env_export(
 /// A .env file piped to `lpm env import -`, as large as a .env file may be.
 /// A terminal is refused: what's pasted there shows on screen, and the
 /// import would wait for an end of input the person may not know to type.
-fn read_piped_env_file() -> Result<String, LpmError> {
+fn read_piped_env_file() -> Result<zeroize::Zeroizing<String>, LpmError> {
+    use lpm_common::secret_read::SecretReadError;
     use std::io::IsTerminal as _;
 
     let stdin = std::io::stdin();
@@ -379,20 +384,18 @@ fn read_piped_env_file() -> Result<String, LpmError> {
             "`lpm env import -` reads a .env file piped to lpm, but standard input is this terminal. Pipe the file in, such as `op inject -i .env.tpl | lpm env import -`, or name the file: `lpm env import .env`".into(),
         ));
     }
-    let bytes =
-        lpm_common::read_stream_capped(stdin.lock(), lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::InvalidData {
-                    LpmError::Env(format!(
-                        "the .env file piped to `lpm env import -` is larger than {} MiB",
-                        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES / (1024 * 1024)
-                    ))
-                } else {
-                    LpmError::Env(format!("failed to read standard input: {error}"))
-                }
-            })?;
-    String::from_utf8(bytes).map_err(|_| {
-        LpmError::Env("the .env file piped to `lpm env import -` isn't UTF-8 text".into())
+    let limit = usize::try_from(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).unwrap_or(usize::MAX);
+    lpm_common::secret_read::read_secret_text(stdin.lock(), limit).map_err(|error| {
+        LpmError::Env(match error {
+            SecretReadError::TooLarge => format!(
+                "the .env file piped to `lpm env import -` is larger than {} MiB",
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES / (1024 * 1024)
+            ),
+            SecretReadError::NotText => {
+                "the .env file piped to `lpm env import -` isn't UTF-8 text".into()
+            }
+            other => format!("failed to read standard input: {other}"),
+        })
     })
 }
 

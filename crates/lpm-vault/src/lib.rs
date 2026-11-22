@@ -1697,9 +1697,21 @@ pub fn import_env_file_to_env(
     import_env_content(project_dir, Some(env), &content, overwrite, source)
 }
 
-fn read_env_file_to_import(env_path: &Path) -> Result<String, String> {
-    lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        .map_err(|e| format!("failed to read {}: {e}", env_path.display()))
+/// The .env file or pipe at `env_path`; a device or a directory is refused.
+fn read_env_file_to_import(env_path: &Path) -> Result<zeroize::Zeroizing<String>, String> {
+    use lpm_common::secret_read::SecretReadError;
+
+    let limit = usize::try_from(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).unwrap_or(usize::MAX);
+    lpm_common::secret_read::read_secret_text_file(env_path, limit).map_err(|error| {
+        let path = env_path.display();
+        match error {
+            SecretReadError::TooLarge => format!(
+                "{path} is larger than {} MiB, the most a .env file to import can be",
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES / (1024 * 1024)
+            ),
+            other => format!("failed to read {path}: {other}"),
+        }
+    })
 }
 
 /// Import secrets from .env `content` read elsewhere, such as from standard

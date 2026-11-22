@@ -50,7 +50,8 @@ pub(super) struct Values {
     /// Read the value of the one KEY given without = from standard input.
     #[arg(long)]
     pub stdin: bool,
-    /// Read a key's value from a file, at most 100 KiB. Can be repeated.
+    /// Read a key's value from a file or a pipe, at most 100 KiB. Can be
+    /// repeated.
     #[arg(long = "from-file", value_name = "KEY=PATH")]
     pub from_files: Vec<String>,
 }
@@ -60,6 +61,7 @@ Examples:
   lpm env set API_KEY                          Ask for the value, hidden
   op read op://dev/api/key | lpm env set API_KEY --stdin
   lpm env set --from-file TLS_KEY=./tls.key
+  lpm env set --from-file A=<(op read op://dev/a) --from-file B=<(op read op://dev/b)
   lpm env set PORT=3000                        A value that isn't secret
 
 A KEY=VALUE argument is saved in your shell history and is visible to other
@@ -102,7 +104,8 @@ pub(super) enum LocalAction {
     Import {
         #[command(flatten)]
         environment: Environment,
-        /// The .env file, or - to read it from standard input.
+        /// The .env file or pipe, or - to read it from standard input
+        /// (./- names a file called -).
         #[arg(value_name = "FILE")]
         file: String,
         /// Replace values the env already has.

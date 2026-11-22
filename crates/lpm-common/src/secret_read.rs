@@ -1,0 +1,334 @@
+//! Reading text that may hold secrets, such as an env value or a .env file,
+//! from a file, a pipe or standard input. Every buffer that held the bytes
+//! is wiped: one that has to grow is copied into a larger one and wiped
+//! rather than left in freed memory, and the caller's text is wiped when it's
+//! dropped.
+
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
+
+use zeroize::{Zeroize as _, Zeroizing};
+
+/// Why text that may hold secrets couldn't be read.
+#[derive(Debug)]
+pub enum SecretReadError {
+    NotFound,
+    Directory,
+    /// Neither a file nor a pipe, such as a terminal or another device, which
+    /// could wait for input or never end.
+    NotFileOrPipe,
+    /// More bytes than the limit.
+    TooLarge,
+    /// Not UTF-8 text.
+    NotText,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for SecretReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("it doesn't exist"),
+            Self::Directory => formatter.write_str("it's a directory"),
+            Self::NotFileOrPipe => formatter.write_str("it isn't a file or a pipe"),
+            Self::TooLarge => formatter.write_str("it's larger than the limit"),
+            Self::NotText => formatter.write_str("it isn't UTF-8 text"),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SecretReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+const INITIAL_CAPACITY: usize = 8 * 1024;
+
+/// All of `reader`, at most `limit` bytes, as UTF-8 text.
+pub fn read_secret_text<R: Read>(
+    reader: R,
+    limit: usize,
+) -> Result<Zeroizing<String>, SecretReadError> {
+    into_text(read_wiped(reader, limit, 0)?)
+}
+
+/// The file or pipe at `path`, at most `limit` bytes, as UTF-8 text, such as
+/// a file or the `/dev/fd` path of a shell's process substitution. A named
+/// pipe is read as any reader reads one, once a writer opens it; a directory
+/// or a device, such as a terminal, which would show what's typed, is
+/// refused.
+pub fn read_secret_text_file(
+    path: &Path,
+    limit: usize,
+) -> Result<Zeroizing<String>, SecretReadError> {
+    let (file, size) = open_file_or_pipe(path, limit)?;
+    into_text(read_wiped(file, limit, size)?)
+}
+
+fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretReadError> {
+    // Windows opens no directory as a file, and says only that access is
+    // denied.
+    #[cfg(windows)]
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(SecretReadError::Directory);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Opening a device can wait for it, so only a named pipe, which waits
+    // for its writer, is opened in a way that can. Whatever the path names
+    // once it's open decides.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+        let named_pipe =
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_fifo());
+        options.custom_flags(if named_pipe {
+            libc::O_CLOEXEC
+        } else {
+            libc::O_CLOEXEC | libc::O_NONBLOCK
+        });
+    }
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            SecretReadError::NotFound
+        } else {
+            SecretReadError::Io(error)
+        }
+    })?;
+    let metadata = file.metadata().map_err(SecretReadError::Io)?;
+    if metadata.is_dir() {
+        return Err(SecretReadError::Directory);
+    }
+    if metadata.is_file() {
+        let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if size > limit {
+            return Err(SecretReadError::TooLarge);
+        }
+        return Ok((file, size));
+    }
+    if is_pipe(&file, &metadata) {
+        #[cfg(unix)]
+        wait_for_input(&file).map_err(SecretReadError::Io)?;
+        return Ok((file, 0));
+    }
+    Err(SecretReadError::NotFileOrPipe)
+}
+
+#[cfg(unix)]
+fn is_pipe(_file: &File, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    metadata.file_type().is_fifo()
+}
+
+#[cfg(windows)]
+fn is_pipe(file: &File, _metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+
+    // SAFETY: the handle is the open file's, valid while `file` lives.
+    unsafe { GetFileType(file.as_raw_handle()) == FILE_TYPE_PIPE }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_pipe(_file: &File, _metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Reads from the pipe wait for what its writer sends, until it closes,
+/// however it was opened.
+#[cfg(unix)]
+fn wait_for_input(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is the open file's; the calls only read and set
+    // its status flags.
+    unsafe {
+        let flags = libc::fcntl(descriptor, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(descriptor, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Everything `reader` holds, refused past `limit` bytes. `size_hint`, a
+/// file's length, sizes the buffer so a file that doesn't change is read
+/// without growing it.
+fn read_wiped(
+    mut reader: impl Read,
+    limit: usize,
+    size_hint: usize,
+) -> Result<Zeroizing<Vec<u8>>, SecretReadError> {
+    // One byte past the limit tells a source that's too large from one that
+    // fills it exactly.
+    let most = limit.saturating_add(1);
+    let capacity = size_hint
+        .saturating_add(1)
+        .clamp(INITIAL_CAPACITY.min(most), most);
+    let mut bytes = Zeroizing::new(vec![0_u8; capacity]);
+    let mut filled = 0;
+    loop {
+        if filled == bytes.len() {
+            if filled == most {
+                return Err(SecretReadError::TooLarge);
+            }
+            let mut grown = Zeroizing::new(vec![0_u8; filled.saturating_mul(2).min(most)]);
+            grown[..filled].copy_from_slice(&bytes[..filled]);
+            bytes = grown;
+        }
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(SecretReadError::Io(error)),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+fn into_text(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, SecretReadError> {
+    match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(text) => Ok(Zeroizing::new(text)),
+        Err(error) => {
+            error.into_bytes().zeroize();
+            Err(SecretReadError::NotText)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that hands out at most `step` bytes a call, as a pipe does.
+    struct Trickle<'a> {
+        bytes: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.bytes.len().min(self.step).min(buffer.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_stream_is_read_whole_however_it_arrives_up_to_exactly_the_limit() {
+        let text = "x".repeat(50_000);
+        for step in [1, 7, 4096, 65_536] {
+            let read = read_secret_text(
+                Trickle {
+                    bytes: text.as_bytes(),
+                    step,
+                },
+                text.len(),
+            )
+            .expect("fits exactly");
+            assert_eq!(read.as_str(), text, "{step}");
+        }
+        assert_eq!(read_secret_text(io::empty(), 10).unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn a_stream_past_the_limit_is_refused() {
+        let text = "x".repeat(10_001);
+        assert!(matches!(
+            read_secret_text(
+                Trickle {
+                    bytes: text.as_bytes(),
+                    step: 333,
+                },
+                10_000,
+            ),
+            Err(SecretReadError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_refused() {
+        assert!(matches!(
+            read_secret_text(&b"fixture\xff"[..], 100),
+            Err(SecretReadError::NotText)
+        ));
+    }
+
+    #[test]
+    fn a_file_is_read_and_one_larger_than_the_limit_is_refused_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("value.txt");
+        std::fs::write(&path, "fixture-value\n").unwrap();
+        assert_eq!(
+            read_secret_text_file(&path, 100).unwrap().as_str(),
+            "fixture-value\n"
+        );
+        assert_eq!(
+            read_secret_text_file(&path, 14).unwrap().as_str(),
+            "fixture-value\n"
+        );
+        assert!(matches!(
+            read_secret_text_file(&path, 13),
+            Err(SecretReadError::TooLarge)
+        ));
+        assert!(matches!(
+            read_secret_text_file(&dir.path().join("missing"), 100),
+            Err(SecretReadError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn a_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_secret_text_file(dir.path(), 100),
+            Err(SecretReadError::Directory)
+        ));
+    }
+
+    #[cfg(unix)]
+    fn fifo(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("pipe");
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_read_from_its_writer_whenever_it_opens_until_it_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fifo(dir.path());
+        let reader = {
+            let path = path.clone();
+            std::thread::spawn(move || read_secret_text_file(&path, 100))
+        };
+        // Opening the writer waits for the reader to open, and reading waits
+        // for the writer, in either order.
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        io::Write::write_all(&mut writer, b"fixture-").unwrap();
+        io::Write::write_all(&mut writer, b"piped").unwrap();
+        drop(writer);
+        assert_eq!(reader.join().unwrap().unwrap().as_str(), "fixture-piped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_is_refused() {
+        assert!(matches!(
+            read_secret_text_file(Path::new("/dev/null"), 100),
+            Err(SecretReadError::NotFileOrPipe)
+        ));
+    }
+}

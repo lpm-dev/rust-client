@@ -4,7 +4,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -30,6 +29,18 @@ pub struct PtySession {
     pub transcript: String,
     /// The terminal echoes again once the command exited.
     pub echo_restored: bool,
+    /// Input bytes still waiting in the terminal once the command exited:
+    /// what the shell would read next.
+    pub left_unread: usize,
+}
+
+/// Bytes waiting to be read from the terminal behind `file`.
+fn unread_input(file: &File) -> usize {
+    let mut waiting: libc::c_int = 0;
+    // SAFETY: `file` owns a valid PTY descriptor and `FIONREAD` writes one int.
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FIONREAD, &mut waiting) };
+    assert_eq!(result, 0, "read the PTY's pending input");
+    usize::try_from(waiting).unwrap_or_default()
 }
 
 /// Run `lpm` with `args` in a PTY as `cwd`'s command, isolated as
@@ -41,6 +52,22 @@ pub fn run_in_pty(
     lpm_home: &Path,
     args: &[&str],
     steps: &[(&[u8], &[u8])],
+) -> PtySession {
+    let chunked: Vec<(&[u8], Vec<&[u8]>)> = steps
+        .iter()
+        .map(|(prompt, response)| (*prompt, vec![*response]))
+        .collect();
+    run_in_pty_chunked(cwd, lpm_home, args, &chunked, Duration::ZERO)
+}
+
+/// [`run_in_pty`], sending each response as several writes with `pause`
+/// between them, the way a terminal delivers a long paste in pieces.
+pub fn run_in_pty_chunked(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], Vec<&[u8]>)],
+    pause: Duration,
 ) -> PtySession {
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -59,6 +86,9 @@ pub fn run_in_pty(
     let mut master = unsafe { File::from_raw_fd(master_fd) };
     // SAFETY: `openpty` returned unique owned descriptors for these files.
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let slave_probe = slave
+        .try_clone()
+        .expect("keep a PTY handle to probe its input");
     // SAFETY: `master` owns a valid descriptor, and these calls only update its flags.
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "read PTY flags");
@@ -67,23 +97,15 @@ pub fn run_in_pty(
         unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
     assert_eq!(set_flags, 0, "set PTY nonblocking mode");
 
+    // The PTY is lpm's standard streams but not its controlling terminal:
+    // a session leader's exit revokes its terminal on macOS, which would
+    // discard the input lpm left unread instead of keeping it for whatever
+    // reads the terminal next, as a shell's foreground job does.
     let mut command = super::lpm_command(cwd, lpm_home, None, args);
     command
         .stdin(Stdio::from(slave.try_clone().expect("clone PTY stdin")))
         .stdout(Stdio::from(slave.try_clone().expect("clone PTY stdout")))
         .stderr(Stdio::from(slave));
-    // SAFETY: The closure calls only async-signal-safe session and terminal syscalls.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     let mut child = command.spawn().expect("spawn lpm in PTY");
     drop(command);
 
@@ -113,8 +135,23 @@ pub fn run_in_pty(
                 .position(|window| window == *prompt)
             && terminal_echo_is_disabled(&master)
         {
-            master.write_all(response).expect("write prompt response");
-            master.flush().expect("flush prompt response");
+            for (index, chunk) in response.iter().enumerate() {
+                if index > 0 {
+                    std::thread::sleep(pause);
+                }
+                let mut rest: &[u8] = chunk;
+                while !rest.is_empty() {
+                    match master.write(rest) {
+                        Ok(written) => rest = &rest[written..],
+                        // The terminal's input buffer is full until lpm reads.
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            drain(&mut master, &mut transcript, &mut buffer);
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("write prompt response: {error}"),
+                    }
+                }
+            }
             searched_from += found + prompt.len();
             answered += 1;
         }
@@ -142,6 +179,7 @@ pub fn run_in_pty(
         status,
         transcript: super::strip_ansi(&text),
         echo_restored: !terminal_echo_is_disabled(&master),
+        left_unread: unread_input(&slave_probe),
         raw: transcript,
     }
 }
