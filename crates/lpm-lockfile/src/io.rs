@@ -113,6 +113,12 @@ impl Lockfile {
             Self::validate_loaded_package(package)?;
             Self::validate_package_schema(package, self.metadata.lockfile_version)
                 .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+            if let Some(reason) = package.git_metadata_error() {
+                return Err(LockfileError::Serialize(format!(
+                    "package {:?} has invalid git metadata: {reason}",
+                    package.name
+                )));
+            }
         }
         Self::validate_standalone_package_order(&self.packages)
             .map_err(|error| LockfileError::Serialize(error.to_string()))?;
@@ -138,19 +144,6 @@ impl Lockfile {
             .map_err(LockfileError::Serialize)?;
         if let Some(reason) = self.git_schema_error() {
             return Err(LockfileError::Serialize(reason));
-        }
-        for pkg in self.packages.iter().chain(self.workspace_packages.values()) {
-            if !pkg.tarball_field_hint_is_consistent() {
-                return Err(LockfileError::InvalidTarballHint {
-                    package: pkg.name.clone(),
-                });
-            }
-            if let Some(reason) = pkg.git_metadata_error() {
-                return Err(LockfileError::Serialize(format!(
-                    "package {:?} has invalid git metadata: {reason}",
-                    pkg.name
-                )));
-            }
         }
         toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize(e.to_string()))
     }

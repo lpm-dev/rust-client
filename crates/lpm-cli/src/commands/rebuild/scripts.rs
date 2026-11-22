@@ -18,6 +18,50 @@ pub(super) fn package_baseline_dir_indexed(
     find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
 
+struct LifecycleScriptsManifest {
+    scripts: Option<serde_json::Value>,
+    gypfile: Option<serde_json::Value>,
+}
+
+impl<'de> serde::Deserialize<'de> for LifecycleScriptsManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ManifestVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ManifestVisitor {
+            type Value = LifecycleScriptsManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a package.json object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut scripts = None;
+                let mut gypfile = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        // Last-wins matches JSON.parse / serde_json::Map, and
+                        // keeps explicit `"scripts": null` as `Some(Value::Null)`.
+                        "scripts" => scripts = Some(map.next_value::<serde_json::Value>()?),
+                        "gypfile" => gypfile = Some(map.next_value::<serde_json::Value>()?),
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(LifecycleScriptsManifest { scripts, gypfile })
+            }
+        }
+
+        deserializer.deserialize_map(ManifestVisitor)
+    }
+}
+
 /// The install-time scripts of the package whose manifest is at
 /// `pkg_json_path`, as they run: those it names, and the native build it
 /// gets without naming one (see
@@ -36,15 +80,14 @@ pub(super) fn read_lifecycle_scripts(
             pkg_json_path.display(),
         )));
     }
-    let manifest: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(content)
-        .map_err(|error| {
-            lpm_common::LpmError::Store(format!(
-                "installed manifest {} is malformed: {error}",
-                pkg_json_path.display()
-            ))
-        })?;
+    let manifest: LifecycleScriptsManifest = serde_json::from_slice(content).map_err(|error| {
+        lpm_common::LpmError::Store(format!(
+            "installed manifest {} is malformed: {error}",
+            pkg_json_path.display()
+        ))
+    })?;
     let no_scripts = serde_json::Map::new();
-    let scripts = match manifest.get("scripts") {
+    let scripts = match manifest.scripts.as_ref() {
         Some(scripts) => scripts.as_object().ok_or_else(|| {
             lpm_common::LpmError::Store(format!(
                 "installed manifest {} is malformed: scripts must be an object",
@@ -69,12 +112,20 @@ pub(super) fn read_lifecycle_scripts(
         }
     }
 
-    if !lifecycle.contains_key("install")
-        && let Some(package_dir) = pkg_json_path.parent()
-        && let Some(implied) =
-            lpm_security::native_build::implied_install_script(package_dir, &manifest)
+    if lpm_security::native_build::scripts_leave_install_to_binding_gyp(
+        lifecycle.get("install").map(String::as_str),
+        lifecycle.get("preinstall").map(String::as_str),
+        manifest
+            .gypfile
+            .as_ref()
+            .and_then(serde_json::Value::as_bool),
+    ) && let Some(package_dir) = pkg_json_path.parent()
+        && lpm_security::native_build::has_binding_gyp(package_dir)
     {
-        lifecycle.insert("install".to_string(), implied.to_string());
+        lifecycle.insert(
+            "install".to_string(),
+            lpm_security::native_build::IMPLIED_INSTALL_SCRIPT.to_string(),
+        );
     }
 
     if lifecycle.is_empty() {
@@ -732,5 +783,40 @@ pub(super) fn warn_stale_trusted_deps(
             "Stale trustedDependencies (no lifecycle scripts): {}",
             stale.join(", ")
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_lifecycle_scripts_rejects_null_scripts_and_uses_last_duplicate_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+
+        std::fs::write(&pkg, r#"{"name":"a","scripts":null}"#).unwrap();
+        let err = read_lifecycle_scripts(&pkg)
+            .expect_err("explicit scripts: null must be rejected as malformed");
+        assert!(err.to_string().contains("scripts must be an object"));
+
+        std::fs::write(
+            &pkg,
+            r#"{"name":"a","scripts":{"postinstall":"echo first"},"scripts":{"postinstall":"echo second"}}"#,
+        )
+        .unwrap();
+        let scripts = read_lifecycle_scripts(&pkg).unwrap().unwrap();
+        assert_eq!(
+            scripts.get("postinstall").map(String::as_str),
+            Some("echo second")
+        );
+
+        std::fs::write(dir.path().join("binding.gyp"), "{}").unwrap();
+        std::fs::write(&pkg, r#"{"name":"a","scripts":{"install":""}}"#).unwrap();
+        let implied = read_lifecycle_scripts(&pkg).unwrap().unwrap();
+        assert_eq!(
+            implied.get("install").map(String::as_str),
+            Some(lpm_security::native_build::IMPLIED_INSTALL_SCRIPT)
+        );
     }
 }

@@ -386,6 +386,15 @@ fn open_reparse_point_target(checked: &std::fs::File, path: &Path) -> io::Result
 
 /// Read bounded UTF-8 text without following a linked leaf or blocking on a special file.
 pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
+    read_text_file_capped_nofollow_with_metadata(path, limit).map(|(content, _)| content)
+}
+
+/// Read bounded UTF-8 text without following a linked leaf, returning the
+/// metadata already queried from the opened file descriptor.
+pub fn read_text_file_capped_nofollow_with_metadata(
+    path: &Path,
+    limit: u64,
+) -> Result<(String, Metadata), BoundedReadError> {
     let file = open_nofollow(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             BoundedReadError::NotFound {
@@ -408,7 +417,9 @@ pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String,
             source: io::Error::new(io::ErrorKind::InvalidData, "not a safe regular file"),
         });
     }
-    read_text_file_capped_from_open_file_with_known_size(file, path, limit, metadata.len())
+    let content =
+        read_text_file_capped_from_open_file_with_known_size(file, path, limit, metadata.len())?;
+    Ok((content, metadata))
 }
 
 /// Read a bounded UTF-8 text file and return metadata from the opened file.

@@ -688,6 +688,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &ambient_peer_installs_for_lockfile,
         );
     }
+    platform_skipped += filter_platform_packages(&mut packages)?;
     let engine_check_timing =
         dependency_engine_check_timing(&packages, &dependency_engine_policy, requested_v2_mode);
     if engine_check_timing == EngineCheckTiming::AfterNodeProbe
@@ -699,8 +700,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         && !tarball_prefetch_held
     {
         // Packages without an engine requirement download while Node is
-        // probed; one left unreachable by a skipped optional parent stays
-        // unused in the store.
+        // probed; platform-incompatible optional trees are already pruned above.
         let unconstrained = packages
             .iter()
             .filter(|package| package.node_engine.is_none())
@@ -729,7 +729,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         &dependency_engine_policy,
         engine_check_timing,
     )?;
-    platform_skipped += filter_platform_packages(&mut packages)?;
     retain_peer_issues_for_packages(&mut peer_warnings, &mut peer_conflicts, &packages);
 
     if !used_lockfile && peer_conflict_auto_isolation_allowed {

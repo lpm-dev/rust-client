@@ -283,7 +283,7 @@ test("pull request CI leaves the Windows filesystem gates and macOS workspace te
 test("Full CI runs its tier where the plan says, and never for a draft or an unrelated label", () => {
   const workflow = readWorkflow("full-ci.yml");
   const trigger = workflow.match(/^  pull_request:\n((?:    .*\n)*)/m)?.[1] ?? "";
-  assert.match(trigger, /^    branches: \[main, "codex\/\*\*"\]$/m);
+  assert.match(trigger, /^    branches: \[main, "codex\/\*\*", "perf\/\*\*"\]$/m);
   assert.match(
     trigger,
     /^    types: \[opened, synchronize, reopened, ready_for_review, labeled\]$/m,

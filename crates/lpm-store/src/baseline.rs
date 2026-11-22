@@ -113,6 +113,40 @@ impl V2BaselineIndex {
         PROJECT_INDEX_BUILDS.load(Ordering::Relaxed)
     }
 
+    /// Build a coordinate-keyed index directly from already-materialized v2/v3
+    /// package directories without walking `node_modules` or re-reading link
+    /// sidecars on disk. Callers must pass direct roots before transitives,
+    /// supply the store object `pristine_dir` and integrity when known, and
+    /// fall back to [`Self::for_project`] when patches are active or multiple
+    /// distinct materialized instances share `(name, version)`.
+    pub fn from_materialized_coords(
+        entries: impl IntoIterator<Item = (String, String, PathBuf, PathBuf, String)>,
+    ) -> Self {
+        let mut index = Self::default();
+        for (name, version, package_dir, pristine_dir, integrity) in entries {
+            let baseline = Arc::new(InstalledPackageBaseline {
+                package_dir,
+                pristine_dir,
+                integrity: integrity.clone(),
+                layout: PackageBaselineLayout::V2,
+            });
+            index
+                .by_coords
+                .entry((name, version))
+                .or_insert_with(|| Arc::clone(&baseline));
+            if !integrity.is_empty() {
+                if let Some(existing) = index.by_integrity.get(&integrity) {
+                    if existing.package_dir != baseline.package_dir {
+                        index.ambiguous_integrities.insert(integrity);
+                    }
+                } else {
+                    index.by_integrity.insert(integrity, baseline);
+                }
+            }
+        }
+        index
+    }
+
     /// Build a project-scoped index by walking only the link entries
     /// the project's `<project>/node_modules/` tree actually points
     /// at, BFS'd through each entry's `LinkMeta.deps` to cover

@@ -1285,8 +1285,8 @@ pub(super) async fn run_offline_install_phase(
             &ambient_peer_installs,
         );
     }
-    filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     let _platform_skipped = filter_platform_packages(&mut locked)?;
+    filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     if !json_output {
         output::info_line(crate::install_ui::terminal_line!(
             "Offline: using lockfile ({} packages)",
@@ -3078,7 +3078,10 @@ pub(super) fn locked_registry_source_matches_url(
     }
 }
 
-fn registry_base_urls_match(left: &str, right: &str) -> bool {
+pub(super) fn registry_base_urls_match(left: &str, right: &str) -> bool {
+    if left == right && is_simple_http_url(left) {
+        return true;
+    }
     let (Ok(left), Ok(right)) = (reqwest::Url::parse(left), reqwest::Url::parse(right)) else {
         return false;
     };
@@ -3088,6 +3091,46 @@ fn registry_base_urls_match(left: &str, right: &str) -> bool {
         && left.path().trim_end_matches('/') == right.path().trim_end_matches('/')
         && left.query() == right.query()
         && left.fragment() == right.fragment()
+}
+
+fn is_simple_http_url(value: &str) -> bool {
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    if rest.bytes().any(|byte| {
+        !byte.is_ascii()
+            || byte.is_ascii_whitespace()
+            || byte.is_ascii_control()
+            || matches!(byte, b'@' | b'?' | b'#' | b'\\' | b'[' | b']')
+    }) {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return false;
+    }
+    match port {
+        Some(port) => {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        }
+        None => true,
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -400,7 +400,12 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     let force_security_floor = global_config
         .get_bool("force-security-floor")
         .unwrap_or(false);
-    let all_trusted_for_auto_build =
+    let all_trusted_for_auto_build = if auto_build
+        || config_auto_build
+        || effective_policy == crate::script_policy_config::ScriptPolicy::Allow
+    {
+        false
+    } else {
         crate::commands::rebuild::all_scripted_packages_trusted_in_context(
             lpm_root,
             &installed_with_integrity,
@@ -414,7 +419,8 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
             advisor_session.as_ref().map(|s| s.approvals()),
             baseline_index.as_ref(),
             Some(&registry_packages),
-        );
+        )
+    };
     let auto_build_attempted = should_auto_build(
         auto_build,
         config_auto_build,
@@ -1131,14 +1137,27 @@ pub(super) async fn build_blocked_set_metadata(
     // consume this enrichment. Fetch those candidates concurrently.
     // Each manifest's first read after linking waits on lookups in the
     // directories linking just created, so the scan runs in parallel.
-    let metadata_packages: Vec<&InstallPackage> = packages
-        .par_iter()
-        .zip(capture_packages)
-        .filter(|(package, capture)| {
-            package_requires_blocked_set_metadata(package, &capture.package_dir)
-        })
-        .map(|(package, _)| package)
-        .collect();
+    const PARALLEL_METADATA_SCAN_THRESHOLD: usize = 512;
+    let metadata_packages: Vec<&InstallPackage> =
+        if packages.len() >= PARALLEL_METADATA_SCAN_THRESHOLD {
+            packages
+                .par_iter()
+                .zip(capture_packages)
+                .filter(|(package, capture)| {
+                    package_requires_blocked_set_metadata(package, &capture.package_dir)
+                })
+                .map(|(package, _)| package)
+                .collect()
+        } else {
+            packages
+                .iter()
+                .zip(capture_packages)
+                .filter(|(package, capture)| {
+                    package_requires_blocked_set_metadata(package, &capture.package_dir)
+                })
+                .map(|(package, _)| package)
+                .collect()
+        };
 
     let mut groups: HashMap<(&str, bool), Vec<&str>> =
         HashMap::with_capacity(metadata_packages.len());

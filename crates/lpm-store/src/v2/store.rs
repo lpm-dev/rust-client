@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use super::finalize_permits::v2_finalize_limiter;
 use super::fs_util::{
     copy_dir_recursively, create_dir_symlink, create_tmp_dir_locked, ensure_store_tier_dir_locked,
+    ensure_store_tier_dir_locked_once, invalidate_hardened_store_tier,
     materialize_into_with_integrity, tmp_sibling,
 };
 pub use super::integrity::{
@@ -30,11 +31,13 @@ use super::integrity::{
     current_tree_content_matches_snapshot, finish_object_rename_after_collision, harden_tier_of,
     has_local_source_sentinel, is_complete_object_dir, object_dir_is_reusable_or_remove,
     object_integrity_for_link, object_integrity_or_remove, object_integrity_or_remove_with_timings,
-    object_integrity_policy_from_env, read_object_integrity, read_tree_snapshot,
+    object_integrity_policy_from_env, read_object_integrity, read_shallow_package_guard,
+    read_tree_snapshot, refresh_link_snapshot_shallow_guard_best_effort,
     remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
-    tree_snapshot_matches, write_object_integrity_for_policy,
-    write_object_integrity_for_policy_with_tree, write_tree_snapshot,
-    write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
+    write_link_tree_snapshot_best_effort, write_link_tree_snapshot_unpublished,
+    write_object_integrity_for_policy, write_object_integrity_for_policy_with_tree,
+    write_tree_snapshot, write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
+    write_tree_snapshot_with_layout_content_unpublished,
 };
 use super::local_source::{
     LocalSourceFingerprint, compute_local_source_fingerprint, local_source_snapshot_matches,
@@ -763,6 +766,18 @@ impl Store {
         self.object_integrity_policy
     }
 
+    /// Whether the active integrity policy permits the shallow package guard
+    /// for the given object SRI (always false under `Tree` policy or for local
+    /// `file:`/`link:` snapshots).
+    pub fn source_policy_allows_shallow_guard_for_sri(&self, source_sri: &str) -> bool {
+        if self.object_integrity_policy != ObjectIntegrityPolicy::Source {
+            return false;
+        }
+        self.paths.object_dir(source_sri).is_ok_and(|dir| {
+            source_policy_uses_source_integrity(&dir, self.object_integrity_policy)
+        })
+    }
+
     /// Return the policy used for extraction and cache-hit backfills.
     pub fn security_analysis_policy(&self) -> SecurityAnalysisPolicy {
         self.security_analysis_policy
@@ -951,26 +966,52 @@ impl Store {
         &self,
         graph_key_digest: &str,
     ) -> Result<lpm_common::SingleFileExclusiveLockHandle, LpmError> {
-        ensure_store_tier_dir_locked(self.paths.build_entry_locks_root()).map_err(|error| {
+        let locks_root = self.paths.build_entry_locks_root();
+        ensure_store_tier_dir_locked_once(locks_root).map_err(|error| {
             LpmError::Store(format!(
                 "failed to create virtual-store build-entry locks dir: {error}"
             ))
         })?;
         let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
-        lpm_common::acquire_single_file_exclusive_lock(lock_path)
+        match lpm_common::acquire_single_file_exclusive_lock(lock_path.clone()) {
+            Ok(handle) => Ok(handle),
+            Err(_) if !locks_root.exists() => {
+                invalidate_hardened_store_tier(locks_root);
+                ensure_store_tier_dir_locked_once(locks_root).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to create virtual-store build-entry locks dir: {error}"
+                    ))
+                })?;
+                lpm_common::acquire_single_file_exclusive_lock(lock_path)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn acquire_build_entry_read_lock(
         &self,
         graph_key_digest: &str,
     ) -> Result<lpm_common::SingleFileSharedLockHandle, LpmError> {
-        ensure_store_tier_dir_locked(self.paths.build_entry_locks_root()).map_err(|error| {
+        let locks_root = self.paths.build_entry_locks_root();
+        ensure_store_tier_dir_locked_once(locks_root).map_err(|error| {
             LpmError::Store(format!(
                 "failed to create virtual-store build-entry locks dir: {error}"
             ))
         })?;
         let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
-        lpm_common::acquire_single_file_shared_lock(lock_path)
+        match lpm_common::acquire_single_file_shared_lock(lock_path.clone()) {
+            Ok(handle) => Ok(handle),
+            Err(_) if !locks_root.exists() => {
+                invalidate_hardened_store_tier(locks_root);
+                ensure_store_tier_dir_locked_once(locks_root).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to create virtual-store build-entry locks dir: {error}"
+                    ))
+                })?;
+                lpm_common::acquire_single_file_shared_lock(lock_path)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Return the object directory when `sri` is already present and
@@ -1297,19 +1338,35 @@ impl Store {
 
     fn create_object_staging_dir(&self, anchor: &Path) -> Result<PathBuf, LpmError> {
         if let Some(parent) = anchor.parent() {
-            ensure_store_tier_dir_locked(parent).map_err(|error| {
+            ensure_store_tier_dir_locked_once(parent).map_err(|error| {
                 LpmError::Store(format!(
                     "failed to create virtual-store objects dir: {error}"
                 ))
             })?;
         }
         let tmp_dir = tmp_sibling(anchor);
-        create_tmp_dir_locked(&tmp_dir).map_err(|error| {
-            LpmError::Store(format!(
+        match create_tmp_dir_locked(&tmp_dir) {
+            Ok(()) => Ok(tmp_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = anchor.parent() {
+                    invalidate_hardened_store_tier(parent);
+                    ensure_store_tier_dir_locked_once(parent).map_err(|err| {
+                        LpmError::Store(format!(
+                            "failed to create virtual-store objects dir: {err}"
+                        ))
+                    })?;
+                }
+                create_tmp_dir_locked(&tmp_dir).map_err(|err| {
+                    LpmError::Store(format!(
+                        "failed to create virtual-store tmp staging dir: {err}"
+                    ))
+                })?;
+                Ok(tmp_dir)
+            }
+            Err(error) => Err(LpmError::Store(format!(
                 "failed to create virtual-store tmp staging dir: {error}"
-            ))
-        })?;
-        Ok(tmp_dir)
+            ))),
+        }
     }
 
     fn create_stream_object_staging_dir(&self) -> Result<StreamStagingGuard, LpmError> {
@@ -2102,7 +2159,7 @@ impl Store {
         if final_dir.exists() {
             let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key.digest_hex())?;
             let reuse_check_start = std::time::Instant::now();
-            if link_entry_is_reusable(
+            if let Some(sidecar_mtime) = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
                 &object_dir,
@@ -2113,7 +2170,12 @@ impl Store {
                 policy,
             )? {
                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
-                return Ok(Self::reused_link_entry(final_dir, total_start, timings));
+                return Ok(Self::reused_link_entry(
+                    final_dir,
+                    sidecar_mtime,
+                    total_start,
+                    timings,
+                ));
             }
             timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
         }
@@ -2128,7 +2190,7 @@ impl Store {
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
             let reuse_check_start = std::time::Instant::now();
-            if link_entry_is_reusable(
+            if let Some(sidecar_mtime) = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
                 &object_dir,
@@ -2139,7 +2201,12 @@ impl Store {
                 policy,
             )? {
                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
-                return Ok(Self::reused_link_entry(final_dir, total_start, timings));
+                return Ok(Self::reused_link_entry(
+                    final_dir,
+                    sidecar_mtime,
+                    total_start,
+                    timings,
+                ));
             }
             timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
 
@@ -2169,7 +2236,7 @@ impl Store {
         let materialize_dir = materialize_dir.as_deref().unwrap_or(&object_dir);
 
         if let Some(parent) = final_dir.parent() {
-            ensure_store_tier_dir_locked(parent).map_err(|e| {
+            ensure_store_tier_dir_locked_once(parent).map_err(|e| {
                 LpmError::Store(format!("failed to create virtual-store links dir: {e}"))
             })?;
         }
@@ -2178,11 +2245,25 @@ impl Store {
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
-        create_tmp_dir_locked(&tmp_dir).map_err(|e| {
-            LpmError::Store(format!(
-                "failed to create virtual-store tmp staging dir: {e}"
-            ))
-        })?;
+        if let Err(e) = create_tmp_dir_locked(&tmp_dir) {
+            if e.kind() == std::io::ErrorKind::NotFound
+                && let Some(parent) = final_dir.parent()
+            {
+                invalidate_hardened_store_tier(parent);
+                ensure_store_tier_dir_locked_once(parent).map_err(|err| {
+                    LpmError::Store(format!("failed to create virtual-store links dir: {err}"))
+                })?;
+                create_tmp_dir_locked(&tmp_dir).map_err(|err| {
+                    LpmError::Store(format!(
+                        "failed to create virtual-store tmp staging dir: {err}"
+                    ))
+                })?;
+            } else {
+                return Err(LpmError::Store(format!(
+                    "failed to create virtual-store tmp staging dir: {e}"
+                )));
+            }
+        }
 
         // Run the atomic-staging body in a closure so a single error
         // path can clean up the tmp dir uniformly. Anything that
@@ -2234,7 +2315,7 @@ impl Store {
             }),
             Err(e) => {
                 let recovery_start = std::time::Instant::now();
-                if link_entry_is_reusable(
+                if let Some(sidecar_mtime) = link_entry_is_reusable(
                     &final_dir,
                     &graph_key,
                     &object_dir,
@@ -2245,16 +2326,18 @@ impl Store {
                     policy,
                 )? {
                     // Concurrent install beat us — discard our stage and
-                    // refresh the existing sidecar's mtime.
+                    // refresh the existing sidecar's mtime when stale.
                     let _ = std::fs::remove_dir_all(&tmp_dir);
-                    let sidecar_path = final_dir.join(LINK_META_FILENAME);
                     let touch_start = std::time::Instant::now();
-                    if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
-                        tracing::debug!("virtual store: race-loss touch failed: {e}");
+                    if should_touch_sidecar(sidecar_mtime) {
+                        let sidecar_path = final_dir.join(LINK_META_FILENAME);
+                        if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
+                            tracing::debug!("virtual store: race-loss touch failed: {e}");
+                        }
+                        timings.touch_ns = timings
+                            .touch_ns
+                            .saturating_add(touch_start.elapsed().as_nanos());
                     }
-                    timings.touch_ns = timings
-                        .touch_ns
-                        .saturating_add(touch_start.elapsed().as_nanos());
                     timings.collision_recovery_ms = timings
                         .collision_recovery_ms
                         .saturating_add(recovery_start.elapsed().as_millis());
@@ -2319,17 +2402,20 @@ impl Store {
 
     fn reused_link_entry(
         final_dir: PathBuf,
+        sidecar_mtime: Option<std::time::SystemTime>,
         total_start: std::time::Instant,
         mut timings: LinkEntryTimings,
     ) -> LinkEntry {
-        let sidecar_path = final_dir.join(LINK_META_FILENAME);
-        let touch_start = std::time::Instant::now();
-        if let Err(error) = LinkMeta::touch_on_disk(&sidecar_path) {
-            tracing::debug!("virtual store: cache-hit touch failed: {error}");
+        if should_touch_sidecar(sidecar_mtime) {
+            let sidecar_path = final_dir.join(LINK_META_FILENAME);
+            let touch_start = std::time::Instant::now();
+            if let Err(error) = LinkMeta::touch_on_disk(&sidecar_path) {
+                tracing::debug!("virtual store: cache-hit touch failed: {error}");
+            }
+            timings.touch_ns = timings
+                .touch_ns
+                .saturating_add(touch_start.elapsed().as_nanos());
         }
-        timings.touch_ns = timings
-            .touch_ns
-            .saturating_add(touch_start.elapsed().as_nanos());
         LinkEntry {
             link_dir: final_dir,
             freshly_populated: false,
@@ -3372,14 +3458,19 @@ fn populate_into(
     let object_integrity = object_integrity.into_owned();
     if package_tree_changed {
         let layout_integrities = compute_object_tree_integrities(&pkg_dir)?;
-        write_tree_snapshot_with_layout_content(tmp_dir, &object_integrity, &layout_integrities)?;
+        write_tree_snapshot_with_layout_content_unpublished(
+            tmp_dir,
+            &object_integrity,
+            &layout_integrities,
+        )?;
     } else {
         let package_metadata_integrity = match materialized_metadata_integrity {
             Some(integrity) => integrity,
             None => compute_tree_metadata_integrity(&pkg_dir)?,
         };
-        write_tree_snapshot(
+        write_link_tree_snapshot_unpublished(
             tmp_dir,
+            &pkg_dir,
             &TreeIntegrities {
                 content: object_integrity,
                 metadata: package_metadata_integrity,
@@ -3575,6 +3666,20 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     path.is_file()
 }
 
+const LINK_TOUCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
+const LINK_BUILD_MARKER: &str = ".lpm-built";
+
+fn should_touch_sidecar(mtime: Option<std::time::SystemTime>) -> bool {
+    let Some(mtime) = mtime else {
+        return true;
+    };
+    match std::time::SystemTime::now().duration_since(mtime) {
+        Ok(elapsed) => elapsed >= LINK_TOUCH_COOLDOWN,
+        // Always refresh future-dated mtimes (clock skew) so prune LRU recovers.
+        Err(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn link_entry_is_reusable(
     dir: &Path,
@@ -3585,33 +3690,54 @@ fn link_entry_is_reusable(
     verified_object_digest: Option<&VerifiedObjectIntegrity>,
     tree_digest: Option<&str>,
     policy: ObjectIntegrityPolicy,
-) -> Result<bool, LpmError> {
+) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
     harden_tier_of(dir, "links")?;
     if !is_complete_link_entry(dir, key) {
-        return Ok(false);
+        return Ok(None);
     }
-    let sidecar = LinkMeta::read_from(dir)?;
+    let (sidecar, sidecar_mtime) = LinkMeta::read_from_with_mtime(dir)?;
     if sidecar.graph_key_digest_hex != key.digest_hex()
         || sidecar.source_sri != source_sri
         || sidecar.tree_digest.as_deref() != tree_digest
         || !dependency_links_match(dir, key, deps, &sidecar.deps)?
     {
-        return Ok(false);
+        return Ok(None);
     }
     let expected = match verified_object_digest {
         Some(digest) => Cow::Borrowed(digest.as_str()),
         None => Cow::Owned(object_integrity_for_link(object_dir, source_sri, policy)?),
     };
     let package_dir = link_entry_package_dir(dir, key);
-    if tree_snapshot_matches(dir, &package_dir, expected.as_ref())? {
-        return Ok(true);
+    let source_shallow_eligible = source_policy_uses_source_integrity(object_dir, policy)
+        && package_dir
+            .join(LINK_BUILD_MARKER)
+            .symlink_metadata()
+            .is_err();
+    let existing_snapshot = read_tree_snapshot(dir);
+    if let Some(snapshot) = existing_snapshot.as_ref()
+        && snapshot.content_integrity == expected.as_ref()
+    {
+        if source_shallow_eligible
+            && snapshot.layout_content_integrity.is_none()
+            && let Some(recorded_guard) = snapshot.shallow_guard()
+            && let Some(current_guard) = read_shallow_package_guard(&package_dir)
+            && current_guard.matches_non_racy(&recorded_guard)
+        {
+            return Ok(Some(sidecar_mtime));
+        }
+        if compute_tree_metadata_integrity(&package_dir)? == snapshot.metadata_integrity {
+            if source_shallow_eligible && snapshot.layout_content_integrity.is_none() {
+                refresh_link_snapshot_shallow_guard_best_effort(dir, &package_dir, snapshot);
+            }
+            return Ok(Some(sidecar_mtime));
+        }
     }
     let actual = compute_object_tree_integrities(&package_dir)?;
     if actual.content == expected.as_ref() {
-        write_tree_snapshot_best_effort(dir, &actual);
-        return Ok(true);
+        write_link_tree_snapshot_best_effort(dir, &package_dir, &actual);
+        return Ok(Some(sidecar_mtime));
     }
-    if read_tree_snapshot(dir).is_some_and(|snapshot| {
+    if existing_snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.content_integrity == expected.as_ref()
             && snapshot.layout_content_integrity.as_deref() == Some(actual.content.as_str())
     }) {
@@ -3622,13 +3748,14 @@ fn link_entry_is_reusable(
                 "virtual store: failed to refresh link layout snapshot: {error}"
             );
         }
-        return Ok(true);
+        return Ok(Some(sidecar_mtime));
     }
     if source_policy_uses_source_integrity(object_dir, policy)
         && link_tree_matches_object_tree(&actual, object_dir)?
     {
-        write_tree_snapshot_best_effort(
+        write_link_tree_snapshot_best_effort(
             dir,
+            &package_dir,
             &TreeIntegrities {
                 content: expected.as_ref().to_owned(),
                 metadata: actual.metadata,
@@ -3636,9 +3763,9 @@ fn link_entry_is_reusable(
                 content_schema: actual.content_schema,
             },
         );
-        return Ok(true);
+        return Ok(Some(sidecar_mtime));
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn dependency_links_match(

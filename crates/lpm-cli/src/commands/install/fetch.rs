@@ -2168,7 +2168,8 @@ pub(super) async fn run_online_fetch_phase(
 
     let downloaded = to_download.len();
     super::resolve::prioritize_fetch_schedule(&mut to_download);
-    let mut v2_streaming_candidate = if streaming_fetch
+    let mut v2_streaming_candidate = if !to_download.is_empty()
+        && streaming_fetch
         && !force
         && store_v2_handle
             .as_ref()
