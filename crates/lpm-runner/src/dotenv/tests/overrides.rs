@@ -26,13 +26,9 @@ fn layers(vars: &[(&str, &str)], overrides: PersonalOverrides) -> ProjectEnvLaye
     }
 }
 
-fn error(key: &str, kind: lpm_env::ValidationErrorKind) -> lpm_env::ValidationError {
-    lpm_env::ValidationError {
-        key: key.to_owned(),
-        kind,
-        description: None,
-        is_secret: false,
-    }
+/// A project whose `envSchema` is `schema`.
+fn config(schema: &str) -> lpm_json::LpmJsonConfig {
+    lpm_json::parse_lpm_json(&format!(r#"{{"envSchema":{schema}}}"#)).expect("schema")
 }
 
 #[test]
@@ -125,6 +121,72 @@ fn validation_failures_name_an_override_only_while_it_is_the_final_origin() {
     );
 }
 
+/// The validation failure of `vars` under `overrides` against `schema`,
+/// with `inherited` in this process's environment while it's evaluated.
+fn group_failure(
+    schema: &str,
+    inherited: (&str, &str),
+    vars: &[(&str, &str)],
+    personal: PersonalOverrides,
+) -> String {
+    let config = config(schema);
+    let validator = config.env_schema.as_ref().map(lpm_env::EnvValidator::new);
+    let mut child = layers(vars, personal).compose(None, None).expect("compose");
+    // SAFETY: the name is this test's own, and nothing else reads or writes it.
+    unsafe { std::env::set_var(inherited.0, inherited.1) };
+    let result = validate_child_env(
+        &mut child,
+        validator.as_ref(),
+        lpm_env::EvalContext::default(),
+        "/usr/bin",
+        true,
+    );
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(inherited.0) };
+    result.expect_err("the group fails").to_string()
+}
+
+#[test]
+fn a_group_an_override_broke_counts_the_member_the_shell_gives() {
+    const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_UNSET_PAIR";
+    let message = group_failure(
+        &format!(
+            r#"{{"vars":{{"{SHELL}":{{}},"B":{{}}}},"groups":{{"pair":{{"mode":"allOrNone","vars":["{SHELL}","B"]}}}}}}"#
+        ),
+        (SHELL, "1"),
+        &[("B", "1")],
+        overrides(&[], &["B"]),
+    );
+    let attributed = format!("(from a personal override on {THIS_MACHINE})");
+    assert_eq!(
+        message.matches(&attributed).count(),
+        2,
+        "both were present before the unset, so it broke the group: {message}"
+    );
+}
+
+#[test]
+fn an_override_of_a_name_the_shell_gives_leaves_its_group_as_it_was() {
+    const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_SET_ONE";
+    let message = group_failure(
+        &format!(
+            r#"{{"vars":{{"{SHELL}":{{}},"B":{{}}}},"groups":{{"one":{{"mode":"exactlyOne","vars":["{SHELL}","B"]}}}}}}"#
+        ),
+        (SHELL, "1"),
+        &[("B", "1")],
+        overrides(&[(SHELL, "mine")], &[]),
+    );
+    assert_eq!(
+        message.matches("group one requires").count(),
+        2,
+        "{message}"
+    );
+    assert!(
+        !message.contains("personal override"),
+        "the shell gave the name a value without the override, so the group failed before it: {message}"
+    );
+}
+
 #[test]
 fn the_count_includes_only_overrides_that_change_the_environment() {
     let layers = layers(
@@ -147,19 +209,27 @@ fn the_count_includes_only_overrides_that_change_the_environment() {
     assert_eq!(child.override_count(), 2);
 }
 
+/// The verdict on `vars` under `personal` against an `envSchema`.
+fn verdict(schema: &str, vars: &[(&str, &str)], personal: PersonalOverrides) -> Verdict {
+    let config = config(schema);
+    let validator = config.env_schema.as_ref().map(lpm_env::EnvValidator::new);
+    layers(vars, personal)
+        .compose(None, None)
+        .expect("compose")
+        .evaluate(validator.as_ref(), lpm_env::EvalContext::default())
+        .expect("evaluate")
+}
+
 #[test]
 fn an_override_of_the_value_the_project_has_is_never_blamed() {
-    let layers = layers(
+    let verdict = verdict(
+        r#"{"vars":{"API_URL":{"format":"url"}}}"#,
         &[("API_URL", "not a url")],
         overrides(&[("API_URL", "not a url")], &[]),
     );
-    let child = layers.compose(None, None).expect("compose");
-    let invalid = error(
-        "API_URL",
-        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
-    );
+    assert_eq!(verdict.errors.len(), 1);
     assert_eq!(
-        child.attribute_overrides(&mut [invalid]),
+        verdict.from_overrides,
         [false],
         "removing the override wouldn't change the value"
     );
@@ -167,22 +237,16 @@ fn an_override_of_the_value_the_project_has_is_never_blamed() {
 
 #[test]
 fn an_error_an_override_caused_forgets_its_value() {
-    let layers = layers(
+    let verdict = verdict(
+        r#"{"vars":{"API_URL":{"format":"url"}}}"#,
         &[("API_URL", "https://team.example")],
         overrides(&[("API_URL", "fixture-not-a-url")], &[]),
     );
-    let child = layers.compose(None, None).expect("compose");
-    let mut errors = [error(
-        "API_URL",
-        lpm_env::ValidationErrorKind::InvalidFormat {
-            expected: lpm_env::VarFormat::Url,
-            got: "fixture-not-a-url".to_owned(),
-        },
-    )];
 
-    assert_eq!(child.attribute_overrides(&mut errors), [true]);
-    let shown = format!("{} {:?}", errors[0], errors[0]);
+    assert_eq!(verdict.from_overrides, [true]);
+    let shown = format!("{} {:?}", verdict.errors[0], verdict);
     assert!(!shown.contains("fixture-not-a-url"), "{shown}");
+    assert!(shown.contains("API_URL"), "{shown}");
 }
 
 #[test]

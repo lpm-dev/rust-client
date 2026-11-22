@@ -366,6 +366,31 @@ impl<'a> EnvValidator<'a> {
         self.schema
     }
 
+    /// Whether `key`, holding `value` when validation begins, holds a
+    /// non-empty value once [`validate_with_default_policy`] has given a
+    /// missing value its default in `context`, as a group rule counts it.
+    /// The caller's default policy allows `key`.
+    ///
+    /// [`validate_with_default_policy`]: Self::validate_with_default_policy
+    pub fn has_value_after_defaults(
+        &self,
+        key: &str,
+        value: Option<&str>,
+        context: crate::EvalContext<'_>,
+    ) -> bool {
+        if value.is_some_and(|value| !value.is_empty()) {
+            return true;
+        }
+        if !self.definition_errors.is_empty() || !context.is_valid() {
+            return false;
+        }
+        self.schema.vars.get(key).is_some_and(|rule| {
+            (value.is_none() || rule.empty == EmptyPolicy::Missing)
+                && crate::scopes::default_for_context(rule, context)
+                    .is_some_and(|default| !default.is_empty())
+        })
+    }
+
     /// Return declaration errors independently of supplied values.
     pub fn schema_errors(&self) -> &[ValidationError] {
         &self.definition_errors

@@ -505,14 +505,14 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 let composed = composed
                     .as_mut()
                     .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
-                let errors = composed.evaluate(
+                let verdict = composed.evaluate(
                     Some(validator),
                     lpm_env::EvalContext {
                         environment: &env.canonical,
                         ..Default::default()
                     },
                 )?;
-                Ok(super::schema::valid_variable_count(schema, &errors))
+                Ok(super::schema::valid_variable_count(schema, &verdict.errors))
             })();
             let valid = match evaluation {
                 Ok(valid) => valid,

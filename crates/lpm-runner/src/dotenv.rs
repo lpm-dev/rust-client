@@ -201,6 +201,16 @@ pub struct StoredValueCharacters {
 /// [`lpm_env::PersonalOverrideOrigins`].
 pub use lpm_env::PersonalOverrideOrigins as OverrideOrigins;
 
+/// A schema's verdict on a child's environment.
+#[derive(Debug, Default)]
+pub struct Verdict {
+    pub errors: Vec<lpm_env::ValidationError>,
+    /// For each of `errors`, in order, whether a personal override caused
+    /// it. An error one caused forgets its value, which is this computer's
+    /// own.
+    pub from_overrides: Vec<bool>,
+}
+
 /// A child's environment through layer 4, with what the personal overrides
 /// still decide. Its later layers write through it, so each write takes the
 /// name back from the overrides.
@@ -316,21 +326,8 @@ impl ChildEnv {
         &mut self,
         validator: Option<&lpm_env::EnvValidator<'_>>,
         context: lpm_env::EvalContext<'_>,
-    ) -> Result<Vec<lpm_env::ValidationError>, LpmError> {
-        evaluate_project_env(&mut self.vars, validator, context)
-    }
-
-    /// For each of `errors`, in order, whether a personal override caused
-    /// it; an error one caused forgets its value, which is this computer's
-    /// own.
-    pub fn attribute_overrides(&self, errors: &mut [lpm_env::ValidationError]) -> Vec<bool> {
-        let caused = self.origins.attribute(errors, &self.vars);
-        for (error, caused) in errors.iter_mut().zip(&caused) {
-            if *caused {
-                error.forget_value();
-            }
-        }
-        caused
+    ) -> Result<Verdict, LpmError> {
+        evaluate_child_env_with_case_policy(self, validator, context, cfg!(windows))
     }
 
     /// Steps 6–8 for a child: remove dangerous names from layers 1–5, insert
@@ -355,8 +352,8 @@ impl ChildEnv {
         }
         self.insert_runtime("PATH".into(), path.into());
         self.validated.push("PATH".into());
-        let errors = self.evaluate(validator, context)?;
-        validation_result(errors, self)
+        let verdict = self.evaluate(validator, context)?;
+        validation_result(verdict)
     }
 }
 
@@ -913,35 +910,34 @@ fn validate_project_env_with_case_policy(
     let validator = config
         .and_then(|config| config.env_schema.as_ref())
         .map(lpm_env::EnvValidator::new);
-    let errors = evaluate_project_env_with_case_policy(
-        vars,
+    let mut child = ChildEnv::plain(std::mem::take(vars));
+    let verdict = evaluate_child_env_with_case_policy(
+        &mut child,
         validator.as_ref(),
         lpm_env::EvalContext::default(),
         case_insensitive,
-    )?;
-    let child = ChildEnv::plain(std::mem::take(vars));
-    let result = validation_result(errors, &child);
+    );
     *vars = child.into_vars();
-    result?;
+    validation_result(verdict?)?;
     remove_dangerous_env_vars(vars, "project env");
     Ok(())
 }
 
-/// Validate effective values without converting inherited values into project overrides.
-pub fn evaluate_project_env(
-    vars: &mut HashMap<String, String>,
-    validator: Option<&lpm_env::EnvValidator<'_>>,
-    context: lpm_env::EvalContext<'_>,
-) -> Result<Vec<lpm_env::ValidationError>, LpmError> {
-    evaluate_project_env_with_case_policy(vars, validator, context, cfg!(windows))
-}
-
-fn evaluate_project_env_with_case_policy(
-    vars: &mut HashMap<String, String>,
+/// Validate effective values without converting inherited values into
+/// project overrides, attributing each error while the inherited values
+/// it counted are still there.
+fn evaluate_child_env_with_case_policy(
+    child: &mut ChildEnv,
     validator: Option<&lpm_env::EnvValidator<'_>>,
     context: lpm_env::EvalContext<'_>,
     case_insensitive: bool,
-) -> Result<Vec<lpm_env::ValidationError>, LpmError> {
+) -> Result<Verdict, LpmError> {
+    let ChildEnv {
+        vars,
+        overrides,
+        origins,
+        ..
+    } = child;
     validate_process_values(vars)?;
     if let Some(validator) = validator {
         let schema = validator.schema();
@@ -999,17 +995,38 @@ fn evaluate_project_env_with_case_policy(
                 }
             }
         }
-        let errors =
+        let mut errors =
             validator.validate_with_default_policy(vars, context, |key| !is_denied_env_var(key));
+        let inherits = |name: &str| {
+            schema.vars.contains_key(name) && !crate::shell::inherited_env_is_stripped(name)
+        };
+        let from_overrides = origins.attribute(&errors, vars, overrides.layer(), |name, before| {
+            let inherited = (before.is_none() && inherits(name))
+                .then(|| std::env::var_os(name))
+                .flatten();
+            match inherited {
+                Some(value) if !value.is_empty() => true,
+                Some(_) => validator.has_value_after_defaults(name, Some(""), context),
+                None => validator.has_value_after_defaults(name, before, context),
+            }
+        });
+        for (error, caused) in errors.iter_mut().zip(&from_overrides) {
+            if *caused {
+                error.forget_value();
+            }
+        }
         // Keep defaults replacing inherited empties, while preserving cacheEnv provenance.
         for (key, was_empty) in inherited_values {
             if !was_empty || vars.get(key).is_none_or(String::is_empty) {
                 vars.remove(key);
             }
         }
-        return Ok(errors);
+        return Ok(Verdict {
+            errors,
+            from_overrides,
+        });
     }
-    Ok(Vec::new())
+    Ok(Verdict::default())
 }
 
 pub(crate) fn validate_project_env_with_plan(
@@ -1017,8 +1034,8 @@ pub(crate) fn validate_project_env_with_plan(
     validator: Option<&lpm_env::EnvValidator<'_>>,
     context: lpm_env::EvalContext<'_>,
 ) -> Result<(), LpmError> {
-    let errors = child.evaluate(validator, context)?;
-    validation_result(errors, child)?;
+    let verdict = child.evaluate(validator, context)?;
+    validation_result(verdict)?;
     remove_dangerous_env_vars(&mut child.vars, "project env");
     Ok(())
 }
@@ -1026,18 +1043,18 @@ pub(crate) fn validate_project_env_with_plan(
 /// Fail with every validation error, saying which ones a personal override
 /// caused: the override is the value's final origin, or its `unset` left the
 /// value missing. Messages never include values.
-fn validation_result(
-    mut errors: Vec<lpm_env::ValidationError>,
-    child: &ChildEnv,
-) -> Result<(), LpmError> {
+fn validation_result(verdict: Verdict) -> Result<(), LpmError> {
+    let Verdict {
+        errors,
+        from_overrides,
+    } = verdict;
     if errors.is_empty() {
         return Ok(());
     }
-    let caused = child.attribute_overrides(&mut errors);
     Err(LpmError::EnvValidation(
         errors
             .iter()
-            .zip(caused)
+            .zip(from_overrides)
             .map(|(error, caused)| {
                 if caused {
                     format!("  {error} (from a personal override on {THIS_MACHINE})")

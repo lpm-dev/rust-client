@@ -348,7 +348,7 @@ pub(super) fn vars_check(
             )?;
             let characters = layers.stored_value_characters();
             let mut composed = layers.compose(lpm_config.as_ref(), scope.service.as_deref())?;
-            let mut errors = composed.evaluate(
+            let verdict = composed.evaluate(
                 Some(&validator),
                 lpm_env::EvalContext {
                     environment: &environment.canonical,
@@ -356,8 +356,7 @@ pub(super) fn vars_check(
                     service: scope.service.as_deref(),
                 },
             )?;
-            let from_overrides = composed.attribute_overrides(&mut errors);
-            Ok::<_, LpmError>((errors, from_overrides, characters))
+            Ok::<_, LpmError>((verdict.errors, verdict.from_overrides, characters))
         });
         let (errors, from_overrides, characters) = checked?;
         all_valid &= errors.is_empty();

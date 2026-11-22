@@ -336,14 +336,13 @@ fn check_stored_values_with_case_policy(
             Some(_) => None,
         })
         .collect::<HashMap<_, _>>();
-    errors.extend(validator.validate_with_default_policy(
-        &mut values,
-        EvalContext {
-            environment,
-            ..Default::default()
-        },
-        |key| !is_denied_env_var(key),
-    ));
+    let context = EvalContext {
+        environment,
+        ..Default::default()
+    };
+    errors.extend(
+        validator.validate_with_default_policy(&mut values, context, |key| !is_denied_env_var(key)),
+    );
     errors.sort_by(|a, b| a.key.cmp(&b.key));
     let defaults = schema
         .vars
@@ -354,8 +353,13 @@ fn check_stored_values_with_case_policy(
             (!was_empty || !value.is_empty()).then(|| (key.clone(), value.clone()))
         })
         .collect();
-    let mut errors = errors;
-    let from_overrides = origins.attribute(&errors, &values);
+    let overrides = overrides.unwrap_or(PersonalOverrideLayer {
+        set: &empty,
+        unset: &[],
+    });
+    let from_overrides = origins.attribute(&errors, &values, overrides, |name, before| {
+        validator.has_value_after_defaults(name, before, context)
+    });
     for (error, caused) in errors.iter_mut().zip(&from_overrides) {
         if *caused {
             error.forget_value();
@@ -816,6 +820,51 @@ mod tests {
             false,
         );
         assert_eq!(blamed(&check), ["FALLBACK", "PRIMARY"]);
+    }
+
+    #[test]
+    fn a_group_counts_the_default_a_member_would_have_had_without_its_override() {
+        let pair = |a: &str| {
+            format!(
+                r#"{{"vars":{{"A":{a},"B":{{}}}},"groups":{{"pair":{{"mode":"allOrNone","vars":["A","B"]}}}}}}"#
+            )
+        };
+        let mine = personal(&[("A", "mine")], &[]);
+
+        let absent = environments(&[("default", &[("OTHER", "team")])]);
+        let check = effective(
+            &pair(r#"{"default":"x"}"#),
+            "default",
+            &absent,
+            &mine,
+            false,
+        );
+        assert_eq!(codes(&check), [("A", "group"), ("B", "group")]);
+        assert!(
+            blamed(&check).is_empty(),
+            "the default gave A a value, so the group failed before the override too"
+        );
+
+        let empty = environments(&[("default", &[("A", "")])]);
+        let check = effective(&pair(r#"{"default":"x"}"#), "default", &empty, &mine, false);
+        assert_eq!(codes(&check), [("A", "group"), ("B", "group")]);
+        assert!(
+            blamed(&check).is_empty(),
+            "the default fills an empty A too"
+        );
+
+        let check = effective(
+            &pair(r#"{"default":"x","empty":"allow"}"#),
+            "default",
+            &empty,
+            &mine,
+            false,
+        );
+        assert_eq!(
+            blamed(&check),
+            ["A", "B"],
+            "an empty A the schema allows keeps no default, so the group held before"
+        );
     }
 
     #[test]

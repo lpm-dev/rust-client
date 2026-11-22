@@ -98,20 +98,13 @@ impl std::hash::Hash for CaselessAscii<'_> {
     }
 }
 
-/// What the personal overrides decided for one name.
-#[derive(Clone, PartialEq, Eq)]
+/// What the personal overrides decided for one name. A `Set` reads its
+/// value from the overrides it was decided from, so the origins never copy
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Decision {
-    Set(String),
+    Set,
     Unset,
-}
-
-impl std::fmt::Debug for Decision {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Set(_) => "Set(..)",
-            Self::Unset => "Unset",
-        })
-    }
 }
 
 /// The names whose value the personal overrides still decide, compared as
@@ -129,9 +122,26 @@ pub struct PersonalOverrideOrigins {
 struct Decided {
     spelling: String,
     decision: Decision,
-    /// The name was present, non-empty, before the override, which a group
-    /// rule's verdict before it counts.
-    present_before: bool,
+    /// What the name held before the override, which a group rule's verdict
+    /// before it counts.
+    before: Before,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Before {
+    Absent,
+    Empty,
+    Present,
+}
+
+impl Before {
+    fn of(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some("") => Self::Empty,
+            Some(_) => Self::Present,
+        }
+    }
 }
 
 impl PersonalOverrideOrigins {
@@ -159,7 +169,6 @@ impl PersonalOverrideOrigins {
             Some(caseless) => caseless.get(&CaselessAscii(name)).copied(),
             None => vars.get(name).map(String::as_str),
         };
-        let present = |value: Option<&str>| value.is_some_and(|value| !value.is_empty());
         for (name, value) in overrides.set {
             let before = current(name);
             if !is_denied_env_var(name) && before != Some(value.as_str()) {
@@ -168,8 +177,8 @@ impl PersonalOverrideOrigins {
                     key,
                     Decided {
                         spelling: name.clone(),
-                        decision: Decision::Set(value.clone()),
-                        present_before: present(before),
+                        decision: Decision::Set,
+                        before: Before::of(before),
                     },
                 );
             }
@@ -183,7 +192,7 @@ impl PersonalOverrideOrigins {
                     Decided {
                         spelling: name.clone(),
                         decision: Decision::Unset,
-                        present_before: present(before),
+                        before: Before::of(before),
                     },
                 );
             }
@@ -231,16 +240,26 @@ impl PersonalOverrideOrigins {
     }
 
     /// For each of `errors`, the schema's verdict on `vars`, in order,
-    /// whether a personal override caused it. A group rule's violation names
-    /// every member of the group, so it's the overrides' when the group kept
-    /// its rule with each member as it was before them and breaks it now;
-    /// any other error is an override's when [`caused`](Self::caused) says
-    /// so. Names are looked up once each, without case where the host
-    /// ignores it.
+    /// whether one of `overrides`, the ones these origins were decided from,
+    /// caused it. A group rule's violation names every member of the group,
+    /// so it's the overrides' when the group kept its rule with each member
+    /// as it would have been without them and breaks it now. Any other error
+    /// is an override's when the override still gives the value the schema
+    /// judged, or its `unset` left the value missing. Names are looked up
+    /// once each, without case where the host ignores it.
+    ///
+    /// `vars` is the environment the schema judged, with everything its
+    /// evaluation added, such as inherited values and defaults. For a member
+    /// an override decides that lacked a value before it (`None`) or held an
+    /// empty one (`Some("")`), `filled` says whether that evaluation would
+    /// have given it a non-empty value. It's asked only about names LPM
+    /// passes to a process.
     pub fn attribute(
         &self,
         errors: &[ValidationError],
         vars: &HashMap<String, String>,
+        overrides: PersonalOverrideLayer<'_>,
+        filled: impl Fn(&str, Option<&str>) -> bool,
     ) -> Vec<bool> {
         if self.decided.is_empty() {
             return vec![false; errors.len()];
@@ -268,7 +287,11 @@ impl PersonalOverrideOrigins {
         let present_before = |name: &str| {
             let now = value_of(name);
             match self.decided.get(&self.key(name)) {
-                Some(decided) if decided.still_decides(now) => decided.present_before,
+                Some(decided) if decided.still_decides(now, overrides) => match decided.before {
+                    Before::Present => true,
+                    Before::Empty => filled(name, Some("")),
+                    Before::Absent => filled(name, None),
+                },
                 _ => now.is_some_and(|value| !value.is_empty()),
             }
         };
@@ -288,32 +311,23 @@ impl PersonalOverrideOrigins {
                 ValidationErrorKind::GroupViolation { group, .. } => {
                     broken.contains(group.as_str())
                 }
-                _ => self.caused_given(error, value_of(&error.key)),
+                _ => self.caused(error, value_of(&error.key), overrides),
             })
             .collect()
     }
 
-    /// Whether a personal override caused `error` in `vars`: it still decides
-    /// the value the schema judged, or its `unset` left the value missing.
-    pub fn caused(&self, error: &ValidationError, vars: &HashMap<String, String>) -> bool {
-        let value = vars.get(&error.key).map(String::as_str).or_else(|| {
-            self.case_insensitive
-                .then(|| {
-                    vars.iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case(&error.key))
-                        .map(|(_, value)| value.as_str())
-                })
-                .flatten()
-        });
-        self.caused_given(error, value)
-    }
-
-    fn caused_given(&self, error: &ValidationError, value: Option<&str>) -> bool {
+    /// Whether an override caused `error` on a name that now holds `value`.
+    fn caused(
+        &self,
+        error: &ValidationError,
+        value: Option<&str>,
+        overrides: PersonalOverrideLayer<'_>,
+    ) -> bool {
         let Some(decided) = self.decided.get(&self.key(&error.key)) else {
             return false;
         };
         match decided.decision {
-            Decision::Set(_) => decided.still_decides(value),
+            Decision::Set => decided.still_decides(value, overrides),
             Decision::Unset => error.kind == ValidationErrorKind::Missing && value.is_none(),
         }
     }
@@ -322,9 +336,11 @@ impl PersonalOverrideOrigins {
 impl Decided {
     /// Whether the override still gives the name its final `value`, rather
     /// than a later layer or a schema default.
-    fn still_decides(&self, value: Option<&str>) -> bool {
-        match &self.decision {
-            Decision::Set(set) => value == Some(set.as_str()),
+    fn still_decides(&self, value: Option<&str>, overrides: PersonalOverrideLayer<'_>) -> bool {
+        match self.decision {
+            Decision::Set => {
+                value.is_some() && value == overrides.set.get(&self.spelling).map(String::as_str)
+            }
             Decision::Unset => value.is_none(),
         }
     }
@@ -396,13 +412,18 @@ mod tests {
             false,
         );
         let empty = HashMap::new();
-        assert!(origins.caused(&error("PORT", ValidationErrorKind::Missing), &empty));
         let invalid = error(
             "PORT",
             ValidationErrorKind::ConstraintViolation { constraint: "port" },
         );
-        assert!(
-            !origins.caused(&invalid, &empty),
+        assert_eq!(
+            origins.attribute(
+                &[error("PORT", ValidationErrorKind::Missing), invalid],
+                &empty,
+                layer(&HashMap::new(), &unset),
+                unfilled,
+            ),
+            [true, false],
             "an invalid value came from somewhere the unset didn't"
         );
     }
@@ -410,16 +431,17 @@ mod tests {
     #[test]
     fn an_override_is_found_under_the_declared_spelling_where_the_host_ignores_case() {
         let set = map(&[("api_url", "not a url")]);
-        let origins = PersonalOverrideOrigins::changing(&HashMap::new(), layer(&set, &[]), true);
-        let invalid = error(
+        let invalid = [error(
             "API_URL",
             ValidationErrorKind::ConstraintViolation { constraint: "url" },
-        );
-        assert!(origins.caused(&invalid, &map(&[("API_URL", "not a url")])));
-        assert!(
-            !PersonalOverrideOrigins::changing(&HashMap::new(), layer(&set, &[]), false)
-                .caused(&invalid, &map(&[("API_URL", "not a url")]))
-        );
+        )];
+        let vars = map(&[("API_URL", "not a url")]);
+        let attribute = |case_insensitive| {
+            PersonalOverrideOrigins::changing(&HashMap::new(), layer(&set, &[]), case_insensitive)
+                .attribute(&invalid, &vars, layer(&set, &[]), unfilled)
+        };
+        assert_eq!(attribute(true), [true]);
+        assert_eq!(attribute(false), [false]);
     }
 
     #[test]
@@ -454,6 +476,11 @@ mod tests {
         }
     }
 
+    /// No evaluation fills a name the overrides decide.
+    fn unfilled(_: &str, _: Option<&str>) -> bool {
+        false
+    }
+
     fn group_error(key: &str, group: &str) -> ValidationError {
         error(
             key,
@@ -479,7 +506,12 @@ mod tests {
             group_error("B", "unrelated"),
         ];
         assert_eq!(
-            origins.attribute(&errors, &map(&[("OTHER", "x")])),
+            origins.attribute(
+                &errors,
+                &map(&[("OTHER", "x")]),
+                layer(&HashMap::new(), &unset),
+                unfilled
+            ),
             [true, true, false, false]
         );
     }
@@ -497,7 +529,12 @@ mod tests {
             group_error("FALLBACK", "database"),
         ];
         assert_eq!(
-            origins.attribute(&errors, &map(&[("PRIMARY", "mine")])),
+            origins.attribute(
+                &errors,
+                &map(&[("PRIMARY", "mine")]),
+                layer(&set, &[]),
+                unfilled
+            ),
             [false, false]
         );
     }
@@ -525,9 +562,15 @@ mod tests {
             all_or_none("PORT", "network"),
             all_or_none("HOST", "network"),
         ];
-        assert_eq!(origins.attribute(&errors, &vars), [true, true, true]);
+        assert_eq!(
+            origins.attribute(&errors, &vars, layer(&set, &[]), unfilled),
+            [true, true, true]
+        );
         let empty = PersonalOverrideOrigins::default();
-        assert_eq!(empty.attribute(&errors, &vars), [false, false, false]);
+        assert_eq!(
+            empty.attribute(&errors, &vars, layer(&set, &[]), unfilled),
+            [false, false, false]
+        );
     }
 
     #[test]
@@ -541,9 +584,59 @@ mod tests {
             all_or_none("C", "three"),
         ];
         assert_eq!(
-            origins.attribute(&errors, &map(&[("A", "team"), ("B", "mine")])),
+            origins.attribute(
+                &errors,
+                &map(&[("A", "team"), ("B", "mine")]),
+                layer(&set, &[]),
+                unfilled
+            ),
             [false, false, false],
             "one of three present before, two now: broken both ways"
+        );
+    }
+
+    #[test]
+    fn a_member_an_override_decides_counts_what_evaluation_would_have_given_it() {
+        let set = map(&[("ABSENT", "mine"), ("EMPTY", "mine")]);
+        let origins = PersonalOverrideOrigins::changing(
+            &map(&[("EMPTY", ""), ("OTHER", "")]),
+            layer(&set, &[]),
+            false,
+        );
+        let errors = [
+            all_or_none("ABSENT", "three"),
+            all_or_none("EMPTY", "three"),
+            all_or_none("OTHER", "three"),
+        ];
+        let vars = map(&[("ABSENT", "mine"), ("EMPTY", "mine"), ("OTHER", "")]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let filled = |name: &str, before: Option<&str>| {
+            asked
+                .borrow_mut()
+                .push((name.to_owned(), before.map(str::to_owned)));
+            true
+        };
+
+        assert_eq!(
+            origins.attribute(&errors, &vars, layer(&set, &[]), filled),
+            [false, false, false],
+            "two of three before and now"
+        );
+        let mut asked = asked.into_inner();
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(
+            asked,
+            [
+                ("ABSENT".to_owned(), None),
+                ("EMPTY".to_owned(), Some(String::new()))
+            ],
+            "only members an override decides"
+        );
+        assert_eq!(
+            origins.attribute(&errors, &vars, layer(&set, &[]), unfilled),
+            [true, true, true],
+            "none of three before, two now"
         );
     }
 
@@ -557,7 +650,12 @@ mod tests {
         );
         let errors = [group_error("A", "auth"), group_error("B", "auth")];
         assert_eq!(
-            origins.attribute(&errors, &map(&[("A", "fallback"), ("B", "team")])),
+            origins.attribute(
+                &errors,
+                &map(&[("A", "fallback"), ("B", "team")]),
+                layer(&HashMap::new(), &unset),
+                unfilled
+            ),
             [false, false]
         );
     }
