@@ -68,8 +68,9 @@ A KEY=VALUE argument is saved in your shell history and is visible to other
 processes on this computer while lpm runs. Use it only for values that aren't
 secret.
 
-From standard input or a file, a value that is one line loses the line break
-at its end. A value of several lines, such as a PEM key, is kept exactly.";
+From the prompt, standard input or a file, a value that is one line loses the
+line break at its end. A value of several lines, such as a PEM key, is kept
+exactly, except that each line break pasted into the prompt is a line feed.";
 
 #[derive(Subcommand)]
 pub(super) enum LocalAction {
