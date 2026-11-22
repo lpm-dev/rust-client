@@ -81,8 +81,22 @@ pub(super) enum V2StreamingEligibility<'a> {
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
 const ENV_V2_STREAMING_EXTRACT_WEIGHT: &str = "LPM_V2_STREAMING_EXTRACT_WEIGHT";
-// APFS store finalization contends on filesystem metadata above this width.
+// APFS store finalization contends on filesystem metadata above 4 writers.
+// Non-macOS kernels (Linux ext4/btrfs/xfs, Windows NTFS) scale cleanly with cores.
 pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
+
+pub(super) fn default_bounded_fetch_extract_permits() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::thread::available_parallelism().map_or(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS, |n| {
+            n.get().clamp(4, 8)
+        })
+    }
+}
 const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 3;
 pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const MAX_RETAINED_SPECULATIVE_TASKS: usize = 128;
@@ -179,13 +193,13 @@ fn configured_fetch_extract_permits(
 ) -> Option<usize> {
     match explicit_permits {
         Some(value) => parse_fetch_extract_permits(value),
-        None if experimental_resolver == Some("1") => Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS),
+        None if experimental_resolver == Some("1") => Some(default_bounded_fetch_extract_permits()),
         None => default_fetch_extract_permits(v2_store_active),
     }
 }
 
 fn default_fetch_extract_permits(v2_store_active: bool) -> Option<usize> {
-    v2_store_active.then_some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
+    v2_store_active.then(default_bounded_fetch_extract_permits)
 }
 
 pub(super) fn configured_fetch_extract_limiter(v2_store_active: bool) -> FetchExtractLimiter {
@@ -421,7 +435,7 @@ fn parse_v2_streaming_extract_weight(value: &str) -> Option<usize> {
         .trim()
         .parse::<usize>()
         .ok()
-        .filter(|&weight| (1..=DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS).contains(&weight))
+        .filter(|&weight| (1..=default_bounded_fetch_extract_permits()).contains(&weight))
 }
 
 fn configured_v2_streaming_extract_weight(
@@ -3057,10 +3071,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_four_for_experimental_installer() {
+    fn fetch_extract_permits_default_to_platform_bound_for_experimental_installer() {
         assert_eq!(
             configured_fetch_extract_permits(None, Some("1"), false),
-            Some(4)
+            Some(default_bounded_fetch_extract_permits())
         );
     }
 
@@ -3081,8 +3095,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_four_for_v2_installs() {
-        assert_eq!(default_fetch_extract_permits(true), Some(4));
+    fn fetch_extract_permits_default_to_platform_bound_for_v2_installs() {
+        let permits = default_fetch_extract_permits(true).unwrap();
+        assert_eq!(permits, default_bounded_fetch_extract_permits());
+        #[cfg(target_os = "macos")]
+        assert_eq!(permits, 4);
+        #[cfg(not(target_os = "macos"))]
+        assert!((4..=12).contains(&permits));
     }
 
     #[test]
@@ -3116,10 +3135,20 @@ mod tests {
     #[test]
     fn explicit_v2_streaming_extract_weight_is_bounded() {
         let large = std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES);
+        let max_permits = default_bounded_fetch_extract_permits();
+        let max_permits_str = max_permits.to_string();
+        let over_max_str = (max_permits + 1).to_string();
         assert_eq!(configured_v2_streaming_extract_weight(Some("1"), large), 1);
         assert_eq!(configured_v2_streaming_extract_weight(Some("3"), large), 3);
+        assert_eq!(
+            configured_v2_streaming_extract_weight(Some(&max_permits_str), large),
+            max_permits
+        );
         assert_eq!(configured_v2_streaming_extract_weight(Some("0"), large), 3);
-        assert_eq!(configured_v2_streaming_extract_weight(Some("5"), large), 3);
+        assert_eq!(
+            configured_v2_streaming_extract_weight(Some(&over_max_str), large),
+            3
+        );
     }
 
     #[tokio::test]

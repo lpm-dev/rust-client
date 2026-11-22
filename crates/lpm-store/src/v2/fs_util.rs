@@ -558,6 +558,18 @@ pub(crate) mod linux_copy {
 
     /// The last device that refused a reflink, or `u64::MAX`.
     static NO_REFLINK_DEVICE: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The last `(src_dev, dst_dev)` pair where `FICLONE` returned `EXDEV`, or `u64::MAX`.
+    static REFLINK_EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The last `(src_dev, dst_dev)` pair where `copy_file_range` returned `EXDEV`, or `u64::MAX`.
+    static COPY_FILE_RANGE_EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The last `(src_dev, dst_dev)` pair that refused `copy_file_range`, or `u64::MAX`.
+    static NO_COPY_FILE_RANGE_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    #[inline]
+    fn device_pair_tag(src_dev: u64, dst_dev: u64) -> u64 {
+        let mixed = src_dev.rotate_left(17) ^ dst_dev.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        if mixed == u64::MAX { 0 } else { mixed }
+    }
 
     #[cfg(test)]
     thread_local! {
@@ -565,24 +577,29 @@ pub(crate) mod linux_copy {
             const { std::cell::Cell::new(0) };
     }
 
-    pub(crate) fn copy_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
-        let failed = |action: &str, error: std::io::Error| {
+    pub fn copy_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+        copy_file_io(src, dst).map_err(|(action, error)| {
             LpmError::Store(format!(
                 "failed to {action} virtual-store source file {} → {}: {error}",
                 src.display(),
                 dst.display()
             ))
-        };
+        })
+    }
+
+    pub fn copy_file_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
+        copy_file_io(src, dst).map_err(|(_, error)| error)
+    }
+
+    fn copy_file_io(src: &Path, dst: &Path) -> Result<(), (&'static str, std::io::Error)> {
         let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(src)
-            .map_err(|error| failed("open", error))?;
-        let source_metadata = source
-            .metadata()
-            .map_err(|error| failed("inspect", error))?;
+            .map_err(|error| ("open", error))?;
+        let source_metadata = source.metadata().map_err(|error| ("inspect", error))?;
         if !source_metadata.is_file() {
-            return Err(failed(
+            return Err((
                 "copy",
                 std::io::Error::other("the source is not a regular file"),
             ));
@@ -593,13 +610,13 @@ pub(crate) mod linux_copy {
             .create_new(true)
             .mode(0o600)
             .open(dst)
-            .map_err(|error| failed("create", error))?;
+            .map_err(|error| ("create", error))?;
         let copied = fill(&mut source, &mut destination, &source_metadata)
             .and_then(|()| destination.set_permissions(std::fs::Permissions::from_mode(mode)));
         copied.map_err(|error| {
             drop(destination);
             let _ = std::fs::remove_file(dst);
-            failed("copy", error)
+            ("copy", error)
         })
     }
 
@@ -609,19 +626,40 @@ pub(crate) mod linux_copy {
         source_metadata: &Metadata,
     ) -> std::io::Result<()> {
         let len = source_metadata.len();
-        if len >= MIN_REFLINK_BYTES
-            && (reflink(source, destination, source_metadata.dev())?
-                || copy_file_range(source, destination, len)?)
-        {
-            return Ok(());
+        if len >= MIN_REFLINK_BYTES {
+            let src_dev = source_metadata.dev();
+            let mut cached_pair: Option<u64> = None;
+            let mut pair_for = || -> std::io::Result<u64> {
+                if let Some(pair) = cached_pair {
+                    return Ok(pair);
+                }
+                let dst_dev = destination.metadata()?.dev();
+                let pair = device_pair_tag(src_dev, dst_dev);
+                cached_pair = Some(pair);
+                Ok(pair)
+            };
+            if reflink(source, destination, src_dev, &mut pair_for)?
+                || copy_file_range(source, destination, len, &mut pair_for)?
+            {
+                return Ok(());
+            }
         }
         copy_through_buffer(source, destination, len)
     }
 
-    fn reflink(source: &File, destination: &File, device: u64) -> std::io::Result<bool> {
+    fn reflink(
+        source: &File,
+        destination: &File,
+        device: u64,
+        pair_for: &mut impl FnMut() -> std::io::Result<u64>,
+    ) -> std::io::Result<bool> {
         #[cfg(test)]
         REFLINK_CANDIDATES.with(|candidates| candidates.set(candidates.get() + 1));
         if NO_REFLINK_DEVICE.load(Ordering::Relaxed) == device {
+            return Ok(false);
+        }
+        let exdev_cached = REFLINK_EXDEV_PAIR.load(Ordering::Relaxed);
+        if exdev_cached != u64::MAX && exdev_cached == pair_for()? {
             return Ok(false);
         }
         const FICLONE: libc::Ioctl = 0x4004_9409;
@@ -636,13 +674,34 @@ pub(crate) mod linux_copy {
                 NO_REFLINK_DEVICE.store(device, Ordering::Relaxed);
                 Ok(false)
             }
-            Some(libc::EXDEV) => Ok(false),
+            Some(libc::EPERM) => Ok(false),
+            Some(libc::EXDEV) => {
+                if let Ok(pair) = pair_for() {
+                    REFLINK_EXDEV_PAIR.store(pair, Ordering::Relaxed);
+                }
+                Ok(false)
+            }
             _ => Err(error),
         }
     }
 
-    fn copy_file_range(source: &File, destination: &File, len: u64) -> std::io::Result<bool> {
-        copy_in_kernel(len, |requested| {
+    fn copy_file_range(
+        source: &File,
+        destination: &File,
+        len: u64,
+        pair_for: &mut impl FnMut() -> std::io::Result<u64>,
+    ) -> std::io::Result<bool> {
+        let exdev_cached = COPY_FILE_RANGE_EXDEV_PAIR.load(Ordering::Relaxed);
+        let unsupported_cached = NO_COPY_FILE_RANGE_PAIR.load(Ordering::Relaxed);
+        if (exdev_cached != u64::MAX || unsupported_cached != u64::MAX) && {
+            let pair = pair_for()?;
+            pair == exdev_cached || pair == unsupported_cached
+        } {
+            return Ok(false);
+        }
+        let mut saw_exdev = false;
+        let mut saw_unsupported = false;
+        let copied = copy_in_kernel(len, |requested| {
             // SAFETY: both descriptors are live; null offsets use and advance
             // each file's own position.
             let written = unsafe {
@@ -655,8 +714,26 @@ pub(crate) mod linux_copy {
                     0,
                 )
             };
-            usize::try_from(written).map_err(|_| std::io::Error::last_os_error())
-        })
+            usize::try_from(written).map_err(|_| {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EXDEV) => saw_exdev = true,
+                    Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => saw_unsupported = true,
+                    _ => {}
+                }
+                err
+            })
+        })?;
+        if !copied {
+            if saw_exdev {
+                if let Ok(pair) = pair_for() {
+                    COPY_FILE_RANGE_EXDEV_PAIR.store(pair, Ordering::Relaxed);
+                }
+            } else if saw_unsupported && let Ok(pair) = pair_for() {
+                NO_COPY_FILE_RANGE_PAIR.store(pair, Ordering::Relaxed);
+            }
+        }
+        Ok(copied)
     }
 
     /// Runs `copy_chunk` until `len` bytes moved. `Ok(false)` when the file
@@ -709,13 +786,38 @@ pub(crate) mod linux_copy {
     ) -> std::io::Result<()> {
         thread_local! {
             static BUFFER: std::cell::RefCell<Vec<u8>> =
-                std::cell::RefCell::new(vec![0; COPY_BUFFER_BYTES]);
+                std::cell::RefCell::new(vec![0; COPY_BUFFER_BYTES + 1]);
         }
         BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
+            if let Ok(len_usize) = usize::try_from(len)
+                && len_usize < COPY_BUFFER_BYTES
+            {
+                let mut copied = 0usize;
+                loop {
+                    let read = match source.read(&mut buffer[copied..=len_usize]) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    };
+                    copied += read;
+                    if copied > len_usize {
+                        return Err(source_changed());
+                    }
+                }
+                if copied != len_usize {
+                    return Err(source_changed());
+                }
+                if copied > 0 {
+                    destination.write_all(&buffer[..copied])?;
+                }
+                return Ok(());
+            }
+
             let mut copied = 0u64;
             loop {
-                let read = match source.read(&mut buffer) {
+                let read = match source.read(&mut buffer[..COPY_BUFFER_BYTES]) {
                     Ok(0) => break,
                     Ok(read) => read,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -768,27 +870,95 @@ pub(crate) mod linux_copy {
             let mut calls = [os_error(libc::EINTR), Ok(40), Ok(60)].into_iter();
             assert!(copy_in_kernel(100, |_| calls.next().unwrap()).unwrap());
         }
+
+        #[test]
+        fn small_file_copy_preserves_bytes_and_permissions_including_owner_only() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let src_600 = dir.path().join("secret.txt");
+            let dst_600 = dir.path().join("secret-copy.txt");
+            std::fs::write(&src_600, b"hello small file").unwrap();
+            std::fs::set_permissions(&src_600, std::fs::Permissions::from_mode(0o600)).unwrap();
+            super::copy_file(&src_600, &dst_600).unwrap();
+            assert_eq!(std::fs::read(&dst_600).unwrap(), b"hello small file");
+            assert_eq!(
+                std::fs::metadata(&dst_600).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+
+            let src_755 = dir.path().join("bin.sh");
+            let dst_755 = dir.path().join("bin-copy.sh");
+            std::fs::write(&src_755, b"#!/bin/sh\necho ok\n").unwrap();
+            std::fs::set_permissions(&src_755, std::fs::Permissions::from_mode(0o755)).unwrap();
+            super::copy_file(&src_755, &dst_755).unwrap();
+            assert_eq!(std::fs::read(&dst_755).unwrap(), b"#!/bin/sh\necho ok\n");
+            assert_eq!(
+                std::fs::metadata(&dst_755).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 fn remove_materialized_object_sidecars(dst: &Path) -> Result<(), LpmError> {
     use super::integrity::{OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME};
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    for name in [
-        ".integrity",
-        ".lpm-security.json",
-        OBJECT_INTEGRITY_FILENAME,
-        TREE_SNAPSHOT_FILENAME,
-    ] {
-        let path = dst.join(name);
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to remove virtual-store metadata sidecar from materialized package at {}: {e}",
-                    path.display()
-                ))
-            })?;
+    const SIDECARS: [&CStr; 4] = [
+        c".integrity",
+        c".lpm-security.json",
+        c".lpm-object-integrity",
+        c".lpm-tree-snapshot.json",
+    ];
+    const _: () = {
+        const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        assert!(bytes_eq(
+            SIDECARS[2].to_bytes(),
+            OBJECT_INTEGRITY_FILENAME.as_bytes()
+        ));
+        assert!(bytes_eq(
+            SIDECARS[3].to_bytes(),
+            TREE_SNAPSHOT_FILENAME.as_bytes()
+        ));
+    };
+
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(::libc::O_DIRECTORY | ::libc::O_NOFOLLOW | ::libc::O_CLOEXEC)
+        .open(dst)
+        .map_err(|e| {
+            LpmError::Store(format!(
+                "failed to open materialized package dir {} to clean metadata sidecars: {e}",
+                dst.display()
+            ))
+        })?;
+    let dirfd = dir.as_raw_fd();
+    for name in SIDECARS {
+        // SAFETY: `dirfd` is a valid open directory fd and `name` is a static NUL-terminated CStr.
+        if unsafe { ::libc::unlinkat(dirfd, name.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(LpmError::Store(format!(
+                    "failed to remove virtual-store metadata sidecar from materialized package at {}: {error}",
+                    dst.join(name.to_string_lossy().as_ref()).display()
+                )));
+            }
         }
     }
     Ok(())

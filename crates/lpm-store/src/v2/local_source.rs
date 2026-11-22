@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::SecurityAnalysisPolicy;
 use lpm_common::LpmError;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use sha2::{Digest, Sha256};
 
 use super::fs_util::{create_fs_symlink, ensure_store_tier_dir_locked, tmp_sibling};
@@ -68,15 +68,187 @@ pub(crate) fn compute_local_source_fingerprint(
     ))))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn compute_local_source_fingerprint(
+    source_root: &Path,
+) -> Result<Option<LocalSourceFingerprint>, LpmError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-local-source-win-v2\0");
+    if !hash_local_source_metadata_windows(source_root, &mut hasher, 0)? {
+        return Ok(None);
+    }
+    Ok(Some(LocalSourceFingerprint(format!(
+        "sha256-{}",
+        hex::encode(hasher.finalize())
+    ))))
+}
+
+#[cfg(not(any(unix, windows)))]
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "matches the Unix implementation, which walks the source"
+    reason = "matches the Unix/Windows implementation, which walks the source"
 )]
 pub(crate) fn compute_local_source_fingerprint(
     _source_root: &Path,
 ) -> Result<Option<LocalSourceFingerprint>, LpmError> {
     Ok(None)
+}
+
+#[cfg(windows)]
+fn hash_local_source_metadata_windows(
+    source_dir: &Path,
+    hasher: &mut Sha256,
+    depth: usize,
+) -> Result<bool, LpmError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
+        return Err(LpmError::Store(format!(
+            "virtual-store local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            source_dir.display()
+        )));
+    }
+
+    let entries =
+        read_snapshot_entries(source_dir, |_, name| is_excluded_local_source_entry(name))?;
+    hasher.update(
+        u64::try_from(entries.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    let mut source_path = source_dir.to_path_buf();
+    for entry in entries {
+        let name: Vec<u8> = entry
+            .name
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(&name);
+        source_path.push(&entry.name);
+        let file_type = entry.metadata.file_type();
+        // Match walk_local_source_object classification (std file_type treats
+        // cloud/ProjFS reparse-point directories as directories, not links).
+        if file_type.is_dir() {
+            hasher.update(*b"d");
+            if !hash_local_source_metadata_windows(&source_path, hasher, depth + 1)? {
+                return Ok(false);
+            }
+            hasher.update(*b"E");
+        } else if file_type.is_file() {
+            hasher.update(*b"f");
+            if !hash_windows_path_identity(hasher, &source_path, &entry.metadata, false) {
+                return Ok(false);
+            }
+        } else if file_type.is_symlink() {
+            hasher.update(*b"l");
+            if !hash_windows_path_identity(hasher, &source_path, &entry.metadata, false) {
+                return Ok(false);
+            }
+            let resolved = source_path
+                .canonicalize()
+                .unwrap_or_else(|_| source_path.clone());
+            match std::fs::metadata(&resolved) {
+                Ok(metadata) if metadata.is_file() => {
+                    hasher.update(*b"f");
+                    if !hash_windows_path_identity(hasher, &resolved, &metadata, true) {
+                        return Ok(false);
+                    }
+                }
+                _ => {
+                    hasher.update(*b"l");
+                    let target: Vec<u8> = resolved
+                        .as_os_str()
+                        .encode_wide()
+                        .flat_map(u16::to_le_bytes)
+                        .collect();
+                    hasher.update(
+                        u64::try_from(target.len())
+                            .unwrap_or(u64::MAX)
+                            .to_le_bytes(),
+                    );
+                    hasher.update(&target);
+                }
+            }
+        } else {
+            hasher.update(*b"o");
+            if !hash_windows_path_identity(hasher, &source_path, &entry.metadata, false) {
+                return Ok(false);
+            }
+        }
+        source_path.pop();
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn hash_windows_path_identity(
+    hasher: &mut Sha256,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    follow_reparse: bool,
+) -> bool {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+        FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx,
+    };
+
+    const STABLE_ATTR_MASK: u32 = FILE_ATTRIBUTE_READONLY
+        | FILE_ATTRIBUTE_HIDDEN
+        | FILE_ATTRIBUTE_SYSTEM
+        | FILE_ATTRIBUTE_DIRECTORY
+        | FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if !follow_reparse {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(flags)
+        .open(path)
+    else {
+        return false;
+    };
+    let handle = file.as_raw_handle();
+    let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` comes from the open file above and `handle_info` is writable.
+    if unsafe { GetFileInformationByHandle(handle, &mut handle_info) } == 0 {
+        return false;
+    }
+    let mut basic_info = FILE_BASIC_INFO::default();
+    // SAFETY: `handle` is live and `basic_info` is writable storage of `FILE_BASIC_INFO`.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            std::ptr::addr_of_mut!(basic_info).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let file_index =
+        (u64::from(handle_info.nFileIndexHigh) << 32) | u64::from(handle_info.nFileIndexLow);
+    let file_size =
+        (u64::from(handle_info.nFileSizeHigh) << 32) | u64::from(handle_info.nFileSizeLow);
+    let stable_attrs = metadata.file_attributes() & STABLE_ATTR_MASK;
+
+    hasher.update(handle_info.dwVolumeSerialNumber.to_le_bytes());
+    hasher.update(file_index.to_le_bytes());
+    hasher.update(file_size.to_le_bytes());
+    hasher.update(stable_attrs.to_le_bytes());
+    hasher.update(basic_info.CreationTime.to_le_bytes());
+    hasher.update(basic_info.LastWriteTime.to_le_bytes());
+    hasher.update(basic_info.ChangeTime.to_le_bytes());
+    true
 }
 
 #[cfg(unix)]
@@ -96,6 +268,11 @@ fn hash_local_source_metadata(
 
     let entries =
         read_snapshot_entries(source_dir, |_, name| is_excluded_local_source_entry(name))?;
+    hasher.update(
+        u64::try_from(entries.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
     let mut source_path = source_dir.to_path_buf();
     for entry in entries {
         let name = entry.name.as_bytes();
@@ -106,6 +283,7 @@ fn hash_local_source_metadata(
         if file_type.is_dir() {
             hasher.update(*b"d");
             hash_local_source_metadata(&source_path, hasher, depth + 1)?;
+            hasher.update(*b"E");
         } else if file_type.is_file() {
             hasher.update(*b"f");
             hash_unix_file_metadata(hasher, &entry.metadata);

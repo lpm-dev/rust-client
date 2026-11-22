@@ -114,7 +114,9 @@ where
             .sync_all()
             .map_err(E::from)?;
     }
-    temporary.commit(path).map_err(E::from)?;
+    temporary
+        .commit(path, options.sync_file || options.sync_parent)
+        .map_err(E::from)?;
 
     if options.sync_parent {
         sync_parent(parent).map_err(E::from)?;
@@ -215,7 +217,9 @@ where
         if let Some(mode) = options.unix_mode {
             set_capability_file_mode(&temporary, mode).map_err(E::from)?;
         }
-        temporary.sync_all().map_err(E::from)?;
+        if options.sync_file {
+            temporary.sync_all().map_err(E::from)?;
+        }
         let published = match simulated::hard_link(directory, &temporary_name, destination) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
@@ -290,7 +294,10 @@ fn copy_into_new_file(
         }
         let mut source = directory.open(temporary_name)?;
         simulated::copy(&mut source, &mut created)?;
-        created.sync_all()
+        if options.sync_file {
+            created.sync_all()?;
+        }
+        Ok(())
     })();
     if let Err(error) = copied {
         if is_current_entry(directory, destination, &created).unwrap_or(false) {
@@ -1040,7 +1047,7 @@ pub fn replace_symlink_atomic(path: &Path, target: &Path) -> io::Result<()> {
         match std::os::unix::fs::symlink(target, &temporary) {
             Ok(()) => {
                 let mut created = CreatedPath::new(temporary);
-                replace_file(created.path(), path)?;
+                replace_file(created.path(), path, false)?;
                 created.disarm();
                 return Ok(());
             }
@@ -1279,9 +1286,9 @@ impl CreatedTemporary {
             .ok_or_else(|| io::Error::other("temporary file is already committed"))
     }
 
-    fn commit(&mut self, destination: &Path) -> io::Result<()> {
+    fn commit(&mut self, destination: &Path, write_through: bool) -> io::Result<()> {
         drop(self.file.take());
-        replace_file(&self.path, destination)?;
+        replace_file(&self.path, destination, write_through)?;
         self.cleanup = false;
         Ok(())
     }
@@ -1344,12 +1351,12 @@ fn sync_parent(_parent: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+fn replace_file(from: &Path, to: &Path, _write_through: bool) -> io::Result<()> {
     fs::rename(from, to)
 }
 
 #[cfg(windows)]
-fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+fn replace_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1364,7 +1371,11 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     let destination = to;
     let from = wide(from)?;
     let to = wide(to)?;
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let flags = if write_through {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_REPLACE_EXISTING
+    };
     for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
