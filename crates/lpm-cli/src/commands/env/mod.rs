@@ -388,6 +388,7 @@ mod tests {
         include_str!("rotation.rs"),
         include_str!("schema.rs"),
         include_str!("sync_payload.rs"),
+        include_str!("value_input.rs"),
     ];
 
     #[test]
