@@ -3,7 +3,8 @@ use super::manifest::{
     ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
     MetadataFetchKey, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
-    fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
+    fetch_metadata_for_resolver_with_permit, fetch_metadata_for_resolver_with_trace_detail,
+    fetch_preferred_metadata_for_resolver,
     parse_cached_metadata_for_resolver, parse_fetched_metadata, parse_partial_fetched_metadata,
     publish_direct_base_fact, reads_public_npm, try_fetch_exact_metadata_for_resolver,
 };
@@ -13,6 +14,7 @@ use super::state::{PendingRootConstraints, ResolveState, selected_package_cardin
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 use super::types::{Edge, PeerRequirement};
 use crate::resolve::SelectedPackageEvent;
+use futures::StreamExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::Instrument as _;
@@ -616,87 +618,112 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
     fn prefetch_manifests<'a>(
         &'a self,
         canonicals: &'a [CanonicalKey],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        direct_limit: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'a>> {
         Box::pin(async move {
-            if self.worker_batch_disabled.load(Ordering::Relaxed) || canonicals.is_empty() {
-                return;
+            if canonicals.is_empty() {
+                return 0;
             }
 
+            let worker_enabled = !self.worker_batch_disabled.load(Ordering::Relaxed);
             let mut seen = AHashSet::with_capacity(canonicals.len());
-            let mut names = Vec::with_capacity(canonicals.len());
+            let mut worker_names = Vec::new();
+            let mut direct_canonicals = Vec::new();
             for canonical in canonicals {
                 if self.shared_cache.contains_key(canonical) {
                     continue;
                 }
-                let CanonicalKey::Npm { name } = canonical else {
-                    continue;
-                };
-                if !matches!(
-                    self.route_table.route_for_package(name),
-                    UpstreamRoute::LpmWorker
-                ) {
+                if !seen.insert(canonical.clone()) {
                     continue;
                 }
-                if seen.insert(canonical.clone()) {
-                    names.push(name.clone());
+                match canonical {
+                    CanonicalKey::Npm { name }
+                        if worker_enabled
+                            && matches!(
+                                self.route_table.route_for_package(name),
+                                UpstreamRoute::LpmWorker
+                            ) =>
+                    {
+                        worker_names.push(name.clone());
+                    }
+                    CanonicalKey::Npm { .. } | CanonicalKey::Lpm { .. }
+                        if direct_canonicals.len() < direct_limit =>
+                    {
+                        direct_canonicals.push(canonical.clone());
+                    }
+                    _ => {}
                 }
-            }
-            if names.is_empty() {
-                return;
             }
 
-            match self
-                .client
-                .batch_metadata_deep_with_release_age_packages(
-                    &names,
-                    self.release_age_package_names,
-                    self.release_age_all_packages,
-                )
-                .await
-            {
-                Ok(batch) => {
-                    self.dispatcher_rpc_count.fetch_add(1, Ordering::Relaxed);
-                    for (name, meta) in batch {
-                        let canonical = crate::package::CanonicalKey::from_dep_name(&name);
-                        if matches!(canonical, crate::package::CanonicalKey::Root) {
-                            continue;
-                        }
-                        if !matches!(
-                            self.route_table.route_for_package(&name),
-                            UpstreamRoute::LpmWorker
-                        ) {
-                            continue;
-                        }
-                        let fetched = parse_fetched_metadata(
-                            meta,
-                            self.spec_tx.is_some(),
-                            self.trace_metadata_fetches,
-                        );
-                        let FetchedMetadata {
-                            speculation, info, ..
-                        } = fetched;
-                        insert_or_merge_cached_package_info(
-                            self.shared_cache,
-                            canonical.clone(),
-                            info,
-                        );
-                        if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
-                            && tx.try_send((canonical.to_string(), speculation)).is_ok()
-                        {
-                            self.tarball_dispatched_count
-                                .fetch_add(1, Ordering::Relaxed);
+            if !worker_names.is_empty() {
+                match self
+                    .client
+                    .batch_metadata_deep_with_release_age_packages(
+                        &worker_names,
+                        self.release_age_package_names,
+                        self.release_age_all_packages,
+                    )
+                    .await
+                {
+                    Ok(batch) => {
+                        self.dispatcher_rpc_count.fetch_add(1, Ordering::Relaxed);
+                        for (name, meta) in batch {
+                            let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                            if matches!(canonical, crate::package::CanonicalKey::Root) {
+                                continue;
+                            }
+                            if !matches!(
+                                self.route_table.route_for_package(&name),
+                                UpstreamRoute::LpmWorker
+                            ) {
+                                continue;
+                            }
+                            let fetched = parse_fetched_metadata(
+                                meta,
+                                self.spec_tx.is_some(),
+                                self.trace_metadata_fetches,
+                            );
+                            let FetchedMetadata {
+                                speculation, info, ..
+                            } = fetched;
+                            insert_or_merge_cached_package_info(
+                                self.shared_cache,
+                                canonical.clone(),
+                                info,
+                            );
+                            if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
+                                && tx.try_send((canonical.to_string(), speculation)).is_ok()
+                            {
+                                self.tarball_dispatched_count
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    self.worker_batch_disabled.store(true, Ordering::Relaxed);
-                    tracing::debug!(
-                        "greedy-fusion: Worker tree prefetch batch failed ({} names): {e} \
-                         — falling back to per-package dispatch",
-                        names.len()
-                    );
+                    Err(e) => {
+                        self.worker_batch_disabled.store(true, Ordering::Relaxed);
+                        tracing::debug!(
+                            "greedy-fusion: Worker tree prefetch batch failed ({} names): {e} \
+                             — falling back to per-package dispatch",
+                            worker_names.len()
+                        );
+                    }
                 }
             }
+
+            if direct_canonicals.is_empty() {
+                return 0;
+            }
+
+            let direct_count = direct_canonicals.len();
+            let concurrency = direct_count.clamp(1, 8);
+            futures::stream::iter(direct_canonicals)
+                .map(|canonical| async move {
+                    let _ = self.ensure_manifest(&canonical).await;
+                })
+                .buffer_unordered(concurrency)
+                .collect::<Vec<()>>()
+                .await;
+            direct_count
         })
     }
 }
@@ -718,6 +745,7 @@ struct PendingMetadataFetch {
 struct MetadataFetchScheduler {
     semaphore: Arc<tokio::sync::Semaphore>,
     exact_document_semaphore: Arc<tokio::sync::Semaphore>,
+    policy_semaphore: Arc<tokio::sync::Semaphore>,
     jobs: tokio::task::JoinSet<(MetadataFetchKey, FetchResult)>,
     pending: VecDeque<PendingMetadataFetch>,
     pending_exact_documents: VecDeque<PendingMetadataFetch>,
@@ -750,6 +778,7 @@ impl MetadataFetchScheduler {
         Self {
             semaphore,
             exact_document_semaphore,
+            policy_semaphore: Arc::new(tokio::sync::Semaphore::new(24)),
             jobs: tokio::task::JoinSet::new(),
             pending: VecDeque::new(),
             pending_exact_documents: VecDeque::new(),
@@ -886,6 +915,7 @@ impl MetadataFetchScheduler {
                 &pending.policy,
             );
         let metadata_semaphore = Arc::clone(&self.semaphore);
+        let policy_semaphore = Arc::clone(&self.policy_semaphore);
         let fallback_metadata = Arc::clone(&self.fallback_metadata);
         let timeline = pending.timeline.clone();
         self.jobs.spawn(async move {
@@ -972,7 +1002,6 @@ impl MetadataFetchScheduler {
                 )
                 .await
             } else {
-                let _permit = permit;
                 if pending.exact_version.is_some()
                     && reads_public_npm(&pending.client, &pending.route_table, &pending.canonical)
                     && (pending.policy.requires_trust_history()
@@ -982,13 +1011,15 @@ impl MetadataFetchScheduler {
                 {
                     lpm_registry::timing::record_exact_document_policy_bypass();
                 }
-                fetch_metadata_for_resolver_with_trace_detail(
+                fetch_metadata_for_resolver_with_permit(
                     &pending.client,
                     &pending.route_table,
                     &pending.canonical,
                     &pending.policy,
                     pending.include_speculation,
                     pending.trace_metadata_fetches,
+                    permit,
+                    &policy_semaphore,
                 )
                 .await
             };

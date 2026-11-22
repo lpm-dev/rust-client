@@ -63,6 +63,7 @@ pub struct CachedPackageInfo {
     pub modified: Option<String>,
     pub modified_unix: Option<i64>,
     pub trust_metadata_complete: bool,
+    pub release_metadata_complete: bool,
     pub versions_complete: bool,
     pub covered_ranges: HashSet<String>,
     pub workspace_versions: HashSet<NpmVersion>,
@@ -450,6 +451,7 @@ impl CachedPackageInfo {
             modified: None,
             modified_unix: None,
             trust_metadata_complete: false,
+            release_metadata_complete: false,
             versions_complete: true,
             covered_ranges: HashSet::new(),
             workspace_versions: HashSet::new(),
@@ -715,6 +717,9 @@ impl CachedPackageInfo {
             }
         }
         self.release = Arc::new(build_release_overlay(releases));
+        if !release_times.time.is_empty() {
+            self.release_metadata_complete = true;
+        }
 
         if let Some(release_platforms) = &release_times.versions {
             let mut platforms = self.platforms_owned();
@@ -934,6 +939,9 @@ impl CachedPackageInfo {
         if !policy.release_age_active() || policy.release_age_excluded(package) {
             return false;
         }
+        if self.release_metadata_complete {
+            return false;
+        }
         let missing_version_time = self.release.records.len() < self.core.versions.len();
         missing_version_time
             && policy.metadata_modified_after_cutoff_for_package(
@@ -1122,6 +1130,8 @@ impl ManifestCacheBuilder {
             modified: self.modified,
             modified_unix,
             trust_metadata_complete: self.trust_metadata_complete,
+            release_metadata_complete: !version_records.is_empty()
+                && release_inputs.len() >= version_records.len(),
             versions_complete: self.versions_complete,
             covered_ranges: self.covered_ranges,
             workspace_versions: self.workspace_versions,

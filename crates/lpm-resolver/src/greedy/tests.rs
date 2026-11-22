@@ -7541,3 +7541,108 @@ async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() 
     assert_eq!(snapshot.route_npm_direct_count, 1);
     lpm_registry::timing::reset_metadata_detail();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_metadata_persists_hydrated_release_times_into_manifest_projection() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+    let abbreviated = serde_json::json!({
+        "name": "proj-release-age",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "proj-release-age",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/proj-release-age.tgz",
+                    "integrity": "sha512-proj-release-age"
+                },
+                "dependencies": {}
+            }
+        }
+    });
+    let full = serde_json::json!({
+        "name": "proj-release-age",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "versions": {
+            "1.0.0": {
+                "name": "proj-release-age",
+                "version": "1.0.0"
+            }
+        },
+        "time": {
+            "modified": "2025-01-03T00:00:00.000Z",
+            "1.0.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/proj-release-age"))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proj-release-age"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(full))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("proj-release-age");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+
+    let (first, first_timings) =
+        fetch_metadata_for_resolver_with_timings(&client, &route_table, &canonical, &policy, false)
+            .await
+            .expect("first fetch should hydrate release times");
+    assert!(!first_timings.projection_hit);
+    assert!(first.info.release_metadata_complete);
+    assert_eq!(
+        first.info.published_at("1.0.0"),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+    client.flush_pending_cache_writes().await;
+
+    // A fresh client reading the same disk cache should hit ManifestProjection
+    // directly with pre-hydrated release times and zero HTTP calls.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/proj-release-age"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let second_client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+    let (second, second_timings) = fetch_metadata_for_resolver_with_timings(
+        &second_client,
+        &route_table,
+        &canonical,
+        &policy,
+        false,
+    )
+    .await
+    .expect("warm cache should answer directly from ManifestProjection");
+    assert!(second_timings.cache_hit);
+    assert!(second_timings.projection_hit);
+    assert_eq!(second_timings.policy_release_time_ms, 0);
+    assert!(second.info.release_metadata_complete);
+    assert_eq!(
+        second.info.published_at("1.0.0"),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}

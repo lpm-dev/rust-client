@@ -193,41 +193,18 @@ pub(super) async fn fetch_metadata_for_resolver(
     policy: &ResolverPolicy,
     include_speculation: bool,
 ) -> Result<FetchedMetadata, ResolveError> {
-    let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    let dist_tags = metadata.dist_tags.clone();
-    let base_fact = Arc::new(parse_owned_metadata_to_cache_info(metadata));
-    if base_fact.needs_trust_metadata(policy) {
-        let mut fetched = fetch_full_metadata_for_policy(
-            client,
-            route_table,
-            canonical,
-            policy,
-            include_speculation,
-            false,
-        )
-        .await?;
-        share_manifest_core_with_base(&mut fetched, &base_fact);
-        fetched.shared_fact = Some(base_fact);
-        return Ok(fetched);
-    }
-    let needs_release_time = base_fact.needs_release_time_metadata(canonical, policy);
-    let needs_platform = base_fact.needs_platform_metadata();
-    if !needs_release_time && !needs_platform {
-        let mut fetched =
-            fetched_metadata_from_arc(None, dist_tags, Arc::clone(&base_fact), include_speculation);
-        fetched.shared_fact = Some(base_fact);
-        return Ok(fetched);
-    }
-    let mut info = (*base_fact).clone();
-    if needs_release_time {
-        fetch_release_times_for_policy(client, route_table, canonical, &mut info, false).await?;
-    }
-    if needs_platform {
-        fetch_platform_metadata(client, route_table, canonical, &mut info, false).await?;
-    }
-    let mut fetched = fetched_metadata_from_info(None, dist_tags, info, include_speculation);
-    fetched.shared_fact = Some(base_fact);
-    Ok(fetched)
+    fetch_metadata_for_resolver_inner(
+        client,
+        route_table,
+        canonical,
+        policy,
+        include_speculation,
+        false,
+        None,
+        None,
+    )
+    .await
+    .map(|(fetched, _)| fetched)
 }
 
 pub(super) async fn fetch_metadata_for_resolver_with_timings(
@@ -237,83 +214,247 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     policy: &ResolverPolicy,
     include_speculation: bool,
 ) -> Result<(FetchedMetadata, ExperimentalMetadataFetchTimings), ResolveError> {
-    let total_start = Instant::now();
+    fetch_metadata_for_resolver_inner(
+        client,
+        route_table,
+        canonical,
+        policy,
+        include_speculation,
+        true,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fetch_metadata_for_resolver_with_permit(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+    trace_metadata_fetches: bool,
+    abbreviated_permit: tokio::sync::OwnedSemaphorePermit,
+    policy_semaphore: &Arc<tokio::sync::Semaphore>,
+) -> Result<FetchedMetadata, ResolveError> {
+    let (fetched, timings) = fetch_metadata_for_resolver_inner(
+        client,
+        route_table,
+        canonical,
+        policy,
+        include_speculation,
+        trace_metadata_fetches,
+        Some(abbreviated_permit),
+        Some(policy_semaphore),
+    )
+    .await?;
+    if trace_metadata_fetches {
+        lpm_registry::timing::record_metadata_fetch_detail(metadata_fetch_detail_record(timings));
+    }
+    Ok(fetched)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_metadata_for_resolver_inner(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+    capture_timings: bool,
+    mut abbreviated_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    policy_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Result<(FetchedMetadata, ExperimentalMetadataFetchTimings), ResolveError> {
+    let total_start = capture_timings.then(Instant::now);
     let mut timings = ExperimentalMetadataFetchTimings {
-        package: canonical.to_string(),
+        package: if capture_timings {
+            canonical.to_string()
+        } else {
+            String::new()
+        },
         ..ExperimentalMetadataFetchTimings::default()
     };
-    let raw_start = Instant::now();
-    let raw = fetch_metadata_raw_with_timings(client, route_table, canonical).await?;
-    timings.raw_fetch_ms = raw_start.elapsed().as_millis();
-    timings.route = raw.route;
-    timings.version_count = raw.metadata.versions.len() as u64;
-    let latest_version = latest_version_from_metadata(&raw.metadata);
-    if let Some(registry) = raw.registry_timings {
-        timings.cache_hit = registry.cache_hit;
-        timings.not_modified = registry.not_modified;
-        timings.cache_read_ms = registry.cache_read_ms;
-        timings.validator_read_ms = registry.validator_read_ms;
-        timings.http_ms = registry.http_ms;
-        timings.body_read_ms = registry.body_read_ms;
-        timings.json_decode_ms = registry.json_decode_ms;
-        timings.cache_after_304_ms = registry.cache_after_304_ms;
-        timings.cache_write_dispatch_ms = registry.cache_write_dispatch_ms;
-        timings.body_bytes = registry.body_bytes;
-    }
 
-    let dist_tags = raw.metadata.dist_tags.clone();
-    let parse_start = Instant::now();
-    let base_fact = Arc::new(parse_owned_metadata_to_cache_info(raw.metadata));
-    timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
-    if base_fact.needs_trust_metadata(policy) {
-        let policy_start = Instant::now();
+    let npm_route = match canonical {
+        CanonicalKey::Npm { name } => Some((name.as_str(), route_table.route_for_package(name))),
+        _ => None,
+    };
+    let public_npm = npm_route
+        .as_ref()
+        .and_then(|(name, route)| client.public_npm_access(route).map(|access| (*name, access)));
+
+    let (mut info, dist_tags, latest_version, version_count, projection_hit, projection_slot) =
+        if let Some((name, access)) = public_npm {
+            let raw_start = capture_timings.then(Instant::now);
+            let resolved = client
+                .get_npm_metadata_direct_resolution_with_timings::<ManifestProjection>(name, access)
+                .await
+                .map_err(|error| metadata_fetch_error(canonical, error))?;
+            if let Some(start) = raw_start {
+                timings.raw_fetch_ms = start.elapsed().as_millis();
+                timings.route = "npm_direct";
+                timings.cache_hit = resolved.timings.cache_hit;
+                timings.not_modified = resolved.timings.not_modified;
+                timings.cache_read_ms = resolved.timings.cache_read_ms;
+                timings.validator_read_ms = resolved.timings.validator_read_ms;
+                timings.http_ms = resolved.timings.http_ms;
+                timings.body_read_ms = resolved.timings.body_read_ms;
+                timings.json_decode_ms = resolved.timings.json_decode_ms;
+                timings.cache_after_304_ms = resolved.timings.cache_after_304_ms;
+                timings.cache_write_dispatch_ms = resolved.timings.cache_write_dispatch_ms;
+                timings.body_bytes = resolved.timings.body_bytes;
+            }
+            let parse_start = capture_timings.then(Instant::now);
+            let (info, dist_tags, version_count, projection_hit) = match resolved.metadata {
+                lpm_registry::ResolutionMetadata::Projected(projection) => (
+                    projection.info,
+                    projection.dist_tags,
+                    projection.version_count,
+                    true,
+                ),
+                lpm_registry::ResolutionMetadata::Document { metadata, .. } => {
+                    let version_count = metadata.versions.len() as u64;
+                    let dist_tags = metadata.dist_tags.clone();
+                    let info = parse_owned_metadata_to_cache_info(*metadata);
+                    (info, dist_tags, version_count, false)
+                }
+            };
+            if let Some(start) = parse_start {
+                timings.cache_info_parse_ms = start.elapsed().as_millis();
+                timings.version_count = version_count;
+                timings.projection_hit = projection_hit;
+            }
+            let latest_version = capture_timings
+                .then(|| info.latest_version.clone())
+                .flatten();
+            (
+                info,
+                dist_tags,
+                latest_version,
+                version_count,
+                projection_hit,
+                resolved.projection_slot,
+            )
+        } else {
+            let raw_start = capture_timings.then(Instant::now);
+            let (metadata, latest_version) = if capture_timings {
+                let raw = fetch_metadata_raw_with_timings(client, route_table, canonical).await?;
+                if let Some(start) = raw_start {
+                    timings.raw_fetch_ms = start.elapsed().as_millis();
+                }
+                timings.route = raw.route;
+                timings.version_count = raw.metadata.versions.len() as u64;
+                let latest_version = latest_version_from_metadata(&raw.metadata);
+                if let Some(registry) = raw.registry_timings {
+                    timings.cache_hit = registry.cache_hit;
+                    timings.not_modified = registry.not_modified;
+                    timings.cache_read_ms = registry.cache_read_ms;
+                    timings.validator_read_ms = registry.validator_read_ms;
+                    timings.http_ms = registry.http_ms;
+                    timings.body_read_ms = registry.body_read_ms;
+                    timings.json_decode_ms = registry.json_decode_ms;
+                    timings.cache_after_304_ms = registry.cache_after_304_ms;
+                    timings.cache_write_dispatch_ms = registry.cache_write_dispatch_ms;
+                    timings.body_bytes = registry.body_bytes;
+                }
+                (raw.metadata, latest_version)
+            } else {
+                let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
+                (metadata, None)
+            };
+            let version_count = metadata.versions.len() as u64;
+            let dist_tags = metadata.dist_tags.clone();
+            let parse_start = capture_timings.then(Instant::now);
+            let info = parse_owned_metadata_to_cache_info(metadata);
+            if let Some(start) = parse_start {
+                timings.cache_info_parse_ms = start.elapsed().as_millis();
+            }
+            (info, dist_tags, latest_version, version_count, false, None)
+        };
+
+    if info.needs_trust_metadata(policy) {
+        drop(abbreviated_permit.take());
+        let _policy_permit = match policy_semaphore {
+            Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+            None => None,
+        };
+        let base_fact = Arc::new(info);
+        let policy_start = capture_timings.then(Instant::now);
         let mut fetched = fetch_full_metadata_for_policy(
             client,
             route_table,
             canonical,
             policy,
             include_speculation,
-            true,
+            capture_timings,
         )
         .await?;
         share_manifest_core_with_base(&mut fetched, &base_fact);
         fetched.shared_fact = Some(base_fact);
-        timings.policy_full_metadata_ms = policy_start.elapsed().as_millis();
-        timings.total_ms = total_start.elapsed().as_millis();
-        return Ok((fetched, timings));
-    }
-    let needs_release_time = base_fact.needs_release_time_metadata(canonical, policy);
-    let needs_platform = base_fact.needs_platform_metadata();
-    if !needs_release_time && !needs_platform {
-        let mut fetched = fetched_metadata_from_arc(
-            latest_version,
-            dist_tags,
-            Arc::clone(&base_fact),
-            include_speculation,
-        );
-        fetched.shared_fact = Some(base_fact);
-        timings.total_ms = total_start.elapsed().as_millis();
-        return Ok((fetched, timings));
-    }
-    let mut info = (*base_fact).clone();
-    if needs_release_time {
-        let policy_start = Instant::now();
-        if let Some(detail) =
-            fetch_release_times_for_policy(client, route_table, canonical, &mut info, true).await?
-        {
-            timings.policy_release_time_fetch_ms = detail.total_ms;
-            timings.policy_release_time_fetch = Some(detail.timings);
-            timings.policy_release_time_version_count = detail.version_count;
+        if let Some(start) = policy_start {
+            timings.policy_full_metadata_ms = start.elapsed().as_millis();
         }
-        timings.policy_release_time_ms = policy_start.elapsed().as_millis();
+        if let Some(start) = total_start {
+            timings.total_ms = start.elapsed().as_millis();
+        }
+        return Ok((fetched, timings));
     }
-    if needs_platform {
-        fetch_platform_metadata(client, route_table, canonical, &mut info, true).await?;
+
+    let needs_release_time = info.needs_release_time_metadata(canonical, policy);
+    let needs_platform = info.needs_platform_metadata();
+    let mut hydrated = false;
+
+    if needs_release_time || needs_platform {
+        // Release the abbreviated packument lane before waiting on full-packument
+        // policy/platform hydration so other packages can start RTT 1 immediately.
+        drop(abbreviated_permit.take());
+        let _policy_permit = match policy_semaphore {
+            Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+            None => None,
+        };
+        if needs_release_time {
+            let policy_start = capture_timings.then(Instant::now);
+            if let Some(detail) = fetch_release_times_for_policy(
+                client,
+                route_table,
+                canonical,
+                &mut info,
+                capture_timings,
+            )
+            .await?
+            {
+                timings.policy_release_time_fetch_ms = detail.total_ms;
+                timings.policy_release_time_fetch = Some(detail.timings);
+                timings.policy_release_time_version_count = detail.version_count;
+            }
+            if let Some(start) = policy_start {
+                timings.policy_release_time_ms = start.elapsed().as_millis();
+            }
+            hydrated = true;
+        }
+        if info.needs_platform_metadata() {
+            fetch_platform_metadata(client, route_table, canonical, &mut info, capture_timings)
+                .await?;
+            hydrated = true;
+        }
     }
+
+    if let Some(slot) = projection_slot
+        && (!projection_hit || hydrated)
+    {
+        client.store_metadata_projection(
+            slot,
+            ManifestProjection::encode(&info, &dist_tags, version_count),
+        );
+    }
+
     let mut fetched =
         fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
-    fetched.shared_fact = Some(base_fact);
-    timings.total_ms = total_start.elapsed().as_millis();
+    fetched.shared_fact = Some(Arc::clone(&fetched.info));
+    if let Some(start) = total_start {
+        timings.total_ms = start.elapsed().as_millis();
+    }
     Ok((fetched, timings))
 }
 
@@ -759,7 +900,7 @@ fn metadata_fetch_detail_record(
         version_count: timings.version_count,
         cache_hit: timings.cache_hit,
         not_modified: timings.not_modified,
-        projection_hit: false,
+        projection_hit: timings.projection_hit,
     }
 }
 
@@ -1070,10 +1211,15 @@ async fn fetch_release_times_for_policy(
         return Ok(None);
     };
     let route = route_table.route_for_package(name);
+    let expected_modified = info.modified.as_deref();
     let release_times = if capture_timings {
         let start = Instant::now();
         let timed = client
-            .get_npm_release_times_routed_full_with_timings(name, route)
+            .get_npm_release_times_routed_full_with_timings_for_modified(
+                name,
+                route,
+                expected_modified,
+            )
             .await
             .map_err(|e| ResolveError::DependencyFetch {
                 package: canonical.to_string(),
@@ -1089,7 +1235,7 @@ async fn fetch_release_times_for_policy(
         return Ok(Some(detail));
     } else {
         client
-            .get_npm_release_times_routed_full(name, route)
+            .get_npm_release_times_routed_full_for_modified(name, route, expected_modified)
             .await
             .map_err(|e| ResolveError::DependencyFetch {
                 package: canonical.to_string(),

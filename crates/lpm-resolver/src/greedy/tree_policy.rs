@@ -18,8 +18,9 @@ pub(super) trait TreeManifestProvider {
     fn prefetch_manifests<'a>(
         &'a self,
         _canonicals: &'a [CanonicalKey],
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+        _direct_limit: usize,
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
+        Box::pin(async { 0 })
     }
 }
 
@@ -183,7 +184,19 @@ where
             .collect();
         let release_age_tree_policy = policy.release_age_checks_all_packages();
         if policy.requires_trust_history() || release_age_tree_policy {
-            provider.prefetch_manifests(&prefetch_canonicals).await;
+            let direct_limit = if policy.requires_trust_history() {
+                prefetch_canonicals.len()
+            } else {
+                RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT.saturating_sub(cache.release_age_lookahead_fetches)
+            };
+            let prefetched_direct = provider
+                .prefetch_manifests(&prefetch_canonicals, direct_limit)
+                .await;
+            if !policy.requires_trust_history() {
+                cache.release_age_lookahead_fetches = cache
+                    .release_age_lookahead_fetches
+                    .saturating_add(prefetched_direct);
+            }
         }
 
         for dependency in entries {

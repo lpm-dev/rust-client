@@ -140,6 +140,7 @@ pub struct ExperimentalMetadataFetchTimings {
     pub version_count: u64,
     pub cache_hit: bool,
     pub not_modified: bool,
+    pub projection_hit: bool,
 }
 
 impl From<version::VersionPick> for ExperimentalVersionSelection {
