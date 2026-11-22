@@ -68,15 +68,22 @@ pub enum ValidationErrorKind {
 }
 
 impl ValidationError {
-    /// The message without the value judged, as a secret's shows it: for a
+    /// Keep none of the value judged, as a secret's error keeps none: for a
     /// failure a personal override caused, whose value is this computer's
-    /// own.
-    pub fn without_value(&self) -> impl std::fmt::Display + '_ {
-        WithoutValue(self)
+    /// own, so neither its message nor its debug output shows it.
+    pub fn forget_value(&mut self) {
+        if let ValidationErrorKind::InvalidFormat { got, .. }
+        | ValidationErrorKind::PatternMismatch { got, .. }
+        | ValidationErrorKind::NotInEnum { got, .. } = &mut self.kind
+        {
+            *got = REDACTED_VALUE.to_owned();
+        }
     }
+}
 
-    fn write(&self, f: &mut std::fmt::Formatter<'_>, hide_value: bool) -> std::fmt::Result {
-        let hide = self.is_secret || hide_value;
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hide = self.is_secret;
         let key = TerminalSafe(&self.key);
         match &self.kind {
             ValidationErrorKind::InvalidEnvironmentName { canonical, alias } => write!(
@@ -164,20 +171,6 @@ impl ValidationError {
             }
         }
         Ok(())
-    }
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.write(f, false)
-    }
-}
-
-struct WithoutValue<'a>(&'a ValidationError);
-
-impl std::fmt::Display for WithoutValue<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.write(f, true)
     }
 }
 
@@ -1048,7 +1041,7 @@ mod tests {
     use crate::schema::EnvSchema;
 
     #[test]
-    fn a_message_without_its_value_names_the_key_and_rule_and_never_the_value() {
+    fn an_error_that_forgets_its_value_names_the_key_and_rule_and_never_the_value() {
         let value = "fixture-not-secret-value";
         let error = |kind| ValidationError {
             key: "API_URL".to_owned(),
@@ -1070,20 +1063,21 @@ mod tests {
                 got: value.to_owned(),
             },
         ] {
-            let error = error(kind);
+            let mut error = error(kind);
             assert!(error.to_string().contains(value), "{error}");
-            let hidden = error.without_value().to_string();
-            assert!(!hidden.contains(value), "{hidden}");
-            assert!(hidden.starts_with("API_URL: "), "{hidden}");
+            error.forget_value();
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains(value), "{shown}");
+            assert!(shown.starts_with("API_URL: "), "{shown}");
         }
-        let enumerated = error(ValidationErrorKind::NotInEnum {
+        let mut enumerated = error(ValidationErrorKind::NotInEnum {
             allowed: vec!["a".to_owned(), "b".to_owned()],
             got: value.to_owned(),
         });
+        enumerated.forget_value();
         assert!(
-            enumerated.without_value().to_string().contains("[a, b]"),
-            "the schema's own choices still show: {}",
-            enumerated.without_value()
+            enumerated.to_string().contains("[a, b]"),
+            "the schema's own choices still show: {enumerated}"
         );
     }
 

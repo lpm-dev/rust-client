@@ -100,6 +100,9 @@ pub(super) fn run_tasks_sequential(
             continue;
         }
 
+        // The task's process runs with the values its cache key is computed
+        // from, whatever another task's cache publication rereads meanwhile.
+        let _pinned_vault_reads = lpm_runner::env_access::pin_vault_reads();
         let cache_context = match dependency_identities.as_deref() {
             Some(dependency_identities) => prepare_cache_context_with_config(
                 project_dir,

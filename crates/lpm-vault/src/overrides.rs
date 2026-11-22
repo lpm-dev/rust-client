@@ -40,42 +40,113 @@ pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides
     in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))
 }
 
+/// The env project a command checked or read before it asked for anything,
+/// for a change committed to that project alone.
+#[derive(Debug)]
+pub struct Project {
+    vault_id: String,
+}
+
+impl Project {
+    /// The project `project_dir` names now, refused unless it's this one:
+    /// the folder may name another since this one was checked.
+    fn still_named(&self, project_dir: &Path, unchanged: &str) -> Result<&str, String> {
+        if crate::linked_vault_id(project_dir)?.as_deref() == Some(self.vault_id.as_str()) {
+            Ok(&self.vault_id)
+        } else {
+            Err(format!("this directory's env project changed {unchanged}"))
+        }
+    }
+}
+
 /// Every environment's personal overrides of one env project, as a review
-/// read them, for a change to commit to that project alone.
+/// read them, for removals to commit to that project alone, only while what
+/// they remove is what it read.
 #[derive(Debug)]
 pub struct Reviewed {
-    vault_id: String,
+    project: Project,
     pub overrides: BTreeMap<String, PersonalOverrides>,
 }
 
 /// Every environment's personal overrides of the env project at
-/// `project_dir`, for a change reviewed against them (see
-/// [`change_reviewed`]); `None` without an env project.
+/// `project_dir`, for removals reviewed against them (see
+/// [`remove_reviewed`]); `None` without an env project.
 pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Ok(None);
     };
     let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
     Ok(Some(Reviewed {
-        vault_id,
+        project: Project { vault_id },
         overrides,
     }))
 }
 
-/// [`change`] for edits made from `reviewed`, refused when `project_dir`
-/// names another project than the one it read.
-pub fn change_reviewed(
+/// Remove the overrides `removals` name, as [`change`] would, refused when
+/// `project_dir` names another project than the one `reviewed` read, or when
+/// an override it would remove changed since: one set to another value, set
+/// where it was unset, or the reverse. An override another command added
+/// meanwhile stays.
+pub fn remove_reviewed(
     project_dir: &Path,
     reviewed: &Reviewed,
+    removals: &[(String, String)],
+) -> Result<Change, String> {
+    const CHANGED: &str = "since its personal overrides were read; nothing was changed";
+    let vault_id = reviewed.project.still_named(project_dir, CHANGED)?;
+    let edits: Vec<Edit> = removals
+        .iter()
+        .map(|(environment, key)| Edit::Remove {
+            environment: environment.clone(),
+            key: key.clone(),
+        })
+        .collect();
+    in_overrides_lock(|directory| {
+        let current = read_all_unlocked(directory, vault_id)?;
+        if removals.iter().any(|(environment, key)| {
+            decision(&reviewed.overrides, environment, key) != decision(&current, environment, key)
+        }) {
+            return Err(
+                "a personal override it asked about changed while it asked; nothing was changed"
+                    .to_owned(),
+            );
+        }
+        drop(current);
+        change_unlocked(directory, vault_id, &edits)
+    })
+    .map(|plan| Change {
+        effects: plan.effects,
+        activated: plan.activated,
+        over_admission_target: plan.over_admission_target,
+    })
+}
+
+/// What `all` decides for `key` in `environment`: its value when set, and
+/// whether it's unset; `None` without overrides there.
+fn decision<'all>(
+    all: &'all BTreeMap<String, PersonalOverrides>,
+    environment: &str,
+    key: &str,
+) -> Option<(Option<&'all str>, bool)> {
+    all.get(environment).map(|overrides| {
+        (
+            overrides.set.get(key).map(String::as_str),
+            overrides.unset.iter().any(|unset| unset == key),
+        )
+    })
+}
+
+/// [`change`] for edits to `project`, the one [`check_before_values`]
+/// checked, refused when `project_dir` names another project since.
+pub fn change_checked(
+    project_dir: &Path,
+    project: &Project,
     edits: &[Edit],
 ) -> Result<Change, String> {
-    let vault_id = reviewed.vault_id.as_str();
-    if crate::linked_vault_id(project_dir)?.as_deref() != Some(vault_id) {
-        return Err(
-            "this directory's env project changed since its personal overrides were read; nothing was changed"
-                .to_owned(),
-        );
-    }
+    let vault_id = project.still_named(
+        project_dir,
+        "while its values were asked for; nothing was stored",
+    )?;
     in_overrides_lock(|directory| change_unlocked(directory, vault_id, edits)).map(|plan| Change {
         effects: plan.effects,
         activated: plan.activated,
@@ -109,13 +180,15 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
 /// whatever their values, before any value is read or asked for: an invalid
 /// environment or name, a name LPM never passes to a process, no env project
 /// here or no values for it on this computer, an interrupted step that can't
-/// be finished, or newer data that refuses the change. It reads only the
-/// marker and attributes, so it never asks for approval.
+/// be finished, or newer data that refuses the change. It reads the marker
+/// and attributes, and probes without showing anything; only finishing an
+/// interrupted step can ask for approval. The project it checked is the one
+/// [`change_checked`] commits to.
 pub fn check_before_values(
     project_dir: &Path,
     environment: &str,
     keys: &[&str],
-) -> Result<(), String> {
+) -> Result<Project, String> {
     let edits: Vec<Edit> = keys
         .iter()
         .map(|key| Edit::Unset {
@@ -127,7 +200,10 @@ pub fn check_before_values(
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Err(NO_PROJECT.to_owned());
     };
-    crate::with_project_vault_transaction(|directory| check_unlocked(directory, &vault_id, &edits))
+    crate::with_project_vault_transaction(|directory| {
+        check_unlocked(directory, &vault_id, &edits)
+    })?;
+    Ok(Project { vault_id })
 }
 
 /// Plan `edits`, listing the store's companion records with `inventory`
@@ -302,15 +378,9 @@ mod tests {
                 .expect("another project takes the folder");
             store_value_and_override(&dir);
 
-            let refused = change_reviewed(
-                &dir,
-                &reviewed,
-                &[Edit::Remove {
-                    environment: "default".to_owned(),
-                    key: "A".to_owned(),
-                }],
-            )
-            .expect_err("the review read another project");
+            let refused =
+                remove_reviewed(&dir, &reviewed, &[("default".to_owned(), "A".to_owned())])
+                    .expect_err("the review read another project");
 
             assert!(refused.contains("nothing was changed"), "{refused}");
             assert_eq!(read_all(&dir).expect("read")["default"].set["A"], "mine");

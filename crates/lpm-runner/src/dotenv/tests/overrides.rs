@@ -159,10 +159,30 @@ fn an_override_of_the_value_the_project_has_is_never_blamed() {
         lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
     );
     assert_eq!(
-        child.override_attribution(&[invalid]),
+        child.attribute_overrides(&mut [invalid]),
         [false],
         "removing the override wouldn't change the value"
     );
+}
+
+#[test]
+fn an_error_an_override_caused_forgets_its_value() {
+    let layers = layers(
+        &[("API_URL", "https://team.example")],
+        overrides(&[("API_URL", "fixture-not-a-url")], &[]),
+    );
+    let child = layers.compose(None, None).expect("compose");
+    let mut errors = [error(
+        "API_URL",
+        lpm_env::ValidationErrorKind::InvalidFormat {
+            expected: lpm_env::VarFormat::Url,
+            got: "fixture-not-a-url".to_owned(),
+        },
+    )];
+
+    assert_eq!(child.attribute_overrides(&mut errors), [true]);
+    let shown = format!("{} {:?}", errors[0], errors[0]);
+    assert!(!shown.contains("fixture-not-a-url"), "{shown}");
 }
 
 #[test]

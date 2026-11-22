@@ -321,9 +321,16 @@ impl ChildEnv {
     }
 
     /// For each of `errors`, in order, whether a personal override caused
-    /// it.
-    pub fn override_attribution(&self, errors: &[lpm_env::ValidationError]) -> Vec<bool> {
-        self.origins.attribute(errors, &self.vars)
+    /// it; an error one caused forgets its value, which is this computer's
+    /// own.
+    pub fn attribute_overrides(&self, errors: &mut [lpm_env::ValidationError]) -> Vec<bool> {
+        let caused = self.origins.attribute(errors, &self.vars);
+        for (error, caused) in errors.iter_mut().zip(&caused) {
+            if *caused {
+                error.forget_value();
+            }
+        }
+        caused
     }
 
     /// Steps 6–8 for a child: remove dangerous names from layers 1–5, insert
@@ -1020,23 +1027,20 @@ pub(crate) fn validate_project_env_with_plan(
 /// caused: the override is the value's final origin, or its `unset` left the
 /// value missing. Messages never include values.
 fn validation_result(
-    errors: Vec<lpm_env::ValidationError>,
+    mut errors: Vec<lpm_env::ValidationError>,
     child: &ChildEnv,
 ) -> Result<(), LpmError> {
     if errors.is_empty() {
         return Ok(());
     }
-    let caused = child.override_attribution(&errors);
+    let caused = child.attribute_overrides(&mut errors);
     Err(LpmError::EnvValidation(
         errors
             .iter()
             .zip(caused)
             .map(|(error, caused)| {
                 if caused {
-                    format!(
-                        "  {} (from a personal override on {THIS_MACHINE})",
-                        error.without_value()
-                    )
+                    format!("  {error} (from a personal override on {THIS_MACHINE})")
                 } else {
                     format!("  {error}")
                 }

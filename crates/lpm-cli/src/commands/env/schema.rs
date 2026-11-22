@@ -348,7 +348,7 @@ pub(super) fn vars_check(
             )?;
             let characters = layers.stored_value_characters();
             let mut composed = layers.compose(lpm_config.as_ref(), scope.service.as_deref())?;
-            let errors = composed.evaluate(
+            let mut errors = composed.evaluate(
                 Some(&validator),
                 lpm_env::EvalContext {
                     environment: &environment.canonical,
@@ -356,7 +356,7 @@ pub(super) fn vars_check(
                     service: scope.service.as_deref(),
                 },
             )?;
-            let from_overrides = composed.override_attribution(&errors);
+            let from_overrides = composed.attribute_overrides(&mut errors);
             Ok::<_, LpmError>((errors, from_overrides, characters))
         });
         let (errors, from_overrides, characters) = checked?;
@@ -390,7 +390,7 @@ pub(super) fn vars_check(
                     "ignored": ignored,
                     "value_warnings": value_warnings,
                     "errors": errors.iter().zip(from_overrides).map(|(e, caused)| {
-                        let message = if *caused { e.without_value().to_string() } else { e.to_string() };
+                        let message = e.to_string();
                         let mut diagnostic = serde_json::json!({"key": e.key, "error": message});
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
                             diagnostic["group"] = serde_json::json!(group);
@@ -455,7 +455,7 @@ pub(super) fn vars_check(
                 if *caused {
                     println!(
                         "    {} {}",
-                        install_ui::red(&error.without_value().to_string()),
+                        install_ui::red(&error.to_string()),
                         install_ui::dim(&format!(
                             "(from a personal override on {})",
                             lpm_runner::dotenv::THIS_MACHINE

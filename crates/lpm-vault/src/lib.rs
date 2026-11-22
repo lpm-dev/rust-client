@@ -1726,13 +1726,20 @@ fn write_all_environments_following_unlocked(
         );
     };
     let in_files = |following| {
-        fallback::write_all_environments_unlocked(directory, vault_id, environments, recording)?;
-        fallback::companion::commit_planned_overrides_unlocked(directory, vault_id, following)
-            .map_err(|error| {
-                format!(
-                    "the values were written, but this computer's personal overrides didn't follow the environments they renamed or removed: {error}"
-                )
-            })
+        fallback::write_all_environments_then_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+            || {
+                fallback::companion::commit_planned_overrides_unlocked(directory, vault_id, following)
+                    .map_err(|error| {
+                        format!(
+                            "the values were written, but this computer's personal overrides didn't follow the environments they renamed or removed: {error}"
+                        )
+                    })
+            },
+        )
     };
     if force_file_vault_backend() {
         return in_files(following);

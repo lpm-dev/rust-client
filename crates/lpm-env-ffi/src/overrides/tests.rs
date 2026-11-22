@@ -152,6 +152,44 @@ fn a_batch_at_every_limit_with_a_full_service_of_names_is_one_input() {
 }
 
 #[test]
+fn environments_changed_together_share_one_budget_across_the_batch() {
+    let renames = |count: usize| -> Vec<Value> {
+        (0..count)
+            .map(|index| json!({"from": format!("e{index}"), "to": format!("f{index}")}))
+            .collect()
+    };
+    let plan = |edits: Value| {
+        call(
+            lpm_env_overrides_plan,
+            &json!({"vaultId": VAULT, "edits": edits}),
+            &[],
+        )
+    };
+    let (status, response, _) = plan(json!([
+        {"action": "environmentsChanged", "renamed": renames(MAX_EDITS), "removed": []}
+    ]));
+    assert_eq!(status, 0, "{response}");
+    let (status, response, _) = plan(json!([
+        {"action": "environmentsChanged", "renamed": renames(MAX_EDITS + 1), "removed": []}
+    ]));
+    assert_eq!(status, 2, "{response}");
+    let half = json!({"action": "environmentsChanged", "renamed": renames(MAX_EDITS / 2 + 1), "removed": []});
+    let (status, response, _) = plan(json!([half, half]));
+    assert_eq!(status, 2, "{response}");
+}
+
+#[test]
+fn a_listing_past_any_service_s_names_is_refused_before_it_is_kept() {
+    let names = vec![""; MAX_NAMES + 1];
+    let (status, response, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "names": names, "edits": []}),
+        &[],
+    );
+    assert_eq!(status, 2, "{response}");
+}
+
+#[test]
 fn the_header_declares_both_override_functions_and_their_input_limit() {
     let header = include_str!("../../include/lpm_env.h");
     assert!(header.contains("#define LPM_ENV_OVERRIDES_INPUT_LIMIT (16 * 1024 * 1024)"));
@@ -322,7 +360,7 @@ struct FixtureCase {
     name: String,
     vault_id: String,
     #[serde(default)]
-    values: Option<bool>,
+    has_values: Option<bool>,
     marker: Option<String>,
     record: Option<String>,
     names: Option<Vec<String>>,
@@ -351,8 +389,8 @@ fn every_override_change_fixture_plans_through_the_engine_as_recorded() {
             })
             .collect();
         let mut request = json!({ "vaultId": case.vault_id, "edits": edits });
-        if let Some(values) = case.values {
-            request["values"] = json!(values);
+        if let Some(values) = case.has_values {
+            request["hasValues"] = json!(values);
         }
         if let Some(marker) = &case.marker {
             blobs.push(marker.as_bytes().to_vec());
@@ -649,7 +687,7 @@ fn environments_changed_together_keep_their_own_overrides() {
 fn a_project_without_values_plans_removals_and_refuses_the_rest() {
     let (status, removed, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "values": false, "edits": [{"action": "remove", "environment": "dev", "key": "A"}]}),
+        &json!({"vaultId": VAULT, "hasValues": false, "edits": [{"action": "remove", "environment": "dev", "key": "A"}]}),
         &[],
     );
     assert_eq!(status, 0, "{removed}");
@@ -657,7 +695,7 @@ fn a_project_without_values_plans_removals_and_refuses_the_rest() {
     assert_eq!(removed["effects"][0]["changed"], false);
     let (status, refused, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "values": false, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 1}]}),
+        &json!({"vaultId": VAULT, "hasValues": false, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 1}]}),
         &[b"fixture"],
     );
     assert_eq!(status, 5, "{refused}");

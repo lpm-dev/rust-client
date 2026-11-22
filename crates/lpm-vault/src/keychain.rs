@@ -2099,13 +2099,7 @@ pub(crate) fn read_for_run_unlocked(
     default_fallback: bool,
 ) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
     let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
-    let overrides = crate::companion::overrides::evaluate(
-        &read.gate,
-        vault_id,
-        env,
-        read.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
-    )
-    .map_err(crate::companion::damaged)?;
+    let overrides = read.overrides(vault_id, env)?;
     let Some(bytes) = read.values else {
         return Ok((None, overrides));
     };
@@ -2134,12 +2128,7 @@ pub(crate) fn read_all_for_run_unlocked(
     String,
 > {
     let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
-    let overrides = crate::companion::overrides::evaluate_all(
-        &read.gate,
-        vault_id,
-        read.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
-    )
-    .map_err(crate::companion::damaged)?;
+    let overrides = read.all_overrides(vault_id)?;
     let values = read
         .values
         .map(|bytes| {

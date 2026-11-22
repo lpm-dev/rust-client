@@ -949,8 +949,16 @@ impl CompanionBackend for FileCompanion<'_> {
         let Some(folder) = self.folder(account.vault_id())? else {
             return Ok(Checked::Absent);
         };
-        let Some(sealed) = self.read_sealed(&folder, &entry_name(account))? else {
-            return Ok(Checked::Absent);
+        let sealed = match folder.read_owner_only_file_within(
+            &entry_name(account),
+            "companion entry",
+            MAX_SEALED_ENTRY_BYTES,
+        )? {
+            None => return Ok(Checked::Absent),
+            Some(Err(over)) => {
+                return Ok(Checked::Unreadable(over.describe("companion entry")));
+            }
+            Some(Ok(sealed)) => sealed,
         };
         let key = self.data_key()?;
         Ok(match open(&key, account, sealed) {
@@ -1008,15 +1016,20 @@ fn read_overrides_record(
 }
 
 /// The personal overrides record, read in the caller's lock after the Apply
-/// gate, with the gate that decides what it means.
-pub(crate) fn read_overrides_record_unlocked(
+/// gate, with the gate that decides what it means; `None` for a project
+/// without values, which has no overrides: they live beside values, and a
+/// record left without them is never applied.
+fn read_overrides_record_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-) -> Result<(ProjectGate, RecordBytes), String> {
+) -> Result<Option<(ProjectGate, RecordBytes)>, String> {
     let mut companion = FileCompanion::open(directory)?;
     let gate = authorize_with(&mut companion, vault_id, Operation::ReadApplyingOverrides)?;
+    if !companion.has_values(vault_id)? {
+        return Ok(None);
+    }
     let record = read_overrides_record(&mut companion, vault_id)?;
-    Ok((gate, record))
+    Ok(Some((gate, record)))
 }
 
 /// The selected environment's personal overrides.
@@ -1025,7 +1038,9 @@ pub(crate) fn read_overrides_unlocked(
     vault_id: &str,
     environment: &str,
 ) -> Result<PersonalOverrides, String> {
-    let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
+    let Some((gate, record)) = read_overrides_record_unlocked(directory, vault_id)? else {
+        return Ok(PersonalOverrides::default());
+    };
     crate::companion::overrides::evaluate(
         &gate,
         vault_id,
@@ -1041,7 +1056,9 @@ pub(crate) fn read_all_overrides_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
-    let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
+    let Some((gate, record)) = read_overrides_record_unlocked(directory, vault_id)? else {
+        return Ok(std::collections::BTreeMap::new());
+    };
     crate::companion::overrides::evaluate_all(
         &gate,
         vault_id,
@@ -1221,11 +1238,20 @@ pub(crate) fn review_companion_data_unlocked(
     let marker = CompanionAccount::Marker {
         vault_id: vault_id.to_owned(),
     };
-    if let Some(folder) = companion.folder(vault_id)?
-        && let Some(sealed) = companion.read_sealed(&folder, &entry_name(&marker))?
-        && let Err(error) = open(&companion.data_key()?, &marker, sealed)
-    {
-        return Ok(CompanionReview::discard(error));
+    if let Some(folder) = companion.folder(vault_id)? {
+        let sealed = folder.read_owner_only_file_within(
+            &entry_name(&marker),
+            "companion entry",
+            MAX_SEALED_ENTRY_BYTES,
+        )?;
+        let unreadable = match sealed {
+            None => None,
+            Some(Err(over)) => Some(over.describe("companion entry")),
+            Some(Ok(sealed)) => open(&companion.data_key()?, &marker, sealed).err(),
+        };
+        if let Some(error) = unreadable {
+            return Ok(CompanionReview::discard(error));
+        }
     }
     crate::companion::authorize(&mut companion, vault_id, Operation::Maintenance)?;
     crate::companion::repair::review(&mut companion, vault_id, None, None)

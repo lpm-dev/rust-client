@@ -348,6 +348,20 @@ impl VaultStorageDirectory {
         label: &str,
         limit: u64,
     ) -> Result<Option<Vec<u8>>, String> {
+        self.read_owner_only_file_within(name, label, limit)?
+            .transpose()
+            .map_err(|over| over.describe(label))
+    }
+
+    /// [`read_owner_only_file_capped`](Self::read_owner_only_file_capped),
+    /// telling a file larger than `limit`, which its content decides, apart
+    /// from a read that failed, which may work when tried again.
+    pub(crate) fn read_owner_only_file_within(
+        &self,
+        name: &str,
+        label: &str,
+        limit: u64,
+    ) -> Result<Option<Result<Vec<u8>, OverLimit>>, String> {
         validate_name(OsStr::new(name))?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No).nonblock(true);
@@ -366,9 +380,13 @@ impl VaultStorageDirectory {
         };
         self.validate_regular_file(&file, OsStr::new(name), true)?;
         let path = self.display.join(name);
-        let (data, _) = lpm_common::read_file_capped_from_open_file(file.into_std(), &path, limit)
-            .map_err(|error| format!("failed to read {label}: {error}"))?;
-        Ok(Some(data))
+        match lpm_common::read_file_capped_from_open_file(file.into_std(), &path, limit) {
+            Ok((data, _)) => Ok(Some(Ok(data))),
+            Err(error @ lpm_common::BoundedReadError::TooLarge { .. }) => {
+                Ok(Some(Err(OverLimit(error.to_string()))))
+            }
+            Err(error) => Err(format!("failed to read {label}: {error}")),
+        }
     }
 
     pub(crate) fn sha256_owner_only_file(
@@ -1057,6 +1075,16 @@ fn metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// A file larger than the most its reader takes.
+#[derive(Debug)]
+pub(crate) struct OverLimit(String);
+
+impl OverLimit {
+    pub(crate) fn describe(&self, label: &str) -> String {
+        format!("failed to read {label}: {}", self.0)
+    }
 }
 
 #[cfg(test)]

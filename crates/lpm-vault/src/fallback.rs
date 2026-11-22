@@ -706,13 +706,7 @@ pub(crate) fn read_all_run_environments_unlocked(
     ),
     String,
 > {
-    let (gate, record) = companion::read_overrides_record_unlocked(directory, vault_id)?;
-    let overrides = crate::companion::overrides::evaluate_all(
-        &gate,
-        vault_id,
-        record.as_ref().map(|bytes| bytes.as_slice()),
-    )
-    .map_err(crate::companion::damaged)?;
+    let overrides = companion::read_all_overrides_unlocked(directory, vault_id)?;
     let values = read_all_environments_unlocked(directory, vault_id)?;
     Ok((values, overrides))
 }
@@ -825,11 +819,40 @@ pub(crate) fn write_all_environments_unlocked(
     )
 }
 
+/// [`write_all_environments_unlocked`], running `then` once the values are
+/// durable and before the cleanup after them, so a cleanup that fails never
+/// keeps `then` from following the write.
+pub(crate) fn write_all_environments_then_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+    then: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    commit_environments_then(
+        directory,
+        vault_id,
+        std::borrow::Cow::Borrowed(environments),
+        recording,
+        then,
+    )
+}
+
 fn commit_environments(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     environments: std::borrow::Cow<'_, EnvironmentMap>,
     recording: &crate::history::scope::Recording,
+) -> Result<(), String> {
+    commit_environments_then(directory, vault_id, environments, recording, || Ok(()))
+}
+
+fn commit_environments_then(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    environments: std::borrow::Cow<'_, EnvironmentMap>,
+    recording: &crate::history::scope::Recording,
+    then: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     crate::authorize_companion(directory, vault_id, Operation::Write)?;
     crate::history::scope::observe_before(recording, || {
@@ -844,10 +867,12 @@ fn commit_environments(
         encrypted.as_bytes(),
         "encrypted vault",
     )?;
-    // The write is durable now, so history records it even if the cleanup
-    // after it fails.
+    // The write is durable now, so history records it, and what follows it
+    // runs, even if the cleanup after it fails.
     crate::history::scope::committed(recording, environments);
-    remove_legacy_vault_file(&vaults, vault_id)
+    let followed = then();
+    let cleaned = remove_legacy_vault_file(&vaults, vault_id);
+    followed.and(cleaned)
 }
 
 /// Removes the vault's legacy file, when an entry is named that exactly.

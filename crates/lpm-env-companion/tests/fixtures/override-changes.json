@@ -602,7 +602,7 @@
     {
       "name": "a project without values removes nothing and says so",
       "vaultId": "proj",
-      "values": false,
+      "hasValues": false,
       "marker": null,
       "record": null,
       "names": null,
@@ -637,7 +637,7 @@
     {
       "name": "a project without values can't have overrides",
       "vaultId": "proj",
-      "values": false,
+      "hasValues": false,
       "marker": null,
       "record": null,
       "names": null,

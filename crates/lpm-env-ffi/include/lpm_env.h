@@ -441,14 +441,16 @@ LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
  * its message says so). */
 LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
 /* Plan one batch of edits, all or none. Input {vaultId, marker?, record?,
- * values?: bool, names?: [every account name in the service, from one
+ * hasValues?: bool, names?: [every account name in the service, from one
  * names-only listing], edits: [{action: "set", environment, key, value: blob} |
  * {action: "unset", environment, key} | {action: "remove", environment, key} |
  * {action: "clearEnvironment", environment} | {action: "clearAll"} | {action:
  * "environmentRenamed", from, to} | {action: "environmentRemoved", environment}
  * | {action: "environmentDuplicated", from, to} | {action: "environmentCreated",
  * environment} | {action: "environmentsChanged", renamed: [{from, to}],
- * removed: [environment]}]}, at most 1024 edits. values is false when the
+ * removed: [environment]}]}, at most 1024 edits, with at most 1024 renames and
+ * removals of environments changed together across them, and at most 131072
+ * names; past any of them is invalid input. hasValues is false when the
  * project's values item is absent: overrides live beside values, so after the
  * marker's refusals a batch that gives no key an override removes nothing and
  * is unchanged, and any other is refused with overrides.no_values. set gives

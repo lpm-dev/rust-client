@@ -566,6 +566,70 @@ mod api {
     }
 
     #[test]
+    fn a_rollback_whose_cleanup_fails_after_the_values_still_takes_the_overrides_along() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            with_vault_transaction(|directory| {
+                let recording = crate::history::scope::begin(
+                    &vault_id,
+                    &Source::new(Action::RenameEnvironment),
+                );
+                crate::history::scope::renamed_environment(&recording, "default", "prod");
+                let renamed = std::collections::HashMap::from([(
+                    "prod".to_owned(),
+                    std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+                )]);
+                crate::write_all_environments_unlocked(
+                    directory, &vault_id, "project", "/project", &renamed, &recording,
+                )
+            })
+            .expect("renamed");
+            crate::overrides::change(
+                &dir,
+                &[crate::overrides::Edit::Set {
+                    environment: "prod".to_owned(),
+                    key: "A".to_owned(),
+                    value: zeroize::Zeroizing::new("mine".to_owned()),
+                }],
+            )
+            .expect("an override of prod");
+            take_outcomes();
+            let entries = ids(&dir);
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(Target::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    side: RelatedSide::After,
+                })
+            })
+            .expect("review");
+            // A directory with the legacy file's name makes the cleanup
+            // after the values write fail.
+            std::fs::create_dir(
+                home.join(".lpm")
+                    .join("vaults")
+                    .join(format!("{vault_id}.enc")),
+            )
+            .expect("a directory in the legacy file's place");
+
+            crate::history::commit_rollback(&dir, &plan, &Choices::default())
+                .expect_err("the cleanup failed");
+
+            assert_eq!(
+                stored(&dir, "A").as_deref(),
+                Some("1"),
+                "the values rolled back"
+            );
+            let overrides = crate::overrides::read_all(&dir).expect("overrides");
+            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["default"]);
+            assert_eq!(overrides["default"].set["A"], "mine");
+        });
+    }
+
+    #[test]
     fn a_rollback_that_renames_an_environment_back_records_a_rename() {
         with_temp_vault_home(|home| {
             force_file_vault();

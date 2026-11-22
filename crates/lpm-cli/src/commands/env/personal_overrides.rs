@@ -85,7 +85,7 @@ fn set(
         },
     };
     let keys = super::value_input::named_keys(&request)?;
-    lpm_vault::overrides::check_before_values(project_dir, &environment, &keys)
+    let checked = lpm_vault::overrides::check_before_values(project_dir, &environment, &keys)
         .map_err(vault_error)?;
     let assignments =
         super::value_input::collect(&request, &mut super::value_input::ProcessSources)?;
@@ -102,7 +102,8 @@ fn set(
         })
         .collect();
     edits.reverse();
-    let change = lpm_vault::overrides::change(project_dir, &edits).map_err(vault_error)?;
+    let change =
+        lpm_vault::overrides::change_checked(project_dir, &checked, &edits).map_err(vault_error)?;
     let warnings: Vec<(&str, lpm_env::ValueCharacters)> = edits
         .iter()
         .filter_map(|edit| match edit {
@@ -458,19 +459,19 @@ fn clear(
             help: "Run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
         });
     }
-    let Some(mut reviewed) = lpm_vault::overrides::review_all(project_dir).map_err(vault_error)?
-    else {
+    let Some(reviewed) = lpm_vault::overrides::review_all(project_dir).map_err(vault_error)? else {
         report_cleared(&selected, &scope, 0, json_output);
         return Ok(());
     };
     // The question counts exactly what's removed, in the project it read:
-    // an override another command adds while it waits stays.
-    let mut removals = Vec::new();
+    // an override another command adds while it waits stays, and one it
+    // changes stops the removal.
+    let mut removals: Vec<(String, String)> = Vec::new();
     let mut counted = Vec::new();
-    for (environment, overrides) in std::mem::take(&mut reviewed.overrides) {
+    for (environment, overrides) in &reviewed.overrides {
         if selected
             .as_ref()
-            .is_some_and(|selected| *selected != environment)
+            .is_some_and(|selected| selected != environment)
         {
             continue;
         }
@@ -478,12 +479,9 @@ fn clear(
         removals.extend(
             overrides
                 .set
-                .into_keys()
-                .chain(overrides.unset)
-                .map(|key| Edit::Remove {
-                    environment: environment.clone(),
-                    key,
-                }),
+                .keys()
+                .chain(&overrides.unset)
+                .map(|key| (environment.clone(), key.clone())),
         );
         if removals.len() > before {
             counted.push(format!("{environment}: {}", removals.len() - before));
@@ -510,7 +508,7 @@ fn clear(
         output::info("nothing was changed");
         return Ok(());
     }
-    let change = lpm_vault::overrides::change_reviewed(project_dir, &reviewed, &removals)
+    let change = lpm_vault::overrides::remove_reviewed(project_dir, &reviewed, &removals)
         .map_err(vault_error)?;
     report_cleared(&selected, &scope, removed(&change), json_output);
     Ok(())

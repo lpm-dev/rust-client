@@ -256,6 +256,92 @@ mod tty {
     }
 
     #[test]
+    fn override_set_stores_nothing_when_the_folder_names_another_project_by_the_answer() {
+        let (project, lpm_home) = project();
+        let run = |args: &[&str]| {
+            let (status, _, stderr) = common::run_lpm(project.path(), lpm_home.path(), None, args);
+            assert!(status.success(), "{args:?}: {stderr}");
+        };
+        let lpm_json = project.path().join("lpm.json");
+        let checked_project = std::fs::read_to_string(&lpm_json).expect("lpm.json");
+        let another_project = r#"{"vault":"another-project"}"#;
+        std::fs::write(&lpm_json, another_project).expect("another project");
+        run(&["env", "set", "API_URL=theirs-team"]);
+        std::fs::write(&lpm_json, &checked_project).expect("the checked project");
+
+        let answered = run_in_pty_answering(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "set", "API_URL"],
+            &[(
+                b"Override for API_URL (default, hidden): ",
+                b"fixture-mine\r",
+            )],
+            &PtyOptions::default(),
+            &mut |_, _| std::fs::write(&lpm_json, another_project).expect("switch projects"),
+        );
+
+        assert!(!answered.status.success(), "{}", answered.transcript);
+        assert!(
+            answered.transcript.contains("nothing was stored"),
+            "{}",
+            answered.transcript
+        );
+        assert_eq!(
+            overrides(project.path(), lpm_home.path()),
+            serde_json::json!([])
+        );
+        std::fs::write(&lpm_json, &checked_project).expect("the checked project");
+        assert_eq!(
+            overrides(project.path(), lpm_home.path()),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn override_clear_removes_nothing_when_an_override_it_asked_about_changes() {
+        for change in [
+            &["env", "override", "set", "API_URL=changed"][..],
+            &["env", "override", "unset", "API_URL"],
+        ] {
+            let (project, lpm_home) = project();
+            let (status, _, stderr) = common::run_lpm(
+                project.path(),
+                lpm_home.path(),
+                None,
+                &["env", "override", "set", "API_URL=mine"],
+            );
+            assert!(status.success(), "{stderr}");
+
+            let accepted = run_in_pty_answering(
+                project.path(),
+                lpm_home.path(),
+                &["env", "override", "clear", "--env", "default"],
+                &[(b"Remove 1 personal override", b"y\r")],
+                &PtyOptions::default(),
+                &mut |_, _| {
+                    let (status, _, stderr) =
+                        common::run_lpm(project.path(), lpm_home.path(), None, change);
+                    assert!(status.success(), "{stderr}");
+                },
+            );
+
+            assert!(
+                !accepted.status.success(),
+                "{change:?}: {}",
+                accepted.transcript
+            );
+            assert!(
+                accepted.transcript.contains("nothing was changed"),
+                "{change:?}: {}",
+                accepted.transcript
+            );
+            let left = overrides(project.path(), lpm_home.path());
+            assert_eq!(left.as_array().map(Vec::len), Some(1), "{change:?}: {left}");
+        }
+    }
+
+    #[test]
     fn override_set_refuses_what_it_can_before_asking_for_a_value() {
         let (project, lpm_home) = project();
         let denied = run_in_pty(

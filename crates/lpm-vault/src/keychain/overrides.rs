@@ -28,7 +28,10 @@ pub(super) fn read_all_with_storage(
 ) -> Result<BTreeMap<String, PersonalOverrides>, String> {
     super::validate_vault_id(vault_id)?;
     let gate = authorize(storage, vault_id, Operation::ReadApplyingOverrides)?;
-    let protected_values = values_demand_approval(storage, vault_id)?.unwrap_or(false);
+    // Overrides live beside values: a project without them has none.
+    let Some(protected_values) = values_demand_approval(storage, vault_id)? else {
+        return Ok(BTreeMap::new());
+    };
     let record = read_overrides_record(storage, vault_id, protected_values)?;
     overrides::evaluate_all(
         &gate,
@@ -40,8 +43,9 @@ pub(super) fn read_all_with_storage(
 
 /// Refuse what `edits` to `vault_id`'s overrides are refused for whatever
 /// their values: an interrupted step that can't be finished, a gate that
-/// refuses writes, or no values, which overrides need. Nothing is read but
-/// the marker and attributes, so it never asks for approval.
+/// refuses writes, or no values, which overrides need. It reads the marker
+/// and attributes, and probes without showing anything; only finishing an
+/// interrupted step first can ask for approval.
 pub(crate) fn check_unlocked(vault_id: &str, edits: &[Edit]) -> Result<(), String> {
     check_with_storage(&mut super::KeychainProjectStorage, vault_id, edits)
 }

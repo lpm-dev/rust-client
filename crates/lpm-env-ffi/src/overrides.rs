@@ -4,7 +4,10 @@
 //! function takes one frame and returns one frame (see `frame`); values
 //! travel only as blobs, never in JSON.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 
 use lpm_common::stored_env::{is_safe_vault_id, is_valid_variable_name};
 use lpm_env_companion::budgets::ADMISSION_CAP;
@@ -178,8 +181,8 @@ enum EditRequest {
         environment: String,
     },
     EnvironmentsChanged {
-        renamed: Vec<RenameRequest>,
-        removed: Vec<String>,
+        renamed: Bounded<RenameRequest, MAX_EDITS, true>,
+        removed: Bounded<String, MAX_EDITS, true>,
     },
 }
 
@@ -190,7 +193,7 @@ struct RenameRequest {
     to: String,
 }
 
-fn has_values() -> bool {
+fn present() -> bool {
     true
 }
 
@@ -205,15 +208,92 @@ struct PlanRequest {
     /// Every account name in the service, from one names-only listing,
     /// once a plan asked for them.
     #[serde(default)]
-    names: Option<Vec<String>>,
+    names: Option<Bounded<String, MAX_NAMES, false>>,
     /// Whether the project's values item exists, which overrides need.
-    #[serde(default = "has_values")]
-    values: bool,
+    #[serde(default = "present")]
+    has_values: bool,
     edits: Vec<EditRequest>,
 }
 
 /// The most edits one batch makes.
 const MAX_EDITS: usize = 1024;
+
+/// The most account names one request carries, past any service's.
+const MAX_NAMES: usize = 128 * 1024;
+
+thread_local! {
+    /// What's left of the request's budget for the renames and removals of
+    /// environments changed together, shared by every such edit.
+    static ENVIRONMENT_CHANGES_LEFT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// A plan request's budget for environments changed together, from before
+/// its decoding until it's answered: as many as the edits a batch makes.
+struct EnvironmentChangeBudget;
+
+impl EnvironmentChangeBudget {
+    fn start() -> Self {
+        ENVIRONMENT_CHANGES_LEFT.set(MAX_EDITS);
+        Self
+    }
+}
+
+impl Drop for EnvironmentChangeBudget {
+    fn drop(&mut self) {
+        ENVIRONMENT_CHANGES_LEFT.set(usize::MAX);
+    }
+}
+
+/// A JSON list decoded item by item, refused as soon as it holds more than
+/// `LIMIT` items or, when `BUDGETED`, takes more than the request's budget
+/// for environments changed together, before more are kept.
+struct Bounded<T, const LIMIT: usize, const BUDGETED: bool>(Vec<T>);
+
+impl<'de, T, const LIMIT: usize, const BUDGETED: bool> Deserialize<'de>
+    for Bounded<T, LIMIT, BUDGETED>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Items<T, const LIMIT: usize, const BUDGETED: bool>(PhantomData<T>);
+
+        impl<'de, T, const LIMIT: usize, const BUDGETED: bool> serde::de::Visitor<'de>
+            for Items<T, LIMIT, BUDGETED>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = Vec<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "a list of at most {LIMIT} items")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Vec<T>, A::Error> {
+                let mut items = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(LIMIT));
+                while let Some(item) = sequence.next_element()? {
+                    let within_budget = !BUDGETED
+                        || ENVIRONMENT_CHANGES_LEFT.with(|left| {
+                            let remaining = left.get();
+                            left.set(remaining.saturating_sub(1));
+                            remaining > 0
+                        });
+                    if items.len() == LIMIT || !within_budget {
+                        return Err(serde::de::Error::invalid_length(items.len() + 1, &self));
+                    }
+                    items.push(item);
+                }
+                Ok(items)
+            }
+        }
+
+        deserializer
+            .deserialize_seq(Items::<T, LIMIT, BUDGETED>(PhantomData))
+            .map(Self)
+    }
+}
 
 /// Why the edits of a request can't be read.
 enum EditsFailure {
@@ -280,10 +360,11 @@ fn edits(requests: Vec<EditRequest>, blobs: &[&[u8]]) -> Result<Vec<Edit>, Edits
             }
             EditRequest::EnvironmentsChanged { renamed, removed } => Edit::EnvironmentsChanged {
                 renamed: renamed
+                    .0
                     .into_iter()
                     .map(|rename| (rename.from, rename.to))
                     .collect(),
-                removed,
+                removed: removed.0,
             },
         });
     }
@@ -472,6 +553,7 @@ impl<'a> From<&'a Effect> for EffectOutput<'a> {
 /// `input` must reference `length` readable bytes during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize) -> LPMEnvResult {
+    let _budget = EnvironmentChangeBudget::start();
     // SAFETY: Forwarded from this function's contract.
     unsafe {
         frame::respond(&DOMAIN, input, length, |request: PlanRequest, blobs| {
@@ -523,7 +605,7 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
                 }
             };
             let gate = gate_of(vault_id, marker);
-            if !request.values {
+            if !request.has_values {
                 return match plan_without_values(&gate, &edits) {
                     Ok(plan) => unchanged(&plan),
                     Err(error) => refusal(&error),
@@ -532,7 +614,7 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             let inventory = request
                 .names
                 .as_ref()
-                .map(|names| Inventory::from_names(vault_id, names.iter().map(String::as_str)));
+                .map(|names| Inventory::from_names(vault_id, names.0.iter().map(String::as_str)));
             let plan = match plan_change(vault_id, &gate, record, &edits, inventory.as_ref()) {
                 Ok(plan) => plan,
                 Err(PlanError::NeedsInventory { need, effects }) => {

@@ -277,6 +277,40 @@ fn a_protected_record_that_claims_no_approval_is_read_once_a_probe_verifies_it()
 }
 
 #[test]
+fn a_record_that_claims_approval_it_lacks_is_strengthened_before_it_is_read() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    for account in [VAULT.to_owned(), overrides_account()] {
+        storage
+            .claims
+            .insert(account, ClaimedAccess::RequireApproval);
+    }
+    storage.protected.insert(VAULT.to_owned());
+    storage.approval_cancelled = true;
+
+    let error = read_all(&mut storage).expect_err("the approval was cancelled");
+    assert!(error.contains("cancelled"), "{error}");
+    let error = change(&mut storage, &[Edit::ClearAll]).expect_err("cancelled again");
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(
+        storage.values.contains_key(&overrides_account()),
+        "nothing was cleared without the values' approval"
+    );
+    assert!(storage.protected.contains(&overrides_account()));
+}
+
+#[test]
+fn a_record_left_without_values_is_never_listed() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage.values.remove(VAULT);
+    storage.reads.clear();
+
+    assert!(read_all(&mut storage).expect("no overrides").is_empty());
+    assert_eq!(storage.reads.get(&overrides_account()).copied(), None);
+}
+
+#[test]
 fn approved_values_settle_an_absent_or_contradictory_record_without_reading_it() {
     let mut storage = storage_with_values();
     storage

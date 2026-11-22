@@ -1094,6 +1094,79 @@ fn a_record_that_fails_to_decrypt_is_repaired_by_removing_its_feature_alone() {
 }
 
 #[test]
+fn a_record_past_the_size_a_record_may_have_is_repaired_by_removing_its_feature() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        std::fs::write(&entry, vec![0_u8; MAX_SEALED_ENTRY_BYTES as usize + 1])
+            .expect("grow it past the cap");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert_eq!(
+            reviewed.repairs(),
+            [CompanionRepair::RemoveFeature("overrides".to_owned())]
+        );
+        assert!(
+            reviewed
+                .problems
+                .iter()
+                .any(|problem| problem.description.contains("it can't be read")),
+            "{reviewed:?}"
+        );
+        repair(&reviewed).expect("repaired");
+        assert!(read_overrides().expect("readable again").is_empty());
+    });
+}
+
+#[test]
+fn a_marker_past_the_size_one_may_have_is_repaired_by_a_discard() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&marker_account()));
+        std::fs::write(&entry, vec![0_u8; MAX_SEALED_ENTRY_BYTES as usize + 1])
+            .expect("grow it past the cap");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert_eq!(reviewed.repairs(), [CompanionRepair::DiscardProject]);
+        repair(&reviewed).expect("repaired");
+        assert_discarded_with_values_kept(home);
+    });
+}
+
+#[test]
+fn a_record_left_without_values_is_never_applied_or_listed() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        std::fs::remove_file(vaults_path(home).join(ValuesFile::Digest.name(VAULT)))
+            .expect("the values go");
+        crate::companion::forget(VAULT);
+
+        let run = crate::try_get_run_environment_for_vault_id(VAULT, None).expect("a run");
+        assert!(run.overrides.set.is_empty() && run.overrides.unset.is_empty());
+        let all = with_vault_transaction(|directory| {
+            crate::fallback::read_all_run_environments_unlocked(directory, VAULT)
+        })
+        .expect("every environment");
+        assert!(all.1.is_empty());
+        assert!(read_overrides().expect("listed").is_empty());
+    });
+}
+
+#[test]
 fn an_override_change_loads_the_data_key_once() {
     with_temp_vault_home(|_| {
         force_file_vault();

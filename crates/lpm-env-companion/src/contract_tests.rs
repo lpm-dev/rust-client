@@ -154,7 +154,7 @@ struct ChangeCase {
     vault_id: String,
     /// Whether the project's values item exists; it does unless a case says.
     #[serde(default)]
-    values: Option<bool>,
+    has_values: Option<bool>,
     marker: Option<String>,
     record: Option<String>,
     names: Option<Vec<String>>,
@@ -260,7 +260,7 @@ fn every_override_change_fixture_plans_the_transaction_it_records() {
             .as_ref()
             .map(|names| Inventory::from_names(&case.vault_id, names.iter().map(String::as_str)));
         let edits: Vec<_> = case.edits.iter().map(fixture_edit).collect();
-        let planned = if case.values == Some(false) {
+        let planned = if case.has_values == Some(false) {
             plan_without_values(&gate, &edits)
         } else {
             plan_change(

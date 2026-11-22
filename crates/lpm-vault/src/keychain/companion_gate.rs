@@ -76,6 +76,45 @@ pub(super) struct RunRead {
     pub(super) overrides_record: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
+impl RunRead {
+    /// `environment`'s personal overrides for a run. A project without
+    /// values has none: overrides live beside values, and a record left
+    /// without them is one LPM Vault collects, never applies.
+    pub(super) fn overrides(
+        &self,
+        vault_id: &str,
+        environment: &str,
+    ) -> Result<crate::PersonalOverrides, String> {
+        if self.values.is_none() {
+            return Ok(crate::PersonalOverrides::default());
+        }
+        crate::companion::overrides::evaluate(
+            &self.gate,
+            vault_id,
+            environment,
+            self.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
+        )
+        .map_err(damaged)
+    }
+
+    /// Every environment's personal overrides for a run, as
+    /// [`overrides`](Self::overrides) gives one environment's.
+    pub(super) fn all_overrides(
+        &self,
+        vault_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, crate::PersonalOverrides>, String> {
+        if self.values.is_none() {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        crate::companion::overrides::evaluate_all(
+            &self.gate,
+            vault_id,
+            self.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
+        )
+        .map_err(damaged)
+    }
+}
+
 /// Why the values item damages a project's access, when its approval
 /// attributes contradict each other.
 pub(super) const CONTRADICTORY_VALUES: &str =
@@ -124,21 +163,34 @@ pub(super) fn read_for_run(
     vault_id: &str,
 ) -> Result<RunRead, String> {
     let gate = authorize(storage, vault_id, Operation::ReadApplyingOverrides)?;
-    let values = read_values(storage, vault_id)?.map(|(bytes, _)| bytes);
-    // The values were just read under their approval, in this lock scope on
-    // this thread, so the record needs no check of its own: one read.
-    let record = match storage.read_with_access(&record_account(OVERRIDES_KIND, vault_id, None))? {
+    let Some((values, values_access)) = read_values(storage, vault_id)? else {
+        return Ok(RunRead {
+            values: None,
+            gate,
+            overrides_record: None,
+        });
+    };
+    let account = record_account(OVERRIDES_KIND, vault_id, None);
+    let record = match storage.read_with_access(&account)? {
         None => None,
         Some((bytes, access)) => {
             let bytes = zeroize::Zeroizing::new(bytes);
-            if access == ClaimedAccess::Contradictory {
-                return Err(contradictory_record());
+            match access {
+                ClaimedAccess::Contradictory => return Err(contradictory_record()),
+                // The values were just read under their approval, in this
+                // lock scope on this thread, so a weaker record's bytes
+                // expose nothing more; it's strengthened before they're used,
+                // and a failure returns none of them.
+                ClaimedAccess::Automatic if values_access == ClaimedAccess::RequireApproval => {
+                    match_values_approval(storage, vault_id, &account)?;
+                }
+                ClaimedAccess::Automatic | ClaimedAccess::RequireApproval => {}
             }
             Some(bytes)
         }
     };
     Ok(RunRead {
-        values,
+        values: Some(values),
         gate,
         overrides_record: record,
     })
@@ -176,26 +228,25 @@ pub(super) fn values_demand_approval(
 /// read with less approval than the values demand when `protected_values`
 /// (see [`values_demand_approval`]). An absent record or one whose
 /// attributes contradict each other is settled from its attributes without
-/// a read. A record that claims no approval is verified by a probe, and
-/// strengthened when it has none, before it's read. Bytes read from a record
-/// that claimed approval but reads as claiming none, as another process
-/// could leave it in between, are refused.
+/// a read. Whatever a record claims, a probe verifies its approval, and it's
+/// strengthened when it has none, before it's read: a claim can be wrong
+/// either way. Bytes read from a record that claimed approval but reads as
+/// claiming none, as another process could leave it in between, are refused.
 pub(super) fn read_overrides_record(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     protected_values: bool,
 ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
     let overrides_account = record_account(OVERRIDES_KIND, vault_id, None);
-    let mut verified = false;
+    let mut claimed = None;
     if protected_values {
         match storage.claimed_access(&overrides_account)? {
             None => return Ok(None),
             Some(ClaimedAccess::Contradictory) => return Err(contradictory_record()),
-            Some(ClaimedAccess::Automatic) => {
+            Some(claim) => {
                 match_values_approval(storage, vault_id, &overrides_account)?;
-                verified = true;
+                claimed = Some(claim);
             }
-            Some(ClaimedAccess::RequireApproval) => {}
         }
     }
     match storage.read_with_access(&overrides_account)? {
@@ -204,11 +255,11 @@ pub(super) fn read_overrides_record(
             let bytes = zeroize::Zeroizing::new(bytes);
             match access {
                 ClaimedAccess::Contradictory => Err(contradictory_record()),
-                ClaimedAccess::Automatic if protected_values && !verified => Err(
+                ClaimedAccess::Automatic if claimed == Some(ClaimedAccess::RequireApproval) => Err(
                     "the personal overrides' approval changed while they were read; try again"
                         .to_owned(),
                 ),
-                _ => Ok(Some(bytes)),
+                ClaimedAccess::Automatic | ClaimedAccess::RequireApproval => Ok(Some(bytes)),
             }
         }
     }

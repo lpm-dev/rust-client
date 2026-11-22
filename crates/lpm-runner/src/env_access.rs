@@ -31,6 +31,8 @@ pub struct EnvAccessScope {
 
 thread_local! {
     static CURRENT: RefCell<Option<EnvAccessScope>> = const { RefCell::new(None) };
+    static PINNED_VAULT_READS: RefCell<Option<HashMap<VaultReadKey, VaultValues>>> =
+        const { RefCell::new(None) };
     static FRESH_VAULT_READS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -54,6 +56,40 @@ pub fn fresh_vault_reads() -> FreshVaultReads {
     FreshVaultReads {
         thread: std::marker::PhantomData,
     }
+}
+
+/// While held, this thread's vault reads return the values they first
+/// returned under it, so a task runs with the values its cache key was
+/// computed from, even when another task's cache publication rereads them
+/// meanwhile. A fresh read still goes to the vault and pins nothing.
+#[must_use]
+pub struct PinnedVaultReads {
+    previous: Option<HashMap<VaultReadKey, VaultValues>>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for PinnedVaultReads {
+    fn drop(&mut self) {
+        PINNED_VAULT_READS.with_borrow_mut(|pinned| *pinned = self.previous.take());
+    }
+}
+
+/// Pins this thread's vault reads for one task, from before its cache key is
+/// computed until its process has run.
+pub fn pin_vault_reads() -> PinnedVaultReads {
+    PinnedVaultReads {
+        previous: PINNED_VAULT_READS.with_borrow_mut(|pinned| pinned.replace(HashMap::new())),
+        thread: std::marker::PhantomData,
+    }
+}
+
+/// `values` as this thread's pinned values for `key`, when it pins reads.
+fn pin(key: &VaultReadKey, values: &VaultValues) {
+    PINNED_VAULT_READS.with_borrow_mut(|pinned| {
+        if let Some(pinned) = pinned {
+            pinned.insert(key.clone(), values.clone());
+        }
+    });
 }
 
 fn vault_reads_are_fresh() -> bool {
@@ -133,16 +169,28 @@ impl EnvAccessScope {
         // task that waited for another's read takes its values.
         self.read(|| {
             let fresh = vault_reads_are_fresh();
-            if !fresh
-                && let Some(values) = self
+            if !fresh {
+                let pinned = PINNED_VAULT_READS.with_borrow(|pinned| {
+                    pinned.as_ref().and_then(|pinned| pinned.get(&key).cloned())
+                });
+                if let Some(values) = pinned {
+                    return Ok(values);
+                }
+                let shared = self
                     .vault_reads
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(&key)
-            {
-                return Ok(values.clone());
+                    .cloned();
+                if let Some(values) = shared {
+                    pin(&key, &values);
+                    return Ok(values);
+                }
             }
             let values = action()?;
+            if !fresh {
+                pin(&key, &values);
+            }
             self.vault_reads
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -348,6 +396,30 @@ mod tests {
 
         assert_eq!(reads.load(Ordering::SeqCst), 2);
         assert_eq!(later, fresh);
+    }
+
+    #[test]
+    fn a_task_runs_with_the_values_it_first_read_while_another_rereads_them() {
+        let reads = AtomicUsize::new(0);
+        let scope = EnvAccessScope::default();
+        let _binding = scope.bind();
+        let pinned = pin_vault_reads();
+        let first = read_vault(key("dev"), || Ok(counted(&reads))).unwrap();
+
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let _binding = scope.bind();
+                let _fresh = fresh_vault_reads();
+                read_vault(key("dev"), || Ok(counted(&reads))).unwrap();
+            });
+        });
+        let again = read_vault(key("dev"), || Ok(counted(&reads))).unwrap();
+        drop(pinned);
+        let next_task = read_vault(key("dev"), || Ok(counted(&reads))).unwrap();
+
+        assert_eq!(again, first, "the task keeps the values its cache key used");
+        assert_ne!(next_task, first, "the next task reads what was reread");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -354,7 +354,13 @@ fn check_stored_values_with_case_policy(
             (!was_empty || !value.is_empty()).then(|| (key.clone(), value.clone()))
         })
         .collect();
+    let mut errors = errors;
     let from_overrides = origins.attribute(&errors, &values);
+    for (error, caused) in errors.iter_mut().zip(&from_overrides) {
+        if *caused {
+            error.forget_value();
+        }
+    }
     let applied_overrides = origins.names().into_iter().map(str::to_owned).collect();
     Ok(StoredValuesCheck {
         reads_default_environment: reads_default,
@@ -777,6 +783,26 @@ mod tests {
             .filter(|(_, caused)| **caused)
             .map(|(error, _)| error.key.as_str())
             .collect()
+    }
+
+    #[test]
+    fn an_error_an_override_caused_keeps_none_of_its_value() {
+        let stored = environments(&[("default", &[("API_URL", "https://team.example")])]);
+        let check = effective(
+            r#"{"vars":{"API_URL":{"format":"url"}}}"#,
+            "default",
+            &stored,
+            &(
+                HashMap::from([("API_URL".to_owned(), "fixture-not-a-url".to_owned())]),
+                Vec::new(),
+            ),
+            false,
+        );
+
+        assert_eq!(blamed(&check), ["API_URL"]);
+        let shown = format!("{} {:?}", check.errors[0], check);
+        assert!(!shown.contains("fixture-not-a-url"), "{shown}");
+        assert!(shown.contains("API_URL"), "{shown}");
     }
 
     #[test]
