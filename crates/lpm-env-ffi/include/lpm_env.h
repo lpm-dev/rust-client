@@ -40,12 +40,14 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * "default"'s values were checked), problems [{key, code, format?, constraint?,
  * group?, mode?}], defaults {KEY: schema default that fills it}, and ignored keys the
  * runner never passes to a process. Output never contains stored values.
- * With overrides: {vaultId, marker?, record?} (the marker and the personal
- * overrides record as read in the same lock, standard base64: this function
- * takes stored values as JSON, as it takes environments, and decodes the record
- * once per call), each environment
- * given is checked as a run on this computer gets it: its own overrides applied
- * over the values it selects, even when it reads "default"'s. A problem an
+ * With overrides: {vaultId, marker?, record?, hasValues: bool} (the marker and
+ * the personal overrides record as read in the same lock, standard base64: this
+ * function takes stored values as JSON, as it takes environments, and decodes
+ * the record once per call), each environment given is checked as a run on this
+ * computer gets it: its own overrides applied over the values it selects, even
+ * when it reads "default"'s. hasValues, which every check with overrides
+ * states, is false when the project's values item is absent: overrides live
+ * beside values, so after the marker's refusals none apply. A problem an
  * override caused has personalOverride: true (the key is left out otherwise),
  * and appliedOverrides lists the overrides that change the environment, the ones
  * a run's notice counts; it's left out when none do. Neither shows a value. An

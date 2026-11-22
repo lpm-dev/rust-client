@@ -868,6 +868,24 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_that_lets_a_default_fill_a_member_breaks_its_group() {
+        let stored = environments(&[("default", &[("A", "1"), ("B", "")])]);
+        let check = effective(
+            r#"{"vars":{"A":{},"B":{"empty":"allow","default":"d"}},"groups":{"one":{"mode":"exactlyOne","vars":["A","B"]}}}"#,
+            "default",
+            &stored,
+            &personal(&[], &["B"]),
+            false,
+        );
+        assert_eq!(codes(&check), [("A", "group"), ("B", "group")]);
+        assert_eq!(
+            blamed(&check),
+            ["A", "B"],
+            "B was empty, which the schema allows, until the unset let its default fill it"
+        );
+    }
+
+    #[test]
     fn the_effective_check_judges_what_the_overrides_give_and_names_them() {
         let schema = r#"{"vars":{"API_URL":{"format":"url"},"TOKEN":{"required":true},"PORT":{"format":"port"}}}"#;
         let stored = environments(&[(

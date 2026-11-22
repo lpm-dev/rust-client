@@ -284,16 +284,16 @@ impl PersonalOverrideOrigins {
             }
         }
         let present_now = |name: &str| value_of(name).is_some_and(|value| !value.is_empty());
-        let present_before = |name: &str| {
-            let now = value_of(name);
-            match self.decided.get(&self.key(name)) {
-                Some(decided) if decided.still_decides(now, overrides) => match decided.before {
-                    Before::Present => true,
-                    Before::Empty => filled(name, Some("")),
-                    Before::Absent => filled(name, None),
-                },
-                _ => now.is_some_and(|value| !value.is_empty()),
-            }
+        // What a member an override decides held before it stands whatever
+        // the evaluation then made of it, such as a default that fills it
+        // after an unset; a later layer that wrote it took it back.
+        let present_before = |name: &str| match self.decided.get(&self.key(name)) {
+            Some(decided) => match decided.before {
+                Before::Present => true,
+                Before::Empty => filled(name, Some("")),
+                Before::Absent => filled(name, None),
+            },
+            None => value_of(name).is_some_and(|value| !value.is_empty()),
         };
         let broken: HashSet<&str> = groups
             .iter()

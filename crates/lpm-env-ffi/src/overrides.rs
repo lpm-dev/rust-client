@@ -150,8 +150,7 @@ pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize)
     }
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+/// One edit, its fields checked against what its action takes.
 enum EditRequest {
     Set {
         environment: String,
@@ -197,6 +196,149 @@ struct RenameRequest {
     to: String,
 }
 
+/// One edit as it's decoded: every field an edit takes, so its lists are
+/// decoded item by item as they come rather than held whole first, as an
+/// enum tagged inside the object holds them. [`edit`](Self::edit) refuses a
+/// field missing or one its action doesn't take.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DecodedEdit {
+    action: Action,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    value: Option<usize>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    renamed: Option<Bounded<RenameRequest, MAX_EDITS, true>>,
+    #[serde(default)]
+    removed: Option<Bounded<String, MAX_EDITS, true>>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+enum Action {
+    Set,
+    Unset,
+    Remove,
+    ClearEnvironment,
+    ClearAll,
+    EnvironmentRenamed,
+    EnvironmentRemoved,
+    EnvironmentDuplicated,
+    EnvironmentCreated,
+    EnvironmentsChanged,
+}
+
+impl DecodedEdit {
+    /// The edit its action makes, with exactly the fields that action takes.
+    fn edit(self) -> Option<EditRequest> {
+        let Self {
+            action,
+            environment,
+            key,
+            value,
+            from,
+            to,
+            renamed,
+            removed,
+        } = self;
+        Some(
+            match (action, environment, key, value, from, to, renamed, removed) {
+                (
+                    Action::Set,
+                    Some(environment),
+                    Some(key),
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    None,
+                ) => EditRequest::Set {
+                    environment,
+                    key,
+                    value,
+                },
+                (Action::Unset, Some(environment), Some(key), None, None, None, None, None) => {
+                    EditRequest::Unset { environment, key }
+                }
+                (Action::Remove, Some(environment), Some(key), None, None, None, None, None) => {
+                    EditRequest::Remove { environment, key }
+                }
+                (
+                    Action::ClearEnvironment,
+                    Some(environment),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) => EditRequest::ClearEnvironment { environment },
+                (Action::ClearAll, None, None, None, None, None, None, None) => {
+                    EditRequest::ClearAll
+                }
+                (
+                    Action::EnvironmentRenamed,
+                    None,
+                    None,
+                    None,
+                    Some(from),
+                    Some(to),
+                    None,
+                    None,
+                ) => EditRequest::EnvironmentRenamed { from, to },
+                (
+                    Action::EnvironmentRemoved,
+                    Some(environment),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) => EditRequest::EnvironmentRemoved { environment },
+                (
+                    Action::EnvironmentDuplicated,
+                    None,
+                    None,
+                    None,
+                    Some(from),
+                    Some(to),
+                    None,
+                    None,
+                ) => EditRequest::EnvironmentDuplicated { from, to },
+                (
+                    Action::EnvironmentCreated,
+                    Some(environment),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) => EditRequest::EnvironmentCreated { environment },
+                (
+                    Action::EnvironmentsChanged,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(renamed),
+                    Some(removed),
+                ) => EditRequest::EnvironmentsChanged { renamed, removed },
+                _ => return None,
+            },
+        )
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlanRequest {
@@ -212,7 +354,7 @@ struct PlanRequest {
     /// Whether the project's values item exists, which overrides need. A
     /// client says so every time, so it never leaves it out by mistake.
     has_values: bool,
-    edits: Vec<EditRequest>,
+    edits: Bounded<DecodedEdit, MAX_EDITS, false>,
 }
 
 /// The most edits one batch makes.
@@ -384,11 +526,15 @@ fn edits(
                     return Err(EditsFailure::ValuesTooLarge { index });
                 }
                 let text = std::str::from_utf8(bytes).map_err(|_| EditsFailure::InvalidInput)?;
-                Edit::Set {
+                let edit = Edit::Set {
                     environment,
                     key,
                     value: Zeroizing::new(text.to_owned()),
-                }
+                };
+                // What the value holds, such as a NUL, before the next edit.
+                check_edit(&edit)
+                    .map_err(|reason| EditsFailure::Refused(PlanError::Edit { index, reason }))?;
+                edit
             }
             (edit, _) => edit,
         };
@@ -584,9 +730,18 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
     unsafe {
         frame::respond(&DOMAIN, input, length, |request: PlanRequest, blobs| {
             let vault_id = request.vault_id.as_str();
-            if !is_safe_vault_id(vault_id) || request.edits.len() > MAX_EDITS {
+            if !is_safe_vault_id(vault_id) {
                 return failure(2, DOMAIN.invalid_input);
             }
+            let Some(requested) = request
+                .edits
+                .0
+                .into_iter()
+                .map(DecodedEdit::edit)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return failure(2, DOMAIN.invalid_input);
+            };
             let (Ok(marker), Ok(record)) = (
                 optional_blob(blobs, request.marker),
                 optional_blob(blobs, request.record),
@@ -597,7 +752,7 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             if let Err(error) = check_writable(&gate) {
                 return refusal(&error);
             }
-            let edits = match edits(request.edits, blobs, request.has_values) {
+            let edits = match edits(requested, blobs, request.has_values) {
                 Ok(edits) => edits,
                 Err(EditsFailure::InvalidInput) => return failure(2, DOMAIN.invalid_input),
                 Err(EditsFailure::Refused(error)) => return refusal(&error),
@@ -704,11 +859,13 @@ fn unchanged(plan: &ChangePlan) -> LPMEnvResult {
 
 /// Every environment's overrides, for `lpm_env_check`'s effective mode, or
 /// the status and code it fails with: 2 for invalid input, 1 for overrides
-/// it can't apply.
+/// it can't apply. Without values, after the marker's refusals, there are
+/// none: overrides live beside values.
 pub(crate) fn for_check(
     vault_id: &str,
     marker: Option<&[u8]>,
     record: Option<&[u8]>,
+    has_values: bool,
 ) -> Result<BTreeMap<String, lpm_env_companion::overrides::PersonalOverrides>, (u32, &'static str)>
 {
     if !is_safe_vault_id(vault_id) {
@@ -720,6 +877,9 @@ pub(crate) fn for_check(
     }
     gate.authorize(Operation::ReadApplyingOverrides)
         .map_err(|error| (1, gate_code(&error)))?;
+    if !has_values {
+        return Ok(BTreeMap::new());
+    }
     evaluate_all(&gate, vault_id, record).map_err(|_| (1, "overrides.damaged"))
 }
 

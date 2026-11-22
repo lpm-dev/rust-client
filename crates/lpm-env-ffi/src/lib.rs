@@ -372,6 +372,10 @@ struct CheckOverrides {
     marker: Option<Base64>,
     #[serde(default)]
     record: Option<Base64>,
+    /// Whether the project's values item exists, beside which overrides
+    /// live. A client says so every time, so it never leaves it out by
+    /// mistake.
+    has_values: bool,
 }
 
 /// Stored bytes as standard base64 in JSON.
@@ -556,6 +560,7 @@ pub unsafe extern "C" fn lpm_env_check(
                 &given.vault_id,
                 given.marker.as_ref().map(|bytes| bytes.0.as_slice()),
                 given.record.as_ref().map(|bytes| bytes.0.as_slice()),
+                given.has_values,
             ) {
                 Ok(overrides) => overrides,
                 Err((status, code)) => return failure(status, code),

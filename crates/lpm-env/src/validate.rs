@@ -76,6 +76,7 @@ impl ValidationError {
         | ValidationErrorKind::PatternMismatch { got, .. }
         | ValidationErrorKind::NotInEnum { got, .. } = &mut self.kind
         {
+            zeroize::Zeroize::zeroize(got);
             *got = REDACTED_VALUE.to_owned();
         }
     }

@@ -227,6 +227,22 @@ fn a_plan_refuses_for_the_marker_first_then_for_each_edit_in_order() {
         refused["code"], "overrides.no_values",
         "no value is read without values"
     );
+
+    let with_nul: &[u8] = b"fixture\0value";
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": true, "edits": [
+            {"action": "set", "environment": "dev", "key": "A", "value": 1},
+            {"action": "set", "environment": "dev", "key": "fixture-not-a-key", "value": 1},
+        ]}),
+        &[with_nul],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.nul_value");
+    assert_eq!(
+        refused["edit"], 0,
+        "the first edit's value before the second's key"
+    );
 }
 
 #[test]
@@ -271,6 +287,79 @@ fn a_read_lists_no_overrides_beside_no_values_after_the_marker_s_refusals() {
         status, 2,
         "every read says whether there are values: {refused}"
     );
+}
+
+/// The most memory this process has held at once, in bytes.
+#[cfg(unix)]
+fn peak_resident_bytes() -> usize {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` fills `usage` when it returns zero.
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: The call above succeeded.
+    let peak = usize::try_from(unsafe { usage.assume_init() }.ru_maxrss).unwrap_or(0);
+    if cfg!(target_os = "macos") {
+        peak
+    } else {
+        peak * 1024
+    }
+}
+
+/// How much the peak memory grew while a plan refused `request`, a JSON
+/// object of nearly the whole input limit, built as `head`, `item`s and
+/// `tail`. Each test runs in a process of its own, so the peak is the
+/// call's alone.
+#[cfg(unix)]
+fn peak_growth_refusing(head: &str, item: &str, tail: &str) -> usize {
+    let room = OVERRIDES_INPUT_LIMIT - 1024;
+    let mut request = Vec::with_capacity(room);
+    request.extend_from_slice(head.as_bytes());
+    while request.len() + item.len() + 1 + tail.len() < room {
+        request.extend_from_slice(item.as_bytes());
+        request.push(b',');
+    }
+    request.extend_from_slice(item.as_bytes());
+    request.extend_from_slice(tail.as_bytes());
+    let mut input = Vec::with_capacity(request.len() + 16);
+    input.extend_from_slice(&FRAME_MAGIC);
+    input.push(FRAME_VERSION);
+    input.extend_from_slice(&1_u32.to_be_bytes());
+    input.extend_from_slice(&(request.len() as u32).to_be_bytes());
+    input.extend_from_slice(&request);
+    drop(request);
+
+    let before = peak_resident_bytes();
+    // SAFETY: The input stays alive for the synchronous call.
+    let result = unsafe { lpm_env_overrides_plan(input.as_ptr(), input.len()) };
+    let status = result.status;
+    // SAFETY: Released exactly once.
+    unsafe { lpm_env_release(result) };
+    assert_eq!(status, 2, "refused as invalid input");
+    peak_resident_bytes().saturating_sub(before)
+}
+
+#[cfg(unix)]
+#[test]
+fn edits_past_the_limit_are_refused_before_they_are_held() {
+    let grown = peak_growth_refusing(
+        r#"{"vaultId":"proj","hasValues":true,"edits":["#,
+        r#"{"action":"clearAll"}"#,
+        "]}",
+    );
+    assert!(grown < 8 * 1024 * 1024, "{grown} bytes held");
+}
+
+#[cfg(unix)]
+#[test]
+fn renames_past_the_limit_are_refused_before_they_are_held() {
+    let grown = peak_growth_refusing(
+        r#"{"vaultId":"proj","hasValues":true,"edits":[{"action":"environmentsChanged","removed":[],"renamed":["#,
+        r#"{"from":"a","to":"b"}"#,
+        "]}]}",
+    );
+    assert!(grown < 8 * 1024 * 1024, "{grown} bytes held");
 }
 
 #[test]
@@ -576,7 +665,7 @@ fn the_check_judges_what_a_run_gets_with_the_overrides_and_names_them() {
         schema,
         &json!({
             "environments": environments,
-            "overrides": {"vaultId": VAULT, "marker": base64(OVERRIDES_MARKER.as_bytes()), "record": base64(record)},
+            "overrides": {"vaultId": VAULT, "marker": base64(OVERRIDES_MARKER.as_bytes()), "record": base64(record), "hasValues": true},
         }),
     );
     assert_eq!(status, 0, "{effective}");
@@ -599,12 +688,47 @@ fn the_check_judges_what_a_run_gets_with_the_overrides_and_names_them() {
 }
 
 #[test]
+fn the_check_applies_no_overrides_beside_no_values_after_the_marker_s_refusals() {
+    let schema = r#"{"vars":{"TOKEN":{"required":true}}}"#;
+    let record = br#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{},"unset":["TOKEN"]}}}"#;
+    let environments = json!({"default": {"TOKEN": "team"}, "staging": {}});
+    let overrides = |marker: &[u8], has_values: Option<bool>| {
+        let mut overrides =
+            json!({"vaultId": VAULT, "marker": base64(marker), "record": base64(record)});
+        if let Some(has_values) = has_values {
+            overrides["hasValues"] = json!(has_values);
+        }
+        json!({"environments": environments, "overrides": overrides})
+    };
+
+    let (status, checked) = check(schema, &overrides(OVERRIDES_MARKER.as_bytes(), Some(false)));
+    assert_eq!(status, 0, "{checked}");
+    let staging = &checked["environments"]["staging"];
+    assert_eq!(
+        staging["problems"],
+        json!([]),
+        "a record left without values is never applied"
+    );
+    assert!(staging.get("appliedOverrides").is_none());
+
+    let (status, refused) = check(schema, &overrides(b"not a marker", Some(false)));
+    assert_eq!(status, 1, "{refused}");
+    assert_eq!(refused["code"], "overrides.damaged");
+
+    let (status, refused) = check(schema, &overrides(OVERRIDES_MARKER.as_bytes(), None));
+    assert_eq!(
+        status, 2,
+        "every check with overrides says whether there are values: {refused}"
+    );
+}
+
+#[test]
 fn the_check_refuses_overrides_it_cant_apply() {
     let (status, refused) = check(
         r#"{"vars":{"A":{}}}"#,
         &json!({
             "environments": {"default": {"A": "1"}},
-            "overrides": {"vaultId": VAULT, "marker": base64(OVERRIDES_MARKER.as_bytes()), "record": base64(b"{not json")},
+            "overrides": {"vaultId": VAULT, "marker": base64(OVERRIDES_MARKER.as_bytes()), "record": base64(b"{not json"), "hasValues": true},
         }),
     );
     assert_eq!(status, 1, "{refused}");
