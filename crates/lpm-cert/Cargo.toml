@@ -12,8 +12,8 @@ cap-primitives = "4.0.2"
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
 lpm-common = { workspace = true }
-rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
-x509-parser = { version = "0.18", features = ["verify"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs", "x509-parser"] }
+x509-parser = { version = "0.18", features = ["verify-aws"] }
 pem = "4"
 sha2 = { workspace = true }
 sha1 = { workspace = true }

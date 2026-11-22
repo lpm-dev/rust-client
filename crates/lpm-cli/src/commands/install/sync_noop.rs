@@ -57,107 +57,114 @@ pub(crate) fn is_up_to_date(
     if analysis_enabled {
         return Ok(false);
     }
-    let linker = crate::linker_config::resolve_effective_linker_from_bytes(
-        None,
-        package_json,
-        &global,
-        project_dir,
+    let (linker, _) = crate::linker_config::resolve_effective_linker_with_source_and_workspace(
+        None, &package, &global, false,
     )
     .map_err(LpmError::Registry)?;
     let integrity = crate::commands::config::resolve_object_integrity_policy(&global)?;
-    let Ok(project_lockfile) = lpm_lockfile::Lockfile::read_for_project(project_dir) else {
-        return Ok(false);
+    let store_version = lpm_store::StoreVersion::from_env();
+    let hash_context = crate::install_state::InstallHashContext {
+        dependency_engine_key: cached_engine.key,
+        security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
     };
-    if project_lockfile.workspace_root.is_some()
-        || project_lockfile.lockfile.metadata.lockfile_version
-            < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
-        || requires_install_access(&project_lockfile.lockfile)
-    {
-        return Ok(false);
-    }
-    if !crate::install_state::check_install_state_with_lockfile(
-        project_dir,
-        package_json,
-        &project_lockfile,
-        linker,
-        integrity,
-        lpm_store::StoreVersion::from_env(),
-        crate::install_state::InstallHashContext {
-            dependency_engine_key: cached_engine.key,
-            security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
-        },
-    )
-    .up_to_date
-    {
-        return Ok(false);
-    }
-    // Replaying the lockfile needs its catalog snapshot to match and each
-    // root to resolve to an instance the manifest still accepts; the full
-    // pipeline's own up-to-date answer checks the same before it answers.
-    let mut manifest_deps = super::manifest::manifest_install_deps(&package);
-    if super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err() {
-        return Ok(false);
-    }
-    let mut manifest_deps = std::borrow::Cow::Owned(manifest_deps);
-    let Some(catalog_resolutions) =
-        super::lockfile::current_catalog_resolutions(&package, None, &mut manifest_deps)
-    else {
-        return Ok(false);
-    };
-    let optional_root_names: std::collections::HashSet<String> =
-        package.optional_dependencies.keys().cloned().collect();
-    let locked_packages: Vec<&lpm_lockfile::LockedPackage> =
-        project_lockfile.lockfile.packages.iter().collect();
-    if !super::lockfile::locked_catalogs_and_roots_match_manifest(
-        &project_lockfile.lockfile,
-        &super::lockfile::LockedRows::indexed(&locked_packages),
-        super::lockfile::LockedManifest {
-            deps: &manifest_deps,
-            catalog_resolutions: catalog_resolutions.as_resolutions(),
-            optional_root_names: &optional_root_names,
-        },
-        project_dir,
-        false,
-    ) {
-        return Ok(false);
-    }
     let frozen = match mode.frozen_lockfile {
         super::FrozenLockfileMode::Always => true,
         super::FrozenLockfileMode::Never => false,
         super::FrozenLockfileMode::Auto => super::install_running_in_ci(),
     };
-    if frozen
-        && super::validation::frozen_install_accepts_lockfile(
-            project_dir,
-            &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
-            &package,
-            None,
-            &project_lockfile.lockfile,
-            super::setup::resolve_auto_install_peers(&package, &global),
-        )
-        .is_err()
-    {
-        // The full install reports why a frozen install refuses it.
-        return Ok(false);
-    }
+    let auto_install_peers = super::setup::resolve_auto_install_peers(&package, &global);
     let routes = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
-    for package in &project_lockfile.lockfile.packages {
-        if !matches!(
-            package.source_kind(),
-            Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let parsed_proof = crate::install_state::SyncNoopLockfileProof::parse_from_state(&cached_state);
+
+    let fast_has_node_engines = if let Some(proof) = parsed_proof.as_ref()
+        && proof.lockfile_eligible
+        && (!frozen
+            || (package
+                .lpm
+                .as_ref()
+                .is_none_or(|lpm| lpm.patched_dependencies.is_empty())
+                && proof.frozen_ok
+                && proof.auto_install_peers == auto_install_peers))
+        && proof.routes_fingerprint == routes.routing_fingerprint()
+        && !has_ancestor_lockfile(project_dir)
+        && crate::install_state::check_cached_state_mtime_match(
+            project_dir,
+            &lock_path,
+            package_json,
+            &cached_state,
+            linker,
+            integrity,
+            store_version,
+            hash_context,
+        )
+        .is_some_and(|m| m.lock_size > 0)
+        && let Ok(lock_raw) = lpm_common::read_file_capped(
+            &lock_path,
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
+        )
+        && !raw_lockfile_mentions_lpm_scope(&lock_raw)
+        && crate::install_state::sync_noop_content_digest_hex(package_json.as_bytes())
+            == proof.pkg_digest
+        && crate::install_state::sync_noop_content_digest_hex(&lock_raw) == proof.lock_digest
+    {
+        Some(proof.has_node_engines)
+    } else {
+        None
+    };
+
+    let full_lockfile = if fast_has_node_engines.is_some() {
+        None
+    } else {
+        let Ok(project_lockfile) = lpm_lockfile::Lockfile::read_for_project(project_dir) else {
+            return Ok(false);
+        };
+        if project_lockfile.workspace_root.is_some()
+            || project_lockfile.lockfile.metadata.lockfile_version
+                < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES
+            || requires_install_access(&project_lockfile.lockfile)
+        {
+            return Ok(false);
+        }
+        if !crate::install_state::check_install_state_with_lockfile(
+            project_dir,
+            package_json,
+            &project_lockfile,
+            linker,
+            integrity,
+            store_version,
+            hash_context,
+        )
+        .up_to_date
+        {
+            return Ok(false);
+        }
+        if !lockfile_roots_and_routes_match(
+            project_dir,
+            &package,
+            &project_lockfile.lockfile,
+            &routes,
         ) {
             return Ok(false);
         }
-        let route = routes.route_for_package(&package.name);
-        let expected = match &route {
-            lpm_registry::UpstreamRoute::Custom { target, .. } => target.base_url.as_ref(),
-            _ => lpm_common::NPM_REGISTRY_URL,
-        };
-        if !super::lockfile::locked_registry_source_matches_url(package, expected) {
+        if frozen
+            && super::validation::frozen_install_accepts_lockfile(
+                project_dir,
+                &lock_path,
+                &package,
+                None,
+                &project_lockfile.lockfile,
+                auto_install_peers,
+            )
+            .is_err()
+        {
+            // The full install reports why a frozen install refuses it.
             return Ok(false);
         }
-    }
+        Some(project_lockfile)
+    };
+
     crate::release_plan::ensure_no_pending_release_transaction(project_dir)?;
     super::validation::validate_project_layout(project_dir)?;
     super::setup::check_project_policy(
@@ -168,7 +175,9 @@ pub(crate) fn is_up_to_date(
         &package,
         json_output,
     )?;
-    crate::release_age_config::ReleaseAgeResolver::resolve_config(
+    crate::release_age_config::ReleaseAgeResolver::resolve_config_with_context(
+        &global,
+        Some(&package),
         project_dir,
         None,
         &[],
@@ -185,30 +194,195 @@ pub(crate) fn is_up_to_date(
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }
-    let engine_policy = crate::engine_check::prepare_dependency_policy_reusing(
+    let engine_policy = crate::engine_check::prepare_dependency_policy_for_standalone_root(
         project_dir,
+        &package,
+        &global,
         false,
         json_output,
         crate::engine_check::NodeVersionReuse::recorded(cached_engine.observed_node()),
     )?;
     // The saved key only admits a candidate. Node launchers still run before
     // success; a changed version re-enters optional filtering.
-    if engine_policy.freshness_key(&project_lockfile.content) != cached_engine.key {
+    let current_engine_key = match fast_has_node_engines {
+        Some(has_node_engines) => engine_policy.freshness_key_from_flags(true, has_node_engines),
+        None => engine_policy.freshness_key(
+            &full_lockfile
+                .as_ref()
+                .expect("slow path verified project_lockfile")
+                .content,
+        ),
+    };
+    if current_engine_key != cached_engine.key {
         return Ok(false);
     }
     if cached_engine.key != "none" {
         let runtime_fingerprint = engine_policy.resolved_node_runtime_fingerprint();
-        if runtime_fingerprint != cached_engine.runtime_fingerprint
-            && let Err(error) = crate::install_state::refresh_install_hash_node_runtime_fingerprint(
+        if runtime_fingerprint != cached_engine.runtime_fingerprint {
+            match crate::install_state::refresh_install_hash_node_runtime_fingerprint(
                 project_dir,
                 cached_engine.key,
                 runtime_fingerprint,
-            )
+            ) {
+                Ok(true) => {
+                    crate::cli::keep_state_ignored_at_exit_from(project_dir);
+                    crate::cli::keep_state_ignored_at_exit();
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        "failed to refresh the cached Node runtime fingerprint: {error}"
+                    );
+                }
+            }
+        }
+    }
+    if fast_has_node_engines.is_none()
+        && let Some(project_lockfile) = full_lockfile.as_ref()
+        && project_lockfile.path == lock_path
+        && !has_ancestor_lockfile(project_dir)
+        && !crate::install_state::package_json_needs_slow_freshness(package_json)
+        && let Ok(lock_raw) = lpm_common::read_file_capped(
+            &lock_path,
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
+        )
+    {
+        let proof = compute_sync_noop_proof(
+            project_dir,
+            &lock_path,
+            &package,
+            package_json,
+            &project_lockfile.lockfile,
+            &lock_raw,
+            &routes,
+            auto_install_peers,
+        );
+        if let Ok(true) =
+            crate::install_state::backfill_install_hash_sync_noop_proof(project_dir, &proof)
         {
-            tracing::debug!("failed to refresh the cached Node runtime fingerprint: {error}");
+            crate::cli::keep_state_ignored_at_exit_from(project_dir);
+            crate::cli::keep_state_ignored_at_exit();
         }
     }
     Ok(true)
+}
+
+fn has_ancestor_lockfile(project_dir: &Path) -> bool {
+    let mut parent = project_dir.parent();
+    while let Some(dir) = parent {
+        if dir.join(lpm_lockfile::LOCKFILE_NAME).is_file() {
+            return true;
+        }
+        parent = dir.parent();
+    }
+    false
+}
+
+fn raw_lockfile_mentions_lpm_scope(bytes: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"@lpm.dev/";
+    bytes.windows(NEEDLE.len()).any(|window| window == NEEDLE)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compute_sync_noop_proof(
+    project_dir: &Path,
+    lock_path: &Path,
+    package: &lpm_workspace::PackageJson,
+    package_json_stripped: &str,
+    lockfile: &lpm_lockfile::Lockfile,
+    lock_raw_bytes: &[u8],
+    routes: &lpm_registry::RouteTable,
+    auto_install_peers: bool,
+) -> crate::install_state::SyncNoopLockfileProofInput {
+    let version_ok = lockfile.metadata.lockfile_version
+        >= lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES;
+    let standalone_ok =
+        lockfile.workspace_packages.is_empty() && lockfile.importers.keys().all(|k| k == ".");
+    let lockfile_eligible = version_ok
+        && standalone_ok
+        && !requires_install_access(lockfile)
+        && !raw_lockfile_mentions_lpm_scope(lock_raw_bytes)
+        && lockfile_roots_and_routes_match(project_dir, package, lockfile, routes);
+    let frozen_ok = lockfile_eligible
+        && package
+            .lpm
+            .as_ref()
+            .is_none_or(|lpm| lpm.patched_dependencies.is_empty())
+        && super::validation::frozen_install_accepts_lockfile(
+            project_dir,
+            lock_path,
+            package,
+            None,
+            lockfile,
+            auto_install_peers,
+        )
+        .is_ok();
+    let has_node_engines = lockfile
+        .packages
+        .iter()
+        .any(|pkg| pkg.node_engine.is_some());
+    crate::install_state::SyncNoopLockfileProofInput {
+        pkg_digest: crate::install_state::sync_noop_content_digest_hex(
+            package_json_stripped.as_bytes(),
+        ),
+        lock_digest: crate::install_state::sync_noop_content_digest_hex(lock_raw_bytes),
+        lockfile_eligible,
+        has_node_engines,
+        auto_install_peers,
+        frozen_ok,
+        routes_fingerprint: routes.routing_fingerprint(),
+    }
+}
+
+fn lockfile_roots_and_routes_match(
+    project_dir: &Path,
+    package: &lpm_workspace::PackageJson,
+    lockfile: &lpm_lockfile::Lockfile,
+    routes: &lpm_registry::RouteTable,
+) -> bool {
+    let mut manifest_deps = super::manifest::manifest_install_deps(package);
+    if super::manifest::normalize_jsr_manifest_deps(&mut manifest_deps).is_err() {
+        return false;
+    }
+    let mut manifest_deps = std::borrow::Cow::Owned(manifest_deps);
+    let Some(catalog_resolutions) =
+        super::lockfile::current_catalog_resolutions(package, None, &mut manifest_deps)
+    else {
+        return false;
+    };
+    let optional_root_names: std::collections::HashSet<String> =
+        package.optional_dependencies.keys().cloned().collect();
+    let locked_packages: Vec<&lpm_lockfile::LockedPackage> = lockfile.packages.iter().collect();
+    if !super::lockfile::locked_catalogs_and_roots_match_manifest(
+        lockfile,
+        &super::lockfile::LockedRows::indexed(&locked_packages),
+        super::lockfile::LockedManifest {
+            deps: &manifest_deps,
+            catalog_resolutions: catalog_resolutions.as_resolutions(),
+            optional_root_names: &optional_root_names,
+        },
+        project_dir,
+        false,
+    ) {
+        return false;
+    }
+    for locked_package in &lockfile.packages {
+        if !matches!(
+            locked_package.source_kind(),
+            Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+        ) {
+            return false;
+        }
+        let route = routes.route_for_package(&locked_package.name);
+        let expected = match &route {
+            lpm_registry::UpstreamRoute::Custom { target, .. } => target.base_url.as_ref(),
+            _ => lpm_common::NPM_REGISTRY_URL,
+        };
+        if !super::lockfile::locked_registry_source_matches_url(locked_package, expected) {
+            return false;
+        }
+    }
+    true
 }
 
 fn requires_install_access(lockfile: &lpm_lockfile::Lockfile) -> bool {
@@ -286,5 +460,150 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
 
         assert!(lockfile_contains_lpm_package(directory.path()));
+    }
+
+    #[test]
+    fn sync_noop_proof_fast_path_validates_content_routes_and_security_invariants() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", home.path().as_os_str().to_owned()),
+            ("HOME", home.path().as_os_str().to_owned()),
+            (
+                "NPM_CONFIG_USERCONFIG",
+                home.path().join(".npmrc").into_os_string(),
+            ),
+            ("LPM_LINKER", std::ffi::OsString::from("hoisted")),
+            ("CI", std::ffi::OsString::from("")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let mut lockfile = lockfile_with_packages(&["react"]);
+        lockfile.root_resolutions.insert(
+            "react".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: None,
+                package: "react".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+            },
+        );
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        lockfile.write_to_file(&lock_path).unwrap();
+        let lock_raw = std::fs::read(&lock_path).unwrap();
+        let lock_content = std::str::from_utf8(&lock_raw).unwrap();
+        let package: lpm_workspace::PackageJson = serde_json::from_str(pkg_json).unwrap();
+        let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        let proof = super::compute_sync_noop_proof(
+            project, &lock_path, &package, pkg_json, &lockfile, &lock_raw, &routes, true,
+        );
+        assert!(proof.lockfile_eligible);
+        assert!(!proof.has_node_engines);
+
+        let platform = lpm_store::v2::PlatformTuple::current();
+        let hash = crate::install_state::compute_install_hash_v10(
+            pkg_json,
+            lock_content,
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            &platform,
+            crate::install_state::InstallHashContext {
+                dependency_engine_key: "none",
+                security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+            },
+        );
+        crate::install_state::write_install_hash_with_known_runtime_state(
+            project,
+            &hash,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            &platform,
+            "none",
+            crate::install_state::KnownInstallHashRuntimeState {
+                lockfile_path: &lock_path,
+                node_runtime_fingerprint: None,
+                security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+                sync_noop_proof: Some(&proof),
+            },
+        )
+        .unwrap();
+
+        let mode = crate::install_state::FastLaneMode {
+            json: true,
+            timing: false,
+            frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+            no_skills: true,
+        };
+        assert!(super::is_up_to_date(project, pkg_json, mode).unwrap());
+
+        // Same-size edit with restored mtime must invalidate the content-bound proof.
+        let pkg_mtime = std::fs::metadata(project.join("package.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let edited_pkg = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^2.0.0"}}"#;
+        assert_eq!(edited_pkg.len(), pkg_json.len());
+        std::fs::write(project.join("package.json"), edited_pkg).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(project.join("package.json"))
+            .unwrap()
+            .set_modified(pkg_mtime)
+            .unwrap();
+        assert!(!super::is_up_to_date(project, edited_pkg, mode).unwrap());
+        // Restore original package.json and mtime.
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(project.join("package.json"))
+            .unwrap()
+            .set_modified(pkg_mtime)
+            .unwrap();
+        assert!(super::is_up_to_date(project, pkg_json, mode).unwrap());
+
+        // Changing `.npmrc` changes the route fingerprint, invalidating the proof.
+        std::fs::write(
+            project.join(".npmrc"),
+            "registry=https://custom.registry.example/\n",
+        )
+        .unwrap();
+        assert!(!super::is_up_to_date(project, pkg_json, mode).unwrap());
+
+        std::fs::remove_file(project.join(".npmrc")).unwrap();
+        assert!(super::is_up_to_date(project, pkg_json, mode).unwrap());
+
+        // A patched project must never mark frozen_ok in the sync proof.
+        let patched_pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"},"lpm":{"patchedDependencies":{"react@1.0.0":{"path":"patches/react@1.0.0.patch","originalIntegrity":"sha512-test"}}}}"#;
+        let patched_pkg: lpm_workspace::PackageJson =
+            serde_json::from_str(patched_pkg_json).unwrap();
+        let patched_proof = super::compute_sync_noop_proof(
+            project,
+            &lock_path,
+            &patched_pkg,
+            patched_pkg_json,
+            &lockfile,
+            &lock_raw,
+            &routes,
+            true,
+        );
+        assert!(!patched_proof.frozen_ok);
+
+        // Changing lpm.lock invalidates both the proof and fallback check.
+        let mut modified_lockfile = lockfile_with_packages(&["react", "left-pad"]);
+        modified_lockfile.root_resolutions.insert(
+            "react".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: None,
+                package: "react".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+            },
+        );
+        modified_lockfile.write_to_file(&lock_path).unwrap();
+        assert!(!super::is_up_to_date(project, pkg_json, mode).unwrap());
     }
 }

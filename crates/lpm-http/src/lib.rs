@@ -2032,7 +2032,7 @@ mod permanent_tls_failure_tests {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("self-signed certificate");
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("TLS protocol versions")
@@ -2102,5 +2102,14 @@ mod permanent_tls_failure_tests {
         let error = request_error(format!("https://127.0.0.1:{port}/")).await;
 
         assert!(!is_permanent_tls_failure(&error), "{}", error_chain(&error));
+    }
+
+    #[test]
+    fn default_tls_provider_prefers_post_quantum_key_exchange() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        assert_eq!(
+            provider.kx_groups[0].name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
     }
 }

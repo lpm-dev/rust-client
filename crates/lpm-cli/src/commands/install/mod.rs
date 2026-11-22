@@ -2194,9 +2194,11 @@ async fn run_with_options_under_store_lock(
         &applied_patches,
     );
 
-    if cleanup_catalogs_in_pipeline {
-        cleanup_unused_catalogs_after_install(project_dir)?;
-    }
+    let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
+        cleanup_unused_catalogs_after_install(project_dir)?
+    } else {
+        false
+    };
 
     // Audit-after-install: run a silent audit pass and stash the
     // resulting counts. Both the JSON envelope and the human Done
@@ -2335,12 +2337,24 @@ async fn run_with_options_under_store_lock(
     // manifest mtimes into the v2 file format so the next up-to-date
     // check can take the mtime fast path.
     if omit_policy.is_default() {
-        write_post_install_hash(
+        let proof_context = if !catalogs_cleaned
+            && direct_versions_out.is_none()
+            && policy_project_dir == project_dir
+        {
+            Some(PostInstallSyncNoopProofContext {
+                routes: &route_table,
+                auto_install_peers,
+            })
+        } else {
+            None
+        };
+        write_post_install_hash_with_proof(
             project_dir,
             linker_mode,
             object_integrity_policy,
             security_analysis_policy,
             dependency_engine_policy.as_ref(),
+            proof_context,
         );
     }
 

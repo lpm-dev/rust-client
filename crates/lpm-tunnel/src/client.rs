@@ -1900,15 +1900,24 @@ pub fn relay_url_is_loopback(url: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn bundled_root_cert_store() -> Arc<rustls::RootCertStore> {
+    static ROOTS: std::sync::OnceLock<Arc<rustls::RootCertStore>> = std::sync::OnceLock::new();
+    Arc::clone(ROOTS.get_or_init(|| {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+        Arc::new(root_store)
+    }))
+}
+
 fn relay_tls_connector(
     options: &TunnelOptions,
     approved_pins: Option<Vec<String>>,
 ) -> Result<tokio_tungstenite::Connector, String> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let root_store = bundled_root_cert_store();
     let mut config = if !options.no_pin && !relay_url_is_loopback(&options.relay_url) {
-        let default_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+        let default_verifier = rustls::client::WebPkiServerVerifier::builder(root_store)
             .build()
             .map_err(|error| error.to_string())?;
         let mut verifier = TofuPinningVerifier::new(default_verifier);
@@ -4601,7 +4610,7 @@ mod tests {
         TofuPinningVerifier,
         rustls::pki_types::CertificateDer<'static>,
     ) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certified = rcgen::generate_simple_self_signed(vec![
             crate::relay::DEFAULT_RELAY_HOST.into(),
             "custom.example".into(),
@@ -4724,9 +4733,8 @@ mod tests {
     fn signed_keys_do_not_bypass_certificate_chain_checks() {
         let (mut verifier, certificate) = trusted_relay_certificate(None);
         verifier.approved_pins = Some(vec![spki_sha256_hex(certificate.as_ref()).unwrap()]);
-        let roots =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        verifier.default_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+        let roots = bundled_root_cert_store();
+        verifier.default_verifier = rustls::client::WebPkiServerVerifier::builder(roots)
             .build()
             .unwrap();
         assert!(matches!(

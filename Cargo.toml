@@ -233,6 +233,42 @@ lto = true
 codegen-units = 1
 strip = true
 
+[profile.release.package.axum]
+opt-level = "z"
+
+[profile.release.package.clap_complete]
+opt-level = "z"
+
+[profile.release.package.cliclack]
+opt-level = "z"
+
+[profile.release.package.jsonschema]
+opt-level = "z"
+
+[profile.release.package.lpm-dashboard]
+opt-level = "z"
+
+[profile.release.package.lpm-inspect]
+opt-level = "z"
+
+[profile.release.package.lpm-migrate]
+opt-level = "z"
+
+[profile.release.package.miette]
+opt-level = "z"
+
+[profile.release.package.ratatui]
+opt-level = "z"
+
+[profile.release.package.rmcp]
+opt-level = "z"
+
+[profile.release.package.schemars]
+opt-level = "z"
+
+[profile.release.package.toml_edit]
+opt-level = "z"
+
 [workspace.lints.rust]
 nonstandard_style = "deny"
 future_incompatible = "warn"

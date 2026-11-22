@@ -46,7 +46,7 @@ impl Lockfile {
             })
             .transpose()?;
         let lockfile = if selected.importer == "." {
-            selected.lockfile.as_lockfile().project_root_importer()?
+            selected.lockfile.0.into_root_importer()?
         } else {
             selected.lockfile.project_importer(&selected.importer)?
         };
