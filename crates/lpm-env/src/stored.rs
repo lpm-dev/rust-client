@@ -1,6 +1,10 @@
 //! Rules for stored project env values, shared by every reader of them.
 
-use crate::{CasingConflict, EnvValidator, EvalContext, ValidationError, ValidationErrorKind};
+use crate::{
+    CasingConflict, EnvValidator, EvalContext, PersonalOverrideLayer, PersonalOverrideOrigins,
+    ValidationError, ValidationErrorKind, apply_personal_overrides,
+};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The environment whose stored values an environment without values of its own uses.
@@ -210,6 +214,12 @@ pub struct StoredValuesCheck {
     pub defaults: BTreeMap<String, String>,
     /// Stored keys the runner never passes to a process, ordered by key.
     pub ignored: Vec<String>,
+    /// The keys of the errors a personal override caused, ordered: it gave
+    /// the value the schema judged, or its unset left the value missing.
+    pub from_overrides: Vec<String>,
+    /// The personal overrides that change the environment, ordered: what a
+    /// run's notice counts.
+    pub applied_overrides: Vec<String>,
 }
 
 /// Evaluate the values stored for `environment` the way the runner does at
@@ -223,13 +233,34 @@ pub fn check_stored_values(
     environment: &str,
     environments: &BTreeMap<String, HashMap<String, String>>,
 ) -> Result<StoredValuesCheck, CasingConflict> {
-    check_stored_values_with_case_policy(validator, environment, environments, cfg!(windows))
+    check_stored_values_with_case_policy(validator, environment, environments, None, cfg!(windows))
+}
+
+/// [`check_stored_values`] for what a run on this computer gets: the
+/// environment's personal overrides applied over its stored values as layer
+/// 4, with each failure they caused named in
+/// [`from_overrides`](StoredValuesCheck::from_overrides). An environment's
+/// own overrides apply even when it reads the default environment's values.
+pub fn check_stored_values_with_overrides(
+    validator: &EnvValidator<'_>,
+    environment: &str,
+    environments: &BTreeMap<String, HashMap<String, String>>,
+    overrides: PersonalOverrideLayer<'_>,
+) -> Result<StoredValuesCheck, CasingConflict> {
+    check_stored_values_with_case_policy(
+        validator,
+        environment,
+        environments,
+        Some(overrides),
+        cfg!(windows),
+    )
 }
 
 fn check_stored_values_with_case_policy(
     validator: &EnvValidator<'_>,
     environment: &str,
     environments: &BTreeMap<String, HashMap<String, String>>,
+    overrides: Option<PersonalOverrideLayer<'_>>,
     case_insensitive: bool,
 ) -> Result<StoredValuesCheck, CasingConflict> {
     let own = environments.get(environment);
@@ -240,17 +271,30 @@ fn check_stored_values_with_case_policy(
     } else {
         own
     };
+    if case_insensitive {
+        let mut stored_names = BTreeSet::new();
+        for key in stored.into_iter().flat_map(HashMap::keys) {
+            if !stored_names.insert(crate::EnvName::new(key)) {
+                return Err(CasingConflict::Stored(key.clone()));
+            }
+        }
+    }
+    let empty = HashMap::new();
+    let stored = stored.unwrap_or(&empty);
+    let (selected, origins) = match overrides.filter(|overrides| !overrides.is_empty()) {
+        Some(overrides) => {
+            let origins = PersonalOverrideOrigins::changing(stored, overrides, case_insensitive);
+            let mut applied = stored.clone();
+            apply_personal_overrides(&mut applied, overrides, case_insensitive);
+            (Cow::Owned(applied), origins)
+        }
+        None => (Cow::Borrowed(stored), PersonalOverrideOrigins::default()),
+    };
     let schema = validator.schema();
-    let mut values = HashMap::with_capacity(stored.map_or(0, HashMap::len));
+    let mut values = HashMap::with_capacity(selected.len());
     let mut ignored = Vec::new();
     let mut errors = Vec::new();
-    let mut stored_names = case_insensitive.then(BTreeSet::new);
-    for (key, value) in stored.into_iter().flatten() {
-        if let Some(names) = &mut stored_names
-            && !names.insert(crate::EnvName::new(key))
-        {
-            return Err(CasingConflict::Stored(key.clone()));
-        }
+    for (key, value) in selected.iter() {
         // The runner rejects a NUL anywhere before it drops denied variables.
         let unusable = value.as_bytes().contains(&0);
         let denied = is_denied_env_var(key);
@@ -300,11 +344,24 @@ fn check_stored_values_with_case_policy(
             (!was_empty || !value.is_empty()).then(|| (key.clone(), value.clone()))
         })
         .collect();
+    let mut from_overrides: Vec<String> = if origins.is_empty() {
+        Vec::new()
+    } else {
+        errors
+            .iter()
+            .filter(|error| origins.caused(error, &values))
+            .map(|error| error.key.clone())
+            .collect()
+    };
+    from_overrides.dedup();
+    let applied_overrides = origins.names().into_iter().map(str::to_owned).collect();
     Ok(StoredValuesCheck {
         reads_default_environment: reads_default,
         errors,
         defaults,
         ignored,
+        from_overrides,
+        applied_overrides,
     })
 }
 
@@ -323,12 +380,19 @@ mod tests {
             let stored = environments(&[("default", &[(upper, value), (lower, value)])]);
             for environment in ["default", "production"] {
                 assert!(matches!(
-                    check_stored_values_with_case_policy(&validator, environment, &stored, true),
+                    check_stored_values_with_case_policy(
+                        &validator,
+                        environment,
+                        &stored,
+                        None,
+                        true
+                    ),
                     Err(CasingConflict::Stored(_))
                 ));
             }
             assert!(
-                check_stored_values_with_case_policy(&validator, "default", &stored, false).is_ok()
+                check_stored_values_with_case_policy(&validator, "default", &stored, None, false)
+                    .is_ok()
             );
         }
     }
@@ -643,11 +707,13 @@ mod tests {
         let validator = EnvValidator::new(&schema);
         let stored = environments(&[("default", &[("port", "invalid")])]);
         let insensitive =
-            check_stored_values_with_case_policy(&validator, "default", &stored, true).unwrap();
+            check_stored_values_with_case_policy(&validator, "default", &stored, None, true)
+                .unwrap();
         assert_eq!(codes(&insensitive), [("PORT", "format")]);
         assert!(insensitive.defaults.is_empty());
         let sensitive =
-            check_stored_values_with_case_policy(&validator, "default", &stored, false).unwrap();
+            check_stored_values_with_case_policy(&validator, "default", &stored, None, false)
+                .unwrap();
         assert!(sensitive.errors.is_empty());
         assert_eq!(
             sensitive.defaults,
@@ -656,7 +722,7 @@ mod tests {
 
         let ambiguous = environments(&[("default", &[("port", "1"), ("PORT", "2")])]);
         assert!(matches!(
-            check_stored_values_with_case_policy(&validator, "default", &ambiguous, true),
+            check_stored_values_with_case_policy(&validator, "default", &ambiguous, None, true),
             Err(CasingConflict::Stored(_))
         ));
     }
@@ -667,5 +733,134 @@ mod tests {
         assert!(!reads_default_environment("production", true));
         assert!(!reads_default_environment(DEFAULT_ENVIRONMENT, false));
         assert!(!reads_default_environment(DEFAULT_ENVIRONMENT, true));
+    }
+
+    fn personal(set: &[(&str, &str)], unset: &[&str]) -> (HashMap<String, String>, Vec<String>) {
+        (
+            set.iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            unset.iter().map(|name| (*name).to_owned()).collect(),
+        )
+    }
+
+    fn effective(
+        schema: &str,
+        environment: &str,
+        stored: &BTreeMap<String, HashMap<String, String>>,
+        overrides: &(HashMap<String, String>, Vec<String>),
+        case_insensitive: bool,
+    ) -> StoredValuesCheck {
+        let schema: crate::EnvSchema = serde_json::from_str(schema).unwrap();
+        let validator = EnvValidator::new(&schema);
+        check_stored_values_with_case_policy(
+            &validator,
+            environment,
+            stored,
+            Some(PersonalOverrideLayer {
+                set: &overrides.0,
+                unset: &overrides.1,
+            }),
+            case_insensitive,
+        )
+        .expect("no casing conflict")
+    }
+
+    #[test]
+    fn the_effective_check_judges_what_the_overrides_give_and_names_them() {
+        let schema = r#"{"vars":{"API_URL":{"format":"url"},"TOKEN":{"required":true},"PORT":{"format":"port"}}}"#;
+        let stored = environments(&[(
+            "development",
+            &[
+                ("API_URL", "https://team.example"),
+                ("TOKEN", "team"),
+                ("PORT", "nope"),
+            ],
+        )]);
+        let check = effective(
+            schema,
+            "development",
+            &stored,
+            &personal(&[("API_URL", "not a url")], &["TOKEN"]),
+            false,
+        );
+        assert_eq!(
+            codes(&check),
+            [
+                ("API_URL", "format"),
+                ("PORT", "format"),
+                ("TOKEN", "missing"),
+            ]
+        );
+        assert_eq!(check.from_overrides, ["API_URL", "TOKEN"]);
+        assert_eq!(check.applied_overrides, ["API_URL", "TOKEN"]);
+        let team_only = check_stored_values(
+            &EnvValidator::new(&serde_json::from_str(schema).unwrap()),
+            "development",
+            &stored,
+        )
+        .unwrap();
+        assert_eq!(codes(&team_only), [("PORT", "format")]);
+        assert!(team_only.from_overrides.is_empty());
+    }
+
+    #[test]
+    fn an_override_of_the_value_the_project_has_is_never_blamed() {
+        let stored = environments(&[("default", &[("PORT", "nope")])]);
+        let check = effective(
+            r#"{"vars":{"PORT":{"format":"port"}}}"#,
+            "default",
+            &stored,
+            &personal(&[("PORT", "nope")], &[]),
+            false,
+        );
+        assert_eq!(codes(&check), [("PORT", "format")]);
+        assert!(check.from_overrides.is_empty());
+        assert!(
+            check.applied_overrides.is_empty(),
+            "an override of the same value changes nothing"
+        );
+    }
+
+    #[test]
+    fn an_environment_reading_default_values_applies_only_its_own_overrides() {
+        let stored = environments(&[("default", &[("API_URL", "https://team.example")])]);
+        let check = effective(
+            r#"{"vars":{"API_URL":{"format":"url"}}}"#,
+            "staging",
+            &stored,
+            &personal(&[("API_URL", "bad")], &[]),
+            false,
+        );
+        assert!(check.reads_default_environment);
+        assert_eq!(check.from_overrides, ["API_URL"]);
+    }
+
+    #[test]
+    fn the_effective_check_ignores_names_lpm_never_passes_from_overrides_too() {
+        let stored = environments(&[("default", &[("A", "1")])]);
+        let check = effective(
+            r#"{"vars":{"A":{}}}"#,
+            "default",
+            &stored,
+            &personal(&[("NODE_OPTIONS", "--inspect")], &[]),
+            false,
+        );
+        assert_eq!(check.ignored, ["NODE_OPTIONS"]);
+        assert!(check.errors.is_empty());
+    }
+
+    #[test]
+    fn an_override_replaces_a_stored_name_it_matches_without_case_where_the_host_ignores_case() {
+        let stored = environments(&[("default", &[("api_url", "https://team.example")])]);
+        let check = effective(
+            r#"{"vars":{"API_URL":{"format":"url"}}}"#,
+            "default",
+            &stored,
+            &personal(&[("API_URL", "bad")], &[]),
+            true,
+        );
+        assert_eq!(codes(&check), [("API_URL", "format")]);
+        assert_eq!(check.from_overrides, ["API_URL"]);
     }
 }

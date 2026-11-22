@@ -3772,6 +3772,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "lpm-common",
+ "lpm-env",
  "serde",
  "serde_json",
  "sha2 0.11.1",

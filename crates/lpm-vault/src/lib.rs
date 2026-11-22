@@ -31,6 +31,7 @@ mod fallback;
 mod freed_memory_probe;
 pub mod history;
 mod links;
+pub mod overrides;
 mod selected_environment;
 pub mod signature;
 pub mod sync;

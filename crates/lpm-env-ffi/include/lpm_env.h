@@ -10,6 +10,7 @@
 #define LPM_ENV_BACKUP_FILE_LIMIT (64 * 1024 * 1024)
 #define LPM_ENV_BACKUP_PASSPHRASE_LIMIT (4 * 1024)
 #define LPM_ENV_HISTORY_INPUT_LIMIT (4 * 1024 * 1024)
+#define LPM_ENV_OVERRIDES_INPUT_LIMIT (4 * 1024 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -39,12 +40,22 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * "default"'s values were checked), problems [{key, code, format?, constraint?,
  * group?, mode?}], defaults {KEY: schema default that fills it}, and ignored keys the
  * runner never passes to a process. Output never contains stored values.
+ * With overrides: {vaultId, marker?, record?} (the marker and the personal
+ * overrides record as read in the same lock, standard base64), each environment
+ * given is checked as a run on this computer gets it: its own overrides applied
+ * over the values it selects, even when it reads "default"'s. A problem an
+ * override caused has personalOverride: true, and appliedOverrides lists the
+ * overrides that change the environment, the ones a run's notice counts. An
+ * environment that has overrides but no values must be given, empty, to be
+ * checked.
  * At most 256 environments and 262144 work units are checked. Each environment
  * costs one unit per declaration, enum member, enum UTF-8 byte, group, group member,
- * and selected stored value (including fallback values), plus one.
+ * selected stored value (including fallback values) and override, plus one.
  * Larger inputs fail before evaluation.
- * status: 0=checked, 1=invalid schema or names differing only in case where the host
- * ignores case, 2=invalid input, 3=panic, 4=work or output limit. */
+ * status: 0=checked, 1=invalid schema, names differing only in case where the host
+ * ignores case, or overrides that can't be applied (code overrides.damaged,
+ * overrides.unsupported or overrides.needs_resume), 2=invalid input, 3=panic,
+ * 4=work or output limit. */
 LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
                          const uint8_t *input, size_t input_length);
 /* Characters in values that are hard to see or change how text reads, flagged
@@ -404,6 +415,54 @@ LPMEnvResult lpm_env_history_admission(const uint8_t *input, size_t input_length
  * {needsTail: true}: read the key and the tail (part omitted when absent) and
  * call again. It trims nothing while the tail isn't the head's. */
 LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
+/* Personal overrides: values one Mac sets or unsets on top of a project's team
+ * values, per environment, read and planned exactly as the CLI reads and plans
+ * them. Nothing here reads or writes a store. Each function takes one frame of at
+ * most LPM_ENV_OVERRIDES_INPUT_LIMIT bytes and returns one, as local history's
+ * do; values only ever travel as blobs. marker and record name the blobs of the
+ * project's feature marker and its overrides record
+ * (__vault_companion_v1__:overrides:<b64url(vault id)>), read in the caller's
+ * lock; leave each out when its account is absent. Status 2 is {code:
+ * "overrides.invalid_input"}, 3 a panic, 5 a refusal {code: "overrides.<reason>",
+ * message}. Every output is wiped when released.
+ *
+ * Every environment's overrides. Input {vaultId, marker?, record?, values?:
+ * bool}. Output {environments: [{environment, set: [{key, passed, value?:
+ * blob}], unset: [{key, passed}]}]}, environments and keys in order. value is
+ * given only with values: true. passed is false for a name LPM never passes to
+ * a process, which only a record written before LPM denied it can hold.
+ * Refusals: overrides.damaged, overrides.unsupported, overrides.needs_resume
+ * (finish the interrupted step first, as lpm_env_companion_plan's resume does). */
+LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
+/* Plan one batch of edits, all or none. Input {vaultId, marker?, record?,
+ * names?: [every account name in the service, from one names-only listing],
+ * edits: [{action: "set", environment, key, value: blob} | {action: "unset",
+ * environment, key} | {action: "remove", environment, key} | {action:
+ * "clearEnvironment", environment} | {action: "clearAll"} | {action:
+ * "environmentRenamed", from, to} | {action: "environmentRemoved", environment}
+ * | {action: "environmentDuplicated", from, to}]}, at most 1024 edits. set gives
+ * the key this Mac's own value (an empty value is a value); unset removes the
+ * project's value; remove drops the key's override. Report every rename, removal
+ * and duplicate of an environment: a rename moves its overrides to the new name,
+ * replacing any an environment removed earlier left there; a removal removes
+ * them; a duplicate copies none. Commit the plan in the same transaction as the
+ * values change. Output {result: "needsNames"} when the batch creates or deletes
+ * the record: list the service's names, pass them as names, and call again;
+ * {result: "unchanged", effects}; or {result: "planned", journal: true, writes:
+ * [{account, blob}], deletes: [account], markerAfter: "present" | "absent",
+ * activated (the project's first override), overAdmissionTarget, effects}.
+ * Commit writes and deletes as one journal transaction; the overrides record
+ * takes the values item's verified approval. effects, one per edit: {kind:
+ * "key", environment, key, previous: "none" | "set" | "unset", changed} |
+ * {kind: "cleared", environment (null for every environment), removed} |
+ * {kind: "environmentRemoved", environment, removed} | {kind: "moved", from,
+ * to, moved, replaced} | {kind: "notCopied", from, to, count}. Refusals:
+ * overrides.invalid_environment, overrides.invalid_key, overrides.denied_name
+ * (a name LPM never passes to a process can't be set or unset, only removed),
+ * overrides.nul_value, overrides.too_large (the record exceeds 100 KiB),
+ * overrides.same_environment, overrides.damaged, overrides.unsupported,
+ * overrides.needs_resume, overrides.over_budget, overrides.admission_refused. */
+LPMEnvResult lpm_env_overrides_plan(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

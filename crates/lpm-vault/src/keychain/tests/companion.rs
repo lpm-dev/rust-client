@@ -43,7 +43,10 @@ fn storage_with_values() -> MemoryProjectStorage {
     storage
 }
 
-fn committed_journal(storage: &mut MemoryProjectStorage, operations: &[(&str, Option<&[u8]>)]) {
+pub(super) fn committed_journal(
+    storage: &mut MemoryProjectStorage,
+    operations: &[(&str, Option<&[u8]>)],
+) {
     let transaction_id = "00000000-0000-4000-8000-0000000000aa";
     let mut journal_operations = Vec::new();
     for (index, (target, value)) in operations.iter().enumerate() {

@@ -2,20 +2,12 @@
 //! Nothing here reads or writes a store: each function takes what the app
 //! read inside its lock and returns what to write.
 //!
-//! Every function takes one frame and returns one frame:
-//!
-//! ```text
-//! frame = "LPMF" ‖ u8 version=1 ‖ u32be count ‖ count × (u32be length ‖ bytes)
-//! ```
-//!
-//! Field 0 is a UTF-8 JSON object of everything that isn't secret. The
-//! other fields are blobs the JSON names by index: stored records, values
-//! payloads, revealed values, records to write. Values and key records never
-//! appear in JSON, and every output buffer is wiped when it's released.
+//! Every function takes one frame and returns one frame (see `frame`):
+//! stored records, values payloads, revealed values and records to write
+//! travel as blobs, never in JSON.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -54,146 +46,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::{ABI_VERSION, LPMEnvResult, bytes, failure, result};
+use crate::frame::{self, Domain, Output, blob, refused};
+use crate::{LPMEnvResult, failure};
 
-const FRAME_MAGIC: [u8; 4] = *b"LPMF";
-const FRAME_VERSION: u8 = 1;
 /// Sixteen parts of 100 KiB, values before and after, the head, the key and
 /// the request, with room to spare.
 pub(crate) const HISTORY_INPUT_LIMIT: usize = 4 * 1024 * 1024;
-const REFUSED: u32 = 5;
 
-/// A decoded input frame: the request and its blobs.
-struct Frame<'a> {
-    request: &'a [u8],
-    blobs: Vec<&'a [u8]>,
-}
-
-/// The most blobs a frame carries: every input names far fewer (a reading
-/// names the head, the key, the values and at most 16 parts).
-const MAX_FRAME_BLOBS: usize = 64;
-
-fn decode_frame(bytes: &[u8]) -> Option<Frame<'_>> {
-    let rest = bytes.strip_prefix(&FRAME_MAGIC)?;
-    let (&version, rest) = rest.split_first()?;
-    if version != FRAME_VERSION {
-        return None;
-    }
-    let (count, mut rest) = rest.split_first_chunk::<4>()?;
-    let count = u32::from_be_bytes(*count) as usize;
-    if count == 0 || count > MAX_FRAME_BLOBS + 1 || count > rest.len() / 4 + 1 {
-        return None;
-    }
-    let mut fields = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (length, after) = rest.split_first_chunk::<4>()?;
-        let length = u32::from_be_bytes(*length) as usize;
-        if length > after.len() {
-            return None;
-        }
-        let (field, after) = after.split_at(length);
-        fields.push(field);
-        rest = after;
-    }
-    if !rest.is_empty() {
-        return None;
-    }
-    let request = fields.remove(0);
-    Some(Frame {
-        request,
-        blobs: fields,
-    })
-}
-
-/// An output frame being built: the response and its blobs, which are
-/// wiped when dropped.
-#[derive(Default)]
-struct Output {
-    blobs: Vec<Zeroizing<Vec<u8>>>,
-}
+const DOMAIN: Domain = Domain {
+    invalid_input: "history.invalid_input",
+    serialization: "history.serialization",
+    panic: "history.panic",
+    input_limit: HISTORY_INPUT_LIMIT,
+};
 
 impl Output {
-    fn blob(&mut self, bytes: impl Into<Vec<u8>>) -> usize {
-        self.blobs.push(Zeroizing::new(bytes.into()));
-        self.blobs.len()
-    }
-
     fn write(&mut self, mut write: RecordWrite) -> Value {
         let account = write.account.name();
         let index = self.blob(std::mem::take(&mut *write.bytes));
         json!({ "account": account, "blob": index })
     }
-
-    /// A secret value as a blob, moved out of the wiped buffer that held it.
-    fn secret(&mut self, mut value: Zeroizing<String>) -> usize {
-        self.blob(std::mem::take(&mut *value).into_bytes())
-    }
-
-    /// The output frame: `response` with the ABI version, serialized once,
-    /// then every blob, in a buffer sized exactly.
-    fn finish(self, response: &impl Serialize) -> LPMEnvResult {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Framed<'r, R> {
-            #[serde(flatten)]
-            response: &'r R,
-            abi_version: u32,
-        }
-        /// Counts what a serialization writes, so the frame is sized once.
-        struct Counted(usize);
-        impl std::io::Write for Counted {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 += bytes.len();
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let framed = Framed {
-            response,
-            abi_version: ABI_VERSION,
-        };
-        // Serializing twice costs less than holding the JSON twice: the
-        // frame is written once, at its exact size.
-        let mut counted = Counted(0);
-        if serde_json::to_writer(&mut counted, &framed).is_err() {
-            return failure(3, "history.serialization");
-        }
-        let request_len = counted.0;
-        let total = 4
-            + 1
-            + 4
-            + 4
-            + request_len
-            + self.blobs.iter().map(|blob| 4 + blob.len()).sum::<usize>();
-        let mut frame = Vec::with_capacity(total);
-        frame.extend_from_slice(&FRAME_MAGIC);
-        frame.push(FRAME_VERSION);
-        frame.extend_from_slice(&((self.blobs.len() + 1) as u32).to_be_bytes());
-        frame.extend_from_slice(&(request_len as u32).to_be_bytes());
-        if serde_json::to_writer(&mut frame, &framed).is_err() {
-            return failure(3, "history.serialization");
-        }
-        for blob in &self.blobs {
-            frame.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-            frame.extend_from_slice(blob);
-        }
-        debug_assert_eq!(frame.len(), total);
-        result(0, frame, None)
-    }
-}
-
-fn refused(code: &str, message: Option<String>) -> LPMEnvResult {
-    let mut output = json!({ "abiVersion": ABI_VERSION, "code": code });
-    if let Some(message) = message {
-        output["message"] = json!(message);
-    }
-    result(
-        REFUSED,
-        serde_json::to_vec(&output).unwrap_or_default(),
-        None,
-    )
 }
 
 /// Run `handle` on a decoded frame and its parsed request, catching panics.
@@ -205,30 +77,8 @@ unsafe fn respond<R: for<'de> Deserialize<'de>>(
     length: usize,
     handle: impl FnOnce(R, &[&[u8]]) -> LPMEnvResult,
 ) -> LPMEnvResult {
-    if length > HISTORY_INPUT_LIMIT {
-        return failure(2, "history.invalid_input");
-    }
-    // SAFETY: Forwarded from this function's contract; the length is bounded above.
-    let Some(raw) = (unsafe { bytes(input, length) }) else {
-        return failure(2, "history.invalid_input");
-    };
-    catch_unwind(AssertUnwindSafe(|| {
-        let Some(frame) = decode_frame(raw) else {
-            return failure(2, "history.invalid_input");
-        };
-        let Ok(request) = serde_json::from_slice::<R>(frame.request) else {
-            return failure(2, "history.invalid_input");
-        };
-        handle(request, &frame.blobs)
-    }))
-    .unwrap_or_else(|_| failure(3, "history.panic"))
-}
-
-fn blob<'a>(blobs: &[&'a [u8]], index: usize) -> Option<&'a [u8]> {
-    index
-        .checked_sub(1)
-        .and_then(|index| blobs.get(index))
-        .copied()
+    // SAFETY: Forwarded from this function's contract.
+    unsafe { frame::respond(&DOMAIN, input, length, handle) }
 }
 
 #[derive(Deserialize)]
@@ -489,7 +339,7 @@ pub unsafe extern "C" fn lpm_env_history_record(input: *const u8, length: usize)
                 after: &after,
                 renames: &renames,
             };
-            let mut output = Output::default();
+            let mut output = Output::new(DOMAIN.serialization);
             let mut random = SystemRandom;
             match (request.create, request.append) {
                 (Some(create), None) => {
@@ -721,7 +571,7 @@ impl<'a> Opening<'a> {
     fn asked(&self) -> Option<LPMEnvResult> {
         self.needed
             .get()
-            .map(|part| Output::default().finish(&json!({ "needsParts": [part] })))
+            .map(|part| Output::new(DOMAIN.serialization).finish(&json!({ "needsParts": [part] })))
     }
 
     fn values(&self) -> Values<'_> {
@@ -1083,7 +933,7 @@ pub unsafe extern "C" fn lpm_env_history_timeline(input: *const u8, length: usiz
                     Ok(timeline) => timeline,
                     Err(error) => return opening.asked().unwrap_or_else(|| read_refusal(error)),
                 };
-                Output::default().finish(&timeline_out(
+                Output::new(DOMAIN.serialization).finish(&timeline_out(
                     &timeline,
                     opening.opened.record.current().generation(),
                 ))
@@ -1127,7 +977,7 @@ pub unsafe extern "C" fn lpm_env_history_reveal(input: *const u8, length: usize)
                     Ok(revealed) => revealed,
                     Err(error) => return opening.asked().unwrap_or_else(|| read_refusal(error)),
                 };
-                let mut output = Output::default();
+                let mut output = Output::new(DOMAIN.serialization);
                 let mut infos = Vec::with_capacity(revealed.len());
                 let mut blobs: Vec<Vec<Vec<ValuesOut>>> = Vec::with_capacity(revealed.len());
                 for entry in revealed {
@@ -1552,7 +1402,7 @@ pub unsafe extern "C" fn lpm_env_history_rollback(input: *const u8, length: usiz
                     Ok(plan) => plan,
                     Err(refusal) => return refusal,
                 };
-                let mut output = Output::default();
+                let mut output = Output::new(DOMAIN.serialization);
                 let Some(apply) = request.rest.apply else {
                     #[derive(Serialize)]
                     struct Planned {
@@ -1882,7 +1732,7 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                                 struct Reviewed<'a> {
                                     review: ReviewOut<'a>,
                                 }
-                                Output::default().finish(&Reviewed {
+                                Output::new(DOMAIN.serialization).finish(&Reviewed {
                                     review: review_out(&opening.opened, &review),
                                 })
                             }
@@ -1908,7 +1758,7 @@ pub unsafe extern "C" fn lpm_env_history_removal(input: *const u8, length: usize
                             &mut SystemRandom,
                         ) {
                             Ok(writes) => {
-                                let mut output = Output::default();
+                                let mut output = Output::new(DOMAIN.serialization);
                                 let writes: Vec<Value> = writes
                                     .into_iter()
                                     .map(|write| output.write(write))
@@ -1956,7 +1806,7 @@ pub unsafe extern "C" fn lpm_env_history_maintenance(
                     Err(refusal) => return refusal,
                 };
                 let opened = &opening.opened;
-                let mut output = Output::default();
+                let mut output = Output::new(DOMAIN.serialization);
                 let approval = request.rest.approval.as_deref().and_then(approval);
                 let response = match request.rest.step.as_str() {
                     "check" => {
@@ -2133,7 +1983,7 @@ pub unsafe extern "C" fn lpm_env_history_check(input: *const u8, length: usize) 
             } else {
                 Some(Vec::new())
             };
-            Output::default().finish(&Checked {
+            Output::new(DOMAIN.serialization).finish(&Checked {
                 history: name,
                 version,
                 tail_part: head.as_ref().map(Head::tail),
@@ -2218,7 +2068,7 @@ pub unsafe extern "C" fn lpm_env_history_admission(
                 CreationAdmission::Reduced => "reduced",
                 CreationAdmission::Refused => "refused",
             };
-            Output::default().finish(&json!({
+            Output::new(DOMAIN.serialization).finish(&json!({
                 "existing": existing,
                 "trims": trims.iter().map(|planned| json!({ "vaultId": planned.vault_id, "count": planned.count, "floor": planned.floor })).collect::<Vec<_>>(),
                 "afterTrims": after_trims,
@@ -2293,7 +2143,7 @@ pub unsafe extern "C" fn lpm_env_history_ring(input: *const u8, length: usize) -
             else {
                 return refused("history.damaged", None);
             };
-            let mut output = Output::default();
+            let mut output = Output::new(DOMAIN.serialization);
             let response = match request.action.as_str() {
                 "trim" => {
                     let Some(floor) = request.floor else {

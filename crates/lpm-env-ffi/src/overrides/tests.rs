@@ -1,0 +1,439 @@
+use std::collections::BTreeMap;
+
+use super::*;
+use crate::frame::{FRAME_MAGIC, FRAME_VERSION, decode_frame};
+use crate::{lpm_env_check, lpm_env_release};
+
+const VAULT: &str = "proj";
+const MARKER_ACCOUNT: &str = "__vault_features_v1__:cHJvag";
+const RECORD_ACCOUNT: &str = "__vault_companion_v1__:overrides:cHJvag";
+const OVERRIDES_MARKER: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+
+fn frame(request: &Value, blobs: &[&[u8]]) -> Vec<u8> {
+    let request = serde_json::to_vec(request).expect("json");
+    let mut out = Vec::new();
+    out.extend_from_slice(&FRAME_MAGIC);
+    out.push(FRAME_VERSION);
+    out.extend_from_slice(&((blobs.len() + 1) as u32).to_be_bytes());
+    out.extend_from_slice(&(request.len() as u32).to_be_bytes());
+    out.extend_from_slice(&request);
+    for blob in blobs {
+        out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        out.extend_from_slice(blob);
+    }
+    out
+}
+
+/// Call `function`, release its result, and return its status, response
+/// and blobs.
+fn call(
+    function: unsafe extern "C" fn(*const u8, usize) -> LPMEnvResult,
+    request: &Value,
+    blobs: &[&[u8]],
+) -> (u32, Value, Vec<Vec<u8>>) {
+    let input = frame(request, blobs);
+    // SAFETY: The input stays alive for the synchronous call.
+    let result = unsafe { function(input.as_ptr(), input.len()) };
+    // SAFETY: The result is unreleased and owned here.
+    let raw = unsafe { std::slice::from_raw_parts(result.data, result.length) }.to_vec();
+    let status = result.status;
+    // SAFETY: Released exactly once.
+    unsafe { lpm_env_release(result) };
+    if status != 0 {
+        return (
+            status,
+            serde_json::from_slice(&raw).expect("refusal json"),
+            Vec::new(),
+        );
+    }
+    let decoded = decode_frame(&raw).expect("an output frame");
+    (
+        status,
+        serde_json::from_slice(decoded.request).expect("response json"),
+        decoded.blobs.iter().map(|blob| blob.to_vec()).collect(),
+    )
+}
+
+/// A store the way the app keeps one: account names to bytes.
+#[derive(Default)]
+struct Store(BTreeMap<String, Vec<u8>>);
+
+impl Store {
+    fn get(&self, account: &str) -> Option<&[u8]> {
+        self.0.get(account).map(Vec::as_slice)
+    }
+
+    /// Plan `edits` as the app does: with the marker and the record read,
+    /// asking again with the names when the plan says so, then commit.
+    fn change(&mut self, edits: Value, values: &[&[u8]]) -> (u32, Value) {
+        let marker = self.get(MARKER_ACCOUNT).map(<[u8]>::to_vec);
+        let record = self.get(RECORD_ACCOUNT).map(<[u8]>::to_vec);
+        let mut blobs: Vec<&[u8]> = values.to_vec();
+        let mut request = json!({ "vaultId": VAULT, "edits": edits });
+        if let Some(marker) = &marker {
+            blobs.push(marker);
+            request["marker"] = json!(blobs.len());
+        }
+        if let Some(record) = &record {
+            blobs.push(record);
+            request["record"] = json!(blobs.len());
+        }
+        let (mut status, mut response, mut out) = call(lpm_env_overrides_plan, &request, &blobs);
+        if status == 0 && response["result"] == "needsNames" {
+            request["names"] = json!(self.0.keys().collect::<Vec<_>>());
+            (status, response, out) = call(lpm_env_overrides_plan, &request, &blobs);
+        }
+        if status == 0 && response["result"] == "planned" {
+            assert_eq!(response["journal"], true);
+            let mut next = self.0.clone();
+            for write in response["writes"].as_array().expect("writes") {
+                let index = write["blob"].as_u64().expect("blob") as usize;
+                next.insert(
+                    write["account"].as_str().expect("account").to_owned(),
+                    out[index - 1].clone(),
+                );
+            }
+            for delete in response["deletes"].as_array().expect("deletes") {
+                next.remove(delete.as_str().expect("account"));
+            }
+            self.0 = next;
+            out.clear();
+        }
+        (status, response)
+    }
+
+    fn read(&self, values: bool) -> (u32, Value, Vec<Vec<u8>>) {
+        let mut blobs: Vec<&[u8]> = Vec::new();
+        let mut request = json!({ "vaultId": VAULT, "values": values });
+        if let Some(marker) = self.get(MARKER_ACCOUNT) {
+            blobs.push(marker);
+            request["marker"] = json!(blobs.len());
+        }
+        if let Some(record) = self.get(RECORD_ACCOUNT) {
+            blobs.push(record);
+            request["record"] = json!(blobs.len());
+        }
+        call(lpm_env_overrides_read, &request, &blobs)
+    }
+}
+
+#[test]
+fn the_header_declares_both_override_functions_and_their_input_limit() {
+    let header = include_str!("../../include/lpm_env.h");
+    assert!(header.contains("#define LPM_ENV_OVERRIDES_INPUT_LIMIT (4 * 1024 * 1024)"));
+    assert_eq!(OVERRIDES_INPUT_LIMIT, 4 * 1024 * 1024);
+    for function in [
+        "LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);",
+        "LPMEnvResult lpm_env_overrides_plan(const uint8_t *input, size_t input_length);",
+    ] {
+        assert!(header.contains(function), "{function}");
+    }
+}
+
+#[test]
+fn a_set_unset_and_removal_round_trip_through_an_app_store() {
+    let mut store = Store::default();
+    let (status, planned) = store.change(
+        json!([
+            {"action": "set", "environment": "development", "key": "API_URL", "value": 1},
+            {"action": "unset", "environment": "development", "key": "SENTRY_DSN"},
+        ]),
+        &[b"http://localhost:4000"],
+    );
+    assert_eq!(status, 0, "{planned}");
+    assert_eq!(planned["result"], "planned");
+    assert_eq!(planned["activated"], true);
+    assert_eq!(planned["markerAfter"], "present");
+    assert!(
+        !planned.to_string().contains("localhost:4000"),
+        "a value never travels in JSON: {planned}"
+    );
+    assert_eq!(store.get(MARKER_ACCOUNT), Some(OVERRIDES_MARKER.as_bytes()));
+
+    let (status, read, values) = store.read(true);
+    assert_eq!(status, 0, "{read}");
+    assert_eq!(
+        read["environments"],
+        json!([{
+            "environment": "development",
+            "set": [{"key": "API_URL", "passed": true, "value": 1}],
+            "unset": [{"key": "SENTRY_DSN", "passed": true}],
+        }])
+    );
+    assert_eq!(values, [b"http://localhost:4000".to_vec()]);
+    let (_, names_only, values) = store.read(false);
+    assert!(values.is_empty());
+    assert!(
+        names_only["environments"][0]["set"][0]
+            .get("value")
+            .is_none()
+    );
+
+    let (status, cleared) = store.change(
+        json!([{"action": "clearEnvironment", "environment": "development"}]),
+        &[],
+    );
+    assert_eq!(status, 0, "{cleared}");
+    assert_eq!(cleared["markerAfter"], "absent");
+    assert_eq!(cleared["deletes"], json!([RECORD_ACCOUNT, MARKER_ACCOUNT]));
+    assert!(
+        store.0.is_empty(),
+        "nothing is left once the last override goes"
+    );
+    let (status, read, _) = store.read(true);
+    assert_eq!(status, 0);
+    assert_eq!(read["environments"], json!([]));
+}
+
+#[test]
+fn reading_a_name_lpm_never_passes_says_so() {
+    let mut store = Store::default();
+    store.0.insert(
+        MARKER_ACCOUNT.to_owned(),
+        OVERRIDES_MARKER.as_bytes().to_vec(),
+    );
+    store.0.insert(
+        RECORD_ACCOUNT.to_owned(),
+        br#"{"schemaVersion":1,"vaultId":"proj","environments":{"default":{"set":{"NODE_OPTIONS":"--inspect"},"unset":["CLASSPATH"]}}}"#.to_vec(),
+    );
+    let (status, read, _) = store.read(false);
+    assert_eq!(status, 0, "{read}");
+    assert_eq!(read["environments"][0]["set"][0]["passed"], false);
+    assert_eq!(read["environments"][0]["unset"][0]["passed"], false);
+}
+
+#[test]
+fn reading_damaged_unsupported_or_unfinished_overrides_is_refused() {
+    let cases: [(Option<&str>, Option<&str>, &str); 4] = [
+        (
+            Some(OVERRIDES_MARKER),
+            Some("{not json"),
+            "overrides.damaged",
+        ),
+        (
+            None,
+            Some(r#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#),
+            "overrides.damaged",
+        ),
+        (
+            Some(&OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#)),
+            None,
+            "overrides.unsupported",
+        ),
+        (
+            Some(&OVERRIDES_MARKER.replace(r#""state":"active"}}"#, r#""state":"removing"}}"#)),
+            None,
+            "overrides.needs_resume",
+        ),
+    ];
+    for (marker, record, code) in cases {
+        let mut store = Store::default();
+        if let Some(marker) = marker {
+            store
+                .0
+                .insert(MARKER_ACCOUNT.to_owned(), marker.as_bytes().to_vec());
+        }
+        if let Some(record) = record {
+            store
+                .0
+                .insert(RECORD_ACCOUNT.to_owned(), record.as_bytes().to_vec());
+        }
+        let (status, refused, _) = store.read(true);
+        assert_eq!(status, 5, "{code}: {refused}");
+        assert_eq!(refused["code"], code);
+        assert!(!refused.to_string().contains("not json"), "{refused}");
+    }
+}
+
+#[test]
+fn malformed_requests_are_invalid_input() {
+    for (request, blobs) in [
+        (json!({"vaultId": "../proj", "edits": []}), Vec::new()),
+        (
+            json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 1}]}),
+            vec![&[0xff_u8, 0xfe][..]],
+        ),
+        (
+            json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 2}]}),
+            vec![&b"x"[..]],
+        ),
+        (
+            json!({"vaultId": VAULT, "edits": [{"action": "rename"}]}),
+            Vec::new(),
+        ),
+        (
+            json!({"vaultId": VAULT, "record": 1, "edits": []}),
+            Vec::new(),
+        ),
+        (
+            json!({"vaultId": VAULT, "edits": vec![json!({"action": "clearAll"}); MAX_EDITS + 1]}),
+            Vec::new(),
+        ),
+    ] {
+        let (status, response, _) = call(lpm_env_overrides_plan, &request, &blobs);
+        assert_eq!(status, 2, "{request}: {response}");
+        assert_eq!(response["code"], "overrides.invalid_input");
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Fixture {
+    cases: Vec<FixtureCase>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FixtureCase {
+    name: String,
+    vault_id: String,
+    marker: Option<String>,
+    record: Option<String>,
+    names: Option<Vec<String>>,
+    edits: Vec<Value>,
+    expect: Value,
+}
+
+#[test]
+fn every_override_change_fixture_plans_through_the_engine_as_recorded() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../lpm-env-companion/tests/fixtures/override-changes.json"
+    ))
+    .expect("fixtures decode");
+    for case in fixture.cases {
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let edits: Vec<Value> = case
+            .edits
+            .iter()
+            .map(|edit| {
+                let mut edit = edit.clone();
+                if let Some(value) = edit.get("value").and_then(Value::as_str) {
+                    blobs.push(value.as_bytes().to_vec());
+                    edit["value"] = json!(blobs.len());
+                }
+                edit
+            })
+            .collect();
+        let mut request = json!({ "vaultId": case.vault_id, "edits": edits });
+        if let Some(marker) = &case.marker {
+            blobs.push(marker.as_bytes().to_vec());
+            request["marker"] = json!(blobs.len());
+        }
+        if let Some(record) = &case.record {
+            blobs.push(record.as_bytes().to_vec());
+            request["record"] = json!(blobs.len());
+        }
+        if let Some(names) = &case.names {
+            request["names"] = json!(names);
+        }
+        let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        let (status, response, out) = call(lpm_env_overrides_plan, &request, &blob_refs);
+        let expect = &case.expect;
+        match expect["result"].as_str().expect("a result") {
+            "refused" => {
+                assert_eq!(status, 5, "{}: {response}", case.name);
+                assert_eq!(response["code"], expect["code"], "{}", case.name);
+            }
+            result => {
+                assert_eq!(status, 0, "{}: {response}", case.name);
+                assert_eq!(response["result"], result, "{}", case.name);
+                if let Some(effects) = expect.get("effects") {
+                    assert_eq!(&response["effects"], effects, "{}", case.name);
+                }
+                if result == "planned" {
+                    let writes: BTreeMap<String, String> = response["writes"]
+                        .as_array()
+                        .expect("writes")
+                        .iter()
+                        .map(|write| {
+                            let index = write["blob"].as_u64().expect("blob") as usize;
+                            (
+                                write["account"].as_str().expect("account").to_owned(),
+                                String::from_utf8(out[index - 1].clone()).expect("UTF-8"),
+                            )
+                        })
+                        .collect();
+                    let expected: BTreeMap<String, String> =
+                        serde_json::from_value(expect["writes"].clone()).expect("writes");
+                    assert_eq!(writes, expected, "{}", case.name);
+                    assert_eq!(response["deletes"], expect["deletes"], "{}", case.name);
+                    assert_eq!(
+                        response["markerAfter"], expect["markerAfter"],
+                        "{}",
+                        case.name
+                    );
+                    assert_eq!(response["activated"], expect["activated"], "{}", case.name);
+                }
+            }
+        }
+    }
+}
+
+fn check(schema: &str, input: &Value) -> (u32, Value) {
+    let input = serde_json::to_vec(input).expect("json");
+    // SAFETY: Both ranges stay alive for the synchronous call.
+    let result =
+        unsafe { lpm_env_check(schema.as_ptr(), schema.len(), input.as_ptr(), input.len()) };
+    // SAFETY: The result is unreleased and owned here.
+    let raw = unsafe { std::slice::from_raw_parts(result.data, result.length) }.to_vec();
+    let status = result.status;
+    // SAFETY: Released exactly once.
+    unsafe { lpm_env_release(result) };
+    (status, serde_json::from_slice(&raw).expect("check json"))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[test]
+fn the_check_judges_what_a_run_gets_with_the_overrides_and_names_them() {
+    let schema = r#"{"vars":{"API_URL":{"format":"url"},"TOKEN":{"required":true}}}"#;
+    let record = br#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"API_URL":"not a url"},"unset":["TOKEN"]}}}"#;
+    let environments = json!({
+        "default": {"API_URL": "https://team.example", "TOKEN": "team"},
+        "staging": {},
+    });
+    let (status, team) = check(schema, &json!({ "environments": environments }));
+    assert_eq!(status, 0, "{team}");
+    assert_eq!(team["environments"]["staging"]["problems"], json!([]));
+
+    let (status, effective) = check(
+        schema,
+        &json!({
+            "environments": environments,
+            "overrides": {"vaultId": VAULT, "marker": base64(OVERRIDES_MARKER.as_bytes()), "record": base64(record)},
+        }),
+    );
+    assert_eq!(status, 0, "{effective}");
+    let staging = &effective["environments"]["staging"];
+    assert_eq!(staging["readsDefaultEnvironment"], true);
+    assert_eq!(
+        staging["problems"],
+        json!([
+            {"key": "API_URL", "code": "env.invalid_format", "format": "url", "personalOverride": true},
+            {"key": "TOKEN", "code": "env.required", "personalOverride": true},
+        ])
+    );
+    assert_eq!(staging["appliedOverrides"], json!(["API_URL", "TOKEN"]));
+    assert!(
+        effective["environments"]["default"]
+            .get("appliedOverrides")
+            .is_none()
+    );
+    assert!(!effective.to_string().contains("not a url"));
+}
+
+#[test]
+fn the_check_refuses_overrides_it_cant_apply() {
+    let (status, refused) = check(
+        r#"{"vars":{"A":{}}}"#,
+        &json!({
+            "environments": {"default": {"A": "1"}},
+            "overrides": {"vaultId": VAULT, "marker": base64(OVERRIDES_MARKER.as_bytes()), "record": base64(b"{not json")},
+        }),
+    );
+    assert_eq!(status, 1, "{refused}");
+    assert_eq!(refused["code"], "overrides.damaged");
+}

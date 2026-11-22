@@ -45,7 +45,7 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
             override_count,
             loaded.env_name.as_deref().unwrap_or("default"),
         );
-        dotenv::log_personal_override_names(loaded.layers.overrides());
+        dotenv::log_personal_override_names(&loaded.layers.override_names());
     }
 
     // Build parts and join with " · "

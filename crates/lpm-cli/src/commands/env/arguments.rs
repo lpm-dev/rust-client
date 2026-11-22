@@ -72,6 +72,71 @@ From the prompt, standard input or a file, a value that is one line loses the
 line break at its end. A value of several lines, such as a PEM key, is kept
 exactly, except that each line break pasted into the prompt is a line feed.";
 
+const OVERRIDE_SET_AFTER_HELP: &str = "\
+Examples:
+  lpm env override set DATABASE_URL --env=development    Ask for the value, hidden
+  echo \"$LOCAL_URL\" | lpm env override set API_URL --stdin
+  lpm env override set --from-file TLS_KEY=./dev.key
+  lpm env override set LOG_LEVEL=debug                   A value that isn't secret
+
+A personal override is this computer's own value for a key. LPM applies it when
+it runs, prints or checks the project here. It never syncs, and LPM leaves it
+out when it pushes values or sends them to CI or a platform. LPM CLI 0.82.0 or
+later applies overrides; an older version runs with team values.
+
+A KEY=VALUE argument is saved in your shell history and is visible to other
+processes on this computer while lpm runs. Use it only for values that aren't
+secret.";
+
+#[derive(Subcommand)]
+pub(super) enum OverrideAction {
+    /// Give keys this computer's own value, on top of the team's.
+    #[command(after_help = OVERRIDE_SET_AFTER_HELP)]
+    Set {
+        #[command(flatten)]
+        environment: Environment,
+        #[command(flatten)]
+        values: Values,
+    },
+    /// Leave out the project's value for keys when LPM runs the project on
+    /// this computer.
+    Unset {
+        #[command(flatten)]
+        environment: Environment,
+        #[arg(required = true, num_args = 1.., value_name = "KEY")]
+        keys: Vec<String>,
+    },
+    /// Remove this computer's override of keys, so the project's value
+    /// applies again.
+    Remove {
+        #[command(flatten)]
+        environment: Environment,
+        #[arg(required = true, num_args = 1.., value_name = "KEY")]
+        keys: Vec<String>,
+    },
+    /// List this computer's overrides: names only, values with --reveal.
+    /// Every environment's, unless --env picks one.
+    List {
+        #[command(flatten)]
+        environment: Environment,
+        /// Show values.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Remove every override of one environment, or of all of them.
+    #[command(group(clap::ArgGroup::new("scope").required(true).args(["env", "all"])))]
+    Clear {
+        #[command(flatten)]
+        environment: Environment,
+        /// Every environment's overrides.
+        #[arg(long, conflicts_with = "env")]
+        all: bool,
+        /// Remove them without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub(super) enum LocalAction {
     /// Store values in this project's env.
@@ -172,6 +237,11 @@ pub(super) enum LocalAction {
     Init {
         #[arg(long)]
         force: bool,
+    },
+    /// This computer's own values for keys, on top of the team's.
+    Override {
+        #[command(subcommand)]
+        action: OverrideAction,
     },
     /// Show what's damaged in this project's newer data, such as its personal
     /// overrides, and repair it.
@@ -346,6 +416,7 @@ impl LocalAction {
             | Self::Check { .. }
             | Self::Validate { .. }
             | Self::Repair { .. }
+            | Self::Override { .. }
             | Self::History { .. }
             | Self::Rollback { .. }
             | Self::Copy { .. } => true,
@@ -374,7 +445,7 @@ fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> 
 
 const LOCAL_SYNC_SUBCOMMANDS: &[&str] = &[
     "set", "get", "list", "delete", "import", "export", "print", "example", "check", "validate",
-    "schema", "generate", "init", "repair", "ls", "copy", "cp", "history", "rollback", "link",
+    "schema", "generate", "init", "repair", "override", "ls", "copy", "cp", "history", "rollback", "link",
     "unlink", "links",
 ];
 

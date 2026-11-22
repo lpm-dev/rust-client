@@ -1,0 +1,494 @@
+//! `lpm env override`: this computer's own values for a project's keys, on
+//! top of its team values. The engine plans every change and validates it;
+//! this module collects input, asks before clearing, and reports what each
+//! change did by name, never by value.
+
+use lpm_vault::overrides::{Edit, Effect, Previous};
+
+use super::arguments::{OverrideAction, Values};
+use super::prelude::*;
+use crate::prompt::PromptResultExt as _;
+use lpm_runner::dotenv::THIS_MACHINE;
+
+/// What a value shows as when it's hidden.
+const HIDDEN: &str = "••••••••";
+
+/// The release that first applied personal overrides; an older LPM CLI
+/// runs a project with team values only.
+const FIRST_RELEASE_APPLYING_OVERRIDES: &str = "0.82.0";
+
+pub(super) fn run(
+    action: OverrideAction,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    match action {
+        OverrideAction::Set {
+            environment,
+            values,
+        } => set(
+            environment.env.as_deref(),
+            &values,
+            project_dir,
+            json_output,
+        ),
+        OverrideAction::Unset { environment, keys } => change_keys(
+            environment.env.as_deref(),
+            &keys,
+            KeyChange::Unset,
+            project_dir,
+            json_output,
+        ),
+        OverrideAction::Remove { environment, keys } => change_keys(
+            environment.env.as_deref(),
+            &keys,
+            KeyChange::Remove,
+            project_dir,
+            json_output,
+        ),
+        OverrideAction::List {
+            environment,
+            reveal,
+        } => list(environment.env.as_deref(), reveal, project_dir, json_output),
+        OverrideAction::Clear {
+            environment,
+            all: _,
+            yes,
+        } => clear(environment.env.as_deref(), yes, project_dir, json_output),
+    }
+}
+
+/// The environment `--env` names, resolved through lpm.json's aliases to the
+/// name overrides are stored under; `default` without one.
+fn environment(env_input: Option<&str>, project_dir: &std::path::Path) -> Result<String, LpmError> {
+    let (resolved, _config) = super::local::resolve_env_from_flag(env_input, project_dir)?;
+    Ok(resolved.unwrap_or_else(|| lpm_env::DEFAULT_ENVIRONMENT.to_owned()))
+}
+
+fn vault_error(error: String) -> LpmError {
+    lpm_runner::dotenv::vault_error(LpmError::Env)(error)
+}
+
+fn set(
+    env_input: Option<&str>,
+    values: &Values,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let environment = environment(env_input, project_dir)?;
+    let assignments = super::value_input::collect(
+        &super::value_input::Request {
+            entries: &values.entries,
+            stdin: values.stdin,
+            from_files: &values.from_files,
+            json_output,
+            command: "lpm env override set",
+        },
+        &mut super::value_input::ProcessSources,
+    )?;
+    // A key given twice as KEY=VALUE keeps its last value, as `env set` does.
+    let mut seen = std::collections::HashSet::with_capacity(assignments.len());
+    let mut edits: Vec<Edit> = assignments
+        .into_iter()
+        .rev()
+        .filter(|assignment| seen.insert(assignment.key.clone()))
+        .map(|assignment| Edit::Set {
+            environment: environment.clone(),
+            key: assignment.key,
+            value: assignment.value,
+        })
+        .collect();
+    edits.reverse();
+    let change = lpm_vault::overrides::change(project_dir, &edits).map_err(vault_error)?;
+    let warnings: Vec<(&str, lpm_env::ValueCharacters)> = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            Edit::Set { key, value, .. } => {
+                lpm_env::check_value_characters(value).map(|found| (key.as_str(), found))
+            }
+            _ => None,
+        })
+        .collect();
+    if json_output {
+        let mut envelope = key_changes_json(&environment, &change);
+        envelope["value_warnings"] = serde_json::Value::Array(
+            warnings
+                .iter()
+                .map(|(key, found)| super::characters::json(key, found))
+                .collect(),
+        );
+        println!("{envelope}");
+        return Ok(());
+    }
+    for effect in &change.effects {
+        if let Effect::Key {
+            key,
+            previous,
+            changed,
+            ..
+        } = effect
+        {
+            if *changed {
+                output::success_line(install_ui::terminal_line!(
+                    "{} {} on {} ({})",
+                    install_ui::bold(key),
+                    if *previous == Previous::None {
+                        "has an override"
+                    } else {
+                        "has a new override"
+                    },
+                    THIS_MACHINE,
+                    &environment,
+                ));
+            } else {
+                output::info_line(install_ui::terminal_line!(
+                    "{} already had that override ({})",
+                    install_ui::bold(key),
+                    &environment,
+                ));
+            }
+        }
+    }
+    for (key, found) in &warnings {
+        super::characters::warn_stored(key, found);
+    }
+    report_storage(&change);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum KeyChange {
+    Unset,
+    Remove,
+}
+
+fn change_keys(
+    env_input: Option<&str>,
+    keys: &[String],
+    kind: KeyChange,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    // A name that isn't a key may be a value typed in the wrong place, so
+    // it's never repeated back.
+    if !keys.iter().all(|key| lpm_env::is_valid_env_var_name(key)) {
+        return Err(LpmError::Env(
+            "env keys must match [A-Za-z_][A-Za-z0-9_]*".into(),
+        ));
+    }
+    let environment = environment(env_input, project_dir)?;
+    let edits: Vec<Edit> = keys
+        .iter()
+        .map(|key| match kind {
+            KeyChange::Unset => Edit::Unset {
+                environment: environment.clone(),
+                key: key.clone(),
+            },
+            KeyChange::Remove => Edit::Remove {
+                environment: environment.clone(),
+                key: key.clone(),
+            },
+        })
+        .collect();
+    let change = lpm_vault::overrides::change(project_dir, &edits).map_err(vault_error)?;
+    if json_output {
+        println!("{}", key_changes_json(&environment, &change));
+        return Ok(());
+    }
+    for effect in &change.effects {
+        let Effect::Key {
+            key,
+            previous,
+            changed,
+            ..
+        } = effect
+        else {
+            continue;
+        };
+        match (kind, changed, previous) {
+            (KeyChange::Unset, true, _) => output::success_line(install_ui::terminal_line!(
+                "{} gets no value from the project on {} ({})",
+                install_ui::bold(key),
+                THIS_MACHINE,
+                &environment,
+            )),
+            (KeyChange::Unset, false, _) => output::info_line(install_ui::terminal_line!(
+                "{} already gets no value from the project ({})",
+                install_ui::bold(key),
+                &environment,
+            )),
+            (KeyChange::Remove, true, _) => output::success_line(install_ui::terminal_line!(
+                "{} uses the project's value again on {} ({})",
+                install_ui::bold(key),
+                THIS_MACHINE,
+                &environment,
+            )),
+            (KeyChange::Remove, false, _) => install_ui::warn_line(install_ui::terminal_line!(
+                "{} had no override ({}); nothing to remove",
+                install_ui::bold(key),
+                &environment,
+            )),
+        }
+    }
+    report_storage(&change);
+    Ok(())
+}
+
+/// A set, unset or remove for `--json`: what each key had and whether the
+/// change touched it.
+fn key_changes_json(environment: &str, change: &lpm_vault::overrides::Change) -> serde_json::Value {
+    let changes: Vec<serde_json::Value> = change
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Key {
+                key,
+                previous,
+                changed,
+                ..
+            } => Some(serde_json::json!({
+                "key": key,
+                "previous": previous,
+                "changed": changed,
+            })),
+            _ => None,
+        })
+        .collect();
+    serde_json::json!({
+        "success": true,
+        "env": environment,
+        "changes": changes,
+        "activated": change.activated,
+    })
+}
+
+/// Say once, when a project gets its first override, which LPM CLIs apply
+/// it, and when the computer holds more newer data than it should.
+fn report_storage(change: &lpm_vault::overrides::Change) {
+    if change.activated {
+        output::warn_line(install_ui::terminal_line!(
+            "LPM CLI {} or later applies personal overrides; an older LPM CLI runs this project with team values",
+            FIRST_RELEASE_APPLYING_OVERRIDES,
+        ));
+    }
+    if change.over_admission_target {
+        output::warn_line(install_ui::terminal_line!(
+            "this computer's env storage holds more newer data than it should; delete env projects you no longer use"
+        ));
+    }
+}
+
+fn list(
+    env_input: Option<&str>,
+    reveal: bool,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let selected = env_input
+        .map(|_| environment(env_input, project_dir))
+        .transpose()?;
+    let mut all = lpm_vault::overrides::read_all(project_dir).map_err(vault_error)?;
+    if let Some(selected) = &selected {
+        all.retain(|name, _| name == selected);
+    }
+    let listed: Vec<Listed> = all
+        .into_iter()
+        .map(|(environment, overrides)| {
+            let mut set: Vec<(String, String)> = overrides.set.into_iter().collect();
+            set.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            let mut unset = overrides.unset;
+            unset.sort_unstable();
+            Listed {
+                environment,
+                set,
+                unset,
+            }
+        })
+        .collect();
+    if json_output {
+        let environments: Vec<serde_json::Value> = listed
+            .iter()
+            .map(
+                |Listed {
+                     environment,
+                     set,
+                     unset,
+                 }| {
+                    serde_json::json!({
+                        "env": environment,
+                        "set": set.iter().map(|(key, value)| serde_json::json!({
+                            "key": key,
+                            "value": if reveal { value.as_str() } else { HIDDEN },
+                            "passed": !lpm_env::is_denied_env_var(key),
+                        })).collect::<Vec<_>>(),
+                        "unset": unset.iter().map(|key| serde_json::json!({
+                            "key": key,
+                            "passed": !lpm_env::is_denied_env_var(key),
+                        })).collect::<Vec<_>>(),
+                    })
+                },
+            )
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"success": true, "environments": environments})
+        );
+        return Ok(());
+    }
+    if listed.is_empty() {
+        match &selected {
+            Some(environment) => output::info(&format!(
+                "No personal overrides on {THIS_MACHINE} ({environment})"
+            )),
+            None => output::info(&format!("No personal overrides on {THIS_MACHINE}")),
+        }
+        println!(
+            "  Run {} to add one",
+            "lpm env override set KEY --env=ENV".cyan()
+        );
+        return Ok(());
+    }
+    for Listed {
+        environment,
+        set,
+        unset,
+    } in &listed
+    {
+        output::info(&format!(
+            "Personal overrides on {THIS_MACHINE} — {environment} ({})",
+            set.len() + unset.len()
+        ));
+        for (key, value) in set {
+            let never_passed = if lpm_env::is_denied_env_var(key) {
+                "  (LPM never passes it to processes)"
+            } else {
+                ""
+            };
+            let line = if reveal {
+                install_ui::terminal_line!(
+                    "  {} = {}{}",
+                    install_ui::bold(key),
+                    value,
+                    install_ui::dim(never_passed),
+                )
+            } else {
+                install_ui::terminal_line!(
+                    "  {} = {}{}",
+                    install_ui::bold(key),
+                    install_ui::dim(HIDDEN),
+                    install_ui::dim(never_passed),
+                )
+            };
+            println!("{line}");
+        }
+        for key in unset {
+            println!(
+                "{}",
+                install_ui::terminal_line!(
+                    "  {} {}",
+                    install_ui::bold(key),
+                    install_ui::dim("(no value from the project)"),
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One environment's overrides, in order.
+struct Listed {
+    environment: String,
+    set: Vec<(String, String)>,
+    unset: Vec<String>,
+}
+
+fn clear(
+    env_input: Option<&str>,
+    yes: bool,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let selected = env_input
+        .map(|_| environment(env_input, project_dir))
+        .transpose()?;
+    let all = lpm_vault::overrides::read_all(project_dir).map_err(vault_error)?;
+    let count: usize = match &selected {
+        Some(environment) => all
+            .get(environment)
+            .map_or(0, lpm_vault::PersonalOverrides::len),
+        None => all.values().map(lpm_vault::PersonalOverrides::len).sum(),
+    };
+    let scope = match &selected {
+        Some(environment) => environment.clone(),
+        None => "every environment".to_owned(),
+    };
+    if count > 0 {
+        let question = format!(
+            "Remove {count} personal override{} on {THIS_MACHINE} ({scope})?",
+            if count == 1 { "" } else { "s" }
+        );
+        match confirm(&question, yes, json_output)? {
+            Some(true) => {}
+            Some(false) => {
+                output::info("nothing was changed");
+                return Ok(());
+            }
+            None => {
+                return Err(LpmError::ConfirmationRequired {
+                    command: "lpm env override clear",
+                    change: question,
+                    help: "Run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+                });
+            }
+        }
+    }
+    let edit = match &selected {
+        Some(environment) => Edit::ClearEnvironment {
+            environment: environment.clone(),
+        },
+        None => Edit::ClearAll,
+    };
+    let change = lpm_vault::overrides::change(project_dir, &[edit]).map_err(vault_error)?;
+    let removed = change
+        .effects
+        .iter()
+        .map(|effect| match effect {
+            Effect::Cleared { removed, .. } => *removed,
+            _ => 0,
+        })
+        .sum::<usize>();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"success": true, "env": selected, "removed": removed})
+        );
+    } else if removed == 0 {
+        output::info(&format!("No personal overrides to remove ({scope})"));
+    } else {
+        output::success_line(install_ui::terminal_line!(
+            "removed {} personal override{} on {} ({})",
+            install_ui::bold(&removed.to_string()),
+            if removed == 1 { "" } else { "s" },
+            THIS_MACHINE,
+            &scope,
+        ));
+    }
+    Ok(())
+}
+
+/// Ask a yes-or-no question that defaults to No, or skip it with `yes`.
+/// `Ok(None)` means there's no terminal to ask on.
+fn confirm(question: &str, yes: bool, json_output: bool) -> Result<Option<bool>, LpmError> {
+    use std::io::IsTerminal as _;
+    if yes {
+        return Ok(Some(true));
+    }
+    if json_output || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None);
+    }
+    cliclack::confirm(question)
+        .initial_value(false)
+        .interact()
+        .map(Some)
+        .map_prompt_err(|error| LpmError::Env(format!("prompt failed: {error}")))
+}

@@ -112,13 +112,23 @@ fn prompt_folder(folder: &std::path::Path) -> String {
 /// Run `run` with every approval prompt saying it's for the project's
 /// local history, as a history command's one prompt must.
 pub(crate) fn prompting_for_local_history<T>(run: impl FnOnce() -> T) -> T {
+    prompting_for("local history", run)
+}
+
+/// Run `run` with every approval prompt saying it's for the project's
+/// personal overrides, as an overrides command's one prompt must.
+pub(crate) fn prompting_for_personal_overrides<T>(run: impl FnOnce() -> T) -> T {
+    prompting_for("personal overrides", run)
+}
+
+fn prompting_for<T>(purpose: &'static str, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<&'static str>);
     impl Drop for Restore {
         fn drop(&mut self) {
             PURPOSE.set(self.0);
         }
     }
-    let _restore = Restore(PURPOSE.replace(Some("local history")));
+    let _restore = Restore(PURPOSE.replace(Some(purpose)));
     run()
 }
 

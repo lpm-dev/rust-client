@@ -468,11 +468,24 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
             }
             Ok(lpm_runner::dotenv::compose_with_overrides(
-                values, overrides,
+                values,
+                overrides,
+                lpm_runner::dotenv::OverridePolicy::Apply,
             ))
         })();
+        // Without the project's files, count what the overrides change in
+        // its stored values, as a run would count them over those alone.
         let override_count = composed.as_ref().map_or_else(
-            |_| overrides.map_or(0, lpm_vault::PersonalOverrides::len),
+            |_| {
+                overrides.map_or(0, |overrides| {
+                    lpm_runner::dotenv::OverrideOrigins::changing(
+                        effective_vars.unwrap_or(&HashMap::new()),
+                        overrides.layer(),
+                        cfg!(windows),
+                    )
+                    .len()
+                })
+            },
             lpm_runner::dotenv::ChildEnv::override_count,
         );
 

@@ -77,35 +77,6 @@ fn unset_removes_the_project_value_and_an_empty_string_is_a_value() {
 }
 
 #[test]
-fn overrides_match_names_without_case_where_the_host_ignores_case() {
-    let mut vars = map(&[
-        ("api_url", "team"),
-        ("Sentry_Dsn", "team"),
-        ("KEEP", "team"),
-    ]);
-    apply_overrides_with_case_policy(
-        &mut vars,
-        &overrides(&[("API_URL", "mine")], &["SENTRY_DSN"]),
-        true,
-    );
-
-    assert_eq!(vars, map(&[("API_URL", "mine"), ("KEEP", "team")]));
-
-    let mut exact = map(&[("api_url", "team")]);
-    apply_overrides_with_case_policy(&mut exact, &overrides(&[("API_URL", "mine")], &[]), false);
-    assert_eq!(exact, map(&[("api_url", "team"), ("API_URL", "mine")]));
-}
-
-#[test]
-fn non_ascii_names_use_the_hosts_own_comparison() {
-    let mut vars = map(&[("ÄPI", "team"), ("API", "team")]);
-    apply_overrides_with_case_policy(&mut vars, &overrides(&[("API", "mine")], &[]), true);
-
-    assert_eq!(vars["API"], "mine");
-    assert_eq!(vars["ÄPI"], "team");
-}
-
-#[test]
 fn composed_layers_refuse_service_values_after_the_overrides() {
     let child = layers(&[("A", "0")], overrides(&[("A", "1")], &[]))
         .compose(None, None)
@@ -151,47 +122,6 @@ fn validation_failures_name_an_override_only_while_it_is_the_final_origin() {
     assert!(
         !message.contains("personal override"),
         "a later layer's value is its own, even when it equals the override's: {message}"
-    );
-}
-
-#[test]
-fn an_unset_is_blamed_only_for_the_value_it_left_missing() {
-    let origins =
-        OverrideOrigins::changing(&map(&[("PORT", "8080")]), &overrides(&[], &["PORT"]), false);
-    let empty = HashMap::new();
-    assert!(origins.caused(
-        &error("PORT", lpm_env::ValidationErrorKind::Missing),
-        &empty
-    ));
-    let invalid = error(
-        "PORT",
-        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "port" },
-    );
-    assert!(
-        !origins.caused(&invalid, &empty),
-        "an invalid value came from somewhere the unset didn't"
-    );
-}
-
-#[test]
-fn an_override_is_found_under_the_declared_spelling_where_the_host_ignores_case() {
-    let origins = OverrideOrigins::changing(
-        &HashMap::new(),
-        &overrides(&[("api_url", "not a url")], &[]),
-        true,
-    );
-    let invalid = error(
-        "API_URL",
-        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
-    );
-    assert!(origins.caused(&invalid, &map(&[("API_URL", "not a url")])));
-    assert!(
-        !OverrideOrigins::changing(
-            &HashMap::new(),
-            &overrides(&[("api_url", "not a url")], &[]),
-            false
-        )
-        .caused(&invalid, &map(&[("API_URL", "not a url")]))
     );
 }
 

@@ -194,8 +194,21 @@ fn format_print_env(
         lpm_runner::dotenv::OverridePolicy::Apply,
     )?;
     // Every format is machine-readable, so overridden keys are reported on
-    // stderr, never marked in the output.
-    lpm_runner::dotenv::announce_personal_overrides(&composed, resolved_mode.unwrap_or("default"));
+    // stderr, never marked in the output, under the environment's own name
+    // as runs report it.
+    let environment = resolved_mode.map_or_else(
+        || lpm_env::DEFAULT_ENVIRONMENT.to_owned(),
+        |mode| {
+            let no_aliases = std::collections::HashMap::new();
+            lpm_env::resolver::resolve(
+                mode,
+                config.map_or(&no_aliases, |config| &config.env),
+                config.and_then(|config| config.environments.as_ref()),
+            )
+            .canonical
+        },
+    );
+    lpm_runner::dotenv::announce_personal_overrides(&composed, &environment);
     let mut env_vars = composed.into_vars();
     let schema = config.and_then(|c| c.env_schema.as_ref());
 
@@ -271,15 +284,19 @@ pub(super) fn vars_check(
     let _env_access_binding = env_access.bind();
     let all_envs = match env_input {
         Some(_) => check_environments(env_input, lpm_config.as_ref(), || Ok(HashMap::new()))?,
-        None => lpm_runner::dotenv::read_vault_environments_for_run(project_dir, |vault_envs| {
-            let empty_env_map = HashMap::new();
-            let config = lpm_config.as_ref();
-            lpm_env::resolver::list_all(
-                config.map_or(&empty_env_map, |c| &c.env),
-                config.and_then(|c| c.environments.as_ref()),
-                vault_envs,
-            )
-        })
+        None => lpm_runner::dotenv::read_vault_environments_for_run(
+            project_dir,
+            lpm_runner::dotenv::OverridePolicy::Apply,
+            |vault_envs| {
+                let empty_env_map = HashMap::new();
+                let config = lpm_config.as_ref();
+                lpm_env::resolver::list_all(
+                    config.map_or(&empty_env_map, |c| &c.env),
+                    config.and_then(|c| c.environments.as_ref()),
+                    vault_envs,
+                )
+            },
+        )
         .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?
         .unwrap_or_default(),
     };

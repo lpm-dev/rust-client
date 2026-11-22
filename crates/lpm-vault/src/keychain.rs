@@ -24,6 +24,7 @@ use crate::macos_keychain::{
 
 mod companion_gate;
 mod history;
+pub(crate) mod overrides;
 
 pub(crate) use history::history_store;
 
@@ -2709,6 +2710,7 @@ mod tests {
 
     mod companion;
     mod history;
+    mod overrides;
 
     #[test]
     fn large_env_data_is_warned_of_in_binary_units() {

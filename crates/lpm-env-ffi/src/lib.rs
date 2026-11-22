@@ -18,7 +18,9 @@ mod backup;
 mod characters;
 mod companion;
 mod files;
+mod frame;
 mod history;
+mod overrides;
 
 /// The engine holds env values, decrypted backups and passphrases, so all
 /// memory it frees is wiped first, including what its dependencies free.
@@ -355,6 +357,35 @@ pub unsafe extern "C" fn lpm_env_verify(snapshot: *const c_void) -> u32 {
 #[serde(deny_unknown_fields)]
 struct CheckInput {
     environments: BTreeMap<String, HashMap<String, String>>,
+    /// The project's personal overrides record, with its marker, as read in
+    /// the caller's lock: given, each environment is checked as a run on
+    /// this computer gets it.
+    #[serde(default)]
+    overrides: Option<CheckOverrides>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckOverrides {
+    vault_id: String,
+    #[serde(default)]
+    marker: Option<Base64>,
+    #[serde(default)]
+    record: Option<Base64>,
+}
+
+/// Stored bytes as standard base64 in JSON.
+struct Base64(Vec<u8>);
+
+impl<'de> Deserialize<'de> for Base64 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use base64::Engine as _;
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map(Self)
+            .map_err(|_| serde::de::Error::custom("invalid base64"))
+    }
 }
 
 #[derive(Serialize)]
@@ -364,6 +395,9 @@ struct CheckedEnvironment {
     problems: Vec<Problem>,
     defaults: BTreeMap<String, String>,
     ignored: Vec<String>,
+    /// The personal overrides that change the environment, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied_overrides: Vec<String>,
 }
 
 /// A rule violation without the offending value: a stable code and the
@@ -380,6 +414,12 @@ struct Problem {
     group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<lpm_env::VarGroupMode>,
+    /// A personal override on this computer caused the problem.
+    #[serde(
+        rename = "personalOverride",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    personal_override: bool,
 }
 
 impl From<lpm_env::ValidationError> for Problem {
@@ -392,6 +432,7 @@ impl From<lpm_env::ValidationError> for Problem {
             constraint: None,
             group: None,
             mode: None,
+            personal_override: false,
         };
         match error.kind {
             lpm_env::ValidationErrorKind::InvalidFormat { expected, .. } => {
@@ -415,6 +456,7 @@ impl From<lpm_env::ValidationError> for Problem {
 struct Checks<'a, 's> {
     validator: &'a lpm_env::EnvValidator<'s>,
     environments: &'a BTreeMap<String, HashMap<String, String>>,
+    overrides: &'a BTreeMap<String, lpm_env_companion::overrides::PersonalOverrides>,
     /// Set when an environment's names differ only in case on a host that ignores case.
     conflict: &'a std::cell::Cell<bool>,
 }
@@ -424,18 +466,38 @@ impl Serialize for Checks<'_, '_> {
         use serde::ser::{Error, SerializeMap};
         let mut map = serializer.serialize_map(Some(self.environments.len()))?;
         for name in self.environments.keys() {
-            let Ok(check) = lpm_env::check_stored_values(self.validator, name, self.environments)
-            else {
+            let checked = match self.overrides.get(name) {
+                Some(overrides) => lpm_env::check_stored_values_with_overrides(
+                    self.validator,
+                    name,
+                    self.environments,
+                    overrides.layer(),
+                ),
+                None => lpm_env::check_stored_values(self.validator, name, self.environments),
+            };
+            let Ok(check) = checked else {
                 self.conflict.set(true);
                 return Err(S::Error::custom("ambiguous environment variable casing"));
             };
+            let from_overrides = &check.from_overrides;
             map.serialize_entry(
                 name,
                 &CheckedEnvironment {
                     reads_default_environment: check.reads_default_environment,
-                    problems: check.errors.into_iter().map(Problem::from).collect(),
+                    problems: check
+                        .errors
+                        .into_iter()
+                        .map(|error| {
+                            let caused = from_overrides.contains(&error.key);
+                            Problem {
+                                personal_override: caused,
+                                ..Problem::from(error)
+                            }
+                        })
+                        .collect(),
                     defaults: check.defaults,
                     ignored: check.ignored,
+                    applied_overrides: check.applied_overrides,
                 },
             )?;
         }
@@ -491,6 +553,17 @@ pub unsafe extern "C" fn lpm_env_check(
         if input.environments.len() > CHECK_ENVIRONMENT_LIMIT {
             return failure(4, "env.check_budget");
         }
+        let overrides = match &input.overrides {
+            None => BTreeMap::new(),
+            Some(given) => match overrides::for_check(
+                &given.vault_id,
+                given.marker.as_ref().map(|bytes| bytes.0.as_slice()),
+                given.record.as_ref().map(|bytes| bytes.0.as_slice()),
+            ) {
+                Ok(overrides) => overrides,
+                Err(code) => return failure(1, code),
+            },
+        };
         let rule_work = schema.vars.values().fold(schema.vars.len(), |work, rule| {
             rule.enum_values.as_ref().map_or(work, |allowed| {
                 allowed.iter().fold(work, |work, value| {
@@ -520,6 +593,11 @@ pub unsafe extern "C" fn lpm_env_check(
                     };
                 work.saturating_add(per_environment)
                     .saturating_add(selected_values)
+                    .saturating_add(
+                        overrides
+                            .get(name)
+                            .map_or(0, lpm_env_companion::overrides::PersonalOverrides::len),
+                    )
             });
         if work > CHECK_WORK_LIMIT {
             return failure(4, "env.check_budget");
@@ -540,6 +618,7 @@ pub unsafe extern "C" fn lpm_env_check(
             environments: Checks {
                 validator: &validator,
                 environments: &input.environments,
+                overrides: &overrides,
                 conflict: &conflict,
             },
         };

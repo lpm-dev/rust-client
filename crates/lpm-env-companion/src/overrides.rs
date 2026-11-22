@@ -14,9 +14,29 @@ use lpm_common::stored_env::{is_valid_environment_name, is_valid_variable_name};
 use serde::{Deserialize, Deserializer};
 
 use crate::gate::{Damage, ProjectGate};
-use crate::marker::{FeatureState, MAX_RECORD_BYTES, UniqueMapVisitor, describe_json_error};
+use crate::marker::{
+    FeatureEntry, FeatureState, Level, MAX_RECORD_BYTES, UniqueMapVisitor, describe_json_error,
+};
+
+pub mod change;
 
 pub const OVERRIDES_KIND: &str = "overrides";
+/// The version of the record this client writes.
+pub const VERSION: u16 = 1;
+
+/// The marker entry for overrides v1. A client that doesn't support a
+/// version refuses the project: running with team values instead of this
+/// computer's overrides would quietly run something else.
+pub fn feature_entry() -> FeatureEntry {
+    FeatureEntry {
+        version: VERSION,
+        if_unsupported: Level::Refuse,
+        kinds: vec![OVERRIDES_KIND.to_owned()],
+        state: FeatureState::Active,
+    }
+}
+
+const _: () = assert!(crate::graph::OVERRIDES.supported_versions[0] == VERSION);
 
 /// The overrides of the selected environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,6 +55,14 @@ impl PersonalOverrides {
     /// How many names the overrides touch.
     pub fn len(&self) -> usize {
         self.set.len() + self.unset.len()
+    }
+
+    /// The overrides as layer 4 of a project's environment applies them.
+    pub fn layer(&self) -> lpm_env::PersonalOverrideLayer<'_> {
+        lpm_env::PersonalOverrideLayer {
+            set: &self.set,
+            unset: &self.unset,
+        }
     }
 }
 

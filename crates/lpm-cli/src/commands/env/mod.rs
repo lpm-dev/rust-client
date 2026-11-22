@@ -14,6 +14,7 @@ pub(crate) mod links;
 mod local;
 mod oidc;
 mod pairing;
+mod personal_overrides;
 mod platform;
 mod pull;
 mod push;
@@ -225,6 +226,9 @@ fn run_local_sync_action(
         }
         LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
         LocalAction::Repair { yes } => repair::env_repair(project_dir, yes, json_output),
+        LocalAction::Override { action } => {
+            personal_overrides::run(action, project_dir, json_output)
+        }
         #[cfg(debug_assertions)]
         LocalAction::DebugCompanion {
             state,
@@ -352,7 +356,7 @@ async fn run_action(
         }
         "pair" => pairing::env_pair(client, &args[1..], json_output).await,
         unknown => Err(LpmError::Env(format!(
-            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, repair, link, unlink, links"
+            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, override, repair, link, unlink, links"
         ))),
     };
     reported(result)

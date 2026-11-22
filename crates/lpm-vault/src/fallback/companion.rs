@@ -995,6 +995,51 @@ pub(crate) fn read_overrides_unlocked(
         .map_err(damaged)
 }
 
+/// Every environment's personal overrides, read in the caller's lock after
+/// the Apply gate.
+pub(crate) fn read_all_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
+    let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
+    crate::companion::overrides::evaluate_all(&gate, vault_id, record.as_deref()).map_err(damaged)
+}
+
+/// Plan `edits` against `vault_id`'s overrides and commit them in one
+/// journaled transaction, in the caller's lock after the write gate.
+pub(crate) fn change_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<crate::companion::overrides::change::ChangePlan, String> {
+    let gate = authorize_unlocked(directory, vault_id, Operation::Write)?;
+    let mut companion = FileCompanion::open(directory)?;
+    let has_values = companion
+        .vaults
+        .entry_exists(&ValuesFile::Digest.name(vault_id))?
+        || super::existing_legacy_vault_file_name(&companion.vaults, vault_id)?.is_some();
+    if !has_values {
+        return Err(crate::overrides::no_values(vault_id));
+    }
+    let record = companion.read(&CompanionAccount::Record {
+        kind: OVERRIDES_KIND.to_owned(),
+        vault_id: vault_id.to_owned(),
+        part: None,
+    })?;
+    let mut plan = crate::overrides::plan(vault_id, &gate, record.as_deref(), edits, || {
+        Ok(crate::companion::overrides::change::Inventory {
+            project: companion.inventory_of(vault_id)?,
+            service_records: companion.record_count()?,
+        })
+    })?;
+    let mutations = std::mem::take(&mut plan.mutations);
+    if !mutations.is_empty() {
+        companion.commit(mutations)?;
+        crate::companion::remember(vault_id, &plan.gate);
+    }
+    Ok(plan)
+}
+
 /// Delete `vault_id`'s values files and every companion record through the
 /// deletion protocol. Its first transaction deletes the values with the
 /// shared key and the single records, so no crash leaves values that run

@@ -7754,6 +7754,23 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
         String::from_utf8_lossy(&seeded.stdout),
         String::from_utf8_lossy(&seeded.stderr),
     );
+    let overridden = lpm(&project)
+        .args([
+            "env",
+            "override",
+            "set",
+            "--env",
+            "production",
+            "APPLICATION_SECRET=personal-override",
+            "ONLY_ON_THIS_COMPUTER=personal",
+        ])
+        .output()
+        .expect("failed to set personal overrides");
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
 
     mock.with_platform_connect_success(
         bearer_token,
@@ -7928,7 +7945,10 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
     let push_json = parse_clean_json_stdout(&push);
     assert_eq!(push_json["success"], true);
     assert_eq!(push_json["platform"], "railway");
-    assert_eq!(push_json["added"], 0);
+    assert_eq!(
+        push_json["added"], 0,
+        "a key only a personal override gives never reaches a platform"
+    );
     assert_eq!(push_json["updated"], 1);
     assert_eq!(push_json["removed"], 0);
     insta::assert_json_snapshot!("env_railway_push_json_envelope", push_json);

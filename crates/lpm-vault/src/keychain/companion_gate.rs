@@ -119,8 +119,25 @@ pub(super) fn read_for_run(
         Some((bytes, access)) => (Some(bytes), Some(access)),
         None => (None, None),
     };
+    let record = read_overrides_record(storage, vault_id, values_access)?;
+    Ok(RunRead {
+        values,
+        gate,
+        overrides_record: record,
+    })
+}
+
+/// The personal overrides record with its approval checked against the
+/// values item's claim `values_access`: contradictory attributes damage the
+/// project's access, and a record weaker than its values is strengthened
+/// before its bytes are used.
+pub(super) fn read_overrides_record(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    values_access: Option<ClaimedAccess>,
+) -> Result<Option<Vec<u8>>, String> {
     let overrides_account = record_account(OVERRIDES_KIND, vault_id, None);
-    let record = match storage.read_with_access(&overrides_account)? {
+    Ok(match storage.read_with_access(&overrides_account)? {
         Some((_, ClaimedAccess::Contradictory)) => {
             return Err(damaged(Damage::Access(
                 "the personal overrides' approval attributes contradict each other".to_owned(),
@@ -135,11 +152,6 @@ pub(super) fn read_for_run(
             Some(bytes)
         }
         None => None,
-    };
-    Ok(RunRead {
-        values,
-        gate,
-        overrides_record: record,
     })
 }
 

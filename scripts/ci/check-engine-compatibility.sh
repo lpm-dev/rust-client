@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prove that an older release's companion engine reads every local history
-# state this release writes: build tests/compat-engine against that release's
-# engine and run the history fixtures through it.
+# state and every personal override change this release writes: build
+# tests/compat-engine against that release's engine and run the history and
+# override change fixtures through it.
 #
 # Usage: scripts/ci/check-engine-compatibility.sh [tag]   (default v0.84.0)
 set -euo pipefail
@@ -25,4 +26,5 @@ git -C "$root" worktree add --quiet --detach "$engine" "$tag"
 cp "$engine/Cargo.lock" "$harness/Cargo.lock"
 cargo update --quiet --workspace --manifest-path "$harness/Cargo.toml"
 cargo run --quiet --locked --manifest-path "$harness/Cargo.toml" -- \
-    "$root/crates/lpm-env-companion/tests/fixtures/history.json"
+    "$root/crates/lpm-env-companion/tests/fixtures/history.json" \
+    "$root/crates/lpm-env-companion/tests/fixtures/override-changes.json"
