@@ -14,7 +14,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use zeroize::Zeroizing;
 
-use super::decode::Utf16;
+use super::decode::{Utf16, typed_unit};
 use super::{Event, Keyboard, Output};
 
 /// The console's input mode for as long as it lives.
@@ -116,7 +116,7 @@ impl Terminal {
                 let key = unsafe { record.Event.KeyEvent };
                 // SAFETY: the console fills the character as UTF-16.
                 let unit = unsafe { key.uChar.UnicodeChar };
-                if key.bKeyDown != 0 && unit != 0 {
+                if let Some(unit) = typed_unit(key.bKeyDown != 0, unit) {
                     self.utf16.feed(unit, each);
                 }
             }

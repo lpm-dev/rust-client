@@ -182,6 +182,13 @@ impl Utf16 {
     }
 }
 
+/// The character a console key record types: only a key press types one,
+/// and the release of a key, Enter's included, types nothing.
+#[cfg(any(windows, test))]
+pub(super) fn typed_unit(key_down: bool, unit: u16) -> Option<u16> {
+    (key_down && unit != 0).then_some(unit)
+}
+
 #[cfg(any(windows, test))]
 /// A character the console read: Ctrl+Z ends input there, as Ctrl+D does on
 /// Unix.
@@ -352,5 +359,17 @@ mod tests {
         assert_eq!(console(&[emoji[0], 0x61]), "\u{fffd}a");
         assert_eq!(console(&[emoji[0], emoji[0], emoji[1]]), "\u{fffd}🔑");
         assert_eq!(console(&[emoji[0]]), "");
+    }
+
+    #[test]
+    fn only_a_key_press_types_a_character_never_its_release() {
+        assert_eq!(typed_unit(true, u16::from(b'a')), Some(u16::from(b'a')));
+        assert_eq!(typed_unit(false, u16::from(b'a')), None);
+        assert_eq!(typed_unit(false, 0x0d), None, "the release of Enter");
+        assert_eq!(
+            typed_unit(true, 0),
+            None,
+            "a key that types nothing, such as Shift"
+        );
     }
 }

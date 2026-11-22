@@ -13,7 +13,9 @@ mod common;
 #[cfg(unix)]
 mod tty {
     use crate::common;
-    use crate::common::pty::{PtySession, run_in_pty, run_in_pty_chunked};
+    use crate::common::pty::{
+        PtySession, run_in_pty, run_in_pty_chunked, run_in_pty_with_stdout_captured,
+    };
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -456,6 +458,31 @@ mod tty {
                 .contains("standard input is this terminal"),
             "{}",
             session.transcript
+        );
+    }
+
+    #[test]
+    fn a_prompt_shown_on_the_terminal_is_asked_when_standard_output_is_captured() {
+        let (project, lpm_home) = project();
+        let (session, stdout) = run_in_pty_with_stdout_captured(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                b"fixture-captured\r",
+            )],
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert!(!stdout.contains("fixture-"), "{stdout}");
+        assert!(
+            !session.transcript.contains("fixture-"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-captured")
         );
     }
 }

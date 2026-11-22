@@ -57,8 +57,9 @@ impl Asking<'_> {
 /// Where values that aren't arguments come from.
 pub(super) trait Sources {
     fn stdin_is_terminal(&self) -> bool;
-    /// Whether a person is at a terminal to answer a prompt: stdin and
-    /// stdout are both one.
+    /// Whether a person is at a terminal to answer a prompt: stdin is one,
+    /// and so is stderr, where the prompt shows, or stdout, where it shows
+    /// when stderr is redirected.
     fn can_prompt(&self) -> bool;
     fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError>;
     fn read_file(&mut self, path: &str, limit: usize)
@@ -76,7 +77,7 @@ impl Sources for ProcessSources {
     }
 
     fn can_prompt(&self) -> bool {
-        io::stdin().is_terminal() && io::stdout().is_terminal()
+        io::stdin().is_terminal() && (io::stderr().is_terminal() || io::stdout().is_terminal())
     }
 
     fn read_stdin(&mut self, limit: usize) -> Result<Zeroizing<String>, SecretReadError> {

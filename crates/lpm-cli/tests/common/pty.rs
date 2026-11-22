@@ -69,6 +69,33 @@ pub fn run_in_pty_chunked(
     steps: &[(&[u8], Vec<&[u8]>)],
     pause: Duration,
 ) -> PtySession {
+    run(cwd, lpm_home, args, steps, pause, false).0
+}
+
+/// [`run_in_pty`] with lpm's standard output captured rather than the
+/// terminal, as `$(lpm ...)` captures it; returns what it wrote there.
+pub fn run_in_pty_with_stdout_captured(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], &[u8])],
+) -> (PtySession, String) {
+    let chunked: Vec<(&[u8], Vec<&[u8]>)> = steps
+        .iter()
+        .map(|(prompt, response)| (*prompt, vec![*response]))
+        .collect();
+    let (session, stdout) = run(cwd, lpm_home, args, &chunked, Duration::ZERO, true);
+    (session, stdout.unwrap_or_default())
+}
+
+fn run(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], Vec<&[u8]>)],
+    pause: Duration,
+    capture_stdout: bool,
+) -> (PtySession, Option<String>) {
     let mut master_fd = -1;
     let mut slave_fd = -1;
     // SAFETY: `openpty` initializes both owned descriptors when it returns zero.
@@ -104,7 +131,11 @@ pub fn run_in_pty_chunked(
     let mut command = super::lpm_command(cwd, lpm_home, None, args);
     command
         .stdin(Stdio::from(slave.try_clone().expect("clone PTY stdin")))
-        .stdout(Stdio::from(slave.try_clone().expect("clone PTY stdout")))
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::from(slave.try_clone().expect("clone PTY stdout"))
+        })
         .stderr(Stdio::from(slave));
     let mut child = command.spawn().expect("spawn lpm in PTY");
     drop(command);
@@ -169,17 +200,25 @@ pub fn run_in_pty_chunked(
         std::thread::sleep(Duration::from_millis(10));
     };
     drain(&mut master, &mut transcript, &mut buffer);
+    let stdout = child.stdout.take().map(|mut piped| {
+        let mut captured = String::new();
+        piped
+            .read_to_string(&mut captured)
+            .expect("read lpm's standard output");
+        captured
+    });
     let text = String::from_utf8_lossy(&transcript).into_owned();
     assert_eq!(
         answered,
         steps.len(),
         "lpm exited before it showed every prompt:\n{text}"
     );
-    PtySession {
+    let session = PtySession {
         status,
         transcript: super::strip_ansi(&text),
         echo_restored: !terminal_echo_is_disabled(&master),
         left_unread: unread_input(&slave_probe),
         raw: transcript,
-    }
+    };
+    (session, stdout)
 }
