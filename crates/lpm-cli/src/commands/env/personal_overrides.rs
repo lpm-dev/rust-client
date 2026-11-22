@@ -83,12 +83,21 @@ fn set(
             what: "Override",
             environment: &environment,
         },
+        // A project's overrides are one record, which holds no more.
+        total_limit: lpm_vault::overrides::MAX_RECORD_BYTES,
     };
-    let keys = super::value_input::named_keys(&request)?;
-    let checked = lpm_vault::overrides::check_before_values(project_dir, &environment, &keys)
+    let checked = super::value_input::check(&request, &super::value_input::ProcessSources)?;
+    // Only a value that's typed, piped or read waits on the person; one in
+    // the arguments needs no check before it.
+    let project = checked
+        .reads_input
+        .then(|| {
+            lpm_vault::overrides::check_before_values(project_dir, &environment, &checked.keys())
+        })
+        .transpose()
         .map_err(vault_error)?;
     let assignments =
-        super::value_input::collect(&request, &mut super::value_input::ProcessSources)?;
+        super::value_input::collect(&request, checked, &mut super::value_input::ProcessSources)?;
     // A key given twice as KEY=VALUE keeps its last value, as `env set` does.
     let mut seen = std::collections::HashSet::with_capacity(assignments.len());
     let mut edits: Vec<Edit> = assignments
@@ -102,8 +111,11 @@ fn set(
         })
         .collect();
     edits.reverse();
-    let change =
-        lpm_vault::overrides::change_checked(project_dir, &checked, &edits).map_err(vault_error)?;
+    let change = match &project {
+        Some(project) => lpm_vault::overrides::change_checked(project_dir, project, &edits),
+        None => lpm_vault::overrides::change(project_dir, &edits),
+    }
+    .map_err(vault_error)?;
     let warnings: Vec<(&str, lpm_env::ValueCharacters)> = edits
         .iter()
         .filter_map(|edit| match edit {
@@ -430,7 +442,7 @@ fn clear(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    use super::value_input::Sources as _;
+    use std::io::IsTerminal as _;
     let selected = env_input
         .map(|_| environment(env_input, project_dir))
         .transpose()?;
@@ -451,8 +463,9 @@ fn clear(
     }
     // Whether it can ask is known before anything is read, so a command
     // that can't ask never reads overrides, or asks for approval, for
-    // nothing.
-    if json_output || !super::value_input::ProcessSources.can_prompt() {
+    // nothing. The question shows on standard error, the one terminal it
+    // can ask on.
+    if json_output || !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         return Err(LpmError::ConfirmationRequired {
             command: "lpm env override clear",
             change: format!("remove the personal overrides on {THIS_MACHINE} ({scope})"),

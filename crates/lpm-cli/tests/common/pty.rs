@@ -49,6 +49,8 @@ pub struct PtyOptions {
     pub pause: Duration,
     /// Capture lpm's standard output rather than give it the terminal.
     pub capture_stdout: bool,
+    /// Capture lpm's standard error rather than give it the terminal.
+    pub capture_stderr: bool,
     /// Leave the terminal's descriptor non-blocking, as an earlier program
     /// can.
     pub nonblocking_stdin: bool,
@@ -63,6 +65,7 @@ impl Default for PtyOptions {
         Self {
             pause: Duration::ZERO,
             capture_stdout: false,
+            capture_stderr: false,
             nonblocking_stdin: false,
             term: Some("xterm-256color"),
             ignored_signals: &[],
@@ -121,6 +124,22 @@ pub fn run_in_pty_with_stdout_captured(
     };
     let (session, stdout) = run_in_pty_with(cwd, lpm_home, args, &whole(steps), &options);
     (session, stdout.unwrap_or_default())
+}
+
+/// [`run_in_pty`] with lpm's standard error captured, as `2>file` sends it
+/// elsewhere, and what it wrote there.
+pub fn run_in_pty_with_stderr_captured(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], &[u8])],
+) -> (PtySession, String) {
+    let options = PtyOptions {
+        capture_stderr: true,
+        ..PtyOptions::default()
+    };
+    let (session, stderr) = run_in_pty_with(cwd, lpm_home, args, &whole(steps), &options);
+    (session, stderr.unwrap_or_default())
 }
 
 /// [`run_in_pty`] with `options`, calling `before_answer` with each step's
@@ -410,7 +429,11 @@ fn run(
         } else {
             Stdio::from(slave.try_clone().expect("clone PTY stdout"))
         })
-        .stderr(Stdio::from(slave));
+        .stderr(if options.capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::from(slave)
+        });
     let mut child = command.spawn().expect("spawn lpm in PTY");
     drop(command);
 
@@ -482,13 +505,18 @@ fn run(
         std::thread::sleep(Duration::from_millis(10));
     };
     drain(&mut master, &mut transcript, &mut buffer);
-    let stdout = child.stdout.take().map(|mut piped| {
+    let read_all = |mut piped: Box<dyn Read>| {
         let mut captured = String::new();
         piped
             .read_to_string(&mut captured)
-            .expect("read lpm's standard output");
+            .expect("read what lpm wrote");
         captured
-    });
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .map(|piped| read_all(Box::new(piped)))
+        .or_else(|| child.stderr.take().map(|piped| read_all(Box::new(piped))));
     let text = String::from_utf8_lossy(&transcript).into_owned();
     assert_eq!(
         answered,

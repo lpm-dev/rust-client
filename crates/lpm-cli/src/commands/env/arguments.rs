@@ -56,13 +56,10 @@ pub(super) struct Values {
     pub from_files: Vec<String>,
 }
 
-const SET_AFTER_HELP: &str = "\
-Examples:
-  lpm env set API_KEY                          Ask for the value, hidden
-  op read op://dev/api/key | lpm env set API_KEY --stdin
-  lpm env set --from-file TLS_KEY=./tls.key
-  lpm env set --from-file A=<(op read op://dev/a) --from-file B=<(op read op://dev/b)
-  lpm env set PORT=3000                        A value that isn't secret
+/// The paragraphs both `set` commands end with.
+macro_rules! value_entry_help {
+    () => {
+        "
 
 A KEY=VALUE argument is saved in your shell history and is visible to other
 processes on this computer while lpm runs. Use it only for values that aren't
@@ -70,9 +67,23 @@ secret.
 
 From the prompt, standard input or a file, a value that is one line loses the
 line break at its end. A value of several lines, such as a PEM key, is kept
-exactly, except that each line break pasted into the prompt is a line feed.";
+exactly, except that each line break pasted into the prompt is a line feed."
+    };
+}
 
-const OVERRIDE_SET_AFTER_HELP: &str = "\
+const SET_AFTER_HELP: &str = concat!(
+    "\
+Examples:
+  lpm env set API_KEY                          Ask for the value, hidden
+  op read op://dev/api/key | lpm env set API_KEY --stdin
+  lpm env set --from-file TLS_KEY=./tls.key
+  lpm env set --from-file A=<(op read op://dev/a) --from-file B=<(op read op://dev/b)
+  lpm env set PORT=3000                        A value that isn't secret",
+    value_entry_help!()
+);
+
+const OVERRIDE_SET_AFTER_HELP: &str = concat!(
+    "\
 Examples:
   lpm env override set DATABASE_URL --env=development    Ask for the value, hidden
   echo \"$LOCAL_URL\" | lpm env override set API_URL --stdin
@@ -82,11 +93,9 @@ Examples:
 A personal override is this computer's own value for a key. LPM applies it when
 it runs, prints or checks the project here. It never syncs, and LPM leaves it
 out when it pushes values or sends them to CI or a platform. LPM CLI 0.82.0 or
-later applies overrides; an older version runs with team values.
-
-A KEY=VALUE argument is saved in your shell history and is visible to other
-processes on this computer while lpm runs. Use it only for values that aren't
-secret.";
+later applies overrides; an older version runs with team values.",
+    value_entry_help!()
+);
 
 #[derive(Subcommand)]
 pub(super) enum OverrideAction {
@@ -519,10 +528,48 @@ fn print_format(value: &str) -> Result<lpm_env::PrintFormat, String> {
     })
 }
 
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 mod tests {
     use clap::CommandFactory;
 
+    /// The long help of the subcommand at `path`, its whitespace collapsed.
+    fn long_help(path: &[&str]) -> String {
+        let mut command = super::LocalCommand::command();
+        let mut subcommand = &mut command;
+        for name in path {
+            subcommand = subcommand
+                .find_subcommand_mut(name)
+                .expect("subcommand registered");
+        }
+        let mut buffer = Vec::new();
+        subcommand
+            .write_long_help(&mut buffer)
+            .expect("write the help");
+        String::from_utf8(buffer)
+            .expect("UTF-8 help")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn both_set_commands_say_what_happens_to_a_value_s_line_breaks() {
+        for path in [&["set"][..], &["override", "set"]] {
+            let help = long_help(path);
+            assert!(
+                help.contains(
+                    "From the prompt, standard input or a file, a value that is one line loses the line break at its end."
+                ),
+                "{path:?}: {help}"
+            );
+            assert!(
+                help.contains("A KEY=VALUE argument is saved in your shell history"),
+                "{path:?}: {help}"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
     #[test]
     fn debug_companion_help_names_every_state() {
         let command = super::LocalCommand::command();

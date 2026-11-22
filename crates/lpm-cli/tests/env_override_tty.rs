@@ -12,7 +12,8 @@ mod common;
 mod tty {
     use crate::common;
     use crate::common::pty::{
-        PtyOptions, run_in_pty, run_in_pty_answering, run_in_pty_with_stdout_captured,
+        PtyOptions, run_in_pty, run_in_pty_answering, run_in_pty_with_stderr_captured,
+        run_in_pty_with_stdout_captured,
     };
 
     use tempfile::TempDir;
@@ -143,6 +144,35 @@ mod tty {
         assert_eq!(
             overrides(project.path(), lpm_home.path()),
             serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn override_clear_needs_yes_before_it_reads_when_its_question_has_no_terminal() {
+        let (project, lpm_home) = project();
+        let (status, _, stderr) = common::run_lpm(
+            project.path(),
+            lpm_home.path(),
+            None,
+            &["env", "override", "set", "API_URL=mine"],
+        );
+        assert!(status.success(), "{stderr}");
+
+        let (refused, written) = run_in_pty_with_stderr_captured(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "clear", "--env", "default"],
+            &[],
+        );
+
+        assert!(!refused.status.success(), "{}", refused.transcript);
+        assert!(written.contains("Confirmation required"), "{written}");
+        assert!(written.contains("--yes"), "{written}");
+        assert_eq!(
+            overrides(project.path(), lpm_home.path())
+                .as_array()
+                .map(Vec::len),
+            Some(1)
         );
     }
 

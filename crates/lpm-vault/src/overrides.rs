@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub use lpm_env_companion::marker::MAX_RECORD_BYTES;
 pub use lpm_env_companion::overrides::change::{Edit, Effect, Previous};
 
 use crate::PersonalOverrides;

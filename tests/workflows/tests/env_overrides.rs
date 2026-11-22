@@ -1271,6 +1271,19 @@ fn the_override_commands_say_what_env_and_their_keys_mean() {
 }
 
 #[test]
+fn override_set_says_what_is_wrong_with_its_arguments_before_it_looks_at_the_project() {
+    let project = TempProject::empty(r#"{"name":"no-env-project","version":"1.0.0"}"#);
+    let refused = lpm(&project)
+        .args(["env", "override", "set", "API_URL", "API_URL"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let said = stderr(&refused);
+    assert!(said.contains("API_URL"), "{said}");
+    assert!(!said.contains("no env project"), "{said}");
+}
+
+#[test]
 fn removing_an_override_and_an_empty_list_say_what_happened_where() {
     let (project, _) = project_with_team_value("{}");
     lpm(&project)
