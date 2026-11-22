@@ -119,7 +119,8 @@ fn run_local_sync_action(
     json_output: bool,
 ) -> Result<(), LpmError> {
     use arguments::LocalAction;
-    if action.uses_project_values() {
+    // set checks its arguments first, so a wrong one never asks to link.
+    if action.uses_project_values() && !matches!(action, LocalAction::Set { .. }) {
         links::ensure_folder_linked(project_dir, json_output)?;
     }
     let result = match action {

@@ -10,7 +10,7 @@
 //! is almost always a mistake, and `KEY=` stores an empty value on purpose
 //! without exposing anything.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal as _};
 
 use lpm_common::secret_read::{SecretReadError, read_secret_stdin, read_secret_text_file};
@@ -127,6 +127,8 @@ enum Entry<'a> {
 pub(super) struct Checked<'a> {
     entries: Vec<Entry<'a>>,
     files: Vec<(&'a str, &'a str)>,
+    /// The bytes of the values the arguments give, each key's last.
+    given: usize,
     /// Some value comes from the prompt, standard input or a file, rather
     /// than the arguments alone.
     pub(super) reads_input: bool,
@@ -157,12 +159,38 @@ pub(super) fn check<'a>(
         })
         .collect();
     refuse_repeated_keys(&entries, &files, cfg!(windows))?;
+    let given = given_bytes(&entries, cfg!(windows));
+    Total { bytes: 0, request }.add(given)?;
     check_how_bare_keys_get_values(request, &bare, sources)?;
     Ok(Checked {
         reads_input: !bare.is_empty() || !files.is_empty(),
         entries,
         files,
+        given,
     })
+}
+
+/// The bytes of the values `entries` give, a key given twice counted once,
+/// for its last value, as it's stored. Where keys differing only in case
+/// name one variable (`fold_case`), so do these.
+fn given_bytes(entries: &[Entry<'_>], fold_case: bool) -> usize {
+    let mut counted = HashSet::with_capacity(entries.len());
+    entries
+        .iter()
+        .rev()
+        .filter_map(|entry| match entry {
+            Entry::Given(key, value) => Some((*key, value.len())),
+            Entry::Bare(_) => None,
+        })
+        .filter(|(key, _)| {
+            counted.insert(if fold_case {
+                std::borrow::Cow::Owned(key.to_ascii_uppercase())
+            } else {
+                std::borrow::Cow::Borrowed(*key)
+            })
+        })
+        .map(|(_, bytes)| bytes)
+        .fold(0, usize::saturating_add)
 }
 
 /// The bytes the values read so far hold, refused once they pass what the
@@ -201,13 +229,21 @@ pub(super) fn collect(
     checked: Checked<'_>,
     sources: &mut impl Sources,
 ) -> Result<Vec<Assignment>, LpmError> {
-    let Checked { entries, files, .. } = checked;
+    let Checked {
+        entries,
+        files,
+        given,
+        ..
+    } = checked;
     let first_bare = entries.iter().find_map(|entry| match entry {
         Entry::Bare(key) => Some(*key),
         Entry::Given(..) => None,
     });
 
-    let mut total = Total { bytes: 0, request };
+    let mut total = Total {
+        bytes: given,
+        request,
+    };
     let mut from_files = Vec::with_capacity(files.len());
     for (key, path) in &files {
         let text = sources
@@ -639,6 +675,43 @@ mod tests {
             "the values given total more than 100 bytes, the most `lpm env set` stores at once; nothing was stored"
         );
         assert_eq!(fake.file_reads, 2, "the third file is never read");
+    }
+
+    #[test]
+    fn values_given_in_the_arguments_count_before_anything_is_read() {
+        let mut fake = Fake {
+            files: HashMap::from([("big".to_owned(), Ok("x".repeat(10)))]),
+            ..Fake::default()
+        };
+        let entries = strings(&["A=0123456789", "B=x", "A=01234567890123456789"]);
+        let from_files = strings(&["C=big"]);
+        let request = |total_limit| Request {
+            entries: &entries,
+            stdin: false,
+            from_files: &from_files,
+            json_output: false,
+            command: "lpm env override set",
+            asking: Asking {
+                what: "Override",
+                environment: "default",
+            },
+            total_limit,
+        };
+
+        let Err(LpmError::Env(refused)) = check(&request(20), &fake) else {
+            panic!("the arguments alone hold too much");
+        };
+        assert_eq!(
+            refused,
+            "the values given total more than 20 bytes, the most `lpm env override set` stores at once; nothing was stored"
+        );
+        assert_eq!(fake.file_reads, 0, "no file is read");
+
+        let checked = check(&request(30), &fake).expect("the last A and B fit");
+        let Err(LpmError::Env(refused)) = collect(&request(30), checked, &mut fake) else {
+            panic!("the file passes the limit");
+        };
+        assert!(refused.contains("more than 30 bytes"), "{refused}");
     }
 
     #[test]

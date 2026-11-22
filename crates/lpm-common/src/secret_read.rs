@@ -67,7 +67,11 @@ pub fn read_secret_text_file(
     limit: usize,
 ) -> Result<Zeroizing<String>, SecretReadError> {
     let (file, size) = open_file_or_pipe(path, limit)?;
-    into_text(read_wiped(file, limit, size)?)
+    #[cfg(unix)]
+    let reader = WaitingForInput(&file);
+    #[cfg(not(unix))]
+    let reader = &file;
+    into_text(read_wiped(reader, limit, size)?)
 }
 
 fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretReadError> {
@@ -121,8 +125,6 @@ fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretR
         return Ok((file, size));
     }
     if is_pipe(&file, &metadata) {
-        #[cfg(unix)]
-        wait_for_input(&file).map_err(SecretReadError::Io)?;
         return Ok((file, 0));
     }
     Err(SecretReadError::NotFileOrPipe)
@@ -221,9 +223,10 @@ pub fn read_secret_stdin(limit: usize) -> Result<Zeroizing<String>, SecretReadEr
     into_text(read_wiped(reader, limit, size)?)
 }
 
-/// Reads of standard input that wait for input rather than fail with
-/// `WouldBlock`, for a descriptor an earlier program left non-blocking. Its
-/// flags belong to an open file that program shares, so they're left alone.
+/// Reads that wait for input rather than fail with `WouldBlock`, for a pipe
+/// opened non-blocking or a descriptor an earlier program left so, which
+/// standard input and, on macOS, a `/dev/fd` path share with that program.
+/// Its flags are left alone.
 #[cfg(unix)]
 struct WaitingForInput<'file>(&'file File);
 
@@ -234,6 +237,10 @@ impl Read for WaitingForInput<'_> {
         loop {
             match (&mut &*self.0).read(buffer) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    #[cfg(test)]
+                    if let Some(waiting) = tests::WAITING_FOR_INPUT.get() {
+                        waiting();
+                    }
                     let mut ready = libc::pollfd {
                         fd: self.0.as_raw_fd(),
                         events: libc::POLLIN,
@@ -251,24 +258,6 @@ impl Read for WaitingForInput<'_> {
             }
         }
     }
-}
-
-/// Reads from the pipe wait for what its writer sends, until it closes,
-/// however it was opened.
-#[cfg(unix)]
-fn wait_for_input(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    let descriptor = file.as_raw_fd();
-    // SAFETY: `descriptor` is the open file's; the calls only read and set
-    // its status flags.
-    unsafe {
-        let flags = libc::fcntl(descriptor, libc::F_GETFL);
-        if flags < 0 || libc::fcntl(descriptor, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 /// Everything `reader` holds, refused past `limit` bytes. `size_hint`, a
@@ -321,6 +310,10 @@ fn into_text(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, SecretR
 mod tests {
     use super::*;
 
+    /// What the reader that waits for input does each time it finds none.
+    #[cfg(unix)]
+    pub(super) static WAITING_FOR_INPUT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
     #[cfg(windows)]
     #[test]
     fn a_missing_or_invalid_standard_handle_is_never_read() {
@@ -333,9 +326,8 @@ mod tests {
     /// Standard input an earlier program left non-blocking is still read
     /// whole: the read waits for what its writer sends. The test runs itself
     /// again as the reader, with the non-blocking end of a pipe for its
-    /// standard input. The writer sends nothing until the reader is about to
-    /// read, then the value in two pieces a moment apart, so a read finds
-    /// the pipe empty before each.
+    /// standard input. The writer sends each of the value's two pieces only
+    /// once the reader found the pipe empty.
     #[cfg(unix)]
     #[test]
     fn standard_input_left_non_blocking_waits_for_its_writer() {
@@ -343,8 +335,12 @@ mod tests {
         use std::os::fd::FromRawFd as _;
         const READER: &str = "LPM_SECRET_READ_NON_BLOCKING_READER";
         if std::env::var_os(READER).is_some() {
-            println!("ready");
-            std::io::stdout().flush().expect("flush");
+            WAITING_FOR_INPUT
+                .set(|| {
+                    println!("waiting");
+                    std::io::stdout().flush().expect("flush");
+                })
+                .expect("set once");
             match read_secret_stdin(64) {
                 Ok(text) => println!("read: {}", text.as_str()),
                 Err(error) => println!("failed: {error}"),
@@ -383,17 +379,16 @@ mod tests {
             .expect("run the reader");
         let mut stdout = std::io::BufReader::new(reader.stdout.take().expect("piped"));
         let mut shown = String::new();
-        while !shown.contains("ready") {
-            assert_ne!(
-                stdout.read_line(&mut shown).expect("the reader's output"),
-                0,
-                "the reader ended first: {shown}"
-            );
-        }
-        // A reader that gave up already has closed its end.
-        for piece in [&b"fixture-"[..], b"late"] {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = write_end.write_all(piece);
+        // Each piece is written once the reader found the pipe empty.
+        for (written, piece) in [&b"fixture-"[..], b"late"].into_iter().enumerate() {
+            while shown.matches("waiting").count() <= written {
+                assert_ne!(
+                    stdout.read_line(&mut shown).expect("the reader's output"),
+                    0,
+                    "the reader ended first: {shown}"
+                );
+            }
+            write_end.write_all(piece).expect("the reader is waiting");
         }
         drop(write_end);
         stdout
@@ -527,6 +522,42 @@ mod tests {
             read_secret_text_file(&dir.path().join("missing"), 100),
             Err(SecretReadError::NotFound)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_read_through_its_descriptor_path_keeps_the_flags_its_owner_set() {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let mut ends = [0; 2];
+        // SAFETY: `ends` holds the two descriptors pipe() returns.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // SAFETY: pipe() returned both descriptors, owned here alone.
+        let (reader, mut writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(ends[0]),
+                std::fs::File::from_raw_fd(ends[1]),
+            )
+        };
+        // SAFETY: the calls only read and set the reader's status flags.
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: as above.
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        writer.write_all(b"fixture-value").unwrap();
+        drop(writer);
+
+        let path = std::path::PathBuf::from(format!("/dev/fd/{}", reader.as_raw_fd()));
+        let read = read_secret_text_file(&path, 1024).unwrap();
+
+        assert_eq!(read.as_str(), "fixture-value");
+        // SAFETY: as above.
+        let after = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(
+            after & libc::O_NONBLOCK,
+            0,
+            "the pipe's owner left it non-blocking, which a read through /dev/fd shares"
+        );
     }
 
     #[test]

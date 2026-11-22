@@ -703,8 +703,10 @@ mod tty {
     }
 
     #[test]
-    fn an_arrow_key_whose_bytes_arrive_apart_adds_nothing() {
+    fn an_escape_whose_sequence_arrives_in_a_later_read_stores_nothing() {
         let (project, lpm_home) = project();
+        // The Escape key, then `[A` and the rest pasted, reads as an arrow
+        // key whose bytes arrived apart.
         let session = run_in_pty_chunked(
             project.path(),
             lpm_home.path(),
@@ -715,11 +717,13 @@ mod tty {
             )],
             Duration::from_millis(120),
         );
-        assert!(session.status.success(), "{}", session.transcript);
-        assert_eq!(
-            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
-            Some("fixture-key")
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("nothing was stored"),
+            "{}",
+            session.transcript
         );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
     }
 
     #[test]

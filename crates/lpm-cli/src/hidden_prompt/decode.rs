@@ -71,15 +71,21 @@ impl Bytes {
                 0x20..=0x7e if self.escape_in_read && !b"[O]P_^X".contains(&byte) => {
                     self.state = State::Ground;
                 }
+                // An escape that ended an earlier read may have been the
+                // Escape key, so what follows it may have been typed.
                 b'[' => {
                     self.state = State::ControlSequence {
                         parameters: [0; 3],
                         length: 0,
-                        crossed: false,
+                        crossed: !self.escape_in_read,
                         taken: false,
                     };
                 }
-                b'O' => self.state = State::SingleShift { crossed: false },
+                b'O' => {
+                    self.state = State::SingleShift {
+                        crossed: !self.escape_in_read,
+                    }
+                }
                 b']' | b'P' | b'_' | b'^' | b'X' => {
                     self.state = State::TerminalString {
                         escape: false,
@@ -559,10 +565,21 @@ mod tests {
             "a<Interrupt>",
             "a key no sequence holds takes nothing"
         );
+        for (split, what) in [
+            (&[&b"\x1b"[..], b"[Ab"], "a CSI"),
+            (&[&b"\x1b"[..], b"OPb"], "an SS3"),
+            (&[&b"\x1b"[..], b"[M !!b"], "a mouse report"),
+        ] {
+            assert_eq!(
+                decoded(split),
+                "<Lost>b",
+                "{what} after an escape that ended its read may be the Escape key and typed text"
+            );
+        }
         assert_eq!(
-            decoded(&[b"\x1b", b"[Ab"]),
-            "b",
-            "a slow escape whose sequence arrives whole adds nothing"
+            decoded(&[b"\x1b", b"[200~x\x1b[201~"]),
+            "<paste>x<PasteEnded>",
+            "a paste's start is the terminal's, wherever a read ends"
         );
     }
 

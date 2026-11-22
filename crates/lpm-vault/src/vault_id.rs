@@ -445,6 +445,24 @@ pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
     .map_err(|error| error.to_string())
 }
 
+/// A new vault ID for `project_dir`, written to its lpm.json in one locked
+/// update; `None` when lpm.json names a vault by then.
+pub fn create_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        if root.get("vault").is_some_and(|value| !value.is_null()) {
+            return Ok(lpm_common::LpmJsonMutation::Unchanged(None));
+        }
+        let vault_id = generate_uuid();
+        root.insert(
+            "vault".to_string(),
+            serde_json::Value::String(vault_id.clone()),
+        );
+        Ok(lpm_common::LpmJsonMutation::Changed(Some(vault_id)))
+    })
+    .map(lpm_common::LpmJsonMutation::into_inner)
+    .map_err(|error| error.to_string())
+}
+
 fn validate_vault_id(vault_id: &str) -> Result<(), String> {
     if is_safe_vault_id(vault_id) {
         return Ok(());

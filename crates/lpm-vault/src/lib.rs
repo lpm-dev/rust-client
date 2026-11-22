@@ -232,18 +232,28 @@ pub struct CheckedValues {
 }
 
 impl CheckedValues {
-    /// The vault the values go to: the checked project's, refused when
-    /// `project_dir` names another project since, while `gathered`.
+    /// The vault the values go to: the checked project's, or a new one for a
+    /// folder that named none, refused when `project_dir` names another
+    /// project since, while `gathered`. The folder is linked to it when it's
+    /// the first to store values there.
     fn vault_id(&self, project_dir: &Path, gathered: &str) -> Result<String, String> {
-        if vault_id::read_vault_id(project_dir) != self.vault_id {
-            return Err(format!(
-                "this directory's env project changed while {gathered}; nothing was stored"
-            ));
-        }
-        match &self.vault_id {
-            Some(vault_id) => Ok(vault_id.clone()),
-            None => linked_vault_id_for_write(project_dir),
-        }
+        let changed =
+            || format!("this directory's env project changed while {gathered}; nothing was stored");
+        let vault_id = match &self.vault_id {
+            Some(checked) => {
+                if vault_id::read_vault_id(project_dir).as_ref() != Some(checked) {
+                    return Err(changed());
+                }
+                checked.clone()
+            }
+            None => {
+                #[cfg(test)]
+                tests::before_vault_id_is_created();
+                vault_id::create_vault_id(project_dir)?.ok_or_else(changed)?
+            }
+        };
+        link_for_write(project_dir, &vault_id)?;
+        Ok(vault_id)
     }
 }
 
@@ -339,13 +349,21 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
 /// names none, when this machine lets the folder store values in it.
 fn linked_vault_id_for_write(project_dir: &Path) -> Result<String, String> {
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
-    if !is_listed(&vault_id, &links::link_folder_path(project_dir)) {
-        let folder = with_link_transaction(|directory| {
-            links::require_for_write(directory, project_dir, &vault_id)
-        })?;
-        remember_listed(&vault_id, folder);
-    }
+    link_for_write(project_dir, &vault_id)?;
     Ok(vault_id)
+}
+
+/// Fails unless `project_dir` may store values in the vault `vault_id`,
+/// linking it as the first folder to when the vault has neither values nor
+/// links on this machine.
+fn link_for_write(project_dir: &Path, vault_id: &str) -> Result<(), String> {
+    if !is_listed(vault_id, &links::link_folder_path(project_dir)) {
+        let folder = with_link_transaction(|directory| {
+            links::require_for_write(directory, project_dir, vault_id)
+        })?;
+        remember_listed(vault_id, folder);
+    }
+    Ok(())
 }
 
 /// Whether `project_dir` may use the vault its lpm.json names; `None` when
@@ -2257,6 +2275,99 @@ fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static BEFORE_VAULT_ID_IS_CREATED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// What a test does once a checked write is about to give its folder a
+    /// vault ID, such as another process naming one first.
+    pub(super) fn before_vault_id_is_created() {
+        if let Some(hook) = BEFORE_VAULT_ID_IS_CREATED.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn import_checked(project_dir: &Path, checked: &CheckedValues) -> Result<(), String> {
+        import_env_content_checked(
+            project_dir,
+            checked,
+            None,
+            "TOKEN=value\n",
+            false,
+            &history::Source::new(history::Action::Import),
+        )
+        .map(drop)
+    }
+
+    fn set_checked(project_dir: &Path, checked: &CheckedValues) -> Result<(), String> {
+        super::set_checked(
+            project_dir,
+            checked,
+            "default",
+            &[("TOKEN", "value")],
+            &history::Source::new(history::Action::Set),
+        )
+    }
+
+    #[test]
+    fn a_checked_first_write_links_the_folder_to_the_vault_its_lpm_json_names() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            for (vault_id, write) in [
+                (
+                    "named-checkout-set",
+                    set_checked as fn(&Path, &CheckedValues) -> _,
+                ),
+                ("named-checkout-import", import_checked),
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    project.path().join("lpm.json"),
+                    format!(r#"{{"vault":"{vault_id}"}}"#),
+                )
+                .unwrap();
+                let checked = check_values_writable(project.path()).unwrap();
+                write(project.path(), &checked).unwrap();
+
+                let read = try_get_run_environment(project.path(), None)
+                    .unwrap_or_else(|error| panic!("{vault_id}: {error}"));
+                assert_eq!(read.values["TOKEN"], "value", "{vault_id}");
+                cleanup_vault(project.path());
+            }
+        });
+    }
+
+    #[test]
+    fn a_checked_write_refuses_a_vault_named_while_it_gave_the_folder_one() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            for write in [
+                set_checked as fn(&Path, &CheckedValues) -> _,
+                import_checked,
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                let checked = check_values_writable(project.path()).unwrap();
+                let manifest = project.path().join("lpm.json");
+                BEFORE_VAULT_ID_IS_CREATED.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        std::fs::write(manifest, r#"{"vault":"named-meanwhile"}"#).unwrap();
+                    }));
+                });
+
+                let refused = write(project.path(), &checked).expect_err("another project");
+
+                assert!(refused.contains("nothing was stored"), "{refused}");
+                assert!(
+                    crate::fallback::read_vault_file_env("named-meanwhile", "default")
+                        .unwrap()
+                        .is_none(),
+                    "the value reached the project named meanwhile"
+                );
+            }
+        });
+    }
 
     #[test]
     fn one_read_of_several_environments_matches_reading_each() {

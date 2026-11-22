@@ -28,6 +28,7 @@ pub(super) fn env_set(
     // refuses the write whatever it holds is found first, and the write
     // goes to the project that was checked.
     let arguments = super::value_input::check(&request, &super::value_input::ProcessSources)?;
+    super::links::ensure_folder_linked(project_dir, json_output)?;
     let checked = arguments
         .reads_input
         .then(|| lpm_vault::check_values_writable(project_dir))
