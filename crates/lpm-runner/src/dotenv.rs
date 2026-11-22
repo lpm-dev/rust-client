@@ -501,6 +501,9 @@ fn apply_layer_four(
     overrides: &Arc<PersonalOverrides>,
 ) -> ChildEnv {
     let origins = OverrideOrigins::changing(&vars, overrides.layer(), cfg!(windows));
+    if !origins.is_empty() {
+        crate::override_marker::record_personal_overrides_applied();
+    }
     let applied_names = if !origins.is_empty() && debug_logging() {
         origins.names().into_iter().map(str::to_owned).collect()
     } else {
@@ -709,18 +712,22 @@ pub(crate) fn load_project_env_layers(
         env_name: env_name.map(ToOwned::to_owned),
         with_overrides: matches!(policy, OverridePolicy::Apply),
     };
-    let (vault_vars, overrides) = crate::env_access::read_vault(read_key, || match policy {
-        OverridePolicy::Apply => lpm_vault::try_get_run_environment(project_dir, env_name)
-            .map(|run| (run.values, run.overrides)),
-        OverridePolicy::Exclude => match env_name {
-            Some(env_name) => {
-                lpm_vault::try_get_all_env_with_default_fallback(project_dir, env_name)
+    let read = crate::env_access::read_vault(read_key, || {
+        match policy {
+            OverridePolicy::Apply => lpm_vault::try_get_run_environment(project_dir, env_name)
+                .map(|run| (run.values, run.overrides)),
+            OverridePolicy::Exclude => match env_name {
+                Some(env_name) => {
+                    lpm_vault::try_get_all_env_with_default_fallback(project_dir, env_name)
+                }
+                None => lpm_vault::try_get_all(project_dir),
             }
-            None => lpm_vault::try_get_all(project_dir),
+            .map(|values| (values, PersonalOverrides::default())),
         }
-        .map(|values| (values, PersonalOverrides::default())),
+        .map(Arc::new)
     })
     .map_err(vault_error(LpmError::EnvValidation))?;
+    let (vault_vars, overrides) = Arc::unwrap_or_clone(read);
 
     let vault_count = vault_vars.len();
     if vault_count > 0 {
@@ -877,7 +884,7 @@ pub fn read_vault_environments_for_run(
                         env_name: mode.map(ToOwned::to_owned),
                         with_overrides: matches!(policy, OverridePolicy::Apply),
                     },
-                    (run.values, run.overrides),
+                    Arc::new((run.values, run.overrides)),
                 )
             })
             .collect();

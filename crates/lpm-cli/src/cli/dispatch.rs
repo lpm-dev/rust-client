@@ -2490,7 +2490,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         .into(),
                 ));
             }
-            if watch {
+            let ran = if watch {
                 if cli.json {
                     return Err(lpm_common::LpmError::Script(
                         "--watch cannot be combined with --json; run without --watch for one JSON result".into(),
@@ -2547,7 +2547,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                     client.session().cloned(),
                 )
                 .await
-            }
+            };
+            lpm_runner::override_marker::forget_nested_personal_overrides();
+            ran
         }
         Commands::Exec(args) => {
             let network_args::ExecArgs {

@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use lpm_common::LpmError;
 
-/// A project's vault values for one environment, and its personal overrides.
-pub(crate) type VaultValues = (HashMap<String, String>, lpm_vault::PersonalOverrides);
+/// A project's vault values for one environment, and its personal overrides:
+/// one snapshot the run's reads and each task's pin share, copied only by
+/// the reader that takes it.
+pub(crate) type VaultValues = Arc<(HashMap<String, String>, lpm_vault::PersonalOverrides)>;
 
 /// Which vault values a read asks for: the project, the environment, and
 /// whether personal overrides apply.
@@ -361,10 +363,10 @@ mod tests {
 
     fn counted(reads: &AtomicUsize) -> VaultValues {
         let read = reads.fetch_add(1, Ordering::SeqCst);
-        (
+        Arc::new((
             HashMap::from([("READ".to_owned(), read.to_string())]),
             lpm_vault::PersonalOverrides::default(),
-        )
+        ))
     }
 
     #[test]
@@ -420,6 +422,22 @@ mod tests {
         assert_eq!(again, first, "the task keeps the values its cache key used");
         assert_ne!(next_task, first, "the next task reads what was reread");
         assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_pin_shares_the_run_s_values_rather_than_copying_them() {
+        let reads = AtomicUsize::new(0);
+        let scope = EnvAccessScope::default();
+        let _binding = scope.bind();
+        let _pinned = pin_vault_reads();
+
+        let first = read_vault(key("dev"), || Ok(counted(&reads))).unwrap();
+        let again = read_vault(key("dev"), || Ok(counted(&reads))).unwrap();
+
+        let shared = scope.vault_reads.lock().unwrap()[&key("dev")].clone();
+        assert!(Arc::ptr_eq(&first, &again), "the pin holds the read");
+        assert!(Arc::ptr_eq(&first, &shared), "which the run holds too");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]

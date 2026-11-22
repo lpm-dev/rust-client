@@ -3446,6 +3446,44 @@ fn run_cache_tracks_inherited_environment_by_default() {
 }
 
 #[test]
+fn run_cache_keys_never_hold_where_a_nested_lpm_reports_personal_overrides() {
+    let project = TempProject::empty(
+        r#"{"name":"nested-cache-key","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"cache":true,"inputs":["build.js"],"outputs":["dist/**"]}}}"#,
+    );
+    project.write_file(
+        "build.js",
+        "const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','built'); console.log('built');",
+    );
+    let marker = |name: &str| project.path().join(name);
+    lpm(&project)
+        .env("LPM_PERSONAL_OVERRIDES_MARKER", marker("first-run"))
+        .args(["run", "build"])
+        .assert()
+        .success();
+
+    let second = lpm(&project)
+        .env("LPM_PERSONAL_OVERRIDES_MARKER", marker("second-run"))
+        .args(["run", "build"])
+        .output()
+        .expect("run the build again");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(second.status.success(), "{combined}");
+    assert!(
+        combined.contains("restored from cache"),
+        "an outer lpm's marker path changes no cache key:\n{combined}"
+    );
+}
+
+#[test]
 fn run_cache_invalidates_when_cli_arguments_change() {
     let project = TempProject::empty(
         r#"{
@@ -3666,6 +3704,80 @@ async fn a_task_run_with_personal_overrides_never_uses_the_remote_cache() {
         .filter(|request| request.url.path().starts_with("/v8/artifacts"))
         .count();
     assert_eq!(asked, 0, "the remote cache isn't asked either");
+}
+
+#[tokio::test]
+async fn a_task_whose_nested_lpm_applies_personal_overrides_never_uploads_to_the_remote_cache() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(&server, state.clone()).await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "remote-cache-nested",
+        "version": "1.0.0",
+        "scripts": { "build": "node print-staging.js" }
+    }"#,
+    );
+    project.write_file(
+        "print-staging.js",
+        r#"const fs = require('fs');
+const { spawnSync } = require('child_process');
+const printed = spawnSync(process.env.LPM_TEST_BIN, ['env', 'print', '--env', 'staging'], { encoding: 'utf8' });
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/staging.env', printed.stdout);
+process.exit(printed.status === null ? 1 : printed.status);
+"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"remoteCache":{{"enabled":true,"url":"{}/v8"}},"tasks":{{"build":{{"cache":true,"outputs":["dist/**"]}}}}}}"#,
+            server.uri()
+        ),
+    );
+    lpm(&project)
+        .args(["env", "set", "API_URL=team"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args([
+            "env",
+            "override",
+            "set",
+            "--env",
+            "staging",
+            "API_URL=fixture-mine",
+        ])
+        .assert()
+        .success();
+
+    let run = lpm(&project)
+        .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "build"])
+        .output()
+        .expect("run the build");
+
+    assert!(
+        run.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert!(
+        project
+            .read_file("dist/staging.env")
+            .contains("fixture-mine")
+    );
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_none(),
+        "outputs a nested lpm built with this computer's overrides are never uploaded"
+    );
 }
 
 #[tokio::test]

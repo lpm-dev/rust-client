@@ -440,6 +440,11 @@ fn build_task_context(
             })
             .map(|(key, value)| (key.into(), value.into())),
     );
+    // Where a nested lpm reports personal overrides differs every run and
+    // changes nothing a task builds.
+    child_env.remove(std::ffi::OsStr::new(
+        lpm_runner::override_marker::MARKER_ENV,
+    ));
     let root = cache_key_root(project_dir, workspace_contract);
     if task_config.is_cache_portable() {
         match script_context.portable_manifest_path(&root) {
@@ -538,8 +543,11 @@ fn build_task_context(
         }
         RemoteCacheResolution::Omit => None,
     };
-    if remote_cache.is_some() && task_config.cache_env.is_none() {
-        crate::commands::remote_cache::warn_task_without_cache_env(script_name);
+    if remote_cache.is_some() {
+        lpm_runner::override_marker::watch_nested_personal_overrides();
+        if task_config.cache_env.is_none() {
+            crate::commands::remote_cache::warn_task_without_cache_env(script_name);
+        }
     }
     Ok(Some(CacheContext {
         command_preference,
@@ -857,15 +865,24 @@ fn store_cache_with_context(
     if let (Some(remote_cache), lpm_task::cache::StoredCacheEntry::Published(published)) =
         (&expected.remote_cache, stored)
     {
-        crate::commands::remote_cache::try_store(
-            remote_cache,
-            published,
-            request.stdout,
-            request.stderr,
-            request.duration_ms,
-            &expected.env_vars,
-            &expected.inherited_env,
-        );
+        // A nested lpm the task started may have built its outputs with
+        // this computer's personal overrides, which never leave it.
+        if lpm_runner::override_marker::nested_personal_overrides_applied() {
+            tracing::debug!(
+                "an lpm that task '{}' started applied personal overrides; not uploading it to the remote cache",
+                lpm_common::sanitize_terminal_inline(request.script_name)
+            );
+        } else {
+            crate::commands::remote_cache::try_store(
+                remote_cache,
+                published,
+                request.stdout,
+                request.stderr,
+                request.duration_ms,
+                &expected.env_vars,
+                &expected.inherited_env,
+            );
+        }
     }
 
     tracing::debug!(

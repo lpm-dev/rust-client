@@ -56,6 +56,12 @@ pub fn hidden_script_direct_invocation_allowed() -> bool {
 
 fn mark_script_child_env(env_vars: &mut dotenv::ChildEnv) {
     env_vars.insert_runtime(LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
+    if let Some(marker) = crate::override_marker::marker().and_then(std::path::Path::to_str) {
+        env_vars.insert_runtime(
+            crate::override_marker::MARKER_ENV.to_owned(),
+            marker.to_owned(),
+        );
+    }
 }
 
 /// Append `arg` to `command` in single quotes, so `sh -c` takes it as data.
