@@ -13,7 +13,7 @@ use crate::graph::{self, SHARED_KEY_KIND};
 
 pub const MARKER_SCHEMA_VERSION: u8 = 1;
 pub const MAX_RECORD_BYTES: usize = 100 * 1024;
-const MAX_FEATURES: usize = 16;
+pub const MAX_FEATURES: usize = 16;
 const MAX_KINDS_PER_FEATURE: usize = 8;
 
 /// What a client that doesn't support a feature's version may do, from most

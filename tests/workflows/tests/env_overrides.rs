@@ -901,12 +901,45 @@ fn override_clear_asks_first_and_needs_yes_without_a_terminal() {
         .assert()
         .success();
 
+    let machine = if cfg!(target_os = "macos") {
+        "this Mac"
+    } else {
+        "this computer"
+    };
     let asked = lpm(&project)
         .args(["env", "override", "clear", "--env", "staging"])
         .output()
         .unwrap();
     assert!(!asked.status.success());
-    assert!(stderr(&asked).contains("--yes"), "{}", stderr(&asked));
+    assert!(
+        stderr(&asked).contains(&format!(
+            "change remove the personal overrides on {machine} (staging)\n"
+        )),
+        "{}",
+        stderr(&asked)
+    );
+    let asked = lpm(&project)
+        .args(["--json", "env", "override", "clear", "--all"])
+        .output()
+        .unwrap();
+    assert!(!asked.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&asked.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["message"],
+        format!(
+            "`lpm env override clear` needs `--yes` to remove the personal overrides on {machine} (every environment) without asking"
+        )
+    );
+    let (empty, _) = project_with_team_value("{}");
+    let nothing = lpm(&empty)
+        .args(["env", "override", "clear", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        !nothing.status.success(),
+        "it never decides without asking, whatever there is: {}",
+        stdout(&nothing)
+    );
     assert_eq!(
         listed(&project, &[])["environments"]
             .as_array()
@@ -1152,8 +1185,8 @@ fn removing_or_clearing_without_overrides_or_values_removes_nothing_and_says_so(
         .output()
         .unwrap();
     assert!(
-        asked.status.success(),
-        "nothing to ask about: {}",
+        !asked.status.success() && stderr(&asked).contains("Confirmation required"),
+        "without a terminal it needs --yes before it reads anything: {}",
         stderr(&asked)
     );
     assert!(!project.path().join("lpm.json").exists());
@@ -1219,11 +1252,13 @@ fn the_human_list_says_when_lpm_never_passes_an_unset_name_too() {
 }
 
 #[test]
-fn the_override_commands_say_what_env_means_for_each() {
+fn the_override_commands_say_what_env_and_their_keys_mean() {
     for (command, said) in [
         ("list", "every environment when left out"),
         ("clear", "The environment whose overrides to remove"),
         ("set", "default when left out"),
+        ("unset", "The keys to leave out"),
+        ("remove", "The keys whose override to remove"),
     ] {
         let project = TempProject::empty(r#"{"name":"help","version":"1.0.0"}"#);
         let help = lpm(&project)
@@ -1233,6 +1268,52 @@ fn the_override_commands_say_what_env_means_for_each() {
         assert!(help.status.success(), "{}", stderr(&help));
         assert!(stdout(&help).contains(said), "{command}: {}", stdout(&help));
     }
+}
+
+#[test]
+fn removing_an_override_and_an_empty_list_say_what_happened_where() {
+    let (project, _) = project_with_team_value("{}");
+    lpm(&project)
+        .args([
+            "env",
+            "override",
+            "set",
+            "--env",
+            "staging",
+            "LOCAL_ONLY=mine",
+        ])
+        .assert()
+        .success();
+
+    let removed = lpm(&project)
+        .args([
+            "env",
+            "override",
+            "remove",
+            "--env",
+            "staging",
+            "LOCAL_ONLY",
+        ])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let said = format!("{}{}", stdout(&removed), stderr(&removed));
+    assert!(
+        said.contains("LOCAL_ONLY no longer has an override on"),
+        "{said}"
+    );
+    assert!(!said.contains("the project's value"), "{said}");
+
+    let empty = lpm(&project)
+        .args(["env", "override", "list", "--env", "staging"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success(), "{}", stderr(&empty));
+    assert!(
+        stdout(&empty).contains("lpm env override set KEY --env=staging"),
+        "{}",
+        stdout(&empty)
+    );
 }
 
 #[test]
@@ -1348,4 +1429,32 @@ fn a_warning_after_a_run_with_overrides_still_shows() {
         text.contains("writes src/generated/value.js, which its cache inputs also match"),
         "{text}"
     );
+}
+
+#[test]
+fn a_failure_an_override_caused_never_shows_its_value() {
+    let (project, _) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"envSchema":{"vars":{"API_URL":{"format":"url"}}}}),
+    );
+    lpm(&project)
+        .args(["env", "set", "API_URL=https://team.example"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["env", "override", "set", "API_URL=fixture-not-a-url"])
+        .assert()
+        .success();
+    for args in [
+        &["env", "check"][..],
+        &["--json", "env", "check"],
+        &["run", "show"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let text = stdout(&output) + &stderr(&output);
+        assert!(text.contains("API_URL"), "{args:?}: {text}");
+        assert!(!text.contains("fixture-not-a-url"), "{args:?}: {text}");
+    }
 }

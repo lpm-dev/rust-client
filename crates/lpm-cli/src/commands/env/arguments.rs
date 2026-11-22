@@ -103,14 +103,16 @@ pub(super) enum OverrideAction {
     Unset {
         #[command(flatten)]
         environment: Environment,
+        /// The keys to leave out, such as `DEBUG`.
         #[arg(required = true, num_args = 1.., value_name = "KEY")]
         keys: Vec<String>,
     },
-    /// Remove this computer's override of keys, so the project's value
-    /// applies again.
+    /// Remove this computer's override of keys, so they get the project's
+    /// value, if it has one.
     Remove {
         #[command(flatten)]
         environment: Environment,
+        /// The keys whose override to remove.
         #[arg(required = true, num_args = 1.., value_name = "KEY")]
         keys: Vec<String>,
     },
@@ -134,7 +136,7 @@ pub(super) enum OverrideAction {
         /// Every environment's overrides.
         #[arg(long, conflicts_with = "env")]
         all: bool,
-        /// Remove them without asking first.
+        /// Remove them without asking first, as a script or `--json` must.
         #[arg(long)]
         yes: bool,
     },

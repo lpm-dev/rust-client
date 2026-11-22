@@ -118,10 +118,44 @@ impl Store {
 }
 
 #[test]
+fn a_batch_at_every_limit_with_a_full_service_of_names_is_one_input() {
+    let marker = vec![b'm'; MAX_RECORD_BYTES];
+    let record = vec![b'r'; MAX_RECORD_BYTES];
+    let values: Vec<Vec<u8>> = (0..MAX_EDITS)
+        .map(|index| vec![b'0' + (index % 10) as u8; MAX_BATCH_VALUE_BYTES / MAX_EDITS])
+        .collect();
+    let mut blobs: Vec<&[u8]> = vec![&marker, &record];
+    blobs.extend(values.iter().map(Vec::as_slice));
+    let names: Vec<String> = (0..lpm_env_companion::budgets::ADMISSION_CAP)
+        .map(|index| {
+            format!(
+                "{index:0>width$}",
+                width = lpm_env_companion::account::MAX_ACCOUNT_BYTES
+            )
+        })
+        .collect();
+    let edits: Vec<Value> = (0..MAX_EDITS)
+        .map(|index| json!({"action": "set", "environment": "dev", "key": format!("K{index}"), "value": index + 3}))
+        .collect();
+
+    let (status, response, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "marker": 1, "record": 2, "names": names, "edits": edits}),
+        &blobs,
+    );
+
+    assert_ne!(status, 2, "{response}");
+    assert_eq!(
+        response["code"], "overrides.damaged",
+        "judged, not refused unread"
+    );
+}
+
+#[test]
 fn the_header_declares_both_override_functions_and_their_input_limit() {
     let header = include_str!("../../include/lpm_env.h");
-    assert!(header.contains("#define LPM_ENV_OVERRIDES_INPUT_LIMIT (4 * 1024 * 1024)"));
-    assert_eq!(OVERRIDES_INPUT_LIMIT, 4 * 1024 * 1024);
+    assert!(header.contains("#define LPM_ENV_OVERRIDES_INPUT_LIMIT (16 * 1024 * 1024)"));
+    assert_eq!(OVERRIDES_INPUT_LIMIT, 16 * 1024 * 1024);
     for function in [
         "LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);",
         "LPMEnvResult lpm_env_overrides_plan(const uint8_t *input, size_t input_length);",
@@ -287,6 +321,8 @@ struct Fixture {
 struct FixtureCase {
     name: String,
     vault_id: String,
+    #[serde(default)]
+    values: Option<bool>,
     marker: Option<String>,
     record: Option<String>,
     names: Option<Vec<String>>,
@@ -315,6 +351,9 @@ fn every_override_change_fixture_plans_through_the_engine_as_recorded() {
             })
             .collect();
         let mut request = json!({ "vaultId": case.vault_id, "edits": edits });
+        if let Some(values) = case.values {
+            request["values"] = json!(values);
+        }
         if let Some(marker) = &case.marker {
             blobs.push(marker.as_bytes().to_vec());
             request["marker"] = json!(blobs.len());
@@ -575,4 +614,85 @@ fn the_check_says_an_invalid_vault_id_is_invalid_input() {
     );
     assert_eq!(status, 2, "{refused}");
     assert_eq!(refused["code"], "env.invalid_input");
+}
+
+#[test]
+fn environments_changed_together_keep_their_own_overrides() {
+    let mut store = Store::default();
+    let (status, _) = store.change(
+        json!([
+            {"action": "set", "environment": "a", "key": "K", "value": 1},
+            {"action": "set", "environment": "b", "key": "K", "value": 2},
+        ]),
+        &[b"fixture-a", b"fixture-b"],
+    );
+    assert_eq!(status, 0);
+    let (status, swapped) = store.change(
+        json!([{"action": "environmentsChanged", "renamed": [{"from": "a", "to": "b"}, {"from": "b", "to": "a"}], "removed": []}]),
+        &[],
+    );
+    assert_eq!(status, 0, "{swapped}");
+    assert_eq!(
+        swapped["effects"],
+        json!([{"kind": "environmentsChanged", "moved": [
+            {"from": "a", "to": "b", "moved": 1, "replaced": 0, "kept": 0},
+            {"from": "b", "to": "a", "moved": 1, "replaced": 0, "kept": 0},
+        ], "removed": []}])
+    );
+    let (_, read, values) = store.read(true);
+    assert_eq!(read["environments"][0]["environment"], "a");
+    let index = read["environments"][0]["set"][0]["value"].as_u64().unwrap() as usize;
+    assert_eq!(values[index - 1], b"fixture-b");
+}
+
+#[test]
+fn a_project_without_values_plans_removals_and_refuses_the_rest() {
+    let (status, removed, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "values": false, "edits": [{"action": "remove", "environment": "dev", "key": "A"}]}),
+        &[],
+    );
+    assert_eq!(status, 0, "{removed}");
+    assert_eq!(removed["result"], "unchanged");
+    assert_eq!(removed["effects"][0]["changed"], false);
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "values": false, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 1}]}),
+        &[b"fixture"],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.no_values");
+}
+
+#[test]
+fn a_too_large_refusal_never_repeats_an_invalid_key_and_names_the_limit_it_met() {
+    let large = vec![b'x'; 100 * 1024 + 1];
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "dev", "key": "fixture-secret-pasted", "value": 1}]}),
+        &[&large],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.invalid_key");
+    assert!(
+        !refused.to_string().contains("fixture-secret-pasted"),
+        "{refused}"
+    );
+
+    let shared = vec![b'x'; 64 * 1024];
+    let edits: Vec<Value> = (0..MAX_EDITS)
+        .map(|index| json!({"action": "set", "environment": "dev", "key": format!("K{index}"), "value": 1}))
+        .collect();
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "edits": edits}),
+        &[&shared],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.too_large");
+    assert_eq!(refused["limit"], MAX_BATCH_VALUE_BYTES);
+    assert!(
+        refused["message"].as_str().unwrap().contains("4 MiB"),
+        "{refused}"
+    );
 }

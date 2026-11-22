@@ -338,6 +338,103 @@
       }
     },
     {
+      "name": "environments changed together swap, chain and go, each keeping its own overrides",
+      "vaultId": "proj",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"1\"},\"unset\":[]},\"b\":{\"set\":{\"K\":\"2\"},\"unset\":[]},\"c\":{\"set\":{\"L\":\"3\"},\"unset\":[]},\"gone\":{\"set\":{\"M\":\"4\"},\"unset\":[]}}}",
+      "names": null,
+      "edits": [
+        {
+          "action": "environmentsChanged",
+          "renamed": [
+            {
+              "from": "a",
+              "to": "b"
+            },
+            {
+              "from": "b",
+              "to": "a"
+            },
+            {
+              "from": "c",
+              "to": "d"
+            }
+          ],
+          "removed": [
+            "gone"
+          ]
+        }
+      ],
+      "expect": {
+        "result": "planned",
+        "writes": {
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"2\"},\"unset\":[]},\"b\":{\"set\":{\"K\":\"1\"},\"unset\":[]},\"d\":{\"set\":{\"L\":\"3\"},\"unset\":[]}}}"
+        },
+        "deletes": [],
+        "markerAfter": "present",
+        "activated": false,
+        "effects": [
+          {
+            "kind": "environmentsChanged",
+            "moved": [
+              {
+                "from": "a",
+                "to": "b",
+                "moved": 1,
+                "replaced": 0,
+                "kept": 0
+              },
+              {
+                "from": "b",
+                "to": "a",
+                "moved": 1,
+                "replaced": 0,
+                "kept": 0
+              },
+              {
+                "from": "c",
+                "to": "d",
+                "moved": 1,
+                "replaced": 0,
+                "kept": 0
+              }
+            ],
+            "removed": [
+              {
+                "environment": "gone",
+                "removed": 1
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "an environment renamed and removed at once is refused",
+      "vaultId": "proj",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"1\"},\"unset\":[]}}}",
+      "names": null,
+      "edits": [
+        {
+          "action": "environmentsChanged",
+          "renamed": [
+            {
+              "from": "a",
+              "to": "b"
+            }
+          ],
+          "removed": [
+            "a"
+          ]
+        }
+      ],
+      "expect": {
+        "result": "refused",
+        "code": "overrides.environment_named_twice"
+      }
+    },
+    {
       "name": "the last removal deletes the record even when the names missed it",
       "vaultId": "proj",
       "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
@@ -500,6 +597,61 @@
       "expect": {
         "result": "refused",
         "code": "overrides.unsupported"
+      }
+    },
+    {
+      "name": "a project without values removes nothing and says so",
+      "vaultId": "proj",
+      "values": false,
+      "marker": null,
+      "record": null,
+      "names": null,
+      "edits": [
+        {
+          "action": "remove",
+          "environment": "development",
+          "key": "API_URL"
+        },
+        {
+          "action": "clearAll"
+        }
+      ],
+      "expect": {
+        "result": "unchanged",
+        "effects": [
+          {
+            "kind": "key",
+            "environment": "development",
+            "key": "API_URL",
+            "previous": "none",
+            "changed": false
+          },
+          {
+            "kind": "cleared",
+            "environment": null,
+            "removed": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "a project without values can't have overrides",
+      "vaultId": "proj",
+      "values": false,
+      "marker": null,
+      "record": null,
+      "names": null,
+      "edits": [
+        {
+          "action": "set",
+          "environment": "development",
+          "key": "API_URL",
+          "value": "http://localhost:4000"
+        }
+      ],
+      "expect": {
+        "result": "refused",
+        "code": "overrides.no_values"
       }
     }
   ]

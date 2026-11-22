@@ -6,13 +6,14 @@
 
 use std::collections::BTreeMap;
 
-use lpm_common::stored_env::is_safe_vault_id;
+use lpm_common::stored_env::{is_safe_vault_id, is_valid_variable_name};
 use lpm_env_companion::budgets::ADMISSION_CAP;
 use lpm_env_companion::gate::{GateError, Operation, ProjectGate};
 use lpm_env_companion::lifecycle::{Mutation, needs_resume};
 use lpm_env_companion::marker::{MAX_RECORD_BYTES, Marker};
 use lpm_env_companion::overrides::change::{
-    Edit, EditError, Effect, Inventory, InventoryNeed, PlanError, plan_change,
+    ChangePlan, Edit, EditError, Effect, EnvironmentMove, Inventory, InventoryNeed, PlanError,
+    plan_change, plan_without_values,
 };
 use lpm_env_companion::overrides::evaluate_all;
 use serde::{Deserialize, Serialize};
@@ -22,9 +23,14 @@ use zeroize::Zeroizing;
 use crate::frame::{self, Domain, Output, blob, refused, refused_with};
 use crate::{LPMEnvResult, failure};
 
-/// A record and a marker of 100 KiB each, the values a batch sets, and the
-/// names of every account in a full service, with room to spare.
-pub(crate) const OVERRIDES_INPUT_LIMIT: usize = 4 * 1024 * 1024;
+/// The most the values one batch sets may total.
+pub(crate) const MAX_BATCH_VALUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// What one input carries at most: a marker and a record of 100 KiB each, a
+/// batch's values ([`MAX_BATCH_VALUE_BYTES`]), and every account name in the
+/// service, whose companion records the admission cap bounds at 4 MiB of
+/// names at the longest, with room for its other items.
+pub(crate) const OVERRIDES_INPUT_LIMIT: usize = 16 * 1024 * 1024;
 
 const DOMAIN: Domain = Domain {
     invalid_input: "overrides.invalid_input",
@@ -171,6 +177,21 @@ enum EditRequest {
     EnvironmentCreated {
         environment: String,
     },
+    EnvironmentsChanged {
+        renamed: Vec<RenameRequest>,
+        removed: Vec<String>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameRequest {
+    from: String,
+    to: String,
+}
+
+fn has_values() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -185,6 +206,9 @@ struct PlanRequest {
     /// once a plan asked for them.
     #[serde(default)]
     names: Option<Vec<String>>,
+    /// Whether the project's values item exists, which overrides need.
+    #[serde(default = "has_values")]
+    values: bool,
     edits: Vec<EditRequest>,
 }
 
@@ -194,11 +218,20 @@ const MAX_EDITS: usize = 1024;
 /// Why the edits of a request can't be read.
 enum EditsFailure {
     InvalidInput,
-    /// A value larger than one record holds, or the values set so far past
-    /// what one input carries: refused before more is copied.
-    TooLarge {
+    /// A set's name that isn't a valid variable name, refused before its
+    /// value's size so a refusal never names it.
+    InvalidKey {
+        index: usize,
+    },
+    /// A value larger than one record holds, refused before it's copied.
+    ValueTooLarge {
         index: usize,
         key: String,
+    },
+    /// The values set so far past what one input carries, refused before
+    /// more is copied.
+    ValuesTooLarge {
+        index: usize,
     },
 }
 
@@ -214,9 +247,15 @@ fn edits(requests: Vec<EditRequest>, blobs: &[&[u8]]) -> Result<Vec<Edit>, Edits
                 value,
             } => {
                 let bytes = blob(blobs, value).ok_or(EditsFailure::InvalidInput)?;
+                if !is_valid_variable_name(&key) {
+                    return Err(EditsFailure::InvalidKey { index });
+                }
+                if bytes.len() > MAX_RECORD_BYTES {
+                    return Err(EditsFailure::ValueTooLarge { index, key });
+                }
                 copied = copied.saturating_add(bytes.len());
-                if bytes.len() > MAX_RECORD_BYTES || copied > OVERRIDES_INPUT_LIMIT {
-                    return Err(EditsFailure::TooLarge { index, key });
+                if copied > MAX_BATCH_VALUE_BYTES {
+                    return Err(EditsFailure::ValuesTooLarge { index });
                 }
                 let text = std::str::from_utf8(bytes).map_err(|_| EditsFailure::InvalidInput)?;
                 Edit::Set {
@@ -239,6 +278,13 @@ fn edits(requests: Vec<EditRequest>, blobs: &[&[u8]]) -> Result<Vec<Edit>, Edits
             EditRequest::EnvironmentCreated { environment } => {
                 Edit::EnvironmentCreated { environment }
             }
+            EditRequest::EnvironmentsChanged { renamed, removed } => Edit::EnvironmentsChanged {
+                renamed: renamed
+                    .into_iter()
+                    .map(|rename| (rename.from, rename.to))
+                    .collect(),
+                removed,
+            },
         });
     }
     Ok(edits)
@@ -253,7 +299,8 @@ fn refusal_details(error: &PlanError) -> serde_json::Map<String, Value> {
             details.insert("edit".to_owned(), json!(index));
             match reason {
                 EditError::InvalidEnvironment(environment)
-                | EditError::SameEnvironment { environment, .. } => {
+                | EditError::SameEnvironment { environment, .. }
+                | EditError::EnvironmentNamedTwice(environment) => {
                     details.insert("environment".to_owned(), json!(environment));
                 }
                 EditError::DeniedName(key) | EditError::NulValue(key) => {
@@ -312,6 +359,40 @@ enum EffectOutput<'a> {
     },
     #[serde(rename_all = "camelCase")]
     Existing { environment: &'a str, count: usize },
+    #[serde(rename_all = "camelCase")]
+    EnvironmentsChanged {
+        moved: Vec<MoveOutput<'a>>,
+        removed: Vec<RemovedOutput<'a>>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MoveOutput<'a> {
+    from: &'a str,
+    to: &'a str,
+    moved: usize,
+    replaced: usize,
+    kept: usize,
+}
+
+impl<'a> From<&'a EnvironmentMove> for MoveOutput<'a> {
+    fn from(change: &'a EnvironmentMove) -> Self {
+        Self {
+            from: &change.from,
+            to: &change.to,
+            moved: change.moved,
+            replaced: change.replaced,
+            kept: change.kept,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovedOutput<'a> {
+    environment: &'a str,
+    removed: usize,
 }
 
 impl<'a> From<&'a Effect> for EffectOutput<'a> {
@@ -370,6 +451,16 @@ impl<'a> From<&'a Effect> for EffectOutput<'a> {
                 environment,
                 count: *count,
             },
+            Effect::EnvironmentsChanged { moved, removed } => Self::EnvironmentsChanged {
+                moved: moved.iter().map(MoveOutput::from).collect(),
+                removed: removed
+                    .iter()
+                    .map(|(environment, removed)| RemovedOutput {
+                        environment,
+                        removed: *removed,
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -397,7 +488,13 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             let edits = match edits(request.edits, blobs) {
                 Ok(edits) => edits,
                 Err(EditsFailure::InvalidInput) => return failure(2, DOMAIN.invalid_input),
-                Err(EditsFailure::TooLarge { index, key }) => {
+                Err(EditsFailure::InvalidKey { index }) => {
+                    return refusal(&PlanError::Edit {
+                        index,
+                        reason: EditError::InvalidKey,
+                    });
+                }
+                Err(EditsFailure::ValueTooLarge { index, key }) => {
                     let mut details = serde_json::Map::new();
                     details.insert("edit".to_owned(), json!(index));
                     details.insert("key".to_owned(), json!(key));
@@ -411,12 +508,31 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
                         details,
                     );
                 }
+                Err(EditsFailure::ValuesTooLarge { index }) => {
+                    let mut details = serde_json::Map::new();
+                    details.insert("edit".to_owned(), json!(index));
+                    details.insert("limit".to_owned(), json!(MAX_BATCH_VALUE_BYTES));
+                    return refused_with(
+                        "overrides.too_large",
+                        Some(format!(
+                            "the values one batch sets total more than {} MiB",
+                            MAX_BATCH_VALUE_BYTES / (1024 * 1024)
+                        )),
+                        details,
+                    );
+                }
             };
+            let gate = gate_of(vault_id, marker);
+            if !request.values {
+                return match plan_without_values(&gate, &edits) {
+                    Ok(plan) => unchanged(&plan),
+                    Err(error) => refusal(&error),
+                };
+            }
             let inventory = request
                 .names
                 .as_ref()
                 .map(|names| Inventory::from_names(vault_id, names.iter().map(String::as_str)));
-            let gate = gate_of(vault_id, marker);
             let plan = match plan_change(vault_id, &gate, record, &edits, inventory.as_ref()) {
                 Ok(plan) => plan,
                 Err(PlanError::NeedsInventory { need, effects }) => {
@@ -430,20 +546,13 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
                         &json!({ "result": "needsNames", "needs": needs, "effects": effects }),
                     );
                 }
-                Err(error) => {
-                    return refused_with(
-                        &format!("overrides.{}", error.code()),
-                        Some(error.to_string()),
-                        refusal_details(&error),
-                    );
-                }
+                Err(error) => return refusal(&error),
             };
+            if plan.mutations.is_empty() {
+                return unchanged(&plan);
+            }
             let effects: Vec<EffectOutput<'_>> =
                 plan.effects.iter().map(EffectOutput::from).collect();
-            if plan.mutations.is_empty() {
-                return Output::new(DOMAIN.serialization)
-                    .finish(&json!({ "result": "unchanged", "effects": effects }));
-            }
             let mut output = Output::new(DOMAIN.serialization);
             let mut writes = Vec::with_capacity(plan.mutations.len());
             let mut deletes = Vec::new();
@@ -471,6 +580,20 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             }))
         })
     }
+}
+
+fn refusal(error: &PlanError) -> LPMEnvResult {
+    refused_with(
+        &format!("overrides.{}", error.code()),
+        Some(error.to_string()),
+        refusal_details(error),
+    )
+}
+
+/// A plan with nothing to commit: its effects alone.
+fn unchanged(plan: &ChangePlan) -> LPMEnvResult {
+    let effects: Vec<EffectOutput<'_>> = plan.effects.iter().map(EffectOutput::from).collect();
+    Output::new(DOMAIN.serialization).finish(&json!({ "result": "unchanged", "effects": effects }))
 }
 
 /// Every environment's overrides, for `lpm_env_check`'s effective mode, or

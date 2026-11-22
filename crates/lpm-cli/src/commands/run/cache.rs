@@ -89,6 +89,9 @@ pub(super) struct CompletedTaskCacheIdentity {
     value: String,
     output_validation: Option<lpm_task::hasher::FilesystemValidation>,
     dependencies: Vec<Arc<Self>>,
+    /// The task, or one it depends on, ran with this computer's personal
+    /// overrides, so nothing built from its outputs leaves this computer.
+    local_only: bool,
 }
 
 impl CompletedTaskCacheIdentity {
@@ -100,6 +103,7 @@ impl CompletedTaskCacheIdentity {
                 &context.task_config.outputs,
             )?),
             dependencies: Vec::new(),
+            local_only: context.local_only,
         }))
     }
 
@@ -113,8 +117,15 @@ impl CompletedTaskCacheIdentity {
                 .iter()
                 .map(|dependency| Arc::clone(&dependency.node))
                 .collect(),
+            local_only: any_local_only(dependencies),
         })
     }
+}
+
+fn any_local_only(dependencies: &[TaskDependencyIdentity]) -> bool {
+    dependencies
+        .iter()
+        .any(|dependency| dependency.node.local_only)
 }
 
 #[derive(Clone)]
@@ -155,6 +166,8 @@ pub(super) struct CacheContext {
     schema_snapshot: Option<Arc<lpm_env_source::SchemaSnapshot>>,
     dependencies: Vec<TaskDependencyIdentity>,
     command_preference: CommandPreference,
+    /// See [`CompletedTaskCacheIdentity::local_only`].
+    local_only: bool,
 }
 
 pub(super) struct CacheStoreRequest<'a> {
@@ -508,12 +521,14 @@ fn build_task_context(
             .verify_dependencies()
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
-    // Outputs and logs built with this computer's personal overrides stay on
-    // it: they're never shared, and the team's never stand in for them.
+    // Outputs and logs built with this computer's personal overrides, or
+    // from a task's that were, stay on it: they're never shared, and the
+    // team's never stand in for them.
+    let local_only = personal_overrides > 0 || any_local_only(dependency_identities);
     let remote_cache = match remote_cache {
-        RemoteCacheResolution::Resolve(_) if personal_overrides > 0 => {
+        RemoteCacheResolution::Resolve(_) if local_only => {
             tracing::debug!(
-                "task '{}' runs with personal overrides; not using the remote cache for it",
+                "task '{}' runs with personal overrides, or after a task that did; not using the remote cache for it",
                 lpm_common::sanitize_terminal_inline(script_name)
             );
             None
@@ -542,6 +557,7 @@ fn build_task_context(
         },
         schema_snapshot,
         dependencies: dependency_identities.to_vec(),
+        local_only,
     }))
 }
 
@@ -878,7 +894,29 @@ mod tests {
             value: value.into(),
             output_validation: None,
             dependencies: Vec::new(),
+            local_only: false,
         })
+    }
+
+    #[test]
+    fn a_meta_task_over_one_built_with_personal_overrides_stays_on_this_computer() {
+        let local = Arc::new(CompletedTaskCacheIdentity {
+            value: "local".into(),
+            output_validation: None,
+            dependencies: Vec::new(),
+            local_only: true,
+        });
+        let dependencies = |node| {
+            vec![TaskDependencyIdentity {
+                label: "local:generate".into(),
+                node,
+            }]
+        };
+        assert!(CompletedTaskCacheIdentity::meta(&dependencies(local)).local_only);
+        assert!(
+            !CompletedTaskCacheIdentity::meta(&dependencies(completed_identity("shared")))
+                .local_only
+        );
     }
 
     fn output_identity(
@@ -897,6 +935,7 @@ mod tests {
                 .unwrap(),
             ),
             dependencies,
+            local_only: false,
         })
     }
 
@@ -980,6 +1019,7 @@ mod tests {
             value: "meta".into(),
             output_validation: None,
             dependencies: vec![generated],
+            local_only: false,
         });
         std::fs::write(project.path().join("generated.txt"), "after").unwrap();
 

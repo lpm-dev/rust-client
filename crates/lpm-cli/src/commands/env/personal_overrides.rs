@@ -231,7 +231,7 @@ fn change_keys(
                 &environment,
             )),
             (KeyChange::Remove, true, _) => output::success_line(install_ui::terminal_line!(
-                "{} uses the project's value again on {} ({})",
+                "{} no longer has an override on {} ({})",
                 install_ui::bold(key),
                 THIS_MACHINE,
                 &environment,
@@ -356,10 +356,11 @@ fn list(
             )),
             None => output::info(&format!("No personal overrides on {THIS_MACHINE}")),
         }
-        println!(
-            "  Run {} to add one",
-            "lpm env override set KEY --env=ENV".cyan()
-        );
+        let example = match &selected {
+            Some(environment) => format!("lpm env override set KEY --env={environment}"),
+            None => "lpm env override set KEY --env=ENV".to_owned(),
+        };
+        println!("  Run {} to add one", example.cyan());
         return Ok(());
     }
     for Listed {
@@ -428,6 +429,7 @@ fn clear(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    use super::value_input::Sources as _;
     let selected = env_input
         .map(|_| environment(env_input, project_dir))
         .transpose()?;
@@ -435,62 +437,88 @@ fn clear(
         Some(environment) => environment.clone(),
         None => "every environment".to_owned(),
     };
-    let edits = if yes {
-        vec![match &selected {
+    if yes {
+        let edit = match &selected {
             Some(environment) => Edit::ClearEnvironment {
                 environment: environment.clone(),
             },
             None => Edit::ClearAll,
-        }]
-    } else {
-        // The question counts exactly what's removed: an override another
-        // command adds while it waits stays.
-        let reviewed: Vec<Edit> = lpm_vault::overrides::read_all(project_dir)
-            .map_err(vault_error)?
-            .into_iter()
-            .filter(|(environment, _)| {
-                selected
-                    .as_ref()
-                    .is_none_or(|selected| selected == environment)
-            })
-            .flat_map(|(environment, overrides)| {
-                overrides
-                    .set
-                    .into_keys()
-                    .chain(overrides.unset)
-                    .map(move |key| Edit::Remove {
-                        environment: environment.clone(),
-                        key,
-                    })
-            })
-            .collect();
-        if reviewed.is_empty() {
-            report_cleared(&selected, &scope, 0, json_output);
-            return Ok(());
-        }
-        let count = reviewed.len();
-        let question = format!(
-            "Remove {count} personal override{} on {THIS_MACHINE} ({scope})?",
-            if count == 1 { "" } else { "s" }
-        );
-        match confirm(&question, false, json_output)? {
-            Some(true) => {}
-            Some(false) => {
-                output::info("nothing was changed");
-                return Ok(());
-            }
-            None => {
-                return Err(LpmError::ConfirmationRequired {
-                    command: "lpm env override clear",
-                    change: question,
-                    help: "Run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
-                });
-            }
-        }
-        reviewed
+        };
+        let change = lpm_vault::overrides::change(project_dir, &[edit]).map_err(vault_error)?;
+        report_cleared(&selected, &scope, removed(&change), json_output);
+        return Ok(());
+    }
+    // Whether it can ask is known before anything is read, so a command
+    // that can't ask never reads overrides, or asks for approval, for
+    // nothing.
+    if json_output || !super::value_input::ProcessSources.can_prompt() {
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm env override clear",
+            change: format!("remove the personal overrides on {THIS_MACHINE} ({scope})"),
+            help: "Run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+        });
+    }
+    let Some(mut reviewed) = lpm_vault::overrides::review_all(project_dir).map_err(vault_error)?
+    else {
+        report_cleared(&selected, &scope, 0, json_output);
+        return Ok(());
     };
-    let change = lpm_vault::overrides::change(project_dir, &edits).map_err(vault_error)?;
-    let removed = change
+    // The question counts exactly what's removed, in the project it read:
+    // an override another command adds while it waits stays.
+    let mut removals = Vec::new();
+    let mut counted = Vec::new();
+    for (environment, overrides) in std::mem::take(&mut reviewed.overrides) {
+        if selected
+            .as_ref()
+            .is_some_and(|selected| *selected != environment)
+        {
+            continue;
+        }
+        let before = removals.len();
+        removals.extend(
+            overrides
+                .set
+                .into_keys()
+                .chain(overrides.unset)
+                .map(|key| Edit::Remove {
+                    environment: environment.clone(),
+                    key,
+                }),
+        );
+        if removals.len() > before {
+            counted.push(format!("{environment}: {}", removals.len() - before));
+        }
+    }
+    if removals.is_empty() {
+        report_cleared(&selected, &scope, 0, json_output);
+        return Ok(());
+    }
+    let count = removals.len();
+    let counts = match &selected {
+        Some(_) => std::borrow::Cow::Borrowed(scope.as_str()),
+        None => std::borrow::Cow::Owned(counted.join(", ")),
+    };
+    let question = format!(
+        "Remove {count} personal override{} on {THIS_MACHINE} ({counts})?",
+        if count == 1 { "" } else { "s" },
+    );
+    let confirmed = cliclack::confirm(&question)
+        .initial_value(false)
+        .interact()
+        .map_prompt_err(|error| LpmError::Env(format!("prompt failed: {error}")))?;
+    if !confirmed {
+        output::info("nothing was changed");
+        return Ok(());
+    }
+    let change = lpm_vault::overrides::change_reviewed(project_dir, &reviewed, &removals)
+        .map_err(vault_error)?;
+    report_cleared(&selected, &scope, removed(&change), json_output);
+    Ok(())
+}
+
+/// How many overrides a clear removed.
+fn removed(change: &lpm_vault::overrides::Change) -> usize {
+    change
         .effects
         .iter()
         .map(|effect| match effect {
@@ -498,9 +526,7 @@ fn clear(
             Effect::Key { changed: true, .. } => 1,
             _ => 0,
         })
-        .sum::<usize>();
-    report_cleared(&selected, &scope, removed, json_output);
-    Ok(())
+        .sum()
 }
 
 fn report_cleared(selected: &Option<String>, scope: &str, removed: usize, json_output: bool) {
@@ -520,21 +546,4 @@ fn report_cleared(selected: &Option<String>, scope: &str, removed: usize, json_o
             scope,
         ));
     }
-}
-
-/// Ask a yes-or-no question that defaults to No, or skip it with `yes`.
-/// `Ok(None)` means there's no terminal to ask on.
-fn confirm(question: &str, yes: bool, json_output: bool) -> Result<Option<bool>, LpmError> {
-    use std::io::IsTerminal as _;
-    if yes {
-        return Ok(Some(true));
-    }
-    if json_output || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Ok(None);
-    }
-    cliclack::confirm(question)
-        .initial_value(false)
-        .interact()
-        .map(Some)
-        .map_prompt_err(|error| LpmError::Env(format!("prompt failed: {error}")))
 }

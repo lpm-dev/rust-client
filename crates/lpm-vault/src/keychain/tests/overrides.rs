@@ -243,6 +243,149 @@ fn a_record_weakened_while_it_is_read_is_refused_rather_than_used() {
 }
 
 #[test]
+fn values_that_demand_approval_they_dont_claim_keep_their_overrides_behind_it() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage.protected.insert(VAULT.to_owned());
+    storage.approval_cancelled = true;
+
+    let error = read_all(&mut storage).expect_err("the values' approval was cancelled");
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(!error.contains("fixture-mine"), "{error}");
+    let error = change(&mut storage, &[remove("API_URL")]).expect_err("cancelled again");
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(
+        storage.values.contains_key(&overrides_account()),
+        "nothing was removed without the values' approval"
+    );
+    assert!(storage.protected.contains(&overrides_account()));
+}
+
+#[test]
+fn a_protected_record_that_claims_no_approval_is_read_once_a_probe_verifies_it() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "mine")]).expect("set");
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.protected.insert(overrides_account());
+
+    let read = read_all(&mut storage).expect("its approval is verified");
+    assert_eq!(read["default"].set["API_URL"], "mine");
+    assert!(storage.approvals_required.is_empty());
+}
+
+#[test]
+fn approved_values_settle_an_absent_or_contradictory_record_without_reading_it() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.reads.clear();
+    assert!(read_all(&mut storage).expect("no overrides").is_empty());
+    assert_eq!(storage.reads.get(&overrides_account()).copied(), None);
+
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage
+        .claims
+        .insert(overrides_account(), ClaimedAccess::Contradictory);
+    storage.reads.clear();
+    let error = read_all(&mut storage).expect_err("contradictory");
+    assert!(error.contains("contradict"), "{error}");
+    assert_eq!(storage.reads.get(&overrides_account()).copied(), None);
+}
+
+#[test]
+fn a_change_probes_the_values_once_for_its_read_and_its_journal() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "mine")]).expect("set");
+    storage.probes.clear();
+
+    change(&mut storage, &[set("API_URL", "yours")]).expect("replace");
+
+    assert_eq!(
+        storage
+            .probes
+            .iter()
+            .filter(|account| *account == VAULT)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn values_and_the_overrides_that_follow_them_land_together_or_not_at_all() {
+    let storage = || {
+        let mut storage = storage_with_values();
+        change(&mut storage, &[set("TOKEN", "mine")]).expect("set");
+        storage.mutation_attempts = 0;
+        storage
+    };
+    let rename = |storage: &mut MemoryProjectStorage| {
+        let _scope = crate::companion::LockScope::enter();
+        recover_project_transaction(storage)?;
+        let following = crate::keychain::overrides::plan_with_storage(
+            storage,
+            VAULT,
+            &[Edit::EnvironmentsChanged {
+                renamed: vec![("default".to_owned(), "prod".to_owned())],
+                removed: Vec::new(),
+            }],
+        )?;
+        let renamed = HashMap::from([(
+            "prod".to_owned(),
+            HashMap::from([("TOKEN".to_owned(), "team".to_owned())]),
+        )]);
+        write_all_environments_following_with_storage(
+            storage,
+            VAULT,
+            "Project",
+            "/project",
+            &renamed,
+            &crate::history::scope::begin(
+                VAULT,
+                &crate::history::Source::new(crate::history::Action::Rollback),
+            ),
+            following,
+        )
+    };
+    let mut uninterrupted = storage();
+    rename(&mut uninterrupted).expect("renamed");
+    assert!(
+        read_all(&mut uninterrupted)
+            .expect("read")
+            .contains_key("prod")
+    );
+    let mutations = uninterrupted.mutation_attempts;
+    assert!(mutations > 0);
+
+    for failure_point in 1..=mutations {
+        let mut storage = storage();
+        storage.fail_once_at_mutation = Some(failure_point);
+        let _ = rename(&mut storage);
+        assert!(storage.injected_failure, "{failure_point}");
+        storage.fail_once_at_mutation = None;
+
+        let overrides =
+            read_all(&mut storage).unwrap_or_else(|error| panic!("{failure_point}: {error}"));
+        let values_moved = storage
+            .values
+            .get(VAULT)
+            .expect("the values")
+            .contains(r#""prod""#);
+        assert_eq!(
+            overrides.contains_key("prod"),
+            values_moved,
+            "{failure_point}: {:?}",
+            overrides.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(overrides.len(), 1, "{failure_point}");
+    }
+}
+
+#[test]
 fn removing_overrides_from_a_project_without_values_changes_nothing_and_says_so() {
     let mut storage = MemoryProjectStorage::default();
     let _scope = crate::companion::LockScope::enter();

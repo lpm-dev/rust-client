@@ -105,13 +105,25 @@ pub(crate) fn review(
 ) -> Result<CompanionReview, String> {
     let marker = backend.read(&marker_account(vault_id))?;
     let inventory = backend.inventory(vault_id)?;
+    let mut unreadable_overrides = None;
     let overrides = match unfinished {
         Some(_) => None,
-        None => Some(backend.read(&CompanionAccount::Record {
-            kind: OVERRIDES_KIND.to_owned(),
-            vault_id: vault_id.to_owned(),
-            part: None,
-        })?),
+        None => Some(
+            match backend.read_checked(&CompanionAccount::Record {
+                kind: OVERRIDES_KIND.to_owned(),
+                vault_id: vault_id.to_owned(),
+                part: None,
+            })? {
+                Checked::Present(bytes) => Some(bytes),
+                Checked::Absent => None,
+                // Content that won't decrypt won't open as a record either, so
+                // the engine judges it as it judges any record it can't open.
+                Checked::Unreadable(reason) => {
+                    unreadable_overrides = Some(reason);
+                    Some(zeroize::Zeroizing::new(Vec::new()))
+                }
+            },
+        ),
     };
     let history = match (unfinished, marker.as_deref()) {
         (None, Some(bytes)) => history_damage(backend, vault_id, bytes)?,
@@ -122,17 +134,31 @@ pub(crate) fn review(
         Observed {
             marker: marker.as_deref(),
             inventory: Some(&inventory),
-            overrides: overrides.as_ref().map(Option::as_deref),
+            overrides: overrides
+                .as_ref()
+                .map(|record| record.as_deref().map(Vec::as_slice)),
             access,
             unfinished,
             history: &history,
         },
     );
+    let described = |damage: &super::gate::Damage| match (damage, &unreadable_overrides) {
+        (super::gate::Damage::InvalidRecord { kind, .. }, Some(reason))
+            if kind == OVERRIDES_KIND =>
+        {
+            super::gate::Damage::InvalidRecord {
+                kind: kind.clone(),
+                reason: format!("it can't be read: {reason}"),
+            }
+            .to_string()
+        }
+        _ => damage.to_string(),
+    };
     Ok(CompanionReview {
         problems: assessment
             .every_damage()
             .map(|damage| CompanionProblem {
-                description: damage.to_string(),
+                description: described(damage),
                 repair: assessment.repair(damage).map(CompanionRepair::from),
             })
             .collect(),

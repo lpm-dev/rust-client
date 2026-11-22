@@ -1085,3 +1085,183 @@ fn removing_the_environment_that_held_the_last_overrides_deletes_the_record_and_
     assert_eq!(planned.gate, ProjectGate::Plain);
     passes_the_commit_check(&planned, Some(&overrides_marker()), &before);
 }
+
+fn changed(renamed: &[(&str, &str)], removed: &[&str]) -> Edit {
+    Edit::EnvironmentsChanged {
+        renamed: renamed
+            .iter()
+            .map(|(from, to)| ((*from).to_owned(), (*to).to_owned()))
+            .collect(),
+        removed: removed.iter().map(|name| (*name).to_owned()).collect(),
+    }
+}
+
+const SWAP_RECORD: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"a":{"set":{"K":"from-a","X":"1"},"unset":[]},"b":{"set":{"K":"from-b","Y":"2"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#;
+
+#[test]
+fn environments_renamed_together_keep_their_own_overrides_when_names_swap_or_chain() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let swapped = plan(
+        &gate,
+        Some(SWAP_RECORD),
+        vec![changed(&[("a", "b"), ("b", "a")], &[])],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        written_record(&swapped).as_deref(),
+        Some(
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"a":{"set":{"K":"from-b","Y":"2"},"unset":[]},"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#
+        )
+    );
+    let chained = plan(
+        &gate,
+        Some(SWAP_RECORD),
+        vec![changed(&[("b", "c"), ("a", "b")], &["c"])],
+        None,
+    );
+    assert!(
+        matches!(
+            chained,
+            Err(PlanError::Edit {
+                reason: EditError::EnvironmentNamedTwice(_),
+                ..
+            })
+        ),
+        "{chained:?}"
+    );
+    let chained = plan(
+        &gate,
+        Some(SWAP_RECORD),
+        vec![changed(&[("a", "b"), ("b", "c")], &[])],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        written_record(&chained).as_deref(),
+        Some(
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"K":"from-b","Y":"2","Z":"3"},"unset":[]}}}"#
+        )
+    );
+    match &chained.effects[..] {
+        [Effect::EnvironmentsChanged { moved, removed }] => {
+            assert_eq!(moved.len(), 2);
+            assert_eq!(
+                (moved[1].moved, moved[1].replaced, moved[1].kept),
+                (2, 0, 1)
+            );
+            assert!(removed.is_empty());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn environments_changed_together_take_removals_out_with_the_renames() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let planned = plan(
+        &gate,
+        Some(SWAP_RECORD),
+        vec![changed(&[("a", "c")], &["b"])],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        written_record(&planned).as_deref(),
+        Some(
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"c":{"set":{"K":"from-a","X":"1","Z":"3"},"unset":[]}}}"#
+        )
+    );
+    for edit in [
+        changed(&[("a", "b"), ("a", "c")], &[]),
+        changed(&[("a", "c"), ("b", "c")], &[]),
+        changed(&[("a", "b")], &["b"]),
+        changed(&[("a", "b")], &["a"]),
+    ] {
+        assert_eq!(
+            plan(&gate, Some(SWAP_RECORD), vec![edit], None)
+                .unwrap_err()
+                .code(),
+            "environment_named_twice"
+        );
+    }
+}
+
+#[test]
+fn the_first_override_beside_a_full_marker_is_over_budget_not_damage() {
+    let mut marker = Marker::empty(VAULT, ProjectState::Active);
+    for index in 0..crate::marker::MAX_FEATURES {
+        let kind = format!("future-{index}");
+        marker.features.insert(
+            kind.clone(),
+            FeatureEntry {
+                version: 1,
+                if_unsupported: Level::Ignore,
+                kinds: vec![kind],
+                state: FeatureState::Active,
+            },
+        );
+    }
+    let refused = plan(
+        &ProjectGate::Marked(marker),
+        None,
+        vec![set("development", "A", "1")],
+        Some(&inventory(Vec::new())),
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused,
+        PlanError::OverBudget(OverBudget::Features(crate::marker::MAX_FEATURES + 1))
+    );
+}
+
+#[test]
+fn a_project_without_values_removes_nothing_and_refuses_the_rest() {
+    let removed = plan_without_values(&ProjectGate::Plain, &[remove("development", "A")])
+        .expect("a removal of nothing succeeds");
+    assert!(removed.mutations.is_empty());
+    assert!(!removed.activated);
+    assert_eq!(
+        removed.effects,
+        vec![Effect::Key {
+            environment: "development".to_owned(),
+            key: "A".to_owned(),
+            previous: Previous::None,
+            changed: false,
+        }]
+    );
+    assert_eq!(
+        plan_without_values(&ProjectGate::Plain, &[set("development", "A", "1")])
+            .unwrap_err()
+            .code(),
+        "no_values"
+    );
+}
+
+#[test]
+fn a_project_without_values_keeps_the_gate_a_plan_with_values_keeps() {
+    let edits = [remove("development", "A")];
+    let mut newer = overrides_marker();
+    newer.features.get_mut(OVERRIDES_KIND).unwrap().version = 2;
+    assert_eq!(
+        plan_without_values(&ProjectGate::Marked(newer), &edits)
+            .unwrap_err()
+            .code(),
+        "unsupported"
+    );
+    let mut removing = overrides_marker();
+    removing.features.get_mut(OVERRIDES_KIND).unwrap().state = FeatureState::Removing;
+    assert_eq!(
+        plan_without_values(&ProjectGate::Marked(removing), &edits).unwrap_err(),
+        PlanError::NeedsResume
+    );
+    assert_eq!(
+        plan_without_values(
+            &ProjectGate::Damaged(crate::gate::Damage::Access("fixture".to_owned())),
+            &edits
+        )
+        .unwrap_err()
+        .code(),
+        "damaged"
+    );
+}

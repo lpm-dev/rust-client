@@ -17,7 +17,7 @@ pub use lpm_vault::PersonalOverrides;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The error an env store failure becomes: an env project's refusal as
 /// itself, so its message and next step stand alone, anything else as
@@ -175,11 +175,12 @@ pub fn load_project_env_for_resolved_with_config(
 }
 
 /// Layers 1 and 2 of a project's environment, with layer 4, the personal
-/// overrides, kept apart until any service values are merged.
-#[derive(Debug, Default)]
+/// overrides, kept apart until any service values are merged. The composed
+/// child shares the overrides rather than copying them.
+#[derive(Default)]
 pub struct ProjectEnvLayers {
     vars: HashMap<String, String>,
-    overrides: PersonalOverrides,
+    overrides: Arc<PersonalOverrides>,
     /// The child environment, once layer 4 was applied to the layers.
     composed: Option<ChildEnv>,
     vault_count: usize,
@@ -203,10 +204,10 @@ pub use lpm_env::PersonalOverrideOrigins as OverrideOrigins;
 /// A child's environment through layer 4, with what the personal overrides
 /// still decide. Its later layers write through it, so each write takes the
 /// name back from the overrides.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ChildEnv {
     vars: HashMap<String, String>,
-    overrides: PersonalOverrides,
+    overrides: Arc<PersonalOverrides>,
     origins: OverrideOrigins,
     /// How many overrides changed the environment at layer 4.
     applied: usize,
@@ -216,6 +217,37 @@ pub struct ChildEnv {
     /// and the trusted values: lpm's own, which validating again replaces
     /// rather than ignoring as a project's.
     validated: Vec<String>,
+}
+
+/// Names only: the values are secrets.
+impl std::fmt::Debug for ChildEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChildEnv")
+            .field("vars", &sorted_keys(&self.vars))
+            .field("overrides", &self.overrides)
+            .field("applied", &self.applied)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Names only: the values are secrets.
+impl std::fmt::Debug for ProjectEnvLayers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectEnvLayers")
+            .field("vars", &sorted_keys(&self.vars))
+            .field("overrides", &self.overrides)
+            .field("composed", &self.composed)
+            .field("vault_values", &sorted_keys(&self.vault_values))
+            .finish_non_exhaustive()
+    }
+}
+
+fn sorted_keys(values: &HashMap<String, String>) -> Vec<&str> {
+    let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
 }
 
 impl ChildEnv {
@@ -244,10 +276,6 @@ impl ChildEnv {
     /// kept only while debug logging is on, the one place they're shown.
     pub fn override_names(&self) -> &[String] {
         &self.applied_names
-    }
-
-    pub fn overrides(&self) -> &PersonalOverrides {
-        &self.overrides
     }
 
     /// Layer 5: one of LPM's runtime values.
@@ -331,7 +359,7 @@ impl ProjectEnvLayers {
     pub(crate) fn already_composed(child: ChildEnv, vault_count: usize) -> Self {
         Self {
             vars: HashMap::new(),
-            overrides: child.overrides.clone(),
+            overrides: Arc::clone(&child.overrides),
             composed: Some(child),
             vault_count,
             vault_values: HashMap::new(),
@@ -385,10 +413,6 @@ impl ProjectEnvLayers {
                 .map(str::to_owned)
                 .collect(),
         }
-    }
-
-    pub fn overrides(&self) -> &PersonalOverrides {
-        &self.overrides
     }
 
     pub(crate) fn vault_count(&self) -> usize {
@@ -461,12 +485,17 @@ pub fn compose_with_overrides(
     policy: OverridePolicy,
 ) -> ChildEnv {
     match (policy, overrides) {
-        (OverridePolicy::Apply, Some(overrides)) => apply_layer_four(vars, overrides),
+        (OverridePolicy::Apply, Some(overrides)) => {
+            apply_layer_four(vars, &Arc::new(overrides.clone()))
+        }
         (OverridePolicy::Apply, None) | (OverridePolicy::Exclude, _) => ChildEnv::plain(vars),
     }
 }
 
-fn apply_layer_four(mut vars: HashMap<String, String>, overrides: &PersonalOverrides) -> ChildEnv {
+fn apply_layer_four(
+    mut vars: HashMap<String, String>,
+    overrides: &Arc<PersonalOverrides>,
+) -> ChildEnv {
     let origins = OverrideOrigins::changing(&vars, overrides.layer(), cfg!(windows));
     let applied_names = if !origins.is_empty() && debug_logging() {
         origins.names().into_iter().map(str::to_owned).collect()
@@ -476,7 +505,7 @@ fn apply_layer_four(mut vars: HashMap<String, String>, overrides: &PersonalOverr
     apply_personal_overrides(&mut vars, overrides);
     ChildEnv {
         vars,
-        overrides: overrides.clone(),
+        overrides: Arc::clone(overrides),
         applied: origins.len(),
         origins,
         applied_names,
@@ -699,7 +728,7 @@ pub(crate) fn load_project_env_layers(
 
     Ok(ProjectEnvLayers {
         vars: loaded,
-        overrides,
+        overrides: Arc::new(overrides),
         composed: None,
         vault_count,
         vault_values: vault_vars,
@@ -1004,7 +1033,10 @@ fn validation_result(
             .zip(caused)
             .map(|(error, caused)| {
                 if caused {
-                    format!("  {error} (from a personal override on {THIS_MACHINE})")
+                    format!(
+                        "  {} (from a personal override on {THIS_MACHINE})",
+                        error.without_value()
+                    )
                 } else {
                     format!("  {error}")
                 }

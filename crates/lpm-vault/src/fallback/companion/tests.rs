@@ -1055,6 +1055,45 @@ fn a_record_that_fails_to_decrypt_is_damage_with_the_way_to_repair_it() {
 }
 
 #[test]
+fn a_record_that_fails_to_decrypt_is_repaired_by_removing_its_feature_alone() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        let mut sealed = std::fs::read(&entry).expect("the sealed record");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(&entry, sealed).expect("corrupt it");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert_eq!(
+            reviewed.repairs(),
+            [CompanionRepair::RemoveFeature("overrides".to_owned())]
+        );
+        assert!(
+            reviewed
+                .problems
+                .iter()
+                .any(|problem| problem.description.contains("it can't be read")),
+            "{reviewed:?}"
+        );
+        repair(&reviewed).expect("repaired");
+        assert!(read_overrides().expect("readable again").is_empty());
+        assert_eq!(
+            crate::try_get_run_environment_for_vault_id(VAULT, None)
+                .expect("the project runs")
+                .values["TOKEN"],
+            "team"
+        );
+    });
+}
+
+#[test]
 fn an_override_change_loads_the_data_key_once() {
     with_temp_vault_home(|_| {
         force_file_vault();

@@ -67,8 +67,16 @@ pub enum ValidationErrorKind {
     },
 }
 
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ValidationError {
+    /// The message without the value judged, as a secret's shows it: for a
+    /// failure a personal override caused, whose value is this computer's
+    /// own.
+    pub fn without_value(&self) -> impl std::fmt::Display + '_ {
+        WithoutValue(self)
+    }
+
+    fn write(&self, f: &mut std::fmt::Formatter<'_>, hide_value: bool) -> std::fmt::Result {
+        let hide = self.is_secret || hide_value;
         let key = TerminalSafe(&self.key);
         match &self.kind {
             ValidationErrorKind::InvalidEnvironmentName { canonical, alias } => write!(
@@ -130,7 +138,7 @@ impl std::fmt::Display for ValidationError {
                 }
             }
             ValidationErrorKind::InvalidFormat { expected, got } => {
-                let display_value = display_value(got, self.is_secret);
+                let display_value = display_value(got, hide);
                 write!(
                     f,
                     "{}: invalid format, expected {expected}, got \"{}\"",
@@ -139,7 +147,7 @@ impl std::fmt::Display for ValidationError {
                 )?;
             }
             ValidationErrorKind::PatternMismatch { pattern, got } => {
-                let display_value = display_value(got, self.is_secret);
+                let display_value = display_value(got, hide);
                 write!(
                     f,
                     "{}: must match pattern `{}`, got \"{}\"",
@@ -149,13 +157,27 @@ impl std::fmt::Display for ValidationError {
                 )?;
             }
             ValidationErrorKind::NotInEnum { allowed, got } => {
-                let display_value = display_value(got, self.is_secret);
+                let display_value = display_value(got, hide);
                 write!(f, "{}: must be one of [", key)?;
                 write_allowed_values(f, allowed, self.is_secret)?;
                 write!(f, "], got \"{}\"", TerminalSafe(display_value))?;
             }
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write(f, false)
+    }
+}
+
+struct WithoutValue<'a>(&'a ValidationError);
+
+impl std::fmt::Display for WithoutValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.write(f, true)
     }
 }
 
@@ -1024,6 +1046,46 @@ fn matches_pattern(value: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use crate::schema::EnvSchema;
+
+    #[test]
+    fn a_message_without_its_value_names_the_key_and_rule_and_never_the_value() {
+        let value = "fixture-not-secret-value";
+        let error = |kind| ValidationError {
+            key: "API_URL".to_owned(),
+            kind,
+            description: None,
+            is_secret: false,
+        };
+        for kind in [
+            ValidationErrorKind::InvalidFormat {
+                expected: VarFormat::Url,
+                got: value.to_owned(),
+            },
+            ValidationErrorKind::PatternMismatch {
+                pattern: "^https://".to_owned(),
+                got: value.to_owned(),
+            },
+            ValidationErrorKind::NotInEnum {
+                allowed: vec!["a".to_owned(), "b".to_owned()],
+                got: value.to_owned(),
+            },
+        ] {
+            let error = error(kind);
+            assert!(error.to_string().contains(value), "{error}");
+            let hidden = error.without_value().to_string();
+            assert!(!hidden.contains(value), "{hidden}");
+            assert!(hidden.starts_with("API_URL: "), "{hidden}");
+        }
+        let enumerated = error(ValidationErrorKind::NotInEnum {
+            allowed: vec!["a".to_owned(), "b".to_owned()],
+            got: value.to_owned(),
+        });
+        assert!(
+            enumerated.without_value().to_string().contains("[a, b]"),
+            "the schema's own choices still show: {}",
+            enumerated.without_value()
+        );
+    }
 
     fn schema_from_json(json: &str) -> EnvSchema {
         serde_json::from_str(json).unwrap()

@@ -57,6 +57,14 @@ pub enum Edit {
     EnvironmentDuplicated { from: String, to: String },
     /// The project has a new environment.
     EnvironmentCreated { environment: String },
+    /// Environments renamed, `(from, to)`, and removed together, as a
+    /// rollback changes them: every renamed and removed environment's
+    /// overrides are taken out first, then each renamed one's merge into its
+    /// new name, so names that swap or chain keep their own.
+    EnvironmentsChanged {
+        renamed: Vec<(String, String)>,
+        removed: Vec<String>,
+    },
 }
 
 impl fmt::Debug for Edit {
@@ -101,6 +109,11 @@ impl fmt::Debug for Edit {
             Self::EnvironmentCreated { environment } => formatter
                 .debug_struct("EnvironmentCreated")
                 .field("environment", environment)
+                .finish(),
+            Self::EnvironmentsChanged { renamed, removed } => formatter
+                .debug_struct("EnvironmentsChanged")
+                .field("renamed", renamed)
+                .field("removed", removed)
                 .finish(),
         }
     }
@@ -158,6 +171,22 @@ pub enum Effect {
         environment: String,
         count: usize,
     },
+    /// Environments renamed and removed together: each rename's counts, as
+    /// [`Moved`](Self::Moved) gives them, and how many each removal took.
+    EnvironmentsChanged {
+        moved: Vec<EnvironmentMove>,
+        removed: Vec<(String, usize)>,
+    },
+}
+
+/// One rename of [`Effect::EnvironmentsChanged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentMove {
+    pub from: String,
+    pub to: String,
+    pub moved: usize,
+    pub replaced: usize,
+    pub kept: usize,
 }
 
 impl Effect {
@@ -170,6 +199,10 @@ impl Effect {
             }
             Self::Moved { moved, .. } => *moved > 0,
             Self::NotCopied { .. } | Self::Existing { .. } => false,
+            Self::EnvironmentsChanged { moved, removed } => {
+                moved.iter().any(|change| change.moved > 0)
+                    || removed.iter().any(|(_, count)| *count > 0)
+            }
         }
     }
 }
@@ -253,6 +286,8 @@ pub enum EditError {
         environment: String,
         copy: bool,
     },
+    /// Environments changed together name one more than once.
+    EnvironmentNamedTwice(String),
 }
 
 impl EditError {
@@ -263,6 +298,7 @@ impl EditError {
             Self::DeniedName(_) => "denied_name",
             Self::NulValue(_) => "nul_value",
             Self::SameEnvironment { .. } => "same_environment",
+            Self::EnvironmentNamedTwice(_) => "environment_named_twice",
         }
     }
 }
@@ -288,6 +324,10 @@ impl fmt::Display for EditError {
                 formatter,
                 "environment {environment:?} can't be {} to itself",
                 if *copy { "copied" } else { "renamed" }
+            ),
+            Self::EnvironmentNamedTwice(environment) => write!(
+                formatter,
+                "environment {environment:?} is renamed or removed more than once in one change"
             ),
         }
     }
@@ -319,6 +359,9 @@ pub enum PlanError {
     /// client commits beside its own work, such as when interrupted steps
     /// left staged records; repairing the project removes them.
     RemovalNeedsRepair,
+    /// The project has no values on this computer, beside which overrides
+    /// live.
+    NoValues,
 }
 
 impl PlanError {
@@ -334,6 +377,7 @@ impl PlanError {
             Self::OverBudget(_) => "over_budget",
             Self::AdmissionRefused(_) => "admission_refused",
             Self::RemovalNeedsRepair => "removal_needs_repair",
+            Self::NoValues => "no_values",
         }
     }
 }
@@ -367,6 +411,9 @@ impl fmt::Display for PlanError {
             ),
             Self::RemovalNeedsRepair => formatter.write_str(
                 "removing the last personal override needs the env project repaired first: run lpm env repair, then try again",
+            ),
+            Self::NoValues => formatter.write_str(
+                "this env project has no values on this computer, so it can't have personal overrides",
             ),
         }
     }
@@ -487,6 +534,13 @@ pub(super) fn plan_change_with_case_policy(
         .marker()
         .cloned()
         .unwrap_or_else(|| Marker::empty(vault_id, ProjectState::Active));
+    if !marker.features.contains_key(OVERRIDES_KIND)
+        && marker.features.len() >= crate::marker::MAX_FEATURES
+    {
+        return Err(PlanError::OverBudget(OverBudget::Features(
+            marker.features.len() + 1,
+        )));
+    }
     marker
         .features
         .insert(OVERRIDES_KIND.to_owned(), feature_entry());
@@ -564,6 +618,26 @@ pub fn effects_without_overrides(edits: &[Edit]) -> Result<Option<Vec<Effect>>, 
         );
     }
     Ok(none.is_empty().then_some(effects))
+}
+
+/// Plan `edits` to a project without values, after the gate checks
+/// [`plan_change`] makes: a plan with nothing to commit when none of them
+/// gives a key an override, and [`PlanError::NoValues`] when one does, since
+/// a project needs values on this computer to have overrides.
+pub fn plan_without_values(gate: &ProjectGate, edits: &[Edit]) -> Result<ChangePlan, PlanError> {
+    if gate.marker().is_some_and(needs_resume) {
+        return Err(PlanError::NeedsResume);
+    }
+    gate.authorize(Operation::Write)
+        .map_err(PlanError::Refused)?;
+    let effects = effects_without_overrides(edits)?.ok_or(PlanError::NoValues)?;
+    Ok(ChangePlan {
+        mutations: Vec::new(),
+        gate: gate.clone(),
+        effects,
+        activated: false,
+        over_admission_target: false,
+    })
 }
 
 /// What an override decides for one name.
@@ -683,17 +757,7 @@ impl Overrides {
             Edit::EnvironmentRenamed { from, to } => {
                 check_two_environments(from, to, false)?;
                 let names = self.environments.remove(from).unwrap_or_default();
-                let moved = names.len();
-                let target = self.environments.entry(to.clone()).or_default();
-                let before = target.len();
-                let mut replaced = 0;
-                for (matched, named) in names {
-                    replaced += usize::from(target.insert(matched, named).is_some());
-                }
-                let kept = before - replaced;
-                if target.is_empty() {
-                    self.environments.remove(to);
-                }
+                let (moved, replaced, kept) = self.merge_into(to, names);
                 Ok(Effect::Moved {
                     from: from.clone(),
                     to: to.clone(),
@@ -725,7 +789,73 @@ impl Overrides {
                     count: self.count(environment),
                 })
             }
+            Edit::EnvironmentsChanged { renamed, removed } => {
+                let mut sources = std::collections::BTreeSet::new();
+                let mut targets = std::collections::BTreeSet::new();
+                for (from, to) in renamed {
+                    check_two_environments(from, to, false)?;
+                    if !sources.insert(from.as_str()) {
+                        return Err(EditError::EnvironmentNamedTwice(from.clone()));
+                    }
+                    if !targets.insert(to.as_str()) {
+                        return Err(EditError::EnvironmentNamedTwice(to.clone()));
+                    }
+                }
+                for environment in removed {
+                    check_environment(environment)?;
+                    if !sources.insert(environment.as_str())
+                        || targets.contains(environment.as_str())
+                    {
+                        return Err(EditError::EnvironmentNamedTwice(environment.clone()));
+                    }
+                }
+                let taken: Vec<_> = renamed
+                    .iter()
+                    .map(|(from, to)| {
+                        (from, to, self.environments.remove(from).unwrap_or_default())
+                    })
+                    .collect();
+                let removed = removed
+                    .iter()
+                    .map(|environment| (environment.clone(), self.take(environment)))
+                    .collect();
+                let moved = taken
+                    .into_iter()
+                    .map(|(from, to, names)| {
+                        let (moved, replaced, kept) = self.merge_into(to, names);
+                        EnvironmentMove {
+                            from: from.clone(),
+                            to: to.clone(),
+                            moved,
+                            replaced,
+                            kept,
+                        }
+                    })
+                    .collect();
+                Ok(Effect::EnvironmentsChanged { moved, removed })
+            }
         }
+    }
+
+    /// Merge `names` into `environment`'s overrides, each replacing one of
+    /// the same name, and count what moved, what they replaced and what
+    /// stayed.
+    fn merge_into(
+        &mut self,
+        environment: &str,
+        names: BTreeMap<String, Named>,
+    ) -> (usize, usize, usize) {
+        let moved = names.len();
+        let target = self.environments.entry(environment.to_owned()).or_default();
+        let before = target.len();
+        let mut replaced = 0;
+        for (matched, named) in names {
+            replaced += usize::from(target.insert(matched, named).is_some());
+        }
+        if target.is_empty() {
+            self.environments.remove(environment);
+        }
+        (moved, replaced, before - replaced)
     }
 
     /// Drop every override of `environment`, and say how many it had.

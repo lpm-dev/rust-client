@@ -37,8 +37,13 @@ pub fn max_parts(kind: &str) -> Option<usize> {
 /// A budget a project's records would exceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverBudget {
+    /// The marker would list more features than it may.
+    Features(usize),
     SingleRecords(usize),
-    Parts { kind: String, count: usize },
+    Parts {
+        kind: String,
+        count: usize,
+    },
     Records(usize),
     Staged(usize),
 }
@@ -46,6 +51,11 @@ pub enum OverBudget {
 impl fmt::Display for OverBudget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Features(count) => write!(
+                formatter,
+                "this env project's feature marker would list {count} features, more than {}",
+                crate::marker::MAX_FEATURES
+            ),
             Self::SingleRecords(count) => write!(
                 formatter,
                 "this env project would hold {count} single records of newer data, more than {MAX_SINGLE_RECORDS}"

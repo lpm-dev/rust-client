@@ -237,32 +237,20 @@ fn init_tracing_once(command: &Commands, verbose: bool) {
         let diagnostic_filter = tracing_subscriber::filter::filter_fn(|metadata| {
             metadata.target() == super::install_timeline::TARGET
         });
-        let ordinary_filter = tracing_subscriber::filter::filter_fn(|metadata| {
-            metadata.target() != super::install_timeline::TARGET
-        });
         let timeline = super::install_timeline::start(command)
             .map(|layer| layer.with_filter(diagnostic_filter));
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(crate::live_region::TracingEvent::default)
-            .with_target(false)
-            .fmt_fields(crate::terminal_output::SanitizedTracingFields::default())
-            .without_time();
 
         #[cfg(feature = "tracy")]
         let registry = tracing_subscriber::registry().with(
             tracing_tracy::TracyLayer::default()
                 .with_filter(env_filter.clone())
-                .with_filter(ordinary_filter.clone()),
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    metadata.target() != super::install_timeline::TARGET
+                })),
         );
         #[cfg(not(feature = "tracy"))]
         let registry = tracing_subscriber::registry();
-        let registry = registry
-            .with(
-                fmt_layer
-                    .with_filter(env_filter)
-                    .with_filter(ordinary_filter),
-            )
-            .with(timeline);
+        let registry = registry.with(log_layer(env_filter)).with(timeline);
 
         let _ = registry.try_init();
     });
@@ -3817,5 +3805,45 @@ fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSe
         changed_files_ignore_pattern: args.changed_files_ignore_pattern,
         test_pattern: args.test_pattern,
         fail_if_no_match: args.fail_if_no_match,
+    }
+}
+
+/// The stderr log layer: lpm's own events at the level `filter` allows,
+/// never the install timeline's. The level filter is outermost, so its level
+/// hint becomes the subscriber's, and code can skip work for a level nothing
+/// logs at.
+fn log_layer<S>(filter: tracing_subscriber::EnvFilter) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use tracing_subscriber::layer::Layer as _;
+
+    tracing_subscriber::fmt::layer()
+        .with_writer(crate::live_region::TracingEvent::default)
+        .with_target(false)
+        .fmt_fields(crate::terminal_output::SanitizedTracingFields::default())
+        .without_time()
+        .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() != super::install_timeline::TARGET
+        }))
+        .with_filter(filter)
+}
+
+#[cfg(test)]
+mod log_layer_tests {
+    use tracing::Subscriber as _;
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[test]
+    fn the_subscriber_s_level_hint_is_the_log_filter_s() {
+        for (filter, level) in [
+            ("lpm=warn", LevelFilter::WARN),
+            ("lpm=debug,reqwest=debug", LevelFilter::DEBUG),
+        ] {
+            let subscriber = tracing_subscriber::registry()
+                .with(super::log_layer(tracing_subscriber::EnvFilter::new(filter)));
+            assert_eq!(subscriber.max_level_hint(), Some(level), "{filter}");
+        }
     }
 }

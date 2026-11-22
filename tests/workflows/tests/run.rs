@@ -3669,6 +3669,74 @@ async fn a_task_run_with_personal_overrides_never_uses_the_remote_cache() {
 }
 
 #[tokio::test]
+async fn a_task_after_one_run_with_personal_overrides_never_uses_the_remote_cache() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(&server, state.clone()).await;
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let config = format!(
+        r#"{{"remoteCache":{{"enabled":true,"url":"{}/v8"}},"tasks":{{"build":{{"cache":true,"outputs":["dist/**"],"dependsOn":["^build"]}}}}}}"#,
+        server.uri()
+    );
+    project.write_file("lpm.json", &config);
+    for member in ["app", "core", "utils"] {
+        let package_path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&package_path)).expect("member package.json");
+        package["scripts"] = serde_json::json!({
+            "build": "node -e \"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/out.txt', process.env.API_URL || 'none')\""
+        });
+        project.write_file(&package_path, &package.to_string());
+        project.write_file(&format!("packages/{member}/lpm.json"), &config);
+    }
+    let utils = project.path().join("packages/utils");
+    lpm(&project)
+        .current_dir(&utils)
+        .args(["env", "set", "API_URL=team"])
+        .assert()
+        .success();
+    lpm(&project)
+        .current_dir(&utils)
+        .args(["env", "override", "set", "API_URL=mine"])
+        .assert()
+        .success();
+
+    let run = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run the workspace build");
+
+    assert!(
+        run.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert_eq!(project.read_file("packages/utils/dist/out.txt"), "mine");
+    assert!(project.file_exists("packages/app/dist/out.txt"));
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().starts_with("/v8/artifacts"))
+        .count();
+    assert_eq!(
+        asked, 0,
+        "a task after one built with this computer's overrides neither asks the remote cache nor uploads to it"
+    );
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
     let server = MockServer::start().await;
     let state = RemoteCacheState::default();

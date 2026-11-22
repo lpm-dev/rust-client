@@ -1701,6 +1701,61 @@ fn write_all_environments_unlocked(
     }
 }
 
+/// Write `environments` with `following`, the personal overrides change
+/// planned for this write in the caller's lock before it
+/// (`overrides::plan_following_unlocked`): in the Keychain, in the values
+/// write's own journal transaction; in the file store, right after the
+/// values, every refusal already found by the plan.
+fn write_all_environments_following_unlocked(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+    recording: &history::scope::Recording,
+    following: Option<companion::overrides::change::ChangePlan>,
+) -> Result<(), String> {
+    let Some(following) = following else {
+        return write_all_environments_unlocked(
+            directory,
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+            recording,
+        );
+    };
+    let in_files = |following| {
+        fallback::write_all_environments_unlocked(directory, vault_id, environments, recording)?;
+        fallback::companion::commit_planned_overrides_unlocked(directory, vault_id, following)
+            .map_err(|error| {
+                format!(
+                    "the values were written, but this computer's personal overrides didn't follow the environments they renamed or removed: {error}"
+                )
+            })
+    };
+    if force_file_vault_backend() {
+        return in_files(following);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = in_files;
+        keychain::write_all_environments_following_unlocked(
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+            recording,
+            following,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (project_name, project_path);
+        in_files(following)
+    }
+}
+
 /// Delete one or more secrets from the vault.
 pub fn delete(
     project_dir: &Path,

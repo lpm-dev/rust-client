@@ -10,7 +10,7 @@
 #define LPM_ENV_BACKUP_FILE_LIMIT (64 * 1024 * 1024)
 #define LPM_ENV_BACKUP_PASSPHRASE_LIMIT (4 * 1024)
 #define LPM_ENV_HISTORY_INPUT_LIMIT (4 * 1024 * 1024)
-#define LPM_ENV_OVERRIDES_INPUT_LIMIT (4 * 1024 * 1024)
+#define LPM_ENV_OVERRIDES_INPUT_LIMIT (16 * 1024 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -441,44 +441,62 @@ LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
  * its message says so). */
 LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
 /* Plan one batch of edits, all or none. Input {vaultId, marker?, record?,
- * names?: [every account name in the service, from one names-only listing],
- * edits: [{action: "set", environment, key, value: blob} | {action: "unset",
- * environment, key} | {action: "remove", environment, key} | {action:
- * "clearEnvironment", environment} | {action: "clearAll"} | {action:
+ * values?: bool, names?: [every account name in the service, from one
+ * names-only listing], edits: [{action: "set", environment, key, value: blob} |
+ * {action: "unset", environment, key} | {action: "remove", environment, key} |
+ * {action: "clearEnvironment", environment} | {action: "clearAll"} | {action:
  * "environmentRenamed", from, to} | {action: "environmentRemoved", environment}
  * | {action: "environmentDuplicated", from, to} | {action: "environmentCreated",
- * environment}]}, at most 1024 edits. set gives the key this Mac's own value (an
- * empty value is a value, at most 100 KiB; the values one batch sets total at
- * most 4 MiB); unset removes the project's value; remove drops the key's
- * override. Report every rename, removal, duplicate and creation of an
- * environment, and commit the plan in the same lock as the values change.
- * Overrides are this Mac's own, so only removing an environment removes its
- * overrides; a rename merges them into the new name, each moved one replacing one
- * of the same name there; a duplicate or a new environment changes none and says
- * how many the name already has, for the app to tell the person. Output
+ * environment} | {action: "environmentsChanged", renamed: [{from, to}],
+ * removed: [environment]}]}, at most 1024 edits. values is false when the
+ * project's values item is absent: overrides live beside values, so after the
+ * marker's refusals a batch that gives no key an override removes nothing and
+ * is unchanged, and any other is refused with overrides.no_values. set gives
+ * the key this Mac's own value (an empty value is a value, at most 100 KiB; the
+ * values one batch sets total at most 4 MiB); unset removes the project's
+ * value; remove drops the key's override. Report every rename, removal,
+ * duplicate and creation of an environment. Overrides are this Mac's own, so
+ * only removing an environment removes its overrides; a rename merges them into
+ * the new name, each moved one replacing one of the same name there; a
+ * duplicate or a new environment changes none and says how many the name
+ * already has, for the app to tell the person. environmentsChanged reports the
+ * renames and removals one values change makes at once, as a rollback does:
+ * every renamed and removed environment's overrides are taken out first, then
+ * each renamed one's merge into its new name, so names that swap or chain keep
+ * their own; a name is the source of one rename or removal at most, and the
+ * target of one rename at most. Plan an edit that follows a values change
+ * before writing the values, so a refusal leaves both as they were, and commit
+ * its writes and deletes in the values write's own journal transaction. Output
  * {result: "needsNames", needs: "project" | "projectAndService", effects} when
- * the batch deletes or creates the record: list the service's names, pass them as
- * names, and call again (effects are already what the batch does, for a
- * confirmation first); {result: "unchanged", effects}; or {result: "planned",
- * journal: true, writes: [{account, blob}], deletes: [account], markerAfter:
- * "present" | "absent", activated (the project's first override),
- * overAdmissionTarget, effects}. Commit writes and deletes as one journal
- * transaction; the overrides record takes the values item's verified approval.
- * effects, one per edit: {kind: "key", environment, key, previous: "none" |
- * "set" | "unset", changed} | {kind: "cleared", environment (null for every
- * environment), removed} | {kind: "environmentRemoved", environment, removed} |
- * {kind: "moved", from, to, moved, replaced, kept} | {kind: "notCopied", from,
- * to, count, existing} | {kind: "existing", environment, count}. Refusals, with
- * edit (its index, from 0) for one edit's: overrides.invalid_environment
- * {environment}, overrides.invalid_key (the name is never repeated: it may be a
- * value), overrides.denied_name {key} (a name LPM never passes to a process can't
- * be set or unset, only removed), overrides.nul_value {key},
- * overrides.same_environment {environment}, overrides.too_large ({edit, key,
- * limit} for a value, {bytes, limit} for the record past 100 KiB),
+ * the batch deletes the record (needs: "project", for the project's records)
+ * or creates it (needs: "projectAndService", for the service's count as well):
+ * list the service's names, pass them as names, and call again (effects are
+ * already what the batch does, for a confirmation first); {result:
+ * "unchanged", effects}; or {result: "planned", journal: true, writes:
+ * [{account, blob}], deletes: [account], markerAfter: "present" | "absent",
+ * activated (the project's first override), overAdmissionTarget, effects}.
+ * Commit writes and deletes as one journal transaction; the overrides record
+ * takes the values item's verified approval. effects, one per edit: {kind:
+ * "key", environment, key, previous: "none" | "set" | "unset", changed} |
+ * {kind: "cleared", environment (null for every environment), removed} |
+ * {kind: "environmentRemoved", environment, removed} | {kind: "moved", from,
+ * to, moved, replaced, kept} | {kind: "notCopied", from, to, count, existing} |
+ * {kind: "existing", environment, count} | {kind: "environmentsChanged",
+ * moved: [{from, to, moved, replaced, kept}], removed: [{environment,
+ * removed}]}. Refusals, with edit (its index, from 0) for one edit's:
+ * overrides.invalid_environment {environment}, overrides.invalid_key (the name
+ * is never repeated: it may be a value; a set's name is checked before its
+ * value's size), overrides.denied_name {key} (a name LPM never passes to a
+ * process can't be set or unset, only removed), overrides.nul_value {key},
+ * overrides.same_environment {environment},
+ * overrides.environment_named_twice {environment}, overrides.too_large ({edit,
+ * key, limit: 102400} for one value, {edit, limit: 4194304} for the values a
+ * batch sets, {bytes, limit: 102400} for the record), overrides.no_values,
  * overrides.damaged, overrides.unsupported, overrides.needs_resume,
  * overrides.over_budget, overrides.admission_refused {records, limit},
  * overrides.removal_needs_repair (repair the project, as lpm env repair does,
- * then try again). */
+ * then try again). An input holds a full service's names: the admission cap
+ * bounds its companion records at 4 MiB of names at the longest. */
 LPMEnvResult lpm_env_overrides_plan(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.

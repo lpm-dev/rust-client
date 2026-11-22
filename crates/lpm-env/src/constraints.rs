@@ -178,6 +178,16 @@ pub(crate) fn ordered_groups(schema: &EnvSchema) -> Vec<(&str, &VarGroup)> {
     groups
 }
 
+/// Whether a group of `members` with `present` of them non-empty keeps its
+/// rule.
+pub(crate) fn group_holds(mode: VarGroupMode, present: usize, members: usize) -> bool {
+    match mode {
+        VarGroupMode::AllOrNone => present == 0 || present == members,
+        VarGroupMode::ExactlyOne => present == 1,
+        VarGroupMode::AtLeastOne => present > 0,
+    }
+}
+
 pub(crate) fn validate_groups(
     schema: &EnvSchema,
     groups: &[(&str, &VarGroup)],
@@ -190,12 +200,7 @@ pub(crate) fn validate_groups(
             .iter()
             .filter(|key| values.get(*key).is_some_and(|value| !value.is_empty()))
             .count();
-        let valid = match group.mode {
-            VarGroupMode::AllOrNone => present == 0 || present == group.vars.len(),
-            VarGroupMode::ExactlyOne => present == 1,
-            VarGroupMode::AtLeastOne => present > 0,
-        };
-        if !valid {
+        if !group_holds(group.mode, present, group.vars.len()) {
             errors.extend(group.vars.iter().map(|key| ValidationError {
                 key: key.clone(),
                 kind: ValidationErrorKind::GroupViolation {

@@ -152,6 +152,9 @@ fn every_overrides_fixture_validates_and_selects_as_recorded() {
 struct ChangeCase {
     name: String,
     vault_id: String,
+    /// Whether the project's values item exists; it does unless a case says.
+    #[serde(default)]
+    values: Option<bool>,
     marker: Option<String>,
     record: Option<String>,
     names: Option<Vec<String>>,
@@ -210,6 +213,25 @@ fn fixture_edit(edit: &serde_json::Value) -> crate::overrides::change::Edit {
         "environmentCreated" => Edit::EnvironmentCreated {
             environment: text("environment"),
         },
+        "environmentsChanged" => Edit::EnvironmentsChanged {
+            renamed: edit["renamed"]
+                .as_array()
+                .expect("renamed")
+                .iter()
+                .map(|rename| {
+                    (
+                        rename["from"].as_str().expect("from").to_owned(),
+                        rename["to"].as_str().expect("to").to_owned(),
+                    )
+                })
+                .collect(),
+            removed: edit["removed"]
+                .as_array()
+                .expect("removed")
+                .iter()
+                .map(|environment| environment.as_str().expect("an environment").to_owned())
+                .collect(),
+        },
         other => panic!("unknown action {other}"),
     }
 }
@@ -218,7 +240,7 @@ fn fixture_edit(edit: &serde_json::Value) -> crate::overrides::change::Edit {
 fn every_override_change_fixture_plans_the_transaction_it_records() {
     use crate::gate::ProjectGate;
     use crate::lifecycle::Mutation;
-    use crate::overrides::change::{Inventory, PlanError, plan_change};
+    use crate::overrides::change::{Inventory, PlanError, plan_change, plan_without_values};
 
     let fixture: Fixture<ChangeCase> =
         serde_json::from_str(include_str!("../tests/fixtures/override-changes.json"))
@@ -238,13 +260,17 @@ fn every_override_change_fixture_plans_the_transaction_it_records() {
             .as_ref()
             .map(|names| Inventory::from_names(&case.vault_id, names.iter().map(String::as_str)));
         let edits: Vec<_> = case.edits.iter().map(fixture_edit).collect();
-        let planned = plan_change(
-            &case.vault_id,
-            &gate,
-            case.record.as_deref().map(str::as_bytes),
-            &edits,
-            inventory.as_ref(),
-        );
+        let planned = if case.values == Some(false) {
+            plan_without_values(&gate, &edits)
+        } else {
+            plan_change(
+                &case.vault_id,
+                &gate,
+                case.record.as_deref().map(str::as_bytes),
+                &edits,
+                inventory.as_ref(),
+            )
+        };
         let expect = &case.expect;
         match (expect.result.as_str(), planned) {
             ("needsNames", Err(PlanError::NeedsInventory { .. })) => {}

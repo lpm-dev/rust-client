@@ -20,6 +20,13 @@ use crate::marker::{Marker, ProjectState};
 /// `discarding` marker every record, since none is read for its content
 /// again. Without a marker no record may exist. `history-off` never has
 /// records, so one of its kind is never listed.
+/// Whether a record of `kind` may be one of several parts: one of a kind
+/// this engine knows as a single record may not, and a kind it doesn't know,
+/// a newer client's, keeps any.
+fn parts_allowed(kind: &str) -> bool {
+    crate::budgets::max_parts(kind).is_some() || !crate::graph::is_known_kind(kind)
+}
+
 pub fn is_listed(marker: Option<&Marker>, account: &CompanionAccount) -> bool {
     let recordless = matches!(account.kind(), Some(kind) if kind == crate::graph::HISTORY_OFF.name);
     match (account, marker) {
@@ -33,8 +40,9 @@ pub fn is_listed(marker: Option<&Marker>, account: &CompanionAccount) -> bool {
             true
         }
         _ if recordless => false,
-        (CompanionAccount::Record { kind, .. }, Some(marker)) => {
-            marker.lists_kind(kind) || marker.restore_lists_kind(kind)
+        (CompanionAccount::Record { kind, part, .. }, Some(marker)) => {
+            (part.is_none() || parts_allowed(kind))
+                && (marker.lists_kind(kind) || marker.restore_lists_kind(kind))
         }
         (CompanionAccount::Staged { kind, .. }, Some(marker)) => marker.restore_lists_kind(kind),
         (_, None) => false,
@@ -246,6 +254,31 @@ mod tests {
             },
         );
         marker
+    }
+
+    #[test]
+    fn a_numbered_record_of_a_kind_known_as_one_record_is_unlisted() {
+        let marker = overrides_marker();
+        let part = |kind: &str| CompanionAccount::Record {
+            kind: kind.to_owned(),
+            vault_id: "proj".to_owned(),
+            part: Some(0),
+        };
+        assert!(!is_listed(Some(&marker), &part("overrides")));
+        let mut with_unknown = marker;
+        with_unknown.features.insert(
+            "future".to_owned(),
+            FeatureEntry {
+                version: 1,
+                if_unsupported: crate::marker::Level::Ignore,
+                kinds: vec!["future".to_owned()],
+                state: FeatureState::Active,
+            },
+        );
+        assert!(
+            is_listed(Some(&with_unknown), &part("future")),
+            "a newer client's kind keeps its parts"
+        );
     }
 
     #[test]

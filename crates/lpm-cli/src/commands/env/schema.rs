@@ -390,7 +390,8 @@ pub(super) fn vars_check(
                     "ignored": ignored,
                     "value_warnings": value_warnings,
                     "errors": errors.iter().zip(from_overrides).map(|(e, caused)| {
-                        let mut diagnostic = serde_json::json!({"key": e.key, "error": e.to_string()});
+                        let message = if *caused { e.without_value().to_string() } else { e.to_string() };
+                        let mut diagnostic = serde_json::json!({"key": e.key, "error": message});
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
                             diagnostic["group"] = serde_json::json!(group);
                             diagnostic["mode"] = serde_json::json!(mode);
@@ -454,7 +455,7 @@ pub(super) fn vars_check(
                 if *caused {
                     println!(
                         "    {} {}",
-                        install_ui::red(&error.to_string()),
+                        install_ui::red(&error.without_value().to_string()),
                         install_ui::dim(&format!(
                             "(from a personal override on {})",
                             lpm_runner::dotenv::THIS_MACHINE

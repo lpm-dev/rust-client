@@ -11,7 +11,9 @@ mod common;
 #[cfg(unix)]
 mod tty {
     use crate::common;
-    use crate::common::pty::{PtyOptions, run_in_pty, run_in_pty_answering};
+    use crate::common::pty::{
+        PtyOptions, run_in_pty, run_in_pty_answering, run_in_pty_with_stdout_captured,
+    };
 
     use tempfile::TempDir;
 
@@ -120,6 +122,64 @@ mod tty {
     }
 
     #[test]
+    fn override_clear_asks_on_the_terminal_while_its_output_goes_elsewhere() {
+        let (project, lpm_home) = project();
+        let (status, _, stderr) = common::run_lpm(
+            project.path(),
+            lpm_home.path(),
+            None,
+            &["env", "override", "set", "API_URL=mine"],
+        );
+        assert!(status.success(), "{stderr}");
+
+        let (accepted, _) = run_in_pty_with_stdout_captured(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "clear", "--env", "default"],
+            &[(b"Remove 1 personal override", b"y\r")],
+        );
+
+        assert!(accepted.status.success(), "{}", accepted.transcript);
+        assert_eq!(
+            overrides(project.path(), lpm_home.path()),
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn override_clear_of_every_environment_counts_each_one_it_asks_about() {
+        let (project, lpm_home) = project();
+        for args in [
+            &["env", "override", "set", "API_URL=mine", "OTHER=mine"][..],
+            &[
+                "env",
+                "override",
+                "set",
+                "--env",
+                "staging",
+                "API_URL=staged",
+            ],
+        ] {
+            let (status, _, stderr) = common::run_lpm(project.path(), lpm_home.path(), None, args);
+            assert!(status.success(), "{stderr}");
+        }
+
+        let declined = run_in_pty(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "clear", "--all"],
+            &[(b"Remove 3 personal overrides", b"n\r")],
+        );
+
+        assert!(declined.status.success(), "{}", declined.transcript);
+        assert!(
+            declined.transcript.contains("(default: 2, staging: 1)?"),
+            "{}",
+            declined.transcript
+        );
+    }
+
+    #[test]
     fn override_clear_removes_only_the_overrides_it_asked_about() {
         let (project, lpm_home) = project();
         let (status, _, stderr) = common::run_lpm(
@@ -156,6 +216,43 @@ mod tty {
         let left = overrides(project.path(), lpm_home.path());
         assert_eq!(left[0]["set"][0]["key"], "LATER", "{left}");
         assert_eq!(left[0]["set"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn override_clear_removes_nothing_from_a_project_that_took_the_folder_while_it_asked() {
+        let (project, lpm_home) = project();
+        let run = |args: &[&str]| {
+            let (status, _, stderr) = common::run_lpm(project.path(), lpm_home.path(), None, args);
+            assert!(status.success(), "{args:?}: {stderr}");
+        };
+        run(&["env", "override", "set", "API_URL=mine"]);
+        let lpm_json = project.path().join("lpm.json");
+        let reviewed_project = std::fs::read_to_string(&lpm_json).expect("lpm.json");
+        let another_project = r#"{"vault":"another-project"}"#;
+        std::fs::write(&lpm_json, another_project).expect("another project");
+        run(&["env", "set", "API_URL=theirs-team"]);
+        run(&["env", "override", "set", "API_URL=theirs"]);
+        std::fs::write(&lpm_json, &reviewed_project).expect("the reviewed project");
+
+        let accepted = run_in_pty_answering(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "clear", "--env", "default"],
+            &[(b"Remove 1 personal override", b"y\r")],
+            &PtyOptions::default(),
+            &mut |_, _| std::fs::write(&lpm_json, another_project).expect("switch projects"),
+        );
+
+        assert!(!accepted.status.success(), "{}", accepted.transcript);
+        assert!(
+            accepted.transcript.contains("nothing was changed"),
+            "{}",
+            accepted.transcript
+        );
+        assert_eq!(
+            overrides(project.path(), lpm_home.path())[0]["set"][0]["value"],
+            "theirs"
+        );
     }
 
     #[test]
@@ -198,6 +295,61 @@ mod tty {
             !unlinked.transcript.contains("Override for"),
             "{}",
             unlinked.transcript
+        );
+    }
+
+    #[test]
+    fn override_set_refuses_a_project_it_cant_change_before_asking_for_a_value() {
+        let (project, lpm_home) = project();
+        let another_computer = TempDir::new().expect("create an LPM home without its values");
+        let without_values = run_in_pty(
+            project.path(),
+            another_computer.path(),
+            &["env", "override", "set", "API_URL"],
+            &[],
+        );
+        assert!(
+            !without_values.status.success(),
+            "{}",
+            without_values.transcript
+        );
+        assert!(
+            without_values
+                .transcript
+                .contains("has no values on this computer")
+                && without_values.transcript.contains("lpm env pull"),
+            "{}",
+            without_values.transcript
+        );
+        assert!(
+            !without_values.transcript.contains("Override for"),
+            "{}",
+            without_values.transcript
+        );
+
+        let (status, _, stderr) = common::run_lpm(
+            project.path(),
+            lpm_home.path(),
+            None,
+            &["env", "debug-companion", "newer-version"],
+        );
+        assert!(status.success(), "{stderr}");
+        let newer = run_in_pty(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "set", "API_URL"],
+            &[],
+        );
+        assert!(!newer.status.success(), "{}", newer.transcript);
+        assert!(
+            newer.transcript.contains("lpm self-update"),
+            "{}",
+            newer.transcript
+        );
+        assert!(
+            !newer.transcript.contains("Override for"),
+            "{}",
+            newer.transcript
         );
     }
 }

@@ -614,35 +614,37 @@ pub(super) fn roll_back(
         Ok(writes) => writes,
         Err(error) => return Ok(Err(error)),
     };
-    let followed: Vec<crate::overrides::Edit> = writes
-        .iter()
-        .filter_map(|write| match (&write.renamed_from, &write.values) {
-            (Some(from), _) => Some(crate::overrides::Edit::EnvironmentRenamed {
-                from: from.clone(),
-                to: write.name.clone(),
-            }),
-            (None, None) => Some(crate::overrides::Edit::EnvironmentRemoved {
-                environment: write.name.clone(),
-            }),
-            (None, Some(_)) => None,
-        })
-        .collect();
+    let (renamed, removed) = environment_changes(&writes);
+    let following =
+        crate::overrides::plan_following_unlocked(directory, vault_id, renamed, removed)?;
     let written = apply_writes(&mut values, writes, recording);
-    crate::write_all_environments_unlocked(
+    crate::write_all_environments_following_unlocked(
         directory,
         vault_id,
         project.name,
         project.path,
         &values,
         recording,
+        following,
     )?;
-    crate::overrides::follow_environment_changes_unlocked(directory, vault_id, &followed)
-        .map_err(|error| {
-            format!(
-                "the rollback was applied, but this computer's personal overrides didn't follow the environments it renamed or removed: {error}"
-            )
-        })?;
     Ok(Ok(written))
+}
+
+/// The environments a rollback's `writes` rename, `(from, to)`, and remove,
+/// which happen all at once.
+pub(super) fn environment_changes(
+    writes: &[EnvironmentWrite],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut renamed = Vec::new();
+    let mut removed = Vec::new();
+    for write in writes {
+        match (&write.renamed_from, &write.values) {
+            (Some(from), _) => renamed.push((from.clone(), write.name.clone())),
+            (None, None) => removed.push(write.name.clone()),
+            (None, Some(_)) => {}
+        }
+    }
+    (renamed, removed)
 }
 
 /// Put a rollback's `writes` into `values`, and return the environments it

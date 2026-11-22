@@ -858,6 +858,14 @@ impl<'directory> FileCompanion<'directory> {
         Ok(())
     }
 
+    /// Whether `vault_id` has values, in either file name.
+    fn has_values(&self, vault_id: &str) -> Result<bool, String> {
+        Ok(self
+            .vaults
+            .entry_exists(&ValuesFile::Digest.name(vault_id))?
+            || super::existing_legacy_vault_file_name(&self.vaults, vault_id)?.is_some())
+    }
+
     /// `vault_id`'s companion and staged records, failing on an entry whose
     /// name LPM doesn't write, which the gate reports as damage.
     fn inventory_of(&self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
@@ -1042,6 +1050,23 @@ pub(crate) fn read_all_overrides_unlocked(
     .map_err(damaged)
 }
 
+/// Refuse what `edits` to `vault_id`'s overrides are refused for whatever
+/// their values, in the caller's lock: an interrupted step that can't be
+/// finished, a gate that refuses writes, or no values, which overrides need.
+/// Nothing is decrypted.
+pub(crate) fn check_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<(), String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::Write)?;
+    if companion.has_values(vault_id)? {
+        return Ok(());
+    }
+    crate::overrides::plan_without_values(&gate, edits).map(drop)
+}
+
 /// Plan `edits` against `vault_id`'s overrides and commit them in one
 /// journaled transaction, in the caller's lock after the write gate.
 pub(crate) fn change_overrides_unlocked(
@@ -1050,16 +1075,41 @@ pub(crate) fn change_overrides_unlocked(
     edits: &[crate::companion::overrides::change::Edit],
 ) -> Result<crate::companion::overrides::change::ChangePlan, String> {
     let mut companion = FileCompanion::open(directory)?;
-    let gate = authorize_with(&mut companion, vault_id, Operation::Write)?;
-    let has_values = companion
-        .vaults
-        .entry_exists(&ValuesFile::Digest.name(vault_id))?
-        || super::existing_legacy_vault_file_name(&companion.vaults, vault_id)?.is_some();
-    if !has_values {
-        return crate::overrides::plan_without_values(vault_id, &gate, edits);
+    let mut plan = plan_with(&mut companion, vault_id, edits)?;
+    commit_plan(&mut companion, vault_id, &mut plan)?;
+    Ok(plan)
+}
+
+/// Plan `edits` without committing them, for a values write that commits
+/// them right after its own (see [`commit_planned_overrides_unlocked`]).
+pub(crate) fn plan_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<crate::companion::overrides::change::ChangePlan, String> {
+    plan_with(&mut FileCompanion::open(directory)?, vault_id, edits)
+}
+
+/// Commit a plan from [`plan_overrides_unlocked`], in the lock it was made in.
+pub(crate) fn commit_planned_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    mut plan: crate::companion::overrides::change::ChangePlan,
+) -> Result<(), String> {
+    commit_plan(&mut FileCompanion::open(directory)?, vault_id, &mut plan)
+}
+
+fn plan_with(
+    companion: &mut FileCompanion,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<crate::companion::overrides::change::ChangePlan, String> {
+    let gate = authorize_with(companion, vault_id, Operation::Write)?;
+    if !companion.has_values(vault_id)? {
+        return crate::overrides::plan_without_values(&gate, edits);
     }
-    let record = read_overrides_record(&mut companion, vault_id)?;
-    let mut plan = crate::overrides::plan(
+    let record = read_overrides_record(companion, vault_id)?;
+    crate::overrides::plan(
         vault_id,
         &gate,
         record.as_ref().map(|bytes| bytes.as_slice()),
@@ -1074,14 +1124,20 @@ pub(crate) fn change_overrides_unlocked(
                 },
             })
         },
-    )?;
-    drop(record);
+    )
+}
+
+fn commit_plan(
+    companion: &mut FileCompanion,
+    vault_id: &str,
+    plan: &mut crate::companion::overrides::change::ChangePlan,
+) -> Result<(), String> {
     let mutations = std::mem::take(&mut plan.mutations);
     if !mutations.is_empty() {
         companion.commit(mutations)?;
         crate::companion::remember(vault_id, &plan.gate);
     }
-    Ok(plan)
+    Ok(())
 }
 
 /// Delete `vault_id`'s values files and every companion record through the
@@ -1159,23 +1215,17 @@ pub(crate) fn review_companion_data_unlocked(
                 .join(", ")
         )));
     }
-    let key = companion.data_key()?;
-    for account in [
-        CompanionAccount::Marker {
-            vault_id: vault_id.to_owned(),
-        },
-        CompanionAccount::Record {
-            kind: OVERRIDES_KIND.to_owned(),
-            vault_id: vault_id.to_owned(),
-            part: None,
-        },
-    ] {
-        if let Some(folder) = companion.folder(vault_id)?
-            && let Some(sealed) = companion.read_sealed(&folder, &entry_name(&account))?
-            && let Err(error) = open(&key, &account, sealed)
-        {
-            return Ok(CompanionReview::discard(error));
-        }
+    // A marker that won't decrypt says nothing about what the project holds,
+    // so only discarding everything repairs it. A record that won't decrypt
+    // is judged by the review, which removes its feature alone.
+    let marker = CompanionAccount::Marker {
+        vault_id: vault_id.to_owned(),
+    };
+    if let Some(folder) = companion.folder(vault_id)?
+        && let Some(sealed) = companion.read_sealed(&folder, &entry_name(&marker))?
+        && let Err(error) = open(&companion.data_key()?, &marker, sealed)
+    {
+        return Ok(CompanionReview::discard(error));
     }
     crate::companion::authorize(&mut companion, vault_id, Operation::Maintenance)?;
     crate::companion::repair::review(&mut companion, vault_id, None, None)

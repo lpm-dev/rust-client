@@ -456,6 +456,30 @@ enum KeychainStorageError {
 
 struct SecurityFrameworkBackend;
 
+/// What a read without authentication UI showed about an item's access,
+/// asking `keychain_is_available` only when the read wasn't allowed, to tell
+/// a protected item from a locked Keychain.
+fn probe_outcome(
+    read: Result<Option<Vec<u8>>, KeychainStorageError>,
+    keychain_is_available: impl FnOnce() -> bool,
+) -> ProbeOutcome {
+    match read {
+        Ok(Some(bytes)) => {
+            drop(zeroize::Zeroizing::new(bytes));
+            ProbeOutcome::Automatic
+        }
+        Ok(None) => ProbeOutcome::Absent,
+        Err(KeychainStorageError::InteractionNotAllowed) => {
+            if keychain_is_available() {
+                ProbeOutcome::Protected
+            } else {
+                ProbeOutcome::Inconclusive
+            }
+        }
+        Err(_) => ProbeOutcome::Inconclusive,
+    }
+}
+
 pub(crate) fn with_keychain_transaction<T>(
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
@@ -806,24 +830,17 @@ impl SecurityFrameworkBackend {
 
     fn probe(service: &str, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
         let context = non_interactive_context();
-        match Self::read_with_context(service, account, context.clone()) {
-            Ok(Some(_)) => ProbeOutcome::Automatic,
-            Ok(None) => ProbeOutcome::Absent,
-            Err(KeychainStorageError::InteractionNotAllowed) => {
-                let keychain_is_available = open_accounts.iter().any(|open| {
+        probe_outcome(
+            Self::read_with_context(service, account, context.clone()),
+            || {
+                open_accounts.iter().any(|open| {
                     matches!(
                         Self::read_with_context(service, open, context.clone()),
                         Ok(Some(_))
                     )
-                });
-                if keychain_is_available {
-                    ProbeOutcome::Protected
-                } else {
-                    ProbeOutcome::Inconclusive
-                }
-            }
-            Err(_) => ProbeOutcome::Inconclusive,
-        }
+                })
+            },
+        )
     }
 
     /// Give an existing item CLI approval, keeping its data.
@@ -1247,6 +1264,31 @@ mod tests {
             SecurityFrameworkBackend::map_status_in("read", -128, None),
             KeychainStorageError::ApprovalCancelled
         ));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_probe_that_reads_an_item_wipes_what_it_read() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let (outcome, found) = watch(|| {
+            probe_outcome(Ok(Some(MARKER.as_bytes().to_vec())), || {
+                unreachable!("an item that reads is automatic")
+            })
+        });
+        assert_eq!(outcome, ProbeOutcome::Automatic);
+        assert!(
+            !found,
+            "the probe's copy of the item, perhaps values, is wiped"
+        );
+        assert_eq!(
+            probe_outcome(Err(KeychainStorageError::InteractionNotAllowed), || true),
+            ProbeOutcome::Protected
+        );
+        assert_eq!(
+            probe_outcome(Err(KeychainStorageError::InteractionNotAllowed), || false),
+            ProbeOutcome::Inconclusive
+        );
+        assert_eq!(probe_outcome(Ok(None), || true), ProbeOutcome::Absent);
     }
 
     #[cfg(not(miri))]

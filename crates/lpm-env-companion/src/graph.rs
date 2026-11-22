@@ -66,6 +66,13 @@ pub fn known_feature(name: &str) -> Option<&'static KnownFeature> {
     KNOWN_FEATURES.iter().find(|feature| feature.name == name)
 }
 
+/// Whether a known feature lists `kind`.
+pub fn is_known_kind(kind: &str) -> bool {
+    KNOWN_FEATURES
+        .iter()
+        .any(|feature| feature.kinds.contains(&kind))
+}
+
 /// The known feature that alone may list `kind`, or `None` for `key`, which
 /// any feature may list, and for kinds no known feature owns.
 pub fn reserved_owner(kind: &str) -> Option<&'static str> {

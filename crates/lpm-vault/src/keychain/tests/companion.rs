@@ -485,7 +485,7 @@ fn applying_overrides_returns_the_selected_environment_with_the_values() {
 }
 
 #[test]
-fn weaker_overrides_under_approved_values_are_strengthened_before_use() {
+fn a_run_uses_weaker_overrides_under_the_values_approval_it_just_gave() {
     let mut storage = storage_with_values();
     let overrides = record_account("overrides", VAULT, None);
     storage
@@ -493,20 +493,24 @@ fn weaker_overrides_under_approved_values_are_strengthened_before_use() {
         .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
     storage
         .values
-        .insert(overrides.clone(), overrides_record(r#""TOKEN":"mine""#));
+        .insert(overrides, overrides_record(r#""TOKEN":"mine""#));
     storage
         .claims
         .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
     storage.protected.insert(VAULT.to_owned());
+    storage.approval_cancelled = true;
+    run_overrides(&mut storage).expect_err("no values approval, no overrides");
+    storage.approval_cancelled = false;
 
-    run_overrides(&mut storage).expect("apply read");
+    let read = run_overrides(&mut storage).expect("apply read");
 
-    assert_eq!(storage.approvals_required, std::slice::from_ref(&overrides));
-    assert!(storage.protected.contains(&overrides));
+    assert_eq!(read.set["TOKEN"], "mine");
+    assert!(storage.probes.is_empty());
+    assert!(storage.approvals_required.is_empty());
 }
 
 #[test]
-fn an_unavailable_keychain_returns_no_override_bytes_and_records_nothing() {
+fn an_unavailable_keychain_lists_no_weaker_override_bytes_and_records_nothing() {
     let mut storage = storage_with_values();
     storage
         .values
@@ -520,11 +524,23 @@ fn an_unavailable_keychain_returns_no_override_bytes_and_records_nothing() {
         .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
     storage.protected.insert(VAULT.to_owned());
     storage.keychain_unavailable = true;
+    storage.reads.clear();
 
-    let error = run_overrides(&mut storage).expect_err("an inconclusive probe fails");
+    let error = {
+        let _scope = crate::companion::LockScope::enter();
+        crate::keychain::overrides::read_all_with_storage(&mut storage, VAULT)
+            .expect_err("an inconclusive probe fails")
+    };
 
     assert!(error.contains("retry once the Mac is unlocked"), "{error}");
     assert!(storage.approvals_required.is_empty());
+    assert_eq!(
+        storage
+            .reads
+            .get(&record_account("overrides", VAULT, None))
+            .copied(),
+        None
+    );
 }
 
 #[test]
@@ -706,6 +722,40 @@ fn an_apply_read_without_overrides_still_reads_their_account_once() {
         Some(1)
     );
     assert_eq!(storage.reads.values().sum::<usize>(), 3);
+}
+
+#[test]
+fn an_apply_read_of_approved_values_asks_nothing_more_about_its_overrides() {
+    for with_overrides in [true, false] {
+        let mut storage = storage_with_values();
+        let overrides = record_account("overrides", VAULT, None);
+        if with_overrides {
+            storage
+                .values
+                .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+            storage
+                .values
+                .insert(overrides.clone(), overrides_record(r#""A":"1""#));
+        }
+        for account in [VAULT.to_owned(), overrides.clone()] {
+            storage
+                .claims
+                .insert(account.clone(), ClaimedAccess::RequireApproval);
+            storage.protected.insert(account);
+        }
+        storage.reads.clear();
+        storage.attribute_reads.clear();
+
+        run_overrides(&mut storage).expect("apply read");
+
+        assert_eq!(
+            storage.attribute_reads.get(&overrides).copied(),
+            None,
+            "with overrides: {with_overrides}"
+        );
+        assert_eq!(storage.reads.get(&overrides).copied(), Some(1));
+        assert!(storage.probes.is_empty());
+    }
 }
 
 #[test]

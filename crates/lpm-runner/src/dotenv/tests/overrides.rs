@@ -19,7 +19,7 @@ fn overrides(set: &[(&str, &str)], unset: &[&str]) -> PersonalOverrides {
 fn layers(vars: &[(&str, &str)], overrides: PersonalOverrides) -> ProjectEnvLayers {
     ProjectEnvLayers {
         vars: map(vars),
-        overrides,
+        overrides: std::sync::Arc::new(overrides),
         composed: None,
         vault_count: 0,
         vault_values: map(vars),
@@ -216,4 +216,19 @@ fn stored_value_characters_lists_vault_values_then_personal_overrides_by_key() {
             ("B_KEY", true, "NO-BREAK SPACE"),
         ]
     );
+}
+
+#[test]
+fn debug_output_of_the_layers_and_the_composed_child_names_keys_and_never_values() {
+    let layers = layers(
+        &[("API_URL", "fixture-team")],
+        overrides(&[("API_URL", "fixture-mine")], &[]),
+    );
+    let printed = format!("{layers:?}");
+    assert!(!printed.contains("fixture-"), "{printed}");
+    assert!(printed.contains("API_URL"), "{printed}");
+    let child = layers.compose(None, None).expect("compose");
+    let printed = format!("{child:?}");
+    assert!(!printed.contains("fixture-"), "{printed}");
+    assert!(printed.contains("API_URL"), "{printed}");
 }

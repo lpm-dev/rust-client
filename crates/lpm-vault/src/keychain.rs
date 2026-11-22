@@ -331,9 +331,10 @@ pub(crate) trait ProjectStorage {
 }
 
 /// A project storage that lists the service once, and learns each item's
-/// claimed approval once, keeping both current through the writes and
-/// deletions it makes, for the several transactions of one operation inside
-/// one lock. Nothing else writes the service while the lock is held.
+/// claimed approval and probed access once, keeping them current through the
+/// writes, deletions and approvals it makes, for the several transactions of
+/// one operation inside one lock. Nothing else writes the service while the
+/// lock is held.
 struct ListedStorage<'storage, S: ProjectStorage> {
     storage: &'storage mut S,
     /// Every account and its claim from one listing; `None` for an account
@@ -341,6 +342,8 @@ struct ListedStorage<'storage, S: ProjectStorage> {
     listing: Option<HashMap<String, Option<ClaimedAccess>>>,
     /// Claims learned without a listing; `None` for an absent item.
     claims: HashMap<String, Option<ClaimedAccess>>,
+    /// Probes that concluded; a probe of a locked Keychain is asked again.
+    probes: HashMap<String, ProbeOutcome>,
 }
 
 impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
@@ -349,11 +352,13 @@ impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
             storage,
             listing: None,
             claims: HashMap::new(),
+            probes: HashMap::new(),
         }
     }
 
     fn wrote(&mut self, account: &str) {
         self.claims.remove(account);
+        self.probes.remove(account);
         if let Some(listing) = self.listing.as_mut() {
             listing.insert(account.to_owned(), None);
         }
@@ -386,6 +391,7 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn delete(&mut self, account: &str) -> Result<bool, String> {
         let deleted = self.storage.delete(account);
+        self.probes.remove(account);
         if deleted.is_ok() {
             self.claims.insert(account.to_owned(), None);
             if let Some(listing) = self.listing.as_mut() {
@@ -474,11 +480,20 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
     }
 
     fn probe(&mut self, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
-        self.storage.probe(account, open_accounts)
+        if let Some(outcome) = self.probes.get(account) {
+            return *outcome;
+        }
+        let outcome = self.storage.probe(account, open_accounts);
+        if outcome != ProbeOutcome::Inconclusive {
+            self.probes.insert(account.to_owned(), outcome);
+        }
+        outcome
     }
 
     fn require_approval(&mut self, account: &str, open_accounts: &[&str]) -> Result<(), String> {
-        self.storage.require_approval(account, open_accounts)
+        let approved = self.storage.require_approval(account, open_accounts);
+        self.wrote(account);
+        approved
     }
 
     fn write_verified(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
@@ -786,10 +801,8 @@ fn verified_values_access(
     vault_id: &str,
     written_in_transaction: bool,
 ) -> Result<CliAccess, String> {
-    probe_values_access(storage, vault_id, written_in_transaction)?.ok_or_else(|| {
-        "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
-            .to_owned()
-    })
+    probe_values_access(storage, vault_id, written_in_transaction)?
+        .ok_or_else(|| companion_gate::APPROVAL_UNCONFIRMED.to_owned())
 }
 
 /// [`verified_values_access`], with `None` when the Keychain is unavailable,
@@ -1638,7 +1651,60 @@ pub(crate) fn write_all_environments_unlocked(
         project_path,
         std::borrow::Cow::Borrowed(environments),
         recording,
+        Vec::new(),
     )
+}
+
+/// [`write_all_environments_unlocked`] with `following`, the personal
+/// overrides change planned for it in this lock before the write
+/// (`overrides::plan_following_unlocked`), committed in the values write's
+/// own journal transaction, so neither lands without the other.
+pub(crate) fn write_all_environments_following_unlocked(
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+    following: crate::companion::overrides::change::ChangePlan,
+) -> Result<(), String> {
+    write_all_environments_following_with_storage(
+        &mut KeychainProjectStorage,
+        vault_id,
+        project_name,
+        project_path,
+        environments,
+        recording,
+        following,
+    )
+}
+
+fn write_all_environments_following_with_storage(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+    following: crate::companion::overrides::change::ChangePlan,
+) -> Result<(), String> {
+    let written = write_all_environments_with_storage_after_recovery(
+        storage,
+        vault_id,
+        project_name,
+        project_path,
+        std::borrow::Cow::Borrowed(environments),
+        recording,
+        following
+            .mutations
+            .into_iter()
+            .map(companion_gate::storage_mutation)
+            .collect(),
+    );
+    match &written {
+        Ok(()) => crate::companion::remember(vault_id, &following.gate),
+        Err(_) => crate::companion::forget(vault_id),
+    }
+    written
 }
 
 pub(crate) fn mutate_vault_env<T>(
@@ -1662,6 +1728,7 @@ pub(crate) fn mutate_vault_env<T>(
             project_path,
             std::borrow::Cow::Owned(environments),
             &recording,
+            Vec::new(),
         )?;
         Ok(result)
     })
@@ -1693,6 +1760,7 @@ pub(crate) fn mutate_existing_vault_env<T>(
                 project_path,
                 std::borrow::Cow::Owned(environments),
                 &recording,
+                Vec::new(),
             )?;
         }
         Ok(Some(result))
@@ -1724,6 +1792,7 @@ fn write_all_environments_with_storage_after_recovery(
     project_path: &str,
     environments: std::borrow::Cow<'_, EnvironmentMap>,
     recording: &crate::history::scope::Recording,
+    following: Vec<ProjectStorageMutation>,
 ) -> Result<(), String> {
     let encoded = crate::selected_environment::serialize(&environments)?;
     warn_if_large(encoded.len());
@@ -1735,6 +1804,7 @@ fn write_all_environments_with_storage_after_recovery(
         project_name,
         project_path,
         payload,
+        following,
     )?;
     crate::history::scope::committed(recording, environments);
     Ok(())
@@ -1781,24 +1851,29 @@ fn save_vault_data_with_storage_after_recovery(
         project_name,
         project_path,
         payload,
+        Vec::new(),
     )
 }
 
+/// Write `payload`, and the project's records when it has none yet, with
+/// `following`, the companion changes that follow this write, in one journal
+/// transaction.
 fn save_validated_vault_data_with_storage_after_recovery(
     storage: &mut impl ProjectStorage,
     project_name: &str,
     project_path: &str,
     payload: ValidatedVaultPayload,
+    following: Vec<ProjectStorageMutation>,
 ) -> Result<(), String> {
     let vault_id = payload.vault_id().to_owned();
     companion_gate::authorize(storage, &vault_id, Operation::Write)?;
     let state = ensure_project_index_after_recovery(storage)?;
     if let Some(mut metadata) = read_project_metadata(storage, &vault_id, &state)? {
         if metadata.record.environment_summaries == payload.environment_summaries() {
-            return apply_project_transaction_after_recovery(
-                storage,
-                vec![ProjectStorageMutation::validated_vault_write(payload)],
-            );
+            let mut mutations = Vec::with_capacity(1 + following.len());
+            mutations.push(ProjectStorageMutation::validated_vault_write(payload));
+            mutations.extend(following);
+            return apply_project_transaction_after_recovery(storage, mutations);
         }
         storage
             .read(&vault_id)?
@@ -1807,15 +1882,23 @@ fn save_validated_vault_data_with_storage_after_recovery(
         let metadata_data = serde_json::to_string(&metadata.record)
             .map_err(|error| format!("failed to serialize vault project metadata: {error}"))?;
         let metadata_account = project_metadata_account(&state.marker.storage_id, &vault_id);
-        return apply_project_transaction_after_recovery(
-            storage,
-            vec![
-                ProjectStorageMutation::validated_vault_write(payload),
-                ProjectStorageMutation::write(metadata_account, metadata_data),
-            ],
-        );
+        let mut mutations = Vec::with_capacity(2 + following.len());
+        mutations.push(ProjectStorageMutation::validated_vault_write(payload));
+        mutations.push(ProjectStorageMutation::write(
+            metadata_account,
+            metadata_data,
+        ));
+        mutations.extend(following);
+        return apply_project_transaction_after_recovery(storage, mutations);
     }
-    create_project_records(storage, project_name, project_path, payload, state)
+    create_project_records(
+        storage,
+        project_name,
+        project_path,
+        payload,
+        state,
+        following,
+    )
 }
 
 /// What's damaged in `vault_id`'s newer data in the Keychain.
@@ -2341,6 +2424,7 @@ fn create_project_records(
     project_path: &str,
     payload: ValidatedVaultPayload,
     mut state: ProjectIndexState,
+    following: Vec<ProjectStorageMutation>,
 ) -> Result<(), String> {
     let vault_id = payload.vault_id();
     let metadata_account = project_metadata_account(&state.marker.storage_id, vault_id);
@@ -2405,6 +2489,7 @@ fn create_project_records(
             marker_data,
         ));
     }
+    mutations.extend(following);
     apply_project_transaction_after_recovery(storage, mutations)
 }
 
@@ -3343,6 +3428,7 @@ mod tests {
                 "new-vault",
                 &crate::history::Source::new(crate::history::Action::Set),
             ),
+            Vec::new(),
         )
         .expect("locally generated project save should succeed");
 

@@ -81,6 +81,15 @@ pub(super) struct RunRead {
 pub(super) const CONTRADICTORY_VALUES: &str =
     "the values' approval attributes contradict each other";
 
+/// Why an approval couldn't be verified while the Keychain is locked.
+pub(super) const APPROVAL_UNCONFIRMED: &str = "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked";
+
+fn contradictory_record() -> String {
+    damaged(Damage::Access(
+        "the personal overrides' approval attributes contradict each other".to_owned(),
+    ))
+}
+
 /// The values item's bytes with the approval they claim, read in one call.
 /// Approval attributes that contradict each other damage the project's
 /// access, which refuses every read.
@@ -115,11 +124,19 @@ pub(super) fn read_for_run(
     vault_id: &str,
 ) -> Result<RunRead, String> {
     let gate = authorize(storage, vault_id, Operation::ReadApplyingOverrides)?;
-    let (values, values_access) = match read_values(storage, vault_id)? {
-        Some((bytes, access)) => (Some(bytes), Some(access)),
-        None => (None, None),
+    let values = read_values(storage, vault_id)?.map(|(bytes, _)| bytes);
+    // The values were just read under their approval, in this lock scope on
+    // this thread, so the record needs no check of its own: one read.
+    let record = match storage.read_with_access(&record_account(OVERRIDES_KIND, vault_id, None))? {
+        None => None,
+        Some((bytes, access)) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            if access == ClaimedAccess::Contradictory {
+                return Err(contradictory_record());
+            }
+            Some(bytes)
+        }
     };
-    let record = read_overrides_record(storage, vault_id, values_access)?;
     Ok(RunRead {
         values,
         gate,
@@ -127,33 +144,67 @@ pub(super) fn read_for_run(
     })
 }
 
-/// The personal overrides record with its approval checked against the
-/// values item's claim `values_access`: contradictory attributes damage the
-/// project's access, and a record that claims less approval than its values
-/// is strengthened before its bytes are read, so they're never read without
-/// the approval the values need. Bytes read from a record that claims less
-/// all the same, as another process could leave it in between, are refused.
+/// Whether the values item demands approval, for a read of what follows it
+/// that doesn't read the values themselves: as its attributes claim when
+/// they claim approval, and as a probe verifies it when they claim none, so
+/// a record never takes less approval than the values really demand. `None`
+/// without values; attributes that contradict each other damage the
+/// project's access.
+pub(super) fn values_demand_approval(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<Option<bool>, String> {
+    match storage.claimed_access(vault_id)? {
+        None => Ok(None),
+        Some(ClaimedAccess::Contradictory) => {
+            Err(damaged(Damage::Access(CONTRADICTORY_VALUES.to_owned())))
+        }
+        Some(ClaimedAccess::RequireApproval) => Ok(Some(true)),
+        Some(ClaimedAccess::Automatic) => {
+            let marker = marker_account(vault_id);
+            match storage.probe(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()]) {
+                ProbeOutcome::Automatic => Ok(Some(false)),
+                ProbeOutcome::Protected => Ok(Some(true)),
+                ProbeOutcome::Absent => Ok(None),
+                ProbeOutcome::Inconclusive => Err(APPROVAL_UNCONFIRMED.to_owned()),
+            }
+        }
+    }
+}
+
+/// The personal overrides record for a list or a change, its bytes never
+/// read with less approval than the values demand when `protected_values`
+/// (see [`values_demand_approval`]). An absent record or one whose
+/// attributes contradict each other is settled from its attributes without
+/// a read. A record that claims no approval is verified by a probe, and
+/// strengthened when it has none, before it's read. Bytes read from a record
+/// that claimed approval but reads as claiming none, as another process
+/// could leave it in between, are refused.
 pub(super) fn read_overrides_record(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-    values_access: Option<ClaimedAccess>,
+    protected_values: bool,
 ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
     let overrides_account = record_account(OVERRIDES_KIND, vault_id, None);
-    let protected_values = values_access == Some(ClaimedAccess::RequireApproval);
-    if protected_values
-        && storage.claimed_access(&overrides_account)? == Some(ClaimedAccess::Automatic)
-    {
-        match_values_approval(storage, vault_id, &overrides_account)?;
+    let mut verified = false;
+    if protected_values {
+        match storage.claimed_access(&overrides_account)? {
+            None => return Ok(None),
+            Some(ClaimedAccess::Contradictory) => return Err(contradictory_record()),
+            Some(ClaimedAccess::Automatic) => {
+                match_values_approval(storage, vault_id, &overrides_account)?;
+                verified = true;
+            }
+            Some(ClaimedAccess::RequireApproval) => {}
+        }
     }
     match storage.read_with_access(&overrides_account)? {
         None => Ok(None),
         Some((bytes, access)) => {
             let bytes = zeroize::Zeroizing::new(bytes);
             match access {
-                ClaimedAccess::Contradictory => Err(damaged(Damage::Access(
-                    "the personal overrides' approval attributes contradict each other".to_owned(),
-                ))),
-                ClaimedAccess::Automatic if protected_values => Err(
+                ClaimedAccess::Contradictory => Err(contradictory_record()),
+                ClaimedAccess::Automatic if protected_values && !verified => Err(
                     "the personal overrides' approval changed while they were read; try again"
                         .to_owned(),
                 ),
@@ -177,9 +228,6 @@ pub(super) fn match_values_approval(
         ProbeOutcome::Protected => Ok(()),
         ProbeOutcome::Automatic => storage.require_approval(account, &open),
         ProbeOutcome::Absent => Err(format!("{account} disappeared while it was read")),
-        ProbeOutcome::Inconclusive => Err(
-            "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
-                .to_owned(),
-        ),
+        ProbeOutcome::Inconclusive => Err(APPROVAL_UNCONFIRMED.to_owned()),
     }
 }

@@ -295,11 +295,11 @@ fn check_stored_values_with_case_policy(
     let mut values = HashMap::with_capacity(selected.len());
     let mut ignored = Vec::new();
     let mut errors = Vec::new();
-    for (key, value) in selected.iter() {
+    let mut take = |key: String, value: String| {
         // The runner rejects a NUL anywhere before it drops denied variables.
         let unusable = value.as_bytes().contains(&0);
-        let denied = is_denied_env_var(key);
-        if unusable && (denied || !schema.vars.contains_key(key)) {
+        let denied = is_denied_env_var(&key);
+        if unusable && (denied || !schema.vars.contains_key(&key)) {
             errors.push(ValidationError {
                 key: key.clone(),
                 kind: ValidationErrorKind::InvalidValue,
@@ -308,10 +308,19 @@ fn check_stored_values_with_case_policy(
             });
         }
         if denied {
-            ignored.push(key.clone());
-        } else if !unusable || schema.vars.contains_key(key) {
-            values.insert(key.clone(), value.clone());
+            ignored.push(key);
+        } else if !unusable || schema.vars.contains_key(&key) {
+            values.insert(key, value);
         }
+    };
+    // The values the overrides were applied to are this check's own to move.
+    match selected {
+        Cow::Owned(selected) => selected
+            .into_iter()
+            .for_each(|(key, value)| take(key, value)),
+        Cow::Borrowed(selected) => selected
+            .iter()
+            .for_each(|(key, value)| take(key.clone(), value.clone())),
     }
     ignored.sort_unstable();
     if case_insensitive {

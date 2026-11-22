@@ -129,9 +129,9 @@ pub struct PersonalOverrideOrigins {
 struct Decided {
     spelling: String,
     decision: Decision,
-    /// The override made the name present where it was missing or empty,
-    /// or the other way round, which decides a group rule.
-    changes_presence: bool,
+    /// The name was present, non-empty, before the override, which a group
+    /// rule's verdict before it counts.
+    present_before: bool,
 }
 
 impl PersonalOverrideOrigins {
@@ -169,7 +169,7 @@ impl PersonalOverrideOrigins {
                     Decided {
                         spelling: name.clone(),
                         decision: Decision::Set(value.clone()),
-                        changes_presence: present(before) != !value.is_empty(),
+                        present_before: present(before),
                     },
                 );
             }
@@ -183,7 +183,7 @@ impl PersonalOverrideOrigins {
                     Decided {
                         spelling: name.clone(),
                         decision: Decision::Unset,
-                        changes_presence: present(before),
+                        present_before: present(before),
                     },
                 );
             }
@@ -232,9 +232,11 @@ impl PersonalOverrideOrigins {
 
     /// For each of `errors`, the schema's verdict on `vars`, in order,
     /// whether a personal override caused it. A group rule's violation names
-    /// every member of the group, so it's an override's when one changed
-    /// whether a member is present; any other error is an override's when
-    /// [`caused`](Self::caused) says so.
+    /// every member of the group, so it's the overrides' when the group kept
+    /// its rule with each member as it was before them and breaks it now;
+    /// any other error is an override's when [`caused`](Self::caused) says
+    /// so. Names are looked up once each, without case where the host
+    /// ignores it.
     pub fn attribute(
         &self,
         errors: &[ValidationError],
@@ -243,23 +245,50 @@ impl PersonalOverrideOrigins {
         if self.decided.is_empty() {
             return vec![false; errors.len()];
         }
-        let mut broken_groups: HashMap<&str, bool> = HashMap::new();
+        let caseless: Option<HashMap<CaselessAscii<'_>, &str>> = self.case_insensitive.then(|| {
+            vars.iter()
+                .map(|(name, value)| (CaselessAscii(name), value.as_str()))
+                .collect()
+        });
+        let value_of = |name: &str| match &caseless {
+            Some(caseless) => caseless.get(&CaselessAscii(name)).copied(),
+            None => vars.get(name).map(String::as_str),
+        };
+        let mut groups: HashMap<&str, (crate::VarGroupMode, Vec<&str>)> = HashMap::new();
         for error in errors {
-            if let ValidationErrorKind::GroupViolation { group, .. } = &error.kind {
-                let changed = self
-                    .decided
-                    .get(&self.key(&error.key))
-                    .is_some_and(|decided| decided.changes_presence);
-                *broken_groups.entry(group).or_default() |= changed;
+            if let ValidationErrorKind::GroupViolation { group, mode } = &error.kind {
+                groups
+                    .entry(group)
+                    .or_insert_with(|| (*mode, Vec::new()))
+                    .1
+                    .push(&error.key);
             }
         }
+        let present_now = |name: &str| value_of(name).is_some_and(|value| !value.is_empty());
+        let present_before = |name: &str| {
+            let now = value_of(name);
+            match self.decided.get(&self.key(name)) {
+                Some(decided) if decided.still_decides(now) => decided.present_before,
+                _ => now.is_some_and(|value| !value.is_empty()),
+            }
+        };
+        let broken: HashSet<&str> = groups
+            .iter()
+            .filter(|(_, (mode, members))| {
+                let before = members.iter().filter(|name| present_before(name)).count();
+                let now = members.iter().filter(|name| present_now(name)).count();
+                crate::constraints::group_holds(*mode, before, members.len())
+                    && !crate::constraints::group_holds(*mode, now, members.len())
+            })
+            .map(|(group, _)| *group)
+            .collect();
         errors
             .iter()
             .map(|error| match &error.kind {
                 ValidationErrorKind::GroupViolation { group, .. } => {
-                    broken_groups.get(group.as_str()).copied().unwrap_or(false)
+                    broken.contains(group.as_str())
                 }
-                _ => self.caused(error, vars),
+                _ => self.caused_given(error, value_of(&error.key)),
             })
             .collect()
     }
@@ -267,21 +296,36 @@ impl PersonalOverrideOrigins {
     /// Whether a personal override caused `error` in `vars`: it still decides
     /// the value the schema judged, or its `unset` left the value missing.
     pub fn caused(&self, error: &ValidationError, vars: &HashMap<String, String>) -> bool {
-        let Some(Decided { decision, .. }) = self.decided.get(&self.key(&error.key)) else {
-            return false;
-        };
-        let value = vars.get(&error.key).or_else(|| {
+        let value = vars.get(&error.key).map(String::as_str).or_else(|| {
             self.case_insensitive
                 .then(|| {
                     vars.iter()
                         .find(|(name, _)| name.eq_ignore_ascii_case(&error.key))
-                        .map(|(_, value)| value)
+                        .map(|(_, value)| value.as_str())
                 })
                 .flatten()
         });
-        match decision {
-            Decision::Set(set) => value == Some(set),
+        self.caused_given(error, value)
+    }
+
+    fn caused_given(&self, error: &ValidationError, value: Option<&str>) -> bool {
+        let Some(decided) = self.decided.get(&self.key(&error.key)) else {
+            return false;
+        };
+        match decided.decision {
+            Decision::Set(_) => decided.still_decides(value),
             Decision::Unset => error.kind == ValidationErrorKind::Missing && value.is_none(),
+        }
+    }
+}
+
+impl Decided {
+    /// Whether the override still gives the name its final `value`, rather
+    /// than a later layer or a schema default.
+    fn still_decides(&self, value: Option<&str>) -> bool {
+        match &self.decision {
+            Decision::Set(set) => value == Some(set.as_str()),
+            Decision::Unset => value.is_none(),
         }
     }
 }
@@ -458,6 +502,16 @@ mod tests {
         );
     }
 
+    fn all_or_none(key: &str, group: &str) -> ValidationError {
+        error(
+            key,
+            ValidationErrorKind::GroupViolation {
+                group: group.to_owned(),
+                mode: crate::VarGroupMode::AllOrNone,
+            },
+        )
+    }
+
     #[test]
     fn each_error_of_one_key_is_blamed_on_its_own() {
         let set = map(&[("PORT", "not-a-port")]);
@@ -468,10 +522,43 @@ mod tests {
                 "PORT",
                 ValidationErrorKind::ConstraintViolation { constraint: "port" },
             ),
-            group_error("PORT", "network"),
+            all_or_none("PORT", "network"),
+            all_or_none("HOST", "network"),
         ];
-        assert_eq!(origins.attribute(&errors, &vars), [true, true]);
+        assert_eq!(origins.attribute(&errors, &vars), [true, true, true]);
         let empty = PersonalOverrideOrigins::default();
-        assert_eq!(empty.attribute(&errors, &vars), [false, false]);
+        assert_eq!(empty.attribute(&errors, &vars), [false, false, false]);
+    }
+
+    #[test]
+    fn a_group_that_failed_before_the_overrides_is_never_blamed_on_them() {
+        let set = map(&[("B", "mine")]);
+        let origins =
+            PersonalOverrideOrigins::changing(&map(&[("A", "team")]), layer(&set, &[]), false);
+        let errors = [
+            all_or_none("A", "three"),
+            all_or_none("B", "three"),
+            all_or_none("C", "three"),
+        ];
+        assert_eq!(
+            origins.attribute(&errors, &map(&[("A", "team"), ("B", "mine")])),
+            [false, false, false],
+            "one of three present before, two now: broken both ways"
+        );
+    }
+
+    #[test]
+    fn a_member_a_default_fills_again_after_an_unset_keeps_the_group_as_it_was() {
+        let unset = names(&["A"]);
+        let origins = PersonalOverrideOrigins::changing(
+            &map(&[("A", "team"), ("B", "team")]),
+            layer(&HashMap::new(), &unset),
+            false,
+        );
+        let errors = [group_error("A", "auth"), group_error("B", "auth")];
+        assert_eq!(
+            origins.attribute(&errors, &map(&[("A", "fallback"), ("B", "team")])),
+            [false, false]
+        );
     }
 }
